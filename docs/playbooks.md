@@ -272,20 +272,21 @@ Directives set playbook-wide configuration. They must appear before any action
 lines (or be interspersed; order relative to actions does not matter since
 directives are processed in a first pass).
 
-| Directive       | Syntax                                          | Default        | Description                                             |
-| --------------- | ----------------------------------------------- | -------------- | ------------------------------------------------------- |
-| `@viewport`     | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                            |
-| `@shell`        | `@shell <path>`                                 | system default | Shell binary for the sandbox                            |
-| `@timeout`      | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds             |
-| `@record`       | `@record true\|false`                           | `false`        | Enable recording of the execution                       |
-| `@render-trace` | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries             |
-| `@name`         | `@name <string>`                                | none           | Playbook name (included in JSON output)                 |
-| `@description`  | `@description <string>`                         | none           | Playbook description                                    |
-| `@plugin`       | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                         |
-| `@var`          | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution     |
-| `@env`          | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process      |
-| `@env-mode`     | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                      |
-| `@include`      | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10) |
+| Directive       | Syntax                                          | Default        | Description                                                                                  |
+| --------------- | ----------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------- |
+| `@viewport`     | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                                                                 |
+| `@driver`       | `@driver sandbox\|attach-sim`                   | `sandbox`      | Execution backend; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
+| `@shell`        | `@shell <path>`                                 | system default | Shell binary for the sandbox                                                                 |
+| `@timeout`      | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds                                                  |
+| `@record`       | `@record true\|false`                           | `false`        | Enable recording of the execution                                                            |
+| `@render-trace` | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries                                                  |
+| `@name`         | `@name <string>`                                | none           | Playbook name (included in JSON output)                                                      |
+| `@description`  | `@description <string>`                         | none           | Playbook description                                                                         |
+| `@plugin`       | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                                                              |
+| `@var`          | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution                                          |
+| `@env`          | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process                                           |
+| `@env-mode`     | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                                                           |
+| `@include`      | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10)                                      |
 
 ### Environment Modes
 
@@ -300,6 +301,50 @@ environment variable (if set) > `inherit`.
 ______________________________________________________________________
 
 ## Actions Reference
+
+### Deterministic Attach Simulation
+
+Use `@driver attach-sim` for lightweight attach UI tests that do not start a
+server or PTY. The driver feeds normalized terminal events into the same attach
+UI reducer used by production, applies effects to fake state, and renders with
+the real status-line renderer.
+
+```text
+@driver attach-sim
+@viewport cols=100 rows=24
+
+seed-window-list names='one,two,three' active='one'
+render
+assert-rendered contains='1:one'
+
+locate id='one' text='1:one'
+locate id='three' text='3:three'
+
+terminal-event kind=mouse phase=down button=left col='${one.center_col}' row='${one.row}'
+terminal-event kind=mouse phase=move button=left col='${three.end_col}' row='${three.row}'
+terminal-event kind=mouse phase=up button=left col='${three.end_col}' row='${three.row}'
+
+assert-effect operation='move-window'
+assert-state path='windows.names' equals='["two","three","one"]'
+```
+
+Supported attach-sim actions:
+
+| Action             | Purpose                                                                                             |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| `seed-window-list` | Seed fake windows: `names='one,two' active='one'`                                                   |
+| `set-config`       | Set supported sim config, currently `status_bar.tab_order=mru\|stable`                              |
+| `render`           | Re-render fake attach status UI                                                                     |
+| `locate`           | Locate rendered text and define `${id.start_col}`, `${id.center_col}`, `${id.end_col}`, `${id.row}` |
+| `terminal-event`   | Send normalized terminal input; currently mouse events are supported                                |
+| `assert-rendered`  | Assert rendered output contains or matches text                                                     |
+| `assert-effect`    | Assert an effect such as `move-window` was emitted                                                  |
+| `assert-no-effect` | Assert an effect was not emitted                                                                    |
+| `assert-state`     | Assert fake state; currently supports `path='windows.names'`                                        |
+
+This driver is intentionally generic around terminal events, rendering,
+effects, and state assertions. Feature fixtures are allowed, but the input and
+assertion primitives should remain reusable for future attach UI behavior.
 
 ### Session Lifecycle
 

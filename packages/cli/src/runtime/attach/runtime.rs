@@ -68,6 +68,10 @@ use super::super::{
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
+use super::input::{
+    TerminalGeometry, TerminalInputEvent, TerminalMouseButton, TerminalMouseEvent,
+    TerminalMousePhase,
+};
 use super::prompt_ui::{
     AttachCloseFallbackTarget, AttachInternalPromptAction, AttachPromptCompletion,
     AttachPromptOrigin, PromptKeyDisposition, prompt_accepts_key_kind,
@@ -82,7 +86,7 @@ use super::state::{
     AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseFloatingDrag,
     AttachMouseResizeAxisDrag, AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
-    AttachUiMode, AttachViewState, PaneRect, PaneRenderBuffer,
+    AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, attach_pane_grid_delta_state_streaming,
@@ -8877,58 +8881,73 @@ const fn mouse_event_to_shared(mouse_event: MouseEvent) -> attach_mouse::Event {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_status_tab_mouse_event(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<bool, ClientError> {
-    match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let Some(source_context_id) = attach_status_tab_context_at(view_state, mouse_event)
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    let reduction = reduce_attach_status_tab_mouse_event(
+        view_state,
+        TerminalMouseEvent::from(mouse_event),
+        TerminalGeometry { cols, rows },
+    );
+    if !reduction.consumed {
+        return Ok(false);
+    }
+    execute_attach_ui_effects(client, view_state, reduction.effects, kernel_client_factory).await?;
+    Ok(true)
+}
+
+pub fn reduce_attach_status_tab_mouse_event(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
+) -> AttachUiReduction {
+    match (mouse_event.phase, mouse_event.button) {
+        (TerminalMousePhase::Down, Some(TerminalMouseButton::Left)) => {
+            let Some(source_context_id) =
+                attach_status_tab_context_at(view_state, mouse_event, geometry)
             else {
                 view_state.mouse.tab_drag = None;
-                return Ok(false);
+                return AttachUiReduction::ignored();
             };
 
             if !view_state.mouse.tab_drag_enabled {
                 trace!("attach.status_tab_drag.disabled.mru_order");
-                return handle_attach_status_tab_click(
-                    client,
-                    view_state,
-                    mouse_event,
-                    kernel_client_factory,
-                )
-                .await;
+                return AttachUiReduction::with_effect(AttachUiEffect::SwitchWindow {
+                    target_context_id: source_context_id,
+                });
             }
 
             let drop_target = view_state
                 .cached_status_line
                 .as_ref()
                 .and_then(|status_line| {
-                    resolve_attach_tab_drop_target(status_line, mouse_event.column)
+                    resolve_attach_tab_drop_target(status_line, mouse_event.col)
                 });
             view_state.mouse.tab_drag = Some(AttachMouseTabDrag {
                 source_context_id,
-                started_col: mouse_event.column,
+                started_col: mouse_event.col,
                 started_row: mouse_event.row,
                 active: false,
                 drop_target,
             });
             view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
-            Ok(true)
+            AttachUiReduction::consumed()
         }
-        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+        (TerminalMousePhase::Drag | TerminalMousePhase::Move, _) => {
             if view_state.mouse.tab_drag.is_none() {
-                return Ok(false);
+                return AttachUiReduction::ignored();
             }
-            let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event) {
+            let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event, geometry)
+            {
                 view_state
                     .cached_status_line
                     .as_ref()
                     .and_then(|status_line| {
-                        resolve_attach_tab_drop_target(status_line, mouse_event.column)
+                        resolve_attach_tab_drop_target(status_line, mouse_event.col)
                     })
             } else {
                 None
@@ -8938,18 +8957,19 @@ pub async fn handle_attach_status_tab_mouse_event(
                 drag.drop_target = drop_target;
             }
             view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
-            Ok(true)
+            AttachUiReduction::consumed()
         }
-        MouseEventKind::Up(MouseButton::Left) => {
+        (TerminalMousePhase::Up, Some(TerminalMouseButton::Left)) => {
             let Some(mut drag) = view_state.mouse.tab_drag.take() else {
-                return Ok(false);
+                return AttachUiReduction::ignored();
             };
-            let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event) {
+            let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event, geometry)
+            {
                 view_state
                     .cached_status_line
                     .as_ref()
                     .and_then(|status_line| {
-                        resolve_attach_tab_drop_target(status_line, mouse_event.column)
+                        resolve_attach_tab_drop_target(status_line, mouse_event.col)
                     })
             } else {
                 None
@@ -8957,59 +8977,99 @@ pub async fn handle_attach_status_tab_mouse_event(
             .or_else(|| drag.drop_target.take());
 
             let drag_active = attach_tab_drag_motion_is_active(&drag, mouse_event, drop_target);
-            if let (true, Some(target)) = (drag_active, drop_target) {
-                if !view_state.can_write {
-                    view_state.set_transient_status(
-                        "tab reorder unavailable in read-only attach".to_string(),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                } else if target.context_id != drag.source_context_id {
-                    move_attach_status_tab(
-                        client,
-                        drag.source_context_id,
-                        target.context_id,
-                        target.placement,
-                    )
-                    .await?;
-                    optimistically_reorder_attach_window_list(
-                        view_state,
-                        drag.source_context_id,
-                        target.context_id,
-                        target.placement,
-                    );
-                }
-            } else if !drag_active {
-                switch_attach_status_tab(
-                    client,
-                    view_state,
-                    drag.source_context_id,
-                    kernel_client_factory,
-                )
-                .await?;
-            }
             view_state
                 .dirty
                 .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
-            Ok(true)
+            if let (true, Some(target)) = (drag_active, drop_target) {
+                if !view_state.can_write {
+                    AttachUiReduction::with_effect(AttachUiEffect::ShowTransientStatus {
+                        message: "tab reorder unavailable in read-only attach".to_string(),
+                    })
+                } else if target.context_id == drag.source_context_id {
+                    AttachUiReduction::consumed()
+                } else {
+                    AttachUiReduction::with_effect(AttachUiEffect::MoveWindow {
+                        source_context_id: drag.source_context_id,
+                        target_context_id: target.context_id,
+                        placement: target.placement,
+                    })
+                }
+            } else if drag_active {
+                AttachUiReduction::consumed()
+            } else {
+                AttachUiReduction::with_effect(AttachUiEffect::SwitchWindow {
+                    target_context_id: drag.source_context_id,
+                })
+            }
         }
-        _ => Ok(false),
+        _ => AttachUiReduction::ignored(),
     }
 }
 
-fn attach_status_mouse_row_matches(view_state: &AttachViewState, mouse_event: MouseEvent) -> bool {
-    let (_cols, rows) = terminal::size().unwrap_or((0, 0));
-    let Some(status_row) = status_row_for_position(view_state.status_position, rows) else {
+async fn execute_attach_ui_effects(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    effects: Vec<AttachUiEffect>,
+    kernel_client_factory: Option<&KernelClientFactory>,
+) -> std::result::Result<(), ClientError> {
+    for effect in effects {
+        match effect {
+            AttachUiEffect::SwitchWindow { target_context_id } => {
+                switch_attach_status_tab(
+                    client,
+                    view_state,
+                    target_context_id,
+                    kernel_client_factory,
+                )
+                .await?;
+                view_state
+                    .dirty
+                    .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
+            }
+            AttachUiEffect::MoveWindow {
+                source_context_id,
+                target_context_id,
+                placement,
+            } => {
+                move_attach_status_tab(client, source_context_id, target_context_id, placement)
+                    .await?;
+                optimistically_reorder_attach_window_list(
+                    view_state,
+                    source_context_id,
+                    target_context_id,
+                    placement,
+                );
+            }
+            AttachUiEffect::ShowTransientStatus { message } => {
+                view_state.set_transient_status(
+                    message,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn attach_status_mouse_row_matches(
+    view_state: &AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
+) -> bool {
+    let Some(status_row) = status_row_for_position(view_state.status_position, geometry.rows)
+    else {
         return false;
     };
-    status_row_matches_mouse(status_row, mouse_event.row, rows)
+    status_row_matches_mouse(status_row, mouse_event.row, geometry.rows)
 }
 
 fn attach_status_tab_context_at(
     view_state: &AttachViewState,
-    mouse_event: MouseEvent,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
 ) -> Option<Uuid> {
-    if !attach_status_mouse_row_matches(view_state, mouse_event) {
+    if !attach_status_mouse_row_matches(view_state, mouse_event, geometry) {
         return None;
     }
     view_state
@@ -9020,7 +9080,7 @@ fn attach_status_tab_context_at(
                 .tab_hitboxes
                 .iter()
                 .find(|hitbox| {
-                    mouse_event.column >= hitbox.start_col && mouse_event.column <= hitbox.end_col
+                    mouse_event.col >= hitbox.start_col && mouse_event.col <= hitbox.end_col
                 })
                 .map(|hitbox| hitbox.context_id)
         })
@@ -9069,7 +9129,7 @@ pub fn resolve_attach_tab_drop_target(
     })
 }
 
-fn attach_tab_drop_marker_col(
+pub(super) fn attach_tab_drop_marker_col(
     status_line: &AttachStatusLine,
     target: AttachTabDropTarget,
     cols: u16,
@@ -9087,13 +9147,13 @@ fn attach_tab_drop_marker_col(
 
 fn attach_tab_drag_motion_is_active(
     drag: &AttachMouseTabDrag,
-    mouse_event: MouseEvent,
+    mouse_event: TerminalMouseEvent,
     drop_target: Option<AttachTabDropTarget>,
 ) -> bool {
     drag.active
         || drop_target.is_some_and(|target| target.context_id != drag.source_context_id)
         || mouse_event
-            .column
+            .col
             .abs_diff(drag.started_col)
             .max(mouse_event.row.abs_diff(drag.started_row))
             > ATTACH_TAB_DRAG_THRESHOLD_CELLS
@@ -9183,70 +9243,6 @@ async fn switch_attach_status_tab(
         Vec::new(),
     )
     .await
-}
-
-pub async fn handle_attach_status_tab_click(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    mouse_event: MouseEvent,
-    kernel_client_factory: Option<&KernelClientFactory>,
-) -> std::result::Result<bool, ClientError> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols == 0 || rows == 0 {
-        trace!("attach.status_click.ignored.empty_terminal");
-        return Ok(false);
-    }
-    let Some(status_row) = status_row_for_position(view_state.status_position, rows) else {
-        trace!("attach.status_click.ignored.status_off");
-        return Ok(false);
-    };
-    if !status_row_matches_mouse(status_row, mouse_event.row, rows) {
-        trace!(
-            mouse_row = mouse_event.row,
-            status_row, rows, "attach.status_click.ignored.row_mismatch"
-        );
-        return Ok(false);
-    }
-
-    let Some(status_line) = view_state.cached_status_line.as_ref() else {
-        trace!("attach.status_click.ignored.no_cached_status");
-        return Ok(false);
-    };
-    trace!(
-        mouse_col = mouse_event.column,
-        mouse_row = mouse_event.row,
-        status_row,
-        hitbox_count = status_line.tab_hitboxes.len(),
-        "attach.status_click.inspect"
-    );
-    let Some(target_context_id) = status_line
-        .tab_hitboxes
-        .iter()
-        .find(|hitbox| {
-            mouse_event.column >= hitbox.start_col && mouse_event.column <= hitbox.end_col
-        })
-        .map(|hitbox| hitbox.context_id)
-    else {
-        trace!("attach.status_click.ignored.no_hitbox_match");
-        return Ok(false);
-    };
-
-    debug!(target_context_id = %target_context_id, "attach.status_click.retarget");
-
-    handle_attach_plugin_command_action(
-        client,
-        "bmux.windows",
-        "switch-window",
-        &[target_context_id.to_string()],
-        view_state,
-        kernel_client_factory,
-        Vec::new(),
-    )
-    .await?;
-    view_state
-        .dirty
-        .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
-    Ok(true)
 }
 
 pub const fn status_row_matches_mouse(status_row: u16, mouse_row: u16, rows: u16) -> bool {
@@ -9972,6 +9968,7 @@ pub fn attach_event_actions(
     attach_input_processor: &mut InputProcessor,
     ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
+    let _normalized_event = TerminalInputEvent::from_crossterm_event(event.clone());
     match event {
         Event::Key(key) => attach_key_event_actions(key, attach_input_processor, ui_mode),
         Event::Mouse(mouse) => Ok(vec![AttachEventAction::Mouse(*mouse)]),
@@ -10170,10 +10167,11 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
     use crate::input::InputProcessor;
+    use crate::runtime::attach::input::TerminalModifiers;
     use crate::runtime::attach::render::append_pane_output;
     use crate::runtime::attach::state::{
         AttachEventAction, AttachMouseSelectionDrag, AttachScrollbackCursor,
-        AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
+        AttachScrollbackPosition, AttachUiEffect, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
     use crate::status::AttachStatusTabHitbox;
 
@@ -10337,7 +10335,7 @@ mod tests {
         };
         assert!(!attach_tab_drag_motion_is_active(
             &drag,
-            same_cell,
+            same_cell.into(),
             drag.drop_target
         ));
 
@@ -10349,18 +10347,189 @@ mod tests {
         };
         assert!(attach_tab_drag_motion_is_active(
             &drag,
-            moved_cell,
+            moved_cell.into(),
             drag.drop_target
         ));
 
         assert!(attach_tab_drag_motion_is_active(
             &drag,
-            same_cell,
+            same_cell.into(),
             Some(AttachTabDropTarget {
                 context_id: second,
                 placement: AttachTabDropPlacement::After,
             })
         ));
+    }
+
+    fn tab_reducer_view_state() -> AttachViewState {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let third = Uuid::from_u128(3);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(99),
+            can_write: true,
+        });
+        view_state.mouse.tab_drag_enabled = true;
+        view_state.cached_status_line = Some(tab_status_line(vec![
+            AttachStatusTabHitbox {
+                start_col: 2,
+                end_col: 5,
+                context_id: first,
+            },
+            AttachStatusTabHitbox {
+                start_col: 8,
+                end_col: 11,
+                context_id: second,
+            },
+            AttachStatusTabHitbox {
+                start_col: 14,
+                end_col: 17,
+                context_id: third,
+            },
+        ]));
+        view_state
+    }
+
+    const fn tab_reducer_geometry() -> TerminalGeometry {
+        TerminalGeometry { cols: 80, rows: 24 }
+    }
+
+    const fn tab_mouse_event(phase: TerminalMousePhase, col: u16, row: u16) -> TerminalMouseEvent {
+        TerminalMouseEvent {
+            phase,
+            button: Some(TerminalMouseButton::Left),
+            col,
+            row,
+            modifiers: TerminalModifiers {
+                shift: false,
+                control: false,
+                alt: false,
+                super_key: false,
+                hyper: false,
+                meta: false,
+            },
+        }
+    }
+
+    #[test]
+    fn status_tab_reducer_emits_move_after_motion() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let third = Uuid::from_u128(3);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+        assert!(down.effects.is_empty());
+
+        let motion = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Move, 17, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(motion.consumed);
+        assert!(motion.effects.is_empty());
+        assert!(view_state.mouse.tab_drag.is_some_and(|drag| drag.active));
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 17, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::MoveWindow {
+                source_context_id: first,
+                target_context_id: third,
+                placement: AttachTabDropPlacement::After,
+            }]
+        );
+        assert!(view_state.mouse.tab_drag.is_none());
+    }
+
+    #[test]
+    fn status_tab_reducer_infers_drag_on_cross_tab_mouse_up() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let third = Uuid::from_u128(3);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 17, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::MoveWindow {
+                source_context_id: first,
+                target_context_id: third,
+                placement: AttachTabDropPlacement::After,
+            }]
+        );
+    }
+
+    #[test]
+    fn status_tab_reducer_click_without_drag_switches() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::SwitchWindow {
+                target_context_id: first,
+            }]
+        );
+    }
+
+    #[test]
+    fn status_tab_reducer_mru_disables_move() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        view_state.mouse.tab_drag_enabled = false;
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            down.effects,
+            vec![AttachUiEffect::SwitchWindow {
+                target_context_id: first,
+            }]
+        );
+        assert!(view_state.mouse.tab_drag.is_none());
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 17, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(!up.consumed);
+        assert!(up.effects.is_empty());
     }
 
     #[test]

@@ -96,6 +96,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         bundled_plugin_ids: Vec::new(),
         verbose: false,
         render_trace: raw.render_trace.unwrap_or(false),
+        driver: super::types::PlaybookDriver::Sandbox,
     })
 }
 

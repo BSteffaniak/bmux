@@ -103,7 +103,7 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
     }
 
     // Check that the first meaningful action is new-session (unless targeting live server)
-    if !target_server {
+    if !target_server && !matches!(playbook.config.driver, types::PlaybookDriver::AttachSim) {
         let first_action = playbook.steps.first().map(|s| &s.action);
         if let Some(action) = first_action
             && !matches!(action, types::Action::NewSession { .. })

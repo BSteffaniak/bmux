@@ -9,8 +9,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use super::types::{
-    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
-    PlaybookRenderTraceOp, RenderAssertion, ServiceKind, SplitDirection, Step,
+    Action, Playbook, PlaybookConfig, PlaybookDriver, PlaybookRenderRowRef,
+    PlaybookRenderRowSegmentRef, PlaybookRenderTraceOp, RenderAssertion, ServiceKind,
+    SimTerminalEvent, SplitDirection, Step,
 };
 
 /// Parse a playbook from the line-oriented DSL format.
@@ -92,6 +93,13 @@ fn parse_config_directive(
         }
         "render-trace" => {
             config.render_trace = rest.trim().parse::<bool>().unwrap_or(true);
+        }
+        "driver" => {
+            config.driver = match rest.trim() {
+                "sandbox" => PlaybookDriver::Sandbox,
+                "attach-sim" => PlaybookDriver::AttachSim,
+                other => bail!("@driver must be 'sandbox' or 'attach-sim', got '{other}'"),
+            };
         }
         "name" => {
             config.name = Some(rest.trim().to_string());
@@ -366,6 +374,46 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
                 assertion: parse_render_assertion(&args)?,
             })
         }
+        "seed-window-list" => {
+            let names = require_arg(&args, "names", "seed-window-list")?
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let active = require_arg(&args, "active", "seed-window-list")?;
+            Ok(Action::SeedWindowList { names, active })
+        }
+        "render" => Ok(Action::Render),
+        "locate" => Ok(Action::Locate {
+            id: require_arg(&args, "id", "locate")?,
+            text: require_arg(&args, "text", "locate")?,
+        }),
+        "terminal-event" => Ok(Action::TerminalEvent(SimTerminalEvent {
+            kind: require_arg(&args, "kind", "terminal-event")?,
+            phase: require_arg(&args, "phase", "terminal-event")?,
+            button: args.get("button").cloned(),
+            col: require_arg(&args, "col", "terminal-event")?,
+            row: require_arg(&args, "row", "terminal-event")?,
+        })),
+        "assert-effect" => Ok(Action::AssertEffect {
+            operation: require_arg(&args, "operation", "assert-effect")?,
+        }),
+        "assert-no-effect" => Ok(Action::AssertNoEffect {
+            operation: require_arg(&args, "operation", "assert-no-effect")?,
+        }),
+        "assert-state" => Ok(Action::AssertState {
+            path: require_arg(&args, "path", "assert-state")?,
+            equals: require_arg(&args, "equals", "assert-state")?,
+        }),
+        "assert-rendered" => Ok(Action::AssertRendered {
+            contains: args.get("contains").cloned(),
+            matches: args.get("matches").cloned(),
+        }),
+        "set-config" => Ok(Action::SetConfig {
+            path: require_arg(&args, "path", "set-config")?,
+            value: require_arg(&args, "value", "set-config")?,
+        }),
         _ => bail!("unknown action: {action_name}"),
     }
 }

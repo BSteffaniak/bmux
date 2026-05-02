@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
 use bmux_attach_pipeline::render::render_attach_scene_with_stats_and_trace;
@@ -49,9 +49,10 @@ use super::sandbox::SandboxServer;
 use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
-    Action, PaneCapture, Playbook, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
-    PlaybookRenderSummary, PlaybookRenderTraceOp, PlaybookResult, RenderAssertion, ServiceKind,
-    SnapshotCapture, SplitDirection, Step, StepFailure, StepResult, StepStatus,
+    Action, PaneCapture, Playbook, PlaybookDriver, PlaybookRenderRowRef,
+    PlaybookRenderRowSegmentRef, PlaybookRenderSummary, PlaybookRenderTraceOp, PlaybookResult,
+    RenderAssertion, ServiceKind, SimTerminalEvent, SnapshotCapture, SplitDirection, Step,
+    StepFailure, StepResult, StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -1879,6 +1880,256 @@ pub async fn run_playbook(
     }
 }
 
+fn run_attach_sim_playbook(playbook: &Playbook, started: Instant) -> PlaybookResult {
+    let playbook_name = playbook.config.name.clone();
+    let mut sim = crate::runtime::attach::sim::AttachSimHarness::new(
+        playbook.config.viewport.cols,
+        playbook.config.viewport.rows,
+    );
+    let mut runtime_vars = RuntimeVars::new(playbook.config.vars.clone());
+    let mut step_results = Vec::new();
+    let mut error_msg = None;
+
+    for step in &playbook.steps {
+        let step_started = Instant::now();
+        let result = execute_attach_sim_step(step, &mut sim, &mut runtime_vars);
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = step_started.elapsed().as_millis() as u64;
+        match result {
+            Ok(detail) => step_results.push(StepResult {
+                index: step.index,
+                action: step.action.to_dsl(),
+                status: StepStatus::Pass,
+                elapsed_ms,
+                detail,
+                expected: None,
+                actual: None,
+                failure_captures: None,
+                render_summary: None,
+                continue_on_error: step.continue_on_error,
+            }),
+            Err(error) => {
+                let message = error.to_string();
+                step_results.push(StepResult {
+                    index: step.index,
+                    action: step.action.to_dsl(),
+                    status: StepStatus::Fail,
+                    elapsed_ms,
+                    detail: Some(message.clone()),
+                    expected: None,
+                    actual: Some(sim.rendered().to_string()),
+                    failure_captures: None,
+                    render_summary: None,
+                    continue_on_error: step.continue_on_error,
+                });
+                if !step.continue_on_error {
+                    error_msg = Some(message);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let total_elapsed_ms = started.elapsed().as_millis() as u64;
+
+    PlaybookResult {
+        playbook_name,
+        pass: error_msg.is_none(),
+        steps: step_results,
+        snapshots: Vec::new(),
+        recording_id: None,
+        recording_path: None,
+        total_elapsed_ms,
+        error: error_msg,
+        sandbox_root: None,
+    }
+}
+
+// This dispatcher intentionally keeps attach-sim action handling in one place
+// so unsupported actions fail with a consistent driver-specific message.
+#[allow(clippy::too_many_lines)]
+fn execute_attach_sim_step(
+    step: &Step,
+    sim: &mut crate::runtime::attach::sim::AttachSimHarness,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<Option<String>> {
+    match &step.action {
+        Action::SeedWindowList { names, active } => {
+            let resolved_names = names
+                .iter()
+                .map(|name| runtime_vars.resolve_opt(name))
+                .collect::<Vec<_>>();
+            let name_refs = resolved_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let active = runtime_vars.resolve_opt(active);
+            sim.seed_window_list(&name_refs, &active);
+            Ok(Some(format!("seeded {} windows", resolved_names.len())))
+        }
+        Action::Render => {
+            sim.render();
+            Ok(Some(sim.rendered().to_string()))
+        }
+        Action::Locate { id, text } => {
+            let resolved_text = runtime_vars.resolve_opt(text);
+            let location = sim
+                .locate_text(&resolved_text)
+                .with_context(|| format!("could not locate '{resolved_text}'"))?;
+            runtime_vars
+                .static_vars
+                .insert(format!("{id}.start_col"), location.start_col.to_string());
+            runtime_vars
+                .static_vars
+                .insert(format!("{id}.end_col"), location.end_col.to_string());
+            runtime_vars
+                .static_vars
+                .insert(format!("{id}.center_col"), location.center_col.to_string());
+            runtime_vars
+                .static_vars
+                .insert(format!("{id}.row"), location.row.to_string());
+            Ok(Some(format!(
+                "{id}: cols {}-{} row {}",
+                location.start_col, location.end_col, location.row
+            )))
+        }
+        Action::TerminalEvent(event) => {
+            let terminal_event = attach_sim_terminal_event(event, runtime_vars)?;
+            sim.send_mouse(terminal_event);
+            Ok(Some("terminal event consumed".to_string()))
+        }
+        Action::AssertEffect { operation } => {
+            let operation = runtime_vars.resolve_opt(operation);
+            ensure!(
+                sim.effects()
+                    .iter()
+                    .any(|effect| attach_sim_effect_operation(effect) == operation),
+                "expected effect '{operation}' was not emitted"
+            );
+            Ok(None)
+        }
+        Action::AssertNoEffect { operation } => {
+            let operation = runtime_vars.resolve_opt(operation);
+            ensure!(
+                !sim.effects()
+                    .iter()
+                    .any(|effect| attach_sim_effect_operation(effect) == operation),
+                "unexpected effect '{operation}' was emitted"
+            );
+            Ok(None)
+        }
+        Action::AssertState { path, equals } => {
+            let path = runtime_vars.resolve_opt(path);
+            let expected = runtime_vars.resolve_opt(equals);
+            let actual = match path.as_str() {
+                "windows.names" => serde_json::to_string(&sim.window_names())?,
+                other => bail!("unsupported attach-sim state path '{other}'"),
+            };
+            ensure!(
+                actual == expected,
+                "state assertion failed for {path}: expected {expected}, got {actual}"
+            );
+            Ok(None)
+        }
+        Action::AssertRendered { contains, matches } => {
+            if let Some(contains) = contains {
+                let contains = runtime_vars.resolve_opt(contains);
+                ensure!(
+                    sim.rendered().contains(&contains),
+                    "rendered output did not contain '{contains}'"
+                );
+            }
+            if let Some(pattern) = matches {
+                let pattern = runtime_vars.resolve_opt(pattern);
+                let re = regex::Regex::new(&pattern)
+                    .with_context(|| format!("invalid regex: {pattern}"))?;
+                ensure!(
+                    re.is_match(sim.rendered()),
+                    "rendered output did not match '{pattern}'"
+                );
+            }
+            Ok(None)
+        }
+        Action::SetConfig { path, value } => {
+            let path = runtime_vars.resolve_opt(path);
+            let value = runtime_vars.resolve_opt(value);
+            match (path.as_str(), value.as_str()) {
+                ("status_bar.tab_order", "mru") => {
+                    sim.set_tab_order(bmux_config::StatusTabOrder::Mru);
+                }
+                ("status_bar.tab_order", "stable") => {
+                    sim.set_tab_order(bmux_config::StatusTabOrder::Stable);
+                }
+                _ => bail!("unsupported attach-sim config {path}={value}"),
+            }
+            Ok(Some(format!("{path}={value}")))
+        }
+        other => bail!(
+            "action '{}' is not supported by @driver attach-sim",
+            other.name()
+        ),
+    }
+}
+
+fn attach_sim_terminal_event(
+    event: &SimTerminalEvent,
+    runtime_vars: &RuntimeVars,
+) -> Result<crate::runtime::attach::input::TerminalMouseEvent> {
+    use crate::runtime::attach::input::{
+        TerminalModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMousePhase,
+    };
+
+    let kind = runtime_vars.resolve_opt(&event.kind);
+    ensure!(
+        kind == "mouse",
+        "attach-sim terminal-event only supports kind=mouse"
+    );
+    let phase = match runtime_vars.resolve_opt(&event.phase).as_str() {
+        "down" => TerminalMousePhase::Down,
+        "up" => TerminalMousePhase::Up,
+        "drag" => TerminalMousePhase::Drag,
+        "move" => TerminalMousePhase::Move,
+        "scroll-up" => TerminalMousePhase::ScrollUp,
+        "scroll-down" => TerminalMousePhase::ScrollDown,
+        "scroll-left" => TerminalMousePhase::ScrollLeft,
+        "scroll-right" => TerminalMousePhase::ScrollRight,
+        other => bail!("unsupported terminal-event phase '{other}'"),
+    };
+    let button = match event
+        .button
+        .as_deref()
+        .map(|button| runtime_vars.resolve_opt(button))
+    {
+        Some(button) => Some(match button.as_str() {
+            "left" => TerminalMouseButton::Left,
+            "right" => TerminalMouseButton::Right,
+            "middle" => TerminalMouseButton::Middle,
+            other => bail!("unsupported terminal-event button '{other}'"),
+        }),
+        None => None,
+    };
+    Ok(TerminalMouseEvent {
+        phase,
+        button,
+        col: runtime_vars.resolve_opt(&event.col).parse()?,
+        row: runtime_vars.resolve_opt(&event.row).parse()?,
+        modifiers: TerminalModifiers::default(),
+    })
+}
+
+const fn attach_sim_effect_operation(
+    effect: &crate::runtime::attach::state::AttachUiEffect,
+) -> &'static str {
+    match effect {
+        crate::runtime::attach::state::AttachUiEffect::SwitchWindow { .. } => "switch-window",
+        crate::runtime::attach::state::AttachUiEffect::MoveWindow { .. } => "move-window",
+        crate::runtime::attach::state::AttachUiEffect::ShowTransientStatus { .. } => {
+            "show-transient-status"
+        }
+    }
+}
+
 /// Core playbook execution logic.
 #[allow(clippy::too_many_lines)]
 async fn run_playbook_inner(
@@ -1894,6 +2145,10 @@ async fn run_playbook_inner(
     let mut snapshots = Vec::new();
     let mut error_msg: Option<String> = None;
     let mut recording_id: Option<Uuid> = None;
+
+    if matches!(playbook.config.driver, PlaybookDriver::AttachSim) {
+        return Ok(run_attach_sim_playbook(&playbook, started));
+    }
 
     // Either connect to an existing server or spin up a sandbox.
     let sandbox: Option<SandboxServer>;
@@ -3602,6 +3857,17 @@ pub(super) async fn execute_step(
         Action::RenderMark { .. } | Action::AssertRender { .. } => {
             bail!("render trace actions are handled by the playbook runner")
         }
+        Action::SeedWindowList { .. }
+        | Action::Render
+        | Action::Locate { .. }
+        | Action::TerminalEvent(_)
+        | Action::AssertEffect { .. }
+        | Action::AssertNoEffect { .. }
+        | Action::AssertState { .. }
+        | Action::AssertRendered { .. }
+        | Action::SetConfig { .. } => {
+            bail!("attach simulation actions require @driver attach-sim")
+        }
     }
 }
 
@@ -4206,6 +4472,27 @@ mod tests {
             cursor_row: 0,
             cursor_col: 0,
         }
+    }
+
+    #[test]
+    fn attach_sim_playbook_reorders_tabs_without_sandbox() {
+        let input = r#"
+@driver attach-sim
+@viewport cols=100 rows=24
+seed-window-list names='one,two,three' active='one'
+render
+assert-rendered contains='1:one'
+locate id='one' text='1:one'
+locate id='three' text='3:three'
+terminal-event kind=mouse phase=down button=left col='${one.center_col}' row='${one.row}'
+terminal-event kind=mouse phase=move button=left col='${three.end_col}' row='${three.row}'
+terminal-event kind=mouse phase=up button=left col='${three.end_col}' row='${three.row}'
+assert-effect operation='move-window'
+assert-state path='windows.names' equals='["two","three","one"]'
+"#;
+        let (playbook, _) = crate::playbook::parse_dsl::parse_dsl(input).expect("parse playbook");
+        let result = run_attach_sim_playbook(&playbook, Instant::now());
+        assert!(result.pass, "attach sim failed: {:?}", result.error);
     }
 
     #[test]

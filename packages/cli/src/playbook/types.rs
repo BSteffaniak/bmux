@@ -47,6 +47,14 @@ pub struct PlaybookConfig {
     pub verbose: bool,
     /// Collect normalized render summaries for render-mark/assert-render steps.
     pub render_trace: bool,
+    /// Execution backend for the playbook.
+    pub driver: PlaybookDriver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybookDriver {
+    Sandbox,
+    AttachSim,
 }
 
 /// Controls how the sandbox server inherits environment variables.
@@ -106,6 +114,7 @@ impl Default for PlaybookConfig {
             bundled_plugin_ids: Vec::new(),
             verbose: false,
             render_trace: false,
+            driver: PlaybookDriver::Sandbox,
         }
     }
 }
@@ -232,6 +241,36 @@ pub enum Action {
         since: String,
         assertion: RenderAssertion,
     },
+    /// Seed a deterministic attach simulation window list.
+    SeedWindowList { names: Vec<String>, active: String },
+    /// Render the current deterministic attach simulation state.
+    Render,
+    /// Locate text in the current deterministic render and store coordinates.
+    Locate { id: String, text: String },
+    /// Send a normalized terminal event to the deterministic attach simulation.
+    TerminalEvent(SimTerminalEvent),
+    /// Assert an effect was emitted by the deterministic attach simulation.
+    AssertEffect { operation: String },
+    /// Assert an effect was not emitted by the deterministic attach simulation.
+    AssertNoEffect { operation: String },
+    /// Assert deterministic simulation state.
+    AssertState { path: String, equals: String },
+    /// Assert deterministic simulation rendered output.
+    AssertRendered {
+        contains: Option<String>,
+        matches: Option<String>,
+    },
+    /// Set deterministic simulation configuration.
+    SetConfig { path: String, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimTerminalEvent {
+    pub kind: String,
+    pub phase: String,
+    pub button: Option<String>,
+    pub col: String,
+    pub row: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -591,6 +630,15 @@ impl Action {
             Self::Status => "status",
             Self::RenderMark { .. } => "render-mark",
             Self::AssertRender { .. } => "assert-render",
+            Self::SeedWindowList { .. } => "seed-window-list",
+            Self::Render => "render",
+            Self::Locate { .. } => "locate",
+            Self::TerminalEvent(_) => "terminal-event",
+            Self::AssertEffect { .. } => "assert-effect",
+            Self::AssertNoEffect { .. } => "assert-no-effect",
+            Self::AssertState { .. } => "assert-state",
+            Self::AssertRendered { .. } => "assert-rendered",
+            Self::SetConfig { .. } => "set-config",
         }
     }
 
@@ -740,6 +788,62 @@ impl Action {
                 append_render_assertion_dsl(&mut line, assertion);
                 line
             }
+            Self::SeedWindowList { names, active } => format!(
+                "seed-window-list names='{}' active='{}'",
+                escape_single_quote(&names.join(",")),
+                escape_single_quote(active)
+            ),
+            Self::Render => "render".to_string(),
+            Self::Locate { id, text } => format!(
+                "locate id='{}' text='{}'",
+                escape_single_quote(id),
+                escape_single_quote(text)
+            ),
+            Self::TerminalEvent(event) => {
+                let mut line = format!(
+                    "terminal-event kind={} phase={} col='{}' row='{}'",
+                    event.kind,
+                    event.phase,
+                    escape_single_quote(&event.col),
+                    escape_single_quote(&event.row)
+                );
+                if let Some(button) = &event.button {
+                    write!(line, " button={button}").unwrap();
+                }
+                line
+            }
+            Self::AssertEffect { operation } => {
+                format!(
+                    "assert-effect operation='{}'",
+                    escape_single_quote(operation)
+                )
+            }
+            Self::AssertNoEffect { operation } => {
+                format!(
+                    "assert-no-effect operation='{}'",
+                    escape_single_quote(operation)
+                )
+            }
+            Self::AssertState { path, equals } => format!(
+                "assert-state path='{}' equals='{}'",
+                escape_single_quote(path),
+                escape_single_quote(equals)
+            ),
+            Self::AssertRendered { contains, matches } => {
+                let mut line = "assert-rendered".to_string();
+                if let Some(value) = contains {
+                    write!(line, " contains='{}'", escape_single_quote(value)).unwrap();
+                }
+                if let Some(value) = matches {
+                    write!(line, " matches='{}'", escape_single_quote(value)).unwrap();
+                }
+                line
+            }
+            Self::SetConfig { path, value } => format!(
+                "set-config path='{}' value='{}'",
+                escape_single_quote(path),
+                escape_single_quote(value)
+            ),
         }
     }
 }

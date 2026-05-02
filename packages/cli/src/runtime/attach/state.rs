@@ -370,6 +370,50 @@ pub enum AttachTabDropPlacement {
     After,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachUiReduction {
+    pub consumed: bool,
+    pub effects: Vec<AttachUiEffect>,
+}
+
+impl AttachUiReduction {
+    pub const fn ignored() -> Self {
+        Self {
+            consumed: false,
+            effects: Vec::new(),
+        }
+    }
+
+    pub const fn consumed() -> Self {
+        Self {
+            consumed: true,
+            effects: Vec::new(),
+        }
+    }
+
+    pub fn with_effect(effect: AttachUiEffect) -> Self {
+        Self {
+            consumed: true,
+            effects: vec![effect],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachUiEffect {
+    SwitchWindow {
+        target_context_id: Uuid,
+    },
+    MoveWindow {
+        source_context_id: Uuid,
+        target_context_id: Uuid,
+        placement: AttachTabDropPlacement,
+    },
+    ShowTransientStatus {
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttachMouseFloatingDrag {
     pub pane_id: Uuid,

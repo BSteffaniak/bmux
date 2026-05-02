@@ -30,7 +30,7 @@ type RecordingEventEnvelope =
 
 mod access_cli;
 mod action_dispatch;
-mod attach;
+pub mod attach;
 mod bootstrap;
 mod built_in_commands;
 mod cli_parse;
