@@ -10,14 +10,13 @@ use bmux_attach_layout_protocol::{
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
     apply_attach_output_chunk_with, attach_scene_damage_between,
-    attach_scene_damage_for_absolute_rects,
 };
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
     RetainedOpacity, RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload,
-    merge_retained_damages, retained_damage_from_absolute_rects,
-    retained_frame_damage_from_frame_damage, retained_layer_order,
-    retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
+    frame_damage_from_retained_repaint_plan, merge_retained_damages,
+    retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
+    retained_layer_order, retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
@@ -80,8 +79,8 @@ use super::prompt_ui::{
     AttachPromptOrigin, AttachPromptOverlayRender, PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, opaque_row_text,
-    queue_frame_damage_overlay_with_trace, queue_render_ops,
+    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, frame_damage_overlay_rects,
+    frame_damage_overlay_render_ops, opaque_row_text, queue_render_ops,
     render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
 };
 use super::state::{
@@ -120,6 +119,7 @@ const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
 const STATUS_SURFACE_ID: Uuid = Uuid::from_u128(3);
+const DAMAGE_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(4);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -5683,6 +5683,50 @@ fn retained_prompt_overlay_surface(render: &AttachPromptOverlayRender) -> Retain
     )
 }
 
+fn retained_damage_overlay_surface(
+    scene: &AttachScene,
+    frame_damage: &bmux_attach_pipeline::FrameDamage,
+    terminal_size: (u16, u16),
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+) -> Option<RetainedSurface> {
+    let ops = frame_damage_overlay_render_ops(
+        scene,
+        frame_damage,
+        terminal_size,
+        status_top_inset,
+        status_bottom_inset,
+    );
+    if ops.is_empty() || terminal_size.0 == 0 || terminal_size.1 == 0 {
+        return None;
+    }
+    Some(
+        RetainedSurface::builder(
+            DAMAGE_OVERLAY_SURFACE_ID,
+            DamageRect::new(0, 0, terminal_size.0, terminal_size.1),
+        )
+        .layer(retained_layer_order(SurfaceLayer::Tooltip))
+        .z(i32::MAX)
+        .transparent()
+        .render_ops(ops)
+        .build(),
+    )
+}
+
+fn retained_full_surface_repaint(surface: &RetainedSurface) -> RetainedRepaintSurface {
+    RetainedRepaintSurface {
+        surface_id: surface.id,
+        rect: surface.rect,
+        layer: surface.layer,
+        z: surface.z,
+        opaque: surface.opaque,
+        opacity: surface.opacity,
+        clip_rect: surface.clip_rect,
+        interactive_regions: surface.interactive_regions.clone(),
+        damage: vec![surface.rect],
+    }
+}
+
 fn render_damage_from_retained_damage_rects(rects: &[DamageRect]) -> RenderDamage {
     RenderDamage::from_rects(
         rects
@@ -5708,25 +5752,6 @@ fn queue_retained_render_ops(
     let damage = render_damage_from_retained_damage_rects(&repaint.damage);
     queue_render_ops(stdout, surface_rect, &damage, ops)
         .context("failed queueing retained render ops")
-}
-
-fn overlay_rect_damage(
-    layout_state: &AttachLayoutState,
-    previous: Option<&AttachSurface>,
-    current: Option<&AttachSurface>,
-    policy: DamageCoalescingPolicy,
-) -> bmux_attach_pipeline::FrameDamage {
-    if previous == current {
-        return bmux_attach_pipeline::FrameDamage::default();
-    }
-    let mut rects = Vec::new();
-    if let Some(surface) = previous {
-        rects.push(attach_surface_damage_rect(surface));
-    }
-    if let Some(surface) = current {
-        rects.push(attach_surface_damage_rect(surface));
-    }
-    attach_scene_damage_for_absolute_rects(&layout_state.scene, &rects, policy)
 }
 
 fn frame_uses_synchronized_update(frame_damage: &bmux_attach_pipeline::FrameDamage) -> bool {
@@ -5763,19 +5788,6 @@ pub fn render_attach_frame(
     };
     let current_prompt_overlay_surface = view_state.prompt.overlay_surface();
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
-    frame_damage.merge_from(&overlay_rect_damage(
-        layout_state,
-        view_state.last_help_overlay_surface.as_ref(),
-        current_help_overlay_surface.as_ref(),
-        damage_policy,
-    ));
-    frame_damage.merge_from(&overlay_rect_damage(
-        layout_state,
-        view_state.last_prompt_overlay_surface.as_ref(),
-        current_prompt_overlay_surface.as_ref(),
-        damage_policy,
-    ));
-    let damage_stats = frame_damage.stats();
 
     if view_state.dirty.status_needs_redraw {
         let transient_status = view_state.transient_status_text(now).map(str::to_owned);
@@ -5822,7 +5834,6 @@ pub fn render_attach_frame(
         .as_ref()
         .map(retained_prompt_overlay_surface);
 
-    let render_scene = frame_damage.scene_damaged();
     let retained_frame_damage = retained_frame_damage_from_frame_damage(
         &layout_state.scene,
         &frame_damage,
@@ -5866,6 +5877,13 @@ pub fn render_attach_frame(
     let retained_repaint_plan = view_state
         .retained_compositor
         .repaint_plan(&retained_damage);
+    frame_damage.merge_from(&frame_damage_from_retained_repaint_plan(
+        &layout_state.scene,
+        &retained_repaint_plan,
+        damage_policy,
+    ));
+    let damage_stats = frame_damage.stats();
+    let render_scene = frame_damage.scene_damaged();
     let retained_repaint_by_id = retained_repaint_plan
         .iter()
         .map(|surface| (surface.surface_id, surface))
@@ -6028,16 +6046,32 @@ pub fn render_attach_frame(
         });
     }
 
-    if damage_config.visualize {
-        overlay_rendered |= queue_frame_damage_overlay_with_trace(
-            &mut frame_bytes,
+    if damage_config.visualize
+        && let Some(damage_surface) = retained_damage_overlay_surface(
             &layout_state.scene,
             &frame_damage,
             terminal_size,
             status_top_inset,
             status_bottom_inset,
-            render_trace,
-        )?;
+        )
+    {
+        let repaint = retained_full_surface_repaint(&damage_surface);
+        if queue_retained_render_ops(&mut frame_bytes, &damage_surface, &repaint)? {
+            let rects = frame_damage_overlay_rects(
+                &layout_state.scene,
+                &frame_damage,
+                terminal_size,
+                status_top_inset,
+                status_bottom_inset,
+            );
+            if let Some(trace) = render_trace.as_mut() {
+                trace.push(AttachRenderTraceOp::DamageOverlay {
+                    rects: u16::try_from(rects.len()).unwrap_or(u16::MAX),
+                    cells: rects.iter().map(|rect| u64::from(rect.area())).sum::<u64>(),
+                });
+            }
+            overlay_rendered = true;
+        }
     }
 
     if view_state.help_overlay_open || view_state.prompt.is_active() {
@@ -14018,6 +14052,30 @@ mod tests {
     }
 
     #[test]
+    fn retained_damage_overlay_surface_uses_transparent_render_ops_payload() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let layout_state = view_state.cached_layout_state.expect("layout state");
+        let pane_id = layout_state.focused_pane_id;
+        let mut damage = bmux_attach_pipeline::FrameDamage::default();
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(0, 0, 2, 1),
+            (10, 5),
+            DamageCoalescingPolicy::default(),
+        );
+
+        let surface = retained_damage_overlay_surface(&layout_state.scene, &damage, (80, 24), 0, 1)
+            .expect("damage overlay surface");
+
+        assert_eq!(surface.id, DAMAGE_OVERLAY_SURFACE_ID);
+        assert_eq!(surface.opacity, RetainedOpacity::Transparent);
+        let RetainedSurfacePayload::RenderOps(ops) = surface.payload else {
+            panic!("damage overlay should lower to render ops");
+        };
+        assert!(ops.iter().any(|op| matches!(op, RenderOp::Border { .. })));
+    }
+
+    #[test]
     fn frame_uses_synchronized_update_only_for_scene_or_overlay_damage() {
         let mut status_only = bmux_attach_pipeline::FrameDamage::default();
         status_only.mark_status();
@@ -14030,86 +14088,6 @@ mod tests {
         let mut content = bmux_attach_pipeline::FrameDamage::default();
         content.mark_content_surface(Uuid::from_u128(1));
         assert!(frame_uses_synchronized_update(&content));
-    }
-
-    #[test]
-    fn overlay_rect_damage_repaints_underlying_pane_rows() {
-        let view_state = attach_view_state_with_scrollback_fixture();
-        let layout_state = view_state.cached_layout_state.expect("layout state");
-        let pane_id = layout_state.focused_pane_id;
-        let previous_overlay = AttachSurface {
-            id: HELP_OVERLAY_SURFACE_ID,
-            kind: AttachSurfaceKind::Overlay,
-            layer: SurfaceLayer::Overlay,
-            z: i32::MAX,
-            rect: AttachRect {
-                x: 0,
-                y: 0,
-                w: 4,
-                h: 3,
-            },
-            content_rect: AttachRect {
-                x: 0,
-                y: 0,
-                w: 4,
-                h: 3,
-            },
-            interactive_regions: Vec::new(),
-            opaque: true,
-            visible: true,
-            accepts_input: true,
-            cursor_owner: true,
-            pane_id: None,
-        };
-
-        let damage = overlay_rect_damage(
-            &layout_state,
-            Some(&previous_overlay),
-            None,
-            DamageCoalescingPolicy::default(),
-        );
-
-        assert_eq!(
-            damage.content_surface_rects(pane_id),
-            &[DamageRect::new(0, 0, 3, 2)]
-        );
-        assert!(!damage.is_full_frame());
-    }
-
-    #[test]
-    fn overlay_rect_damage_repaints_previous_and_current_bounds() {
-        let view_state = attach_view_state_with_scrollback_fixture();
-        let layout_state = view_state.cached_layout_state.expect("layout state");
-        let pane_id = layout_state.focused_pane_id;
-        let overlay_surface = |x, y| AttachSurface {
-            id: HELP_OVERLAY_SURFACE_ID,
-            kind: AttachSurfaceKind::Overlay,
-            layer: SurfaceLayer::Overlay,
-            z: i32::MAX,
-            rect: AttachRect { x, y, w: 2, h: 1 },
-            content_rect: AttachRect { x, y, w: 2, h: 1 },
-            interactive_regions: Vec::new(),
-            opaque: true,
-            visible: true,
-            accepts_input: true,
-            cursor_owner: true,
-            pane_id: None,
-        };
-        let previous_overlay = overlay_surface(1, 1);
-        let current_overlay = overlay_surface(5, 4);
-
-        let damage = overlay_rect_damage(
-            &layout_state,
-            Some(&previous_overlay),
-            Some(&current_overlay),
-            DamageCoalescingPolicy::default(),
-        );
-
-        assert_eq!(
-            damage.content_surface_rects(pane_id),
-            &[DamageRect::new(0, 0, 2, 1), DamageRect::new(4, 3, 2, 1)]
-        );
-        assert!(!damage.is_full_frame());
     }
 
     #[test]

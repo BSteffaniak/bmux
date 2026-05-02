@@ -25,10 +25,10 @@ use uuid::Uuid;
 
 pub use compositor::{
     RetainedCompositor, RetainedDamage, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
-    RetainedSurfaceBuilder, RetainedSurfacePayload, merge_retained_damages,
-    retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
-    retained_layer_order, retained_repaint_plan_from_frame_damage,
-    retained_surfaces_from_attach_scene,
+    RetainedSurfaceBuilder, RetainedSurfacePayload, frame_damage_from_retained_repaint_plan,
+    merge_retained_damages, retained_damage_from_absolute_rects,
+    retained_frame_damage_from_frame_damage, retained_layer_order,
+    retained_repaint_plan_from_frame_damage, retained_surfaces_from_attach_scene,
 };
 pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
@@ -36,8 +36,9 @@ pub use mouse::{
 };
 pub use render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, DamageCoalescingPolicy,
-    DamageRect, FrameDamage, FrameDamageStats, frame_damage_overlay_render_ops,
-    queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace,
+    DamageRect, FrameDamage, FrameDamageStats, frame_damage_overlay_rects,
+    frame_damage_overlay_render_ops, queue_frame_damage_overlay,
+    queue_frame_damage_overlay_with_trace,
 };
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{

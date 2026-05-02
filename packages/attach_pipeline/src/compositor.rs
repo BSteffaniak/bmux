@@ -463,6 +463,26 @@ pub fn retained_repaint_plan_from_frame_damage(
 }
 
 #[must_use]
+pub fn frame_damage_from_retained_repaint_plan(
+    scene: &AttachScene,
+    plan: &[RetainedRepaintSurface],
+    policy: DamageCoalescingPolicy,
+) -> FrameDamage {
+    let mut frame_damage = FrameDamage::default();
+    for repaint in plan {
+        let Some(surface) = scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == repaint.surface_id && surface.visible)
+        else {
+            continue;
+        };
+        mark_retained_surface_repaint_damage(&mut frame_damage, surface, &repaint.damage, policy);
+    }
+    frame_damage
+}
+
+#[must_use]
 pub fn retained_surfaces_from_attach_scene(scene: &AttachScene) -> Vec<RetainedSurface> {
     scene
         .surfaces
@@ -493,6 +513,46 @@ pub fn retained_surfaces_from_attach_scene(scene: &AttachScene) -> Vec<RetainedS
             )
         })
         .collect()
+}
+
+fn mark_retained_surface_repaint_damage(
+    frame_damage: &mut FrameDamage,
+    surface: &bmux_attach_layout_protocol::AttachSurface,
+    absolute_damage: &[DamageRect],
+    policy: DamageCoalescingPolicy,
+) {
+    let surface_rect = damage_rect_from_attach_rect(surface.rect);
+    let content_rect = damage_rect_from_attach_rect(surface.content_rect);
+    for rect in absolute_damage {
+        if let Some(surface_damage) = intersect_rects(*rect, surface_rect) {
+            frame_damage.mark_extension_surface_rect(
+                surface.id,
+                relative_damage_rect(surface_damage, surface_rect),
+                (surface.rect.w, surface.rect.h),
+                policy,
+            );
+        }
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if let Some(content_damage) = intersect_rects(*rect, content_rect) {
+            frame_damage.mark_content_surface_rect(
+                pane_id,
+                relative_damage_rect(content_damage, content_rect),
+                (surface.content_rect.w, surface.content_rect.h),
+                policy,
+            );
+        }
+    }
+}
+
+const fn relative_damage_rect(rect: DamageRect, origin: DamageRect) -> DamageRect {
+    DamageRect::new(
+        rect.x.saturating_sub(origin.x),
+        rect.y.saturating_sub(origin.y),
+        rect.w,
+        rect.h,
+    )
 }
 
 fn layer_rects(scene: &AttachScene, layer: AttachLayer) -> impl Iterator<Item = DamageRect> + '_ {
@@ -877,6 +937,66 @@ mod tests {
         assert_eq!(
             surfaces[0].interactive_regions,
             vec![DamageRect::new(1, 2, 10, 1)]
+        );
+    }
+
+    #[test]
+    fn frame_damage_from_retained_repaint_plan_marks_scene_surface_rects() {
+        let pane_id = Uuid::from_u128(80);
+        let surface_id = Uuid::from_u128(81);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(1),
+            focus: AttachFocusTarget::None,
+            surfaces: vec![AttachSurface {
+                id: surface_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: AttachLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 10,
+                    y: 5,
+                    w: 20,
+                    h: 10,
+                },
+                content_rect: AttachRect {
+                    x: 12,
+                    y: 7,
+                    w: 16,
+                    h: 6,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: false,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let plan = vec![RetainedRepaintSurface {
+            surface_id,
+            rect: DamageRect::new(10, 5, 20, 10),
+            layer: retained_layer_order(AttachLayer::Pane),
+            z: 0,
+            opaque: true,
+            opacity: RetainedOpacity::Opaque,
+            clip_rect: None,
+            interactive_regions: Vec::new(),
+            damage: vec![DamageRect::new(13, 9, 3, 1)],
+        }];
+
+        let damage = frame_damage_from_retained_repaint_plan(
+            &scene,
+            &plan,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(
+            damage.extension_surface_rects(surface_id),
+            &[DamageRect::new(3, 4, 3, 1)]
+        );
+        assert_eq!(
+            damage.content_surface_rects(pane_id),
+            &[DamageRect::new(1, 2, 3, 1)]
         );
     }
 

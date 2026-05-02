@@ -1224,7 +1224,12 @@ fn frame_damage_overlay_render_ops_from_rects(rects: &[DamageRect]) -> Vec<Rende
         .collect()
 }
 
-fn frame_damage_overlay_rects(
+/// Collect absolute display-cell rectangles used by the frame-damage debug overlay.
+///
+/// The returned rectangles are geometry only; they never include pane contents or
+/// raw input/output bytes.
+#[must_use]
+pub fn frame_damage_overlay_rects(
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
