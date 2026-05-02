@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bmux_plugin::{
     AttachRenderExtension, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
-    RenderColor, RenderDamage, RenderOp, RenderStyle,
+    RenderColor, RenderDamage, RenderNamedColor, RenderOp, RenderStyle,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -45,6 +45,7 @@ use bmux_scene_protocol::scene_protocol::{
     Style as SceneStyle, SurfaceDecoration,
 };
 use bmux_scene_protocol_render::paint::apply_paint_commands;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 /// Shared cache of the decoration plugin's latest scene. Stored
@@ -273,7 +274,7 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
                 x: *col,
                 y: *row,
                 text: text.clone(),
-                style: render_style_from_scene(style)?,
+                style: render_style_from_scene(style),
             });
         }
         PaintCommand::FilledRect {
@@ -285,7 +286,7 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
             ops.push(RenderOp::FillRect {
                 rect: extension_rect_from_scene(rect),
                 ch: single_char(glyph)?,
-                style: render_style_from_scene(style)?,
+                style: render_style_from_scene(style),
             });
         }
         PaintCommand::GradientRun {
@@ -307,7 +308,7 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
                 x: *col,
                 y: *row,
                 text: text.clone(),
-                style: render_style_from_scene(from_style)?,
+                style: render_style_from_scene(from_style),
             });
         }
         PaintCommand::CellGrid {
@@ -338,7 +339,7 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
             ops.push(RenderOp::Border {
                 rect: extension_rect_from_scene(rect),
                 glyphs: render_border_glyphs(glyphs)?,
-                style: render_style_from_scene(style)?,
+                style: render_style_from_scene(style),
             });
         }
     }
@@ -355,21 +356,18 @@ const fn paint_command_z(command: &PaintCommand) -> i16 {
     }
 }
 
-fn render_style_from_scene(style: &SceneStyle) -> Option<RenderStyle> {
-    if style.underline
-        || style.italic
-        || style.reverse
-        || style.dim
-        || style.blink
-        || style.strikethrough
-    {
-        return None;
-    }
-    Some(RenderStyle {
+fn render_style_from_scene(style: &SceneStyle) -> RenderStyle {
+    RenderStyle {
         fg: style.fg.as_ref().map(render_color_from_scene),
         bg: style.bg.as_ref().map(render_color_from_scene),
         bold: style.bold,
-    })
+        underline: style.underline,
+        italic: style.italic,
+        reverse: style.reverse,
+        dim: style.dim,
+        blink: style.blink,
+        strikethrough: style.strikethrough,
+    }
 }
 
 fn render_color_from_scene(color: &SceneColor) -> RenderColor {
@@ -381,28 +379,28 @@ fn render_color_from_scene(color: &SceneColor) -> RenderColor {
             g: *g,
             b: *b,
         },
-        SceneColor::Named { name } => RenderColor::Indexed(named_color_index(*name)),
+        SceneColor::Named { name } => RenderColor::Named(render_named_color_from_scene(*name)),
     }
 }
 
-const fn named_color_index(color: NamedColor) -> u8 {
+const fn render_named_color_from_scene(color: NamedColor) -> RenderNamedColor {
     match color {
-        NamedColor::Black => 0,
-        NamedColor::Red => 1,
-        NamedColor::Green => 2,
-        NamedColor::Yellow => 3,
-        NamedColor::Blue => 4,
-        NamedColor::Magenta => 5,
-        NamedColor::Cyan => 6,
-        NamedColor::White => 7,
-        NamedColor::BrightBlack => 8,
-        NamedColor::BrightRed => 9,
-        NamedColor::BrightGreen => 10,
-        NamedColor::BrightYellow => 11,
-        NamedColor::BrightBlue => 12,
-        NamedColor::BrightMagenta => 13,
-        NamedColor::BrightCyan => 14,
-        NamedColor::BrightWhite => 15,
+        NamedColor::Black => RenderNamedColor::Black,
+        NamedColor::Red => RenderNamedColor::Red,
+        NamedColor::Green => RenderNamedColor::Green,
+        NamedColor::Yellow => RenderNamedColor::Yellow,
+        NamedColor::Blue => RenderNamedColor::Blue,
+        NamedColor::Magenta => RenderNamedColor::Magenta,
+        NamedColor::Cyan => RenderNamedColor::Cyan,
+        NamedColor::White => RenderNamedColor::White,
+        NamedColor::BrightBlack => RenderNamedColor::BrightBlack,
+        NamedColor::BrightRed => RenderNamedColor::BrightRed,
+        NamedColor::BrightGreen => RenderNamedColor::BrightGreen,
+        NamedColor::BrightYellow => RenderNamedColor::BrightYellow,
+        NamedColor::BrightBlue => RenderNamedColor::BrightBlue,
+        NamedColor::BrightMagenta => RenderNamedColor::BrightMagenta,
+        NamedColor::BrightCyan => RenderNamedColor::BrightCyan,
+        NamedColor::BrightWhite => RenderNamedColor::BrightWhite,
     }
 }
 
@@ -416,7 +414,7 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
             }
             row.push(RenderCell {
                 ch: single_char(&cell.glyph)?,
-                style: render_style_from_scene(&cell.style)?,
+                style: render_style_from_scene(&cell.style),
             });
         }
         rows.push(row);
@@ -446,13 +444,17 @@ fn single_char(value: &str) -> Option<char> {
     }
 }
 
+fn text_width_u16(text: &str) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
 fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = ExtensionRect> + '_ {
     let rects: Vec<ExtensionRect> = match command {
         PaintCommand::Text { col, row, text, .. }
         | PaintCommand::GradientRun { col, row, text, .. } => vec![ExtensionRect {
             x: *col,
             y: *row,
-            w: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            w: text_width_u16(text),
             h: 1,
         }],
         PaintCommand::FilledRect { rect, .. } => vec![extension_rect_from_scene(rect)],
@@ -722,6 +724,77 @@ mod tests {
     }
 
     #[test]
+    fn render_ops_preserves_named_color() {
+        let surface_id = Uuid::from_u128(5);
+        let mut style = scene_style();
+        style.fg = Some(SceneColor::Named {
+            name: NamedColor::BrightYellow,
+        });
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 2,
+                row: 3,
+                z: 0,
+                text: "hello".to_string(),
+                style,
+            }],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("named colors should be declarative");
+
+        assert!(matches!(
+            &ops[..],
+            [RenderOp::TextRun { style, .. }]
+                if style.fg == Some(RenderColor::Named(RenderNamedColor::BrightYellow))
+        ));
+    }
+
+    #[test]
+    fn surface_damage_uses_display_width_for_text_commands() {
+        let surface_id = Uuid::from_u128(4);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 2,
+                row: 3,
+                z: 0,
+                text: "界".to_string(),
+                style: scene_style(),
+            }],
+        );
+
+        assert_eq!(
+            extension.surface_damage(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+            ),
+            RenderDamage::Regions(vec![ExtensionRect {
+                x: 2,
+                y: 3,
+                w: 2,
+                h: 1,
+            }])
+        );
+    }
+
+    #[test]
     fn render_ops_sorts_by_z_before_returning_ops() {
         let surface_id = Uuid::from_u128(2);
         let (extension, _cache) = extension_with_surface(
@@ -765,10 +838,15 @@ mod tests {
     }
 
     #[test]
-    fn render_ops_falls_back_for_lossy_style_without_marking_rendered() {
+    fn render_ops_converts_full_style_flags_and_marks_rendered() {
         let surface_id = Uuid::from_u128(3);
         let mut style = scene_style();
         style.underline = true;
+        style.italic = true;
+        style.reverse = true;
+        style.dim = true;
+        style.blink = true;
+        style.strikethrough = true;
         let (extension, cache) = extension_with_surface(
             surface_id,
             vec![PaintCommand::Text {
@@ -780,26 +858,35 @@ mod tests {
             }],
         );
 
-        assert!(
-            extension
-                .render_ops(
-                    surface_id,
-                    &ExtensionRect {
-                        x: 0,
-                        y: 0,
-                        w: 20,
-                        h: 10,
-                    },
-                    &RenderDamage::FullSurface,
-                )
-                .is_none()
-        );
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("full style flags should be declarative");
+
+        assert!(matches!(
+            &ops[..],
+            [RenderOp::TextRun { style, .. }]
+                if style.underline
+                    && style.italic
+                    && style.reverse
+                    && style.dim
+                    && style.blink
+                    && style.strikethrough
+        ));
         assert!(
             cache
                 .lock()
                 .expect("cache should lock")
                 .rendered_surface(&surface_id)
-                .is_none()
+                .is_some()
         );
     }
 }

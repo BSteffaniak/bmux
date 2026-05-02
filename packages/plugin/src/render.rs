@@ -98,15 +98,43 @@ impl ExtensionRect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderColor {
     Default,
+    Named(RenderNamedColor),
     Indexed(u8),
     Rgb { r: u8, g: u8, b: u8 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderNamedColor {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+}
+
+#[allow(clippy::struct_excessive_bools)] // Terminal SGR flags are independent style attributes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderStyle {
     pub fg: Option<RenderColor>,
     pub bg: Option<RenderColor>,
     pub bold: bool,
+    pub underline: bool,
+    pub italic: bool,
+    pub reverse: bool,
+    pub dim: bool,
+    pub blink: bool,
+    pub strikethrough: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

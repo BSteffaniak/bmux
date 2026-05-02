@@ -9,7 +9,8 @@ use bmux_appearance::{
 };
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::{
-    AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle,
+    AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderNamedColor, RenderOp,
+    RenderStyle,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -194,8 +195,7 @@ fn merge_pending_text_run(
     if pending.y != y || pending.style != style {
         return false;
     }
-    let pending_width =
-        u16::try_from(UnicodeWidthStr::width(pending.text.as_str())).unwrap_or(u16::MAX);
+    let pending_width = text_width_u16(pending.text.as_str());
     if pending.x.saturating_add(pending_width) != x {
         return false;
     }
@@ -234,15 +234,99 @@ fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Resul
         queue!(stdout, SetAttribute(Attribute::Bold))
             .context("failed setting render op bold attribute")?;
     }
+    if style.dim {
+        queue!(stdout, SetAttribute(Attribute::Dim))
+            .context("failed setting render op dim attribute")?;
+    }
+    if style.italic {
+        queue!(stdout, SetAttribute(Attribute::Italic))
+            .context("failed setting render op italic attribute")?;
+    }
+    if style.underline {
+        queue!(stdout, SetAttribute(Attribute::Underlined))
+            .context("failed setting render op underline attribute")?;
+    }
+    if style.blink {
+        queue!(stdout, SetAttribute(Attribute::SlowBlink))
+            .context("failed setting render op blink attribute")?;
+    }
+    if style.reverse {
+        queue!(stdout, SetAttribute(Attribute::Reverse))
+            .context("failed setting render op reverse attribute")?;
+    }
+    if style.strikethrough {
+        queue!(stdout, SetAttribute(Attribute::CrossedOut))
+            .context("failed setting render op strikethrough attribute")?;
+    }
     Ok(())
 }
 
 const fn render_color_to_crossterm(color: RenderColor) -> Color {
     match color {
         RenderColor::Default => Color::Reset,
+        RenderColor::Named(name) => render_named_color_to_crossterm(name),
         RenderColor::Indexed(index) => Color::AnsiValue(index),
         RenderColor::Rgb { r, g, b } => Color::Rgb { r, g, b },
     }
+}
+
+const fn render_named_color_to_crossterm(color: RenderNamedColor) -> Color {
+    match color {
+        RenderNamedColor::Black => Color::Black,
+        RenderNamedColor::Red => Color::DarkRed,
+        RenderNamedColor::Green => Color::DarkGreen,
+        RenderNamedColor::Yellow => Color::DarkYellow,
+        RenderNamedColor::Blue => Color::DarkBlue,
+        RenderNamedColor::Magenta => Color::DarkMagenta,
+        RenderNamedColor::Cyan => Color::DarkCyan,
+        RenderNamedColor::White => Color::Grey,
+        RenderNamedColor::BrightBlack => Color::DarkGrey,
+        RenderNamedColor::BrightRed => Color::Red,
+        RenderNamedColor::BrightGreen => Color::Green,
+        RenderNamedColor::BrightYellow => Color::Yellow,
+        RenderNamedColor::BrightBlue => Color::Blue,
+        RenderNamedColor::BrightMagenta => Color::Magenta,
+        RenderNamedColor::BrightCyan => Color::Cyan,
+        RenderNamedColor::BrightWhite => Color::White,
+    }
+}
+
+fn text_width_u16(text: &str) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
+fn char_display_width_u16(ch: char) -> u16 {
+    let mut buffer = [0; 4];
+    text_width_u16(ch.encode_utf8(&mut buffer))
+}
+
+fn clip_text_run_to_surface(
+    x: u16,
+    text: &str,
+    surface_rect: ExtensionRect,
+) -> Option<(u16, String)> {
+    let clip_left = surface_rect.x;
+    let clip_right = surface_rect.right();
+    let mut cursor = x;
+    let mut clipped_x = None;
+    let mut clipped = String::new();
+    for ch in text.chars() {
+        let width = char_display_width_u16(ch);
+        let next = cursor.saturating_add(width);
+        let include = if width == 0 {
+            clipped_x.is_some() || (cursor >= clip_left && cursor < clip_right)
+        } else {
+            next > clip_left && cursor < clip_right && cursor >= clip_left && next <= clip_right
+        };
+        if include {
+            clipped_x.get_or_insert(cursor);
+            clipped.push(ch);
+        } else if cursor >= clip_right {
+            break;
+        }
+        cursor = next;
+    }
+    clipped_x.map(|x| (x, clipped))
 }
 
 fn queue_render_text_run<W: io::Write>(
@@ -256,18 +340,11 @@ fn queue_render_text_run<W: io::Write>(
     if y < surface_rect.y || y >= surface_rect.bottom() || x >= surface_rect.right() {
         return Ok(false);
     }
-    let chars = text.chars().collect::<Vec<_>>();
-    let start = usize::from(surface_rect.x.saturating_sub(x));
-    if start >= chars.len() {
+    let Some((clipped_x, clipped)) = clip_text_run_to_surface(x, text, surface_rect) else {
         return Ok(false);
-    }
-    let max_len = usize::from(surface_rect.right().saturating_sub(x.max(surface_rect.x)));
-    let clipped = chars[start..].iter().take(max_len).collect::<String>();
-    if clipped.is_empty() {
-        return Ok(false);
-    }
+    };
     queue_render_style(stdout, style)?;
-    queue!(stdout, MoveTo(x.max(surface_rect.x), y), Print(clipped))
+    queue!(stdout, MoveTo(clipped_x, y), Print(clipped))
         .context("failed queueing declarative text render op")?;
     Ok(true)
 }
@@ -404,7 +481,7 @@ fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
         RenderOp::TextRun { x, y, text, .. } => ExtensionRect {
             x: *x,
             y: *y,
-            w: u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX),
+            w: text_width_u16(text),
             h: 1,
         },
         RenderOp::FillRect { rect, .. } | RenderOp::Border { rect, .. } => *rect,
@@ -2218,7 +2295,9 @@ mod tests {
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
         AttachSurfaceKind, PaneState, PaneSummary,
     };
-    use bmux_plugin::{ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle};
+    use bmux_plugin::{
+        ExtensionRect, RenderColor, RenderDamage, RenderNamedColor, RenderOp, RenderStyle,
+    };
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
@@ -2576,6 +2655,116 @@ mod tests {
 
         let output = String::from_utf8(output).expect("render op bytes should be utf8");
         assert!(output.contains('界'), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_emits_named_color() {
+        let ops = [RenderOp::TextRun {
+            x: 0,
+            y: 0,
+            text: "named".to_string(),
+            style: RenderStyle {
+                fg: Some(RenderColor::Named(RenderNamedColor::BrightYellow)),
+                ..RenderStyle::default()
+            },
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("named color op should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[38;5;11m"), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_clips_text_on_display_cell_boundaries() {
+        let ops = [RenderOp::TextRun {
+            x: 0,
+            y: 0,
+            text: "界a".to_string(),
+            style: RenderStyle::default(),
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 1,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("clipped text op should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[1;3Ha"), "{output:?}");
+        assert!(!output.contains('界'), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_applies_full_style_flags() {
+        let ops = [RenderOp::TextRun {
+            x: 0,
+            y: 0,
+            text: "styled".to_string(),
+            style: RenderStyle {
+                bold: true,
+                underline: true,
+                italic: true,
+                reverse: true,
+                dim: true,
+                blink: true,
+                strikethrough: true,
+                ..RenderStyle::default()
+            },
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("styled op should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        for sgr in [
+            "\u{1b}[1m",
+            "\u{1b}[2m",
+            "\u{1b}[3m",
+            "\u{1b}[4m",
+            "\u{1b}[5m",
+            "\u{1b}[7m",
+            "\u{1b}[9m",
+        ] {
+            assert!(output.contains(sgr), "missing {sgr:?} in {output:?}");
+        }
     }
 
     #[test]
@@ -3206,8 +3395,8 @@ mod tests {
                     text: "OPS".to_string(),
                     style: RenderStyle {
                         fg: Some(RenderColor::Rgb { r: 1, g: 2, b: 3 }),
-                        bg: None,
                         bold: true,
+                        ..RenderStyle::default()
                     },
                 }])
             }
