@@ -175,6 +175,23 @@ fn typed_client_error(error: &TypedServiceClientError) -> ClientError {
     }
 }
 
+fn typed_dispatch_client_error(operation: &str, error: &TypedServiceClientError) -> ClientError {
+    ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("{operation} dispatch failed: {error}"),
+    }
+}
+
+fn windows_pane_mutation_client_error(
+    operation: &str,
+    error: &windows_commands::PaneMutationError,
+) -> ClientError {
+    ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("{operation} failed: {error:?}"),
+    }
+}
+
 #[must_use]
 fn ipc_to_windows_selector(selector: SessionSelector) -> windows_commands::Selector {
     match selector {
@@ -8409,7 +8426,6 @@ async fn handle_attach_mouse_floating_drag(
             let Some(pane_id) = surface.pane_id else {
                 return Ok(false);
             };
-            focus_attach_pane(client, view_state, pane_id).await?;
             view_state.mouse.selection_drag = None;
             let (scene_max_x, scene_max_y) =
                 attach_scene_bounds(view_state).unwrap_or((u16::MAX, u16::MAX));
@@ -8426,6 +8442,18 @@ async fn handle_attach_mouse_floating_drag(
                 start_column: mouse_event.column,
                 start_row: mouse_event.row,
             });
+            if let Err(error) = focus_attach_pane(client, view_state, pane_id).await {
+                let message = format!(
+                    "floating drag focus failed: {}",
+                    map_attach_client_error(error)
+                );
+                warn!(message = %message, pane_id = %pane_id, "floating pane drag focus failed");
+                view_state.set_transient_status(
+                    message,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
             Ok(true)
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -9656,25 +9684,23 @@ pub async fn focus_attach_pane(
 
     let selector = attached_session_selector(view_state);
     if attach_scene_pane_is_floating(view_state, pane_id) {
-        let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        windows_commands::client::focus_floating_pane(
             client,
-            "focus-floating-pane",
-            &windows_commands::client::FocusFloatingPaneRequest {
-                session: Some(ipc_to_windows_selector(selector)),
-                target: pane_id_windows_selector(pane_id),
-            },
+            Some(ipc_to_windows_selector(selector)),
+            pane_id_windows_selector(pane_id),
         )
-        .await?;
+        .await
+        .map_err(|error| typed_dispatch_client_error("focus-floating-pane", &error))?
+        .map_err(|error| windows_pane_mutation_client_error("focus-floating-pane", &error))?;
     } else {
-        let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        windows_commands::client::focus_pane_by_selector(
             client,
-            "focus-pane-by-selector",
-            &windows_commands::client::FocusPaneBySelectorRequest {
-                session: Some(ipc_to_windows_selector(selector)),
-                target: pane_id_windows_selector(pane_id),
-            },
+            Some(ipc_to_windows_selector(selector)),
+            pane_id_windows_selector(pane_id),
         )
-        .await?;
+        .await
+        .map_err(|error| typed_dispatch_client_error("focus-pane-by-selector", &error))?
+        .map_err(|error| windows_pane_mutation_client_error("focus-pane-by-selector", &error))?;
     }
 
     view_state.mouse.last_focused_pane_id = Some(pane_id);
@@ -9693,17 +9719,16 @@ async fn resize_attach_pane(
     cells: u16,
 ) -> std::result::Result<(), ClientError> {
     let selector = attached_session_selector(view_state);
-    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+    windows_commands::client::resize_pane(
         client,
-        "resize-pane",
-        &windows_commands::client::ResizePaneRequest {
-            session: Some(ipc_to_windows_selector(selector)),
-            target: Some(pane_id_windows_selector(pane_id)),
-            direction,
-            cells: cells.max(1),
-        },
+        Some(ipc_to_windows_selector(selector)),
+        Some(pane_id_windows_selector(pane_id)),
+        direction,
+        cells.max(1),
     )
-    .await?;
+    .await
+    .map_err(|error| typed_dispatch_client_error("resize-pane", &error))?
+    .map_err(|error| windows_pane_mutation_client_error("resize-pane", &error))?;
 
     view_state
         .dirty
@@ -9719,17 +9744,16 @@ async fn move_attach_floating_pane(
     y: u16,
 ) -> std::result::Result<(), ClientError> {
     let selector = attached_session_selector(view_state);
-    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+    windows_commands::client::move_floating_pane(
         client,
-        "move-floating-pane",
-        &windows_commands::client::MoveFloatingPaneRequest {
-            session: Some(ipc_to_windows_selector(selector)),
-            target: pane_id_windows_selector(pane_id),
-            x,
-            y,
-        },
+        Some(ipc_to_windows_selector(selector)),
+        pane_id_windows_selector(pane_id),
+        x,
+        y,
     )
-    .await?;
+    .await
+    .map_err(|error| typed_dispatch_client_error("move-floating-pane", &error))?
+    .map_err(|error| windows_pane_mutation_client_error("move-floating-pane", &error))?;
 
     view_state
         .dirty
