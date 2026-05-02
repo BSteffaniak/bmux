@@ -1,5 +1,5 @@
-use super::render::{AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill};
-use super::state::{AttachCursorState, PaneRect};
+use super::render::{opaque_row_text, queue_render_ops};
+use super::state::AttachCursorState;
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
     PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
@@ -8,12 +8,10 @@ use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
     AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind,
 };
-use crossterm::cursor::MoveTo;
+use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderDamage, RenderOp, RenderStyle};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::queue;
-use crossterm::style::Print;
 use crossterm::terminal;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
@@ -746,72 +744,48 @@ impl AttachPromptState {
         let body_rows = height.saturating_sub(4).max(1);
         let text_width = width.saturating_sub(4);
 
-        let surface = AttachLayerSurface::new(
-            PaneRect {
-                x: layout.surface.rect.x,
-                y: layout.surface.rect.y,
-                w: layout.surface.rect.w,
-                h: layout.surface.rect.h,
-            },
-            // Prompt overlay paints its own 1-cell frame; the fill area is the interior.
-            PaneRect {
-                x: layout.surface.rect.x.saturating_add(1),
-                y: layout.surface.rect.y.saturating_add(1),
-                w: layout.surface.rect.w.saturating_sub(2),
-                h: layout.surface.rect.h.saturating_sub(2),
-            },
-            AttachLayer::Overlay,
-            true,
+        let body = render_prompt_body(active, text_width, body_rows);
+        let footer = prompt_footer_text(&active.envelope.request);
+        let style = RenderStyle::new();
+        let surface_rect = ExtensionRect::new(
+            layout.surface.rect.x,
+            layout.surface.rect.y,
+            layout.surface.rect.w,
+            layout.surface.rect.h,
         );
-
-        let top = format!("+{}+", "-".repeat(width.saturating_sub(2)));
-        queue!(stdout, MoveTo(x as u16, y as u16), Print(&top))
-            .context("failed drawing prompt overlay top")?;
-
+        let interior = ExtensionRect::new(
+            layout.surface.rect.x.saturating_add(1),
+            layout.surface.rect.y.saturating_add(1),
+            layout.surface.rect.w.saturating_sub(2),
+            layout.surface.rect.h.saturating_sub(2),
+        );
         let title = format!(
             " {} ",
             truncate_chars(&active.envelope.request.title, text_width)
         );
         let title_x = x + ((width.saturating_sub(title.len())) / 2);
-        queue!(stdout, MoveTo(title_x as u16, y as u16), Print(title))
-            .context("failed drawing prompt overlay title")?;
-
-        for row in 1..height.saturating_sub(1) {
-            let y_row = (y + row) as u16;
-            queue!(
-                stdout,
-                MoveTo(x as u16, y_row),
-                Print("|"),
-                MoveTo((x + width - 1) as u16, y_row),
-                Print("|")
-            )
-            .context("failed drawing prompt overlay border")?;
-        }
-
-        queue_layer_fill(stdout, surface).context("failed filling prompt overlay body")?;
-
-        queue!(
-            stdout,
-            MoveTo(x as u16, (y + height - 1) as u16),
-            Print(&top)
-        )
-        .context("failed drawing prompt overlay bottom")?;
-
-        let body = render_prompt_body(active, text_width, body_rows);
+        let mut ops = vec![
+            RenderOp::clear_rect(interior, style),
+            RenderOp::border(surface_rect, BorderGlyphs::ascii(), style),
+            RenderOp::text_run(title_x as u16, y as u16, title, style),
+        ];
         for (index, line) in body.lines.iter().take(body_rows).enumerate() {
             let row = y + 1 + index;
-            queue!(stdout, MoveTo((x + 2) as u16, row as u16), Print(line))
-                .context("failed drawing prompt overlay body")?;
+            ops.push(RenderOp::text_run(
+                (x + 2) as u16,
+                row as u16,
+                line.clone(),
+                style,
+            ));
         }
-
-        let footer = prompt_footer_text(&active.envelope.request);
-        let footer_rendered = opaque_row_text(&footer, text_width);
-        queue!(
-            stdout,
-            MoveTo((x + 2) as u16, (y + height - 2) as u16),
-            Print(footer_rendered)
-        )
-        .context("failed drawing prompt overlay footer")?;
+        ops.push(RenderOp::text_run(
+            (x + 2) as u16,
+            (y + height - 2) as u16,
+            opaque_row_text(&footer, text_width),
+            style,
+        ));
+        queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &ops)
+            .context("failed queueing declarative prompt overlay")?;
 
         let cursor_state = body.cursor.map(|(row, col)| AttachCursorState {
             x: (x + 2 + col).min(u16::MAX as usize) as u16,

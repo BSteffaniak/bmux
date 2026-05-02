@@ -77,21 +77,22 @@ use super::prompt_ui::{
     AttachPromptOrigin, PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
-    AttachSceneRenderStats, opaque_row_text, queue_frame_damage_overlay_with_trace,
-    queue_layer_fill, render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
+    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, opaque_row_text,
+    queue_frame_damage_overlay_with_trace, queue_render_ops,
+    render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
 };
 use super::state::{
     AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseFloatingDrag,
     AttachMouseResizeAxisDrag, AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
-    AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRect, PaneRenderBuffer,
+    AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, attach_pane_grid_delta_state_streaming,
     attach_pane_grid_snapshot_state_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
+use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderDamage, RenderOp, RenderStyle};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_GRID_SNAPSHOT_MAX_ROWS_PER_PANE: usize = u32::MAX as usize;
@@ -5577,76 +5578,74 @@ pub fn queue_attach_help_overlay(
     lines: &[String],
     scroll: usize,
 ) -> Result<()> {
+    let surface_rect = ExtensionRect::new(
+        surface_meta.rect.x,
+        surface_meta.rect.y,
+        surface_meta.rect.w,
+        surface_meta.rect.h,
+    );
+    let ops = help_overlay_render_ops(surface_meta, lines, scroll);
+    queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &ops)
+        .context("failed queueing declarative help overlay")?;
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)] // Overlay geometry is clamped to terminal bounds before u16 conversion.
+fn help_overlay_render_ops(
+    surface_meta: &AttachSurface,
+    lines: &[String],
+    scroll: usize,
+) -> Vec<RenderOp> {
     let width = usize::from(surface_meta.rect.w);
     let height = usize::from(surface_meta.rect.h);
     let x = usize::from(surface_meta.rect.x);
     let y = usize::from(surface_meta.rect.y);
     let body_rows = height.saturating_sub(4).max(1);
-    let outer = PaneRect {
-        x: surface_meta.rect.x,
-        y: surface_meta.rect.y,
-        w: surface_meta.rect.w,
-        h: surface_meta.rect.h,
-    };
-    // Help overlay paints its own 1-cell frame; the fill area is the interior.
-    let content = PaneRect {
-        x: outer.x.saturating_add(1),
-        y: outer.y.saturating_add(1),
-        w: outer.w.saturating_sub(2),
-        h: outer.h.saturating_sub(2),
-    };
-    let surface = AttachLayerSurface::new(outer, content, AttachLayer::Overlay, true);
     let text_width = width.saturating_sub(4);
+    let style = RenderStyle::new();
+    let rect = ExtensionRect::new(
+        surface_meta.rect.x,
+        surface_meta.rect.y,
+        surface_meta.rect.w,
+        surface_meta.rect.h,
+    );
+    let interior = ExtensionRect::new(
+        surface_meta.rect.x.saturating_add(1),
+        surface_meta.rect.y.saturating_add(1),
+        surface_meta.rect.w.saturating_sub(2),
+        surface_meta.rect.h.saturating_sub(2),
+    );
 
-    let top = format!("+{}+", "-".repeat(width.saturating_sub(2)));
-    queue!(stdout, MoveTo(x as u16, y as u16), Print(&top))
-        .context("failed drawing help overlay top")?;
+    let mut ops = vec![
+        RenderOp::clear_rect(interior, style),
+        RenderOp::border(rect, BorderGlyphs::ascii(), style),
+    ];
 
     let title = " bmux help ";
     let title_x = x + ((width.saturating_sub(title.len())) / 2);
-    queue!(stdout, MoveTo(title_x as u16, y as u16), Print(title))
-        .context("failed drawing help overlay title")?;
-
-    for row in 1..height.saturating_sub(1) {
-        let y_row = (y + row) as u16;
-        queue!(
-            stdout,
-            MoveTo(x as u16, y_row),
-            Print("|"),
-            MoveTo((x + width - 1) as u16, y_row),
-            Print("|")
-        )
-        .context("failed drawing help overlay border")?;
-    }
-
-    queue_layer_fill(stdout, surface).context("failed filling help overlay body")?;
-
-    queue!(
-        stdout,
-        MoveTo(x as u16, (y + height - 1) as u16),
-        Print(&top)
-    )
-    .context("failed drawing help overlay bottom")?;
+    ops.push(RenderOp::text_run(title_x as u16, y as u16, title, style));
 
     let header = "scope    chord                action";
-    let header_rendered = opaque_row_text(header, text_width);
-    queue!(
-        stdout,
-        MoveTo((x + 2) as u16, (y + 1) as u16),
-        Print(header_rendered)
-    )
-    .context("failed drawing help overlay header")?;
+    ops.push(RenderOp::text_run(
+        (x + 2) as u16,
+        (y + 1) as u16,
+        opaque_row_text(header, text_width),
+        style,
+    ));
 
     let start = scroll.min(lines.len().saturating_sub(body_rows));
     let end = (start + body_rows).min(lines.len());
     for (idx, line) in lines.iter().skip(start).take(body_rows).enumerate() {
-        let rendered = opaque_row_text(line, text_width);
         let row = y + 2 + idx;
         if row >= y + height - 1 {
             break;
         }
-        queue!(stdout, MoveTo((x + 2) as u16, row as u16), Print(rendered))
-            .context("failed drawing help overlay entry")?;
+        ops.push(RenderOp::text_run(
+            (x + 2) as u16,
+            row as u16,
+            opaque_row_text(line, text_width),
+            style,
+        ));
     }
 
     let footer = format!(
@@ -5655,15 +5654,13 @@ pub fn queue_attach_help_overlay(
         end,
         lines.len()
     );
-    let footer_rendered = opaque_row_text(&footer, text_width);
-    queue!(
-        stdout,
-        MoveTo((x + 2) as u16, (y + height - 2) as u16),
-        Print(footer_rendered)
-    )
-    .context("failed drawing help overlay footer")?;
-
-    Ok(())
+    ops.push(RenderOp::text_run(
+        (x + 2) as u16,
+        (y + height - 2) as u16,
+        opaque_row_text(&footer, text_width),
+        style,
+    ));
+    ops
 }
 
 const fn attach_surface_damage_rect(surface: &AttachSurface) -> DamageRect {

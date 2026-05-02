@@ -223,7 +223,15 @@ fn queue_terminal_commands<W: io::Write>(
     Ok(!commands.is_empty())
 }
 
-fn queue_render_ops<W: io::Write>(
+/// Queue declarative render operations clipped to `surface_rect` and `damage`.
+///
+/// Returns `Ok(true)` when any terminal bytes were queued.
+///
+/// # Errors
+///
+/// Returns an error when lowering render operations or queueing terminal control
+/// sequences to `stdout` fails.
+pub fn queue_render_ops<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
