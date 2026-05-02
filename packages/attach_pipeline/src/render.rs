@@ -10,7 +10,7 @@ use bmux_appearance::{
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::{
     AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderNamedColor, RenderOp,
-    RenderStyle,
+    RenderStyle, clip_render_text_run_to_rect, render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -213,7 +213,7 @@ fn merge_pending_text_run(
     if pending.y != y || pending.style != style {
         return false;
     }
-    let pending_width = text_width_u16(pending.text.as_str());
+    let pending_width = render_text_width_u16(pending.text.as_str());
     if pending.x.saturating_add(pending_width) != x {
         return false;
     }
@@ -309,44 +309,6 @@ const fn render_named_color_to_crossterm(color: RenderNamedColor) -> Color {
     }
 }
 
-fn text_width_u16(text: &str) -> u16 {
-    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
-}
-
-fn char_display_width_u16(ch: char) -> u16 {
-    let mut buffer = [0; 4];
-    text_width_u16(ch.encode_utf8(&mut buffer))
-}
-
-fn clip_text_run_to_surface(
-    x: u16,
-    text: &str,
-    surface_rect: ExtensionRect,
-) -> Option<(u16, String)> {
-    let clip_left = surface_rect.x;
-    let clip_right = surface_rect.right();
-    let mut cursor = x;
-    let mut clipped_x = None;
-    let mut clipped = String::new();
-    for ch in text.chars() {
-        let width = char_display_width_u16(ch);
-        let next = cursor.saturating_add(width);
-        let include = if width == 0 {
-            clipped_x.is_some() || (cursor >= clip_left && cursor < clip_right)
-        } else {
-            next > clip_left && cursor < clip_right && cursor >= clip_left && next <= clip_right
-        };
-        if include {
-            clipped_x.get_or_insert(cursor);
-            clipped.push(ch);
-        } else if cursor >= clip_right {
-            break;
-        }
-        cursor = next;
-    }
-    clipped_x.map(|x| (x, clipped))
-}
-
 fn queue_render_text_run<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -358,7 +320,7 @@ fn queue_render_text_run<W: io::Write>(
     if y < surface_rect.y || y >= surface_rect.bottom() || x >= surface_rect.right() {
         return Ok(false);
     }
-    let Some((clipped_x, clipped)) = clip_text_run_to_surface(x, text, surface_rect) else {
+    let Some((clipped_x, clipped)) = clip_render_text_run_to_rect(x, text, surface_rect) else {
         return Ok(false);
     };
     queue_render_style(stdout, style)?;
@@ -511,7 +473,7 @@ fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
         RenderOp::TextRun { x, y, text, .. } => ExtensionRect {
             x: *x,
             y: *y,
-            w: text_width_u16(text),
+            w: render_text_width_u16(text),
             h: 1,
         },
         RenderOp::ClearRect { rect, .. }

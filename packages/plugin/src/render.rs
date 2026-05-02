@@ -30,6 +30,7 @@
 
 use std::io;
 use std::sync::{Arc, OnceLock, RwLock};
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 /// Minimal rectangle used by render extensions to report content-rect
@@ -49,6 +50,11 @@ pub struct ExtensionRect {
 }
 
 impl ExtensionRect {
+    #[must_use]
+    pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self { x, y, w, h }
+    }
+
     #[must_use]
     pub const fn right(self) -> u16 {
         self.x.saturating_add(self.w)
@@ -93,6 +99,74 @@ impl ExtensionRect {
             h: bottom.saturating_sub(y),
         }
     }
+}
+
+/// Return the Unicode display-cell width of `text`, saturated to `u16::MAX`.
+///
+/// Declarative render APIs use display cells for text damage, clipping, and
+/// cursor advance. This helper centralizes that contract so extensions and the
+/// host do not duplicate subtly different width calculations.
+#[must_use]
+pub fn render_text_width_u16(text: &str) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
+/// Return the Unicode display-cell width of a single scalar value.
+#[must_use]
+pub fn render_char_display_width_u16(ch: char) -> u16 {
+    let mut buffer = [0; 4];
+    render_text_width_u16(ch.encode_utf8(&mut buffer))
+}
+
+/// Return the single character in `value` only when it occupies exactly one
+/// display cell. Empty, multi-scalar, zero-width, and wide strings return
+/// `None` so callers can fall back conservatively.
+#[must_use]
+pub fn render_single_display_cell_char(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || render_char_display_width_u16(ch) != 1 {
+        None
+    } else {
+        Some(ch)
+    }
+}
+
+/// Clip a text run to `bounds` without splitting wide glyphs across display
+/// cell boundaries.
+///
+/// `x` is the run's absolute display-cell column. The returned column is the
+/// first emitted display cell. Zero-width characters are retained only after a
+/// preceding emitted character has established a visible starting column, or
+/// when their cursor position lies inside `bounds`.
+#[must_use]
+pub fn clip_render_text_run_to_rect(
+    x: u16,
+    text: &str,
+    bounds: ExtensionRect,
+) -> Option<(u16, String)> {
+    let clip_left = bounds.x;
+    let clip_right = bounds.right();
+    let mut cursor = x;
+    let mut clipped_x = None;
+    let mut clipped = String::new();
+    for ch in text.chars() {
+        let width = render_char_display_width_u16(ch);
+        let next = cursor.saturating_add(width);
+        let include = if width == 0 {
+            clipped_x.is_some() || (cursor >= clip_left && cursor < clip_right)
+        } else {
+            next > clip_left && cursor < clip_right && cursor >= clip_left && next <= clip_right
+        };
+        if include {
+            clipped_x.get_or_insert(cursor);
+            clipped.push(ch);
+        } else if cursor >= clip_right {
+            break;
+        }
+        cursor = next;
+    }
+    clipped_x.map(|x| (x, clipped))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +516,46 @@ mod tests {
         fn surface_removed(&self, surface_id: Uuid) {
             self.removed.lock().unwrap().push(surface_id);
         }
+    }
+
+    #[test]
+    fn display_cell_helpers_handle_wide_and_sparse_text() {
+        assert_eq!(render_text_width_u16("a界"), 3);
+        assert_eq!(render_char_display_width_u16('界'), 2);
+        assert_eq!(render_single_display_cell_char("x"), Some('x'));
+        assert_eq!(render_single_display_cell_char("界"), None);
+        assert_eq!(render_single_display_cell_char(""), None);
+        assert_eq!(render_single_display_cell_char("ab"), None);
+    }
+
+    #[test]
+    fn clip_render_text_run_preserves_display_cell_boundaries() {
+        assert_eq!(
+            clip_render_text_run_to_rect(
+                0,
+                "界a",
+                ExtensionRect {
+                    x: 1,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                },
+            ),
+            Some((2, "a".to_string()))
+        );
+        assert_eq!(
+            clip_render_text_run_to_rect(
+                0,
+                "界a",
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 2,
+                    h: 1,
+                },
+            ),
+            Some((0, "界".to_string()))
+        );
     }
 
     #[test]

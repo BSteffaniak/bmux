@@ -1417,7 +1417,6 @@ dependencies = [
  "bmux_scene_protocol_render",
  "tokio",
  "tracing",
- "unicode-width",
  "uuid",
 ]
 
@@ -1759,6 +1758,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "unicode-width",
  "uuid",
 ]
 

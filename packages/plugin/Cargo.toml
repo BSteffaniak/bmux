@@ -26,6 +26,7 @@ thiserror           = { workspace = true }
 tokio               = { workspace = true, features = ["sync"] }
 toml                = { workspace = true, features = ["parse"] }
 tracing             = { workspace = true, features = ["std"] }
+unicode-width       = { workspace = true }
 uuid                = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]

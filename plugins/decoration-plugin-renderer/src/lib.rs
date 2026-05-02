@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use bmux_plugin::{
     AttachRenderExtension, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderNamedColor, RenderOp, RenderStyle,
+    render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -45,7 +46,6 @@ use bmux_scene_protocol::scene_protocol::{
     Style as SceneStyle, SurfaceDecoration,
 };
 use bmux_scene_protocol_render::paint::{apply_paint_commands, interpolate_style};
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 /// Shared cache of the decoration plugin's latest scene. Stored
@@ -290,7 +290,7 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
             } else {
                 ops.push(RenderOp::FillRect {
                     rect,
-                    ch: single_display_cell_char(glyph)?,
+                    ch: render_single_display_cell_char(glyph)?,
                     style,
                 });
             }
@@ -390,7 +390,7 @@ fn push_gradient_run_ops(
                     text: segment.to_string(),
                     style,
                 });
-                offset = offset.saturating_add(text_width_u16(segment).max(1));
+                offset = offset.saturating_add(render_text_width_u16(segment).max(1));
             }
             GradientAxis::Vertical => {
                 ops.push(RenderOp::TextRun {
@@ -480,7 +480,7 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
                 ch: if cell.glyph.is_empty() {
                     None
                 } else {
-                    Some(single_display_cell_char(&cell.glyph)?)
+                    Some(render_single_display_cell_char(&cell.glyph)?)
                 },
                 style: render_style_from_scene(&cell.style),
             });
@@ -493,37 +493,13 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
 fn render_border_glyphs(glyphs: &SceneBorderGlyphs) -> Option<RenderBorderGlyphs> {
     let glyphs = border_glyphs_corners_or_custom(glyphs)?;
     Some(RenderBorderGlyphs {
-        top_left: single_display_cell_char(glyphs.top_left)?,
-        top_right: single_display_cell_char(glyphs.top_right)?,
-        bottom_left: single_display_cell_char(glyphs.bottom_left)?,
-        bottom_right: single_display_cell_char(glyphs.bottom_right)?,
-        horizontal: single_display_cell_char(glyphs.horizontal)?,
-        vertical: single_display_cell_char(glyphs.vertical)?,
+        top_left: render_single_display_cell_char(glyphs.top_left)?,
+        top_right: render_single_display_cell_char(glyphs.top_right)?,
+        bottom_left: render_single_display_cell_char(glyphs.bottom_left)?,
+        bottom_right: render_single_display_cell_char(glyphs.bottom_right)?,
+        horizontal: render_single_display_cell_char(glyphs.horizontal)?,
+        vertical: render_single_display_cell_char(glyphs.vertical)?,
     })
-}
-
-fn single_char(value: &str) -> Option<char> {
-    let mut chars = value.chars();
-    let ch = chars.next()?;
-    if chars.next().is_none() {
-        Some(ch)
-    } else {
-        None
-    }
-}
-
-fn single_display_cell_char(value: &str) -> Option<char> {
-    let ch = single_char(value)?;
-    (char_display_width_u16(ch) == 1).then_some(ch)
-}
-
-fn text_width_u16(text: &str) -> u16 {
-    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
-}
-
-fn char_display_width_u16(ch: char) -> u16 {
-    let mut buffer = [0; 4];
-    text_width_u16(ch.encode_utf8(&mut buffer))
 }
 
 fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = ExtensionRect> + '_ {
@@ -532,7 +508,7 @@ fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = Extensio
         | PaintCommand::GradientRun { col, row, text, .. } => vec![ExtensionRect {
             x: *col,
             y: *row,
-            w: text_width_u16(text),
+            w: render_text_width_u16(text),
             h: 1,
         }],
         PaintCommand::FilledRect { rect, .. } => vec![extension_rect_from_scene(rect)],

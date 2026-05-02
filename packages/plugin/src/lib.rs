@@ -63,8 +63,9 @@ pub use registry::{
 };
 pub use render::{
     AttachRenderExtension, BorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
-    RenderExtensionRegistry, RenderNamedColor, RenderOp, RenderStyle,
+    RenderExtensionRegistry, RenderNamedColor, RenderOp, RenderStyle, clip_render_text_run_to_rect,
     global_render_extension_registry, register_render_extension, registered_render_extensions,
+    render_char_display_width_u16, render_single_display_cell_char, render_text_width_u16,
 };
 pub use service_location::{ServiceLocation, ServiceLocationMap, global_service_locations};
 pub use startup_gate::{
