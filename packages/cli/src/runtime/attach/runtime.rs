@@ -2547,6 +2547,7 @@ pub async fn run_session_attach_with_client(
             ));
             let help_scroll = view_state.help_overlay_scroll;
             let render_started_at = Instant::now();
+            let (cols, rows) = terminal::size().unwrap_or((0, 0));
             let frame_stats = render_attach_frame(
                 &mut client,
                 &mut view_state,
@@ -2561,6 +2562,8 @@ pub async fn run_session_attach_with_client(
                 &attach_config.behavior.damage,
                 attach_config.logs.client.slow_terminal_write_ms,
                 &mut display_capture,
+                render_started_at,
+                TerminalGeometry { cols, rows },
                 None,
             )?;
             let render_ms = duration_millis_u64(render_started_at.elapsed());
@@ -2820,6 +2823,7 @@ pub async fn run_session_attach_with_client(
         ));
         let help_scroll = view_state.help_overlay_scroll;
         let render_started_at = Instant::now();
+        let (cols, rows) = terminal::size().unwrap_or((0, 0));
         let frame_stats = render_attach_frame(
             &mut client,
             &mut view_state,
@@ -2834,6 +2838,8 @@ pub async fn run_session_attach_with_client(
             &attach_config.behavior.damage,
             attach_config.logs.client.slow_terminal_write_ms,
             &mut display_capture,
+            render_started_at,
+            TerminalGeometry { cols, rows },
             None,
         )?;
         let render_ms = duration_millis_u64(render_started_at.elapsed());
@@ -5690,6 +5696,8 @@ pub fn render_attach_frame(
     damage_config: &bmux_config::DamageBehaviorConfig,
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
+    now: Instant,
+    geometry: TerminalGeometry,
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
     let damage_policy = DamageCoalescingPolicy {
@@ -5718,7 +5726,6 @@ pub fn render_attach_frame(
     let damage_stats = frame_damage.stats();
 
     if view_state.dirty.status_needs_redraw {
-        let now = Instant::now();
         let transient_status = view_state.transient_status_text(now).map(str::to_owned);
         view_state.cached_status_line = Some(build_attach_status_line_for_draw(
             client,
@@ -5743,7 +5750,7 @@ pub fn render_attach_frame(
 
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
-    let terminal_size = terminal::size().unwrap_or((0, 0));
+    let terminal_size = (geometry.cols, geometry.rows);
     let render_scene = frame_damage.scene_damaged();
     let use_synchronized_update =
         frame_uses_synchronized_update(&frame_damage) || damage_config.visualize;
