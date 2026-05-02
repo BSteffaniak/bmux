@@ -1317,6 +1317,28 @@ fn estimate_terminal_grid_delta_bytes(delta: &GridDeltaBatch) -> usize {
         + row_bytes
 }
 
+fn select_terminal_grid_deltas(
+    log: &TerminalGridDeltaLog,
+    start: usize,
+    max_batches: usize,
+    response_budget: usize,
+) -> Vec<GridDeltaBatch> {
+    let mut selected = Vec::new();
+    let mut estimated_bytes = 0_usize;
+    for delta in log.iter().skip(start).take(max_batches.max(1)) {
+        let delta_bytes = estimate_terminal_grid_delta_bytes(delta);
+        if selected.is_empty() && delta_bytes > response_budget {
+            break;
+        }
+        if !selected.is_empty() && estimated_bytes.saturating_add(delta_bytes) > response_budget {
+            break;
+        }
+        estimated_bytes = estimated_bytes.saturating_add(delta_bytes);
+        selected.push(delta.clone());
+    }
+    selected
+}
+
 fn push_terminal_grid_delta(
     deltas: &Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     delta: GridDeltaBatch,
@@ -5080,12 +5102,22 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                         });
                         continue;
                     };
-                    let selected = log
-                        .iter()
-                        .skip(start)
-                        .take(max_batches_per_pane.max(1))
-                        .cloned()
-                        .collect::<Vec<_>>();
+                    let selected = select_terminal_grid_deltas(
+                        &log,
+                        start,
+                        max_batches_per_pane,
+                        RESPONSE_OUTPUT_BUDGET,
+                    );
+                    if selected.is_empty() {
+                        deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
+                            pane_id: *pane_id,
+                            base_revision,
+                            revision: current_revision,
+                            desynced: true,
+                            encoded: Vec::new(),
+                        });
+                        continue;
+                    }
                     let revision = selected
                         .last()
                         .map_or(base_revision, |delta| delta.revision);
@@ -5921,6 +5953,53 @@ mod tests {
             accepts_input: true,
             cursor_owner: false,
         }
+    }
+
+    fn test_delta(base_revision: u64, revision: u64, text_len: usize) -> GridDeltaBatch {
+        GridDeltaBatch {
+            base_revision,
+            revision,
+            width: 10,
+            height: 2,
+            mode: "main".to_string(),
+            scrollback_rows: 0,
+            cursor: bmux_terminal_grid::CursorSnapshot::default(),
+            saved_cursor: bmux_terminal_grid::CursorSnapshot::default(),
+            current_style: bmux_terminal_grid::Style::default(),
+            autowrap: true,
+            pending_wrap: false,
+            scroll_region: None,
+            pending_bytes: Vec::new(),
+            styles: Vec::new(),
+            reset_rows: false,
+            row_updates: vec![bmux_terminal_grid::RowUpdateSnapshot {
+                row_index: 0,
+                row: bmux_terminal_grid::RowSnapshot {
+                    wrapped: false,
+                    runs: vec![bmux_terminal_grid::CellRunSnapshot {
+                        start_col: 0,
+                        text: "x".repeat(text_len),
+                        style: bmux_terminal_grid::StyleId::DEFAULT,
+                    }],
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn terminal_grid_delta_selection_respects_response_budget() {
+        let mut log = TerminalGridDeltaLog::default();
+        log.push(test_delta(0, 1, 8));
+        log.push(test_delta(1, 2, 64));
+        log.push(test_delta(2, 3, 8));
+        let first_delta_size = estimate_terminal_grid_delta_bytes(
+            log.batches.front().expect("log should contain first delta"),
+        );
+
+        let selected = select_terminal_grid_deltas(&log, 0, 3, first_delta_size + 1);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].revision, 1);
     }
 
     #[tokio::test]
