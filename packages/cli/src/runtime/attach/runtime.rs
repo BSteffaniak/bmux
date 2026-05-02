@@ -68,6 +68,7 @@ use super::super::{
     plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
     run_plugin_keybinding_command_with_active_bindings, scan_available_plugins,
 };
+use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
 use super::input::{
@@ -7610,7 +7611,7 @@ pub async fn handle_attach_terminal_event(
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
-    let now = Instant::now();
+    let now = SystemAttachClock.now();
     if matches!(terminal_event, Event::Resize(_, _)) {
         update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     }
@@ -8163,7 +8164,7 @@ async fn handle_attach_action_dispatch(
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
-    let now = Instant::now();
+    let now = SystemAttachClock.now();
     let action_str = &dispatch_request.action;
     let action = match parse_action(action_str) {
         Ok(action) => action,
@@ -8276,7 +8277,7 @@ pub async fn handle_attach_mouse_event(
         mouse_event,
         view_state,
         kernel_client_factory,
-        Instant::now(),
+        SystemAttachClock.now(),
         TerminalGeometry { cols, rows },
     )
     .await

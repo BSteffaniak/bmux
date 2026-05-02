@@ -2,6 +2,15 @@ use anyhow::Result;
 use bmux_client::BmuxClient;
 use tokio::sync::oneshot;
 
+pub use crate::runtime::attach::adapters::{
+    AttachAdapterFuture, AttachClock, AttachEventBus, AttachEventEnvelope, AttachRenderSink,
+    AttachScheduledWake, AttachScheduler, AttachServiceCall, AttachServiceHost, AttachStorage,
+    AttachStorageKey, AttachTerminalInputSource, FixedAttachClock, SystemAttachClock,
+};
+pub use crate::runtime::attach::input::{
+    TerminalGeometry, TerminalInputEvent, TerminalKeyCode, TerminalKeyEvent, TerminalKeyPhase,
+    TerminalModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMousePhase,
+};
 pub use crate::runtime::{
     ActionDispatchError, ActionDispatchRequest, AttachExitReason, AttachRunOutcome, PromptEvent,
     PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,

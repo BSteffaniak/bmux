@@ -107,6 +107,7 @@ pub struct TerminalGeometry {
 }
 
 impl TerminalInputEvent {
+    #[must_use]
     pub fn from_crossterm_event(event: crossterm::event::Event) -> Option<Self> {
         match event {
             crossterm::event::Event::Key(key) => Some(Self::Key(TerminalKeyEvent::from(key))),
