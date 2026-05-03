@@ -1,3 +1,4 @@
+use super::input::TerminalGeometry;
 use super::render::opaque_row_text;
 use super::state::AttachCursorState;
 use crate::runtime::prompt::{
@@ -12,7 +13,6 @@ use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderOp, RenderStyle};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::terminal;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -652,10 +652,15 @@ impl AttachPromptState {
         PromptKeyDisposition::Consumed
     }
 
-    pub fn handle_mouse_event(&mut self, mouse: MouseEvent) -> PromptKeyDisposition {
-        let Some(layout) =
-            prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))
-        else {
+    pub fn handle_mouse_event(
+        &mut self,
+        mouse: MouseEvent,
+        geometry: TerminalGeometry,
+    ) -> PromptKeyDisposition {
+        let Some(layout) = prompt_overlay_layout(
+            self.active.as_ref().map(|active| &active.envelope.request),
+            geometry,
+        ) else {
             return PromptKeyDisposition::NotActive;
         };
         let Some(active) = self.active.as_mut() else {
@@ -723,15 +728,23 @@ impl AttachPromptState {
     }
 
     #[must_use]
-    pub fn overlay_surface(&self) -> Option<AttachSurface> {
-        prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))
-            .map(|layout| layout.surface)
+    pub fn overlay_surface(&self, geometry: TerminalGeometry) -> Option<AttachSurface> {
+        prompt_overlay_layout(
+            self.active.as_ref().map(|active| &active.envelope.request),
+            geometry,
+        )
+        .map(|layout| layout.surface)
     }
 
-    #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are bounded by terminal::size() u16 dimensions.
-    pub fn attach_prompt_overlay_render(&mut self) -> Option<AttachPromptOverlayRender> {
-        let layout =
-            prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))?;
+    #[allow(clippy::cast_possible_truncation)] // Overlay coordinates are bounded by explicit terminal geometry.
+    pub fn attach_prompt_overlay_render(
+        &mut self,
+        geometry: TerminalGeometry,
+    ) -> Option<AttachPromptOverlayRender> {
+        let layout = prompt_overlay_layout(
+            self.active.as_ref().map(|active| &active.envelope.request),
+            geometry,
+        )?;
         let active = self.active.as_mut()?;
 
         let width = usize::from(layout.surface.rect.w);
@@ -1106,10 +1119,12 @@ fn form_value_display(value: &PromptFormValue) -> String {
 }
 
 #[allow(clippy::cast_possible_truncation)] // Overlay geometry is clamped to terminal bounds before u16 conversion.
-fn prompt_overlay_layout(request: Option<&PromptRequest>) -> Option<PromptOverlayLayout> {
+fn prompt_overlay_layout(
+    request: Option<&PromptRequest>,
+    geometry: TerminalGeometry,
+) -> Option<PromptOverlayLayout> {
     let request = request?;
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols < 24 || rows < 8 {
+    if geometry.cols < 24 || geometry.rows < 8 {
         return None;
     }
 
@@ -1118,13 +1133,13 @@ fn prompt_overlay_layout(request: Option<&PromptRequest>) -> Option<PromptOverla
     let width = (content_width + 4)
         .max(usize::from(request.width.min.max(24)))
         .min(usize::from(capped_max.max(24)))
-        .min((cols as usize).saturating_sub(2));
+        .min((geometry.cols as usize).saturating_sub(2));
     let estimated_lines = prompt_estimated_lines(request);
     let height = (estimated_lines + 4)
         .max(7)
-        .min((rows as usize).saturating_sub(2));
-    let x = ((cols as usize).saturating_sub(width)) / 2;
-    let y = ((rows as usize).saturating_sub(height)) / 2;
+        .min((geometry.rows as usize).saturating_sub(2));
+    let x = ((geometry.cols as usize).saturating_sub(width)) / 2;
+    let y = ((geometry.rows as usize).saturating_sub(height)) / 2;
 
     Some(PromptOverlayLayout {
         surface: AttachSurface {

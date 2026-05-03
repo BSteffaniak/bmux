@@ -468,7 +468,12 @@ impl AttachSimHarness {
             }
             if self.view_state.help_overlay_open {
                 let help_lines = build_attach_help_lines(&BmuxConfig::default());
-                if handle_help_overlay_key_event(&key, &help_lines, &mut self.view_state) {
+                if handle_help_overlay_key_event(
+                    &key,
+                    &help_lines,
+                    &mut self.view_state,
+                    self.geometry,
+                ) {
                     emitted.push("help:handled".to_string());
                     continue;
                 }

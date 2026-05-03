@@ -3480,14 +3480,14 @@ pub async fn retarget_attach_to_context(
         "attach.retarget.start"
     );
     let retarget_service_started = Instant::now();
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    let geometry = current_attach_terminal_geometry();
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
     let attach_info = client
         .retarget_attach_context_with_insets(
             context_id,
-            cols,
-            rows,
+            geometry.cols,
+            geometry.rows,
             status_top_inset,
             status_bottom_inset,
         )
@@ -4971,9 +4971,9 @@ pub fn build_attach_status_line_for_draw(
     help_overlay_open: bool,
     transient_status: Option<&str>,
     keymap: &Keymap,
+    geometry: TerminalGeometry,
 ) -> AttachStatusLine {
-    let (cols, _) = terminal::size().unwrap_or((0, 0));
-    if cols == 0 {
+    if geometry.cols == 0 {
         return AttachStatusLine {
             rendered: String::new(),
             spans: Vec::new(),
@@ -5065,7 +5065,7 @@ pub fn build_attach_status_line_for_draw(
     };
 
     let mut status_line = build_attach_status_line(
-        cols,
+        geometry.cols,
         status_config,
         &runtime_appearance,
         &session_label,
@@ -5083,7 +5083,7 @@ pub fn build_attach_status_line_for_draw(
         .tab_drag
         .as_ref()
         .and_then(|drag| drag.drop_target)
-        .and_then(|target| attach_tab_drop_marker_col(&status_line, target, cols));
+        .and_then(|target| attach_tab_drop_marker_col(&status_line, target, geometry.cols));
     status_line
 }
 
@@ -5397,11 +5397,10 @@ fn retained_status_surface(
     )
 }
 
-pub fn help_overlay_visible_rows(lines: &[String]) -> usize {
-    let (_cols, rows) = terminal::size().unwrap_or((0, 0));
-    let max_content_rows = (rows as usize).saturating_sub(6);
+pub fn help_overlay_visible_rows(lines: &[String], geometry: TerminalGeometry) -> usize {
+    let max_content_rows = (geometry.rows as usize).saturating_sub(6);
     let content_rows = lines.len().min(max_content_rows);
-    let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
+    let height = (content_rows + 4).min((geometry.rows as usize).saturating_sub(2));
     height.saturating_sub(4).max(1)
 }
 
@@ -5431,6 +5430,7 @@ pub fn handle_help_overlay_key_event(
     key: &KeyEvent,
     help_lines: &[String],
     view_state: &mut AttachViewState,
+    geometry: TerminalGeometry,
 ) -> bool {
     if !help_overlay_accepts_key_kind(key.kind) {
         return false;
@@ -5453,7 +5453,7 @@ pub fn handle_help_overlay_key_event(
                 view_state.help_overlay_scroll,
                 -1,
                 help_lines.len(),
-                help_overlay_visible_rows(help_lines),
+                help_overlay_visible_rows(help_lines, geometry),
             );
             view_state
                 .dirty
@@ -5465,7 +5465,7 @@ pub fn handle_help_overlay_key_event(
                 view_state.help_overlay_scroll,
                 1,
                 help_lines.len(),
-                help_overlay_visible_rows(help_lines),
+                help_overlay_visible_rows(help_lines, geometry),
             );
             view_state
                 .dirty
@@ -5473,12 +5473,12 @@ pub fn handle_help_overlay_key_event(
             true
         }
         KeyCode::PageUp => {
-            let page = help_overlay_visible_rows(help_lines).cast_signed();
+            let page = help_overlay_visible_rows(help_lines, geometry).cast_signed();
             view_state.help_overlay_scroll = adjust_help_overlay_scroll(
                 view_state.help_overlay_scroll,
                 -page,
                 help_lines.len(),
-                help_overlay_visible_rows(help_lines),
+                help_overlay_visible_rows(help_lines, geometry),
             );
             view_state
                 .dirty
@@ -5486,12 +5486,12 @@ pub fn handle_help_overlay_key_event(
             true
         }
         KeyCode::PageDown => {
-            let page = help_overlay_visible_rows(help_lines).cast_signed();
+            let page = help_overlay_visible_rows(help_lines, geometry).cast_signed();
             view_state.help_overlay_scroll = adjust_help_overlay_scroll(
                 view_state.help_overlay_scroll,
                 page,
                 help_lines.len(),
-                help_overlay_visible_rows(help_lines),
+                help_overlay_visible_rows(help_lines, geometry),
             );
             view_state
                 .dirty
@@ -5506,7 +5506,7 @@ pub fn handle_help_overlay_key_event(
             true
         }
         KeyCode::End => {
-            let visible = help_overlay_visible_rows(help_lines);
+            let visible = help_overlay_visible_rows(help_lines, geometry);
             view_state.help_overlay_scroll = help_lines.len().saturating_sub(visible);
             view_state
                 .dirty
@@ -5518,9 +5518,8 @@ pub fn handle_help_overlay_key_event(
 }
 
 #[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
-pub fn help_overlay_surface(lines: &[String]) -> Option<AttachSurface> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols < 20 || rows < 6 {
+pub fn help_overlay_surface(lines: &[String], geometry: TerminalGeometry) -> Option<AttachSurface> {
+    if geometry.cols < 20 || geometry.rows < 6 {
         return None;
     }
 
@@ -5532,12 +5531,12 @@ pub fn help_overlay_surface(lines: &[String]) -> Option<AttachSurface> {
         .min(80);
     let width = (content_width + 4)
         .max(36)
-        .min((cols as usize).saturating_sub(2));
-    let max_content_rows = (rows as usize).saturating_sub(6);
+        .min((geometry.cols as usize).saturating_sub(2));
+    let max_content_rows = (geometry.rows as usize).saturating_sub(6);
     let content_rows = lines.len().min(max_content_rows);
-    let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
-    let x = ((cols as usize).saturating_sub(width)) / 2;
-    let y = ((rows as usize).saturating_sub(height)) / 2;
+    let height = (content_rows + 4).min((geometry.rows as usize).saturating_sub(2));
+    let x = ((geometry.cols as usize).saturating_sub(width)) / 2;
+    let y = ((geometry.rows as usize).saturating_sub(height)) / 2;
 
     Some(AttachSurface {
         id: HELP_OVERLAY_SURFACE_ID,
@@ -5779,11 +5778,11 @@ pub fn render_attach_frame(
         max_area_percent: damage_config.max_area_percent,
     };
     let current_help_overlay_surface = if view_state.help_overlay_open {
-        help_overlay_surface(help_lines)
+        help_overlay_surface(help_lines, geometry)
     } else {
         None
     };
-    let current_prompt_overlay_surface = view_state.prompt.overlay_surface();
+    let current_prompt_overlay_surface = view_state.prompt.overlay_surface(geometry);
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
 
     if view_state.dirty.status_needs_redraw {
@@ -5805,6 +5804,7 @@ pub fn render_attach_frame(
             view_state.help_overlay_open,
             transient_status.as_deref(),
             keymap,
+            geometry,
         ));
         view_state.dirty.status_needs_redraw = false;
     }
@@ -5823,7 +5823,7 @@ pub fn render_attach_frame(
         .as_ref()
         .map(|surface| retained_help_overlay_surface(surface, help_lines, help_scroll));
     let prompt_overlay_render = if view_state.prompt.is_active() {
-        view_state.prompt.attach_prompt_overlay_render()
+        view_state.prompt.attach_prompt_overlay_render(geometry)
     } else {
         None
     };
@@ -6913,16 +6913,30 @@ pub async fn update_attach_viewport(
     session_id: Uuid,
     status_position: StatusPosition,
 ) -> std::result::Result<(), ClientError> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols == 0 || rows == 0 {
+    update_attach_viewport_with_geometry(
+        client,
+        session_id,
+        status_position,
+        current_attach_terminal_geometry(),
+    )
+    .await
+}
+
+pub async fn update_attach_viewport_with_geometry(
+    client: &mut StreamingBmuxClient,
+    session_id: Uuid,
+    status_position: StatusPosition,
+    geometry: TerminalGeometry,
+) -> std::result::Result<(), ClientError> {
+    if geometry.cols == 0 || geometry.rows == 0 {
         return Ok(());
     }
     let (status_top_inset, status_bottom_inset) = status_insets_for_position(status_position);
     client
         .attach_set_viewport_with_insets(
             session_id,
-            cols,
-            rows,
+            geometry.cols,
+            geometry.rows,
             status_top_inset,
             status_bottom_inset,
         )
@@ -7624,7 +7638,13 @@ pub async fn handle_attach_terminal_event(
     let geometry = terminal_event.geometry;
     let raw_event = terminal_event.raw;
     if matches!(&raw_event, Event::Resize(_, _)) {
-        update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+        update_attach_viewport_with_geometry(
+            client,
+            view_state.attached_id,
+            view_state.status_position,
+            geometry,
+        )
+        .await?;
     }
 
     if view_state.prompt.is_active() {
@@ -7650,7 +7670,7 @@ pub async fn handle_attach_terminal_event(
             }
             Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => {
                 if let Event::Mouse(mouse) = &raw_event {
-                    match view_state.prompt.handle_mouse_event(*mouse) {
+                    match view_state.prompt.handle_mouse_event(*mouse, geometry) {
                         PromptKeyDisposition::Completed(completion) => {
                             if let Some(control) = handle_attach_prompt_completion_at(
                                 client, view_state, completion, now,
@@ -7676,7 +7696,7 @@ pub async fn handle_attach_terminal_event(
 
     if view_state.help_overlay_open
         && let Event::Key(key) = &raw_event
-        && handle_help_overlay_key_event(key, help_lines, view_state)
+        && handle_help_overlay_key_event(key, help_lines, view_state, geometry)
     {
         return Ok(AttachLoopControl::Continue);
     }
@@ -13948,6 +13968,7 @@ mod tests {
             ),
             &lines,
             &mut view_state,
+            TerminalGeometry { cols: 80, rows: 24 },
         );
         assert!(handled);
         assert!(view_state.help_overlay_scroll > 0);
@@ -13976,6 +13997,7 @@ mod tests {
             ),
             &lines,
             &mut view_state,
+            TerminalGeometry { cols: 80, rows: 24 },
         );
         assert!(!handled);
         assert_eq!(view_state.help_overlay_scroll, 5);
@@ -14002,6 +14024,7 @@ mod tests {
             ),
             &[],
             &mut view_state,
+            TerminalGeometry { cols: 80, rows: 24 },
         );
 
         assert!(handled);
