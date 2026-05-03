@@ -37,6 +37,7 @@ const ATTACH_SIM_FIXTURES: &[&str] = &[
     "attach_sim_pane_resize.dsl",
     "attach_sim_floating_pane_drag.dsl",
     "attach_sim_prompt_overlay.dsl",
+    "attach_sim_help_overlay_scroll.dsl",
 ];
 
 struct TempDirGuard {

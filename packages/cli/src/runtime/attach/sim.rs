@@ -588,6 +588,10 @@ impl AttachSimHarness {
         self.view_state.help_overlay_open
     }
 
+    pub const fn help_overlay_scroll(&self) -> usize {
+        self.view_state.help_overlay_scroll
+    }
+
     pub const fn prompt_active(&self) -> bool {
         self.view_state.prompt.is_active()
     }
