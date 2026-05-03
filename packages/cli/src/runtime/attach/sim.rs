@@ -1,3 +1,4 @@
+use super::adapters::{AttachClock, FixedAttachClock};
 use super::input::{TerminalGeometry, TerminalMouseEvent};
 use super::prompt_ui::PromptKeyDisposition;
 use super::runtime::{
@@ -49,7 +50,7 @@ pub struct AttachSimHarness {
     input_processor: InputProcessor,
     effects: Vec<AttachUiEffect>,
     forwarded_bytes: Vec<Vec<u8>>,
-    now: Instant,
+    clock: FixedAttachClock,
 }
 
 impl AttachSimHarness {
@@ -74,7 +75,7 @@ impl AttachSimHarness {
             input_processor: InputProcessor::new(crate::input::Keymap::default_runtime(), false),
             effects: Vec::new(),
             forwarded_bytes: Vec::new(),
-            now: Instant::now(),
+            clock: FixedAttachClock::new(Instant::now()),
         }
     }
 
@@ -163,11 +164,22 @@ impl AttachSimHarness {
             .expect("simulation render should cache status line")
     }
 
+    #[cfg(test)]
+    pub const fn set_clock(&mut self, now: Instant) {
+        self.clock.set_now(now);
+    }
+
+    #[cfg(test)]
+    pub fn advance_clock(&mut self, duration: std::time::Duration) {
+        self.clock.advance(duration);
+    }
+
     pub fn send_mouse(&mut self, event: TerminalMouseEvent) {
         let mut reduction =
             reduce_attach_status_tab_mouse_event(&mut self.view_state, event, self.geometry);
         if !reduction.consumed {
-            reduction = reduce_attach_mouse_resize_event(&mut self.view_state, event, self.now);
+            reduction =
+                reduce_attach_mouse_resize_event(&mut self.view_state, event, self.clock.now());
         }
         if !reduction.consumed {
             reduction = reduce_attach_mouse_floating_drag_event(&mut self.view_state, event);
@@ -535,7 +547,7 @@ impl AttachSimHarness {
                 self.view_state.help_overlay_scroll = 0;
             }
         } else {
-            handle_attach_ui_action_at(ui_action, &mut self.view_state, self.now);
+            handle_attach_ui_action_at(ui_action, &mut self.view_state, self.clock.now());
         }
     }
 
@@ -768,6 +780,7 @@ mod tests {
     };
     use crate::runtime::attach::state::{AttachTabDropPlacement, AttachUiEffect};
     use bmux_config::StatusPosition;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     const fn left_mouse(phase: TerminalMousePhase, col: u16, row: u16) -> TerminalMouseEvent {
@@ -785,6 +798,19 @@ mod tests {
                 meta: false,
             },
         }
+    }
+
+    #[test]
+    fn attach_sim_uses_fixed_clock_adapter() {
+        let start = Instant::now();
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.set_clock(start);
+        sim.advance_clock(Duration::from_millis(10));
+        sim.seed_vertical_split_panes();
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 10, 5));
+
+        assert!(sim.effects().is_empty());
     }
 
     #[test]
