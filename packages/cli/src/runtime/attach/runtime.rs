@@ -72,8 +72,8 @@ use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent, AttachTerminalEvent};
 use super::input::{
-    TerminalGeometry, TerminalInputEvent, TerminalMouseButton, TerminalMouseEvent,
-    TerminalMousePhase,
+    TerminalGeometry, TerminalInputEvent, TerminalKeyEvent, TerminalMouseButton,
+    TerminalMouseEvent, TerminalMousePhase,
 };
 use super::prompt_ui::{
     AttachCloseFallbackTarget, AttachInternalPromptAction, AttachPromptCompletion,
@@ -5426,6 +5426,16 @@ pub const fn help_overlay_accepts_key_kind(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+pub fn handle_help_overlay_terminal_key_event(
+    key: &TerminalKeyEvent,
+    help_lines: &[String],
+    view_state: &mut AttachViewState,
+    geometry: TerminalGeometry,
+) -> bool {
+    key.to_crossterm()
+        .is_some_and(|key| handle_help_overlay_key_event(&key, help_lines, view_state, geometry))
+}
+
 pub fn handle_help_overlay_key_event(
     key: &KeyEvent,
     help_lines: &[String],
@@ -7636,6 +7646,7 @@ pub async fn handle_attach_terminal_event(
 ) -> Result<AttachLoopControl> {
     let now = terminal_event.received_at;
     let geometry = terminal_event.geometry;
+    let normalized_event = terminal_event.normalized;
     let raw_event = terminal_event.raw;
     if matches!(&raw_event, Event::Resize(_, _)) {
         update_attach_viewport_with_geometry(
@@ -7648,57 +7659,63 @@ pub async fn handle_attach_terminal_event(
     }
 
     if view_state.prompt.is_active() {
-        match &raw_event {
-            Event::Key(key) if prompt_accepts_key_kind(key.kind) => {
-                match view_state.prompt.handle_key_event(key) {
-                    PromptKeyDisposition::Completed(completion) => {
-                        if let Some(control) =
-                            handle_attach_prompt_completion_at(client, view_state, completion, now)
-                                .await?
-                        {
-                            return Ok(control);
-                        }
-                    }
-                    PromptKeyDisposition::Consumed => {
-                        view_state
-                            .dirty
-                            .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
-                    }
-                    PromptKeyDisposition::NotActive => {}
-                }
-                return Ok(AttachLoopControl::Continue);
+        let prompt_disposition = match &normalized_event {
+            Some(TerminalInputEvent::Key(key))
+                if prompt_accepts_key_kind(key.kind.to_crossterm()) =>
+            {
+                Some(view_state.prompt.handle_terminal_key_event(key))
             }
-            Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => {
-                if let Event::Mouse(mouse) = &raw_event {
-                    match view_state.prompt.handle_mouse_event(*mouse, geometry) {
-                        PromptKeyDisposition::Completed(completion) => {
-                            if let Some(control) = handle_attach_prompt_completion_at(
-                                client, view_state, completion, now,
-                            )
+            Some(TerminalInputEvent::Key(_) | TerminalInputEvent::Bytes(_)) => {
+                Some(PromptKeyDisposition::NotActive)
+            }
+            Some(TerminalInputEvent::Mouse(mouse)) => Some(
+                view_state
+                    .prompt
+                    .handle_terminal_mouse_event(*mouse, geometry),
+            ),
+            _ => match &raw_event {
+                Event::Key(key) if prompt_accepts_key_kind(key.kind) => {
+                    Some(view_state.prompt.handle_key_event(key))
+                }
+                Event::Key(_) | Event::Paste(_) => Some(PromptKeyDisposition::NotActive),
+                Event::Mouse(mouse) => Some(view_state.prompt.handle_mouse_event(*mouse, geometry)),
+                _ => None,
+            },
+        };
+
+        if let Some(disposition) = prompt_disposition {
+            match disposition {
+                PromptKeyDisposition::Completed(completion) => {
+                    if let Some(control) =
+                        handle_attach_prompt_completion_at(client, view_state, completion, now)
                             .await?
-                            {
-                                return Ok(control);
-                            }
-                        }
-                        PromptKeyDisposition::Consumed => {
-                            view_state
-                                .dirty
-                                .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
-                        }
-                        PromptKeyDisposition::NotActive => {}
+                    {
+                        return Ok(control);
                     }
                 }
-                return Ok(AttachLoopControl::Continue);
+                PromptKeyDisposition::Consumed => {
+                    view_state
+                        .dirty
+                        .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+                }
+                PromptKeyDisposition::NotActive => {}
             }
-            _ => {}
+            return Ok(AttachLoopControl::Continue);
         }
     }
 
-    if view_state.help_overlay_open
-        && let Event::Key(key) = &raw_event
-        && handle_help_overlay_key_event(key, help_lines, view_state, geometry)
-    {
-        return Ok(AttachLoopControl::Continue);
+    if view_state.help_overlay_open {
+        let handled = match &normalized_event {
+            Some(TerminalInputEvent::Key(key)) => {
+                handle_help_overlay_terminal_key_event(key, help_lines, view_state, geometry)
+            }
+            _ => {
+                matches!(&raw_event, Event::Key(key) if handle_help_overlay_key_event(key, help_lines, view_state, geometry))
+            }
+        };
+        if handled {
+            return Ok(AttachLoopControl::Continue);
+        }
     }
 
     if matches!(&raw_event, Event::Key(_)) {
@@ -7709,9 +7726,17 @@ pub async fn handle_attach_terminal_event(
         );
     }
 
-    for attach_action in
+    let attach_actions = if let Some(normalized_event) = &normalized_event {
+        attach_terminal_input_event_actions(
+            normalized_event,
+            attach_input_processor,
+            view_state.ui_mode,
+        )?
+    } else {
         attach_event_actions(&raw_event, attach_input_processor, view_state.ui_mode)?
-    {
+    };
+
+    for attach_action in attach_actions {
         match attach_action {
             AttachEventAction::Detach => {
                 return try_detach_or_continue_at(client, view_state, now).await;
@@ -10185,7 +10210,6 @@ pub fn attach_event_actions(
     attach_input_processor: &mut InputProcessor,
     ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
-    let _normalized_event = TerminalInputEvent::from_crossterm_event(event.clone());
     match event {
         Event::Key(key) => attach_key_event_actions(key, attach_input_processor, ui_mode),
         Event::Mouse(mouse) => Ok(vec![AttachEventAction::Mouse(*mouse)]),
@@ -10194,6 +10218,35 @@ pub fn attach_event_actions(
             Ok(vec![AttachEventAction::Ignore])
         }
     }
+}
+
+fn attach_terminal_input_event_actions(
+    event: &TerminalInputEvent,
+    attach_input_processor: &mut InputProcessor,
+    ui_mode: AttachUiMode,
+) -> Result<Vec<AttachEventAction>> {
+    match event {
+        TerminalInputEvent::Key(key) => {
+            attach_terminal_key_event_actions(key, attach_input_processor, ui_mode)
+        }
+        TerminalInputEvent::Mouse(mouse) => mouse.to_crossterm().map_or_else(
+            || Ok(vec![AttachEventAction::Ignore]),
+            |mouse| Ok(vec![AttachEventAction::Mouse(mouse)]),
+        ),
+        TerminalInputEvent::Resize { .. } => Ok(vec![AttachEventAction::Redraw]),
+        TerminalInputEvent::Bytes(_) => Ok(vec![AttachEventAction::Ignore]),
+    }
+}
+
+fn attach_terminal_key_event_actions(
+    key: &TerminalKeyEvent,
+    attach_input_processor: &mut InputProcessor,
+    ui_mode: AttachUiMode,
+) -> Result<Vec<AttachEventAction>> {
+    let Some(key) = key.to_crossterm() else {
+        return Ok(vec![AttachEventAction::Ignore]);
+    };
+    attach_key_event_actions(&key, attach_input_processor, ui_mode)
 }
 
 #[allow(clippy::unnecessary_wraps)] // Result aligns with the broader action dispatch interface

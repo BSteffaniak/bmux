@@ -1,4 +1,4 @@
-use super::input::TerminalGeometry;
+use super::input::{TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent};
 use super::render::opaque_row_text;
 use super::state::AttachCursorState;
 use crate::runtime::prompt::{
@@ -650,6 +650,25 @@ impl AttachPromptState {
         }
 
         PromptKeyDisposition::Consumed
+    }
+
+    pub fn handle_terminal_key_event(&mut self, key: &TerminalKeyEvent) -> PromptKeyDisposition {
+        key.to_crossterm()
+            .map_or(PromptKeyDisposition::Consumed, |key| {
+                self.handle_key_event(&key)
+            })
+    }
+
+    pub fn handle_terminal_mouse_event(
+        &mut self,
+        mouse: TerminalMouseEvent,
+        geometry: TerminalGeometry,
+    ) -> PromptKeyDisposition {
+        mouse
+            .to_crossterm()
+            .map_or(PromptKeyDisposition::Consumed, |mouse| {
+                self.handle_mouse_event(mouse, geometry)
+            })
     }
 
     pub fn handle_mouse_event(

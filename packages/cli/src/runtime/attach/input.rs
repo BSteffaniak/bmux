@@ -121,6 +121,18 @@ impl TerminalInputEvent {
     }
 }
 
+impl TerminalKeyEvent {
+    #[must_use]
+    pub fn to_crossterm(&self) -> Option<KeyEvent> {
+        let code = self.code.to_crossterm()?;
+        Some(KeyEvent::new_with_kind(
+            code,
+            self.modifiers.to_crossterm(),
+            self.kind.to_crossterm(),
+        ))
+    }
+}
+
 impl From<KeyEvent> for TerminalKeyEvent {
     fn from(event: KeyEvent) -> Self {
         Self {
@@ -128,6 +140,40 @@ impl From<KeyEvent> for TerminalKeyEvent {
             kind: TerminalKeyPhase::from(event.kind),
             modifiers: TerminalModifiers::from(event.modifiers),
         }
+    }
+}
+
+impl TerminalKeyCode {
+    #[must_use]
+    pub const fn to_crossterm(&self) -> Option<KeyCode> {
+        Some(match self {
+            Self::Backspace => KeyCode::Backspace,
+            Self::Enter => KeyCode::Enter,
+            Self::Left => KeyCode::Left,
+            Self::Right => KeyCode::Right,
+            Self::Up => KeyCode::Up,
+            Self::Down => KeyCode::Down,
+            Self::Home => KeyCode::Home,
+            Self::End => KeyCode::End,
+            Self::PageUp => KeyCode::PageUp,
+            Self::PageDown => KeyCode::PageDown,
+            Self::Tab => KeyCode::Tab,
+            Self::BackTab => KeyCode::BackTab,
+            Self::Delete => KeyCode::Delete,
+            Self::Insert => KeyCode::Insert,
+            Self::Function(value) => KeyCode::F(*value),
+            Self::Char(value) => KeyCode::Char(*value),
+            Self::Null => KeyCode::Null,
+            Self::Esc => KeyCode::Esc,
+            Self::CapsLock => KeyCode::CapsLock,
+            Self::ScrollLock => KeyCode::ScrollLock,
+            Self::NumLock => KeyCode::NumLock,
+            Self::PrintScreen => KeyCode::PrintScreen,
+            Self::Pause => KeyCode::Pause,
+            Self::Menu => KeyCode::Menu,
+            Self::KeypadBegin => KeyCode::KeypadBegin,
+            Self::Media(_) | Self::Modifier(_) => return None,
+        })
     }
 }
 
@@ -165,6 +211,17 @@ impl From<KeyCode> for TerminalKeyCode {
     }
 }
 
+impl TerminalKeyPhase {
+    #[must_use]
+    pub const fn to_crossterm(self) -> KeyEventKind {
+        match self {
+            Self::Press => KeyEventKind::Press,
+            Self::Repeat => KeyEventKind::Repeat,
+            Self::Release => KeyEventKind::Release,
+        }
+    }
+}
+
 impl From<KeyEventKind> for TerminalKeyPhase {
     fn from(kind: KeyEventKind) -> Self {
         match kind {
@@ -172,6 +229,28 @@ impl From<KeyEventKind> for TerminalKeyPhase {
             KeyEventKind::Repeat => Self::Repeat,
             KeyEventKind::Release => Self::Release,
         }
+    }
+}
+
+impl TerminalMouseEvent {
+    #[must_use]
+    pub fn to_crossterm(self) -> Option<MouseEvent> {
+        let kind = match self.phase {
+            TerminalMousePhase::Down => MouseEventKind::Down(self.button?.to_crossterm()),
+            TerminalMousePhase::Up => MouseEventKind::Up(self.button?.to_crossterm()),
+            TerminalMousePhase::Drag => MouseEventKind::Drag(self.button?.to_crossterm()),
+            TerminalMousePhase::Move => MouseEventKind::Moved,
+            TerminalMousePhase::ScrollUp => MouseEventKind::ScrollUp,
+            TerminalMousePhase::ScrollDown => MouseEventKind::ScrollDown,
+            TerminalMousePhase::ScrollLeft => MouseEventKind::ScrollLeft,
+            TerminalMousePhase::ScrollRight => MouseEventKind::ScrollRight,
+        };
+        Some(MouseEvent {
+            kind,
+            column: self.col,
+            row: self.row,
+            modifiers: self.modifiers.to_crossterm(),
+        })
     }
 }
 
@@ -197,6 +276,17 @@ impl From<MouseEvent> for TerminalMouseEvent {
     }
 }
 
+impl TerminalMouseButton {
+    #[must_use]
+    pub const fn to_crossterm(self) -> MouseButton {
+        match self {
+            Self::Left => MouseButton::Left,
+            Self::Right => MouseButton::Right,
+            Self::Middle => MouseButton::Middle,
+        }
+    }
+}
+
 impl From<MouseButton> for TerminalMouseButton {
     fn from(button: MouseButton) -> Self {
         match button {
@@ -204,6 +294,32 @@ impl From<MouseButton> for TerminalMouseButton {
             MouseButton::Right => Self::Right,
             MouseButton::Middle => Self::Middle,
         }
+    }
+}
+
+impl TerminalModifiers {
+    #[must_use]
+    pub fn to_crossterm(self) -> KeyModifiers {
+        let mut modifiers = KeyModifiers::empty();
+        if self.shift {
+            modifiers.insert(KeyModifiers::SHIFT);
+        }
+        if self.control {
+            modifiers.insert(KeyModifiers::CONTROL);
+        }
+        if self.alt {
+            modifiers.insert(KeyModifiers::ALT);
+        }
+        if self.super_key {
+            modifiers.insert(KeyModifiers::SUPER);
+        }
+        if self.hyper {
+            modifiers.insert(KeyModifiers::HYPER);
+        }
+        if self.meta {
+            modifiers.insert(KeyModifiers::META);
+        }
+        modifiers
     }
 }
 
