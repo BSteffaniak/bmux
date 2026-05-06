@@ -29,12 +29,34 @@ use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_p
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{trace, warn};
+
+static PANE_BLOCKING_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct PaneBlockingThreadGuard {
+    pane_id: Uuid,
+    role: &'static str,
+}
+
+impl PaneBlockingThreadGuard {
+    fn new(pane_id: Uuid, role: &'static str) -> Self {
+        let active = PANE_BLOCKING_THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        trace!(%pane_id, role, active, "pane blocking thread started");
+        Self { pane_id, role }
+    }
+}
+
+impl Drop for PaneBlockingThreadGuard {
+    fn drop(&mut self) {
+        let active = PANE_BLOCKING_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+        trace!(pane_id = %self.pane_id, role = self.role, active, "pane blocking thread exited");
+    }
+}
 use uuid::Uuid;
 
 type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
@@ -134,7 +156,13 @@ async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
         .await
         .is_err()
     {
-        // The pane runtime task owns OS-thread joins for PTY reader/waiter
+        let active_blocking_threads = PANE_BLOCKING_THREAD_COUNT.load(Ordering::SeqCst);
+        warn!(
+            pane_id = %pane.meta.id,
+            active_blocking_threads,
+            "pane runtime shutdown exceeded 250ms; aborting async task and leaving blocking thread cleanup detached",
+        );
+        // The pane runtime task owns OS-thread handles for PTY reader/waiter
         // teardown. If one of those threads is stuck in a blocking read or
         // wait, awaiting an aborted task here can wedge the server-side
         // service dispatcher. Abort and detach instead; the task/thread
@@ -2725,9 +2753,12 @@ impl SessionRuntimeManager {
             let exit_reason_for_waiter = Arc::clone(&exit_reason_for_task);
             let output_buffer_for_waiter = Arc::clone(&output_buffer_for_reader);
             let resurrection_state_for_waiter = Arc::clone(&resurrection_state_for_waiter_seed);
+            let child_waiter_done = Arc::new(AtomicBool::new(false));
+            let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
             let child_waiter = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
+                    let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
                     let wait_result = child.wait();
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
@@ -2751,14 +2782,22 @@ impl SessionRuntimeManager {
                         pane_id,
                     });
                     let _ = child_exit_tx.send(());
+                    child_waiter_done_for_thread.store(true, Ordering::SeqCst);
                 })
                 .ok();
+            if child_waiter.is_none() {
+                child_waiter_done.store(true, Ordering::SeqCst);
+                warn!(%pane_id, "failed spawning pane process waiter thread");
+            }
 
             let reader_output = Arc::clone(&output_buffer_for_reader);
             let writer_for_reader = Arc::clone(&writer);
+            let reader_thread_done = Arc::new(AtomicBool::new(false));
+            let reader_thread_done_for_thread = Arc::clone(&reader_thread_done);
             let reader_thread = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}"))
                 .spawn(move || {
+                    let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "reader");
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
                     let (initial_rows, initial_cols) = last_requested_size_for_reader
@@ -3003,8 +3042,13 @@ impl SessionRuntimeManager {
                             }
                         }
                     }
+                    reader_thread_done_for_thread.store(true, Ordering::SeqCst);
                 })
                 .ok();
+            if reader_thread.is_none() {
+                reader_thread_done.store(true, Ordering::SeqCst);
+                warn!(%pane_id, "failed spawning pane PTY reader thread");
+            }
 
             loop {
                 tokio::select! {
@@ -3052,6 +3096,22 @@ impl SessionRuntimeManager {
             drop(master);
             drop(child_waiter);
             drop(reader_thread);
+            let waiter_done_for_diagnostic = Arc::clone(&child_waiter_done);
+            let reader_done_for_diagnostic = Arc::clone(&reader_thread_done);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let waiter_done = waiter_done_for_diagnostic.load(Ordering::SeqCst);
+                let reader_done = reader_done_for_diagnostic.load(Ordering::SeqCst);
+                if !waiter_done || !reader_done {
+                    warn!(
+                        %pane_id,
+                        waiter_done,
+                        reader_done,
+                        active_blocking_threads = PANE_BLOCKING_THREAD_COUNT.load(Ordering::SeqCst),
+                        "pane blocking thread cleanup still pending 5s after runtime task shutdown",
+                    );
+                }
+            });
             exited_for_task.store(true, Ordering::SeqCst);
         });
 
