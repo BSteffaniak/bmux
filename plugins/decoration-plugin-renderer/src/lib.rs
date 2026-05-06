@@ -10,13 +10,13 @@
 //! This crate consumes those relayed scenes on the client side:
 //!
 //! 1. [`install`] registers an
-//!    [`bmux_plugin::AttachRenderExtension`] and spawns a subscriber
-//!    that listens on the client-side
-//!    [`bmux_plugin::global_event_bus`] for the
-//!    retained `bmux.scene/scene-protocol` state.
+//!    [`bmux_plugin::AttachRenderExtension`] and subscribes to the
+//!    client-side [`bmux_plugin::global_event_bus`] retained
+//!    `bmux.scene/scene-protocol` state.
 //! 2. The retained scene state seeds the extension's cache immediately, and
-//!    every subsequent scene replacement updates it (revision-guarded so stale
-//!    wire events can't downgrade).
+//!    every subsequent scene replacement is drained by
+//!    [`AttachRenderExtension::refresh_state`] before the next frame renders
+//!    (revision-guarded so stale wire events can't downgrade).
 //! 3. On every attach-render pass, the extension reports generic
 //!    surface damage and `render_surface` hands matching paint
 //!    commands to [`bmux_scene_protocol_render::paint::apply_paint_commands`].
@@ -49,14 +49,14 @@ use bmux_scene_protocol_render::paint::{apply_paint_commands, interpolate_style}
 use uuid::Uuid;
 
 /// Shared cache of the decoration plugin's latest scene. Stored
-/// under `Arc<Mutex<_>>` so both the subscriber thread and the
-/// render extension can read/write without unwrapping poisoned
-/// locks at every call site.
+/// under `Arc<Mutex<_>>` so the render extension can refresh/read/write
+/// without unwrapping poisoned locks at every call site.
 #[derive(Default)]
 struct DecorationRendererCache {
     revision: u64,
     surfaces: BTreeMap<Uuid, SurfaceDecoration>,
     rendered_surfaces: BTreeMap<Uuid, SurfaceDecoration>,
+    scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
 }
 
 impl DecorationRendererCache {
@@ -67,6 +67,20 @@ impl DecorationRendererCache {
         self.revision = scene.revision;
         self.surfaces = scene.surfaces;
         true
+    }
+
+    fn set_scene_receiver(&mut self, rx: tokio::sync::watch::Receiver<Arc<DecorationScene>>) {
+        self.scene_rx = Some(rx);
+    }
+
+    fn refresh_from_state_channel(&mut self) {
+        let Some(rx) = self.scene_rx.as_mut() else {
+            return;
+        };
+        if let Ok(true) = rx.has_changed() {
+            let scene = rx.borrow_and_update().as_ref().clone();
+            self.replace_if_newer(scene);
+        }
     }
 
     fn surface(&self, surface_id: &Uuid) -> Option<&SurfaceDecoration> {
@@ -101,6 +115,12 @@ struct DecorationRenderExtension {
 impl AttachRenderExtension for DecorationRenderExtension {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn refresh_state(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.refresh_from_state_channel();
+        }
     }
 
     fn surface_damage(&self, surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
@@ -597,10 +617,9 @@ static INSTALLED_CACHE: OnceLock<Arc<Mutex<DecorationRendererCache>>> = OnceLock
 /// deployments that don't bundle the decoration plugin can simply
 /// skip this crate.
 pub fn install() {
-    // SAFETY: both `OnceLock`s coordinate single-shot initialisation;
-    // repeat calls are no-ops after the first.
-    static SUBSCRIBER_SPAWNED: OnceLock<()> = OnceLock::new();
-    let cache = INSTALLED_CACHE.get_or_init(|| {
+    // SAFETY: `OnceLock` coordinates single-shot initialisation; repeat
+    // calls are no-ops after the first.
+    let _ = INSTALLED_CACHE.get_or_init(|| {
         let cache: Arc<Mutex<DecorationRendererCache>> =
             Arc::new(Mutex::new(DecorationRendererCache::default()));
         let ext = Arc::new(DecorationRenderExtension {
@@ -610,8 +629,8 @@ pub fn install() {
         bmux_plugin::register_render_extension(ext);
         // Register a local retained state channel for scene updates. The CLI's
         // streaming loop re-publishes IPC-delivered `PluginBusEvent`s onto this
-        // channel so any render extension can hydrate without touching
-        // transport.
+        // channel so the extension can drain the retained state at the frame
+        // boundary without a background subscriber race.
         let _ = bmux_plugin::global_event_bus().register_state_channel::<DecorationScene>(
             SCENE_STATE_KIND,
             DecorationScene {
@@ -620,15 +639,24 @@ pub fn install() {
                 animation: None,
             },
         );
+        match bmux_plugin::global_event_bus().subscribe_state::<DecorationScene>(&SCENE_STATE_KIND)
+        {
+            Ok((initial, rx)) => {
+                if let Ok(mut guard) = cache.lock() {
+                    guard.replace_if_newer(initial.as_ref().clone());
+                    guard.set_scene_receiver(rx);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "decoration render extension: scene-protocol state channel not registered"
+                );
+            }
+        }
         tracing::debug!("decoration render extension installed");
         cache
     });
-    // Spawn the subscriber thread lazily alongside `cache` init so a
-    // second `install()` doesn't double-spawn.
-    if SUBSCRIBER_SPAWNED.get().is_none() {
-        let _ = SUBSCRIBER_SPAWNED.set(());
-        spawn_scene_subscriber(cache.clone());
-    }
 }
 
 /// Manual push path. Callers that receive scene payloads from a
@@ -643,44 +671,6 @@ pub fn push_scene(scene: DecorationScene) -> bool {
         return false;
     };
     guard.replace_if_newer(scene)
-}
-
-fn spawn_scene_subscriber(cache: Arc<Mutex<DecorationRendererCache>>) {
-    let receiver =
-        bmux_plugin::global_event_bus().subscribe_state::<DecorationScene>(&SCENE_STATE_KIND);
-    let Ok((initial, mut rx)) = receiver else {
-        tracing::warn!(
-            "decoration render extension: scene-protocol state channel not registered; \
-             events pushed via push_scene only"
-        );
-        return;
-    };
-    if let Ok(mut guard) = cache.lock() {
-        guard.replace_if_newer((*initial).clone());
-    }
-    std::thread::spawn(move || {
-        // Construct a dedicated current-thread tokio runtime so we can await
-        // the watch receiver without requiring the extension crate to be
-        // tokio-aware at its call sites.
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::error!(
-                "decoration render extension: failed to build tokio runtime for scene subscriber"
-            );
-            return;
-        };
-        runtime.block_on(async move {
-            while rx.changed().await.is_ok() {
-                let scene = rx.borrow().as_ref().clone();
-                if let Ok(mut guard) = cache.lock() {
-                    guard.replace_if_newer(scene);
-                }
-            }
-            tracing::debug!("decoration render extension subscriber loop exited");
-        });
-    });
 }
 
 #[cfg(test)]
@@ -732,12 +722,65 @@ mod tests {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, surface(surface_id, paint_commands))]),
             rendered_surfaces: BTreeMap::new(),
+            scene_rx: None,
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
             cache: cache.clone(),
         };
         (extension, cache)
+    }
+
+    #[test]
+    fn refresh_state_drains_retained_scene_before_render_queries() {
+        let surface_id = Uuid::from_u128(9001);
+        let initial = DecorationScene {
+            revision: 1,
+            surfaces: BTreeMap::new(),
+            animation: None,
+        };
+        let updated = DecorationScene {
+            revision: 2,
+            surfaces: BTreeMap::from([(
+                surface_id,
+                surface(
+                    surface_id,
+                    vec![PaintCommand::Text {
+                        col: 1,
+                        row: 1,
+                        z: 0,
+                        text: "decorated".to_string(),
+                        style: scene_style(),
+                    }],
+                ),
+            )]),
+            animation: None,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(Arc::new(initial));
+        let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
+        {
+            let mut guard = cache.lock().expect("cache lock");
+            guard.set_scene_receiver(rx);
+        }
+        let extension = DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache: cache.clone(),
+        };
+
+        tx.send(Arc::new(updated))
+            .expect("watch receiver remains live");
+        extension.refresh_state();
+
+        {
+            let guard = cache.lock().expect("cache lock");
+            assert_eq!(guard.revision, 2);
+            assert!(guard.surfaces.contains_key(&surface_id));
+        }
+        assert!(
+            !extension
+                .surface_damage(surface_id, &ExtensionRect::new(0, 0, 10, 5))
+                .is_none()
+        );
     }
 
     #[test]

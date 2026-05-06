@@ -640,6 +640,16 @@ pub trait AttachRenderExtension: Send + Sync {
     /// `"bmux.decoration.renderer"`).
     fn name(&self) -> &str;
 
+    /// Refresh any retained state that the extension consumes before a
+    /// frame is rendered.
+    ///
+    /// The attach renderer calls this once per frame, before querying
+    /// damage or render revisions. Implementations should make this a
+    /// cheap non-blocking drain of already-retained state (for example,
+    /// `watch::Receiver::borrow_and_update`), not an IPC call or other
+    /// unbounded operation.
+    fn refresh_state(&self) {}
+
     /// Return the currently-invalid region for a surface. The default
     /// is conservative: if the caller asks an extension to repaint and
     /// the extension cannot provide exact damage, the host treats the

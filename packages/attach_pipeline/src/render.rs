@@ -2021,6 +2021,10 @@ fn render_attach_scene_inner<W: io::Write>(
         stats.viewport_cells = u64::from(cols).saturating_mul(u64::from(rows));
     }
 
+    for ext in render_extensions {
+        ext.refresh_state();
+    }
+
     let mut cursor_state = None;
     if frame_damage.is_full_frame() {
         let clear_start = status_top_inset.min(rows);
@@ -3978,12 +3982,17 @@ mod tests {
 
         struct DeclarativeExtension {
             calls: Arc<AtomicUsize>,
+            refreshes: Arc<AtomicUsize>,
         }
 
         impl AttachRenderExtension for DeclarativeExtension {
             #[allow(clippy::unnecessary_literal_bound)]
             fn name(&self) -> &str {
                 "test.declarative"
+            }
+
+            fn refresh_state(&self) {
+                self.refreshes.fetch_add(1, Ordering::Relaxed);
             }
 
             fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
@@ -4006,6 +4015,10 @@ mod tests {
                 _surface_rect: &ExtensionRect,
                 _damage: &RenderDamage,
             ) -> Option<Vec<RenderOp>> {
+                assert!(
+                    self.refreshes.load(Ordering::Relaxed) > 0,
+                    "refresh_state must run before render_ops"
+                );
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 Some(vec![RenderOp::TextRun {
                     x: 2,
@@ -4052,8 +4065,10 @@ mod tests {
         let mut pane_buffers = BTreeMap::new();
         pane_buffers.insert(pane_id, PaneRenderBuffer::default());
         let calls = Arc::new(AtomicUsize::new(0));
+        let refreshes = Arc::new(AtomicUsize::new(0));
         let extensions: Vec<Arc<dyn AttachRenderExtension>> = vec![Arc::new(DeclarativeExtension {
             calls: Arc::clone(&calls),
+            refreshes: Arc::clone(&refreshes),
         })
             as Arc<dyn AttachRenderExtension>];
 
@@ -4085,6 +4100,7 @@ mod tests {
         assert!(rendered.contains("\x1b[38;2;1;2;3m"));
         assert!(rendered.contains("\x1b[1m"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
         assert_eq!(stats.extension_render_op_calls, 1);
         assert_eq!(stats.extension_cache_hits, 0);
         assert!(trace.ops().contains(&AttachRenderTraceOp::ExtensionOps {
@@ -4121,6 +4137,7 @@ mod tests {
                 .contains("OPS")
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(refreshes.load(Ordering::Relaxed), 2);
         assert_eq!(cached_stats.extension_cache_hits, 1);
         assert!(
             cached_trace
