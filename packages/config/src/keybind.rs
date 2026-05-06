@@ -491,6 +491,12 @@ pub fn key_event_to_string(event: &KeyEvent) -> String {
     if event.modifiers.super_key {
         result.push_str("Super-");
     }
+    if event.modifiers.hyper {
+        result.push_str("Hyper-");
+    }
+    if event.modifiers.meta {
+        result.push_str("Meta-");
+    }
 
     result.push_str(&keycode_to_string(&event.code));
     result

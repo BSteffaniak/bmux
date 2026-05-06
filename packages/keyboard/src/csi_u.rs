@@ -17,8 +17,8 @@ use crate::types::{KeyCode, KeyStroke, Modifiers};
 /// Per the kitty keyboard protocol specification:
 /// `modifier_param = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (super ? 8 : 0)`
 ///
-/// bmux's canonical key model currently stores Super/Hyper/Meta in one
-/// `super_key` bucket, so encoding always emits the Super bit.
+/// bmux's canonical key model preserves Super, Hyper, and Meta as distinct
+/// command-like modifiers and encodes them on their Kitty modifier bits.
 #[must_use]
 pub const fn modifier_param(mods: Modifiers) -> u8 {
     let mut param: u8 = 1;
@@ -33,6 +33,12 @@ pub const fn modifier_param(mods: Modifiers) -> u8 {
     }
     if mods.super_key {
         param += 8;
+    }
+    if mods.hyper {
+        param += 16;
+    }
+    if mods.meta {
+        param += 32;
     }
     param
 }
@@ -50,10 +56,9 @@ pub const fn modifiers_from_param(param: u8) -> Option<Modifiers> {
         shift: val & 1 != 0,
         alt: val & 2 != 0,
         ctrl: val & 4 != 0,
-        // Fold Kitty's Super, Hyper, and Meta modifier bits into bmux's
-        // single platform-command modifier bucket so they never collapse to
-        // a plain key during keymap matching.
-        super_key: val & (8 | 16 | 32) != 0,
+        super_key: val & 8 != 0,
+        hyper: val & 16 != 0,
+        meta: val & 32 != 0,
     })
 }
 
@@ -351,6 +356,31 @@ mod tests {
     }
 
     #[test]
+    fn modifier_param_command_like_modifiers_are_distinct() {
+        assert_eq!(
+            modifier_param(Modifiers {
+                super_key: true,
+                ..Modifiers::NONE
+            }),
+            9
+        );
+        assert_eq!(
+            modifier_param(Modifiers {
+                hyper: true,
+                ..Modifiers::NONE
+            }),
+            17
+        );
+        assert_eq!(
+            modifier_param(Modifiers {
+                meta: true,
+                ..Modifiers::NONE
+            }),
+            33
+        );
+    }
+
+    #[test]
     fn modifier_param_roundtrip() {
         let cases = [
             Modifiers::NONE,
@@ -375,6 +405,8 @@ mod tests {
                 shift: true,
                 alt: true,
                 super_key: true,
+                hyper: true,
+                meta: true,
             },
         ];
         for m in &cases {
@@ -390,17 +422,16 @@ mod tests {
     }
 
     #[test]
-    fn modifiers_from_param_folds_hyper_and_meta_into_super_bucket() {
-        for param in [17, 33] {
-            let modifiers = modifiers_from_param(param).expect("valid modifier param");
-            assert!(
-                modifiers.super_key,
-                "param {param} should preserve command-like modifiers"
-            );
-            assert!(!modifiers.shift);
-            assert!(!modifiers.alt);
-            assert!(!modifiers.ctrl);
-        }
+    fn modifiers_from_param_preserves_hyper_and_meta_distinctly() {
+        let hyper = modifiers_from_param(17).expect("valid hyper modifier param");
+        assert!(hyper.hyper);
+        assert!(!hyper.super_key);
+        assert!(!hyper.meta);
+
+        let meta = modifiers_from_param(33).expect("valid meta modifier param");
+        assert!(meta.meta);
+        assert!(!meta.super_key);
+        assert!(!meta.hyper);
     }
 
     #[test]

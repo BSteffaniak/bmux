@@ -58,23 +58,24 @@ const fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
     if mods.is_empty() {
         return false;
     }
+    let has_command_like_modifier = mods.super_key || mods.hyper || mods.meta;
 
     match stroke.key {
         // Chars: legacy handles Ctrl+alpha, Alt+char, and Shift+alpha (uppercase).
-        // Need CSI u only for Super+char.
-        KeyCode::Char(_) => mods.super_key,
+        // Need CSI u only for command-like modifiers.
+        KeyCode::Char(_) => has_command_like_modifier,
 
         // Enter, Backspace, Escape, Space: legacy only handles Alt prefix.
         // Tab additionally has a widely-supported legacy Shift+Tab sequence
-        // (ESC [ Z), so only Ctrl/Super require CSI u there.
-        KeyCode::Tab => mods.ctrl || mods.super_key,
+        // (ESC [ Z), so only Ctrl or command-like modifiers require CSI u there.
+        KeyCode::Tab => mods.ctrl || has_command_like_modifier,
         KeyCode::Enter | KeyCode::Backspace | KeyCode::Escape | KeyCode::Space => {
-            mods.ctrl || mods.shift || mods.super_key
+            mods.ctrl || mods.shift || has_command_like_modifier
         }
 
         // Arrows: legacy only handles Shift (param 2).
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
-            mods.ctrl || mods.alt || mods.super_key
+            mods.ctrl || mods.alt || has_command_like_modifier
         }
 
         // Navigation + F-keys: legacy has no modifier encoding at all.

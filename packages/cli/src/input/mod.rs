@@ -1074,14 +1074,36 @@ pub fn display_chord(chord: &[KeyStroke]) -> String {
 }
 
 #[must_use]
+const fn super_modifier_display_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Command"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Win"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "Super"
+    }
+}
+
+#[must_use]
 pub fn display_stroke(stroke: &KeyStroke) -> String {
     let uppercase_shift_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
         && stroke.modifiers.shift
         && !stroke.modifiers.ctrl
         && !stroke.modifiers.alt
-        && !stroke.modifiers.super_key;
+        && !stroke.modifiers.super_key
+        && !stroke.modifiers.hyper
+        && !stroke.modifiers.meta;
     let uppercase_modified_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
-        && (stroke.modifiers.ctrl || stroke.modifiers.alt || stroke.modifiers.super_key);
+        && (stroke.modifiers.ctrl
+            || stroke.modifiers.alt
+            || stroke.modifiers.super_key
+            || stroke.modifiers.hyper
+            || stroke.modifiers.meta);
 
     let mut parts = Vec::new();
     if stroke.modifiers.ctrl {
@@ -1091,7 +1113,13 @@ pub fn display_stroke(stroke: &KeyStroke) -> String {
         parts.push("Alt".to_string());
     }
     if stroke.modifiers.super_key {
-        parts.push("Super".to_string());
+        parts.push(super_modifier_display_name().to_string());
+    }
+    if stroke.modifiers.hyper {
+        parts.push("Hyper".to_string());
+    }
+    if stroke.modifiers.meta {
+        parts.push("Meta".to_string());
     }
     if stroke.modifiers.shift && !uppercase_shift_char {
         parts.push("Shift".to_string());
@@ -1139,6 +1167,12 @@ pub fn stroke_to_string(stroke: &KeyStroke) -> String {
     }
     if stroke.modifiers.super_key {
         parts.push("super".to_string());
+    }
+    if stroke.modifiers.hyper {
+        parts.push("hyper".to_string());
+    }
+    if stroke.modifiers.meta {
+        parts.push("meta".to_string());
     }
 
     let key = match stroke.key {
@@ -1883,6 +1917,16 @@ mod tests {
     }
 
     #[test]
+    fn keybinding_parser_preserves_command_like_modifiers() {
+        assert_eq!(super::canonical_chord_key("cmd+c"), "super+c");
+        assert_eq!(super::canonical_chord_key("command+c"), "super+c");
+        assert_eq!(super::canonical_chord_key("win+c"), "super+c");
+        assert_eq!(super::canonical_chord_key("windows+c"), "super+c");
+        assert_eq!(super::canonical_chord_key("meta+c"), "meta+c");
+        assert_eq!(super::canonical_chord_key("hyper+c"), "hyper+c");
+    }
+
+    #[test]
     fn command_like_modified_char_does_not_match_plain_normal_mode_binding() {
         let new_window = RuntimeAction::PluginCommand {
             plugin_id: "bmux.windows".to_string(),
@@ -1918,6 +1962,59 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::HYPER)),
             Vec::<RuntimeAction>::new()
+        );
+    }
+
+    #[test]
+    fn command_like_modifiers_match_only_same_modifier_binding() {
+        let super_action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.test".to_string(),
+            command_name: "super".to_string(),
+            args: vec![],
+        };
+        let meta_action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.test".to_string(),
+            command_name: "meta".to_string(),
+            args: vec![],
+        };
+        let hyper_action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.test".to_string(),
+            command_name: "hyper".to_string(),
+            args: vec![],
+        };
+        let modes = BTreeMap::from([(
+            "normal".to_string(),
+            modal_mode(
+                "NORMAL",
+                false,
+                &[
+                    ("super+c", super_action.clone()),
+                    ("meta+c", meta_action.clone()),
+                    ("hyper+c", hyper_action.clone()),
+                ],
+            ),
+        )]);
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(250),
+            "normal",
+            &modes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("modal keymap should parse");
+        let mut processor = new_processor(keymap);
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            vec![super_action]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::META)),
+            vec![meta_action]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::HYPER)),
+            vec![hyper_action]
         );
     }
 

@@ -34,6 +34,8 @@ pub fn encode_with_modes(
         alt,
         shift,
         super_key: _,
+        hyper: _,
+        meta: _,
     } = stroke.modifiers;
 
     let mut out = Vec::new();

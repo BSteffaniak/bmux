@@ -43,12 +43,15 @@ pub enum KeyCode {
 /// Modifier flags for a key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
     pub super_key: bool,
+    pub hyper: bool,
+    pub meta: bool,
 }
 
 impl Modifiers {
@@ -57,12 +60,14 @@ impl Modifiers {
         alt: false,
         shift: false,
         super_key: false,
+        hyper: false,
+        meta: false,
     };
 
     /// Returns true if no modifiers are set.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        !self.ctrl && !self.alt && !self.shift && !self.super_key
+        !self.ctrl && !self.alt && !self.shift && !self.super_key && !self.hyper && !self.meta
     }
 }
 

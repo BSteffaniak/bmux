@@ -58,12 +58,15 @@ pub enum KeyCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[allow(clippy::struct_excessive_bools)]
 pub struct KeyModifiers {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
     pub super_key: bool, // Windows/Cmd key
+    pub hyper: bool,
+    pub meta: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

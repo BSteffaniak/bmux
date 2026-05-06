@@ -738,6 +738,12 @@ fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
     if stroke.modifiers.super_key {
         modifiers |= KeyModifiers::SUPER;
     }
+    if stroke.modifiers.hyper {
+        modifiers |= KeyModifiers::HYPER;
+    }
+    if stroke.modifiers.meta {
+        modifiers |= KeyModifiers::META;
+    }
 
     CrosstermEvent::Key(KeyEvent {
         code,

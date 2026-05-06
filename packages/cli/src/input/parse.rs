@@ -41,13 +41,17 @@ pub(super) fn parse_stroke(value: &str) -> Result<KeyStroke> {
     let mut alt = false;
     let mut shift = false;
     let mut super_key = false;
+    let mut hyper = false;
+    let mut meta = false;
 
     for modifier in &tokens[..tokens.len() - 1] {
         match *modifier {
             "ctrl" => ctrl = true,
             "alt" => alt = true,
             "shift" => shift = true,
-            "super" => super_key = true,
+            "super" | "cmd" | "command" | "win" | "windows" => super_key = true,
+            "hyper" => hyper = true,
+            "meta" => meta = true,
             unknown => bail!("unknown modifier '{unknown}' in '{value}'"),
         }
     }
@@ -59,6 +63,8 @@ pub(super) fn parse_stroke(value: &str) -> Result<KeyStroke> {
             alt,
             shift,
             super_key,
+            hyper,
+            meta,
         },
     ))
 }
