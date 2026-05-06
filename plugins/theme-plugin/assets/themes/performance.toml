@@ -47,12 +47,7 @@ style         = "double"
 exited  = "x"
 running = ">"
 
-[plugins."bmux.decoration".animation]
-hz   = 8
-kind = "performance_header"
-
 [plugins."bmux.decoration".script_access]
-event_channels = ["bmux.performance/metric-events"]
 state_channels = ["bmux.performance/metrics-state"]
 
 [[plugins."bmux.decoration".script_access.services]]
