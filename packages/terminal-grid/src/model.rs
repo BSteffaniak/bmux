@@ -890,20 +890,40 @@ impl TerminalGrid {
 
     #[must_use]
     pub fn display_rows(&self, scrollback_offset: usize, rows: usize) -> Vec<PhysicalRow> {
-        let all_rows = match self.mode {
-            GridMode::Main => self.all_main_rows(),
-            GridMode::Alternate => self.viewport_rows(),
-        };
-        let end = all_rows
-            .len()
-            .saturating_sub(scrollback_offset.min(all_rows.len()));
         let requested_rows = rows.max(self.height);
+        let total_rows = match self.mode {
+            GridMode::Main => self.main_rows.len(),
+            GridMode::Alternate => self.alt_rows.len(),
+        };
+        let end = total_rows.saturating_sub(scrollback_offset.min(total_rows));
         let start = end.saturating_sub(requested_rows);
-        let mut display_rows = all_rows[start..end].to_vec();
-        while display_rows.len() < requested_rows {
-            display_rows.insert(0, PhysicalRow::new());
+        let mut display_rows = match self.mode {
+            GridMode::Main => self
+                .main_rows
+                .iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .cloned()
+                .collect(),
+            GridMode::Alternate => self.alt_rows[start..end].to_vec(),
+        };
+        if display_rows.len() < requested_rows {
+            let missing = requested_rows.saturating_sub(display_rows.len());
+            let mut padded = Vec::with_capacity(requested_rows);
+            padded.resize_with(missing, PhysicalRow::new);
+            padded.extend(display_rows);
+            display_rows = padded;
         }
         display_rows
+    }
+
+    #[must_use]
+    pub fn main_row_count(&self) -> usize {
+        self.main_rows.len()
+    }
+
+    pub(crate) fn main_rows(&self) -> impl Iterator<Item = &PhysicalRow> {
+        self.main_rows.iter()
     }
 
     #[must_use]

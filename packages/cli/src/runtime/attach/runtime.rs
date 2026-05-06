@@ -478,7 +478,6 @@ impl DisplayCaptureFanout {
     }
 }
 
-#[cfg(test)]
 fn apply_attach_output_chunk(
     view_state: &mut AttachViewState,
     pane_id: Uuid,
@@ -2606,7 +2605,7 @@ pub async fn run_session_attach_with_client(
                 for chunk in result.chunks {
                     let pane_id = chunk.pane_id;
                     let sync_update_active = chunk.sync_update_active;
-                    match apply_attach_output_chunk_protocol_only(
+                    match apply_attach_output_chunk(
                         &mut view_state,
                         pane_id,
                         &chunk.data,
@@ -2616,6 +2615,7 @@ pub async fn run_session_attach_with_client(
                             stream_gap: chunk.stream_gap,
                             sync_update_active,
                         },
+                        &mut frame_needs_render,
                     ) {
                         AttachChunkApplyOutcome::Applied {
                             had_data: chunk_had_data,
@@ -2663,26 +2663,14 @@ pub async fn run_session_attach_with_client(
                     }
                 }
             }
-            if !recovered_output_desync {
+            if !recovered_output_desync && !drained_any_data {
                 let structured_delta_applied = apply_attach_structured_grid_deltas(
                     &mut client,
                     &mut view_state,
                     pane_ids.clone(),
                 )
                 .await?;
-                let structured_snapshot_hydrated = if structured_delta_applied || !drained_any_data
-                {
-                    false
-                } else {
-                    !hydrate_attach_structured_grid_snapshots(
-                        &mut client,
-                        &mut view_state,
-                        pane_ids,
-                    )
-                    .await?
-                    .is_empty()
-                };
-                frame_needs_render |= structured_delta_applied || structured_snapshot_hydrated;
+                frame_needs_render |= structured_delta_applied;
             }
 
             // Keep output pending if the last round still produced bytes OR
@@ -4806,13 +4794,16 @@ pub fn extract_attach_text(
         return Some(String::new());
     }
     let selected_rows = end.row.saturating_sub(start.row).saturating_add(1);
-    let all_rows = grid.all_main_rows();
-    if all_rows.is_empty() {
+    let main_row_count = grid.main_row_count();
+    if main_row_count == 0 {
         return Some(String::new());
     }
-    let display_end = all_rows.len().saturating_sub(start.row.min(all_rows.len()));
+    let display_end = main_row_count.saturating_sub(start.row.min(main_row_count));
     let display_start = display_end.saturating_sub(grid.height());
-    let rows = &all_rows[display_start..display_end];
+    let rows = grid.display_rows(start.row, grid.height());
+    let rows = &rows[rows
+        .len()
+        .saturating_sub(display_end.saturating_sub(display_start))..];
     if rows.is_empty() {
         return Some(String::new());
     }
@@ -4868,8 +4859,7 @@ pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     buffer
         .terminal_grid
         .grid()
-        .all_main_rows()
-        .len()
+        .main_row_count()
         .saturating_sub(buffer.terminal_grid.grid().height())
 }
 

@@ -895,7 +895,7 @@ fn push_cut_full_repaint_baseline_if_needed(
     {
         match &frame.event {
             DisplayTrackEvent::Resize { cols, rows } if *cols > 0 && *rows > 0 => {
-                let _ = terminal_grid.resize_delta(*cols, *rows);
+                let _ = terminal_grid.resize(*cols, *rows);
             }
             DisplayTrackEvent::FrameBytes { data } => {
                 terminal_grid.process(data);

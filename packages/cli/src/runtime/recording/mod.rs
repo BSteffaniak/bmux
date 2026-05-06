@@ -3468,7 +3468,7 @@ fn export_recording_gif(
                 DisplayTrackEvent::Resize { cols, rows } => {
                     current_cols = (*cols).max(1);
                     current_rows = (*rows).max(1);
-                    let _ = terminal_grid.resize_delta(current_cols, current_rows);
+                    let _ = terminal_grid.resize(current_cols, current_rows);
                     frame_had_display_change = true;
                 }
                 DisplayTrackEvent::FrameBytes { data } => {
@@ -6286,7 +6286,7 @@ impl DisplayCaptureFileWriter {
             && *rows > 0
         {
             self.latest_resize = Some((*cols, *rows));
-            let _ = self.replay_grid.resize_delta(*cols, *rows);
+            let _ = self.replay_grid.resize(*cols, *rows);
         }
         if let DisplayTrackEvent::FrameBytes { data } = &event {
             update_cursor_replay_state(&mut self.cursor_replay_state, data);

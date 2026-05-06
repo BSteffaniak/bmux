@@ -40,7 +40,9 @@ use uuid::Uuid;
 type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
 
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
+#[cfg(test)]
 const MAX_TERMINAL_GRID_DELTA_BATCHES: usize = 1_024;
+#[cfg(test)]
 const MAX_TERMINAL_GRID_DELTA_BYTES: usize = 16 * 1024 * 1024;
 const RESPONSE_METADATA_HEADROOM: usize = 65_536;
 const RESPONSE_OUTPUT_BUDGET: usize =
@@ -478,7 +480,7 @@ impl PaneCursorTracker {
         if self.rows == rows && self.cols == cols {
             return;
         }
-        let _ = self.terminal_grid.resize_delta(cols, rows);
+        let _ = self.terminal_grid.resize(cols, rows);
         self.rows = rows;
         self.cols = cols;
     }
@@ -1267,10 +1269,12 @@ $env.config = (
 #[derive(Default)]
 struct TerminalGridDeltaLog {
     batches: VecDeque<GridDeltaBatch>,
+    #[cfg(test)]
     estimated_bytes: usize,
 }
 
 impl TerminalGridDeltaLog {
+    #[cfg(test)]
     fn push(&mut self, delta: GridDeltaBatch) {
         let estimated = estimate_terminal_grid_delta_bytes(&delta);
         if estimated > MAX_TERMINAL_GRID_DELTA_BYTES {
@@ -1341,6 +1345,7 @@ fn select_terminal_grid_deltas(
     selected
 }
 
+#[cfg(test)]
 fn push_terminal_grid_delta(
     deltas: &Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     delta: GridDeltaBatch,
@@ -1361,10 +1366,8 @@ impl PaneRuntimeHandle {
         if let Ok(mut last) = self.last_requested_size.lock() {
             *last = (rows, cols);
         }
-        if let Ok(mut grid) = self.terminal_grid.lock()
-            && let Ok(Some(delta)) = grid.resize_delta(cols, rows)
-        {
-            push_terminal_grid_delta(&self.terminal_grid_deltas, delta);
+        if let Ok(mut grid) = self.terminal_grid.lock() {
+            let _ = grid.resize(cols, rows);
         }
         let _ = self
             .input_tx
@@ -2532,7 +2535,6 @@ impl SessionRuntimeManager {
         ));
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
         let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default()));
-        let terminal_grid_deltas_for_reader = Arc::clone(&terminal_grid_deltas);
         let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
@@ -2905,12 +2907,7 @@ impl SessionRuntimeManager {
                                     .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
 
                                 if let Ok(mut grid) = terminal_grid_for_reader.lock() {
-                                    if let Some(delta) = grid.process_delta(chunk) {
-                                        push_terminal_grid_delta(
-                                            &terminal_grid_deltas_for_reader,
-                                            delta,
-                                        );
-                                    }
+                                    grid.process(chunk);
                                 } else {
                                     break;
                                 }
@@ -6096,7 +6093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resize_pty_records_reflow_delta() {
+    async fn resize_pty_reports_delta_desync_without_reflow_payload() {
         let session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
@@ -6124,22 +6121,10 @@ mod tests {
             &[base_revision],
             16,
         )
-        .expect("resize delta should be available");
-        let batches = serde_json::from_slice::<Vec<GridDeltaBatch>>(&state.deltas[0].encoded)
-            .expect("delta payload should decode");
+        .expect("delta state should be available");
 
-        assert_eq!(batches.len(), 1);
-        assert!(batches[0].reset_rows);
-        assert_eq!(batches[0].width, 5);
-        let mut consumer = TerminalGridStream::new(10, 2, GridLimits::default())
-            .expect("consumer grid dimensions are valid");
-        consumer.process(b"abcdefghij");
-        consumer
-            .apply_delta(&batches[0], GridLimits::default())
-            .expect("resize delta should apply");
-        let rows = consumer.grid().viewport_rows();
-        assert_eq!(row_text(&rows[0]), "abcde");
-        assert_eq!(row_text(&rows[1]), "fghij");
+        assert!(state.deltas[0].desynced);
+        assert!(state.deltas[0].encoded.is_empty());
     }
 
     #[tokio::test]

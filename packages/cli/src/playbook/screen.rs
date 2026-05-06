@@ -273,7 +273,7 @@ impl ScreenInspector {
             if state.rows != rows || state.cols != cols {
                 state.rows = rows;
                 state.cols = cols;
-                let _ = state.terminal_grid.resize_delta(cols.max(1), rows.max(1));
+                let _ = state.terminal_grid.resize(cols.max(1), rows.max(1));
             }
         }
 
@@ -530,7 +530,7 @@ impl ScreenInspector {
                 &snapshot,
                 bmux_terminal_grid::GridLimits::default(),
             ) {
-                let _ = stream.resize_delta(cols.max(1), rows.max(1));
+                let _ = stream.resize(cols.max(1), rows.max(1));
                 buffer.terminal_grid = stream;
             }
             buffer.sync_update_in_progress = state.sync_update_active;

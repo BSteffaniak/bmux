@@ -124,6 +124,15 @@ impl TerminalGridStream {
         GridDeltaBatch::between(&before, &after)
     }
 
+    /// Resize the grid without computing a structured delta.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if width or height is zero.
+    pub fn resize(&mut self, width: u16, height: u16) -> Result<(), TerminalGridError> {
+        self.grid.resize(width, height)
+    }
+
     /// Resize the grid and return a structured row delta when state changed.
     ///
     /// # Errors
@@ -134,6 +143,9 @@ impl TerminalGridStream {
         width: u16,
         height: u16,
     ) -> Result<Option<GridDeltaBatch>, TerminalGridError> {
+        if self.grid.width() == usize::from(width) && self.grid.height() == usize::from(height) {
+            return Ok(None);
+        }
         let before = self.snapshot(0, usize::MAX);
         self.grid.resize(width, height)?;
         let after = self.snapshot(0, usize::MAX);

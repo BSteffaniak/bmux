@@ -113,7 +113,7 @@ impl PlaybookDisplayTrackWriter {
     ///
     /// Returns an error if writing to the display track file fails.
     pub fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        let _ = self.terminal_grid.resize_delta(cols.max(1), rows.max(1));
+        let _ = self.terminal_grid.resize(cols.max(1), rows.max(1));
         self.record(DisplayTrackEvent::Resize { cols, rows })
     }
 

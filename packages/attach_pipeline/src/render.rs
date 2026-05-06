@@ -2278,7 +2278,7 @@ fn render_attach_scene_inner<W: io::Write>(
             );
             let _ = entry
                 .terminal_grid
-                .resize_delta(inner_width.max(1), inner_height.max(1));
+                .resize(inner_width.max(1), inner_height.max(1));
             // Invalidate the row cache when the pane dimensions change, since
             // the row strings are no longer comparable at a different size.
             let next_grid_size = (
@@ -2569,7 +2569,7 @@ mod tests {
     fn feed_pane_buffer(buffer: &mut PaneRenderBuffer, rows: u16, cols: u16, bytes: &[u8]) {
         buffer
             .terminal_grid
-            .resize_delta(cols.max(1), rows.max(1))
+            .resize(cols.max(1), rows.max(1))
             .expect("test terminal grid dimensions should be valid");
         append_pane_output(buffer, bytes);
     }

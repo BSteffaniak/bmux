@@ -253,7 +253,7 @@ pub fn resize_attach_grids_for_scene_with_size(
             buffer.terminal_grid.grid().width(),
             buffer.terminal_grid.grid().height(),
         );
-        let _ = buffer.terminal_grid.resize_delta(inner_w, inner_h);
+        let _ = buffer.terminal_grid.resize(inner_w, inner_h);
         let next_grid_size = (
             buffer.terminal_grid.grid().width(),
             buffer.terminal_grid.grid().height(),
