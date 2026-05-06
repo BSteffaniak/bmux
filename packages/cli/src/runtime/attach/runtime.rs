@@ -1867,10 +1867,22 @@ pub async fn run_session_attach_with_client(
         .await
         .map_err(map_attach_client_error)?;
 
-    if let Ok(appearance) = typed_active_runtime_appearance_attach(&mut client).await {
-        runtime_appearance = appearance.clone();
-        let _ = bmux_plugin::global_event_bus()
-            .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+    match typed_active_runtime_appearance_attach(&mut client).await {
+        Ok(appearance) => {
+            tracing::info!(
+                background = %appearance.background,
+                foreground = %appearance.foreground,
+                border_active = %appearance.border.active,
+                status_background = %appearance.status.background,
+                "attach seeded runtime appearance from theme plugin",
+            );
+            runtime_appearance = appearance.clone();
+            let _ = bmux_plugin::global_event_bus()
+                .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "attach failed to seed runtime appearance from theme plugin");
+        }
     }
 
     let mut display_capture = DisplayCaptureFanout::default();
@@ -3206,6 +3218,13 @@ async fn handle_attach_stream_server_event(
         } else if kind.as_str() == RUNTIME_APPEARANCE_STATE_KIND.as_str() {
             match serde_json::from_slice::<RuntimeAppearance>(payload) {
                 Ok(appearance) => {
+                    tracing::info!(
+                        background = %appearance.background,
+                        foreground = %appearance.foreground,
+                        border_active = %appearance.border.active,
+                        status_background = %appearance.status.background,
+                        "attach received forwarded runtime appearance update",
+                    );
                     let _ = bmux_plugin::global_event_bus()
                         .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
                     view_state

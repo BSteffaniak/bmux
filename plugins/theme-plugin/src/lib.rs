@@ -20,7 +20,7 @@ use bmux_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 const STORAGE_PERFORMANCE_THEME_SETTINGS: &str = "theme_settings.performance";
@@ -34,6 +34,12 @@ impl RustPlugin for ThemePlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        info!(
+            data_dir = %context.connection.data_dir,
+            config_dirs = ?context.connection.config_dir_candidate_paths(),
+            settings_present = context.settings.is_some(),
+            "theme plugin activating",
+        );
         self.lifecycle_context = Some(context.clone());
         apply_configured_appearance(&context);
         apply_configured_theme_extensions(&context);
@@ -44,6 +50,11 @@ impl RustPlugin for ThemePlugin {
         if event.kind.as_str() == "bmux.core/server_started"
             && let Some(context) = self.lifecycle_context.as_ref()
         {
+            info!(
+                data_dir = %context.connection.data_dir,
+                event_kind = %event.kind.as_str(),
+                "theme plugin handling lifecycle event; reapplying theme state",
+            );
             apply_configured_appearance(context);
             apply_configured_theme_extensions(context);
         }
@@ -59,9 +70,11 @@ impl RustPlugin for ThemePlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "theme-state", "active-appearance" => |_req: (), ctx| {
-                active_runtime_appearance(ctx).ok_or_else(|| {
+                let appearance = active_runtime_appearance(ctx).ok_or_else(|| {
                     ServiceResponse::error("theme_not_found", "active theme was not found")
-                })
+                })?;
+                info!("active runtime appearance service returned resolved theme appearance");
+                Ok(appearance)
             },
         })
     }
@@ -295,6 +308,14 @@ fn apply_configured_appearance(context: &NativeLifecycleContext) {
     if let Some(active) = configured_theme(context) {
         log_active_theme(context, &active);
         publish_runtime_appearance(&active.theme);
+        info!(
+            source = ?active.source,
+            requested_name = active.requested_name.as_deref().unwrap_or(""),
+            stack = ?active.stack,
+            "runtime appearance published for active theme",
+        );
+    } else {
+        warn!("no active theme resolved for runtime appearance apply");
     }
 }
 
@@ -305,6 +326,13 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
     };
     let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
+    info!(
+        source = ?active.source,
+        requested_name = active.requested_name.as_deref().unwrap_or(""),
+        stack = ?active.stack,
+        extension_plugin_count = all_plugin_ids.len(),
+        "applying theme extension settings",
+    );
     apply_theme_extensions(
         context,
         &active.theme,
@@ -325,6 +353,14 @@ fn active_runtime_appearance(
 fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<ActiveThemeResolution> {
     let settings = parse_settings(context.settings_value());
     let catalog = load_theme_catalog(&context.connection_info().config_dir_candidate_paths());
+    info!(
+        data_dir = %context.connection_info().data_dir,
+        catalog_count = catalog.len(),
+        configured_theme = settings.theme.as_deref().unwrap_or(""),
+        configured_stack = ?settings.themes,
+        persistence = ?settings.persistence,
+        "theme settings parsed",
+    );
     let active = active_theme_stack(context, &settings, &catalog);
     let theme = resolve_theme_stack(&catalog, &active.stack)?;
     Some(ActiveThemeResolution {
@@ -336,8 +372,9 @@ fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<Active
 }
 
 fn log_active_theme(context: &impl ThemeHostContext, active: &ActiveThemeResolution) {
-    debug!(
+    info!(
         data_dir = %context.connection_info().data_dir,
+        config_dirs = ?context.connection_info().config_dir_candidate_paths(),
         source = ?active.source,
         requested_name = active.requested_name.as_deref().unwrap_or(""),
         stack = ?active.stack,
@@ -455,11 +492,17 @@ async fn run_theme_picker(context: NativeCommandContext) {
             ThemePersistence::PersistBetweenConnects
         ) {
             persist_theme_name(&context, &name);
+        } else {
+            info!(
+                theme = %name,
+                persistence = ?settings.persistence,
+                "theme selection not persisted because persistence is disabled",
+            );
         }
         if name == "performance" {
             configure_performance_theme_header(&context, settings.persistence).await;
         }
-        debug!(theme = %name, "theme selected");
+        info!(theme = %name, persistence = ?settings.persistence, "theme selected");
         return;
     }
 
@@ -530,6 +573,11 @@ async fn configure_performance_theme_header(
     };
     if matches!(persistence, ThemePersistence::PersistBetweenConnects) {
         persist_performance_theme_settings(context, &settings);
+    } else {
+        info!(
+            persistence = ?persistence,
+            "performance theme settings not persisted because persistence is disabled",
+        );
     }
 }
 
@@ -545,7 +593,12 @@ fn persist_performance_theme_settings(
         value,
     );
     if let Err(error) = context.storage_set(&request) {
-        warn!(%error, "failed persisting performance theme settings");
+        warn!(%error, key = STORAGE_PERFORMANCE_THEME_SETTINGS, "failed persisting performance theme settings");
+    } else {
+        info!(
+            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
+            "persisted performance theme settings"
+        );
     }
 }
 
@@ -560,6 +613,10 @@ fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
         return;
     };
     let Some(value) = response.value else {
+        info!(
+            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
+            "no persisted performance theme settings found"
+        );
         return;
     };
     let Ok(settings) =
@@ -571,6 +628,10 @@ fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
         );
         return;
     };
+    info!(
+        key = STORAGE_PERFORMANCE_THEME_SETTINGS,
+        "applying persisted performance theme settings"
+    );
     let request = performance_commands::client::SetThemeHeaderSettingsRequest { settings };
     if let Err(error) = context
         .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
@@ -582,6 +643,11 @@ fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
         )
     {
         warn!(%error, "failed applying persisted performance theme settings");
+    } else {
+        info!(
+            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
+            "applied persisted performance theme settings"
+        );
     }
 }
 
@@ -620,7 +686,7 @@ fn base_theme_stack(name: &str) -> Vec<String> {
 }
 
 fn active_theme_stack(
-    context: &(impl HostRuntimeApi + ?Sized),
+    context: &(impl ThemeHostContext + ?Sized),
     settings: &ThemePluginSettings,
     catalog: &[ThemeCatalogEntry],
 ) -> ActiveThemeStack {
@@ -639,6 +705,7 @@ fn active_theme_stack(
     ) && let Some(name) = read_persisted_theme_name(context)
     {
         if theme_by_name(catalog, &name).is_some() {
+            info!(theme = %name, "using persisted theme selection");
             let stack = filter_existing_theme_names(catalog, base_theme_stack(&name));
             return ActiveThemeStack {
                 stack,
@@ -745,35 +812,72 @@ fn merge_toml_value(base: &mut toml::Value, overlay: &toml::Value) {
     }
 }
 
-fn read_persisted_theme_name(context: &(impl HostRuntimeApi + ?Sized)) -> Option<String> {
+fn read_persisted_theme_name(context: &(impl ThemeHostContext + ?Sized)) -> Option<String> {
     let response = match context.storage_get(&StorageGetRequest::new(
         bmux_plugin_sdk::storage_key!("selected_theme"),
     )) {
         Ok(response) => response,
         Err(error) => {
-            debug!(%error, key = STORAGE_SELECTED_APPEARANCE, "failed reading persisted theme selection");
+            warn!(
+                %error,
+                data_dir = %context.connection_info().data_dir,
+                key = STORAGE_SELECTED_APPEARANCE,
+                "failed reading persisted theme selection",
+            );
             return None;
         }
     };
     let Some(value) = response.value else {
-        debug!(
+        info!(
+            data_dir = %context.connection_info().data_dir,
             key = STORAGE_SELECTED_APPEARANCE,
-            "no persisted theme selection found"
+            "no persisted theme selection found",
         );
         return None;
     };
-    String::from_utf8(value)
-        .ok()
-        .map(|name| normalized_theme_name(&name))
+    match String::from_utf8(value) {
+        Ok(name) => {
+            let normalized = normalized_theme_name(&name);
+            info!(
+                data_dir = %context.connection_info().data_dir,
+                key = STORAGE_SELECTED_APPEARANCE,
+                theme = %normalized,
+                "persisted theme selection read",
+            );
+            Some(normalized)
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                data_dir = %context.connection_info().data_dir,
+                key = STORAGE_SELECTED_APPEARANCE,
+                "persisted theme selection was not valid UTF-8",
+            );
+            None
+        }
+    }
 }
 
-fn persist_theme_name(context: &impl HostRuntimeApi, name: &str) {
+fn persist_theme_name(context: &impl ThemeHostContext, name: &str) {
     let result = context.storage_set(&StorageSetRequest::new(
         bmux_plugin_sdk::storage_key!("selected_theme"),
         name.as_bytes().to_vec(),
     ));
     if let Err(error) = result {
-        warn!(%error, "failed persisting selected theme");
+        warn!(
+            %error,
+            data_dir = %context.connection_info().data_dir,
+            key = STORAGE_SELECTED_APPEARANCE,
+            theme = %name,
+            "failed persisting selected theme",
+        );
+    } else {
+        info!(
+            data_dir = %context.connection_info().data_dir,
+            key = STORAGE_SELECTED_APPEARANCE,
+            theme = %name,
+            "persisted selected theme",
+        );
     }
 }
 
@@ -913,10 +1017,18 @@ fn apply_theme_extensions(
             toml,
             config_dir_candidates: config_dir_candidates.to_vec(),
         };
+        let has_extension = !request.toml.trim().is_empty();
         let Ok(payload) = bmux_plugin_sdk::encode_service_message(&request) else {
+            warn!(plugin_id = %plugin_id, "failed encoding theme extension apply request");
             continue;
         };
         let capability = format!("{plugin_id}.write");
+        info!(
+            plugin_id = %plugin_id,
+            capability = %capability,
+            has_extension,
+            "applying theme extension",
+        );
         if let Err(error) = execute_theme_extension_apply(context, &capability, payload) {
             warn!(
                 %error,
@@ -925,6 +1037,13 @@ fn apply_theme_extensions(
                 interface = "theme-extension",
                 operation = "apply",
                 "theme extension apply failed",
+            );
+        } else {
+            info!(
+                plugin_id = %plugin_id,
+                capability = %capability,
+                has_extension,
+                "theme extension apply completed",
             );
         }
     }
