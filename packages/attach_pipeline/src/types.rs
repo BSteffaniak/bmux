@@ -53,6 +53,7 @@ pub struct PaneRenderBuffer {
 pub struct PaneScrollbackWindow {
     pub scrollback_offset: usize,
     pub max_scrollback_offset: usize,
+    pub total_scrolled_rows: u64,
     pub rows: Vec<PhysicalRow>,
 }
 

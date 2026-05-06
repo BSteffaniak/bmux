@@ -461,12 +461,16 @@ interface attach-runtime-state {
         pane_id: uuid,
         scrollback_offset: u32,
         rows: u32,
+        anchor_total_scrolled_rows: u64?,
     }
 
     record pane-grid-window {
         pane_id: uuid,
         scrollback_offset: u32,
         max_scrollback_offset: u32,
+        total_scrolled_rows: u64,
+        anchor_delta_rows: u32,
+        anchor_clamped: bool,
         stream_end: u64,
         encoded: list<u8>,
     }

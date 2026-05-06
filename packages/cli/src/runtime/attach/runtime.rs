@@ -2712,6 +2712,20 @@ pub async fn run_session_attach_with_client(
                 .values()
                 .any(|b| b.sync_update_in_progress);
             pane_output_pending = last_round_had_data || any_sync_still_active;
+            if drained_any_data
+                && view_state.scrollback_active
+                && let Err(error) =
+                    ensure_focused_scrollback_window(&mut client, &mut view_state, true).await
+            {
+                view_state.set_transient_status(
+                    format!(
+                        "scrollback window fetch failed: {}",
+                        map_attach_client_error(error)
+                    ),
+                    SystemAttachClock.now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
         }
 
         // Fetch image deltas only when the server notified us that image
@@ -7165,6 +7179,7 @@ async fn hydrate_attach_structured_grid_snapshots(
 async fn ensure_focused_scrollback_window(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
+    force_refresh: bool,
 ) -> std::result::Result<(), ClientError> {
     if !view_state.scrollback_active {
         return Ok(());
@@ -7176,14 +7191,16 @@ async fn ensure_focused_scrollback_window(
         return Ok(());
     };
     let scrollback_offset = view_state.scrollback_offset;
-    if view_state
+    let cached_window = view_state
         .pane_buffers
         .get(&pane_id)
-        .and_then(|buffer| buffer.scrollback_window.as_ref())
-        .is_some_and(|window| window.scrollback_offset == scrollback_offset)
+        .and_then(|buffer| buffer.scrollback_window.as_ref());
+    if !force_refresh
+        && cached_window.is_some_and(|window| window.scrollback_offset == scrollback_offset)
     {
         return Ok(());
     }
+    let anchor_total_scrolled_rows = cached_window.map(|window| window.total_scrolled_rows);
 
     let windows = attach_pane_grid_window_state_streaming(
         client,
@@ -7192,6 +7209,7 @@ async fn ensure_focused_scrollback_window(
             pane_id,
             scrollback_offset,
             rows,
+            anchor_total_scrolled_rows,
         }],
     )
     .await?;
@@ -7211,10 +7229,25 @@ async fn ensure_focused_scrollback_window(
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("hydrating structured scrollback window: {error}"),
     })?;
+    let adjusted_offset = window.scrollback_offset;
+    let offset_delta = adjusted_offset.saturating_sub(scrollback_offset);
+    if offset_delta > 0 {
+        view_state.scrollback_offset = adjusted_offset;
+        if let Some(anchor) = view_state.selection_anchor.as_mut() {
+            anchor.row = anchor.row.saturating_add(offset_delta);
+        }
+    } else if adjusted_offset < scrollback_offset {
+        let delta = scrollback_offset - adjusted_offset;
+        view_state.scrollback_offset = adjusted_offset;
+        if let Some(anchor) = view_state.selection_anchor.as_mut() {
+            anchor.row = anchor.row.saturating_sub(delta);
+        }
+    }
     if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
         buffer.scrollback_window = Some(PaneScrollbackWindow {
-            scrollback_offset: window.scrollback_offset,
+            scrollback_offset: adjusted_offset,
             max_scrollback_offset: window.max_scrollback_offset,
+            total_scrolled_rows: window.total_scrolled_rows,
             rows: grid.viewport_rows(),
         });
     }
@@ -7235,7 +7268,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         return Ok(false);
     }
 
-    ensure_focused_scrollback_window(client, view_state).await?;
+    ensure_focused_scrollback_window(client, view_state, false).await?;
 
     if matches!(kind, MouseEventKind::ScrollUp)
         && !was_active
@@ -7243,7 +7276,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         && view_state.scrollback_offset == before_offset
     {
         step_attach_scrollback(view_state, -scroll_lines);
-        ensure_focused_scrollback_window(client, view_state).await?;
+        ensure_focused_scrollback_window(client, view_state, false).await?;
     }
 
     Ok(true)
@@ -7263,13 +7296,13 @@ async fn handle_attach_ui_action_with_scrollback(
             | RuntimeAction::MoveCursorUp
     ) && view_state.scrollback_active;
     if needs_max_before {
-        ensure_focused_scrollback_window(client, view_state).await?;
+        ensure_focused_scrollback_window(client, view_state, false).await?;
     }
 
     handle_attach_ui_action_at(action, view_state, now);
 
     if view_state.scrollback_active {
-        ensure_focused_scrollback_window(client, view_state).await?;
+        ensure_focused_scrollback_window(client, view_state, false).await?;
     }
     Ok(())
 }
@@ -7974,7 +8007,9 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
-                if let Err(error) = ensure_focused_scrollback_window(client, view_state).await {
+                if let Err(error) =
+                    ensure_focused_scrollback_window(client, view_state, false).await
+                {
                     view_state.set_transient_status(
                         format!(
                             "scrollback window fetch failed: {}",

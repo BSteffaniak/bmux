@@ -259,6 +259,7 @@ pub fn attach_pane_grid_window_state(
                 pane_id: window.pane_id,
                 scrollback_offset: window.scrollback_offset as usize,
                 rows: window.rows as usize,
+                anchor_total_scrolled_rows: window.anchor_total_scrolled_rows,
             },
         )
         .collect::<Vec<_>>();
@@ -275,6 +276,9 @@ pub fn attach_pane_grid_window_state(
                 scrollback_offset: u32::try_from(window.scrollback_offset).unwrap_or(u32::MAX),
                 max_scrollback_offset: u32::try_from(window.max_scrollback_offset)
                     .unwrap_or(u32::MAX),
+                total_scrolled_rows: window.total_scrolled_rows,
+                anchor_delta_rows: u32::try_from(window.anchor_delta_rows).unwrap_or(u32::MAX),
+                anchor_clamped: window.anchor_clamped,
                 stream_end: window.stream_end,
                 encoded: window.encoded,
             })

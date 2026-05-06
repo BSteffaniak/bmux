@@ -2300,12 +2300,7 @@ fn render_attach_scene_inner<W: io::Write>(
                     .as_ref()
                     .filter(|window| window.scrollback_offset == scrollback_offset)
                     .map_or_else(
-                        || {
-                            entry
-                                .terminal_grid
-                                .grid()
-                                .display_rows(scrollback_offset, inner_h)
-                        },
+                        || vec![PhysicalRow::new(); inner_h],
                         |window| window.rows.clone(),
                     )
             } else {

@@ -45,6 +45,7 @@ pub struct PaneGridWindowRequest {
     pub pane_id: Uuid,
     pub scrollback_offset: usize,
     pub rows: usize,
+    pub anchor_total_scrolled_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,9 @@ pub struct PaneGridWindowResult {
     pub pane_id: Uuid,
     pub scrollback_offset: usize,
     pub max_scrollback_offset: usize,
+    pub total_scrolled_rows: u64,
+    pub anchor_delta_rows: usize,
+    pub anchor_clamped: bool,
     pub stream_end: u64,
     pub encoded: Vec<u8>,
 }
@@ -133,6 +137,7 @@ pub async fn attach_pane_grid_window_state_streaming(
             pane_id: window.pane_id,
             scrollback_offset: u32::try_from(window.scrollback_offset).unwrap_or(u32::MAX),
             rows: u32::try_from(window.rows).unwrap_or(u32::MAX),
+            anchor_total_scrolled_rows: window.anchor_total_scrolled_rows,
         })
         .collect::<Vec<_>>();
     match AttachState::client::attach_pane_grid_window_state(client, session_id, windows).await {
@@ -143,6 +148,9 @@ pub async fn attach_pane_grid_window_state_streaming(
                 pane_id: window.pane_id,
                 scrollback_offset: window.scrollback_offset as usize,
                 max_scrollback_offset: window.max_scrollback_offset as usize,
+                total_scrolled_rows: window.total_scrolled_rows,
+                anchor_delta_rows: window.anchor_delta_rows as usize,
+                anchor_clamped: window.anchor_clamped,
                 stream_end: window.stream_end,
                 encoded: window.encoded,
             })

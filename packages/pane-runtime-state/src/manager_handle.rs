@@ -91,6 +91,7 @@ pub struct AttachPaneGridWindowRequest {
     pub pane_id: Uuid,
     pub scrollback_offset: usize,
     pub rows: usize,
+    pub anchor_total_scrolled_rows: Option<u64>,
 }
 
 /// Bounded structured terminal-grid scrollback window for one pane.
@@ -99,6 +100,9 @@ pub struct AttachPaneGridWindow {
     pub pane_id: Uuid,
     pub scrollback_offset: usize,
     pub max_scrollback_offset: usize,
+    pub total_scrolled_rows: u64,
+    pub anchor_delta_rows: usize,
+    pub anchor_clamped: bool,
     pub stream_end: u64,
     pub encoded: Vec<u8>,
 }

@@ -36,9 +36,6 @@ pub fn apply_attach_output_chunk_with(
 
     let buffer = pane_buffers.entry(pane_id).or_default();
     let had_data = apply_bytes(buffer, bytes);
-    if had_data {
-        buffer.scrollback_window = None;
-    }
     buffer.sync_update_in_progress = meta.sync_update_active;
     buffer.expected_stream_start = Some(meta.stream_end);
 
