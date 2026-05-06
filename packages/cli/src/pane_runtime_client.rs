@@ -40,6 +40,22 @@ pub struct PaneGridDeltaResult {
     pub encoded: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneGridWindowRequest {
+    pub pane_id: Uuid,
+    pub scrollback_offset: usize,
+    pub rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneGridWindowResult {
+    pub pane_id: Uuid,
+    pub scrollback_offset: usize,
+    pub max_scrollback_offset: usize,
+    pub stream_end: u64,
+    pub encoded: Vec<u8>,
+}
+
 #[allow(
     dead_code,
     reason = "structured attach hydration is wired in follow-up phases"
@@ -103,6 +119,36 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
             .collect()),
         Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
         Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+    }
+}
+
+pub async fn attach_pane_grid_window_state_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    windows: Vec<PaneGridWindowRequest>,
+) -> ClientResult<Vec<PaneGridWindowResult>> {
+    let windows = windows
+        .into_iter()
+        .map(|window| AttachState::PaneGridWindowRequest {
+            pane_id: window.pane_id,
+            scrollback_offset: u32::try_from(window.scrollback_offset).unwrap_or(u32::MAX),
+            rows: u32::try_from(window.rows).unwrap_or(u32::MAX),
+        })
+        .collect::<Vec<_>>();
+    match AttachState::client::attach_pane_grid_window_state(client, session_id, windows).await {
+        Ok(Ok(state)) => Ok(state
+            .windows
+            .into_iter()
+            .map(|window| PaneGridWindowResult {
+                pane_id: window.pane_id,
+                scrollback_offset: window.scrollback_offset as usize,
+                max_scrollback_offset: window.max_scrollback_offset as usize,
+                stream_end: window.stream_end,
+                encoded: window.encoded,
+            })
+            .collect()),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-window-state", err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-window-state", err),
     }
 }
 

@@ -36,10 +36,11 @@ pub use layout::{
     PaneResizeDirection, contains_pane,
 };
 pub use manager_handle::{
-    AttachGridDeltaState, AttachGridSnapshotState, AttachLayoutState, AttachPaneGridDelta,
-    AttachPaneGridSnapshot, AttachPaneSnapshotState, AttachSnapshotState,
-    FloatingPaneRuntimeSummary, NoopSessionRuntimeManager, PaneProcessIdentity, RemovedRuntimeInfo,
-    SessionRuntimeManagerApi, SessionRuntimeManagerHandle, SessionRuntimeSnapshot,
+    AttachGridDeltaState, AttachGridSnapshotState, AttachGridWindowState, AttachLayoutState,
+    AttachPaneGridDelta, AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneGridWindowRequest,
+    AttachPaneSnapshotState, AttachSnapshotState, FloatingPaneRuntimeSummary,
+    NoopSessionRuntimeManager, PaneProcessIdentity, RemovedRuntimeInfo, SessionRuntimeManagerApi,
+    SessionRuntimeManagerHandle, SessionRuntimeSnapshot,
 };
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};
 pub use output::{OutputRead, PaneOutputReader, PaneOutputReaderHandle};

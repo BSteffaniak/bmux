@@ -2287,12 +2287,26 @@ fn render_attach_scene_inner<W: io::Write>(
             );
             if next_grid_size != previous_grid_size {
                 entry.prev_rows.clear();
+                entry.scrollback_window = None;
             }
             let use_scrollback = scrollback_active && focus;
-            let grid_rows = entry
-                .terminal_grid
-                .grid()
-                .display_rows(if use_scrollback { scrollback_offset } else { 0 }, inner_h);
+            let grid_rows = if use_scrollback {
+                entry
+                    .scrollback_window
+                    .as_ref()
+                    .filter(|window| window.scrollback_offset == scrollback_offset)
+                    .map_or_else(
+                        || {
+                            entry
+                                .terminal_grid
+                                .grid()
+                                .display_rows(scrollback_offset, inner_h)
+                        },
+                        |window| window.rows.clone(),
+                    )
+            } else {
+                entry.terminal_grid.grid().display_rows(0, inner_h)
+            };
             let selection = if use_scrollback {
                 selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
             } else {

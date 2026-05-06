@@ -36,6 +36,9 @@ pub fn apply_attach_output_chunk_with(
 
     let buffer = pane_buffers.entry(pane_id).or_default();
     let had_data = apply_bytes(buffer, bytes);
+    if had_data {
+        buffer.scrollback_window = None;
+    }
     buffer.sync_update_in_progress = meta.sync_update_active;
     buffer.expected_stream_start = Some(meta.stream_end);
 
@@ -260,6 +263,7 @@ pub fn resize_attach_grids_for_scene_with_size(
         );
         if next_grid_size != previous_grid_size {
             buffer.prev_rows.clear();
+            buffer.scrollback_window = None;
         }
     }
 }

@@ -1025,6 +1025,11 @@ impl TerminalGrid {
         }
     }
 
+    #[must_use]
+    pub fn max_scrollback_offset(&self) -> usize {
+        self.display_row_count().saturating_sub(self.height)
+    }
+
     /// Materialize all retained main-screen rows.
     ///
     /// This is intentionally named as a slow path. Production render and resize

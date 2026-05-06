@@ -183,7 +183,6 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const VERIFY_SERVER_START_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
-const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 512 * 1024;
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
 const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";
 const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";

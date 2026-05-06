@@ -1692,7 +1692,7 @@ impl OutputFanoutBuffer {
 
     fn read_recent_with_offsets(&self, max_bytes: usize) -> OutputRead {
         let end = self.end_offset();
-        if self.data.is_empty() {
+        if self.data.is_empty() || max_bytes == 0 {
             return OutputRead {
                 bytes: Vec::new(),
                 stream_start: end,
@@ -1700,7 +1700,7 @@ impl OutputFanoutBuffer {
                 stream_gap: false,
             };
         }
-        let to_read = self.data.len().min(max_bytes.max(1));
+        let to_read = self.data.len().min(max_bytes);
         let intended_start = end - to_read as u64;
         let safe_start = self.first_safe_offset_at_or_after(intended_start);
 
@@ -5049,6 +5049,65 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         .unwrap_or(Err(SessionRuntimeError::Closed))
     }
 
+    fn attach_grid_window_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        windows: &[bmux_pane_runtime_state::AttachPaneGridWindowRequest],
+    ) -> Result<bmux_pane_runtime_state::AttachGridWindowState, SessionRuntimeError> {
+        self.with_lock(|m| {
+            let session = m
+                .runtimes
+                .get(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            if !session.attached_clients.contains(&client_id) {
+                return Err(SessionRuntimeError::NotAttached);
+            }
+            let mut snapshots = Vec::new();
+            for window in windows {
+                let Some(owner_session_id) = m.pane_session_for_attach(session_id, window.pane_id)
+                else {
+                    continue;
+                };
+                let Some(pane) = m
+                    .runtimes
+                    .get(&owner_session_id)
+                    .and_then(|runtime| runtime.panes.get(&window.pane_id))
+                else {
+                    continue;
+                };
+                let (snapshot, max_scrollback_offset) = {
+                    let grid = pane
+                        .terminal_grid
+                        .lock()
+                        .map_err(|_| SessionRuntimeError::Closed)?;
+                    (
+                        grid.snapshot(window.scrollback_offset, window.rows),
+                        grid.grid().max_scrollback_offset(),
+                    )
+                };
+                let stream_end = {
+                    let output = pane
+                        .output_buffer
+                        .lock()
+                        .map_err(|_| SessionRuntimeError::Closed)?;
+                    output.end_offset()
+                };
+                let encoded =
+                    serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+                snapshots.push(bmux_pane_runtime_state::AttachPaneGridWindow {
+                    pane_id: window.pane_id,
+                    scrollback_offset: window.scrollback_offset,
+                    max_scrollback_offset,
+                    stream_end,
+                    encoded,
+                });
+            }
+            Ok(bmux_pane_runtime_state::AttachGridWindowState { windows: snapshots })
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
     fn attach_grid_delta_state(
         &self,
         session_id: SessionId,
@@ -6047,6 +6106,57 @@ mod tests {
         assert!(retained.iter().any(|row| row == "line3"));
         assert_eq!(retained.len(), usize::from(snapshot.height));
         assert!(snapshot.scrollback_rows > 0);
+    }
+
+    #[tokio::test]
+    async fn attach_grid_window_state_returns_bounded_scrollback_window() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 5, 2);
+        pane.terminal_grid
+            .lock()
+            .expect("grid lock should be available")
+            .process(b"line1\r\nline2\r\nline3");
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[bmux_pane_runtime_state::AttachPaneGridWindowRequest {
+                pane_id,
+                scrollback_offset: 1,
+                rows: 2,
+            }],
+        )
+        .expect("attached client should receive grid window");
+
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(state.windows[0].scrollback_offset, 1);
+        assert!(state.windows[0].max_scrollback_offset >= 1);
+        let snapshot =
+            serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&state.windows[0].encoded)
+                .expect("window payload should decode");
+        assert_eq!(snapshot.rows.len(), 2);
+        let retained = snapshot
+            .rows
+            .iter()
+            .map(|row| {
+                row.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(retained.iter().any(|row| row == "line1"));
+        assert!(retained.iter().any(|row| row == "line2"));
+        assert!(!retained.iter().any(|row| row == "line3"));
     }
 
     #[tokio::test]

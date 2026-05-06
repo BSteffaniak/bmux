@@ -12,9 +12,10 @@ use bmux_attach_layout_protocol::{
 };
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachLayout as AttachLayoutRecord, AttachPaneGridDelta, AttachPaneGridSnapshot,
-    AttachPaneImages, AttachPaneOutputBatch, AttachPaneSnapshot as AttachPaneSnapshotRecord,
-    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneGridDelta,
-    PaneGridSnapshot, PaneInputMode, PaneMouseProtocol,
+    AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch,
+    AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
+    AttachStateError, PaneChunk, PaneGridDelta, PaneGridSnapshot, PaneGridWindow,
+    PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -51,6 +52,12 @@ pub struct AttachPaneGridSnapshotArgs {
     pub session_id: Uuid,
     pub pane_ids: Vec<Uuid>,
     pub max_rows_per_pane: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneGridWindowArgs {
+    pub session_id: Uuid,
+    pub windows: Vec<PaneGridWindowRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +240,43 @@ pub fn attach_pane_grid_snapshot_state(
                 pane_id: snapshot.pane_id,
                 stream_end: snapshot.stream_end,
                 encoded: snapshot.encoded,
+            })
+            .collect(),
+    })
+}
+
+pub fn attach_pane_grid_window_state(
+    req: &AttachPaneGridWindowArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneGridWindow, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let windows = req
+        .windows
+        .iter()
+        .map(
+            |window| bmux_pane_runtime_state::AttachPaneGridWindowRequest {
+                pane_id: window.pane_id,
+                scrollback_offset: window.scrollback_offset as usize,
+                rows: window.rows as usize,
+            },
+        )
+        .collect::<Vec<_>>();
+    let state = handle
+        .0
+        .attach_grid_window_state(SessionId(req.session_id), caller_client_id(ctx), &windows)
+        .map_err(|_| AttachStateError::NotAttached)?;
+    Ok(AttachPaneGridWindow {
+        windows: state
+            .windows
+            .into_iter()
+            .map(|window| PaneGridWindow {
+                pane_id: window.pane_id,
+                scrollback_offset: u32::try_from(window.scrollback_offset).unwrap_or(u32::MAX),
+                max_scrollback_offset: u32::try_from(window.max_scrollback_offset)
+                    .unwrap_or(u32::MAX),
+                stream_end: window.stream_end,
+                encoded: window.encoded,
             })
             .collect(),
     })

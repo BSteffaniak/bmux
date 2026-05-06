@@ -85,6 +85,30 @@ pub struct AttachGridSnapshotState {
     pub snapshots: Vec<AttachPaneGridSnapshot>,
 }
 
+/// Bounded structured terminal-grid scrollback window request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachPaneGridWindowRequest {
+    pub pane_id: Uuid,
+    pub scrollback_offset: usize,
+    pub rows: usize,
+}
+
+/// Bounded structured terminal-grid scrollback window for one pane.
+#[derive(Debug, Clone)]
+pub struct AttachPaneGridWindow {
+    pub pane_id: Uuid,
+    pub scrollback_offset: usize,
+    pub max_scrollback_offset: usize,
+    pub stream_end: u64,
+    pub encoded: Vec<u8>,
+}
+
+/// Structured terminal-grid scrollback window DTO.
+#[derive(Debug, Clone)]
+pub struct AttachGridWindowState {
+    pub windows: Vec<AttachPaneGridWindow>,
+}
+
 /// Structured terminal-grid delta batches for one pane.
 #[derive(Debug, Clone)]
 pub struct AttachPaneGridDelta {
@@ -356,6 +380,13 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pane_ids: &[Uuid],
         max_rows_per_pane: usize,
     ) -> Result<AttachGridSnapshotState, SessionRuntimeError>;
+
+    fn attach_grid_window_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        windows: &[AttachPaneGridWindowRequest],
+    ) -> Result<AttachGridWindowState, SessionRuntimeError>;
 
     fn attach_grid_delta_state(
         &self,
@@ -802,6 +833,15 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
     ) -> Result<AttachGridSnapshotState, SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
+    fn attach_grid_window_state(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _windows: &[AttachPaneGridWindowRequest],
+    ) -> Result<AttachGridWindowState, SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+
     fn attach_grid_delta_state(
         &self,
         _session_id: SessionId,

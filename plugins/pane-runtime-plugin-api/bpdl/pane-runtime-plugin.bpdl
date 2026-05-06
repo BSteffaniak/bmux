@@ -457,6 +457,24 @@ interface attach-runtime-state {
         snapshots: list<pane-grid-snapshot>,
     }
 
+    record pane-grid-window-request {
+        pane_id: uuid,
+        scrollback_offset: u32,
+        rows: u32,
+    }
+
+    record pane-grid-window {
+        pane_id: uuid,
+        scrollback_offset: u32,
+        max_scrollback_offset: u32,
+        stream_end: u64,
+        encoded: list<u8>,
+    }
+
+    record attach-pane-grid-window {
+        windows: list<pane-grid-window>,
+    }
+
     record pane-grid-delta {
         pane_id: uuid,
         base_revision: u64,
@@ -506,6 +524,11 @@ interface attach-runtime-state {
         pane_ids: list<uuid>,
         max_rows_per_pane: u32,
     ) -> result<attach-pane-grid-snapshot, attach-state-error>;
+
+    query attach-pane-grid-window-state(
+        session_id: uuid,
+        windows: list<pane-grid-window-request>,
+    ) -> result<attach-pane-grid-window, attach-state-error>;
 
     query attach-pane-grid-delta-state(
         session_id: uuid,

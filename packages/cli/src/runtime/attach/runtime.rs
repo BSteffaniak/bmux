@@ -13,8 +13,8 @@ use bmux_attach_pipeline::reconcile::{
 };
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
-    RetainedOpacity, RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload,
-    frame_damage_from_retained_repaint_plan, merge_retained_damages,
+    PaneScrollbackWindow, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
+    RetainedSurfacePayload, frame_damage_from_retained_repaint_plan, merge_retained_damages,
     retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
     retained_layer_order, retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
 };
@@ -59,14 +59,14 @@ use super::super::prompt::{self, PromptOption, PromptRequest, PromptResponse, Pr
 use super::super::{
     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS, ATTACH_SELECTION_CLEARED_STATUS,
     ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
-    ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE, ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL,
-    BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor, KernelClientFactory, Keymap,
-    RuntimeAction, action_dispatch, attach, attach_quit_failure_status,
-    available_capability_providers, available_service_descriptors, command_accepts_repeat,
-    effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
-    map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
-    plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
-    run_plugin_keybinding_command_with_active_bindings, scan_available_plugins,
+    ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL, BmuxClient, HELP_OVERLAY_SURFACE_ID,
+    InputProcessor, KernelClientFactory, Keymap, RuntimeAction, action_dispatch, attach,
+    attach_quit_failure_status, available_capability_providers, available_service_descriptors,
+    command_accepts_repeat, effective_enabled_plugins, enter_host_kernel_connection,
+    host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
+    parse_session_selector, parse_uuid_value, plugin_command_policy_hints, plugin_host_metadata,
+    recording, resolve_plugin_search_paths, run_plugin_keybinding_command_with_active_bindings,
+    scan_available_plugins,
 };
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
@@ -91,13 +91,14 @@ use super::state::{
     AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
-    BmuxPaneRuntimeClientExt, attach_pane_grid_delta_state_streaming,
-    attach_pane_grid_snapshot_state_streaming,
+    BmuxPaneRuntimeClientExt, PaneGridWindowRequest, attach_pane_grid_delta_state_streaming,
+    attach_pane_grid_snapshot_state_streaming, attach_pane_grid_window_state_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderDamage, RenderOp, RenderStyle};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
+const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
 const ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE: usize = 1;
 const ATTACH_GRID_DELTA_MAX_BATCHES_PER_PANE: usize = 128;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
@@ -4941,11 +4942,15 @@ pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     let Some(buffer) = focused_attach_pane_buffer(view_state) else {
         return 0;
     };
-    buffer
+    let local = buffer
         .terminal_grid
         .grid()
         .main_row_count()
-        .saturating_sub(buffer.terminal_grid.grid().height())
+        .saturating_sub(buffer.terminal_grid.grid().height());
+    buffer
+        .scrollback_window
+        .as_ref()
+        .map_or(local, |window| local.max(window.max_scrollback_offset))
 }
 
 pub fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
@@ -7205,11 +7210,124 @@ async fn hydrate_attach_structured_grid_snapshots(
         let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
         buffer.terminal_grid = stream;
         buffer.expected_stream_start = Some(snapshot.stream_end);
+        buffer.scrollback_window = None;
         buffer.prev_rows.clear();
         hydrated.insert(snapshot.pane_id);
     }
 
     Ok(hydrated)
+}
+
+async fn ensure_focused_scrollback_window(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
+    if !view_state.scrollback_active {
+        return Ok(());
+    }
+    let Some(pane_id) = focused_attach_pane_id(view_state) else {
+        return Ok(());
+    };
+    let Some((_, rows)) = focused_attach_pane_inner_size(view_state) else {
+        return Ok(());
+    };
+    let scrollback_offset = view_state.scrollback_offset;
+    if view_state
+        .pane_buffers
+        .get(&pane_id)
+        .and_then(|buffer| buffer.scrollback_window.as_ref())
+        .is_some_and(|window| window.scrollback_offset == scrollback_offset)
+    {
+        return Ok(());
+    }
+
+    let windows = attach_pane_grid_window_state_streaming(
+        client,
+        view_state.attached_id,
+        vec![PaneGridWindowRequest {
+            pane_id,
+            scrollback_offset,
+            rows,
+        }],
+    )
+    .await?;
+    let Some(window) = windows.into_iter().find(|window| window.pane_id == pane_id) else {
+        return Ok(());
+    };
+    let decoded = serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&window.encoded)
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decoding structured scrollback window: {error}"),
+        })?;
+    let grid = bmux_terminal_grid::TerminalGrid::from_snapshot(
+        &decoded,
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("hydrating structured scrollback window: {error}"),
+    })?;
+    if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
+        buffer.scrollback_window = Some(PaneScrollbackWindow {
+            scrollback_offset: window.scrollback_offset,
+            max_scrollback_offset: window.max_scrollback_offset,
+            rows: grid.viewport_rows(),
+        });
+    }
+    Ok(())
+}
+
+async fn handle_attach_mouse_scrollback_with_window(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    kind: MouseEventKind,
+) -> std::result::Result<bool, ClientError> {
+    let was_active = view_state.scrollback_active;
+    let before_offset = view_state.scrollback_offset;
+    let scroll_lines =
+        isize::try_from(view_state.mouse.config.scroll_lines_per_tick.max(1)).unwrap_or(isize::MAX);
+    let consumed = handle_attach_mouse_scrollback(view_state, kind);
+    if !consumed {
+        return Ok(false);
+    }
+
+    ensure_focused_scrollback_window(client, view_state).await?;
+
+    if matches!(kind, MouseEventKind::ScrollUp)
+        && !was_active
+        && view_state.scrollback_active
+        && view_state.scrollback_offset == before_offset
+    {
+        step_attach_scrollback(view_state, -scroll_lines);
+        ensure_focused_scrollback_window(client, view_state).await?;
+    }
+
+    Ok(true)
+}
+
+async fn handle_attach_ui_action_with_scrollback(
+    client: &mut StreamingBmuxClient,
+    action: &RuntimeAction,
+    view_state: &mut AttachViewState,
+    now: Instant,
+) -> std::result::Result<(), ClientError> {
+    let needs_max_before = matches!(
+        action,
+        RuntimeAction::ScrollUpLine
+            | RuntimeAction::ScrollUpPage
+            | RuntimeAction::ScrollTop
+            | RuntimeAction::MoveCursorUp
+    ) && view_state.scrollback_active;
+    if needs_max_before {
+        ensure_focused_scrollback_window(client, view_state).await?;
+    }
+
+    handle_attach_ui_action_at(action, view_state, now);
+
+    if view_state.scrollback_active {
+        ensure_focused_scrollback_window(client, view_state).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // Snapshot hydration intentionally keeps related state transitions in one ordered flow.
@@ -7230,7 +7348,10 @@ async fn hydrate_attach_state_from_snapshot_mode(
         pane_input_modes,
         zoomed,
     } = client
-        .attach_snapshot(view_state.attached_id, ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE)
+        .attach_snapshot(
+            view_state.attached_id,
+            ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE,
+        )
         .await?;
 
     let active_pane_ids = panes
@@ -7354,7 +7475,7 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
         .attach_pane_snapshot(
             view_state.attached_id,
             pane_ids.to_vec(),
-            ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE,
+            ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE,
         )
         .await?;
 
@@ -7909,6 +8030,16 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
+                if let Err(error) = ensure_focused_scrollback_window(client, view_state).await {
+                    view_state.set_transient_status(
+                        format!(
+                            "scrollback window fetch failed: {}",
+                            map_attach_client_error(error)
+                        ),
+                        now,
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Ui(action) => {
@@ -7963,7 +8094,18 @@ pub async fn handle_attach_terminal_event(
                 }
                 let prompt_only_action = matches!(action, RuntimeAction::Quit)
                     || is_windows_close_active_pane_action(&action);
-                handle_attach_ui_action_at(&action, view_state, now);
+                if let Err(error) =
+                    handle_attach_ui_action_with_scrollback(client, &action, view_state, now).await
+                {
+                    view_state.set_transient_status(
+                        format!(
+                            "scrollback window fetch failed: {}",
+                            map_attach_client_error(error)
+                        ),
+                        now,
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
                 if prompt_only_action && view_state.prompt.is_active() {
                     view_state
                         .dirty
@@ -8378,7 +8520,18 @@ async fn handle_attach_action_dispatch(
             }
         }
         AttachEventAction::Ui(ui_action) => {
-            handle_attach_ui_action_at(&ui_action, view_state, now);
+            if let Err(error) =
+                handle_attach_ui_action_with_scrollback(client, &ui_action, view_state, now).await
+            {
+                view_state.set_transient_status(
+                    format!(
+                        "scrollback window fetch failed: {}",
+                        map_attach_client_error(error)
+                    ),
+                    now,
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
             view_state
                 .dirty
                 .mark_layout_frame_dirty(AttachDirtySource::ActionDispatch);
@@ -8565,7 +8718,12 @@ async fn handle_attach_mouse_event_at(
                 return Ok(());
             }
             bmux_config::MouseWheelPropagation::ScrollbackOnly => {
-                let _ = handle_attach_mouse_scrollback(view_state, mouse_event.kind);
+                let _ = handle_attach_mouse_scrollback_with_window(
+                    client,
+                    view_state,
+                    mouse_event.kind,
+                )
+                .await?;
                 return Ok(());
             }
             bmux_config::MouseWheelPropagation::ForwardAndScrollback => {
@@ -8578,7 +8736,12 @@ async fn handle_attach_mouse_event_at(
                     false,
                 )
                 .await?;
-                let _ = handle_attach_mouse_scrollback(view_state, mouse_event.kind);
+                let _ = handle_attach_mouse_scrollback_with_window(
+                    client,
+                    view_state,
+                    mouse_event.kind,
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -9619,7 +9782,7 @@ pub async fn handle_attach_mouse_gesture_action(
             Ok(true)
         }
         AttachEventAction::Ui(action) => {
-            handle_attach_ui_action_at(&action, view_state, now);
+            handle_attach_ui_action_with_scrollback(client, &action, view_state, now).await?;
             view_state
                 .dirty
                 .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
@@ -9696,12 +9859,13 @@ pub async fn handle_attach_mouse_wheel_auto(
                 .await
             }
             bmux_config::AlternateScreenWheelBehavior::ScrollbackOnly => {
-                Ok(handle_attach_mouse_scrollback(view_state, mouse_event.kind))
+                handle_attach_mouse_scrollback_with_window(client, view_state, mouse_event.kind)
+                    .await
             }
         };
     }
 
-    Ok(handle_attach_mouse_scrollback(view_state, mouse_event.kind))
+    handle_attach_mouse_scrollback_with_window(client, view_state, mouse_event.kind).await
 }
 
 pub fn pane_mouse_protocol_reports_event(

@@ -1,6 +1,6 @@
 use bmux_attach_layout_protocol::{AttachInputModeState, AttachMouseProtocolState};
 use bmux_plugin::{ExtensionRect, RenderDamage};
-use bmux_terminal_grid::{GridLimits, TerminalGridStream, TerminalProtocolTracker};
+use bmux_terminal_grid::{GridLimits, PhysicalRow, TerminalGridStream, TerminalProtocolTracker};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -46,7 +46,14 @@ pub struct PaneRenderBuffer {
     pub prev_rows: Vec<String>,
     pub sync_update_in_progress: bool,
     pub expected_stream_start: Option<u64>,
+    pub scrollback_window: Option<PaneScrollbackWindow>,
     pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
+}
+
+pub struct PaneScrollbackWindow {
+    pub scrollback_offset: usize,
+    pub max_scrollback_offset: usize,
+    pub rows: Vec<PhysicalRow>,
 }
 
 impl Default for PaneRenderBuffer {
@@ -58,6 +65,7 @@ impl Default for PaneRenderBuffer {
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
             expected_stream_start: None,
+            scrollback_window: None,
             extension_render_cache: BTreeMap::new(),
         }
     }
