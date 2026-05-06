@@ -132,11 +132,15 @@ async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
 
     if tokio::time::timeout(Duration::from_millis(250), &mut pane.task)
         .await
-        .is_ok()
+        .is_err()
     {
-    } else {
+        // The pane runtime task owns OS-thread joins for PTY reader/waiter
+        // teardown. If one of those threads is stuck in a blocking read or
+        // wait, awaiting an aborted task here can wedge the server-side
+        // service dispatcher. Abort and detach instead; the task/thread
+        // resources are process-scoped cleanup best-effort after the pane has
+        // already been removed from runtime state.
         pane.task.abort();
-        let _ = pane.task.await;
     }
 }
 
@@ -3038,12 +3042,16 @@ impl SessionRuntimeManager {
                 }
             }
 
-            if let Some(waiter) = child_waiter {
-                let _ = waiter.join();
-            }
-            if let Some(thread) = reader_thread {
-                let _ = thread.join();
-            }
+            // Do not synchronously join the OS reader/waiter threads from the
+            // async runtime task. On shutdown the reader can remain blocked in
+            // a PTY read until all handles are dropped; joining it here before
+            // the task returns can deadlock pane/session teardown and starve
+            // unrelated attach service requests. Dropping the handles detaches
+            // the threads; they exit once the PTY/process closes.
+            drop(writer);
+            drop(master);
+            drop(child_waiter);
+            drop(reader_thread);
             exited_for_task.store(true, Ordering::SeqCst);
         });
 
