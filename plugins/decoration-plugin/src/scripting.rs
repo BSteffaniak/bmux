@@ -1031,6 +1031,10 @@ mod tests {
         use std::sync::Arc;
 
         fn render_message() -> ScriptMessage {
+            render_message_with_focus(true)
+        }
+
+        fn render_message_with_focus(focused: bool) -> ScriptMessage {
             ScriptMessage::Render(ScriptRenderMessage {
                 time_ms: 500,
                 frame: 10,
@@ -1039,7 +1043,7 @@ mod tests {
                         "id": "test-pane",
                         "rect": { "x": 0, "y": 0, "w": 20, "h": 5 },
                         "content_rect": { "x": 1, "y": 1, "w": 18, "h": 3 },
-                        "focused": true,
+                        "focused": focused,
                         "zoomed": false,
                         "status": "running"
                     }
@@ -1280,6 +1284,45 @@ mod tests {
             assert!(commands.iter().any(|command| matches!(
                 command,
                 bmux_scene_protocol::scene_protocol::PaintCommand::Text { text, .. } if text == " CPU 86% MEM 100M P 17 "
+            )));
+        }
+
+        #[test]
+        fn bundled_performance_header_script_renders_unfocused_low_cpu_header() {
+            let backend = make_backend(ScriptHostAccess::default());
+            backend
+                .compile(
+                    Path::new("performance_header.lua"),
+                    include_str!("../assets/decorations/performance_header.lua"),
+                )
+                .expect("compile");
+            backend
+                .invoke(&ScriptMessage::Event(ScriptEventMessage {
+                    source: "bmux.performance/metrics-state".to_string(),
+                    kind: "bmux.performance/metrics-state".to_string(),
+                    delivery: ScriptEventDelivery::State,
+                    snapshot: true,
+                    payload: json!({
+                        "system": { "cpu_percent": 12.0, "cpu_normalized_percent": 12.0 },
+                        "panes": {
+                            "test-pane": {
+                                "available": true,
+                                "cpu_percent": 12.0,
+                                "cpu_normalized_percent": 12.0,
+                                "memory_bytes": 104_857_600,
+                                "process_count": 3
+                            }
+                        }
+                    }),
+                }))
+                .expect("metrics event invoke");
+            let outcome = backend
+                .invoke(&render_message_with_focus(false))
+                .expect("render invoke");
+            let commands = &outcome.surfaces["test-pane"];
+            assert!(commands.iter().any(|command| matches!(
+                command,
+                bmux_scene_protocol::scene_protocol::PaintCommand::Text { text, .. } if text == " CPU 12% MEM 100M P 3 "
             )));
         }
 

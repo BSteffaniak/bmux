@@ -97,16 +97,14 @@ local function render(message)
             glyphs = glyphs,
             style = { fg = bmux.rgb(r, g, b), bold = cpu >= 50 },
         }}
-        if pane.focused or cpu >= 70 then
-            table.insert(cmds, {
-                kind = "text",
-                col = pane.rect.x + 2,
-                row = pane.rect.y,
-                z = z + 1,
-                text = label,
-                style = { fg = bmux.rgb(r, g, b), bold = true },
-            })
-        end
+        table.insert(cmds, {
+            kind = "text",
+            col = pane.rect.x + 2,
+            row = pane.rect.y,
+            z = z + 1,
+            text = label,
+            style = { fg = bmux.rgb(r, g, b), bold = true },
+        })
         surfaces[pane.id] = cmds
     end
     return { surfaces = surfaces }
