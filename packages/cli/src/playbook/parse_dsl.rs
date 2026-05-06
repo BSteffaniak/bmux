@@ -602,39 +602,20 @@ fn parse_value(input: &str) -> Result<(String, &str)> {
 fn parse_quoted_value(input: &str, quote: char) -> Result<(String, &str)> {
     let bytes = input.as_bytes();
     debug_assert!(bytes[0] == quote as u8);
+    let quote_byte = quote as u8;
     let mut result = Vec::new();
     let mut i = 1; // skip opening quote
 
     while i < bytes.len() {
-        if bytes[i] == quote as u8 {
-            // Closing quote found
+        if bytes[i] == quote_byte {
             return Ok((String::from_utf8(result)?, &input[i + 1..]));
         }
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            // Escape sequence inside quoted string
-            i += 1;
-            match bytes[i] {
-                b'n' => result.push(b'\n'),
-                b'r' => result.push(b'\r'),
-                b't' => result.push(b'\t'),
-                b'\\' => result.push(b'\\'),
-                b'\'' => result.push(b'\''),
-                b'"' => result.push(b'"'),
-                b'x' if i + 2 < bytes.len() => {
-                    let hex = &input[i + 1..i + 3];
-                    let byte = u8::from_str_radix(hex, 16)
-                        .with_context(|| format!("invalid hex escape: \\x{hex}"))?;
-                    result.push(byte);
-                    i += 2;
-                }
-                other => {
-                    result.push(b'\\');
-                    result.push(other);
-                }
-            }
-        } else {
-            result.push(bytes[i]);
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'\'' | b'"') {
+            result.push(bytes[i + 1]);
+            i += 2;
+            continue;
         }
+        result.push(bytes[i]);
         i += 1;
     }
 
@@ -739,6 +720,18 @@ snapshot id=final
         match &playbook.steps[0].action {
             Action::SendKeys { keys, .. } => {
                 assert_eq!(keys, b"hello\r\n");
+            }
+            _ => panic!("expected send-keys"),
+        }
+    }
+
+    #[test]
+    fn parse_send_keys_preserves_double_escaped_shell_sequences() {
+        let input = r#"send-keys keys='printf \"\\e[2J\\e[H\\n\"\r'"#;
+        let (playbook, _includes) = parse_dsl(input).unwrap();
+        match &playbook.steps[0].action {
+            Action::SendKeys { keys, .. } => {
+                assert_eq!(keys, b"printf \"\\e[2J\\e[H\\n\"\r");
             }
             _ => panic!("expected send-keys"),
         }

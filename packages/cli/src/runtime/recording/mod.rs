@@ -6567,7 +6567,7 @@ mod tests {
             recording_id,
             &root,
             client_id,
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
         )
         .expect("writer should open");
 

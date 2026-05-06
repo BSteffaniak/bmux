@@ -1,35 +1,10 @@
 use crate::model::{Cell, PhysicalRow};
 use std::collections::VecDeque;
 
-pub(crate) fn reflow_main_rows(
-    rows: &mut VecDeque<PhysicalRow>,
-    old_width: usize,
-    new_width: usize,
-) {
-    if rows.is_empty() || old_width == new_width || new_width == 0 {
-        return;
-    }
-
-    let mut reflowed = VecDeque::new();
-    let mut logical = Vec::new();
-
-    for row in rows.iter() {
-        logical.extend(
-            row.visual_cells(old_width)
-                .into_iter()
-                .filter(|cell| !cell.is_wide_continuation()),
-        );
-        if !row.wrapped() {
-            push_reflowed_logical_line(&mut reflowed, &logical, new_width);
-            logical.clear();
-        }
-    }
-
-    if !logical.is_empty() {
-        push_reflowed_logical_line(&mut reflowed, &logical, new_width);
-    }
-
-    *rows = reflowed;
+pub(crate) fn project_logical_line(cells: &[Cell], width: usize) -> VecDeque<PhysicalRow> {
+    let mut rows = VecDeque::new();
+    push_reflowed_logical_line(&mut rows, cells, width);
+    rows
 }
 
 fn push_reflowed_logical_line(rows: &mut VecDeque<PhysicalRow>, cells: &[Cell], width: usize) {
@@ -93,18 +68,14 @@ mod tests {
     use crate::style::StyleId;
 
     #[test]
-    fn reflow_joins_wrapped_rows_only() {
-        let mut rows = VecDeque::new();
-        let mut first = row("abc");
-        first.set_wrapped(true);
-        rows.push_back(first);
-        rows.push_back(row("def"));
-        rows.push_back(row("ghi"));
+    fn projects_logical_cells_to_requested_width() {
+        let cells = row("abcdef").visual_cells(6);
+        let rows = project_logical_line(&cells, 3);
 
-        reflow_main_rows(&mut rows, 3, 10);
-
-        assert_eq!(text(&rows[0]), "abcdef");
-        assert_eq!(text(&rows[1]), "ghi");
+        assert_eq!(text(&rows[0]), "abc");
+        assert!(rows[0].wrapped());
+        assert_eq!(text(&rows[1]), "def");
+        assert!(!rows[1].wrapped());
     }
 
     fn row(text: &str) -> PhysicalRow {

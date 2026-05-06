@@ -68,9 +68,10 @@ impl GridSnapshot {
         let selected_rows = match grid.mode() {
             GridMode::Main => grid
                 .main_rows()
+                .into_iter()
                 .skip(start)
                 .take(end.saturating_sub(start))
-                .map(|row| row_snapshot(row, grid.width()))
+                .map(|row| row_snapshot(&row, grid.width()))
                 .collect(),
             GridMode::Alternate => grid
                 .viewport_rows()

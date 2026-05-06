@@ -427,7 +427,7 @@ const fn is_regex_meta(ch: char) -> bool {
 
 /// Escape single quotes for DSL string values.
 pub(super) fn escape_single_quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    s.replace('\'', "\\'")
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn escape_single_quote_basic() {
         assert_eq!(escape_single_quote("it's"), "it\\'s");
-        assert_eq!(escape_single_quote("a\\b"), "a\\\\b");
+        assert_eq!(escape_single_quote("a\\b"), "a\\b");
     }
 
     #[test]

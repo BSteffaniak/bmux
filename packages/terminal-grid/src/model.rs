@@ -1,3 +1,4 @@
+use crate::reflow::project_logical_line;
 use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 use serde::{Deserialize, Serialize};
@@ -259,6 +260,9 @@ pub struct TerminalGrid {
     width: usize,
     height: usize,
     limits: GridLimits,
+    main_history: VecDeque<LogicalLine>,
+    main_history_projected_rows: usize,
+    pending_history_cells: Vec<Cell>,
     main_rows: VecDeque<PhysicalRow>,
     alt_rows: Vec<PhysicalRow>,
     mode: GridMode,
@@ -272,6 +276,11 @@ pub struct TerminalGrid {
     pending_wrap: bool,
     scroll_region: Option<(usize, usize)>,
     protocol: ProtocolState,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LogicalLine {
+    cells: Vec<Cell>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -300,6 +309,9 @@ impl TerminalGrid {
             width,
             height,
             limits,
+            main_history: VecDeque::new(),
+            main_history_projected_rows: 0,
+            pending_history_cells: Vec::new(),
             main_rows,
             alt_rows: vec![PhysicalRow::new(); height],
             mode: GridMode::Main,
@@ -350,11 +362,20 @@ impl TerminalGrid {
             .iter()
             .map(|row| row_from_snapshot(row, width))
             .collect::<Vec<_>>();
+        let mut main_history = VecDeque::new();
+        let mut pending_history_cells = Vec::new();
         let mut main_rows = VecDeque::new();
         let mut alt_rows = vec![PhysicalRow::new(); height];
         match mode {
             GridMode::Main => {
-                main_rows.extend(rows);
+                let viewport_start = rows.len().saturating_sub(height);
+                hydrate_logical_history(
+                    &rows[..viewport_start],
+                    width,
+                    &mut main_history,
+                    &mut pending_history_cells,
+                );
+                main_rows.extend(rows.into_iter().skip(viewport_start));
                 while main_rows.len() < height {
                     main_rows.push_front(PhysicalRow::new());
                 }
@@ -368,10 +389,17 @@ impl TerminalGrid {
                 }
             }
         }
+        let main_history_projected_rows = main_history
+            .iter()
+            .map(|line| projected_row_count(&line.cells, width))
+            .sum();
         let mut grid = Self {
             width,
             height,
             limits,
+            main_history,
+            main_history_projected_rows,
+            pending_history_cells,
             main_rows,
             alt_rows,
             mode,
@@ -456,8 +484,9 @@ impl TerminalGrid {
         crate::parser::process(self, bytes);
     }
 
-    /// Resize the terminal. Main-screen retained rows are reflowed by joining
-    /// soft-wrapped row runs and splitting them to the new width.
+    /// Resize the terminal. Main-screen finalized scrollback remains logical
+    /// and width-independent; only the live viewport tail is projected to the
+    /// new width.
     ///
     /// # Errors
     ///
@@ -471,22 +500,12 @@ impl TerminalGrid {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        let cursor_anchor = self.main_cursor_anchor();
-        crate::reflow::reflow_main_rows(&mut self.main_rows, self.width, width);
-        while self.main_rows.len() > height
-            && self
-                .main_rows
-                .back()
-                .is_some_and(|row| row.cells().is_empty() && !row.wrapped())
-        {
-            self.main_rows.pop_back();
+        if self.mode == GridMode::Main {
+            self.resize_main_viewport(width, height);
         }
         self.width = width;
         self.height = height;
         self.pending_wrap = false;
-        while self.main_rows.len() < height {
-            self.main_rows.push_front(PhysicalRow::new());
-        }
         self.evict_excess_history();
         self.alt_rows.resize_with(height, PhysicalRow::new);
         self.scroll_region = self.scroll_region.and_then(|(top, bottom)| {
@@ -497,9 +516,6 @@ impl TerminalGrid {
         for row in &mut self.alt_rows {
             row.truncate(width);
             row.set_wrapped(false);
-        }
-        if self.mode == GridMode::Main {
-            self.restore_main_cursor_anchor(cursor_anchor);
         }
         self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
@@ -717,9 +733,9 @@ impl TerminalGrid {
                     self.clear_viewport_row(row);
                 }
                 if mode == 3 && self.mode == GridMode::Main {
-                    let viewport = self.viewport_rows().clone();
-                    self.main_rows.clear();
-                    self.main_rows.extend(viewport);
+                    self.main_history.clear();
+                    self.main_history_projected_rows = 0;
+                    self.pending_history_cells.clear();
                 }
             }
             _ => {}
@@ -878,12 +894,7 @@ impl TerminalGrid {
     #[must_use]
     pub fn viewport_rows(&self) -> Vec<PhysicalRow> {
         match self.mode {
-            GridMode::Main => self
-                .main_rows
-                .iter()
-                .skip(self.main_rows.len().saturating_sub(self.height))
-                .cloned()
-                .collect(),
+            GridMode::Main => self.main_rows.iter().cloned().collect(),
             GridMode::Alternate => self.alt_rows.clone(),
         }
     }
@@ -891,21 +902,9 @@ impl TerminalGrid {
     #[must_use]
     pub fn display_rows(&self, scrollback_offset: usize, rows: usize) -> Vec<PhysicalRow> {
         let requested_rows = rows.max(self.height);
-        let total_rows = match self.mode {
-            GridMode::Main => self.main_rows.len(),
-            GridMode::Alternate => self.alt_rows.len(),
-        };
-        let end = total_rows.saturating_sub(scrollback_offset.min(total_rows));
-        let start = end.saturating_sub(requested_rows);
         let mut display_rows = match self.mode {
-            GridMode::Main => self
-                .main_rows
-                .iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .cloned()
-                .collect(),
-            GridMode::Alternate => self.alt_rows[start..end].to_vec(),
+            GridMode::Main => self.main_display_rows(scrollback_offset, requested_rows),
+            GridMode::Alternate => self.alt_display_rows(scrollback_offset, requested_rows),
         };
         if display_rows.len() < requested_rows {
             let missing = requested_rows.saturating_sub(display_rows.len());
@@ -919,16 +918,21 @@ impl TerminalGrid {
 
     #[must_use]
     pub fn main_row_count(&self) -> usize {
-        self.main_rows.len()
+        self.history_projected_row_count()
+            .saturating_add(projected_pending_row_count(
+                &self.pending_history_cells,
+                self.width,
+            ))
+            .saturating_add(self.main_rows.len())
     }
 
-    pub(crate) fn main_rows(&self) -> impl Iterator<Item = &PhysicalRow> {
-        self.main_rows.iter()
+    pub(crate) fn main_rows(&self) -> Vec<PhysicalRow> {
+        self.all_main_rows()
     }
 
     #[must_use]
     pub fn all_main_rows(&self) -> Vec<PhysicalRow> {
-        self.main_rows.iter().cloned().collect()
+        self.display_rows(0, self.main_row_count())
     }
 
     #[must_use]
@@ -940,97 +944,8 @@ impl TerminalGrid {
         self.revision = self.revision.saturating_add(1);
     }
 
-    fn cursor_absolute_row(&self) -> usize {
-        match self.mode {
-            GridMode::Main => self
-                .main_rows
-                .len()
-                .saturating_sub(self.height)
-                .saturating_add(self.cursor.row),
-            GridMode::Alternate => self.cursor.row,
-        }
-    }
-
-    fn main_cursor_anchor(&self) -> Option<CursorAnchor> {
-        if self.mode != GridMode::Main || self.main_rows.is_empty() {
-            return None;
-        }
-        let cursor_absolute_row = self.cursor_absolute_row().min(self.main_rows.len() - 1);
-        let mut logical_line = 0_usize;
-        let mut logical_start = 0_usize;
-        for (index, row) in self.main_rows.iter().enumerate() {
-            if index == cursor_absolute_row {
-                let logical_col = self.logical_col_in_run(logical_start, cursor_absolute_row);
-                return Some(CursorAnchor {
-                    logical_line,
-                    logical_col,
-                });
-            }
-            if !row.wrapped() {
-                logical_line = logical_line.saturating_add(1);
-                logical_start = index.saturating_add(1);
-            }
-        }
-        None
-    }
-
-    fn logical_col_in_run(&self, start_row: usize, cursor_row: usize) -> usize {
-        let prefix_rows = cursor_row.saturating_sub(start_row);
-        prefix_rows
-            .saturating_mul(self.width)
-            .saturating_add(self.cursor.col)
-    }
-
-    fn restore_main_cursor_anchor(&mut self, anchor: Option<CursorAnchor>) {
-        let Some(anchor) = anchor else {
-            self.clamp_cursor();
-            return;
-        };
-        if self.main_rows.is_empty() {
-            self.cursor.row = 0;
-            self.cursor.col = 0;
-            return;
-        }
-        let mut logical_line = 0_usize;
-        let mut run_start = 0_usize;
-        for (index, row) in self.main_rows.iter().enumerate() {
-            if logical_line == anchor.logical_line && !row.wrapped() {
-                self.place_cursor_in_main_run(run_start, index, anchor.logical_col);
-                return;
-            }
-            if !row.wrapped() {
-                logical_line = logical_line.saturating_add(1);
-                run_start = index.saturating_add(1);
-            }
-        }
-        let last_row = self.main_rows.len().saturating_sub(1);
-        if logical_line == anchor.logical_line {
-            self.place_cursor_in_main_run(run_start, last_row, anchor.logical_col);
-        } else {
-            self.place_cursor_absolute(last_row, self.width.saturating_sub(1));
-        }
-    }
-
-    fn place_cursor_in_main_run(&mut self, start_row: usize, end_row: usize, logical_col: usize) {
-        let row_offset = if self.width == 0 {
-            0
-        } else {
-            logical_col / self.width
-        };
-        let absolute_row = start_row.saturating_add(row_offset).min(end_row);
-        let col = if self.width == 0 {
-            0
-        } else {
-            logical_col % self.width
-        };
-        self.place_cursor_absolute(absolute_row, col);
-    }
-
-    fn place_cursor_absolute(&mut self, absolute_row: usize, col: usize) {
-        let viewport_start = self.main_rows.len().saturating_sub(self.height);
-        self.cursor.row = absolute_row.saturating_sub(viewport_start);
-        self.cursor.col = col;
-        self.clamp_cursor();
+    const fn cursor_absolute_row(&self) -> usize {
+        self.cursor.row
     }
 
     fn active_row_mut(&mut self, absolute_row: usize) -> &mut PhysicalRow {
@@ -1049,26 +964,19 @@ impl TerminalGrid {
         *self.active_row_mut(absolute_row) = row;
     }
 
-    fn viewport_absolute_row(&self, row: usize) -> usize {
-        match self.mode {
-            GridMode::Main => self
-                .main_rows
-                .len()
-                .saturating_sub(self.height)
-                .saturating_add(row),
-            GridMode::Alternate => row,
-        }
+    const fn viewport_absolute_row(row: usize) -> usize {
+        row
     }
 
     fn viewport_row(&self, row: usize) -> PhysicalRow {
         match self.mode {
-            GridMode::Main => self.main_rows[self.viewport_absolute_row(row)].clone(),
+            GridMode::Main => self.main_rows[Self::viewport_absolute_row(row)].clone(),
             GridMode::Alternate => self.alt_rows[row].clone(),
         }
     }
 
     fn set_viewport_row(&mut self, row: usize, value: PhysicalRow) {
-        let absolute = self.viewport_absolute_row(row);
+        let absolute = Self::viewport_absolute_row(row);
         *self.active_row_mut(absolute) = value;
     }
 
@@ -1110,6 +1018,9 @@ impl TerminalGrid {
     fn scroll_up_one(&mut self) {
         match self.mode {
             GridMode::Main => {
+                if let Some(row) = self.main_rows.pop_front() {
+                    self.push_history_row(&row);
+                }
                 self.main_rows.push_back(PhysicalRow::new());
                 self.total_scrolled_rows = self.total_scrolled_rows.saturating_add(1);
                 self.evict_excess_history();
@@ -1128,6 +1039,223 @@ impl TerminalGrid {
         self.active_row_mut(row).set_wrapped(true);
     }
 
+    fn push_history_row(&mut self, row: &PhysicalRow) {
+        self.pending_history_cells
+            .extend(row_logical_cells(row, self.width));
+        if !row.wrapped() {
+            let cells = trim_trailing_blank_cells(std::mem::take(&mut self.pending_history_cells));
+            self.push_history_line(LogicalLine { cells });
+        }
+    }
+
+    fn push_history_line(&mut self, line: LogicalLine) {
+        self.main_history_projected_rows = self
+            .main_history_projected_rows
+            .saturating_add(projected_row_count(&line.cells, self.width));
+        self.main_history.push_back(line);
+    }
+
+    fn history_projected_row_count(&self) -> usize {
+        self.main_history
+            .iter()
+            .map(|line| projected_row_count(&line.cells, self.width))
+            .sum()
+    }
+
+    fn main_display_rows(
+        &self,
+        scrollback_offset: usize,
+        requested_rows: usize,
+    ) -> Vec<PhysicalRow> {
+        let mut skipped = 0_usize;
+        let mut selected = Vec::with_capacity(requested_rows);
+        for row in self.main_rows.iter().rev() {
+            collect_reversed_row(
+                row.clone(),
+                scrollback_offset,
+                requested_rows,
+                &mut skipped,
+                &mut selected,
+            );
+            if selected.len() >= requested_rows {
+                break;
+            }
+        }
+        if selected.len() < requested_rows && !self.pending_history_cells.is_empty() {
+            collect_projected_line_reversed(
+                &self.pending_history_cells,
+                self.width,
+                scrollback_offset,
+                requested_rows,
+                &mut skipped,
+                &mut selected,
+            );
+        }
+        for line in self.main_history.iter().rev() {
+            if selected.len() >= requested_rows {
+                break;
+            }
+            collect_projected_line_reversed(
+                &line.cells,
+                self.width,
+                scrollback_offset,
+                requested_rows,
+                &mut skipped,
+                &mut selected,
+            );
+        }
+        selected.reverse();
+        selected
+    }
+
+    fn alt_display_rows(
+        &self,
+        scrollback_offset: usize,
+        requested_rows: usize,
+    ) -> Vec<PhysicalRow> {
+        let total_rows = self.alt_rows.len();
+        let end = total_rows.saturating_sub(scrollback_offset.min(total_rows));
+        let start = end.saturating_sub(requested_rows);
+        self.alt_rows[start..end].to_vec()
+    }
+
+    fn resize_main_viewport(&mut self, new_width: usize, new_height: usize) {
+        let mut source_rows = self.main_rows.iter().cloned().collect::<Vec<_>>();
+        while source_rows.len() > 1
+            && source_rows
+                .last()
+                .is_some_and(|row| row_is_blank(row) && !row.wrapped())
+            && self.cursor.row < source_rows.len().saturating_sub(1)
+        {
+            source_rows.pop();
+        }
+        let anchor = self.live_cursor_anchor(&source_rows);
+        let live_lines = self.live_logical_lines(&source_rows);
+        let mut projected_by_line = Vec::with_capacity(live_lines.len());
+        let mut total_rows = 0_usize;
+        for line in &live_lines {
+            let rows = project_logical_line(&line.cells, new_width);
+            total_rows = total_rows.saturating_add(rows.len());
+            projected_by_line.push(rows.into_iter().collect::<Vec<_>>());
+        }
+        let keep_start = total_rows.saturating_sub(new_height);
+        let mut row_index = 0_usize;
+        let mut next_pending = Vec::new();
+        let mut next_rows = VecDeque::new();
+        for (line, rows) in live_lines.iter().zip(&projected_by_line) {
+            let line_start = row_index;
+            let line_end = line_start.saturating_add(rows.len());
+            if line_end <= keep_start {
+                self.push_history_line(line.clone());
+            } else if line_start < keep_start {
+                let hidden = keep_start.saturating_sub(line_start);
+                for row in rows.iter().take(hidden) {
+                    next_pending.extend(row_logical_cells(row, new_width));
+                }
+                for row in rows.iter().skip(hidden) {
+                    next_rows.push_back(row.clone());
+                }
+            } else {
+                for row in rows {
+                    next_rows.push_back(row.clone());
+                }
+            }
+            row_index = line_end;
+        }
+        self.pending_history_cells = trim_trailing_blank_cells(next_pending);
+        while next_rows.len() < new_height {
+            next_rows.push_back(PhysicalRow::new());
+        }
+        while next_rows.len() > new_height {
+            if let Some(row) = next_rows.pop_front() {
+                self.push_history_row(&row);
+            }
+        }
+        self.main_rows = next_rows;
+        self.restore_live_cursor_anchor(
+            anchor,
+            &projected_by_line,
+            keep_start,
+            new_width,
+            new_height,
+        );
+    }
+
+    fn live_cursor_anchor(&self, source_rows: &[PhysicalRow]) -> Option<CursorAnchor> {
+        if self.mode != GridMode::Main || source_rows.is_empty() {
+            return None;
+        }
+        let mut logical_line = 0_usize;
+        let mut run_start = 0_usize;
+        let mut prefix_cols = logical_width(&self.pending_history_cells);
+        for (index, row) in source_rows.iter().enumerate() {
+            if index == self.cursor.row.min(source_rows.len().saturating_sub(1)) {
+                return Some(CursorAnchor {
+                    logical_line,
+                    logical_col: prefix_cols
+                        .saturating_add(index.saturating_sub(run_start).saturating_mul(self.width))
+                        .saturating_add(self.cursor.col),
+                });
+            }
+            if !row.wrapped() {
+                logical_line = logical_line.saturating_add(1);
+                run_start = index.saturating_add(1);
+                prefix_cols = 0;
+            }
+        }
+        None
+    }
+
+    fn live_logical_lines(&mut self, source_rows: &[PhysicalRow]) -> Vec<LogicalLine> {
+        let mut lines = Vec::new();
+        let mut logical = std::mem::take(&mut self.pending_history_cells);
+        for row in source_rows {
+            logical.extend(row_logical_cells(row, self.width));
+            if !row.wrapped() {
+                lines.push(LogicalLine {
+                    cells: trim_trailing_blank_cells(std::mem::take(&mut logical)),
+                });
+            }
+        }
+        if !logical.is_empty() {
+            lines.push(LogicalLine {
+                cells: trim_trailing_blank_cells(logical),
+            });
+        }
+        if lines.is_empty() {
+            lines.push(LogicalLine::default());
+        }
+        lines
+    }
+
+    fn restore_live_cursor_anchor(
+        &mut self,
+        anchor: Option<CursorAnchor>,
+        projected_by_line: &[Vec<PhysicalRow>],
+        keep_start: usize,
+        width: usize,
+        height: usize,
+    ) {
+        let Some(anchor) = anchor else {
+            self.clamp_cursor();
+            return;
+        };
+        let mut absolute_row = 0_usize;
+        for (line_index, rows) in projected_by_line.iter().enumerate() {
+            if line_index == anchor.logical_line {
+                absolute_row = absolute_row.saturating_add(anchor.logical_col / width.max(1));
+                self.cursor.row = absolute_row
+                    .saturating_sub(keep_start)
+                    .min(height.saturating_sub(1));
+                self.cursor.col = (anchor.logical_col % width.max(1)).min(width.saturating_sub(1));
+                self.clamp_cursor();
+                return;
+            }
+            absolute_row = absolute_row.saturating_add(rows.len());
+        }
+        self.clamp_cursor();
+    }
+
     fn append_combining(&mut self, ch: char) {
         let row = self.cursor_absolute_row();
         let col = self.cursor.col.saturating_sub(1);
@@ -1144,9 +1272,23 @@ impl TerminalGrid {
     }
 
     fn evict_excess_history(&mut self) {
-        let max_rows = self.limits.scrollback_rows.saturating_add(self.height);
-        while self.main_rows.len() > max_rows.max(self.height) {
-            self.main_rows.pop_front();
+        while self.main_history.len() > self.limits.scrollback_rows
+            || self
+                .main_history_projected_rows
+                .saturating_add(projected_pending_row_count(
+                    &self.pending_history_cells,
+                    self.width,
+                ))
+                > self.limits.scrollback_rows
+        {
+            if let Some(line) = self.main_history.pop_front() {
+                self.main_history_projected_rows = self
+                    .main_history_projected_rows
+                    .saturating_sub(projected_row_count(&line.cells, self.width));
+            } else {
+                self.pending_history_cells.clear();
+                break;
+            }
         }
     }
 }
@@ -1216,6 +1358,95 @@ fn row_from_snapshot(snapshot: &RowSnapshot, width: usize) -> PhysicalRow {
     row
 }
 
+fn hydrate_logical_history(
+    rows: &[PhysicalRow],
+    width: usize,
+    history: &mut VecDeque<LogicalLine>,
+    pending: &mut Vec<Cell>,
+) {
+    for row in rows {
+        pending.extend(row_logical_cells(row, width));
+        if !row.wrapped() {
+            history.push_back(LogicalLine {
+                cells: trim_trailing_blank_cells(std::mem::take(pending)),
+            });
+        }
+    }
+}
+
+fn row_logical_cells(row: &PhysicalRow, width: usize) -> Vec<Cell> {
+    row.visual_cells(width)
+        .into_iter()
+        .filter(|cell| !cell.is_wide_continuation())
+        .collect()
+}
+
+fn trim_trailing_blank_cells(mut cells: Vec<Cell>) -> Vec<Cell> {
+    while cells
+        .last()
+        .is_some_and(|cell| cell.text() == " " && !cell.is_wide_continuation())
+    {
+        cells.pop();
+    }
+    cells
+}
+
+fn projected_row_count(cells: &[Cell], width: usize) -> usize {
+    project_logical_line(cells, width).len()
+}
+
+fn projected_pending_row_count(cells: &[Cell], width: usize) -> usize {
+    if cells.is_empty() {
+        0
+    } else {
+        projected_row_count(cells, width)
+    }
+}
+
+fn logical_width(cells: &[Cell]) -> usize {
+    cells
+        .iter()
+        .map(|cell| usize::from(cell.width()).max(1))
+        .sum()
+}
+
+fn row_is_blank(row: &PhysicalRow) -> bool {
+    row.cells().iter().all(|cell| cell.text() == " ")
+}
+
+fn collect_reversed_row(
+    row: PhysicalRow,
+    scrollback_offset: usize,
+    requested_rows: usize,
+    skipped: &mut usize,
+    selected: &mut Vec<PhysicalRow>,
+) {
+    if *skipped < scrollback_offset {
+        *skipped = skipped.saturating_add(1);
+        return;
+    }
+    if selected.len() < requested_rows {
+        selected.push(row);
+    }
+}
+
+fn collect_projected_line_reversed(
+    cells: &[Cell],
+    width: usize,
+    scrollback_offset: usize,
+    requested_rows: usize,
+    skipped: &mut usize,
+    selected: &mut Vec<PhysicalRow>,
+) {
+    let rows = project_logical_line(cells, width);
+    for row in rows.into_iter().rev() {
+        collect_reversed_row(row, scrollback_offset, requested_rows, skipped, selected);
+        if selected.len() >= requested_rows {
+            break;
+        }
+    }
+}
+
 fn indexed_color(index: i64) -> Option<Color> {
     Some(Color::Indexed(u8::try_from(index).ok()?))
 }
@@ -1261,6 +1492,25 @@ mod tests {
             .find(|row| row_text(row) == "abcdefghij")
             .expect("reflowed logical line should be retained");
         assert!(!text_row.wrapped());
+    }
+
+    #[test]
+    fn resize_reflows_line_split_across_history_and_viewport() {
+        let mut grid = TerminalGrid::new(
+            5,
+            2,
+            GridLimits {
+                scrollback_rows: 20,
+            },
+        )
+        .unwrap();
+        grid.process(b"abcdefghijk");
+
+        grid.resize(10, 2).unwrap();
+
+        let rows = grid.display_rows(0, 2);
+        assert_eq!(row_text(&rows[0]), "abcdefghij");
+        assert_eq!(row_text(&rows[1]), "k");
     }
 
     #[test]
@@ -1370,13 +1620,13 @@ mod tests {
         }
 
         grid.resize(24, 20).unwrap();
-        assert!(grid.all_main_rows().len() <= 520);
+        assert!(grid.main_history.len() <= 500);
         let narrow_text = crate::visible_text(&grid, 0, 80);
         assert!(narrow_text.contains("line-1499"));
         assert!(narrow_text.contains("payload"));
 
         grid.resize(100, 20).unwrap();
-        assert!(grid.all_main_rows().len() <= 520);
+        assert!(grid.main_history.len() <= 500);
         let wide_text = crate::visible_text(&grid, 0, 40);
         assert!(wide_text.contains("line-1499 payload payload payload"));
     }

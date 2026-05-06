@@ -529,12 +529,11 @@ fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = Extensio
             cells,
             ..
         } => {
-            let rows = if *cols == 0 {
-                0
-            } else {
-                let len = u16::try_from(cells.len()).unwrap_or(u16::MAX);
-                len.saturating_add(cols.saturating_sub(1)) / *cols
-            };
+            let len = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+            let rows = len
+                .saturating_add(cols.saturating_sub(1))
+                .checked_div(*cols)
+                .unwrap_or(0);
             vec![ExtensionRect {
                 x: *origin_col,
                 y: *origin_row,
