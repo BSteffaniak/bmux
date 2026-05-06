@@ -64,9 +64,11 @@ const fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
         // Need CSI u only for Super+char.
         KeyCode::Char(_) => mods.super_key,
 
-        // Enter, Tab, Backspace, Escape: legacy only handles Alt prefix.
-        // Need CSI u when Ctrl, Shift, or Super is set.
-        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Escape | KeyCode::Space => {
+        // Enter, Backspace, Escape, Space: legacy only handles Alt prefix.
+        // Tab additionally has a widely-supported legacy Shift+Tab sequence
+        // (ESC [ Z), so only Ctrl/Super require CSI u there.
+        KeyCode::Tab => mods.ctrl || mods.super_key,
+        KeyCode::Enter | KeyCode::Backspace | KeyCode::Escape | KeyCode::Space => {
             mods.ctrl || mods.shift || mods.super_key
         }
 
@@ -182,6 +184,19 @@ mod tests {
                 (c - b'a' + b'A') as char,
             );
         }
+    }
+
+    #[cfg(feature = "csi-u")]
+    #[test]
+    fn shift_tab_uses_legacy_backtab_sequence() {
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Tab,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode_key(&stroke, true).unwrap(), b"\x1b[Z");
     }
 
     #[cfg(feature = "csi-u")]

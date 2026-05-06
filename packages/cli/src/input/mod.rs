@@ -1864,6 +1864,64 @@ mod tests {
     }
 
     #[test]
+    fn terminal_backtab_forwards_legacy_shift_tab_sequence() {
+        let modes = BTreeMap::from([("insert".to_string(), modal_mode("INSERT", true, &[]))]);
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(250),
+            "insert",
+            &modes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("modal keymap should parse");
+        let mut processor = new_processor(keymap);
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::BackTab, KeyModifiers::NONE)),
+            vec![RuntimeAction::ForwardToPane(b"\x1b[Z".to_vec())]
+        );
+    }
+
+    #[test]
+    fn command_like_modified_char_does_not_match_plain_normal_mode_binding() {
+        let new_window = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "new-window".to_string(),
+            args: vec![],
+        };
+        let modes = BTreeMap::from([(
+            "normal".to_string(),
+            modal_mode("NORMAL", false, &[("c", new_window.clone())]),
+        )]);
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(250),
+            "normal",
+            &modes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("modal keymap should parse");
+        let mut processor = new_processor(keymap);
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::NONE)),
+            vec![new_window]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::META)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::HYPER)),
+            Vec::<RuntimeAction>::new()
+        );
+    }
+
+    #[test]
     fn parse_runtime_action_name_accepts_plugin_command_action() {
         assert_eq!(
             super::parse_runtime_action_name("plugin:bmux.windows:new-window")

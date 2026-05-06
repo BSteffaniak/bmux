@@ -16,6 +16,9 @@ use crate::types::{KeyCode, KeyStroke, Modifiers};
 ///
 /// Per the kitty keyboard protocol specification:
 /// `modifier_param = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (super ? 8 : 0)`
+///
+/// bmux's canonical key model currently stores Super/Hyper/Meta in one
+/// `super_key` bucket, so encoding always emits the Super bit.
 #[must_use]
 pub const fn modifier_param(mods: Modifiers) -> u8 {
     let mut param: u8 = 1;
@@ -47,7 +50,10 @@ pub const fn modifiers_from_param(param: u8) -> Option<Modifiers> {
         shift: val & 1 != 0,
         alt: val & 2 != 0,
         ctrl: val & 4 != 0,
-        super_key: val & 8 != 0,
+        // Fold Kitty's Super, Hyper, and Meta modifier bits into bmux's
+        // single platform-command modifier bucket so they never collapse to
+        // a plain key during keymap matching.
+        super_key: val & (8 | 16 | 32) != 0,
     })
 }
 
@@ -381,6 +387,20 @@ mod tests {
     #[test]
     fn modifiers_from_param_zero_is_none() {
         assert!(modifiers_from_param(0).is_none());
+    }
+
+    #[test]
+    fn modifiers_from_param_folds_hyper_and_meta_into_super_bucket() {
+        for param in [17, 33] {
+            let modifiers = modifiers_from_param(param).expect("valid modifier param");
+            assert!(
+                modifiers.super_key,
+                "param {param} should preserve command-like modifiers"
+            );
+            assert!(!modifiers.shift);
+            assert!(!modifiers.alt);
+            assert!(!modifiers.ctrl);
+        }
     }
 
     #[test]

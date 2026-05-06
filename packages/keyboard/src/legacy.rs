@@ -13,6 +13,7 @@ use crate::types::{KeyCode, KeyStroke, Modifiers};
 /// Legacy encoding has limited modifier support:
 /// - Ctrl+alpha maps to control codes (0x01-0x1a)
 /// - Alt prepends ESC (0x1b) for chars, Enter, Tab, Backspace
+/// - Shift+Tab maps to the legacy back-tab sequence (`ESC [ Z`)
 /// - Shift on alphabetic chars maps to uppercase (A-Z)
 /// - Shift encodes for arrow keys (modifier param 2)
 /// - Other modifier combinations for special keys are silently lost
@@ -74,7 +75,11 @@ pub fn encode_with_modes(
         }
         KeyCode::Tab => {
             push_alt(&mut out);
-            out.push(b'\t');
+            if shift {
+                out.extend_from_slice(b"\x1b[Z");
+            } else {
+                out.push(b'\t');
+            }
             Some(out)
         }
         KeyCode::Backspace => {
@@ -379,6 +384,31 @@ mod tests {
             },
         );
         assert_eq!(encode(&stroke).unwrap(), b"\x1bx");
+    }
+
+    #[test]
+    fn encode_shift_tab() {
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Tab,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode(&stroke).unwrap(), b"\x1b[Z");
+    }
+
+    #[test]
+    fn encode_alt_shift_tab() {
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Tab,
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode(&stroke).unwrap(), b"\x1b\x1b[Z");
     }
 
     #[test]

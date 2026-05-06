@@ -48,7 +48,9 @@ pub const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let alt = modifiers.contains(KeyModifiers::ALT);
     let mut shift = modifiers.contains(KeyModifiers::SHIFT);
-    let super_key = modifiers.contains(KeyModifiers::SUPER);
+    let super_key = modifiers.contains(KeyModifiers::SUPER)
+        || modifiers.contains(KeyModifiers::HYPER)
+        || modifiers.contains(KeyModifiers::META);
 
     let key_code = match key.code {
         CrosstermKeyCode::Char(c) => {
@@ -67,6 +69,10 @@ pub const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
         }
         CrosstermKeyCode::Enter => KeyCode::Enter,
         CrosstermKeyCode::Tab => KeyCode::Tab,
+        CrosstermKeyCode::BackTab => {
+            shift = true;
+            KeyCode::Tab
+        }
         CrosstermKeyCode::Backspace => KeyCode::Backspace,
         CrosstermKeyCode::Esc => KeyCode::Escape,
         CrosstermKeyCode::Up => KeyCode::Up,
