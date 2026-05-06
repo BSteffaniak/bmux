@@ -409,6 +409,7 @@ impl ScreenInspector {
             }
 
             if !data.is_empty() {
+                state.terminal_grid.process(&data);
                 result.pane_outputs.push(PaneOutputChunk {
                     pane_index: state.pane_index,
                     data,
@@ -556,7 +557,7 @@ impl ScreenInspector {
             .find(|state| state.pane_index == pane_index)
             .map(|state| state.pane_id)?;
         let grid = &self.pane_states.get(&pane_id)?.terminal_grid;
-        Some(terminal_grid_rows_to_text(grid.grid().all_main_rows()))
+        Some(terminal_grid_rows_to_text(grid.grid().all_main_rows_slow()))
     }
 
     /// Get cursor position for a pane (by index). Returns (row, col).

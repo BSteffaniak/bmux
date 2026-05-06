@@ -57,30 +57,17 @@ pub struct GridSnapshot {
 impl GridSnapshot {
     #[must_use]
     pub fn from_grid(grid: &TerminalGrid, scrollback_offset: usize, rows: usize) -> Self {
-        let total_rows = match grid.mode() {
-            GridMode::Main => grid.main_row_count(),
-            GridMode::Alternate => grid.height(),
+        let requested_rows = if rows == usize::MAX {
+            grid.height()
+        } else {
+            rows.max(grid.height())
         };
-        let viewport_start = total_rows.saturating_sub(grid.height());
-        let scrollback_rows = u32::try_from(viewport_start).unwrap_or(u32::MAX);
-        let end = total_rows.saturating_sub(scrollback_offset.min(total_rows));
-        let start = end.saturating_sub(rows.max(grid.height()));
-        let selected_rows = match grid.mode() {
-            GridMode::Main => grid
-                .main_rows()
-                .into_iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .map(|row| row_snapshot(&row, grid.width()))
-                .collect(),
-            GridMode::Alternate => grid
-                .viewport_rows()
-                .into_iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .map(|row| row_snapshot(&row, grid.width()))
-                .collect(),
-        };
+        let scrollback_rows = u32::try_from(grid.scrollback_rows_hint()).unwrap_or(u32::MAX);
+        let projected_rows = grid.display_rows_unpadded(scrollback_offset, requested_rows);
+        let selected_rows = projected_rows
+            .into_iter()
+            .map(|row| row_snapshot(&row, grid.width()))
+            .collect();
         let cursor = cursor_snapshot(grid.cursor());
         Self {
             revision: grid.revision(),

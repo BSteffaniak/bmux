@@ -1,8 +1,9 @@
-use crate::reflow::project_logical_line;
+use crate::reflow::{project_logical_line, projected_logical_line_row_count};
 use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use unicode_width::UnicodeWidthChar;
 
@@ -26,6 +27,20 @@ impl Default for GridLimits {
 pub enum GridMode {
     Main,
     Alternate,
+}
+
+/// Bounded row window requested from a terminal grid projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridRowWindow {
+    pub scrollback_offset: usize,
+    pub rows: usize,
+}
+
+/// Rows projected for a bounded display window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedRows {
+    pub rows: Vec<PhysicalRow>,
+    pub has_more_above: bool,
 }
 
 /// Grid cursor in viewport-relative coordinates.
@@ -278,9 +293,48 @@ pub struct TerminalGrid {
     protocol: ProtocolState,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct LogicalLine {
     cells: Vec<Cell>,
+    cached_projection_width: AtomicUsize,
+    cached_projected_rows: AtomicUsize,
+}
+
+impl Clone for LogicalLine {
+    fn clone(&self) -> Self {
+        Self {
+            cells: self.cells.clone(),
+            cached_projection_width: AtomicUsize::new(
+                self.cached_projection_width.load(Ordering::Relaxed),
+            ),
+            cached_projected_rows: AtomicUsize::new(
+                self.cached_projected_rows.load(Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl LogicalLine {
+    fn new(cells: Vec<Cell>) -> Self {
+        Self {
+            cells,
+            cached_projection_width: AtomicUsize::new(0),
+            cached_projected_rows: AtomicUsize::new(0),
+        }
+    }
+
+    fn projected_row_count(&self, width: usize) -> usize {
+        if self.cached_projection_width.load(Ordering::Relaxed) == width {
+            let rows = self.cached_projected_rows.load(Ordering::Relaxed);
+            if rows != 0 {
+                return rows;
+            }
+        }
+        let rows = projected_logical_line_row_count(&self.cells, width);
+        self.cached_projected_rows.store(rows, Ordering::Relaxed);
+        self.cached_projection_width.store(width, Ordering::Relaxed);
+        rows
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -391,7 +445,7 @@ impl TerminalGrid {
         }
         let main_history_projected_rows = main_history
             .iter()
-            .map(|line| projected_row_count(&line.cells, width))
+            .map(|line| line.projected_row_count(width))
             .sum();
         let mut grid = Self {
             width,
@@ -899,13 +953,24 @@ impl TerminalGrid {
         }
     }
 
-    #[must_use]
-    pub fn display_rows(&self, scrollback_offset: usize, rows: usize) -> Vec<PhysicalRow> {
+    pub(crate) fn display_rows_unpadded(
+        &self,
+        scrollback_offset: usize,
+        rows: usize,
+    ) -> Vec<PhysicalRow> {
         let requested_rows = rows.max(self.height);
-        let mut display_rows = match self.mode {
+        match self.mode {
             GridMode::Main => self.main_display_rows(scrollback_offset, requested_rows),
             GridMode::Alternate => self.alt_display_rows(scrollback_offset, requested_rows),
-        };
+        }
+    }
+
+    #[must_use]
+    pub fn display_window(&self, window: GridRowWindow) -> ProjectedRows {
+        let requested_rows = window.rows.max(self.height);
+        let mut display_rows = self.display_rows_unpadded(window.scrollback_offset, requested_rows);
+        let has_more_above =
+            window.scrollback_offset.saturating_add(display_rows.len()) < self.display_row_count();
         if display_rows.len() < requested_rows {
             let missing = requested_rows.saturating_sub(display_rows.len());
             let mut padded = Vec::with_capacity(requested_rows);
@@ -913,7 +978,34 @@ impl TerminalGrid {
             padded.extend(display_rows);
             display_rows = padded;
         }
-        display_rows
+        ProjectedRows {
+            rows: display_rows,
+            has_more_above,
+        }
+    }
+
+    #[must_use]
+    pub fn display_rows(&self, scrollback_offset: usize, rows: usize) -> Vec<PhysicalRow> {
+        self.display_window(GridRowWindow {
+            scrollback_offset,
+            rows,
+        })
+        .rows
+    }
+
+    #[must_use]
+    pub fn scrollback_rows_hint(&self) -> usize {
+        match self.mode {
+            GridMode::Main => self
+                .main_history
+                .len()
+                .saturating_add(projected_pending_row_count(
+                    &self.pending_history_cells,
+                    self.width,
+                ))
+                .saturating_add(self.main_rows.len().saturating_sub(self.height)),
+            GridMode::Alternate => 0,
+        }
     }
 
     #[must_use]
@@ -926,12 +1018,19 @@ impl TerminalGrid {
             .saturating_add(self.main_rows.len())
     }
 
-    pub(crate) fn main_rows(&self) -> Vec<PhysicalRow> {
-        self.all_main_rows()
+    fn display_row_count(&self) -> usize {
+        match self.mode {
+            GridMode::Main => self.main_row_count(),
+            GridMode::Alternate => self.alt_rows.len(),
+        }
     }
 
+    /// Materialize all retained main-screen rows.
+    ///
+    /// This is intentionally named as a slow path. Production render and resize
+    /// code should use [`Self::display_rows`] with a bounded row count instead.
     #[must_use]
-    pub fn all_main_rows(&self) -> Vec<PhysicalRow> {
+    pub fn all_main_rows_slow(&self) -> Vec<PhysicalRow> {
         self.display_rows(0, self.main_row_count())
     }
 
@@ -1044,21 +1143,21 @@ impl TerminalGrid {
             .extend(row_logical_cells(row, self.width));
         if !row.wrapped() {
             let cells = trim_trailing_blank_cells(std::mem::take(&mut self.pending_history_cells));
-            self.push_history_line(LogicalLine { cells });
+            self.push_history_line(LogicalLine::new(cells));
         }
     }
 
     fn push_history_line(&mut self, line: LogicalLine) {
         self.main_history_projected_rows = self
             .main_history_projected_rows
-            .saturating_add(projected_row_count(&line.cells, self.width));
+            .saturating_add(line.projected_row_count(self.width));
         self.main_history.push_back(line);
     }
 
     fn history_projected_row_count(&self) -> usize {
         self.main_history
             .iter()
-            .map(|line| projected_row_count(&line.cells, self.width))
+            .map(|line| line.projected_row_count(self.width))
             .sum()
     }
 
@@ -1068,7 +1167,7 @@ impl TerminalGrid {
         requested_rows: usize,
     ) -> Vec<PhysicalRow> {
         let mut skipped = 0_usize;
-        let mut selected = Vec::with_capacity(requested_rows);
+        let mut selected = Vec::with_capacity(requested_rows.min(self.height.saturating_mul(2)));
         for row in self.main_rows.iter().rev() {
             collect_reversed_row(
                 row.clone(),
@@ -1084,6 +1183,7 @@ impl TerminalGrid {
         if selected.len() < requested_rows && !self.pending_history_cells.is_empty() {
             collect_projected_line_reversed(
                 &self.pending_history_cells,
+                projected_row_count(&self.pending_history_cells, self.width),
                 self.width,
                 scrollback_offset,
                 requested_rows,
@@ -1097,6 +1197,7 @@ impl TerminalGrid {
             }
             collect_projected_line_reversed(
                 &line.cells,
+                line.projected_row_count(self.width),
                 self.width,
                 scrollback_offset,
                 requested_rows,
@@ -1212,15 +1313,13 @@ impl TerminalGrid {
         for row in source_rows {
             logical.extend(row_logical_cells(row, self.width));
             if !row.wrapped() {
-                lines.push(LogicalLine {
-                    cells: trim_trailing_blank_cells(std::mem::take(&mut logical)),
-                });
+                lines.push(LogicalLine::new(trim_trailing_blank_cells(std::mem::take(
+                    &mut logical,
+                ))));
             }
         }
         if !logical.is_empty() {
-            lines.push(LogicalLine {
-                cells: trim_trailing_blank_cells(logical),
-            });
+            lines.push(LogicalLine::new(trim_trailing_blank_cells(logical)));
         }
         if lines.is_empty() {
             lines.push(LogicalLine::default());
@@ -1272,19 +1371,11 @@ impl TerminalGrid {
     }
 
     fn evict_excess_history(&mut self) {
-        while self.main_history.len() > self.limits.scrollback_rows
-            || self
-                .main_history_projected_rows
-                .saturating_add(projected_pending_row_count(
-                    &self.pending_history_cells,
-                    self.width,
-                ))
-                > self.limits.scrollback_rows
-        {
+        while self.main_history.len() > self.limits.scrollback_rows {
             if let Some(line) = self.main_history.pop_front() {
                 self.main_history_projected_rows = self
                     .main_history_projected_rows
-                    .saturating_sub(projected_row_count(&line.cells, self.width));
+                    .saturating_sub(line.projected_row_count(self.width));
             } else {
                 self.pending_history_cells.clear();
                 break;
@@ -1367,9 +1458,9 @@ fn hydrate_logical_history(
     for row in rows {
         pending.extend(row_logical_cells(row, width));
         if !row.wrapped() {
-            history.push_back(LogicalLine {
-                cells: trim_trailing_blank_cells(std::mem::take(pending)),
-            });
+            history.push_back(LogicalLine::new(trim_trailing_blank_cells(std::mem::take(
+                pending,
+            ))));
         }
     }
 }
@@ -1392,7 +1483,7 @@ fn trim_trailing_blank_cells(mut cells: Vec<Cell>) -> Vec<Cell> {
 }
 
 fn projected_row_count(cells: &[Cell], width: usize) -> usize {
-    project_logical_line(cells, width).len()
+    projected_logical_line_row_count(cells, width)
 }
 
 fn projected_pending_row_count(cells: &[Cell], width: usize) -> usize {
@@ -1432,12 +1523,17 @@ fn collect_reversed_row(
 
 fn collect_projected_line_reversed(
     cells: &[Cell],
+    projected_rows: usize,
     width: usize,
     scrollback_offset: usize,
     requested_rows: usize,
     skipped: &mut usize,
     selected: &mut Vec<PhysicalRow>,
 ) {
+    if skipped.saturating_add(projected_rows) <= scrollback_offset {
+        *skipped = skipped.saturating_add(projected_rows);
+        return;
+    }
     let rows = project_logical_line(cells, width);
     for row in rows.into_iter().rev() {
         collect_reversed_row(row, scrollback_offset, requested_rows, skipped, selected);
@@ -1481,12 +1577,12 @@ mod tests {
         )
         .unwrap();
         grid.process(b"abcdefghij");
-        assert_eq!(grid.all_main_rows().len(), 2);
-        assert!(grid.all_main_rows()[0].wrapped());
-        assert!(!grid.all_main_rows()[1].wrapped());
+        assert_eq!(grid.all_main_rows_slow().len(), 2);
+        assert!(grid.all_main_rows_slow()[0].wrapped());
+        assert!(!grid.all_main_rows_slow()[1].wrapped());
 
         grid.resize(10, 2).unwrap();
-        let rows = grid.all_main_rows();
+        let rows = grid.all_main_rows_slow();
         let text_row = rows
             .iter()
             .find(|row| row_text(row) == "abcdefghij")
@@ -1525,7 +1621,7 @@ mod tests {
         .unwrap();
         grid.process(b"abc\r\ndef");
         grid.resize(10, 2).unwrap();
-        let rows = grid.all_main_rows();
+        let rows = grid.all_main_rows_slow();
         let texts = rows.iter().map(row_text).collect::<Vec<_>>();
         assert!(texts.windows(2).any(|window| window == ["abc", "def"]));
     }
@@ -1552,7 +1648,7 @@ mod tests {
     fn sgr_styles_are_interned() {
         let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
         grid.process(b"\x1b[31mred\x1b[0m plain");
-        let rows = grid.all_main_rows();
+        let rows = grid.all_main_rows_slow();
         let red = rows[0].cells()[0].style();
         let plain = rows[0].cells()[3].style();
         assert_ne!(red, plain);
@@ -1563,7 +1659,7 @@ mod tests {
     fn wide_chars_keep_spacer_cells() {
         let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
         grid.process("a界b".as_bytes());
-        let rows = grid.all_main_rows();
+        let rows = grid.all_main_rows_slow();
         assert_eq!(rows[0].cells()[1].text(), "界");
         assert!(rows[0].cells()[2].is_wide_continuation());
     }
@@ -1573,7 +1669,7 @@ mod tests {
         let mut grid = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
         grid.process("e\u{301}".as_bytes());
 
-        assert_eq!(grid.all_main_rows()[0].cells()[0].text(), "e\u{301}");
+        assert_eq!(grid.all_main_rows_slow()[0].cells()[0].text(), "e\u{301}");
         assert_eq!(grid.cursor().col, 1);
     }
 
@@ -1582,7 +1678,7 @@ mod tests {
         let mut grid = TerminalGrid::new(5, 2, GridLimits { scrollback_rows: 1 }).unwrap();
         grid.process(b"1\r\n2\r\n3\r\n4");
 
-        assert_eq!(grid.all_main_rows().len(), 3);
+        assert_eq!(grid.all_main_rows_slow().len(), 3);
     }
 
     #[test]
@@ -1600,9 +1696,44 @@ mod tests {
         grid.resize(4, 2).unwrap();
 
         assert_eq!(grid.cursor().col, 3);
-        let rows = grid.all_main_rows();
+        let rows = grid.all_main_rows_slow();
         assert_eq!(row_text(&rows[0]), "abcd");
         assert_eq!(row_text(&rows[1]), "efg");
+    }
+
+    #[test]
+    fn large_scrollback_resize_and_snapshot_project_only_visible_tail() {
+        let mut grid = TerminalGrid::new(
+            80,
+            20,
+            GridLimits {
+                scrollback_rows: 5_000,
+            },
+        )
+        .unwrap();
+        for index in 0..5_000 {
+            grid.process(format!("line-{index:04} payload payload payload\r\n").as_bytes());
+        }
+
+        crate::reflow::reset_projection_stats();
+        grid.resize(24, 20).unwrap();
+        let resize_stats = crate::reflow::projection_stats();
+        assert!(
+            resize_stats.logical_lines_projected <= 24,
+            "resize should project only the live tail, got {resize_stats:?}"
+        );
+
+        crate::reflow::reset_projection_stats();
+        let snapshot = grid.snapshot(0, 20);
+        let snapshot_stats = crate::reflow::projection_stats();
+        assert_eq!(snapshot.rows.len(), 20);
+        assert!(
+            snapshot_stats.logical_lines_projected <= 20,
+            "bounded snapshot should project only visible rows, got {snapshot_stats:?}"
+        );
+
+        let clamped_snapshot = grid.snapshot(0, usize::MAX);
+        assert_eq!(clamped_snapshot.rows.len(), grid.height());
     }
 
     #[test]

@@ -109,7 +109,7 @@ impl TerminalGridStream {
         delta: &GridDeltaBatch,
         limits: GridLimits,
     ) -> Result<(), TerminalGridStreamDeltaError> {
-        let mut snapshot = self.snapshot(0, usize::MAX);
+        let mut snapshot = self.snapshot(0, self.grid.height());
         delta.apply_to_snapshot(&mut snapshot)?;
         *self = Self::from_snapshot(&snapshot, limits)?;
         Ok(())
@@ -118,9 +118,9 @@ impl TerminalGridStream {
     /// Process one chunk and return a structured row delta when state changed.
     #[must_use]
     pub fn process_delta(&mut self, bytes: &[u8]) -> Option<GridDeltaBatch> {
-        let before = self.snapshot(0, usize::MAX);
+        let before = self.snapshot(0, self.grid.height());
         self.process(bytes);
-        let after = self.snapshot(0, usize::MAX);
+        let after = self.snapshot(0, self.grid.height());
         GridDeltaBatch::between(&before, &after)
     }
 
@@ -146,9 +146,9 @@ impl TerminalGridStream {
         if self.grid.width() == usize::from(width) && self.grid.height() == usize::from(height) {
             return Ok(None);
         }
-        let before = self.snapshot(0, usize::MAX);
+        let before = self.snapshot(0, self.grid.height());
         self.grid.resize(width, height)?;
-        let after = self.snapshot(0, usize::MAX);
+        let after = self.snapshot(0, self.grid.height());
         Ok(GridDeltaBatch::between(&before, &after))
     }
 }

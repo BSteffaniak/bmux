@@ -524,7 +524,7 @@ mod tests {
         let mut source = TerminalGridStream::new(10, 2, GridLimits::default())
             .expect("source grid dimensions are valid");
         source.process(b"A\x1b[");
-        let snapshot = source.snapshot(0, usize::MAX);
+        let snapshot = source.snapshot(0, source.grid().height());
         let mut pipeline = AttachScenePipeline::new(AttachViewport {
             cols: 10,
             rows: 2,

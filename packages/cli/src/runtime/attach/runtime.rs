@@ -98,7 +98,7 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderDamage, RenderOp, RenderStyle};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
-const ATTACH_GRID_SNAPSHOT_MAX_ROWS_PER_PANE: usize = u32::MAX as usize;
+const ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE: usize = 1;
 const ATTACH_GRID_DELTA_MAX_BATCHES_PER_PANE: usize = 128;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
@@ -7132,6 +7132,31 @@ async fn apply_attach_structured_grid_deltas(
     Ok(applied_any)
 }
 
+fn attach_grid_snapshot_max_rows_for_panes(
+    view_state: &AttachViewState,
+    pane_ids: &[Uuid],
+) -> usize {
+    let requested = pane_ids.iter().copied().collect::<BTreeSet<_>>();
+    view_state
+        .cached_layout_state
+        .as_ref()
+        .and_then(|layout_state| {
+            layout_state
+                .scene
+                .surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.visible
+                        && surface
+                            .pane_id
+                            .is_some_and(|pane_id| requested.contains(&pane_id))
+                })
+                .map(|surface| usize::from(surface.content_rect.h.max(1)))
+                .max()
+        })
+        .unwrap_or(ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE)
+}
+
 async fn hydrate_attach_structured_grid_snapshots(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -7140,11 +7165,12 @@ async fn hydrate_attach_structured_grid_snapshots(
     if pane_ids.is_empty() {
         return Ok(BTreeSet::new());
     }
+    let max_rows_per_pane = attach_grid_snapshot_max_rows_for_panes(view_state, &pane_ids);
     let snapshots = match attach_pane_grid_snapshot_state_streaming(
         client,
         view_state.attached_id,
         pane_ids,
-        ATTACH_GRID_SNAPSHOT_MAX_ROWS_PER_PANE,
+        max_rows_per_pane,
     )
     .await
     {

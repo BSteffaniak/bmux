@@ -6003,7 +6003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_grid_snapshot_state_contains_retained_scrollback() {
+    async fn attach_grid_snapshot_state_reports_retained_scrollback_without_encoding_it() {
         let session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
@@ -6043,9 +6043,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(retained.iter().any(|row| row == "line1"));
+        assert!(!retained.iter().any(|row| row == "line1"));
         assert!(retained.iter().any(|row| row == "line3"));
-        assert!(retained.len() > usize::from(snapshot.height));
+        assert_eq!(retained.len(), usize::from(snapshot.height));
+        assert!(snapshot.scrollback_rows > 0);
     }
 
     #[tokio::test]

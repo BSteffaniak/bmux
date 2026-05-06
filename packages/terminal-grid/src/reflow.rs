@@ -1,10 +1,77 @@
 use crate::model::{Cell, PhysicalRow};
 use std::collections::VecDeque;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static PROJECTED_LOGICAL_LINES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static PROJECTED_PHYSICAL_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProjectionStats {
+    pub logical_lines_projected: usize,
+    pub physical_rows_projected: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn reset_projection_stats() {
+    PROJECTED_LOGICAL_LINES.store(0, Ordering::Relaxed);
+    PROJECTED_PHYSICAL_ROWS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn projection_stats() -> ProjectionStats {
+    ProjectionStats {
+        logical_lines_projected: PROJECTED_LOGICAL_LINES.load(Ordering::Relaxed),
+        physical_rows_projected: PROJECTED_PHYSICAL_ROWS.load(Ordering::Relaxed),
+    }
+}
+
 pub(crate) fn project_logical_line(cells: &[Cell], width: usize) -> VecDeque<PhysicalRow> {
+    #[cfg(test)]
+    PROJECTED_LOGICAL_LINES.fetch_add(1, Ordering::Relaxed);
+
     let mut rows = VecDeque::new();
     push_reflowed_logical_line(&mut rows, cells, width);
+
+    #[cfg(test)]
+    PROJECTED_PHYSICAL_ROWS.fetch_add(rows.len(), Ordering::Relaxed);
+
     rows
+}
+
+pub(crate) fn projected_logical_line_row_count(cells: &[Cell], width: usize) -> usize {
+    let width = width.max(1);
+    let cells = trim_trailing_blank_cells(cells);
+    if cells.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 0_usize;
+    let mut col = 0_usize;
+    let mut current_has_cells = false;
+    for cell in cells {
+        let cell_width = usize::from(cell.width()).max(1);
+        if col > 0 && col.saturating_add(cell_width) > width {
+            rows = rows.saturating_add(1);
+            col = 0;
+        }
+        col = col.saturating_add(cell_width).min(width);
+        current_has_cells = true;
+        if col >= width {
+            rows = rows.saturating_add(1);
+            col = 0;
+            current_has_cells = false;
+        }
+    }
+    if current_has_cells {
+        rows = rows.saturating_add(1);
+    }
+    rows.max(1)
 }
 
 fn push_reflowed_logical_line(rows: &mut VecDeque<PhysicalRow>, cells: &[Cell], width: usize) {

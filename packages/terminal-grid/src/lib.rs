@@ -19,8 +19,8 @@ mod style;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{
-    Cell, Cursor, GridLimits, GridMode, MouseProtocolEncoding, MouseProtocolMode, PhysicalRow,
-    ProtocolState, TerminalGrid, TerminalGridError,
+    Cell, Cursor, GridLimits, GridMode, GridRowWindow, MouseProtocolEncoding, MouseProtocolMode,
+    PhysicalRow, ProjectedRows, ProtocolState, TerminalGrid, TerminalGridError,
 };
 pub use parser::{
     ProtocolProcessOutcome, TerminalGridStream, TerminalGridStreamDeltaError,
