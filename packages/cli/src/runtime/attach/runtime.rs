@@ -311,6 +311,81 @@ async fn typed_active_runtime_appearance_attach(
     })
 }
 
+/// Pull the decoration plugin's retained scene on attach startup.
+///
+/// Decoration scenes are retained in the server process, while each attach
+/// process owns a fresh client-side renderer cache. A reconnect can miss the
+/// original scene publication if nothing changes after the new client attaches,
+/// so hydrate the local cache by querying the plugin-owned snapshot surface.
+async fn typed_decoration_scene_snapshot_attach(
+    client: &mut StreamingBmuxClient,
+) -> std::result::Result<bmux_scene_protocol::scene_protocol::DecorationScene, ClientError> {
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding decoration scene snapshot args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            "bmux.decoration.read",
+            InvokeServiceKind::Query,
+            "decoration-state",
+            "scene-snapshot",
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding decoration scene snapshot response: {error}"),
+    })
+}
+
+async fn hydrate_decoration_scene_snapshot_attach(
+    client: &mut StreamingBmuxClient,
+    expect_surfaces: bool,
+) -> std::result::Result<bmux_scene_protocol::scene_protocol::DecorationScene, ClientError> {
+    const HYDRATE_ATTEMPTS_WITH_LAYOUT: usize = 6;
+    const HYDRATE_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+    let attempts = if expect_surfaces {
+        HYDRATE_ATTEMPTS_WITH_LAYOUT
+    } else {
+        1
+    };
+    for attempt in 0..attempts {
+        let scene = typed_decoration_scene_snapshot_attach(client).await?;
+        if !expect_surfaces || !scene.surfaces.is_empty() || attempt + 1 == attempts {
+            return Ok(scene);
+        }
+        tokio::time::sleep(HYDRATE_RETRY_DELAY).await;
+    }
+
+    typed_decoration_scene_snapshot_attach(client).await
+}
+
+const fn empty_decoration_scene() -> bmux_scene_protocol::scene_protocol::DecorationScene {
+    bmux_scene_protocol::scene_protocol::DecorationScene {
+        revision: 0,
+        surfaces: BTreeMap::new(),
+        animation: None,
+    }
+}
+
+fn publish_decoration_scene_locally(scene: bmux_scene_protocol::scene_protocol::DecorationScene) {
+    let _ = bmux_plugin::global_event_bus()
+        .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+            bmux_scene_protocol::scene_protocol::STATE_KIND,
+            empty_decoration_scene(),
+        );
+    let _ = bmux_plugin::global_event_bus().publish_state(
+        &bmux_scene_protocol::scene_protocol::STATE_KIND,
+        scene.clone(),
+    );
+    #[cfg(feature = "bundled-plugin-decoration")]
+    {
+        let _ = bmux_decoration_plugin_renderer::push_scene(scene);
+    }
+}
+
 /// Typed dispatch wrapper for `contexts-state:current-context`.
 async fn typed_current_context_attach(
     client: &mut StreamingBmuxClient,
@@ -1917,8 +1992,18 @@ pub async fn run_session_attach_with_client(
     // per-pane rects at attach entry. Subsequent layout changes flow
     // through the loop-body call to
     // `notify_extensions_of_layout` at the layout-refresh site.
-    let _ = notify_extensions_of_layout(&mut client, None, view_state.cached_layout_state.as_ref())
-        .await;
+    let initial_layout_pane_ids =
+        notify_extensions_of_layout(&mut client, None, view_state.cached_layout_state.as_ref())
+            .await;
+    if let Ok(scene) =
+        hydrate_decoration_scene_snapshot_attach(&mut client, !initial_layout_pane_ids.is_empty())
+            .await
+    {
+        publish_decoration_scene_locally(scene);
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::SceneChanged);
+    }
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     sync_attach_active_mode_from_processor(&mut view_state, &attach_keymap, None);
     view_state.set_transient_status(
