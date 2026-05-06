@@ -84,11 +84,23 @@ pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, Reso
 pub use host_services::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, LogWriteLevel, LogWriteRequest, PluginCommandOutcome,
     RecordingWriteEventRequest, RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse,
-    StorageSetRequest, VolatileStateClearRequest, VolatileStateGetRequest,
-    VolatileStateGetResponse, VolatileStateSetRequest, begin_command_outcome_capture,
-    finish_command_outcome_capture, record_command_outcome_metadata,
+    StorageKey, StorageKeyError, StorageSetRequest, VolatileStateClearRequest,
+    VolatileStateGetRequest, VolatileStateGetResponse, VolatileStateSetRequest,
+    begin_command_outcome_capture, finish_command_outcome_capture, record_command_outcome_metadata,
+    storage_key_is_valid,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
+
+#[macro_export]
+macro_rules! storage_key {
+    ($key:literal) => {{
+        const _: () = assert!(
+            $crate::storage_key_is_valid($key),
+            "invalid storage key literal; use non-empty [A-Za-z0-9._-]"
+        );
+        $crate::StorageKey::from_validated_literal($key)
+    }};
+}
 pub use native_exports::{
     EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,
     TypedServiceRegistrationContext, take_last_command_error,

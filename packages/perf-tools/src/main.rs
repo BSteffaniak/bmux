@@ -2248,9 +2248,8 @@ impl CoreServiceBenchContext {
     }
 
     fn storage_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let request = bmux_plugin_sdk::StorageGetRequest {
-            key: key.to_string(),
-        };
+        let key = bmux_plugin_sdk::StorageKey::new(key).map_err(|error| error.to_string())?;
+        let request = bmux_plugin_sdk::StorageGetRequest::new(key);
         self.call(
             bmux_plugin_sdk::ServiceKind::Query,
             "storage-query/v1",
@@ -2261,10 +2260,8 @@ impl CoreServiceBenchContext {
     }
 
     fn storage_set(&self, key: &str, value: &[u8]) -> Result<(), String> {
-        let request = bmux_plugin_sdk::StorageSetRequest {
-            key: key.to_string(),
-            value: value.to_vec(),
-        };
+        let key = bmux_plugin_sdk::StorageKey::new(key).map_err(|error| error.to_string())?;
+        let request = bmux_plugin_sdk::StorageSetRequest::new(key, value.to_vec());
         self.call(
             bmux_plugin_sdk::ServiceKind::Command,
             "storage-command/v1",
@@ -2274,9 +2271,8 @@ impl CoreServiceBenchContext {
     }
 
     fn volatile_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let request = bmux_plugin_sdk::VolatileStateGetRequest {
-            key: key.to_string(),
-        };
+        let key = bmux_plugin_sdk::StorageKey::new(key).map_err(|error| error.to_string())?;
+        let request = bmux_plugin_sdk::VolatileStateGetRequest::new(key);
         self.call(
             bmux_plugin_sdk::ServiceKind::Query,
             "volatile-state-query/v1",
@@ -2287,10 +2283,8 @@ impl CoreServiceBenchContext {
     }
 
     fn volatile_set(&self, key: &str, value: &[u8]) -> Result<(), String> {
-        let request = bmux_plugin_sdk::VolatileStateSetRequest {
-            key: key.to_string(),
-            value: value.to_vec(),
-        };
+        let key = bmux_plugin_sdk::StorageKey::new(key).map_err(|error| error.to_string())?;
+        let request = bmux_plugin_sdk::VolatileStateSetRequest::new(key, value.to_vec());
         self.call(
             bmux_plugin_sdk::ServiceKind::Command,
             "volatile-state-command/v1",
@@ -2300,9 +2294,8 @@ impl CoreServiceBenchContext {
     }
 
     fn volatile_clear(&self, key: &str) -> Result<(), String> {
-        let request = bmux_plugin_sdk::VolatileStateClearRequest {
-            key: key.to_string(),
-        };
+        let key = bmux_plugin_sdk::StorageKey::new(key).map_err(|error| error.to_string())?;
+        let request = bmux_plugin_sdk::VolatileStateClearRequest::new(key);
         self.call(
             bmux_plugin_sdk::ServiceKind::Command,
             "volatile-state-command/v1",

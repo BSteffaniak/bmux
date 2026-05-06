@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLUSTER_PANE_BINDING_PREFIX: &str = "cluster.pane.";
-const CLUSTER_CONNECTION_EVENTS_KEY: &str = "cluster.connection.events";
 const CLUSTER_CONNECTION_EVENTS_MAX: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2539,8 +2538,9 @@ fn retarget_pane_name_with_cluster(
     retarget_pane_name(name, target)
 }
 
-fn pane_binding_storage_key(pane_id: &str) -> String {
-    format!("{CLUSTER_PANE_BINDING_PREFIX}{pane_id}")
+fn pane_binding_storage_key(pane_id: &str) -> bmux_plugin_sdk::StorageKey {
+    bmux_plugin_sdk::StorageKey::new(format!("{CLUSTER_PANE_BINDING_PREFIX}{pane_id}"))
+        .expect("pane binding storage key should use storage-safe pane identifiers")
 }
 
 fn set_cluster_pane_binding(
@@ -2555,10 +2555,10 @@ fn set_cluster_pane_binding(
         Vec::new()
     };
     caller
-        .storage_set(&StorageSetRequest {
-            key: pane_binding_storage_key(pane_id),
+        .storage_set(&StorageSetRequest::new(
+            pane_binding_storage_key(pane_id),
             value,
-        })
+        ))
         .map_err(|error| format!("failed writing pane metadata: {error}"))
 }
 
@@ -2567,9 +2567,7 @@ fn get_cluster_pane_binding(
     pane_id: &str,
 ) -> Result<Option<ClusterPaneBinding>, String> {
     let response = caller
-        .storage_get(&StorageGetRequest {
-            key: pane_binding_storage_key(pane_id),
-        })
+        .storage_get(&StorageGetRequest::new(pane_binding_storage_key(pane_id)))
         .map_err(|error| format!("failed reading pane metadata: {error}"))?;
     let Some(value) = response.value else {
         return Ok(None);
@@ -2586,9 +2584,9 @@ fn get_cluster_connection_events(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<Vec<ClusterConnectionEvent>, String> {
     let response = caller
-        .storage_get(&StorageGetRequest {
-            key: CLUSTER_CONNECTION_EVENTS_KEY.to_string(),
-        })
+        .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
+            "cluster.connection.events"
+        )))
         .map_err(|error| format!("failed reading connection events: {error}"))?;
     let Some(value) = response.value else {
         return Ok(Vec::new());
@@ -2607,10 +2605,10 @@ fn set_cluster_connection_events(
     let value = serde_json::to_vec(events)
         .map_err(|error| format!("failed encoding connection events: {error}"))?;
     caller
-        .storage_set(&StorageSetRequest {
-            key: CLUSTER_CONNECTION_EVENTS_KEY.to_string(),
+        .storage_set(&StorageSetRequest::new(
+            bmux_plugin_sdk::storage_key!("cluster.connection.events"),
             value,
-        })
+        ))
         .map_err(|error| format!("failed writing connection events: {error}"))
 }
 
@@ -2926,7 +2924,7 @@ mod tests {
         ) -> Result<bmux_plugin_sdk::StorageGetResponse, String> {
             let guard = self.inner.lock().expect("runtime lock poisoned");
             Ok(bmux_plugin_sdk::StorageGetResponse {
-                value: guard.storage.get(&request.key).cloned(),
+                value: guard.storage.get(request.key.as_str()).cloned(),
             })
         }
 
@@ -2935,7 +2933,7 @@ mod tests {
                 .lock()
                 .expect("runtime lock poisoned")
                 .storage
-                .insert(request.key.clone(), request.value.clone());
+                .insert(request.key.to_string(), request.value.clone());
             Ok(())
         }
     }
@@ -3855,10 +3853,10 @@ mod tests {
         runtime.set_health("db-a", true);
         let old_pane = runtime.add_pane(Some("host:db-a".to_string()), true);
         runtime
-            .storage_set(&StorageSetRequest {
-                key: pane_binding_storage_key(&old_pane.to_string()),
-                value: vec![0xff, 0x00, 0x41],
-            })
+            .storage_set(&StorageSetRequest::new(
+                pane_binding_storage_key(&old_pane.to_string()),
+                vec![0xff, 0x00, 0x41],
+            ))
             .expect("seed corrupt pane metadata should succeed");
 
         let result = execute_cluster_pane_retry(

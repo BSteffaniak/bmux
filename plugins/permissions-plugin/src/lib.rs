@@ -402,8 +402,6 @@ impl StoredPermissions {
     }
 }
 
-const PERMISSIONS_STORAGE_KEY: &str = "permissions-v1";
-
 fn list_entries(
     caller: &(impl HostRuntimeApi + Sync),
     session: &str,
@@ -956,9 +954,9 @@ fn classify_action(action: &str) -> PolicyActionKind {
 
 fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String> {
     let response = caller
-        .storage_get(&StorageGetRequest {
-            key: PERMISSIONS_STORAGE_KEY.to_string(),
-        })
+        .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
+            "permissions-v1"
+        )))
         .map_err(|error| error.to_string())?;
     response.value.map_or_else(
         || Ok(StoredPermissions::with_default()),
@@ -969,10 +967,10 @@ fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String>
 fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result<(), String> {
     let value = encode_service_message(state).map_err(|error| error.to_string())?;
     caller
-        .storage_set(&StorageSetRequest {
-            key: PERMISSIONS_STORAGE_KEY.to_string(),
+        .storage_set(&StorageSetRequest::new(
+            bmux_plugin_sdk::storage_key!("permissions-v1"),
             value,
-        })
+        ))
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -1140,7 +1138,7 @@ mod tests {
                         .storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .get(&request.key)
+                        .get(request.key.as_str())
                         .cloned();
                     encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
                 }
@@ -1149,7 +1147,7 @@ mod tests {
                     self.storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .insert(request.key, request.value);
+                        .insert(request.key.to_string(), request.value);
                     encode_service_message(&())
                 }
                 ("contexts-state", "list-contexts") => encode_service_message(&self.contexts),

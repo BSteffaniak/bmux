@@ -23,6 +23,7 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
+const STORAGE_PERFORMANCE_THEME_SETTINGS: &str = "theme_settings.performance";
 
 #[derive(Default)]
 pub struct ThemePlugin {
@@ -43,6 +44,7 @@ impl RustPlugin for ThemePlugin {
         if event.kind.as_str() == "bmux.core/server_started"
             && let Some(context) = self.lifecycle_context.as_ref()
         {
+            apply_configured_appearance(context);
             apply_configured_theme_extensions(context);
         }
         Ok(EXIT_OK)
@@ -538,20 +540,23 @@ fn persist_performance_theme_settings(
     let Ok(value) = serde_json::to_vec(settings) else {
         return;
     };
-    let request = StorageSetRequest {
-        key: "theme_settings:performance".to_string(),
+    let request = StorageSetRequest::new(
+        bmux_plugin_sdk::storage_key!("theme_settings.performance"),
         value,
-    };
+    );
     if let Err(error) = context.storage_set(&request) {
         warn!(%error, "failed persisting performance theme settings");
     }
 }
 
 fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
-    let request = StorageGetRequest {
-        key: "theme_settings:performance".to_string(),
-    };
+    let request =
+        StorageGetRequest::new(bmux_plugin_sdk::storage_key!("theme_settings.performance"));
     let Ok(response) = context.storage_get(&request) else {
+        warn!(
+            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
+            "failed reading persisted performance theme settings"
+        );
         return;
     };
     let Some(value) = response.value else {
@@ -560,17 +565,24 @@ fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
     let Ok(settings) =
         serde_json::from_slice::<bmux_performance_plugin_api::ThemeHeaderSettings>(&value)
     else {
+        warn!(
+            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
+            "failed decoding persisted performance theme settings"
+        );
         return;
     };
     let request = performance_commands::client::SetThemeHeaderSettingsRequest { settings };
-    let _ = context
+    if let Err(error) = context
         .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
             capabilities::PERFORMANCE_WRITE.as_str(),
             ServiceKind::Command,
             performance_commands::INTERFACE_ID.as_str(),
             performance_commands::OP_SET_THEME_HEADER_SETTINGS.as_str(),
             &request,
-        );
+        )
+    {
+        warn!(%error, "failed applying persisted performance theme settings");
+    }
 }
 
 fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
@@ -734,9 +746,9 @@ fn merge_toml_value(base: &mut toml::Value, overlay: &toml::Value) {
 }
 
 fn read_persisted_theme_name(context: &(impl HostRuntimeApi + ?Sized)) -> Option<String> {
-    let response = match context.storage_get(&StorageGetRequest {
-        key: STORAGE_SELECTED_APPEARANCE.to_string(),
-    }) {
+    let response = match context.storage_get(&StorageGetRequest::new(
+        bmux_plugin_sdk::storage_key!("selected_theme"),
+    )) {
         Ok(response) => response,
         Err(error) => {
             debug!(%error, key = STORAGE_SELECTED_APPEARANCE, "failed reading persisted theme selection");
@@ -756,10 +768,10 @@ fn read_persisted_theme_name(context: &(impl HostRuntimeApi + ?Sized)) -> Option
 }
 
 fn persist_theme_name(context: &impl HostRuntimeApi, name: &str) {
-    let result = context.storage_set(&StorageSetRequest {
-        key: STORAGE_SELECTED_APPEARANCE.to_string(),
-        value: name.as_bytes().to_vec(),
-    });
+    let result = context.storage_set(&StorageSetRequest::new(
+        bmux_plugin_sdk::storage_key!("selected_theme"),
+        name.as_bytes().to_vec(),
+    ));
     if let Err(error) = result {
         warn!(%error, "failed persisting selected theme");
     }
@@ -949,8 +961,9 @@ mod tests {
     use super::*;
     use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
     use bmux_plugin_sdk::{
-        ApiVersion, HostMetadata, HostScope, ProviderId, RegisteredService, ServiceKind,
-        ServiceRequest, StorageGetResponse, decode_service_message, encode_service_message,
+        ApiVersion, HostMetadata, HostScope, PluginEventKind, ProviderId, RegisteredService,
+        ServiceKind, ServiceRequest, StorageGetResponse, decode_service_message,
+        encode_service_message,
     };
     use std::sync::{Arc, Mutex};
 
@@ -1139,6 +1152,88 @@ mod tests {
         assert!(
             applied_toml.contains("style = \"thick\""),
             "activation should apply persisted hacker decoration extension: {applied_toml}",
+        );
+    }
+
+    #[test]
+    fn performance_theme_settings_use_storage_safe_key_for_persist_and_restore() {
+        let settings = bmux_performance_plugin_api::ThemeHeaderSettings {
+            sample_interval_ms: 2_500,
+            ..bmux_performance_plugin_api::ThemeHeaderSettings::default()
+        };
+        let settings_bytes = serde_json::to_vec(&settings).expect("settings should encode");
+        let stored_keys = Arc::new(Mutex::new(Vec::new()));
+        let applied_settings = Arc::new(Mutex::new(Vec::new()));
+        let _router = install_performance_theme_settings_router(
+            settings_bytes,
+            Arc::clone(&stored_keys),
+            Arc::clone(&applied_settings),
+        );
+        let context = lifecycle_context(None);
+
+        persist_performance_theme_settings(&context, &settings);
+        apply_persisted_performance_theme_settings(&context);
+
+        let stored_keys_snapshot = {
+            let stored_keys = stored_keys.lock().expect("stored key lock should hold");
+            stored_keys.clone()
+        };
+        assert_eq!(
+            stored_keys_snapshot.as_slice(),
+            [STORAGE_PERFORMANCE_THEME_SETTINGS]
+        );
+        let applied_settings_snapshot = {
+            let applied_settings = applied_settings
+                .lock()
+                .expect("applied settings lock should hold");
+            applied_settings.clone()
+        };
+        assert_eq!(applied_settings_snapshot.as_slice(), [settings]);
+    }
+
+    #[test]
+    fn server_started_republishes_persisted_runtime_appearance() {
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let _router =
+            install_persisted_theme_extension_router(Some("hacker"), Arc::clone(&applied));
+        bmux_plugin::global_event_bus().register_state_channel::<RuntimeAppearance>(
+            RUNTIME_APPEARANCE_STATE_KIND,
+            RuntimeAppearance::default(),
+        );
+        let context = lifecycle_context(Some(toml::Value::Table(toml::map::Map::from_iter([
+            (
+                "theme".to_string(),
+                toml::Value::String("pulse-demo".to_string()),
+            ),
+            (
+                "persistence".to_string(),
+                toml::Value::String("persist_between_connects".to_string()),
+            ),
+        ]))));
+        let mut plugin = ThemePlugin {
+            lifecycle_context: Some(context),
+        };
+
+        plugin
+            .handle_event(PluginEvent {
+                kind: PluginEventKind::from_owned("bmux.core/server_started".to_string()),
+                payload: serde_json::json!({}),
+            })
+            .expect("server_started should reapply theme");
+
+        let (appearance, _rx) = bmux_plugin::global_event_bus()
+            .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
+            .expect("runtime appearance state should be registered");
+        assert_eq!(appearance.foreground, "#39ff14");
+        assert_eq!(appearance.border.active, "#39ff14");
+        let applied_toml = {
+            let applied = applied.lock().expect("applied extensions lock should hold");
+            assert_eq!(applied.len(), 1);
+            applied[0].toml.clone()
+        };
+        assert!(
+            applied_toml.contains("style = \"thick\""),
+            "server_started should also apply persisted decoration extension: {applied_toml}",
         );
     }
 
@@ -1398,6 +1493,63 @@ mod tests {
                 encode_service_message(&StorageGetResponse {
                     value: selected.map(|value| value.as_bytes().to_vec()),
                 })
+            },
+        );
+        install_test_service_router(router)
+    }
+
+    #[allow(clippy::result_large_err)] // Test router signature is fixed by bmux_plugin test support.
+    fn install_performance_theme_settings_router(
+        settings_bytes: Vec<u8>,
+        stored_keys: Arc<Mutex<Vec<String>>>,
+        applied_settings: Arc<Mutex<Vec<bmux_performance_plugin_api::ThemeHeaderSettings>>>,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        let router: TestServiceRouter = Arc::new(
+            move |_caller_plugin_id,
+                  _caller_client_id,
+                  capability,
+                  kind,
+                  interface,
+                  operation,
+                  payload| {
+                match (capability, kind, interface, operation) {
+                    ("bmux.storage", ServiceKind::Command, "storage-command/v1", "set") => {
+                        let request: StorageSetRequest = decode_service_message(&payload)
+                            .expect("storage set payload should decode");
+                        stored_keys
+                            .lock()
+                            .expect("stored key lock should hold")
+                            .push(request.key.into_string());
+                        let stored_settings: bmux_performance_plugin_api::ThemeHeaderSettings =
+                            serde_json::from_slice(&request.value)
+                                .expect("stored performance settings should decode");
+                        assert_eq!(stored_settings.sample_interval_ms, 2_500);
+                        encode_service_message(&())
+                    }
+                    ("bmux.storage", ServiceKind::Query, "storage-query/v1", "get") => {
+                        let request: StorageGetRequest = decode_service_message(&payload)
+                            .expect("storage get payload should decode");
+                        assert_eq!(request.key.as_str(), STORAGE_PERFORMANCE_THEME_SETTINGS);
+                        encode_service_message(&StorageGetResponse {
+                            value: Some(settings_bytes.clone()),
+                        })
+                    }
+                    ("bmux.performance.write", ServiceKind::Command, interface, operation)
+                        if interface == performance_commands::INTERFACE_ID.as_str()
+                            && operation
+                                == performance_commands::OP_SET_THEME_HEADER_SETTINGS.as_str() =>
+                    {
+                        let request: performance_commands::client::SetThemeHeaderSettingsRequest =
+                            decode_service_message(&payload)
+                                .expect("performance settings payload should decode");
+                        applied_settings
+                            .lock()
+                            .expect("applied settings lock should hold")
+                            .push(request.settings.clone());
+                        encode_service_message(&request.settings)
+                    }
+                    other => panic!("unexpected service call: {other:?}"),
+                }
             },
         );
         install_test_service_router(router)

@@ -36,8 +36,11 @@ use uuid::Uuid;
 
 const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
-const WINDOW_ORDER_KEY: &str = "windows.order";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
+
+fn storage_key(key: &str) -> bmux_plugin_sdk::StorageKey {
+    bmux_plugin_sdk::StorageKey::new(key).expect("windows plugin storage key should be valid")
+}
 
 fn typed_service_error(operation: &'static str, err: impl std::fmt::Display) -> String {
     format!("{operation} failed: {err}")
@@ -2626,9 +2629,7 @@ fn resolve_effective_current_context_with_contexts(
 
 fn get_stored_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Option<Uuid>, String> {
     let response = caller
-        .storage_get(&StorageGetRequest {
-            key: key.to_string(),
-        })
+        .storage_get(&StorageGetRequest::new(storage_key(key)))
         .map_err(|error| error.to_string())?;
     let Some(value) = response.value else {
         return Ok(None);
@@ -2677,9 +2678,7 @@ fn get_volatile_context_id(
             bmux_plugin_sdk::ServiceKind::Query,
             "volatile-state-query/v1",
             "get",
-            &VolatileStateGetRequest {
-                key: key.to_string(),
-            },
+            &VolatileStateGetRequest::new(storage_key(key)),
         )
         .map_err(|error| error.to_string())?;
     let Some(value) = response.value else {
@@ -2714,10 +2713,10 @@ fn set_runtime_context_id(
                     bmux_plugin_sdk::ServiceKind::Command,
                     "volatile-state-command/v1",
                     "set",
-                    &VolatileStateSetRequest {
-                        key: key.to_string(),
-                        value: context_id.to_string().into_bytes(),
-                    },
+                    &VolatileStateSetRequest::new(
+                        storage_key(key),
+                        context_id.to_string().into_bytes(),
+                    ),
                 )
                 .map_err(|error| error.to_string())
         },
@@ -2754,9 +2753,7 @@ fn clear_runtime_context_id(
             bmux_plugin_sdk::ServiceKind::Command,
             "volatile-state-command/v1",
             "clear",
-            &VolatileStateClearRequest {
-                key: key.to_string(),
-            },
+            &VolatileStateClearRequest::new(storage_key(key)),
         )
         .map_err(|error| error.to_string())
 }
@@ -2768,10 +2765,7 @@ fn set_stored_context_id(
 ) -> Result<(), String> {
     let value = context_id.map_or_else(Vec::new, |id| id.to_string().into_bytes());
     caller
-        .storage_set(&StorageSetRequest {
-            key: key.to_string(),
-            value,
-        })
+        .storage_set(&StorageSetRequest::new(storage_key(key), value))
         .map_err(|error| error.to_string())
 }
 
@@ -2927,9 +2921,9 @@ fn project_window_order_ids(mut order_ids: Vec<Uuid>, contexts: &[ContextSummary
 
 fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>, String> {
     let response = caller
-        .storage_get(&StorageGetRequest {
-            key: WINDOW_ORDER_KEY.to_string(),
-        })
+        .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
+            "windows.order"
+        )))
         .map_err(|error| error.to_string())?;
     let Some(value) = response.value else {
         return Ok(Vec::new());
@@ -2968,10 +2962,10 @@ fn set_stored_window_order_ids(
 ) -> Result<(), String> {
     let value = encode_stored_window_order_lines(order_ids);
     caller
-        .storage_set(&StorageSetRequest {
-            key: WINDOW_ORDER_KEY.to_string(),
+        .storage_set(&StorageSetRequest::new(
+            bmux_plugin_sdk::storage_key!("windows.order"),
             value,
-        })
+        ))
         .map_err(|error| error.to_string())
 }
 
@@ -4654,7 +4648,7 @@ mod tests {
                         .storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .get(&request.key)
+                        .get(request.key.as_str())
                         .cloned();
                     encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
                 }
@@ -4663,7 +4657,7 @@ mod tests {
                     self.storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .insert(request.key, request.value);
+                        .insert(request.key.to_string(), request.value);
                     encode_service_message(&())
                 }
                 ("volatile-state-query/v1", "get") => {
@@ -4672,7 +4666,7 @@ mod tests {
                         .storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .get(&request.key)
+                        .get(request.key.as_str())
                         .cloned();
                     encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse { value })
                 }
@@ -4681,7 +4675,7 @@ mod tests {
                     self.storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .insert(request.key, request.value);
+                        .insert(request.key.to_string(), request.value);
                     encode_service_message(&())
                 }
                 ("volatile-state-command/v1", "clear") => {
@@ -4689,7 +4683,7 @@ mod tests {
                     self.storage
                         .lock()
                         .expect("storage lock should succeed")
-                        .remove(&request.key);
+                        .remove(request.key.as_str());
                     encode_service_message(&())
                 }
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {

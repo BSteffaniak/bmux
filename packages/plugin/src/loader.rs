@@ -1322,13 +1322,13 @@ fn handle_core_service_call(
             let total_started = Instant::now();
             let request: bmux_plugin_sdk::VolatileStateGetRequest =
                 decode_service_message(payload)?;
-            validate_storage_key(&request.key)?;
+            validate_storage_key(request.key.as_str())?;
             let map_started = Instant::now();
             let value = volatile_state().lock().ok().and_then(|map| {
                 map.get(&plugin_state_key(
                     connection,
                     caller_plugin_id,
-                    &request.key,
+                    request.key.as_str(),
                 ))
                 .cloned()
             });
@@ -1352,11 +1352,11 @@ fn handle_core_service_call(
             let total_started = Instant::now();
             let request: bmux_plugin_sdk::VolatileStateSetRequest =
                 decode_service_message(payload)?;
-            validate_storage_key(&request.key)?;
+            validate_storage_key(request.key.as_str())?;
             let map_started = Instant::now();
             if let Ok(mut map) = volatile_state().lock() {
                 map.insert(
-                    plugin_state_key(connection, caller_plugin_id, &request.key),
+                    plugin_state_key(connection, caller_plugin_id, request.key.as_str()),
                     request.value.clone(),
                 );
             }
@@ -1378,13 +1378,13 @@ fn handle_core_service_call(
             let total_started = Instant::now();
             let request: bmux_plugin_sdk::VolatileStateClearRequest =
                 decode_service_message(payload)?;
-            validate_storage_key(&request.key)?;
+            validate_storage_key(request.key.as_str())?;
             let map_started = Instant::now();
             if let Ok(mut map) = volatile_state().lock() {
                 map.remove(&plugin_state_key(
                     connection,
                     caller_plugin_id,
-                    &request.key,
+                    request.key.as_str(),
                 ));
             }
             let map_us = map_started.elapsed().as_micros();
@@ -2835,6 +2835,14 @@ mod tests {
         static OMIT_CURRENT_CLIENT_FROM_LIST: Cell<bool> = const { Cell::new(false) };
         static GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY: Cell<bool> = const { Cell::new(false) };
         static NATIVE_SERVICE_INVOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn host_storage_validation_rejects_raw_invalid_keys() {
+        assert!(super::validate_storage_key("theme_settings.performance").is_ok());
+        assert!(super::validate_storage_key("theme_settings:performance").is_err());
+        assert!(super::validate_storage_key("bad/key").is_err());
+        assert!(super::validate_storage_key("").is_err());
     }
 
     const TEST_MANIFEST_TEXT: &str = concat!(
