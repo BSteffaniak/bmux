@@ -5,8 +5,10 @@ use bmux_clients_plugin_api::clients_state;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_contexts_plugin_api::contexts_commands::{self, ContextAck as ContextAckRecord};
 use bmux_diagnostic_log::{DiagnosticLogConfig, DiagnosticLogMode, DiagnosticLogWriter};
-use bmux_recording_plugin_api::{recording_commands, recording_state};
-use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions, RecordingSummary};
+use bmux_recording_plugin_api::{ManualRecordingStartOptions, recording_commands, recording_state};
+use bmux_recording_protocol::{
+    RecordingEventKind, RecordingRollingStartOptions, RecordingStatus, RecordingSummary,
+};
 use bmux_server::BmuxServer;
 use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
 use std::collections::BTreeMap;
@@ -14,6 +16,8 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use tracing::{Level, warn};
 use uuid::Uuid;
+
+const BOOTSTRAP_RECORDING_START_ENV: &str = "BMUX_BOOTSTRAP_RECORDING_START";
 
 use super::plugin_kernel::RuntimeLoggingHandle;
 use super::{
@@ -48,36 +52,18 @@ pub(super) async fn run_default_server_attach(
         stop_server_on_exit = options.stop_server_on_exit,
         "attach.bootstrap.default_start"
     );
+    let startup_recording = options
+        .record
+        .then(|| manual_recording_start_options_from_default_attach(&options));
     if options.record {
         ensure_server_not_running_for_record_bootstrap(connection_context).await?;
     }
-    ensure_server_running_for_default_attach(connection_context).await?;
+    ensure_server_running_for_default_attach(connection_context, startup_recording).await?;
     tracing::info!("attach.bootstrap.server_ready");
 
     let mut active_recording_id = None;
     if options.record {
-        let mut recording_client = connect_with_context(
-            ConnectionPolicyScope::Normal,
-            "bmux-cli-default-attach-recording-start",
-            connection_context,
-        )
-        .await?;
-        let started: RecordingSummary = recording_commands::client::start(
-            &mut recording_client,
-            None,
-            options.capture_input,
-            options.name.clone(),
-            recording::recording_profile_arg_to_ipc(options.profile).map(Into::into),
-            recording::resolve_event_kind_override(
-                options.profile,
-                &options.event_kinds,
-                options.capture_input,
-            )
-            .map(|kinds| kinds.into_iter().map(Into::into).collect()),
-        )
-        .await?
-        .map(Into::into)
-        .map_err(recording::recording_plugin_error)?;
+        let started = active_startup_recording(connection_context).await?;
         active_recording_id = Some(started.id);
         let name_display = started.name.as_deref().unwrap_or("-");
         println!(
@@ -153,6 +139,38 @@ pub(super) async fn run_default_server_attach(
     attach_result
 }
 
+fn manual_recording_start_options_from_default_attach(
+    options: &DefaultAttachOptions,
+) -> ManualRecordingStartOptions {
+    ManualRecordingStartOptions {
+        capture_input: options.capture_input,
+        name: options.name.clone(),
+        profile: recording::recording_profile_arg_to_ipc(options.profile),
+        event_kinds: recording::resolve_event_kind_override(
+            options.profile,
+            &options.event_kinds,
+            options.capture_input,
+        ),
+    }
+}
+
+async fn active_startup_recording(
+    connection_context: ConnectionContext<'_>,
+) -> Result<RecordingSummary> {
+    let mut recording_client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-default-attach-recording-status",
+        connection_context,
+    )
+    .await?;
+    let status: RecordingStatus = recording_state::client::status(&mut recording_client)
+        .await?
+        .into();
+    status
+        .active
+        .context("startup recording did not become active")
+}
+
 pub(super) async fn ensure_server_not_running_for_record_bootstrap(
     connection_context: ConnectionContext<'_>,
 ) -> Result<()> {
@@ -166,6 +184,7 @@ pub(super) async fn ensure_server_not_running_for_record_bootstrap(
 
 pub(super) async fn ensure_server_running_for_default_attach(
     connection_context: ConnectionContext<'_>,
+    startup_recording: Option<ManualRecordingStartOptions>,
 ) -> Result<()> {
     if server_is_running(connection_context).await? {
         tracing::info!("attach.bootstrap.server_already_running");
@@ -179,6 +198,7 @@ pub(super) async fn ensure_server_running_for_default_attach(
         None,
         RecordingRollingStartOptions::default(),
         None,
+        startup_recording,
     )
     .await?;
     if !server_is_running(connection_context).await? {
@@ -292,8 +312,13 @@ pub(super) async fn run_server_start(
     rolling_enabled_override: Option<bool>,
     rolling_options: RecordingRollingStartOptions,
     pane_shell_integration_override: Option<bool>,
+    startup_recording: Option<ManualRecordingStartOptions>,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
+    let startup_recording = match startup_recording {
+        Some(options) => Some(options),
+        None => startup_recording_from_env()?,
+    };
     if server_is_running(ConnectionContext::default()).await? {
         println!("bmux server is already running");
         return Ok(1);
@@ -369,7 +394,11 @@ pub(super) async fn run_server_start(
                     Level::DEBUG => "debug",
                     Level::TRACE => "trace",
                 },
-            )
+            );
+        if let Some(startup_recording) = startup_recording.as_ref() {
+            set_startup_recording_env(&mut child, startup_recording)?;
+        }
+        child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -393,6 +422,7 @@ pub(super) async fn run_server_start(
         &paths,
         effective_rolling_enabled,
         &effective_rolling_settings,
+        startup_recording,
     );
     register_snapshot_plugin_config(&config, &paths);
     register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
@@ -554,6 +584,7 @@ fn register_recording_plugin_config(
     paths: &ConfigPaths,
     rolling_auto_start: bool,
     rolling_settings: &bmux_recording_plugin_api::RollingRecordingSettings,
+    startup_recording: Option<ManualRecordingStartOptions>,
 ) {
     use bmux_recording_plugin_api::RecordingPluginConfig;
     let plugin_config = RecordingPluginConfig {
@@ -563,9 +594,29 @@ fn register_recording_plugin_config(
         retention_days: config.recording.retention_days,
         rolling_defaults: rolling_settings.clone(),
         rolling_auto_start,
+        startup_recording,
     };
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
     bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&handle);
+}
+
+fn set_startup_recording_env(
+    command: &mut ProcessCommand,
+    options: &ManualRecordingStartOptions,
+) -> Result<()> {
+    let value =
+        serde_json::to_string(options).context("failed to encode startup recording config")?;
+    command.env(BOOTSTRAP_RECORDING_START_ENV, value);
+    Ok(())
+}
+
+fn startup_recording_from_env() -> Result<Option<ManualRecordingStartOptions>> {
+    let Ok(value) = std::env::var(BOOTSTRAP_RECORDING_START_ENV) else {
+        return Ok(None);
+    };
+    serde_json::from_str(&value)
+        .map(Some)
+        .context("failed to decode startup recording config")
 }
 
 /// Register the snapshot plugin's startup config (file path +
@@ -1059,6 +1110,32 @@ mod tests {
                 .contains("--record is only supported for top-level interactive start"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn default_attach_record_options_become_startup_recording() {
+        let options = DefaultAttachOptions {
+            record: true,
+            capture_input: true,
+            profile: Some(bmux_cli_schema::RecordingProfileArg::Full),
+            name: Some("restore-pane-repro".to_string()),
+            event_kinds: Vec::new(),
+            recording_id_file: None,
+            stop_server_on_exit: false,
+        };
+
+        let startup = manual_recording_start_options_from_default_attach(&options);
+
+        assert!(startup.capture_input);
+        assert_eq!(startup.name.as_deref(), Some("restore-pane-repro"));
+        assert_eq!(
+            startup.profile,
+            Some(bmux_recording_protocol::RecordingProfile::Full)
+        );
+        let event_kinds = startup.event_kinds.expect("full profile has event kinds");
+        assert!(event_kinds.contains(&RecordingEventKind::PaneInputRaw));
+        assert!(event_kinds.contains(&RecordingEventKind::ProtocolReplyRaw));
+        assert!(event_kinds.contains(&RecordingEventKind::ServerEvent));
     }
 
     #[test]

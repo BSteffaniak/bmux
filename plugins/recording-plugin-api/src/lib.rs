@@ -11,6 +11,8 @@
 //!   read it during `activate`.
 //! - [`RecordingPluginConfig`] — recordings/rolling-recordings
 //!   directory paths + segment size; registered by CLI startup.
+//! - [`ManualRecordingStartOptions`] — optional one-shot startup
+//!   recording request for capture that must begin during plugin activation.
 //!
 //! The `RecordingRuntime` concrete type + the `DualRuntimeSink`
 //! fan-out impl + `ManualRecordingRuntimeHandle` /
@@ -281,6 +283,20 @@ impl From<recording_types::RecordingRollingClearReport> for protocol::RecordingR
     }
 }
 
+/// Optional startup recording request used when capture must begin
+/// during the recording plugin's `activate` callback.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManualRecordingStartOptions {
+    /// Whether raw pane input bytes should be captured.
+    pub capture_input: bool,
+    /// Optional human-readable recording name.
+    pub name: Option<String>,
+    /// Optional recording profile; `None` uses the recording runtime's default.
+    pub profile: Option<protocol::RecordingProfile>,
+    /// Optional event-kind allowlist; `None` uses the recording runtime's default.
+    pub event_kinds: Option<Vec<protocol::RecordingEventKind>>,
+}
+
 /// CLI-provided configuration values needed by the recording plugin's
 /// `activate` callback to construct manual + rolling runtimes.
 /// Registered into `PluginStateRegistry` by CLI bootstrap (before
@@ -301,4 +317,6 @@ pub struct RecordingPluginConfig {
     pub rolling_defaults: RollingRecordingSettings,
     /// Whether to auto-start a rolling recording on plugin activation.
     pub rolling_auto_start: bool,
+    /// Optional one-shot manual recording to start during plugin activation.
+    pub startup_recording: Option<ManualRecordingStartOptions>,
 }

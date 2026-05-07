@@ -23,7 +23,9 @@ pub use recording_runtime::{
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
-use bmux_recording_plugin_api::{RecordingPluginConfig, recording_events, recording_types};
+use bmux_recording_plugin_api::{
+    ManualRecordingStartOptions, RecordingPluginConfig, recording_events, recording_types,
+};
 use bmux_recording_protocol::{
     RecordingCaptureTarget, RecordingEventKind, RecordingPayload as ProtocolRecordingPayload,
     RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
@@ -149,6 +151,7 @@ impl RustPlugin for RecordingPlugin {
         let retention_days = config.retention_days;
         let rolling_defaults = config.rolling_defaults.clone();
         let rolling_auto_start = config.rolling_auto_start;
+        let startup_recording = config.startup_recording.clone();
         drop(config);
 
         let manual_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
@@ -188,6 +191,10 @@ impl RustPlugin for RecordingPlugin {
             &rolling_runtime,
         ))));
         global_plugin_state_registry().register::<RollingRecordingRuntimeHandle>(&rolling_handle);
+
+        if let Some(options) = startup_recording.as_ref() {
+            auto_start_manual(&manual_runtime, options);
+        }
 
         // Hourly prune loop. Runs on a bare OS thread (plugin
         // activation can't assume a tokio runtime; bundled-rlib and
@@ -295,6 +302,30 @@ fn spawn_prune_loop(manual_runtime: Arc<Mutex<RecordingRuntime>>) {
             }
         }
     });
+}
+
+fn auto_start_manual(
+    manual_runtime: &Arc<Mutex<RecordingRuntime>>,
+    options: &ManualRecordingStartOptions,
+) {
+    let Ok(mut runtime) = manual_runtime.lock() else {
+        return;
+    };
+    if runtime.status().active.is_some() {
+        return;
+    }
+    let profile = options.profile.unwrap_or(RecordingProfile::Full);
+    let event_kinds = options
+        .event_kinds
+        .clone()
+        .unwrap_or_else(default_event_kinds);
+    let _ = runtime.start(
+        None,
+        options.capture_input,
+        options.name.clone(),
+        profile,
+        event_kinds,
+    );
 }
 
 fn auto_start_rolling(

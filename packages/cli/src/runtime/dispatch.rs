@@ -705,6 +705,7 @@ pub(super) async fn dispatch_built_in_command(
                 rolling_enabled_override,
                 rolling_options,
                 pane_shell_integration_override,
+                None,
             )
             .await
         }

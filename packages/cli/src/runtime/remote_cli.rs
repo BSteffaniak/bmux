@@ -2912,6 +2912,7 @@ async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -
             None,
             RecordingRollingStartOptions::default(),
             None,
+            None,
         )
         .await?;
         if wait_for_local_ipc_ready(&endpoint, Duration::from_secs(3)).await {
