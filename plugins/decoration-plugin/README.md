@@ -34,7 +34,7 @@ Themes can attach a Lua script that emits paint commands each animation
 tick. The `scripting-luau` feature is enabled by default; consumers that
 want a stub build can opt out via `default-features = false`.
 
-Attach a script from your theme:
+Attach a legacy whole-theme script from your theme:
 
 ```toml
 # ~/.config/bmux/themes/my-theme.toml
@@ -44,6 +44,35 @@ script = "pulse"                      # bundled name OR filesystem path
 [plugins."bmux.decoration".animation]
 kind = "pulse"
 hz   = 30                             # ticks per second; no upper clamp
+```
+
+Theme authors can also expose named, user-composable components. Users layer
+components relative to other component ids rather than writing numeric z-indexes:
+
+```toml
+[plugins."bmux.decoration".components."performance.border"]
+script = "performance_header"
+entrypoint = "border"
+
+[plugins."bmux.decoration".components."performance.header"]
+script = "performance_header"
+entrypoint = "header"
+above = ["performance.border"]
+
+[plugins."bmux.decoration".components.snake]
+script = "rainbow_snake"
+above = ["performance.border"]
+below = ["performance.header"]
+```
+
+Later theme layers can disable or reorder individual components by id:
+
+```toml
+[plugins."bmux.decoration".components.snake]
+below = ["performance.header"]
+
+[plugins."bmux.decoration".components."performance.header"]
+enabled = false
 ```
 
 ### Script resolution

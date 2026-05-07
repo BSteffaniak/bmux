@@ -217,6 +217,8 @@ struct ThemePluginSettings {
     themes: Vec<String>,
     #[serde(default)]
     persistence: ThemePersistence,
+    #[serde(default)]
+    components: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -362,7 +364,7 @@ fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<Active
         "theme settings parsed",
     );
     let active = active_theme_stack(context, &settings, &catalog);
-    let theme = resolve_theme_stack(&catalog, &active.stack)?;
+    let theme = resolve_theme_stack_with_settings(&catalog, &active.stack, &settings)?;
     Some(ActiveThemeResolution {
         stack: active.stack,
         source: active.source,
@@ -426,7 +428,9 @@ async fn run_theme_picker(context: NativeCommandContext) {
         .find(|name| name.as_str() != "mode-aware")
         .cloned()
         .unwrap_or_else(|| "default".to_string());
-    let Some(original_theme) = resolve_theme_stack(&catalog, &active_stack.stack) else {
+    let Some(original_theme) =
+        resolve_theme_stack_with_settings(&catalog, &active_stack.stack, &settings)
+    else {
         return;
     };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
@@ -463,7 +467,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
             }
             event = event_rx.recv() => {
                 if let Some(PromptEvent::SelectionChanged { value, .. }) = event
-                    && let Some(theme) = resolve_theme_stack(&catalog, &base_theme_stack(&value))
+                    && let Some(theme) = resolve_theme_stack_with_settings(&catalog, &base_theme_stack(&value), &settings)
                 {
                     publish_runtime_appearance_to_host(&context, &theme);
                     apply_theme_extensions(
@@ -478,7 +482,8 @@ async fn run_theme_picker(context: NativeCommandContext) {
     };
 
     if let Some(name) = selected_name
-        && let Some(theme) = resolve_theme_stack(&catalog, &base_theme_stack(&name))
+        && let Some(theme) =
+            resolve_theme_stack_with_settings(&catalog, &base_theme_stack(&name), &settings)
     {
         publish_runtime_appearance_to_host(&context, &theme);
         apply_theme_extensions(
@@ -769,6 +774,38 @@ fn resolve_theme_stack(catalog: &[ThemeCatalogEntry], stack: &[String]) -> Optio
         appearance,
         plugins,
     })
+}
+
+fn resolve_theme_stack_with_settings(
+    catalog: &[ThemeCatalogEntry],
+    stack: &[String],
+    settings: &ThemePluginSettings,
+) -> Option<ResolvedTheme> {
+    let mut theme = resolve_theme_stack(catalog, stack)?;
+    apply_settings_component_overrides(&mut theme, &settings.components);
+    Some(theme)
+}
+
+fn apply_settings_component_overrides(
+    theme: &mut ResolvedTheme,
+    components: &BTreeMap<String, toml::Value>,
+) {
+    if components.is_empty() {
+        return;
+    }
+    let components_table = components
+        .iter()
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect::<toml::map::Map<_, _>>();
+    let overlay = toml::Value::Table(toml::map::Map::from_iter([(
+        "components".to_string(),
+        toml::Value::Table(components_table),
+    )]));
+    let extension = theme
+        .plugins
+        .entry("bmux.decoration".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    merge_toml_value(extension, &overlay);
 }
 
 fn apply_theme_layer(
@@ -1515,6 +1552,145 @@ mod tests {
         assert_eq!(
             extension.get("style").and_then(toml::Value::as_str),
             Some("rounded")
+        );
+    }
+
+    #[test]
+    fn settings_components_apply_final_decoration_component_overrides() {
+        let base: ThemeConfig = toml::from_str(
+            r#"
+            [plugins."bmux.decoration".components."performance.border"]
+            script = "performance_header"
+
+            [plugins."bmux.decoration".components.snake]
+            script = "rainbow_snake"
+            "#,
+        )
+        .expect("base theme parses");
+        let catalog = vec![ThemeCatalogEntry {
+            name: "base".to_string(),
+            theme: base,
+        }];
+        let settings = ThemePluginSettings {
+            components: BTreeMap::from([(
+                "snake".to_string(),
+                toml::Value::Table(toml::map::Map::from_iter([
+                    (
+                        "above".to_string(),
+                        toml::Value::Array(vec![toml::Value::String(
+                            "performance.border".to_string(),
+                        )]),
+                    ),
+                    (
+                        "below".to_string(),
+                        toml::Value::Array(vec![toml::Value::String(
+                            "performance.header".to_string(),
+                        )]),
+                    ),
+                ])),
+            )]),
+            ..ThemePluginSettings::default()
+        };
+
+        let resolved =
+            resolve_theme_stack_with_settings(&catalog, &["base".to_string()], &settings)
+                .expect("stack resolves");
+        let snake = resolved
+            .plugins
+            .get("bmux.decoration")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("components"))
+            .and_then(toml::Value::as_table)
+            .and_then(|components| components.get("snake"))
+            .and_then(toml::Value::as_table)
+            .expect("snake component exists");
+
+        assert_eq!(
+            snake.get("script").and_then(toml::Value::as_str),
+            Some("rainbow_snake")
+        );
+        assert_eq!(
+            snake
+                .get("above")
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("performance.border")
+        );
+        assert_eq!(
+            snake
+                .get("below")
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("performance.header")
+        );
+    }
+
+    #[test]
+    fn decoration_component_extensions_merge_by_component_id() {
+        let lower: ThemeConfig = toml::from_str(
+            r#"
+            [plugins."bmux.decoration".components."performance.header"]
+            script = "performance_header"
+            above = ["performance.border"]
+            "#,
+        )
+        .expect("lower theme parses");
+        let upper: ThemeConfig = toml::from_str(
+            r#"
+            [plugins."bmux.decoration".components."performance.header"]
+            enabled = false
+            below = ["snake.body"]
+            "#,
+        )
+        .expect("upper theme parses");
+        let catalog = vec![
+            ThemeCatalogEntry {
+                name: "lower".to_string(),
+                theme: lower,
+            },
+            ThemeCatalogEntry {
+                name: "upper".to_string(),
+                theme: upper,
+            },
+        ];
+
+        let resolved = resolve_theme_stack(&catalog, &["lower".to_string(), "upper".to_string()])
+            .expect("stack resolves");
+        let component = resolved
+            .plugins
+            .get("bmux.decoration")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("components"))
+            .and_then(toml::Value::as_table)
+            .and_then(|components| components.get("performance.header"))
+            .and_then(toml::Value::as_table)
+            .expect("component extension exists");
+
+        assert_eq!(
+            component.get("script").and_then(toml::Value::as_str),
+            Some("performance_header")
+        );
+        assert_eq!(
+            component.get("enabled").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            component
+                .get("above")
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("performance.border")
+        );
+        assert_eq!(
+            component
+                .get("below")
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("snake.body")
         );
     }
 

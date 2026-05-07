@@ -17,7 +17,9 @@ themes = ["cyberpunk", "mode-aware"]
 
 When `themes` is present, themes are merged from left to right. Later layers
 paint on top of earlier layers and may override or extend appearance fields,
-mode-specific overlays, content effects, and plugin extension tables.
+mode-specific overlays, content effects, and plugin extension tables. Plugin
+extension tables are deep-merged, so decoration component maps can be composed
+by id across multiple theme files.
 
 When only `theme` is set, BMUX treats it as the base theme and applies the
 bundled `mode-aware` layer by default. `mode-aware` adds visible mode cues
@@ -39,4 +41,15 @@ hz = 30
 ```
 
 This keeps the theme runtime domain-agnostic while allowing plugins such as
-`bmux.decoration` to expose richer theme behavior.
+`bmux.decoration` to expose richer theme behavior. Users can also add final
+component overrides in the `bmux.theme` plugin settings, without creating a
+separate combination theme:
+
+```toml
+[plugins.settings."bmux.theme"]
+themes = ["performance", "rainbow-snake"]
+
+[plugins.settings."bmux.theme".components.snake]
+above = ["performance.border"]
+below = ["performance.header"]
+```

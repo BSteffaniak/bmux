@@ -124,6 +124,13 @@ pub struct ScriptRenderMessage {
     pub time_ms: u64,
     pub frame: u64,
     pub panes: JsonValue,
+    pub component: Option<ScriptComponentMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptComponentMessage {
+    pub id: String,
+    pub entrypoint: Option<String>,
 }
 
 /// Errors produced by script compile / invoke paths.
@@ -527,6 +534,14 @@ mod lua_backend {
                 t.set("time_ms", render.time_ms)?;
                 t.set("frame", render.frame)?;
                 t.set("panes", json_to_lua(lua, &render.panes)?)?;
+                if let Some(component) = &render.component {
+                    let component_table = lua.create_table()?;
+                    component_table.set("id", component.id.as_str())?;
+                    if let Some(entrypoint) = component.entrypoint.as_deref() {
+                        component_table.set("entrypoint", entrypoint)?;
+                    }
+                    t.set("component", component_table)?;
+                }
             }
         }
         Ok(t)
@@ -1048,6 +1063,7 @@ mod tests {
                         "status": "running"
                     }
                 ]),
+                component: None,
             })
         }
 

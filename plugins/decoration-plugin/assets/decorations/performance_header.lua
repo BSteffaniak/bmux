@@ -75,8 +75,16 @@ local function remember_metrics(event)
     latest.system = latest.system or { cpu_percent = 0, cpu_normalized_percent = 0 }
 end
 
+local function component_entrypoint(message)
+    if message.component ~= nil and message.component.entrypoint ~= nil then
+        return message.component.entrypoint
+    end
+    return "all"
+end
+
 local function render(message)
     local surfaces = {}
+    local entrypoint = component_entrypoint(message)
     for _, pane in ipairs(message.panes or {}) do
         local metrics = pane_metrics(pane)
         local label, cpu = label_for(metrics)
@@ -90,21 +98,26 @@ local function render(message)
             glyphs = "rounded"
             z = 12
         end
-        local cmds = {{
-            kind = "box_border",
-            rect = pane.rect,
-            z = z,
-            glyphs = glyphs,
-            style = { fg = bmux.rgb(r, g, b), bold = cpu >= 50 },
-        }}
-        table.insert(cmds, {
-            kind = "text",
-            col = pane.rect.x + 2,
-            row = pane.rect.y,
-            z = z + 1,
-            text = label,
-            style = { fg = bmux.rgb(r, g, b), bold = true },
-        })
+        local cmds = {}
+        if entrypoint == "all" or entrypoint == "border" then
+            table.insert(cmds, {
+                kind = "box_border",
+                rect = pane.rect,
+                z = z,
+                glyphs = glyphs,
+                style = { fg = bmux.rgb(r, g, b), bold = cpu >= 50 },
+            })
+        end
+        if entrypoint == "all" or entrypoint == "header" then
+            table.insert(cmds, {
+                kind = "text",
+                col = pane.rect.x + 2,
+                row = pane.rect.y,
+                z = z + 1,
+                text = label,
+                style = { fg = bmux.rgb(r, g, b), bold = true },
+            })
+        end
         surfaces[pane.id] = cmds
     end
     return { surfaces = surfaces }

@@ -17,7 +17,6 @@ foreground     = "#d8e8ff"
 mode_indicator = "#5fffff"
 
 [plugins."bmux.decoration"]
-script = "rainbow_snake"
 
 [plugins."bmux.decoration".unfocused]
 bg            = ""
@@ -50,3 +49,6 @@ running = "◆"
 [plugins."bmux.decoration".animation]
 hz   = 12
 kind = "rainbow_snake"
+
+[plugins."bmux.decoration".components.snake]
+script = "rainbow_snake"

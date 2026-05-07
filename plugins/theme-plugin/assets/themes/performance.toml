@@ -17,7 +17,6 @@ foreground     = "#f4f1e8"
 mode_indicator = "#ff5f5f"
 
 [plugins."bmux.decoration"]
-script = "performance_header"
 
 [plugins."bmux.decoration".unfocused]
 bg            = ""
@@ -55,3 +54,12 @@ capability   = "bmux.performance.read"
 interface_id = "performance-commands"
 kind         = "query"
 operation    = "get-snapshot"
+
+[plugins."bmux.decoration".components."performance.border"]
+entrypoint = "border"
+script     = "performance_header"
+
+[plugins."bmux.decoration".components."performance.header"]
+above      = ["performance.border"]
+entrypoint = "header"
+script     = "performance_header"

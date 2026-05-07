@@ -14,7 +14,7 @@
 pub mod glyphs;
 pub mod scripting;
 
-use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService, NotifyError};
 use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderSpec, BorderStyle, DecorationStateService, DecorationThemeExtension, PaneActivity,
-    PaneDecoration, PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
+    BorderSpec, BorderStyle, DecorationComponentSpec, DecorationStateService,
+    DecorationThemeExtension, PaneActivity, PaneDecoration, PaneGeometry, PaneLifecycle,
+    SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::prelude::*;
@@ -38,10 +39,35 @@ use bmux_scene_protocol::scene_protocol::{
 use uuid::Uuid;
 
 use crate::scripting::{
-    PerfTracker, ScriptBackend, ScriptEventDelivery, ScriptEventMessage, ScriptHostAccess,
-    ScriptMessage, ScriptRenderMessage, ScriptServiceCall, ScriptServiceGrant,
+    PerfTracker, ScriptBackend, ScriptComponentMessage, ScriptEventDelivery, ScriptEventMessage,
+    ScriptHostAccess, ScriptMessage, ScriptRenderMessage, ScriptServiceCall, ScriptServiceGrant,
     bundled_decoration_scripts,
 };
+
+/// Runtime state for one user-composable decoration component.
+struct ScriptComponentRuntime {
+    id: String,
+    spec: DecorationComponentSpec,
+    backend: Option<Box<dyn ScriptBackend>>,
+    script_path: Option<PathBuf>,
+    script_source_hash: Option<u64>,
+    script_started_at: Option<Instant>,
+    script_frame: u64,
+    script_perf: Option<PerfTracker>,
+    script_events: VecDeque<ScriptEventMessage>,
+}
+
+impl std::fmt::Debug for ScriptComponentRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptComponentRuntime")
+            .field("id", &self.id)
+            .field("spec", &self.spec)
+            .field("script_path", &self.script_path)
+            .field("script_source_hash", &self.script_source_hash)
+            .field("script_frame", &self.script_frame)
+            .finish_non_exhaustive()
+    }
+}
 
 /// In-memory state store.
 #[derive(Default)]
@@ -73,8 +99,8 @@ struct State {
     /// Currently-loaded extension supplied through `theme-extension:apply`;
     /// `None` means "no extension observed; paint with built-in ASCII defaults".
     current_theme: Option<DecorationThemeExtension>,
-    /// Compiled decoration script, if any. `None` means the theme
-    /// did not request a script, or scripting was disabled at build
+    /// Compiled legacy decoration script, if any. `None` means the theme
+    /// did not request a top-level script, or scripting was disabled at build
     /// time, or compilation failed (the loader logs the failure).
     script_backend: Option<Box<dyn ScriptBackend>>,
     /// Display path of the active script (used for perf + error
@@ -97,6 +123,10 @@ struct State {
     script_events: VecDeque<ScriptEventMessage>,
     /// External plugin event kinds the active script asked to receive.
     script_event_subscriptions: Vec<String>,
+    /// Named user-composable decoration components exported by the active
+    /// theme stack. These run after the static border and legacy script path,
+    /// ordered by their relative `above` / `below` constraints.
+    script_components: BTreeMap<String, ScriptComponentRuntime>,
     /// Monotonic generation used to stop stale subscription threads
     /// after a theme/script reload.
     script_subscription_generation: u64,
@@ -124,6 +154,10 @@ impl std::fmt::Debug for State {
             .field("script_path", &self.script_path)
             .field("script_source_hash", &self.script_source_hash)
             .field("script_frame", &self.script_frame)
+            .field(
+                "script_components",
+                &self.script_components.keys().collect::<Vec<_>>(),
+            )
             .field("animation_hz", &self.animation_hz)
             .finish_non_exhaustive()
     }
@@ -468,6 +502,7 @@ fn build_scene(state: &mut State) -> DecorationScene {
         );
     }
     merge_script_paint_commands(state, &mut surfaces);
+    merge_component_paint_commands(state, &mut surfaces);
     DecorationScene {
         revision: state.scene_revision,
         surfaces,
@@ -552,6 +587,7 @@ fn merge_script_paint_commands(
         time_ms,
         frame: state.script_frame,
         panes: script_panes_payload(state),
+        component: None,
     });
     let outcome = match backend.invoke(&render) {
         Ok(outcome) => outcome,
@@ -593,6 +629,218 @@ fn merge_script_paint_commands(
             commands_merged = commands_merged,
             "first decoration script invocation with geometry",
         );
+    }
+}
+
+fn merge_component_paint_commands(
+    state: &mut State,
+    surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
+) {
+    let order = ordered_enabled_component_ids(state);
+    let panes = script_panes_payload(state);
+    for (index, component_id) in order.iter().enumerate() {
+        merge_component_paint_commands_for_id(state, surfaces, component_id, index, &panes);
+    }
+}
+
+fn merge_component_paint_commands_for_id(
+    state: &mut State,
+    surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
+    component_id: &str,
+    order_index: usize,
+    panes: &serde_json::Value,
+) {
+    let Some(component) = state.script_components.get_mut(component_id) else {
+        return;
+    };
+    let Some(backend) = component.backend.as_ref() else {
+        return;
+    };
+    while let Some(event) = component.script_events.pop_front() {
+        let message = ScriptMessage::Event(event);
+        let outcome = match backend.invoke(&message) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(
+                    target: "decoration.script",
+                    component_id,
+                    error = %error,
+                    "decoration component event invocation failed",
+                );
+                continue;
+            }
+        };
+        record_component_script_perf(component, outcome.duration);
+    }
+
+    component.script_frame = component.script_frame.saturating_add(1);
+    let time_ms = component.script_started_at.map_or(0, |started_at| {
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    });
+    let render = ScriptMessage::Render(ScriptRenderMessage {
+        time_ms,
+        frame: component.script_frame,
+        panes: panes.clone(),
+        component: Some(ScriptComponentMessage {
+            id: component.id.clone(),
+            entrypoint: component.spec.entrypoint.clone(),
+        }),
+    });
+    let outcome = match backend.invoke(&render) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(
+                target: "decoration.script",
+                component_id,
+                error = %error,
+                "decoration component render invocation failed",
+            );
+            return;
+        }
+    };
+    record_component_script_perf(component, outcome.duration);
+    for (pane_id, mut commands) in outcome.surfaces {
+        let Ok(pane_id) = pane_id.parse::<Uuid>() else {
+            tracing::warn!(target: "decoration.script", pane_id, component_id, "component returned unknown pane id");
+            continue;
+        };
+        normalize_component_command_z(&mut commands, order_index);
+        let surface = surfaces
+            .entry(pane_id)
+            .or_insert_with(|| empty_surface_for(state, pane_id));
+        surface.paint_commands.extend(commands);
+    }
+}
+
+fn record_component_script_perf(component: &ScriptComponentRuntime, duration: Duration) {
+    if let Some(tracker) = component.script_perf.as_ref()
+        && let Some(msg) = tracker.record(duration)
+    {
+        tracing::warn!(target: "decoration.script", component_id = %component.id, "{msg}");
+    }
+}
+
+fn ordered_enabled_component_ids(state: &State) -> Vec<String> {
+    let enabled = state
+        .script_components
+        .iter()
+        .filter(|(_, component)| component_enabled(&component.spec))
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut incoming = enabled
+        .iter()
+        .map(|id| (id.clone(), BTreeSet::<String>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = enabled
+        .iter()
+        .map(|id| (id.clone(), BTreeSet::<String>::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for id in &enabled {
+        let Some(component) = state.script_components.get(id) else {
+            continue;
+        };
+        for target in component.spec.above.as_deref().unwrap_or_default() {
+            if enabled.contains(target) {
+                add_component_order_edge(target, id, &mut incoming, &mut outgoing);
+            }
+        }
+        for target in component.spec.below.as_deref().unwrap_or_default() {
+            if enabled.contains(target) {
+                add_component_order_edge(id, target, &mut incoming, &mut outgoing);
+            }
+        }
+    }
+
+    let mut ready = incoming
+        .iter()
+        .filter(|(_, deps)| deps.is_empty())
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(enabled.len());
+    while let Some(id) = ready.pop_first() {
+        ordered.push(id.clone());
+        let dependents = outgoing.remove(&id).unwrap_or_default();
+        for dependent in dependents {
+            let Some(deps) = incoming.get_mut(&dependent) else {
+                continue;
+            };
+            deps.remove(&id);
+            if deps.is_empty() {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if ordered.len() != enabled.len() {
+        let unresolved = enabled
+            .into_iter()
+            .filter(|id| !ordered.iter().any(|ordered_id| ordered_id == id))
+            .collect::<Vec<_>>();
+        tracing::warn!(
+            target: "decoration.script",
+            unresolved = ?unresolved,
+            "component layering cycle detected; appending unresolved components in id order",
+        );
+        ordered.extend(unresolved);
+    }
+    ordered
+}
+
+fn add_component_order_edge(
+    before: &str,
+    after: &str,
+    incoming: &mut BTreeMap<String, BTreeSet<String>>,
+    outgoing: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    if before == after {
+        return;
+    }
+    if let Some(deps) = incoming.get_mut(after) {
+        deps.insert(before.to_string());
+    }
+    if let Some(dependents) = outgoing.get_mut(before) {
+        dependents.insert(after.to_string());
+    }
+}
+
+fn component_enabled(spec: &DecorationComponentSpec) -> bool {
+    spec.enabled.unwrap_or(true)
+}
+
+fn normalize_component_command_z(commands: &mut [PaintCommand], order_index: usize) {
+    if commands.is_empty() {
+        return;
+    }
+    let min_z = commands.iter().map(paint_command_z).min().unwrap_or(0);
+    let base = component_base_z(order_index);
+    for command in commands {
+        let relative = paint_command_z(command).saturating_sub(min_z).clamp(0, 99);
+        set_paint_command_z(command, base.saturating_add(relative));
+    }
+}
+
+fn component_base_z(order_index: usize) -> i16 {
+    let index = i16::try_from(order_index).unwrap_or(i16::MAX / 100);
+    100_i16.saturating_add(index.saturating_mul(100))
+}
+
+const fn paint_command_z(command: &PaintCommand) -> i16 {
+    match command {
+        PaintCommand::Text { z, .. }
+        | PaintCommand::FilledRect { z, .. }
+        | PaintCommand::GradientRun { z, .. }
+        | PaintCommand::CellGrid { z, .. }
+        | PaintCommand::BoxBorder { z, .. } => *z,
+    }
+}
+
+fn set_paint_command_z(command: &mut PaintCommand, next_z: i16) {
+    match command {
+        PaintCommand::Text { z, .. }
+        | PaintCommand::FilledRect { z, .. }
+        | PaintCommand::GradientRun { z, .. }
+        | PaintCommand::CellGrid { z, .. }
+        | PaintCommand::BoxBorder { z, .. } => *z = next_z,
     }
 }
 
@@ -786,6 +1034,7 @@ fn apply_theme_extension_toml(
         if let Ok(mut state) = state.lock() {
             state.current_theme = None;
             state.animation_hz = None;
+            state.script_components.clear();
             install_script_backend(&mut state, None, ScriptHostAccess::default());
             bump_revision(&mut state);
         }
@@ -815,6 +1064,12 @@ fn apply_theme_extension_toml(
     script_host_access.service_grants = script_service_grants(script_access.as_ref());
     let mut subscription_generation = None;
     if let Ok(mut state) = state.lock() {
+        install_script_components(
+            &mut state,
+            &extension,
+            config_dir_candidates,
+            &script_host_access,
+        );
         state.current_theme = Some(extension);
         state.animation_hz = animation_hz;
         install_script_backend(&mut state, script, script_host_access);
@@ -969,7 +1224,13 @@ fn enqueue_script_json_event(
     let Ok(mut guard) = state.lock() else {
         return false;
     };
-    if guard.script_subscription_generation != generation || guard.script_backend.is_none() {
+    let has_component_backend = guard
+        .script_components
+        .values()
+        .any(|component| component.backend.is_some());
+    if guard.script_subscription_generation != generation
+        || (guard.script_backend.is_none() && !has_component_backend)
+    {
         return false;
     }
     if guard.script_events.len() >= MAX_SCRIPT_EVENT_QUEUE {
@@ -980,13 +1241,20 @@ fn enqueue_script_json_event(
         bmux_plugin::DeliveryMode::Broadcast => ScriptEventDelivery::Broadcast,
         bmux_plugin::DeliveryMode::State => ScriptEventDelivery::State,
     };
-    guard.script_events.push_back(ScriptEventMessage {
+    let event_message = ScriptEventMessage {
         source: source.clone(),
         kind: source,
         delivery,
         payload: event.payload.clone(),
         snapshot,
-    });
+    };
+    guard.script_events.push_back(event_message.clone());
+    for component in guard.script_components.values_mut() {
+        if component.script_events.len() >= MAX_SCRIPT_EVENT_QUEUE {
+            component.script_events.pop_front();
+        }
+        component.script_events.push_back(event_message.clone());
+    }
     bump_revision(&mut guard);
     true
 }
@@ -1914,6 +2182,119 @@ struct NotifyPaneEventArgs {
     event: PaneEvent,
 }
 
+fn install_script_components(
+    state: &mut State,
+    extension: &DecorationThemeExtension,
+    config_dir_candidates: &[PathBuf],
+    host_access: &ScriptHostAccess,
+) {
+    state.script_components.clear();
+    let Some(components) = extension.components.as_ref() else {
+        return;
+    };
+    for (id, spec) in components {
+        if !component_enabled(spec) {
+            state.script_components.insert(
+                id.clone(),
+                ScriptComponentRuntime {
+                    id: id.clone(),
+                    spec: spec.clone(),
+                    backend: None,
+                    script_path: None,
+                    script_source_hash: None,
+                    script_started_at: None,
+                    script_frame: 0,
+                    script_perf: None,
+                    script_events: VecDeque::new(),
+                },
+            );
+            continue;
+        }
+        let script = spec
+            .script
+            .as_deref()
+            .and_then(|script| resolve_decoration_script(config_dir_candidates, script));
+        let runtime = compile_script_component(id, spec, script, host_access.clone());
+        state.script_components.insert(id.clone(), runtime);
+    }
+}
+
+fn compile_script_component(
+    id: &str,
+    spec: &DecorationComponentSpec,
+    script: Option<ResolvedScript>,
+    host_access: ScriptHostAccess,
+) -> ScriptComponentRuntime {
+    let Some(script) = script else {
+        return ScriptComponentRuntime {
+            id: id.to_string(),
+            spec: spec.clone(),
+            backend: None,
+            script_path: None,
+            script_source_hash: None,
+            script_started_at: None,
+            script_frame: 0,
+            script_perf: None,
+            script_events: VecDeque::new(),
+        };
+    };
+    let backend = crate::scripting::make_backend(host_access);
+    if !backend.is_functional() {
+        tracing::warn!(
+            target: "decoration.script",
+            component_id = id,
+            script = ?script.path,
+            "decoration scripting is not compiled into this build — component script will be ignored",
+        );
+        return ScriptComponentRuntime {
+            id: id.to_string(),
+            spec: spec.clone(),
+            backend: None,
+            script_path: Some(script.path),
+            script_source_hash: None,
+            script_started_at: None,
+            script_frame: 0,
+            script_perf: None,
+            script_events: VecDeque::new(),
+        };
+    }
+    if let Err(error) = backend.compile(&script.path, &script.source) {
+        tracing::warn!(
+            target: "decoration.script",
+            component_id = id,
+            script = ?script.path,
+            error = %error,
+            "decoration component script failed to compile — component will be ignored",
+        );
+        return ScriptComponentRuntime {
+            id: id.to_string(),
+            spec: spec.clone(),
+            backend: None,
+            script_path: Some(script.path),
+            script_source_hash: None,
+            script_started_at: None,
+            script_frame: 0,
+            script_perf: None,
+            script_events: VecDeque::new(),
+        };
+    }
+    let source_hash = script_source_hash(&script.path, &script.source);
+    ScriptComponentRuntime {
+        id: id.to_string(),
+        spec: spec.clone(),
+        backend: Some(backend),
+        script_path: Some(script.path.clone()),
+        script_source_hash: Some(source_hash),
+        script_started_at: Some(Instant::now()),
+        script_frame: 0,
+        script_perf: Some(PerfTracker::new(
+            script.path,
+            crate::scripting::DEFAULT_WARN_MS,
+        )),
+        script_events: VecDeque::new(),
+    }
+}
+
 /// Compile `script` into a fresh backend and install it on `state`.
 /// Invoked during `activate` before the first revision bump so the
 /// initial published scene already reflects any script output.
@@ -2019,9 +2400,14 @@ fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16) {
             if guard.animation_hz != Some(hz) {
                 return;
             }
-            // Skip the tick entirely if the script was unloaded
+            // Skip the tick entirely if scripts were unloaded
             // between frames — avoids a useless revision bump.
-            if guard.script_backend.is_some() {
+            if guard.script_backend.is_some()
+                || guard
+                    .script_components
+                    .values()
+                    .any(|component| component.backend.is_some())
+            {
                 bump_revision(&mut guard);
             }
         }
@@ -2649,6 +3035,7 @@ mod tests {
             animation: None,
             script: None,
             script_access: None,
+            components: None,
         }
     }
 
@@ -2792,6 +3179,7 @@ mod tests {
             .and_then(|spec| resolve_decoration_script(&[], spec));
         let mut state = plugin.state.inner.lock().expect("lock");
         state.animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
+        install_script_components(&mut state, &extension, &[], &ScriptHostAccess::default());
         state.current_theme = Some(extension);
         install_script_backend(&mut state, script, ScriptHostAccess::default());
     }
@@ -3823,9 +4211,13 @@ exited = ""
 
         {
             let state = plugin.state.inner.lock().expect("lock");
-            assert!(state.script_backend.is_some(), "script backend installed");
+            let component = state
+                .script_components
+                .get("snake")
+                .expect("snake component installed");
+            assert!(component.backend.is_some(), "component backend installed");
             assert_eq!(
-                state.script_path.as_deref(),
+                component.script_path.as_deref(),
                 Some(Path::new("bundled:rainbow_snake")),
             );
         }
@@ -3835,8 +4227,117 @@ exited = ""
         let has_snake_text = surface
             .paint_commands
             .iter()
-            .any(|cmd| matches!(cmd, PaintCommand::Text { z: 20, text, .. } if text == "◆"));
+            .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "◆"));
         assert!(has_snake_text, "rainbow snake text command emitted");
+    }
+
+    #[test]
+    fn component_layering_uses_relative_above_below_order() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xf003);
+        seed_geometry(&plugin, pane, 20, 5);
+        let extension = decoration_extension_from_theme(
+            r##"
+            [plugins."bmux.decoration".unfocused]
+            bg = ""
+            fg = "#606060"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "single-line"
+
+            [plugins."bmux.decoration".focused]
+            bg = ""
+            fg = "#e0e0e0"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "thick"
+
+            [plugins."bmux.decoration".zoomed]
+            bg = ""
+            fg = "#ffffff"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "double"
+
+            [plugins."bmux.decoration".badges]
+            running = ""
+            exited = ""
+
+            [plugins."bmux.decoration".components."performance.border"]
+            script = "decorations/border.lua"
+
+            [plugins."bmux.decoration".components."performance.header"]
+            above = ["snake.body"]
+            script = "decorations/header.lua"
+
+            [plugins."bmux.decoration".components."snake.body"]
+            above = ["performance.border"]
+            below = ["performance.header"]
+            script = "decorations/snake.lua"
+            "##,
+        );
+        let config_dir =
+            std::env::temp_dir().join(format!("bmux-components-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(config_dir.join("decorations")).expect("mkdir decorations");
+        write_component_test_script(&config_dir, "border", "B");
+        write_component_test_script(&config_dir, "snake", "S");
+        write_component_test_script(&config_dir, "header", "H");
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            install_script_components(
+                &mut state,
+                &extension,
+                std::slice::from_ref(&config_dir),
+                &ScriptHostAccess::default(),
+            );
+            state.current_theme = Some(extension);
+        }
+
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        let ordered_text = surface
+            .paint_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                PaintCommand::Text { text, .. } if text == "B" || text == "S" || text == "H" => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered_text, vec!["B", "S", "H"]);
+    }
+
+    fn write_component_test_script(config_dir: &Path, name: &str, label: &str) {
+        std::fs::write(
+            config_dir.join("decorations").join(format!("{name}.lua")),
+            format!(
+                r#"
+                function decorate(message)
+                    if message.kind ~= "render" then
+                        return nil
+                    end
+                    local surfaces = {{}}
+                    for _, pane in ipairs(message.panes or {{}}) do
+                        surfaces[pane.id] = {{{{
+                            kind = "text",
+                            col = pane.rect.x,
+                            row = pane.rect.y,
+                            z = 0,
+                            text = "{label}",
+                            style = {{}},
+                        }}}}
+                    end
+                    return {{ surfaces = surfaces }}
+                end
+                "#,
+            ),
+        )
+        .expect("write script");
     }
 
     #[test]

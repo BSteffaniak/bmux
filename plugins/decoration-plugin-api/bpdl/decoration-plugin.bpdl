@@ -60,6 +60,37 @@ interface decoration-state {
         // payloads; it subscribes/calls only the declared plugin APIs
         // and forwards JSON-shaped data into Lua.
         script-access: script-access-spec?,
+        // Optional named decoration components exported by a theme.
+        // Component ids are the user-facing composition handles (for
+        // example `performance.border`, `performance.header`, or
+        // `snake.body`). Theme stacks deep-merge this map by id, so a
+        // later user theme can disable or relatively reorder a
+        // component without copying the whole component definition.
+        components: map<string, decoration-component-spec>?,
+    }
+
+    // One user-composable decoration component. Components are ordered
+    // only relative to other component ids: `above = ["x"]` means this
+    // component paints after `x`; `below = ["y"]` means this component
+    // paints before `y`. The decoration plugin translates the final
+    // relative order into renderer draw order internally.
+    record decoration-component-spec {
+        // Disabled components are kept in the merged theme document but
+        // omitted from rendering. Missing => enabled.
+        enabled: bool?,
+        // Optional decoration script. Components without a script are
+        // currently inert but remain valid so future non-scripted
+        // component kinds can be added without changing the schema.
+        script: string?,
+        // Optional script-selected entrypoint/export. The Lua message
+        // exposes this as `message.component.entrypoint`; scripts may
+        // use it to render only a named sub-component from one source
+        // file.
+        entrypoint: string?,
+        // Paint this component after the listed component ids.
+        above: list<string>?,
+        // Paint this component before the listed component ids.
+        below: list<string>?,
     }
 
     // Generic plugin access available to a decoration script. Channel
