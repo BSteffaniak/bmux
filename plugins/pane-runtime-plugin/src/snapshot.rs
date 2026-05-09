@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::runtime::{session_handle, session_runtime_handle};
 use bmux_pane_runtime_state::{
-    FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource,
-    PaneLaunchSpec, PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta,
+    AttachViewport, FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect,
+    PaneCommandSource, PaneLaunchSpec, PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta,
 };
 
 /// Stable id for the pane-runtime plugin snapshot surface.
@@ -56,6 +56,10 @@ pub struct PaneRuntimeSessionSnapshotV1 {
     /// no layout is persisted yet.
     #[serde(default)]
     pub layout_root: Option<PaneRuntimeSnapshotV1Layout>,
+    /// Last attached viewport, used to restore PTYs at their layout-derived size
+    /// before resurrected full-screen commands start drawing.
+    #[serde(default)]
+    pub attach_viewport: Option<AttachViewport>,
     /// Floating surfaces anchored to panes in this session.
     #[serde(default)]
     pub floating_surfaces: Vec<PaneRuntimeSnapshotV1FloatingSurface>,
@@ -265,6 +269,7 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
             panes,
             focused_pane_id: Some(runtime.focused_pane_id),
             layout_root: runtime.layout_root.as_ref().map(layout_to_snapshot),
+            attach_viewport: runtime.attach_viewport,
             floating_surfaces,
         });
     }
@@ -360,6 +365,7 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
             entry.layout_root.as_ref().map(layout_from_snapshot),
             focused_pane_id,
             floating_surfaces,
+            entry.attach_viewport,
         ) {
             warn!(
                 "failed restoring pane runtime for session {}: {error}",
@@ -423,7 +429,9 @@ mod tests {
         PaneRuntimeSnapshotV1SplitDirection,
     };
     use bmux_attach_layout_protocol::PaneLaunchCommand;
-    use bmux_pane_runtime_state::{FloatingPaneLayer, FloatingPaneScope, PaneCommandSource};
+    use bmux_pane_runtime_state::{
+        AttachViewport, FloatingPaneLayer, FloatingPaneScope, PaneCommandSource,
+    };
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
@@ -460,6 +468,12 @@ mod tests {
                     ratio: 0.5,
                     first: Box::new(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
                     second: Box::new(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
+                }),
+                attach_viewport: Some(AttachViewport {
+                    cols: 120,
+                    rows: 40,
+                    status_top_inset: 1,
+                    status_bottom_inset: 2,
                 }),
                 floating_surfaces: vec![PaneRuntimeSnapshotV1FloatingSurface {
                     id: surface_id,
@@ -520,6 +534,7 @@ mod tests {
                 }],
                 focused_pane_id: Some(pane_id),
                 layout_root: Some(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
+                attach_viewport: None,
                 floating_surfaces: vec![],
             }],
         };
@@ -572,6 +587,7 @@ mod tests {
                 }],
                 focused_pane_id: Some(pane_id),
                 layout_root: Some(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
+                attach_viewport: None,
                 floating_surfaces: vec![],
             }],
         };

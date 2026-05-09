@@ -187,6 +187,7 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         layout_root: Option<PaneLayoutNode>,
         focused_pane_id: Uuid,
         floating_surfaces: Vec<FloatingSurfaceRuntime>,
+        attach_viewport: Option<AttachViewport>,
     ) -> anyhow::Result<()>;
 
     fn remove_runtime(&self, session_id: SessionId) -> Option<RemovedRuntimeInfo>;
@@ -616,6 +617,7 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _layout_root: Option<PaneLayoutNode>,
         _focused_pane_id: Uuid,
         _floating_surfaces: Vec<FloatingSurfaceRuntime>,
+        _attach_viewport: Option<AttachViewport>,
     ) -> anyhow::Result<()> {
         anyhow::bail!("pane-runtime plugin not active")
     }

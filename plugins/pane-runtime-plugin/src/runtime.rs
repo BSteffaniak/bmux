@@ -2479,7 +2479,7 @@ impl SessionRuntimeManager {
             launch: None,
             resurrection: PaneResurrectionSnapshot::default(),
         };
-        let first_pane = self.spawn_pane_runtime(session_id, pane_meta);
+        let first_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
         let mut panes = BTreeMap::new();
         panes.insert(first_pane_id, first_pane);
 
@@ -2508,6 +2508,7 @@ impl SessionRuntimeManager {
         layout_root: Option<PaneLayoutNode>,
         focused_pane_id: Uuid,
         floating_surfaces: Vec<FloatingSurfaceRuntime>,
+        attach_viewport: Option<AttachViewport>,
     ) -> Result<()> {
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
@@ -2520,13 +2521,29 @@ impl SessionRuntimeManager {
             anyhow::bail!("focused pane missing from restored runtime");
         }
 
-        let mut runtime_panes = BTreeMap::new();
-        for pane_meta in panes {
-            let pane = self.spawn_pane_runtime(session_id, pane_meta.clone());
-            runtime_panes.insert(pane_meta.id, pane);
+        let runtime_layout_root = layout_root.or_else(|| layout_from_panes(panes));
+        let mut initial_pane_sizes = BTreeMap::new();
+        if let (Some(layout_root), Some(viewport)) = (&runtime_layout_root, attach_viewport) {
+            let mut rects = BTreeMap::new();
+            collect_layout_rects(
+                layout_root,
+                scene_root_from_viewport(Some(viewport)),
+                &mut rects,
+            );
+            for (pane_id, rect) in rects {
+                initial_pane_sizes.insert(pane_id, pane_pty_size(rect));
+            }
         }
 
-        let runtime_layout_root = layout_root.or_else(|| layout_from_panes(panes));
+        let mut runtime_panes = BTreeMap::new();
+        for pane_meta in panes {
+            let initial_size = initial_pane_sizes
+                .get(&pane_meta.id)
+                .copied()
+                .unwrap_or((24, 80));
+            let pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), initial_size);
+            runtime_panes.insert(pane_meta.id, pane);
+        }
 
         self.runtimes.insert(
             session_id,
@@ -2537,7 +2554,7 @@ impl SessionRuntimeManager {
                 zoomed_pane_id: None,
                 floating_surfaces,
                 attached_clients: BTreeSet::new(),
-                attach_viewport: None,
+                attach_viewport,
                 attach_view_revision: 0,
             },
         );
@@ -2555,19 +2572,21 @@ impl SessionRuntimeManager {
         &self,
         session_id: SessionId,
         pane_meta: PaneRuntimeMeta,
+        initial_size: (u16, u16),
     ) -> PaneRuntimeHandle {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<PaneRuntimeCommand>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
+        let (initial_rows, initial_cols) = sanitize_pty_size(initial_size.0, initial_size.1);
         let terminal_grid = Arc::new(std::sync::Mutex::new(
-            TerminalGridStream::new(80, 24, GridLimits::default())
-                .expect("default pane terminal grid dimensions are valid"),
+            TerminalGridStream::new(initial_cols, initial_rows, GridLimits::default())
+                .expect("initial pane terminal grid dimensions are valid"),
         ));
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
         let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default()));
-        let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
+        let last_requested_size = Arc::new(std::sync::Mutex::new((initial_rows, initial_cols)));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
         let pane_term = self.pane_term.clone();
@@ -2634,8 +2653,8 @@ impl SessionRuntimeManager {
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
             let Ok(pty_pair) = pty_system.openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows: initial_rows,
+                cols: initial_cols,
                 pixel_width: 0,
                 pixel_height: 0,
             }) else {
@@ -3207,7 +3226,7 @@ impl SessionRuntimeManager {
             launch,
             resurrection: PaneResurrectionSnapshot::default(),
         };
-        let handle = self.spawn_pane_runtime(session_id, pane_meta);
+        let handle = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -3428,7 +3447,7 @@ impl SessionRuntimeManager {
             shutdown_pane_handle(old_pane).await;
         });
 
-        let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone());
+        let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), (24, 80));
         let client_ids = {
             let session = self
                 .runtimes
@@ -3547,7 +3566,7 @@ impl SessionRuntimeManager {
             launch: command.map(pane_launch_spec_from_command).transpose()?,
             resurrection: PaneResurrectionSnapshot::default(),
         };
-        let handle = self.spawn_pane_runtime(session_id, pane_meta);
+        let handle = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -4531,6 +4550,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         layout_root: Option<bmux_pane_runtime_state::PaneLayoutNode>,
         focused_pane_id: Uuid,
         floating_surfaces: Vec<bmux_pane_runtime_state::FloatingSurfaceRuntime>,
+        attach_viewport: Option<bmux_pane_runtime_state::AttachViewport>,
     ) -> anyhow::Result<()> {
         self.with_lock(|m| {
             m.restore_runtime(
@@ -4539,6 +4559,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 layout_root,
                 focused_pane_id,
                 floating_surfaces,
+                attach_viewport,
             )
         })
         .ok_or_else(Self::lock_poisoned_anyhow)?
