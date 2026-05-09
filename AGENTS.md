@@ -62,15 +62,16 @@ These boundary rules are strict and take precedence over convenience.
 
 If you change code, run the relevant tests before finishing and report exactly what you ran and whether it passed.
 
-In addition, for any code change anywhere in the repo, run:
+In addition, for any code change anywhere in the repo, run clippy before the full nextest suite:
 
-- `cargo nextest run --no-fail-fast`
+1. `cargo clippy --all-targets -- -D warnings`
+2. `cargo nextest run --no-fail-fast`
 
-This is required. Treat failures as blocking, and do not finish with known flaky/failing tests.
+These are required. Treat failures as blocking, and do not finish with known flaky/failing tests.
 
 ## Clippy (REQUIRED)
 
-For any code change anywhere in the repo, run:
+For any code change anywhere in the repo, run before `cargo nextest run --no-fail-fast`:
 
 - `cargo clippy --all-targets -- -D warnings`
 
@@ -118,10 +119,11 @@ If `bmux plugin rebuild --all-workspace-plugins` is unavailable in the current e
 
 For changes in `packages/cli/**` (runtime, input, pane/layout, protocol, terminal handling), run:
 
-1. `cargo nextest run --no-fail-fast`
-2. `cargo test -p bmux_cli`
-3. `cargo check -p bmux_cli`
-4. `./scripts/smoke-pty-runtime.sh`
+1. `cargo clippy --all-targets -- -D warnings`
+2. `cargo nextest run --no-fail-fast`
+3. `cargo test -p bmux_cli`
+4. `cargo check -p bmux_cli`
+5. `./scripts/smoke-pty-runtime.sh`
 
 ## Compatibility-Related Changes (REQUIRED extra check)
 
@@ -139,33 +141,33 @@ This includes edits under:
 ## Change-to-Tests Mapping
 
 - Protocol/query/reply/TERM/profile changes
-  - Run all 5 commands above.
+  - Run all 5 CLI/runtime commands above, plus `./scripts/compat-matrix.sh`.
 - Input/keymap/runtime command handling changes
-  - Run 1-4.
+  - Run CLI/runtime commands 1-5.
 - Layout/pane lifecycle/compositor changes
-  - Run 1-4.
+  - Run CLI/runtime commands 1-5.
 - Config-only changes
-  - Run at least 1-3; include 4 if behavior affects runtime startup.
+  - Run at least CLI/runtime commands 1-4; include 5 if behavior affects runtime startup.
 - Any plugin changes under `plugins/**`
   - Run `bmux plugin rebuild --all-workspace-plugins`.
 - Docs-only changes
   - No mandatory runtime commands.
 
-In addition, for any non-doc code change, always run:
+In addition, for any non-doc code change, always run clippy before the full nextest suite:
 
-- `cargo nextest run --no-fail-fast`
 - `cargo clippy --all-targets -- -D warnings`
+- `cargo nextest run --no-fail-fast`
 - `cargo machete --with-metadata`
 
 ## Completion Reporting Format
 
 Agents should report test execution in final response using this format:
 
+- `cargo clippy --all-targets -- -D warnings` - PASS/FAIL
+- `cargo nextest run --no-fail-fast` - PASS/FAIL
+- `cargo machete --with-metadata` - PASS/FAIL
 - `cargo test -p bmux_cli` - PASS/FAIL
 - `cargo check -p bmux_cli` - PASS/FAIL
-- `cargo nextest run --no-fail-fast` - PASS/FAIL
-- `cargo clippy --all-targets -- -D warnings` - PASS/FAIL
-- `cargo machete --with-metadata` - PASS/FAIL
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
 - `bmux plugin rebuild --all-workspace-plugins` - PASS/FAIL (if required)

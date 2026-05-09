@@ -13,8 +13,8 @@ Any change touching plugin runtime, plugin SDK, command routing, or bundled plug
 
 ### 1) Build and correctness
 
-- `cargo nextest run --no-fail-fast`
 - `cargo clippy --all-targets -- -D warnings`
+- `cargo nextest run --no-fail-fast`
 - `cargo machete --with-metadata`
 
 ### 2) CLI/runtime safety checks
