@@ -4267,6 +4267,51 @@ exited = ""
     }
 
     #[test]
+    fn pong_theme_slice_installs_split_components_and_runs_bundled_script() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xf005);
+        seed_geometry(&plugin, pane, 30, 8);
+        set_activity(&plugin, pane, true, false);
+
+        let theme = include_str!("../../theme-plugin/assets/themes/pong.toml");
+        let extension = decoration_extension_from_theme(theme);
+        install_extension_with_script(&plugin, extension);
+
+        {
+            let state = plugin.state.inner.lock().expect("lock");
+            for id in ["pong.ball", "pong.paddles", "pong.score"] {
+                let component = state
+                    .script_components
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{id} component installed"));
+                assert!(component.backend.is_some(), "{id} backend installed");
+                assert_eq!(
+                    component.script_path.as_deref(),
+                    Some(Path::new("bundled:pong"))
+                );
+            }
+        }
+
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        assert!(
+            surface
+                .before_content_paint_commands
+                .iter()
+                .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "●"))
+        );
+        assert!(surface.paint_commands.iter().any(
+            |cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "▌" || text == "▐")
+        ));
+        assert!(
+            surface
+                .paint_commands
+                .iter()
+                .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text.contains(" : ")))
+        );
+    }
+
+    #[test]
     fn component_layering_uses_relative_above_below_order() {
         let plugin = DecorationPlugin::new();
         let pane = Uuid::from_u128(0xf003);

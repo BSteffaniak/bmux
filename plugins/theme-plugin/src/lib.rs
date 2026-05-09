@@ -975,6 +975,7 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
             "performance",
             include_str!("../assets/themes/performance.toml"),
         ),
+        ("pong", include_str!("../assets/themes/pong.toml")),
         (
             "mode-aware",
             include_str!("../assets/themes/mode-aware.toml"),

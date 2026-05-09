@@ -951,6 +951,7 @@ pub fn bundled_decoration_scripts() -> &'static [(&'static str, &'static str)] {
                 "performance_header",
                 include_str!("../assets/decorations/performance_header.lua"),
             ),
+            ("pong", include_str!("../assets/decorations/pong.lua")),
         ]
     }
     #[cfg(not(feature = "bundled-decoration-scripts"))]
