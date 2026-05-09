@@ -11,8 +11,8 @@ use bmux_appearance::{
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::{
     AttachRenderExtension, BorderGlyphs, ExtensionRect, RenderColor, RenderDamage,
-    RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, clip_render_text_run_to_rect,
-    render_text_width_u16,
+    RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
+    clip_render_text_run_to_rect, render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -641,6 +641,56 @@ fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
             .copied()
             .any(|region| render_op_bounds(op).intersects(region)),
     }
+}
+
+fn render_ops_to_cells(ops: &[RenderOp]) -> BTreeMap<(u16, u16), RenderUnderCell> {
+    let mut cells = BTreeMap::new();
+    for op in ops {
+        match op {
+            RenderOp::TextRun { x, y, text, style } => {
+                let mut col = *x;
+                for ch in text.chars() {
+                    cells.insert((col, *y), RenderUnderCell { ch, style: *style });
+                    col = col.saturating_add(1);
+                }
+            }
+            RenderOp::FillRect { rect, ch, style } => {
+                for row in rect.y..rect.bottom() {
+                    for col in rect.x..rect.right() {
+                        cells.insert(
+                            (col, row),
+                            RenderUnderCell {
+                                ch: *ch,
+                                style: *style,
+                            },
+                        );
+                    }
+                }
+            }
+            RenderOp::CellGrid { x, y, rows } => {
+                for (row_offset, row) in rows.iter().enumerate() {
+                    let Ok(row_offset) = u16::try_from(row_offset) else {
+                        break;
+                    };
+                    for (col_offset, cell) in row.iter().enumerate() {
+                        let Ok(col_offset) = u16::try_from(col_offset) else {
+                            break;
+                        };
+                        let Some(ch) = cell.ch else { continue };
+                        cells.insert(
+                            (x.saturating_add(col_offset), y.saturating_add(row_offset)),
+                            RenderUnderCell {
+                                ch,
+                                style: cell.style,
+                            },
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    cells
 }
 
 fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
@@ -1510,6 +1560,26 @@ const fn grid_color_to_cell_color(color: Option<GridColor>) -> CellColor {
     }
 }
 
+const fn render_style_to_cell_style(style: RenderStyle) -> CellStyle {
+    CellStyle {
+        fg: render_color_to_cell_color(style.fg),
+        bg: render_color_to_cell_color(style.bg),
+        bold: style.bold,
+        dim: style.dim,
+        italic: style.italic,
+        underline: style.underline,
+        inverse: style.reverse,
+    }
+}
+
+const fn render_color_to_cell_color(color: Option<RenderColor>) -> CellColor {
+    match color {
+        Some(RenderColor::Indexed(index)) => CellColor::Indexed(index),
+        Some(RenderColor::Rgb { r, g, b }) => CellColor::Rgb(r, g, b),
+        _ => CellColor::Default,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RgbColor {
     r: u8,
@@ -1634,6 +1704,51 @@ const fn selected_style(mut style: CellStyle) -> CellStyle {
     style
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellCoverage {
+    Transparent,
+    Opaque,
+}
+
+fn pane_cell_coverage(cell: Option<&Cell>, raw_style: CellStyle, selected: bool) -> CellCoverage {
+    if selected {
+        return CellCoverage::Opaque;
+    }
+    let Some(cell) = cell else {
+        return CellCoverage::Transparent;
+    };
+    if cell.is_wide_continuation() {
+        return CellCoverage::Opaque;
+    }
+    let text = cell.text();
+    if (text.is_empty() || text == " ") && raw_style == CellStyle::default() {
+        CellCoverage::Transparent
+    } else {
+        CellCoverage::Opaque
+    }
+}
+
+fn push_under_cell(line: &mut String, current: &mut CellStyle, cell: &RenderUnderCell) {
+    let style = render_style_to_cell_style(cell.style);
+    if style != *current {
+        line.push_str(&style_sgr(style));
+        *current = style;
+    }
+    line.push(cell.ch);
+}
+
+fn transparent_run_width(
+    col: u16,
+    end_col: u16,
+    before_content_cells: &BTreeMap<u16, RenderUnderCell>,
+) -> u16 {
+    let next_under_col = before_content_cells
+        .range(col.saturating_add(1)..end_col)
+        .next()
+        .map_or(end_col, |(under_col, _)| *under_col);
+    next_under_col.saturating_sub(col).max(1)
+}
+
 #[derive(Clone, Copy)]
 struct GridRowRenderContext<'a> {
     row: &'a PhysicalRow,
@@ -1641,6 +1756,7 @@ struct GridRowRenderContext<'a> {
     absolute_row: usize,
     runtime_appearance: &'a RuntimeAppearance,
     palette: &'a bmux_terminal_grid::StylePalette,
+    before_content_cells: &'a BTreeMap<u16, RenderUnderCell>,
 }
 
 fn render_grid_row_segment(
@@ -1655,10 +1771,23 @@ fn render_grid_row_segment(
     let mut col = start_col;
     while col < end_col {
         let cell = context.row.cells().get(usize::from(col));
-        let mut style = cell.map_or_else(CellStyle::default, |cell| {
+        let raw_style = cell.map_or_else(CellStyle::default, |cell| {
             grid_cell_style(context.palette.get(cell.style()))
         });
-        if cell_selected(context.selection, context.absolute_row, usize::from(col)) {
+        let selected = cell_selected(context.selection, context.absolute_row, usize::from(col));
+        if matches!(
+            pane_cell_coverage(cell, raw_style, selected),
+            CellCoverage::Transparent
+        ) && let Some(under_cell) = context.before_content_cells.get(&col)
+        {
+            push_under_cell(&mut line, &mut current, under_cell);
+            emitted_cols = emitted_cols.saturating_add(1);
+            col = col.saturating_add(1);
+            continue;
+        }
+
+        let mut style = raw_style;
+        if selected {
             style = selected_style(style);
         }
         style = apply_content_effects(style, context.runtime_appearance);
@@ -1684,7 +1813,7 @@ fn render_grid_row_segment(
             col = col.saturating_add(u16::from(cell.width()).max(1));
         } else {
             let run_width = if context.selection.is_none() {
-                end_col.saturating_sub(col)
+                transparent_run_width(col, end_col, context.before_content_cells)
             } else {
                 1
             };
@@ -1714,6 +1843,16 @@ fn render_grid_row_segment(
         line.push_str("\x1b[0m");
     }
     line
+}
+
+fn before_content_row_cells(
+    cells: &BTreeMap<(u16, u16), RenderUnderCell>,
+    row: u16,
+) -> BTreeMap<u16, RenderUnderCell> {
+    cells
+        .iter()
+        .filter_map(|((col, cell_row), cell)| (*cell_row == row).then_some((*col, cell.clone())))
+        .collect()
 }
 
 fn damaged_grid_row_ranges(
@@ -1988,33 +2127,35 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_extension_layer_for_surface<W: io::Write>(
-    stdout: &mut W,
-    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+fn before_content_cells_for_surface(
     surface: &bmux_attach_layout_protocol::AttachSurface,
     pane_id: Uuid,
-    surface_index: usize,
     rect: PaneRect,
+    content: PaneRect,
     frame_damage: &FrameDamage,
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
-    render_trace: &mut Option<&mut AttachRenderTrace>,
-    layer: RenderExtensionLayer,
-) -> Result<()> {
+) -> (BTreeMap<(u16, u16), RenderUnderCell>, Vec<DamageRect>) {
     let ext_rect = bmux_plugin::ExtensionRect {
         x: rect.x,
         y: rect.y,
         w: rect.w,
         h: rect.h,
     };
+    let mut cells = BTreeMap::new();
+    let mut damage_rects = Vec::new();
     for ext in render_extensions {
         let extension_rect_damage = frame_damage.extension_surface_rects(surface.id);
         let damage = if frame_damage.content_surface_damaged(pane_id) {
             RenderDamage::FullSurface
         } else if extension_rect_damage.is_empty() {
             coalesce_render_damage(
-                ext.surface_layer_damage(surface.id, &ext_rect, layer),
+                ext.surface_layer_damage(
+                    surface.id,
+                    &ext_rect,
+                    RenderExtensionLayer::BeforePaneContent,
+                ),
                 ext_rect,
                 damage_policy,
             )
@@ -2031,64 +2172,54 @@ fn render_extension_layer_for_surface<W: io::Write>(
         if let Some(stats) = render_stats.as_deref_mut() {
             stats.extension_render_calls = stats.extension_render_calls.saturating_add(1);
         }
-        let revision = ext.render_layer_revision(surface.id, layer);
-        let cache_key = (format!("{}::{layer:?}", ext.name()), surface.id);
-        if let Some(revision) = revision
-            && let Some(entry) = pane_buffers
-                .get(&pane_id)
-                .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
-            && entry.surface_rect == ext_rect
-            && entry.damage == damage
-            && entry.revision == revision
-        {
-            stdout
-                .write_all(&entry.bytes)
-                .context("failed replaying cached declarative render ops")?;
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.extension_cache_hits = stats.extension_cache_hits.saturating_add(1);
+        match &damage {
+            RenderDamage::FullSurface => {
+                damage_rects.push(DamageRect::new(0, 0, content.w, content.h));
             }
-            if let Some(trace) = render_trace.as_deref_mut() {
-                trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
+            RenderDamage::Regions(regions) => {
+                damage_rects.extend(regions.iter().filter_map(|region| {
+                    let x1 = region.x.max(content.x);
+                    let y1 = region.y.max(content.y);
+                    let x2 = region.right().min(content.x.saturating_add(content.w));
+                    let y2 = region.bottom().min(content.y.saturating_add(content.h));
+                    (x1 < x2 && y1 < y2).then_some(DamageRect::new(
+                        x1.saturating_sub(content.x),
+                        y1.saturating_sub(content.y),
+                        x2.saturating_sub(x1),
+                        y2.saturating_sub(y1),
+                    ))
+                }));
             }
-            continue;
+            RenderDamage::None => {}
         }
-        if let Some(ops) = ext.render_layer_ops(surface.id, &ext_rect, &damage, layer) {
-            if ops.is_empty() {
-                continue;
+        if let Some(layer_cells) = ext.render_before_content_cells(surface.id, &ext_rect, &damage) {
+            for (col, row, cell) in layer_cells {
+                if col >= content.x
+                    && col < content.x.saturating_add(content.w)
+                    && row >= content.y
+                    && row < content.y.saturating_add(content.h)
+                {
+                    cells.insert((col.saturating_sub(content.x), row), cell);
+                }
             }
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.extension_render_op_calls = stats.extension_render_op_calls.saturating_add(1);
+        } else if let Some(ops) = ext.render_layer_ops(
+            surface.id,
+            &ext_rect,
+            &damage,
+            RenderExtensionLayer::BeforePaneContent,
+        ) {
+            for ((col, row), cell) in render_ops_to_cells(&ops) {
+                if col >= content.x
+                    && col < content.x.saturating_add(content.w)
+                    && row >= content.y
+                    && row < content.y.saturating_add(content.h)
+                {
+                    cells.insert((col.saturating_sub(content.x), row), cell);
+                }
             }
-            let mut bytes = Vec::new();
-            queue_render_ops(&mut bytes, ext_rect, &damage, &ops)?;
-            stdout
-                .write_all(&bytes)
-                .context("failed writing declarative render op bytes")?;
-            if let Some(revision) = revision
-                && let Some(buffer) = pane_buffers.get_mut(&pane_id)
-            {
-                buffer.extension_render_cache.insert(
-                    cache_key,
-                    ExtensionRenderCacheEntry {
-                        surface_id: surface.id,
-                        surface_rect: ext_rect,
-                        damage,
-                        revision,
-                        bytes,
-                    },
-                );
-            }
-        } else {
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.extension_imperative_calls =
-                    stats.extension_imperative_calls.saturating_add(1);
-            }
-            let dyn_writer: &mut dyn io::Write = stdout;
-            ext.render_layer_surface(dyn_writer, surface.id, &ext_rect, &damage, layer)
-                .context("render extension render_surface failed")?;
         }
     }
-    Ok(())
+    (cells, damage_rects)
 }
 
 #[allow(
@@ -2204,7 +2335,21 @@ fn render_attach_scene_inner<W: io::Write>(
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
-        let should_draw_content = frame_damage.content_surface_damaged(pane_id);
+        let before_content = before_content_cells_for_surface(
+            surface,
+            pane_id,
+            rect,
+            content,
+            frame_damage,
+            damage_policy,
+            render_extensions,
+            &mut render_stats,
+        );
+        let before_content_cells = before_content.0;
+        let before_content_damage = before_content.1;
+        let before_content_damaged = !before_content_damage.is_empty();
+        let should_draw_content =
+            frame_damage.content_surface_damaged(pane_id) || before_content_damaged;
         let should_draw_extensions = frame_damage.extension_surface_damaged(surface.id, pane_id);
         if let Some(stats) = render_stats.as_deref_mut() {
             stats.visible_pane_surfaces = stats.visible_pane_surfaces.saturating_add(1);
@@ -2401,23 +2546,6 @@ fn render_attach_scene_inner<W: io::Write>(
             }
         }
 
-        if should_draw_extensions {
-            render_extension_layer_for_surface(
-                stdout,
-                pane_buffers,
-                surface,
-                pane_id,
-                surface_index,
-                rect,
-                frame_damage,
-                damage_policy,
-                render_extensions,
-                &mut render_stats,
-                &mut render_trace,
-                RenderExtensionLayer::BeforePaneContent,
-            )?;
-        }
-
         let inner_width = content.w;
         let inner_height = content.h;
         let inner_w = usize::from(inner_width);
@@ -2507,16 +2635,24 @@ fn render_attach_scene_inner<W: io::Write>(
                 continue;
             }
             let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
+            let mut effective_content_damage = damaged_content_rows.to_vec();
+            effective_content_damage.extend(before_content_damage.iter().copied());
             for row in 0..inner_h {
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
                 }
                 let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
+                let y = content.y.saturating_add(row_u16);
+                let before_cells = before_content_row_cells(&before_content_cells, y);
                 let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
-                    damaged_grid_row_ranges(grid_row, row_u16, inner_width, damaged_content_rows)
+                    damaged_grid_row_ranges(
+                        grid_row,
+                        row_u16,
+                        inner_width,
+                        &effective_content_damage,
+                    )
                 });
                 let force_row_damage = !damaged_ranges.is_empty();
-                let y = content.y.saturating_add(row_u16);
                 let line = grid_rows.get(row).map_or_else(
                     || {
                         let blank_row = PhysicalRow::new();
@@ -2531,6 +2667,7 @@ fn render_attach_scene_inner<W: io::Write>(
                                 },
                                 runtime_appearance,
                                 palette: entry.terminal_grid.grid().palette(),
+                                before_content_cells: &before_cells,
                             },
                             0,
                             inner_width,
@@ -2548,6 +2685,7 @@ fn render_attach_scene_inner<W: io::Write>(
                                 },
                                 runtime_appearance,
                                 palette: entry.terminal_grid.grid().palette(),
+                                before_content_cells: &before_cells,
                             },
                             0,
                             inner_width,
@@ -2590,6 +2728,7 @@ fn render_attach_scene_inner<W: io::Write>(
                                         },
                                         runtime_appearance,
                                         palette: entry.terminal_grid.grid().palette(),
+                                        before_content_cells: &before_cells,
                                     },
                                     start_col,
                                     end_col,
@@ -2607,6 +2746,7 @@ fn render_attach_scene_inner<W: io::Write>(
                                         },
                                         runtime_appearance,
                                         palette: entry.terminal_grid.grid().palette(),
+                                        before_content_cells: &before_cells,
                                     },
                                     start_col,
                                     end_col,
@@ -2655,10 +2795,11 @@ fn render_attach_scene_inner<W: io::Write>(
             }
             // Trim stale cache entries if the visible row count shrank.
             entry.prev_rows.truncate(inner_h);
-        } else if should_draw_content {
+        } else if should_draw_content || !before_content_damage.is_empty() {
             let palette = bmux_terminal_grid::StylePalette::default();
             for row in 0..inner_h {
                 let y = content.y.saturating_add(row as u16);
+                let before_cells = before_content_row_cells(&before_content_cells, y);
                 let blank_row = PhysicalRow::new();
                 let line = render_grid_row_segment(
                     GridRowRenderContext {
@@ -2667,6 +2808,7 @@ fn render_attach_scene_inner<W: io::Write>(
                         absolute_row: row,
                         runtime_appearance,
                         palette: &palette,
+                        before_content_cells: &before_cells,
                     },
                     0,
                     inner_width,

@@ -415,6 +415,13 @@ pub enum RenderExtensionLayer {
     AfterPaneContent,
 }
 
+/// One cell from a before-pane-content render layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderUnderCell {
+    pub ch: char,
+    pub style: RenderStyle,
+}
+
 /// Declarative paint operation emitted by an attach render extension.
 ///
 /// Coordinates are absolute terminal display-cell coordinates in the same
@@ -768,6 +775,19 @@ pub trait AttachRenderExtension: Send + Sync {
                 self.render_ops(surface_id, surface_rect, damage)
             }
         }
+    }
+
+    /// Return before-content cells for the damaged region of `surface_rect`.
+    /// This is the composited counterpart to [`Self::render_layer_ops`] for
+    /// [`RenderExtensionLayer::BeforePaneContent`]: cells returned here are
+    /// merged into pane row rendering so pane content can repaint over them.
+    fn render_before_content_cells(
+        &self,
+        _surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        _damage: &RenderDamage,
+    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
+        Some(Vec::new())
     }
 
     /// Override the surface's content-rect inset. Returning `Some`

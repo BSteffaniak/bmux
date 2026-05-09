@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use bmux_plugin::{
     AttachRenderExtension, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
-    render_single_display_cell_char, render_text_width_u16,
+    RenderUnderCell, render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -214,6 +214,33 @@ impl AttachRenderExtension for DecorationRenderExtension {
         let ops = render_ops_for_surface_layer(&surface, layer)?;
         cache.mark_rendered(surface_id);
         Some(ops)
+    }
+
+    fn render_before_content_cells(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Some(Vec::new());
+        };
+        let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        };
+        if surface.before_content_paint_commands.is_empty() || damage.is_none() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let surface = filter_surface_layer_for_damage(
+            surface,
+            damage,
+            RenderExtensionLayer::BeforePaneContent,
+        );
+        let ops = render_ops_for_surface_layer(&surface, RenderExtensionLayer::BeforePaneContent)?;
+        cache.mark_rendered(surface_id);
+        Some(render_ops_to_under_cells(&ops))
     }
 
     fn render_ops(
@@ -395,6 +422,58 @@ pub fn render_ops_for_paint_commands(paint_commands: &[PaintCommand]) -> Option<
         push_render_ops_for_command(&mut ops, command)?;
     }
     Some(ops)
+}
+
+fn render_ops_to_under_cells(ops: &[RenderOp]) -> Vec<(u16, u16, RenderUnderCell)> {
+    let mut cells = Vec::new();
+    for op in ops {
+        match op {
+            RenderOp::TextRun { x, y, text, style } => {
+                let mut col = *x;
+                for ch in text.chars() {
+                    cells.push((col, *y, RenderUnderCell { ch, style: *style }));
+                    col = col.saturating_add(1);
+                }
+            }
+            RenderOp::FillRect { rect, ch, style } => {
+                for row in rect.y..rect.bottom() {
+                    for col in rect.x..rect.right() {
+                        cells.push((
+                            col,
+                            row,
+                            RenderUnderCell {
+                                ch: *ch,
+                                style: *style,
+                            },
+                        ));
+                    }
+                }
+            }
+            RenderOp::CellGrid { x, y, rows } => {
+                for (row_offset, row) in rows.iter().enumerate() {
+                    let Ok(row_offset) = u16::try_from(row_offset) else {
+                        break;
+                    };
+                    for (col_offset, cell) in row.iter().enumerate() {
+                        let Ok(col_offset) = u16::try_from(col_offset) else {
+                            break;
+                        };
+                        let Some(ch) = cell.ch else { continue };
+                        cells.push((
+                            x.saturating_add(col_offset),
+                            y.saturating_add(row_offset),
+                            RenderUnderCell {
+                                ch,
+                                style: cell.style,
+                            },
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    cells
 }
 
 fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) -> Option<()> {
