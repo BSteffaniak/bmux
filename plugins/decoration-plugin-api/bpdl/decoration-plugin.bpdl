@@ -91,6 +91,11 @@ interface decoration-state {
         above: list<string>?,
         // Paint this component before the listed component ids.
         below: list<string>?,
+        // Optional component-local settings forwarded to scripts as
+        // `message.component.settings`. Theme stacks deep-merge this map
+        // with the rest of the component spec, allowing user config to
+        // tune scripted components without plugin-specific host logic.
+        settings: map<string, string>?,
     }
 
     // Generic plugin access available to a decoration script. Channel

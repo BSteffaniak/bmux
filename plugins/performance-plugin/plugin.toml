@@ -1,11 +1,15 @@
-execution_class       = "native_fast"
-id                    = "bmux.performance"
-name                  = "bmux Performance"
-owns_namespaces       = []
-provided_capabilities = ["bmux.performance.read", "bmux.performance.write"]
-provided_features     = ["bmux.performance"]
+execution_class = "native_fast"
+id = "bmux.performance"
+name = "bmux Performance"
+owns_namespaces = []
+provided_capabilities = [
+    "bmux.performance.read",
+    "bmux.performance.write",
+    "bmux.theme.settings",
+]
+provided_features = ["bmux.performance"]
 required_capabilities = []
-version               = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.performance.read"
@@ -15,6 +19,16 @@ kind         = "query"
 [[services]]
 capability   = "bmux.performance.write"
 interface_id = "performance-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.theme.settings"
+interface_id = "performance-theme-settings"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.theme.settings"
+interface_id = "performance-theme-settings"
 kind         = "command"
 
 [[event_publications]]

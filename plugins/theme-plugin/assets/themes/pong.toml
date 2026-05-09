@@ -50,17 +50,32 @@ running = "◆"
 hz   = 16
 kind = "pong"
 
+[settings.component_settings.pong]
+components = ["pong.ball", "pong.paddles", "pong.score"]
+
 [plugins."bmux.decoration".components."pong.ball"]
 below      = ["pane.content"]
 entrypoint = "ball"
 script     = "pong"
+
+[plugins."bmux.decoration".components."pong.ball".settings]
+rally_ms    = "5500"
+win_hold_ms = "3500"
 
 [plugins."bmux.decoration".components."pong.paddles"]
 above      = ["pane.content"]
 entrypoint = "paddles"
 script     = "pong"
 
+[plugins."bmux.decoration".components."pong.paddles".settings]
+rally_ms    = "5500"
+win_hold_ms = "3500"
+
 [plugins."bmux.decoration".components."pong.score"]
 above      = ["pong.paddles"]
 entrypoint = "score"
 script     = "pong"
+
+[plugins."bmux.decoration".components."pong.score".settings]
+rally_ms    = "5500"
+win_hold_ms = "3500"

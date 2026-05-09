@@ -706,6 +706,7 @@ fn merge_component_paint_commands_for_id(
         component: Some(ScriptComponentMessage {
             id: component.id.clone(),
             entrypoint: component.spec.entrypoint.clone(),
+            settings: component_settings_json(&component.spec),
         }),
     });
     let outcome = match backend.invoke(&render) {
@@ -736,6 +737,20 @@ fn merge_component_paint_commands_for_id(
             surface.paint_commands.extend(commands);
         }
     }
+}
+
+fn component_settings_json(spec: &DecorationComponentSpec) -> serde_json::Value {
+    serde_json::Value::Object(
+        spec.settings
+            .as_ref()
+            .map(|settings| {
+                settings
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
 }
 
 fn record_component_script_perf(component: &ScriptComponentRuntime, duration: Duration) {

@@ -9,13 +9,12 @@ use bmux_appearance::{
     RuntimeContentEffectPatch, RuntimeContentEffectScope, RuntimeStatusAppearancePatch,
 };
 use bmux_ipc::Request as IpcRequest;
-use bmux_performance_plugin_api::{capabilities, performance_commands, performance_state};
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostConnectionInfo, NativeServiceContext, PluginEvent, PromptEvent, PromptResponse,
-    PromptValue, ServiceKind, ServiceResponse, StorageGetRequest, StorageSetRequest,
+    PromptValue, ServiceKind, ServiceResponse, StorageGetRequest, StorageKey, StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +22,6 @@ use std::path::Path;
 use tracing::{info, warn};
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
-const STORAGE_PERFORMANCE_THEME_SETTINGS: &str = "theme_settings.performance";
 
 #[derive(Default)]
 pub struct ThemePlugin {
@@ -96,6 +94,8 @@ struct ThemeConfig {
     modes: BTreeMap<String, Self>,
     #[serde(rename = "plugins", skip_serializing_if = "BTreeMap::is_empty")]
     plugins: BTreeMap<String, toml::Value>,
+    #[serde(skip_serializing_if = "ThemeSettingsConfig::is_empty")]
+    settings: ThemeSettingsConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +131,75 @@ struct ThemeContentBlend {
     amount_permille: Option<u16>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeSettingsConfig {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    providers: BTreeMap<String, ThemeSettingsProviderSpec>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    component_settings: BTreeMap<String, ThemeComponentSettingsSpec>,
+}
+
+impl ThemeSettingsConfig {
+    fn is_empty(&self) -> bool {
+        self.providers.is_empty() && self.component_settings.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeComponentSettingsSpec {
+    components: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeSettingsProviderSpec {
+    modal_id: Option<String>,
+    storage_key: Option<String>,
+    prompt_on_select: Option<bool>,
+    form: Option<ThemeSettingsEndpoint>,
+    apply_form: Option<ThemeSettingsEndpoint>,
+    apply_settings: Option<ThemeSettingsEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThemeSettingsEndpoint {
+    capability: String,
+    interface_id: String,
+    operation: String,
+    #[serde(default)]
+    kind: ThemeSettingsServiceKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ThemeSettingsServiceKind {
+    #[default]
+    Query,
+    Command,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThemeSettingsPayload {
+    json: Vec<u8>,
+}
+
+impl ThemeSettingsPayload {
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        serde_json::to_vec(value).ok().map(|json| Self { json })
+    }
+}
+
+impl From<ThemeSettingsServiceKind> for ServiceKind {
+    fn from(kind: ThemeSettingsServiceKind) -> Self {
+        match kind {
+            ThemeSettingsServiceKind::Query => Self::Query,
+            ThemeSettingsServiceKind::Command => Self::Command,
+        }
+    }
+}
+
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
@@ -144,6 +213,7 @@ impl Default for ThemeConfig {
             content_effects: BTreeMap::new(),
             modes: BTreeMap::new(),
             plugins: BTreeMap::new(),
+            settings: ThemeSettingsConfig::default(),
         }
     }
 }
@@ -219,6 +289,8 @@ struct ThemePluginSettings {
     persistence: ThemePersistence,
     #[serde(default)]
     components: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    theme_settings: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +303,7 @@ struct ThemeCatalogEntry {
 struct ResolvedTheme {
     appearance: RuntimeAppearance,
     plugins: BTreeMap<String, toml::Value>,
+    settings: ThemeSettingsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,9 +414,8 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
         &all_plugin_ids,
         &context.connection.config_dir_candidates,
     );
-    if active.stack.iter().any(|name| name == "performance") {
-        apply_persisted_performance_theme_settings(context);
-    }
+    let settings = parse_settings(context.settings.as_ref());
+    apply_configured_theme_settings(context, &active.theme, &settings);
 }
 
 fn active_runtime_appearance(
@@ -504,9 +576,8 @@ async fn run_theme_picker(context: NativeCommandContext) {
                 "theme selection not persisted because persistence is disabled",
             );
         }
-        if name == "performance" {
-            configure_performance_theme_header(&context, settings.persistence).await;
-        }
+        apply_configured_theme_settings(&context, &theme, &settings);
+        configure_theme_settings_providers(&context, &theme, &settings).await;
         info!(theme = %name, persistence = ?settings.persistence, "theme selected");
         return;
     }
@@ -520,140 +591,197 @@ async fn run_theme_picker(context: NativeCommandContext) {
     );
 }
 
-async fn configure_performance_theme_header(
+async fn configure_theme_settings_providers(
     context: &NativeCommandContext,
+    theme: &ResolvedTheme,
+    settings: &ThemePluginSettings,
+) {
+    for (provider_id, provider) in &theme.settings.providers {
+        if !provider.prompt_on_select.unwrap_or(false)
+            || settings.theme_settings.contains_key(provider_id)
+        {
+            continue;
+        }
+        configure_theme_settings_provider(context, provider_id, provider, settings.persistence)
+            .await;
+    }
+}
+
+async fn configure_theme_settings_provider(
+    context: &NativeCommandContext,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
     persistence: ThemePersistence,
 ) {
-    let response = match context
-        .call_service::<(), bmux_performance_plugin_api::performance_types::PromptForm>(
-            capabilities::PERFORMANCE_READ.as_str(),
-            ServiceKind::Query,
-            performance_state::INTERFACE_ID.as_str(),
-            performance_state::OP_BUILD_THEME_HEADER_SETTINGS_FORM.as_str(),
-            &(),
-        ) {
-        Ok(response) => response,
+    let Some(form_endpoint) = provider.form.as_ref() else {
+        return;
+    };
+    let Some(apply_endpoint) = provider.apply_form.as_ref() else {
+        return;
+    };
+    let request = match call_theme_settings_service::<(), bmux_plugin_sdk::PromptRequest>(
+        context,
+        form_endpoint,
+        &(),
+    ) {
+        Ok(request) => request,
         Err(error) => {
-            warn!(%error, "failed building performance theme settings form");
+            warn!(%error, provider_id, "failed building theme settings form");
             return;
         }
     };
-    let Ok(request) = bmux_plugin_sdk::PromptRequest::try_from(response) else {
-        warn!("performance settings form service returned invalid prompt form");
-        return;
-    };
     let request = request
         .owner_plugin_id("bmux.theme")
-        .modal_id("performance-advanced-settings")
+        .modal_id(
+            provider
+                .modal_id
+                .clone()
+                .unwrap_or_else(|| format!("theme-settings-{provider_id}")),
+        )
         .policy(bmux_plugin_sdk::PromptPolicy::Enqueue);
     let response = match prompt::request(request).await {
         Ok(response) => response,
         Err(error) => {
-            warn!(%error, "failed opening performance theme settings form");
+            warn!(%error, provider_id, "failed opening theme settings form");
             return;
         }
     };
     let PromptResponse::Submitted(PromptValue::Form(values)) = response else {
         return;
     };
-    let values = values
-        .into_iter()
-        .map(|(key, value)| (key, value.into()))
-        .collect();
-    let request = performance_commands::client::ApplyThemeHeaderSettingsFormRequest { values };
-    let response = context
-        .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
-            capabilities::PERFORMANCE_WRITE.as_str(),
-            ServiceKind::Command,
-            performance_commands::INTERFACE_ID.as_str(),
-            performance_commands::OP_APPLY_THEME_HEADER_SETTINGS_FORM.as_str(),
-            &request,
-        );
-    let settings = match response {
-        Ok(settings) => settings,
+    let settings_payload = match call_theme_settings_service::<_, ThemeSettingsPayload>(
+        context,
+        apply_endpoint,
+        &values,
+    ) {
+        Ok(settings_payload) => settings_payload,
         Err(error) => {
-            warn!(%error, "failed applying performance theme settings form");
+            warn!(%error, provider_id, "failed applying theme settings form");
             return;
         }
     };
     if matches!(persistence, ThemePersistence::PersistBetweenConnects) {
-        persist_performance_theme_settings(context, &settings);
+        persist_theme_settings(context, provider_id, provider, &settings_payload);
     } else {
         info!(
+            provider_id,
             persistence = ?persistence,
-            "performance theme settings not persisted because persistence is disabled",
+            "theme settings not persisted because persistence is disabled",
         );
     }
 }
 
-fn persist_performance_theme_settings(
+fn apply_configured_theme_settings(
     context: &impl ServiceCaller,
-    settings: &bmux_performance_plugin_api::ThemeHeaderSettings,
+    theme: &ResolvedTheme,
+    settings: &ThemePluginSettings,
 ) {
-    let Ok(value) = serde_json::to_vec(settings) else {
+    for (provider_id, provider) in &theme.settings.providers {
+        if let Some(configured) = settings.theme_settings.get(provider_id) {
+            apply_configured_theme_settings_provider(context, provider_id, provider, configured);
+        } else {
+            apply_persisted_theme_settings(context, provider_id, provider);
+        }
+    }
+}
+
+fn apply_configured_theme_settings_provider(
+    context: &impl ServiceCaller,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
+    configured: &toml::Value,
+) {
+    let Some(endpoint) = provider.apply_settings.as_ref() else {
         return;
     };
-    let request = StorageSetRequest::new(
-        bmux_plugin_sdk::storage_key!("theme_settings.performance"),
-        value,
-    );
-    if let Err(error) = context.storage_set(&request) {
-        warn!(%error, key = STORAGE_PERFORMANCE_THEME_SETTINGS, "failed persisting performance theme settings");
-    } else {
-        info!(
-            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
-            "persisted performance theme settings"
+    let Ok(settings_value) = serde_json::to_value(configured) else {
+        warn!(provider_id, "failed encoding configured theme settings");
+        return;
+    };
+    let Some(settings_payload) = ThemeSettingsPayload::from_value(&settings_value) else {
+        warn!(
+            provider_id,
+            "failed encoding configured theme settings payload"
         );
+        return;
+    };
+    if let Err(error) =
+        call_theme_settings_service::<_, ThemeSettingsPayload>(context, endpoint, &settings_payload)
+    {
+        warn!(%error, provider_id, "failed applying configured theme settings");
     }
 }
 
-fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
-    let request =
-        StorageGetRequest::new(bmux_plugin_sdk::storage_key!("theme_settings.performance"));
+fn persist_theme_settings(
+    context: &impl ServiceCaller,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
+    settings: &ThemeSettingsPayload,
+) {
+    let key = provider_storage_key(provider_id, provider);
+    let request = StorageSetRequest::new(storage_key_from_string(&key), settings.json.clone());
+    if let Err(error) = context.storage_set(&request) {
+        warn!(%error, key, provider_id, "failed persisting theme settings");
+    } else {
+        info!(key, provider_id, "persisted theme settings");
+    }
+}
+
+fn apply_persisted_theme_settings(
+    context: &impl ServiceCaller,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
+) {
+    let Some(endpoint) = provider.apply_settings.as_ref() else {
+        return;
+    };
+    let key = provider_storage_key(provider_id, provider);
+    let request = StorageGetRequest::new(storage_key_from_string(&key));
     let Ok(response) = context.storage_get(&request) else {
-        warn!(
-            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
-            "failed reading persisted performance theme settings"
-        );
+        warn!(key, provider_id, "failed reading persisted theme settings");
         return;
     };
     let Some(value) = response.value else {
-        info!(
-            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
-            "no persisted performance theme settings found"
-        );
         return;
     };
-    let Ok(settings) =
-        serde_json::from_slice::<bmux_performance_plugin_api::ThemeHeaderSettings>(&value)
-    else {
-        warn!(
-            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
-            "failed decoding persisted performance theme settings"
-        );
-        return;
-    };
-    info!(
-        key = STORAGE_PERFORMANCE_THEME_SETTINGS,
-        "applying persisted performance theme settings"
-    );
-    let request = performance_commands::client::SetThemeHeaderSettingsRequest { settings };
-    if let Err(error) = context
-        .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
-            capabilities::PERFORMANCE_WRITE.as_str(),
-            ServiceKind::Command,
-            performance_commands::INTERFACE_ID.as_str(),
-            performance_commands::OP_SET_THEME_HEADER_SETTINGS.as_str(),
-            &request,
-        )
+    let settings = ThemeSettingsPayload { json: value };
+    if let Err(error) =
+        call_theme_settings_service::<_, ThemeSettingsPayload>(context, endpoint, &settings)
     {
-        warn!(%error, "failed applying persisted performance theme settings");
+        warn!(%error, provider_id, "failed applying persisted theme settings");
     } else {
-        info!(
-            key = STORAGE_PERFORMANCE_THEME_SETTINGS,
-            "applied persisted performance theme settings"
-        );
+        info!(key, provider_id, "applied persisted theme settings");
     }
+}
+
+fn provider_storage_key(provider_id: &str, provider: &ThemeSettingsProviderSpec) -> String {
+    provider
+        .storage_key
+        .clone()
+        .unwrap_or_else(|| format!("theme_settings.{provider_id}"))
+}
+
+fn storage_key_from_string(key: &str) -> StorageKey {
+    StorageKey::new(key).unwrap_or_else(|_| bmux_plugin_sdk::storage_key!("theme_settings.invalid"))
+}
+
+#[allow(clippy::result_large_err)] // Mirrors ServiceCaller's public result type for thin forwarding.
+fn call_theme_settings_service<Request, Response>(
+    context: &impl ServiceCaller,
+    endpoint: &ThemeSettingsEndpoint,
+    request: &Request,
+) -> bmux_plugin_sdk::Result<Response>
+where
+    Request: Serialize,
+    Response: serde::de::DeserializeOwned,
+{
+    context.call_service(
+        &endpoint.capability,
+        endpoint.kind.into(),
+        &endpoint.interface_id,
+        &endpoint.operation,
+        request,
+    )
 }
 
 fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
@@ -766,13 +894,15 @@ fn resolve_theme_stack(catalog: &[ThemeCatalogEntry], stack: &[String]) -> Optio
     }
     let mut appearance = RuntimeAppearance::default();
     let mut plugins = BTreeMap::new();
+    let mut theme_settings = ThemeSettingsConfig::default();
     for name in stack {
         let theme = theme_by_name(catalog, name)?;
-        apply_theme_layer(&mut appearance, &mut plugins, theme);
+        apply_theme_layer(&mut appearance, &mut plugins, &mut theme_settings, theme);
     }
     Some(ResolvedTheme {
         appearance,
         plugins,
+        settings: theme_settings,
     })
 }
 
@@ -783,10 +913,74 @@ fn resolve_theme_stack_with_settings(
 ) -> Option<ResolvedTheme> {
     let mut theme = resolve_theme_stack(catalog, stack)?;
     apply_settings_component_overrides(&mut theme, &settings.components);
+    apply_theme_settings_component_overrides(&mut theme, &settings.theme_settings);
     Some(theme)
 }
 
 fn apply_settings_component_overrides(
+    theme: &mut ResolvedTheme,
+    components: &BTreeMap<String, toml::Value>,
+) {
+    if components.is_empty() {
+        return;
+    }
+    merge_decoration_component_overrides(theme, components);
+}
+
+fn apply_theme_settings_component_overrides(
+    theme: &mut ResolvedTheme,
+    theme_settings: &BTreeMap<String, toml::Value>,
+) {
+    if theme_settings.is_empty() {
+        return;
+    }
+    let mut components = BTreeMap::new();
+    for (settings_id, value) in theme_settings {
+        let Some(spec) = theme.settings.component_settings.get(settings_id) else {
+            continue;
+        };
+        let Some(settings_table) = component_settings_table(value) else {
+            continue;
+        };
+        for component_id in &spec.components {
+            components.insert(
+                component_id.clone(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "settings".to_string(),
+                    toml::Value::Table(settings_table.clone()),
+                )])),
+            );
+        }
+    }
+    merge_decoration_component_overrides(theme, &components);
+}
+
+fn component_settings_table(value: &toml::Value) -> Option<toml::map::Map<String, toml::Value>> {
+    let table = value.as_table()?;
+    Some(
+        table
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    toml::Value::String(component_setting_string(value)),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn component_setting_string(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(value) => value.clone(),
+        toml::Value::Integer(value) => value.to_string(),
+        toml::Value::Float(value) => value.to_string(),
+        toml::Value::Boolean(value) => value.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn merge_decoration_component_overrides(
     theme: &mut ResolvedTheme,
     components: &BTreeMap<String, toml::Value>,
 ) {
@@ -811,6 +1005,7 @@ fn apply_settings_component_overrides(
 fn apply_theme_layer(
     appearance: &mut RuntimeAppearance,
     plugins: &mut BTreeMap<String, toml::Value>,
+    settings: &mut ThemeSettingsConfig,
     theme: &ThemeConfig,
 ) {
     appearance.apply_patch(&RuntimeAppearancePatch::from(theme));
@@ -828,6 +1023,16 @@ fn apply_theme_layer(
                 plugins.insert(plugin_id.clone(), extension.clone());
             }
         }
+    }
+    for (provider_id, provider) in &theme.settings.providers {
+        settings
+            .providers
+            .insert(provider_id.clone(), provider.clone());
+    }
+    for (settings_id, component_settings) in &theme.settings.component_settings {
+        settings
+            .component_settings
+            .insert(settings_id.clone(), component_settings.clone());
     }
 }
 
@@ -1313,23 +1518,22 @@ mod tests {
     }
 
     #[test]
-    fn performance_theme_settings_use_storage_safe_key_for_persist_and_restore() {
-        let settings = bmux_performance_plugin_api::ThemeHeaderSettings {
-            sample_interval_ms: 2_500,
-            ..bmux_performance_plugin_api::ThemeHeaderSettings::default()
-        };
+    fn theme_settings_provider_uses_storage_safe_key_for_persist_and_restore() {
+        let settings = serde_json::json!({ "sample_interval_ms": 2_500 });
         let settings_bytes = serde_json::to_vec(&settings).expect("settings should encode");
         let stored_keys = Arc::new(Mutex::new(Vec::new()));
         let applied_settings = Arc::new(Mutex::new(Vec::new()));
-        let _router = install_performance_theme_settings_router(
+        let provider = performance_settings_provider();
+        let _router = install_theme_settings_router(
             settings_bytes,
             Arc::clone(&stored_keys),
             Arc::clone(&applied_settings),
         );
         let context = lifecycle_context(None);
 
-        persist_performance_theme_settings(&context, &settings);
-        apply_persisted_performance_theme_settings(&context);
+        let payload = ThemeSettingsPayload::from_value(&settings).expect("settings encode");
+        persist_theme_settings(&context, "performance-header", &provider, &payload);
+        apply_persisted_theme_settings(&context, "performance-header", &provider);
 
         let stored_keys_snapshot = {
             let stored_keys = stored_keys.lock().expect("stored key lock should hold");
@@ -1337,7 +1541,7 @@ mod tests {
         };
         assert_eq!(
             stored_keys_snapshot.as_slice(),
-            [STORAGE_PERFORMANCE_THEME_SETTINGS]
+            ["theme_settings.performance"]
         );
         let applied_settings_snapshot = {
             let applied_settings = applied_settings
@@ -1629,6 +1833,60 @@ mod tests {
     }
 
     #[test]
+    fn theme_settings_can_override_declared_component_settings() {
+        let theme: ThemeConfig = toml::from_str(
+            r#"
+            [settings.component_settings.pong]
+            components = ["pong.ball", "pong.paddles"]
+
+            [plugins."bmux.decoration".components."pong.ball"]
+            script = "pong"
+
+            [plugins."bmux.decoration".components."pong.ball".settings]
+            rally_ms = "5500"
+            "#,
+        )
+        .expect("theme parses");
+        let catalog = vec![ThemeCatalogEntry {
+            name: "pong".to_string(),
+            theme,
+        }];
+        let settings = ThemePluginSettings {
+            theme_settings: BTreeMap::from([(
+                "pong".to_string(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "rally_ms".to_string(),
+                    toml::Value::Integer(8_000),
+                )])),
+            )]),
+            ..ThemePluginSettings::default()
+        };
+
+        let resolved =
+            resolve_theme_stack_with_settings(&catalog, &["pong".to_string()], &settings)
+                .expect("theme resolves");
+        let decoration = resolved
+            .plugins
+            .get("bmux.decoration")
+            .and_then(toml::Value::as_table)
+            .expect("decoration extension exists");
+        let components = decoration
+            .get("components")
+            .and_then(toml::Value::as_table)
+            .expect("components exist");
+        for component_id in ["pong.ball", "pong.paddles"] {
+            let rally_ms = components
+                .get(component_id)
+                .and_then(toml::Value::as_table)
+                .and_then(|component| component.get("settings"))
+                .and_then(toml::Value::as_table)
+                .and_then(|settings| settings.get("rally_ms"))
+                .and_then(toml::Value::as_str);
+            assert_eq!(rally_ms, Some("8000"));
+        }
+    }
+
+    #[test]
     fn decoration_component_extensions_merge_by_component_id() {
         let lower: ThemeConfig = toml::from_str(
             r#"
@@ -1745,6 +2003,7 @@ mod tests {
             provided_capabilities: vec![
                 "bmux.theme.read".to_string(),
                 "bmux.theme.write".to_string(),
+                "bmux.theme.settings".to_string(),
             ],
             services: Vec::new(),
             available_capabilities: Vec::new(),
@@ -1794,11 +2053,27 @@ mod tests {
         install_test_service_router(router)
     }
 
+    fn performance_settings_provider() -> ThemeSettingsProviderSpec {
+        ThemeSettingsProviderSpec {
+            modal_id: Some("performance-advanced-settings".to_string()),
+            storage_key: Some("theme_settings.performance".to_string()),
+            prompt_on_select: Some(true),
+            form: None,
+            apply_form: None,
+            apply_settings: Some(ThemeSettingsEndpoint {
+                capability: "bmux.theme.settings".to_string(),
+                interface_id: "performance-theme-settings".to_string(),
+                operation: "set-settings".to_string(),
+                kind: ThemeSettingsServiceKind::Command,
+            }),
+        }
+    }
+
     #[allow(clippy::result_large_err)] // Test router signature is fixed by bmux_plugin test support.
-    fn install_performance_theme_settings_router(
+    fn install_theme_settings_router(
         settings_bytes: Vec<u8>,
         stored_keys: Arc<Mutex<Vec<String>>>,
-        applied_settings: Arc<Mutex<Vec<bmux_performance_plugin_api::ThemeHeaderSettings>>>,
+        applied_settings: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> bmux_plugin::test_support::TestServiceRouterGuard {
         let router: TestServiceRouter = Arc::new(
             move |_caller_plugin_id,
@@ -1816,33 +2091,35 @@ mod tests {
                             .lock()
                             .expect("stored key lock should hold")
                             .push(request.key.into_string());
-                        let stored_settings: bmux_performance_plugin_api::ThemeHeaderSettings =
+                        let stored_settings: serde_json::Value =
                             serde_json::from_slice(&request.value)
-                                .expect("stored performance settings should decode");
-                        assert_eq!(stored_settings.sample_interval_ms, 2_500);
+                                .expect("stored theme settings should decode");
+                        assert_eq!(stored_settings["sample_interval_ms"], 2_500);
                         encode_service_message(&())
                     }
                     ("bmux.storage", ServiceKind::Query, "storage-query/v1", "get") => {
                         let request: StorageGetRequest = decode_service_message(&payload)
                             .expect("storage get payload should decode");
-                        assert_eq!(request.key.as_str(), STORAGE_PERFORMANCE_THEME_SETTINGS);
+                        assert_eq!(request.key.as_str(), "theme_settings.performance");
                         encode_service_message(&StorageGetResponse {
                             value: Some(settings_bytes.clone()),
                         })
                     }
-                    ("bmux.performance.write", ServiceKind::Command, interface, operation)
-                        if interface == performance_commands::INTERFACE_ID.as_str()
-                            && operation
-                                == performance_commands::OP_SET_THEME_HEADER_SETTINGS.as_str() =>
-                    {
-                        let request: performance_commands::client::SetThemeHeaderSettingsRequest =
-                            decode_service_message(&payload)
-                                .expect("performance settings payload should decode");
+                    (
+                        "bmux.theme.settings",
+                        ServiceKind::Command,
+                        "performance-theme-settings",
+                        "set-settings",
+                    ) => {
+                        let settings: ThemeSettingsPayload = decode_service_message(&payload)
+                            .expect("theme settings payload should decode");
+                        let settings_value: serde_json::Value =
+                            serde_json::from_slice(&settings.json).expect("json decodes");
                         applied_settings
                             .lock()
                             .expect("applied settings lock should hold")
-                            .push(request.settings.clone());
-                        encode_service_message(&request.settings)
+                            .push(settings_value);
+                        encode_service_message(&settings)
                     }
                     other => panic!("unexpected service call: {other:?}"),
                 }

@@ -30,6 +30,16 @@ local function clamp(value, min_value, max_value)
     return math.max(min_value, math.min(max_value, value))
 end
 
+local function component_setting_number(message, key, default_value)
+    local component = message.component or {}
+    local settings = component.settings or {}
+    local value = tonumber(settings[key])
+    if value == nil or value <= 0 then
+        return default_value
+    end
+    return value
+end
+
 local function score_before(rally_index)
     local left = 0
     local right = 0
@@ -43,19 +53,19 @@ local function score_before(rally_index)
     return left, right
 end
 
-local function game_snapshot(active_ms)
+local function game_snapshot(active_ms, rally_ms, win_hold_ms)
     local match_rallies = #SCORERS
-    local match_ms = match_rallies * RALLY_MS + WIN_HOLD_MS
+    local match_ms = match_rallies * rally_ms + win_hold_ms
     local t = active_ms % match_ms
     local winner = SCORERS[match_rallies]
 
-    if t >= match_rallies * RALLY_MS then
+    if t >= match_rallies * rally_ms then
         local left, right = score_before(match_rallies)
         return { win = true, winner = winner, left_score = left, right_score = right }
     end
 
-    local rally_index = math.floor(t / RALLY_MS) + 1
-    local rally_t = (t % RALLY_MS) / RALLY_MS
+    local rally_index = math.floor(t / rally_ms) + 1
+    local rally_t = (t % rally_ms) / rally_ms
     local left, right = score_before(rally_index - 1)
     local scorer = SCORERS[rally_index]
     return {
@@ -154,7 +164,9 @@ local function render_pane(pane, message)
     end
 
     local entrypoint = message.component and message.component.entrypoint or "all"
-    local snapshot = game_snapshot(state.active_ms)
+    local rally_ms = component_setting_number(message, "rally_ms", RALLY_MS)
+    local win_hold_ms = component_setting_number(message, "win_hold_ms", WIN_HOLD_MS)
+    local snapshot = game_snapshot(state.active_ms, rally_ms, win_hold_ms)
     local cmds = {}
     if entrypoint == "ball" or entrypoint == "all" then
         render_ball(cmds, pane, snapshot)

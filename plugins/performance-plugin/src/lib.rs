@@ -129,6 +129,15 @@ impl RustPlugin for PerformancePlugin {
                 let values = req.values.into_iter().map(|(key, value)| (key, value.into())).collect();
                 Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_apply_theme_header_settings_form(&values))
             },
+            "performance-theme-settings", "build-form" => |_req: (), _ctx| {
+                Ok::<bmux_plugin_sdk::PromptRequest, ServiceResponse>(handle_build_theme_header_settings_form())
+            },
+            "performance-theme-settings", "apply-form" => |values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue>, _ctx| {
+                Ok::<ThemeSettingsPayload, ServiceResponse>(handle_apply_theme_header_settings_form_payload(&values))
+            },
+            "performance-theme-settings", "set-settings" => |settings: ThemeSettingsPayload, _ctx| {
+                Ok::<ThemeSettingsPayload, ServiceResponse>(handle_set_theme_header_settings_payload(settings))
+            },
         })
     }
 
@@ -165,6 +174,23 @@ struct SetThemeHeaderSettingsRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ApplyThemeHeaderSettingsFormRequest {
     values: BTreeMap<String, performance_types::PromptFormValue>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ThemeSettingsPayload {
+    json: Vec<u8>,
+}
+
+impl ThemeSettingsPayload {
+    fn from_settings(settings: &ThemeHeaderSettings) -> Self {
+        Self {
+            json: serde_json::to_vec(settings).unwrap_or_default(),
+        }
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        serde_json::from_slice(&self.json).unwrap_or(serde_json::Value::Null)
+    }
 }
 
 fn handle_list_watches() -> Vec<MetricWatch> {
@@ -236,6 +262,82 @@ fn handle_apply_theme_header_settings_form(
     values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
 ) -> ThemeHeaderSettings {
     handle_set_theme_header_settings(settings_from_form_values(values))
+}
+
+fn handle_apply_theme_header_settings_form_payload(
+    values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+) -> ThemeSettingsPayload {
+    ThemeSettingsPayload::from_settings(&handle_apply_theme_header_settings_form(values))
+}
+
+fn handle_set_theme_header_settings_payload(
+    settings: ThemeSettingsPayload,
+) -> ThemeSettingsPayload {
+    let settings_value = settings.into_value();
+    let settings = theme_header_settings_from_value(&settings_value).unwrap_or_default();
+    ThemeSettingsPayload::from_settings(&handle_set_theme_header_settings(settings))
+}
+
+fn theme_header_settings_from_value(value: &serde_json::Value) -> Option<ThemeHeaderSettings> {
+    serde_json::from_value(value.clone()).ok().or_else(|| {
+        let object = value.as_object()?;
+        let mut settings = ThemeHeaderSettings::default();
+        if let Some(value) = object.get("enabled").and_then(serde_json::Value::as_bool) {
+            settings.enabled = value;
+        }
+        if let Some(value) = object
+            .get("sample_interval_ms")
+            .or_else(|| object.get("sample-interval-ms"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            settings.sample_interval_ms = value;
+        }
+        if let Some(value) = object.get("scope").and_then(serde_json::Value::as_str) {
+            settings.scope = match value {
+                "system" => performance_types::ThemeHeaderScope::System,
+                "both" => performance_types::ThemeHeaderScope::Both,
+                _ => performance_types::ThemeHeaderScope::Pane,
+            };
+        }
+        if let Some(value) = object.get("style").and_then(serde_json::Value::as_str) {
+            settings.style = match value {
+                "detailed" => performance_types::ThemeHeaderStyle::Detailed,
+                "heat-only" | "heat_only" => performance_types::ThemeHeaderStyle::HeatOnly,
+                _ => performance_types::ThemeHeaderStyle::Compact,
+            };
+        }
+        if let Some(value) = object
+            .get("cpu_percent_mode")
+            .or_else(|| object.get("cpu-percent-mode"))
+            .and_then(serde_json::Value::as_str)
+        {
+            settings.cpu_percent_mode = match value {
+                "raw-core-sum" | "raw_core_sum" => performance_types::CpuPercentMode::RawCoreSum,
+                _ => performance_types::CpuPercentMode::Normalized,
+            };
+        }
+        if let Some(metrics) = object.get("metrics").and_then(serde_json::Value::as_array) {
+            settings.metrics = metrics
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(theme_header_metric_from_str)
+                .collect();
+        }
+        Some(settings)
+    })
+}
+
+fn theme_header_metric_from_str(value: &str) -> Option<ThemeHeaderMetric> {
+    match value {
+        "cpu" => Some(ThemeHeaderMetric::Cpu),
+        "memory" => Some(ThemeHeaderMetric::Memory),
+        "process-count" | "process_count" => Some(ThemeHeaderMetric::ProcessCount),
+        "disk-read" | "disk_read" => Some(ThemeHeaderMetric::DiskRead),
+        "disk-write" | "disk_write" => Some(ThemeHeaderMetric::DiskWrite),
+        "network-rx" | "network_rx" => Some(ThemeHeaderMetric::NetworkRx),
+        "network-tx" | "network_tx" => Some(ThemeHeaderMetric::NetworkTx),
+        _ => None,
+    }
 }
 
 fn metric_capabilities() -> Vec<MetricCapability> {

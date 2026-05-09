@@ -131,6 +131,7 @@ pub struct ScriptRenderMessage {
 pub struct ScriptComponentMessage {
     pub id: String,
     pub entrypoint: Option<String>,
+    pub settings: JsonValue,
 }
 
 /// Errors produced by script compile / invoke paths.
@@ -540,6 +541,7 @@ mod lua_backend {
                     if let Some(entrypoint) = component.entrypoint.as_deref() {
                         component_table.set("entrypoint", entrypoint)?;
                     }
+                    component_table.set("settings", json_to_lua(lua, &component.settings)?)?;
                     t.set("component", component_table)?;
                 }
             }
