@@ -82,6 +82,7 @@ fn decoration_scene_round_trips_through_json() {
             text: "+--".to_string(),
             style,
         }],
+        before_content_paint_commands: Vec::new(),
         interactive_regions: Vec::new(),
     };
 

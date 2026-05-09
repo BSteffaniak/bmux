@@ -473,6 +473,7 @@ mod tests {
                     style: default_style(),
                 },
             ],
+            before_content_paint_commands: Vec::new(),
             interactive_regions: Vec::new(),
         };
         // Clone so we can also verify a second call produces identical output.

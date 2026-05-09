@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bmux_plugin::{
     AttachRenderExtension, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
-    RenderColor, RenderDamage, RenderNamedColor, RenderOp, RenderStyle,
+    RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
     render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
@@ -123,6 +123,20 @@ impl AttachRenderExtension for DecorationRenderExtension {
         }
     }
 
+    fn surface_layer_damage(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        layer: RenderExtensionLayer,
+    ) -> RenderDamage {
+        let Ok(cache) = self.cache.lock() else {
+            return RenderDamage::None;
+        };
+        let current = cache.surface(&surface_id);
+        let previous = cache.rendered_surface(&surface_id);
+        decoration_surface_layer_damage(previous, current, layer)
+    }
+
     fn surface_damage(&self, surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
         let Ok(cache) = self.cache.lock() else {
             return RenderDamage::None;
@@ -174,6 +188,34 @@ impl AttachRenderExtension for DecorationRenderExtension {
         Ok(rendered)
     }
 
+    fn render_layer_ops(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+    ) -> Option<Vec<RenderOp>> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Some(Vec::new());
+        };
+        let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        };
+        if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let surface = filter_surface_layer_for_damage(surface, damage, layer);
+        if layer_paint_commands(&surface, layer).is_empty() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let ops = render_ops_for_surface_layer(&surface, layer)?;
+        cache.mark_rendered(surface_id);
+        Some(ops)
+    }
+
     fn render_ops(
         &self,
         surface_id: Uuid,
@@ -214,12 +256,52 @@ impl AttachRenderExtension for DecorationRenderExtension {
     }
 }
 
+fn layer_paint_commands(
+    surface: &SurfaceDecoration,
+    layer: RenderExtensionLayer,
+) -> &[PaintCommand] {
+    match layer {
+        RenderExtensionLayer::BeforePaneContent => &surface.before_content_paint_commands,
+        RenderExtensionLayer::AfterPaneContent => &surface.paint_commands,
+    }
+}
+
+fn layer_paint_commands_mut(
+    surface: &mut SurfaceDecoration,
+    layer: RenderExtensionLayer,
+) -> &mut Vec<PaintCommand> {
+    match layer {
+        RenderExtensionLayer::BeforePaneContent => &mut surface.before_content_paint_commands,
+        RenderExtensionLayer::AfterPaneContent => &mut surface.paint_commands,
+    }
+}
+
 fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
     ExtensionRect {
         x: rect.x,
         y: rect.y,
         w: rect.w,
         h: rect.h,
+    }
+}
+
+fn decoration_surface_layer_damage(
+    previous: Option<&SurfaceDecoration>,
+    current: Option<&SurfaceDecoration>,
+    layer: RenderExtensionLayer,
+) -> RenderDamage {
+    match (previous, current) {
+        (None, None) => RenderDamage::None,
+        (Some(previous), Some(current)) if previous.content_rect != current.content_rect => {
+            RenderDamage::FullSurface
+        }
+        (previous, current) => {
+            RenderDamage::from_rects(previous.into_iter().chain(current).flat_map(|surface| {
+                layer_paint_commands(surface, layer)
+                    .iter()
+                    .flat_map(paint_command_damage)
+            }))
+        }
     }
 }
 
@@ -239,6 +321,30 @@ fn decoration_surface_damage(
                 .flat_map(|surface| surface.paint_commands.iter().flat_map(paint_command_damage)),
         ),
     }
+}
+
+fn filter_surface_layer_for_damage(
+    surface: &SurfaceDecoration,
+    damage: &RenderDamage,
+    layer: RenderExtensionLayer,
+) -> SurfaceDecoration {
+    let mut filtered = surface.clone();
+    if matches!(damage, RenderDamage::FullSurface) {
+        return filtered;
+    }
+    let RenderDamage::Regions(regions) = damage else {
+        layer_paint_commands_mut(&mut filtered, layer).clear();
+        return filtered;
+    };
+    *layer_paint_commands_mut(&mut filtered, layer) = layer_paint_commands(surface, layer)
+        .iter()
+        .filter(|command| {
+            paint_command_damage(command)
+                .any(|rect| regions.iter().any(|region| region.intersects(rect)))
+        })
+        .cloned()
+        .collect();
+    filtered
 }
 
 fn filter_surface_for_damage(
@@ -264,6 +370,14 @@ fn filter_surface_for_damage(
         .cloned()
         .collect();
     filtered
+}
+
+#[must_use]
+pub fn render_ops_for_surface_layer(
+    surface: &SurfaceDecoration,
+    layer: RenderExtensionLayer,
+) -> Option<Vec<RenderOp>> {
+    render_ops_for_paint_commands(layer_paint_commands(surface, layer))
 }
 
 #[must_use]
@@ -707,6 +821,7 @@ mod tests {
                 h: 8,
             },
             paint_commands,
+            before_content_paint_commands: Vec::new(),
             interactive_regions: Vec::new(),
         }
     }

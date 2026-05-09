@@ -11,7 +11,8 @@ use bmux_appearance::{
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::{
     AttachRenderExtension, BorderGlyphs, ExtensionRect, RenderColor, RenderDamage,
-    RenderNamedColor, RenderOp, RenderStyle, clip_render_text_run_to_rect, render_text_width_u16,
+    RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, clip_render_text_run_to_rect,
+    render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -1986,6 +1987,110 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
     Ok((cursor_state, stats))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_extension_layer_for_surface<W: io::Write>(
+    stdout: &mut W,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    surface: &bmux_attach_layout_protocol::AttachSurface,
+    pane_id: Uuid,
+    surface_index: usize,
+    rect: PaneRect,
+    frame_damage: &FrameDamage,
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+    layer: RenderExtensionLayer,
+) -> Result<()> {
+    let ext_rect = bmux_plugin::ExtensionRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    };
+    for ext in render_extensions {
+        let extension_rect_damage = frame_damage.extension_surface_rects(surface.id);
+        let damage = if frame_damage.content_surface_damaged(pane_id) {
+            RenderDamage::FullSurface
+        } else if extension_rect_damage.is_empty() {
+            coalesce_render_damage(
+                ext.surface_layer_damage(surface.id, &ext_rect, layer),
+                ext_rect,
+                damage_policy,
+            )
+        } else {
+            coalesce_render_damage(
+                frame_rects_to_render_damage(extension_rect_damage, ext_rect),
+                ext_rect,
+                damage_policy,
+            )
+        };
+        if damage.is_none() {
+            continue;
+        }
+        if let Some(stats) = render_stats.as_deref_mut() {
+            stats.extension_render_calls = stats.extension_render_calls.saturating_add(1);
+        }
+        let revision = ext.render_layer_revision(surface.id, layer);
+        let cache_key = (format!("{}::{layer:?}", ext.name()), surface.id);
+        if let Some(revision) = revision
+            && let Some(entry) = pane_buffers
+                .get(&pane_id)
+                .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
+            && entry.surface_rect == ext_rect
+            && entry.damage == damage
+            && entry.revision == revision
+        {
+            stdout
+                .write_all(&entry.bytes)
+                .context("failed replaying cached declarative render ops")?;
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.extension_cache_hits = stats.extension_cache_hits.saturating_add(1);
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
+            }
+            continue;
+        }
+        if let Some(ops) = ext.render_layer_ops(surface.id, &ext_rect, &damage, layer) {
+            if ops.is_empty() {
+                continue;
+            }
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.extension_render_op_calls = stats.extension_render_op_calls.saturating_add(1);
+            }
+            let mut bytes = Vec::new();
+            queue_render_ops(&mut bytes, ext_rect, &damage, &ops)?;
+            stdout
+                .write_all(&bytes)
+                .context("failed writing declarative render op bytes")?;
+            if let Some(revision) = revision
+                && let Some(buffer) = pane_buffers.get_mut(&pane_id)
+            {
+                buffer.extension_render_cache.insert(
+                    cache_key,
+                    ExtensionRenderCacheEntry {
+                        surface_id: surface.id,
+                        surface_rect: ext_rect,
+                        damage,
+                        revision,
+                        bytes,
+                    },
+                );
+            }
+        } else {
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.extension_imperative_calls =
+                    stats.extension_imperative_calls.saturating_add(1);
+            }
+            let dyn_writer: &mut dyn io::Write = stdout;
+            ext.render_layer_surface(dyn_writer, surface.id, &ext_rect, &damage, layer)
+                .context("render extension render_surface failed")?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2146,7 +2251,11 @@ fn render_attach_scene_inner<W: io::Write>(
                     RenderDamage::FullSurface
                 } else if extension_rect_damage.is_empty() {
                     coalesce_render_damage(
-                        ext.surface_damage(surface.id, &ext_rect),
+                        ext.surface_layer_damage(
+                            surface.id,
+                            &ext_rect,
+                            RenderExtensionLayer::AfterPaneContent,
+                        ),
                         ext_rect,
                         damage_policy,
                     )
@@ -2176,8 +2285,16 @@ fn render_attach_scene_inner<W: io::Write>(
                     }
                 }
 
-                let revision = ext.render_revision(surface.id);
-                let cache_key = (ext.name().to_string(), surface.id);
+                let revision =
+                    ext.render_layer_revision(surface.id, RenderExtensionLayer::AfterPaneContent);
+                let cache_key = (
+                    format!(
+                        "{}::{:?}",
+                        ext.name(),
+                        RenderExtensionLayer::AfterPaneContent
+                    ),
+                    surface.id,
+                );
                 if let Some(revision) = revision
                     && let Some(entry) = pane_buffers
                         .get(&pane_id)
@@ -2198,7 +2315,15 @@ fn render_attach_scene_inner<W: io::Write>(
                     continue;
                 }
 
-                if let Some(ops) = ext.render_ops(surface.id, &ext_rect, &damage) {
+                if let Some(ops) = ext.render_layer_ops(
+                    surface.id,
+                    &ext_rect,
+                    &damage,
+                    RenderExtensionLayer::AfterPaneContent,
+                ) {
+                    if ops.is_empty() {
+                        continue;
+                    }
                     if let Some(stats) = render_stats.as_deref_mut() {
                         stats.extension_render_op_calls =
                             stats.extension_render_op_calls.saturating_add(1);
@@ -2258,8 +2383,13 @@ fn render_attach_scene_inner<W: io::Write>(
                         });
                     }
                     let dyn_writer: &mut dyn io::Write = stdout;
-                    if let Err(err) = ext.render_surface(dyn_writer, surface.id, &ext_rect, &damage)
-                    {
+                    if let Err(err) = ext.render_layer_surface(
+                        dyn_writer,
+                        surface.id,
+                        &ext_rect,
+                        &damage,
+                        RenderExtensionLayer::AfterPaneContent,
+                    ) {
                         tracing::warn!(
                             extension = ext.name(),
                             surface_id = %surface.id,
@@ -2269,6 +2399,23 @@ fn render_attach_scene_inner<W: io::Write>(
                     }
                 }
             }
+        }
+
+        if should_draw_extensions {
+            render_extension_layer_for_surface(
+                stdout,
+                pane_buffers,
+                surface,
+                pane_id,
+                surface_index,
+                rect,
+                frame_damage,
+                damage_policy,
+                render_extensions,
+                &mut render_stats,
+                &mut render_trace,
+                RenderExtensionLayer::BeforePaneContent,
+            )?;
         }
 
         let inner_width = content.w;
@@ -2565,7 +2712,8 @@ mod tests {
         AttachSurfaceKind, PaneState, PaneSummary,
     };
     use bmux_plugin::{
-        ExtensionRect, RenderColor, RenderDamage, RenderNamedColor, RenderOp, RenderStyle,
+        ExtensionRect, RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp,
+        RenderStyle,
     };
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
@@ -3990,8 +4138,33 @@ mod tests {
                 self.refreshes.fetch_add(1, Ordering::Relaxed);
             }
 
+            fn surface_layer_damage(
+                &self,
+                surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => {
+                        self.surface_damage(surface_id, surface_rect)
+                    }
+                }
+            }
+
             fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
                 Some(7)
+            }
+
+            fn render_layer_revision(
+                &self,
+                surface_id: Uuid,
+                layer: RenderExtensionLayer,
+            ) -> Option<u64> {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => None,
+                    RenderExtensionLayer::AfterPaneContent => self.render_revision(surface_id),
+                }
             }
 
             fn render_surface(
@@ -4002,6 +4175,21 @@ mod tests {
                 _damage: &RenderDamage,
             ) -> io::Result<bool> {
                 panic!("imperative render_surface should not be called when render_ops is Some")
+            }
+
+            fn render_layer_ops(
+                &self,
+                surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                damage: &RenderDamage,
+                layer: RenderExtensionLayer,
+            ) -> Option<Vec<RenderOp>> {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => Some(Vec::new()),
+                    RenderExtensionLayer::AfterPaneContent => {
+                        self.render_ops(surface_id, surface_rect, damage)
+                    }
+                }
             }
 
             fn render_ops(
@@ -4203,6 +4391,7 @@ mod tests {
                         text: "DECO!".to_string(),
                         style,
                     }],
+                    before_content_paint_commands: Vec::new(),
                     interactive_regions: Vec::new(),
                 };
                 let mut writer: &mut dyn io::Write = stdout;
@@ -4621,6 +4810,7 @@ mod tests {
                 h: 4,
             },
             paint_commands,
+            before_content_paint_commands: Vec::new(),
             interactive_regions: Vec::new(),
         };
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =

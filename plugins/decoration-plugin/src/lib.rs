@@ -44,6 +44,11 @@ use crate::scripting::{
     bundled_decoration_scripts,
 };
 
+/// Reserved decoration component id that represents pane terminal content.
+/// Components ordered below this anchor render before the PTY content;
+/// components ordered above it render after the PTY content.
+const PANE_CONTENT_COMPONENT_ID: &str = "pane.content";
+
 /// Runtime state for one user-composable decoration component.
 struct ScriptComponentRuntime {
     id: String,
@@ -497,6 +502,7 @@ fn build_scene(state: &mut State) -> DecorationScene {
                 rect,
                 content_rect,
                 paint_commands,
+                before_content_paint_commands: Vec::new(),
                 interactive_regions,
             },
         );
@@ -639,7 +645,22 @@ fn merge_component_paint_commands(
     let order = ordered_enabled_component_ids(state);
     let panes = script_panes_payload(state);
     for (index, component_id) in order.iter().enumerate() {
-        merge_component_paint_commands_for_id(state, surfaces, component_id, index, &panes);
+        if component_id == PANE_CONTENT_COMPONENT_ID {
+            continue;
+        }
+        let below_pane_content = order
+            .iter()
+            .position(|id| id == component_id)
+            .zip(order.iter().position(|id| id == PANE_CONTENT_COMPONENT_ID))
+            .is_some_and(|(component_index, content_index)| component_index < content_index);
+        merge_component_paint_commands_for_id(
+            state,
+            surfaces,
+            component_id,
+            index,
+            &panes,
+            below_pane_content,
+        );
     }
 }
 
@@ -649,6 +670,7 @@ fn merge_component_paint_commands_for_id(
     component_id: &str,
     order_index: usize,
     panes: &serde_json::Value,
+    below_pane_content: bool,
 ) {
     let Some(component) = state.script_components.get_mut(component_id) else {
         return;
@@ -708,7 +730,11 @@ fn merge_component_paint_commands_for_id(
         let surface = surfaces
             .entry(pane_id)
             .or_insert_with(|| empty_surface_for(state, pane_id));
-        surface.paint_commands.extend(commands);
+        if below_pane_content {
+            surface.before_content_paint_commands.extend(commands);
+        } else {
+            surface.paint_commands.extend(commands);
+        }
     }
 }
 
@@ -721,12 +747,13 @@ fn record_component_script_perf(component: &ScriptComponentRuntime, duration: Du
 }
 
 fn ordered_enabled_component_ids(state: &State) -> Vec<String> {
-    let enabled = state
+    let mut enabled = state
         .script_components
         .iter()
         .filter(|(_, component)| component_enabled(&component.spec))
         .map(|(id, _)| id.clone())
         .collect::<BTreeSet<_>>();
+    enabled.insert(PANE_CONTENT_COMPONENT_ID.to_string());
     let mut incoming = enabled
         .iter()
         .map(|id| (id.clone(), BTreeSet::<String>::new()))
@@ -758,7 +785,7 @@ fn ordered_enabled_component_ids(state: &State) -> Vec<String> {
         .map(|(id, _)| id.clone())
         .collect::<BTreeSet<_>>();
     let mut ordered = Vec::with_capacity(enabled.len());
-    while let Some(id) = ready.pop_first() {
+    while let Some(id) = pop_next_component_id(&mut ready) {
         ordered.push(id.clone());
         let dependents = outgoing.remove(&id).unwrap_or_default();
         for dependent in dependents {
@@ -784,6 +811,13 @@ fn ordered_enabled_component_ids(state: &State) -> Vec<String> {
         ordered.extend(unresolved);
     }
     ordered
+}
+
+fn pop_next_component_id(ready: &mut BTreeSet<String>) -> Option<String> {
+    if ready.remove(PANE_CONTENT_COMPONENT_ID) {
+        return Some(PANE_CONTENT_COMPONENT_ID.to_string());
+    }
+    ready.pop_first()
 }
 
 fn add_component_order_edge(
@@ -887,6 +921,7 @@ fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
         rect,
         content_rect,
         paint_commands: Vec::new(),
+        before_content_paint_commands: Vec::new(),
         interactive_regions: Vec::new(),
     }
 }
@@ -4310,6 +4345,82 @@ exited = ""
             .collect::<Vec<_>>();
 
         assert_eq!(ordered_text, vec!["B", "S", "H"]);
+    }
+
+    #[test]
+    fn pane_content_anchor_splits_component_paint_commands() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xf004);
+        seed_geometry(&plugin, pane, 20, 5);
+        let extension = decoration_extension_from_theme(
+            r##"
+            [plugins."bmux.decoration".unfocused]
+            bg = ""
+            fg = "#606060"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "single-line"
+
+            [plugins."bmux.decoration".focused]
+            bg = ""
+            fg = "#e0e0e0"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "thick"
+
+            [plugins."bmux.decoration".zoomed]
+            bg = ""
+            fg = "#ffffff"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "double"
+
+            [plugins."bmux.decoration".badges]
+            running = ""
+            exited = ""
+
+            [plugins."bmux.decoration".components."pong.ball"]
+            below = ["pane.content"]
+            script = "decorations/ball.lua"
+
+            [plugins."bmux.decoration".components."pong.score"]
+            above = ["pane.content"]
+            script = "decorations/score.lua"
+            "##,
+        );
+        let config_dir =
+            std::env::temp_dir().join(format!("bmux-components-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(config_dir.join("decorations")).expect("mkdir decorations");
+        write_component_test_script(&config_dir, "ball", "B");
+        write_component_test_script(&config_dir, "score", "S");
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            install_script_components(
+                &mut state,
+                &extension,
+                std::slice::from_ref(&config_dir),
+                &ScriptHostAccess::default(),
+            );
+            state.current_theme = Some(extension);
+        }
+
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        assert!(
+            surface
+                .before_content_paint_commands
+                .iter()
+                .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "B"))
+        );
+        assert!(
+            surface
+                .paint_commands
+                .iter()
+                .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "S"))
+        );
     }
 
     fn write_component_test_script(config_dir: &Path, name: &str, label: &str) {

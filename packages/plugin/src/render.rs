@@ -405,6 +405,16 @@ impl Default for BorderGlyphs {
     }
 }
 
+/// Render-extension layer currently being painted relative to pane
+/// terminal content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RenderExtensionLayer {
+    /// Paint before pane terminal content.
+    BeforePaneContent,
+    /// Paint after pane terminal content.
+    AfterPaneContent,
+}
+
 /// Declarative paint operation emitted by an attach render extension.
 ///
 /// Coordinates are absolute terminal display-cell coordinates in the same
@@ -658,12 +668,33 @@ pub trait AttachRenderExtension: Send + Sync {
         RenderDamage::FullSurface
     }
 
+    /// Return the currently-invalid region for a surface on a specific
+    /// layer. Implementations with layered output should override this;
+    /// the default delegates to [`Self::surface_damage`] for backward
+    /// compatibility.
+    fn surface_layer_damage(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        _layer: RenderExtensionLayer,
+    ) -> RenderDamage {
+        self.surface_damage(surface_id, surface_rect)
+    }
+
     /// Return an optional revision token for render output on this
     /// surface. Declarative render ops are cached only when this
     /// returns `Some`; increment or otherwise change the token whenever
     /// the extension's output for the surface can change.
     fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
         None
+    }
+
+    /// Return an optional revision token for render output on this
+    /// surface and layer. Implementations with layered output should
+    /// override this; the default delegates to [`Self::render_revision`]
+    /// for backward compatibility.
+    fn render_layer_revision(&self, surface_id: Uuid, _layer: RenderExtensionLayer) -> Option<u64> {
+        self.render_revision(surface_id)
     }
 
     /// Paint per-surface output onto `stdout` for the damaged region
@@ -681,6 +712,30 @@ pub trait AttachRenderExtension: Send + Sync {
         damage: &RenderDamage,
     ) -> io::Result<bool>;
 
+    /// Paint per-surface output for one layer onto `stdout` for the
+    /// damaged region of `surface_rect`. The default delegates after-content
+    /// rendering to [`Self::render_surface`] and emits nothing for
+    /// before-content rendering, preserving existing extension behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from queueing bytes onto `stdout`.
+    fn render_layer_surface(
+        &self,
+        stdout: &mut dyn io::Write,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+    ) -> io::Result<bool> {
+        match layer {
+            RenderExtensionLayer::BeforePaneContent => Ok(false),
+            RenderExtensionLayer::AfterPaneContent => {
+                self.render_surface(stdout, surface_id, surface_rect, damage)
+            }
+        }
+    }
+
     /// Return declarative render operations for the damaged region of
     /// `surface_rect`. Returning `None` asks the host to call
     /// [`Self::render_surface`] as an imperative escape hatch. Returning
@@ -693,6 +748,26 @@ pub trait AttachRenderExtension: Send + Sync {
         _damage: &RenderDamage,
     ) -> Option<Vec<RenderOp>> {
         None
+    }
+
+    /// Return declarative render operations for one layer and damaged
+    /// region of `surface_rect`. Returning `None` asks the host to call
+    /// [`Self::render_layer_surface`] as an imperative escape hatch.
+    /// The default delegates after-content rendering to [`Self::render_ops`]
+    /// and emits no before-content operations.
+    fn render_layer_ops(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+    ) -> Option<Vec<RenderOp>> {
+        match layer {
+            RenderExtensionLayer::BeforePaneContent => Some(Vec::new()),
+            RenderExtensionLayer::AfterPaneContent => {
+                self.render_ops(surface_id, surface_rect, damage)
+            }
+        }
     }
 
     /// Override the surface's content-rect inset. Returning `Some`
