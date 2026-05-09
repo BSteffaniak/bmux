@@ -129,8 +129,8 @@ impl RustPlugin for PerformancePlugin {
                 let values = req.values.into_iter().map(|(key, value)| (key, value.into())).collect();
                 Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_apply_theme_header_settings_form(&values))
             },
-            "performance-theme-settings", "build-form" => |_req: (), _ctx| {
-                Ok::<bmux_plugin_sdk::PromptRequest, ServiceResponse>(handle_build_theme_header_settings_form())
+            "performance-theme-settings", "build-form" => |defaults: ThemeSettingsPayload, _ctx| {
+                Ok::<bmux_plugin_sdk::PromptRequest, ServiceResponse>(handle_build_theme_header_settings_form_with_defaults(defaults))
             },
             "performance-theme-settings", "apply-form" => |values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue>, _ctx| {
                 Ok::<ThemeSettingsPayload, ServiceResponse>(handle_apply_theme_header_settings_form_payload(&values))
@@ -256,6 +256,18 @@ fn handle_build_theme_header_settings_form() -> bmux_plugin_sdk::PromptRequest {
         |state| state.theme_header_settings.clone(),
     );
     theme_header_settings_form(&settings)
+}
+
+fn handle_build_theme_header_settings_form_with_defaults(
+    defaults: ThemeSettingsPayload,
+) -> bmux_plugin_sdk::PromptRequest {
+    let settings = theme_header_settings_from_value(&defaults.into_value()).unwrap_or_else(|| {
+        metrics_state().lock().map_or_else(
+            |_| ThemeHeaderSettings::default(),
+            |state| state.theme_header_settings.clone(),
+        )
+    });
+    theme_header_settings_form(&normalize_theme_header_settings(settings))
 }
 
 fn handle_apply_theme_header_settings_form(

@@ -138,11 +138,13 @@ struct ThemeSettingsConfig {
     providers: BTreeMap<String, ThemeSettingsProviderSpec>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     component_settings: BTreeMap<String, ThemeComponentSettingsSpec>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    forms: BTreeMap<String, ThemeSettingsFormSpec>,
 }
 
 impl ThemeSettingsConfig {
     fn is_empty(&self) -> bool {
-        self.providers.is_empty() && self.component_settings.is_empty()
+        self.providers.is_empty() && self.component_settings.is_empty() && self.forms.is_empty()
     }
 }
 
@@ -150,6 +152,39 @@ impl ThemeSettingsConfig {
 #[serde(default)]
 struct ThemeComponentSettingsSpec {
     components: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeSettingsFormSpec {
+    title: Option<String>,
+    section_label: Option<String>,
+    width_min: Option<u16>,
+    width_max: Option<u16>,
+    fields: Vec<ThemeSettingsFormFieldSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeSettingsFormFieldSpec {
+    key: String,
+    label: String,
+    #[serde(rename = "type")]
+    field_type: ThemeSettingsFormFieldType,
+    default: Option<toml::Value>,
+    min: Option<i64>,
+    max: Option<i64>,
+    placeholder: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ThemeSettingsFormFieldType {
+    Bool,
+    #[default]
+    Text,
+    Integer,
+    Number,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -577,7 +612,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
             );
         }
         apply_configured_theme_settings(&context, &theme, &settings);
-        configure_theme_settings_providers(&context, &theme, &settings).await;
+        configure_theme_settings_providers(&context, &theme, &settings, &all_plugin_ids).await;
         info!(theme = %name, persistence = ?settings.persistence, "theme selected");
         return;
     }
@@ -595,40 +630,49 @@ async fn configure_theme_settings_providers(
     context: &NativeCommandContext,
     theme: &ResolvedTheme,
     settings: &ThemePluginSettings,
+    all_plugin_ids: &[String],
 ) {
     for (provider_id, provider) in &theme.settings.providers {
-        if !provider.prompt_on_select.unwrap_or(false)
-            || settings.theme_settings.contains_key(provider_id)
-        {
+        if !provider.prompt_on_select.unwrap_or(false) {
             continue;
         }
-        configure_theme_settings_provider(context, provider_id, provider, settings.persistence)
-            .await;
+        configure_theme_settings_provider(
+            context,
+            theme,
+            provider_id,
+            provider,
+            settings,
+            all_plugin_ids,
+        )
+        .await;
     }
 }
 
 async fn configure_theme_settings_provider(
     context: &NativeCommandContext,
+    theme: &ResolvedTheme,
     provider_id: &str,
     provider: &ThemeSettingsProviderSpec,
-    persistence: ThemePersistence,
+    settings: &ThemePluginSettings,
+    all_plugin_ids: &[String],
 ) {
-    let Some(form_endpoint) = provider.form.as_ref() else {
-        return;
-    };
-    let Some(apply_endpoint) = provider.apply_form.as_ref() else {
-        return;
-    };
-    let request = match call_theme_settings_service::<(), bmux_plugin_sdk::PromptRequest>(
-        context,
-        form_endpoint,
-        &(),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(%error, provider_id, "failed building theme settings form");
-            return;
+    let defaults = effective_theme_settings_payload(context, provider_id, provider, settings);
+    let request = if let Some(form_endpoint) = provider.form.as_ref() {
+        match call_theme_settings_service::<_, bmux_plugin_sdk::PromptRequest>(
+            context,
+            form_endpoint,
+            &defaults,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, provider_id, "failed building theme settings form");
+                return;
+            }
         }
+    } else if let Some(form) = theme.settings.forms.get(provider_id) {
+        build_builtin_theme_settings_form(provider_id, form, &defaults)
+    } else {
+        return;
     };
     let request = request
         .owner_plugin_id("bmux.theme")
@@ -649,23 +693,41 @@ async fn configure_theme_settings_provider(
     let PromptResponse::Submitted(PromptValue::Form(values)) = response else {
         return;
     };
-    let settings_payload = match call_theme_settings_service::<_, ThemeSettingsPayload>(
-        context,
-        apply_endpoint,
-        &values,
-    ) {
-        Ok(settings_payload) => settings_payload,
-        Err(error) => {
-            warn!(%error, provider_id, "failed applying theme settings form");
-            return;
+    let settings_payload = if let Some(apply_endpoint) = provider.apply_form.as_ref() {
+        match call_theme_settings_service::<_, ThemeSettingsPayload>(
+            context,
+            apply_endpoint,
+            &values,
+        ) {
+            Ok(settings_payload) => settings_payload,
+            Err(error) => {
+                warn!(%error, provider_id, "failed applying theme settings form");
+                return;
+            }
         }
+    } else if let Some(form) = theme.settings.forms.get(provider_id) {
+        builtin_theme_settings_payload_from_form(form, &values)
+    } else {
+        return;
     };
-    if matches!(persistence, ThemePersistence::PersistBetweenConnects) {
+    if theme.settings.component_settings.contains_key(provider_id) {
+        apply_builtin_component_theme_settings(
+            context,
+            theme,
+            provider_id,
+            &settings_payload,
+            all_plugin_ids,
+        );
+    }
+    if matches!(
+        settings.persistence,
+        ThemePersistence::PersistBetweenConnects
+    ) {
         persist_theme_settings(context, provider_id, provider, &settings_payload);
     } else {
         info!(
             provider_id,
-            persistence = ?persistence,
+            persistence = ?settings.persistence,
             "theme settings not persisted because persistence is disabled",
         );
     }
@@ -677,39 +739,222 @@ fn apply_configured_theme_settings(
     settings: &ThemePluginSettings,
 ) {
     for (provider_id, provider) in &theme.settings.providers {
-        if let Some(configured) = settings.theme_settings.get(provider_id) {
-            apply_configured_theme_settings_provider(context, provider_id, provider, configured);
+        let payload = effective_theme_settings_payload(context, provider_id, provider, settings);
+        if payload.json.is_empty() {
+            continue;
+        }
+        if theme.settings.component_settings.contains_key(provider_id) {
+            apply_builtin_component_theme_settings(
+                context,
+                theme,
+                provider_id,
+                &payload,
+                &theme.plugins.keys().cloned().collect::<Vec<_>>(),
+            );
         } else {
-            apply_persisted_theme_settings(context, provider_id, provider);
+            apply_theme_settings_provider_payload(context, provider_id, provider, &payload);
         }
     }
 }
 
-fn apply_configured_theme_settings_provider(
+fn apply_theme_settings_provider_payload(
     context: &impl ServiceCaller,
     provider_id: &str,
     provider: &ThemeSettingsProviderSpec,
-    configured: &toml::Value,
+    payload: &ThemeSettingsPayload,
 ) {
     let Some(endpoint) = provider.apply_settings.as_ref() else {
         return;
     };
-    let Ok(settings_value) = serde_json::to_value(configured) else {
-        warn!(provider_id, "failed encoding configured theme settings");
-        return;
-    };
-    let Some(settings_payload) = ThemeSettingsPayload::from_value(&settings_value) else {
-        warn!(
-            provider_id,
-            "failed encoding configured theme settings payload"
-        );
-        return;
-    };
     if let Err(error) =
-        call_theme_settings_service::<_, ThemeSettingsPayload>(context, endpoint, &settings_payload)
+        call_theme_settings_service::<_, ThemeSettingsPayload>(context, endpoint, payload)
     {
-        warn!(%error, provider_id, "failed applying configured theme settings");
+        warn!(%error, provider_id, "failed applying theme settings");
     }
+}
+
+fn effective_theme_settings_payload(
+    context: &impl ServiceCaller,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
+    settings: &ThemePluginSettings,
+) -> ThemeSettingsPayload {
+    if let Some(persisted) = read_persisted_theme_settings(context, provider_id, provider) {
+        return persisted;
+    }
+    if let Some(configured) = settings.theme_settings.get(provider_id)
+        && let Ok(value) = serde_json::to_value(configured)
+        && let Some(payload) = ThemeSettingsPayload::from_value(&value)
+    {
+        return payload;
+    }
+    ThemeSettingsPayload { json: Vec::new() }
+}
+
+fn read_persisted_theme_settings(
+    context: &impl ServiceCaller,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
+) -> Option<ThemeSettingsPayload> {
+    let key = provider_storage_key(provider_id, provider);
+    let request = StorageGetRequest::new(storage_key_from_string(&key));
+    let response = context.storage_get(&request).ok()?;
+    response.value.map(|json| ThemeSettingsPayload { json })
+}
+
+fn payload_to_json_value(payload: &ThemeSettingsPayload) -> serde_json::Value {
+    if payload.json.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    serde_json::from_slice(&payload.json)
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+fn build_builtin_theme_settings_form(
+    provider_id: &str,
+    form: &ThemeSettingsFormSpec,
+    defaults: &ThemeSettingsPayload,
+) -> bmux_plugin_sdk::PromptRequest {
+    let defaults = payload_to_json_value(defaults);
+    let fields = form
+        .fields
+        .iter()
+        .map(|field| builtin_theme_settings_form_field(field, &defaults))
+        .collect();
+    let title = form
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("{provider_id} Settings"));
+    let section_label = form.section_label.clone().unwrap_or_else(|| title.clone());
+    let mut request = bmux_plugin_sdk::PromptRequest::form(
+        title,
+        vec![bmux_plugin_sdk::PromptFormSection::new(
+            provider_id,
+            section_label,
+            fields,
+        )],
+    );
+    if let (Some(min), Some(max)) = (form.width_min, form.width_max) {
+        request = request.width_range(min, max);
+    }
+    request
+}
+
+fn builtin_theme_settings_form_field(
+    field: &ThemeSettingsFormFieldSpec,
+    defaults: &serde_json::Value,
+) -> bmux_plugin_sdk::PromptFormField {
+    let default = defaults
+        .get(&field.key)
+        .map(json_to_toml_value)
+        .or_else(|| field.default.clone());
+    let kind = match field.field_type {
+        ThemeSettingsFormFieldType::Bool => bmux_plugin_sdk::PromptFormFieldKind::Bool {
+            default: default
+                .as_ref()
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
+        },
+        ThemeSettingsFormFieldType::Text => bmux_plugin_sdk::PromptFormFieldKind::Text {
+            initial_value: default
+                .as_ref()
+                .map(component_setting_string)
+                .unwrap_or_default(),
+            placeholder: field.placeholder.clone(),
+            validation: None,
+        },
+        ThemeSettingsFormFieldType::Integer => bmux_plugin_sdk::PromptFormFieldKind::Integer {
+            initial_value: default
+                .as_ref()
+                .and_then(toml::Value::as_integer)
+                .unwrap_or(0),
+            min: field.min,
+            max: field.max,
+        },
+        ThemeSettingsFormFieldType::Number => bmux_plugin_sdk::PromptFormFieldKind::Number {
+            initial_value: default
+                .as_ref()
+                .map(component_setting_string)
+                .unwrap_or_default(),
+            min: field.min.map(|value| value.to_string()),
+            max: field.max.map(|value| value.to_string()),
+        },
+    };
+    bmux_plugin_sdk::PromptFormField::new(field.key.clone(), field.label.clone(), kind)
+}
+
+fn json_to_toml_value(value: &serde_json::Value) -> toml::Value {
+    match value {
+        serde_json::Value::Bool(value) => toml::Value::Boolean(*value),
+        serde_json::Value::Number(value) => value.as_i64().map_or_else(
+            || toml::Value::String(value.to_string()),
+            toml::Value::Integer,
+        ),
+        serde_json::Value::String(value) => toml::Value::String(value.clone()),
+        other => toml::Value::String(other.to_string()),
+    }
+}
+
+fn builtin_theme_settings_payload_from_form(
+    form: &ThemeSettingsFormSpec,
+    values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+) -> ThemeSettingsPayload {
+    let mut json = serde_json::Map::new();
+    for field in &form.fields {
+        if let Some(value) = values.get(&field.key) {
+            json.insert(field.key.clone(), prompt_value_to_json(value));
+        }
+    }
+    ThemeSettingsPayload::from_value(&serde_json::Value::Object(json))
+        .unwrap_or_else(|| ThemeSettingsPayload { json: Vec::new() })
+}
+
+fn prompt_value_to_json(value: &bmux_plugin_sdk::PromptFormValue) -> serde_json::Value {
+    match value {
+        bmux_plugin_sdk::PromptFormValue::Bool(value) => serde_json::Value::Bool(*value),
+        bmux_plugin_sdk::PromptFormValue::Text(value)
+        | bmux_plugin_sdk::PromptFormValue::Number(value)
+        | bmux_plugin_sdk::PromptFormValue::Single(value) => {
+            serde_json::Value::String(value.clone())
+        }
+        bmux_plugin_sdk::PromptFormValue::Integer(value) => {
+            serde_json::Value::Number((*value).into())
+        }
+        bmux_plugin_sdk::PromptFormValue::Multi(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    }
+}
+
+fn json_settings_to_toml(value: &serde_json::Value) -> toml::Value {
+    match value {
+        serde_json::Value::Object(map) => toml::Value::Table(
+            map.iter()
+                .map(|(key, value)| (key.clone(), json_to_toml_value(value)))
+                .collect(),
+        ),
+        value => json_to_toml_value(value),
+    }
+}
+
+fn apply_builtin_component_theme_settings(
+    context: &impl ServiceCaller,
+    theme: &ResolvedTheme,
+    provider_id: &str,
+    payload: &ThemeSettingsPayload,
+    all_plugin_ids: &[String],
+) {
+    let settings_value = json_settings_to_toml(&payload_to_json_value(payload));
+    let mut theme = theme.clone();
+    apply_theme_settings_component_overrides(
+        &mut theme,
+        &BTreeMap::from([(provider_id.to_string(), settings_value)]),
+    );
+    apply_theme_extensions(context, &theme, all_plugin_ids, &[]);
 }
 
 fn persist_theme_settings(
@@ -724,33 +969,6 @@ fn persist_theme_settings(
         warn!(%error, key, provider_id, "failed persisting theme settings");
     } else {
         info!(key, provider_id, "persisted theme settings");
-    }
-}
-
-fn apply_persisted_theme_settings(
-    context: &impl ServiceCaller,
-    provider_id: &str,
-    provider: &ThemeSettingsProviderSpec,
-) {
-    let Some(endpoint) = provider.apply_settings.as_ref() else {
-        return;
-    };
-    let key = provider_storage_key(provider_id, provider);
-    let request = StorageGetRequest::new(storage_key_from_string(&key));
-    let Ok(response) = context.storage_get(&request) else {
-        warn!(key, provider_id, "failed reading persisted theme settings");
-        return;
-    };
-    let Some(value) = response.value else {
-        return;
-    };
-    let settings = ThemeSettingsPayload { json: value };
-    if let Err(error) =
-        call_theme_settings_service::<_, ThemeSettingsPayload>(context, endpoint, &settings)
-    {
-        warn!(%error, provider_id, "failed applying persisted theme settings");
-    } else {
-        info!(key, provider_id, "applied persisted theme settings");
     }
 }
 
@@ -1033,6 +1251,9 @@ fn apply_theme_layer(
         settings
             .component_settings
             .insert(settings_id.clone(), component_settings.clone());
+    }
+    for (form_id, form) in &theme.settings.forms {
+        settings.forms.insert(form_id.clone(), form.clone());
     }
 }
 
@@ -1533,7 +1754,14 @@ mod tests {
 
         let payload = ThemeSettingsPayload::from_value(&settings).expect("settings encode");
         persist_theme_settings(&context, "performance-header", &provider, &payload);
-        apply_persisted_theme_settings(&context, "performance-header", &provider);
+        let persisted = read_persisted_theme_settings(&context, "performance-header", &provider)
+            .expect("persisted settings should read");
+        apply_theme_settings_provider_payload(
+            &context,
+            "performance-header",
+            &provider,
+            &persisted,
+        );
 
         let stored_keys_snapshot = {
             let stored_keys = stored_keys.lock().expect("stored key lock should hold");

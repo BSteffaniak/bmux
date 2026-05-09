@@ -64,24 +64,24 @@ above      = ["performance.border"]
 entrypoint = "header"
 script     = "performance_header"
 
-[settings.providers."performance-header"]
+[settings.providers.performance]
 modal_id         = "performance-advanced-settings"
 prompt_on_select = true
 storage_key      = "theme_settings.performance"
 
-[settings.providers."performance-header".form]
+[settings.providers.performance.form]
 capability   = "bmux.theme.settings"
 interface_id = "performance-theme-settings"
 kind         = "query"
 operation    = "build-form"
 
-[settings.providers."performance-header".apply_form]
+[settings.providers.performance.apply_form]
 capability   = "bmux.theme.settings"
 interface_id = "performance-theme-settings"
 kind         = "command"
 operation    = "apply-form"
 
-[settings.providers."performance-header".apply_settings]
+[settings.providers.performance.apply_settings]
 capability   = "bmux.theme.settings"
 interface_id = "performance-theme-settings"
 kind         = "command"

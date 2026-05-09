@@ -53,6 +53,33 @@ kind = "pong"
 [settings.component_settings.pong]
 components = ["pong.ball", "pong.paddles", "pong.score"]
 
+[settings.providers.pong]
+modal_id         = "pong-advanced-settings"
+prompt_on_select = true
+storage_key      = "theme_settings.pong"
+
+[settings.forms.pong]
+section_label = "Pong"
+title         = "Pong Settings"
+width_max     = 72
+width_min     = 42
+
+[[settings.forms.pong.fields]]
+default = 5500
+key     = "rally_ms"
+label   = "Rally duration ms"
+max     = 20000
+min     = 1000
+type    = "integer"
+
+[[settings.forms.pong.fields]]
+default = 3500
+key     = "win_hold_ms"
+label   = "Win screen hold ms"
+max     = 15000
+min     = 500
+type    = "integer"
+
 [plugins."bmux.decoration".components."pong.ball"]
 below      = ["pane.content"]
 entrypoint = "ball"
