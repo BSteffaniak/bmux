@@ -1005,6 +1005,13 @@ fn cycle_form_value(field: &PromptFormField, values: &mut BTreeMap<String, Promp
                 }
             }
         }
+        (PromptFormFieldKind::Text { .. }, Some(PromptFormValue::Text(value)))
+        | (PromptFormFieldKind::Number { .. }, Some(PromptFormValue::Number(value))) => {
+            value.clear();
+        }
+        (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
+            *value = 0;
+        }
         _ => {}
     }
 }
@@ -1020,8 +1027,41 @@ fn append_form_text_char(
             value.push(ch);
             true
         }
+        (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
+            append_form_integer_char(value, ch)
+        }
         _ => false,
     }
+}
+
+fn append_form_integer_char(value: &mut i64, ch: char) -> bool {
+    let mut text = value.to_string();
+    match ch {
+        '-' => {
+            if text.starts_with('-') {
+                text.remove(0);
+            } else {
+                text.insert(0, '-');
+            }
+        }
+        ch if ch.is_ascii_digit() => {
+            if text == "0" {
+                text.clear();
+            } else if text == "-0" {
+                text = "-".to_string();
+            }
+            text.push(ch);
+        }
+        _ => return false,
+    }
+    *value = if text.is_empty() || text == "-" {
+        0
+    } else if let Ok(parsed) = text.parse::<i64>() {
+        parsed
+    } else {
+        return false;
+    };
+    true
 }
 
 fn pop_form_text_char(
@@ -1034,8 +1074,24 @@ fn pop_form_text_char(
             value.pop();
             true
         }
+        (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
+            pop_form_integer_char(value)
+        }
         _ => false,
     }
+}
+
+fn pop_form_integer_char(value: &mut i64) -> bool {
+    let mut text = value.to_string();
+    text.pop();
+    *value = if text.is_empty() || text == "-" {
+        0
+    } else if let Ok(parsed) = text.parse::<i64>() {
+        parsed
+    } else {
+        return false;
+    };
+    true
 }
 
 fn validate_form_field(
@@ -1535,7 +1591,7 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
             request.submit_label, request.cancel_label
         ),
         PromptField::Form { .. } => format!(
-            "Up/Down move | Space edit | Enter {} | Esc {}",
+            "Up/Down move | Space clear/toggle | Type edit | Enter {} | Esc {}",
             request.submit_label, request.cancel_label
         ),
     }
@@ -1730,7 +1786,8 @@ mod tests {
         render_prompt_body,
     };
     use crate::runtime::prompt::{
-        PromptOption, PromptRequest, PromptResponse, PromptValidation, PromptValue,
+        PromptFormField, PromptFormFieldKind, PromptFormSection, PromptFormValue, PromptOption,
+        PromptRequest, PromptResponse, PromptValidation, PromptValue,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use uuid::Uuid;
@@ -1877,6 +1934,47 @@ mod tests {
         assert_eq!(
             completion.response,
             PromptResponse::Submitted(PromptValue::Single("wide".to_string()))
+        );
+    }
+
+    #[test]
+    fn form_integer_field_can_be_cleared_and_typed() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Pong Settings",
+                vec![PromptFormSection::new(
+                    "pong",
+                    "Pong",
+                    vec![PromptFormField::new(
+                        "rally_ms",
+                        "Rally duration ms",
+                        PromptFormFieldKind::Integer {
+                            initial_value: 5_500,
+                            min: Some(1_000),
+                            max: Some(20_000),
+                        },
+                    )],
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Char(' ')));
+        for ch in "8000".chars() {
+            let _ = state.handle_key_event(&key_event(KeyCode::Char(ch)));
+        }
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        let PromptResponse::Submitted(PromptValue::Form(values)) = completion.response else {
+            panic!("expected form response");
+        };
+        assert_eq!(
+            values.get("rally_ms"),
+            Some(&PromptFormValue::Integer(8_000))
         );
     }
 
