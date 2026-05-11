@@ -1769,6 +1769,8 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

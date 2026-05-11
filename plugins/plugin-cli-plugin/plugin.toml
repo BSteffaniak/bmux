@@ -132,7 +132,7 @@ owns_paths = [
         "cleanup",
     ],
 ]
-required_capabilities = ["bmux.commands"]
+required_capabilities = ["bmux.commands", "bmux.recording.write"]
 version = "0.0.1-alpha.0"
 
 [[commands]]

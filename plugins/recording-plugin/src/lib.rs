@@ -85,6 +85,12 @@ struct CutRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+struct QueueCutRequest {
+    last_seconds: Option<u64>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 struct RollingStartRequest {
     options: recording_types::RecordingRollingStartOptions,
 }
@@ -256,6 +262,11 @@ impl RustPlugin for RecordingPlugin {
             "recording-commands", "cut" => |req: CutRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     recording_cut_generated(req),
+                )
+            },
+            "recording-commands", "queue-cut" => |req: QueueCutRequest, _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    recording_queue_cut_generated(req),
                 )
             },
             "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
@@ -441,6 +452,61 @@ fn recording_cut_generated(
             Err(generated_failed(reason))
         }
     }
+}
+
+fn recording_queue_cut_generated(
+    req: QueueCutRequest,
+) -> Result<uuid::Uuid, recording_types::RecordingError> {
+    // Validate preconditions synchronously so the caller gets
+    // fast failure when the plugin state is unavailable.
+    let config_handle = global_plugin_state_registry()
+        .get::<RecordingPluginConfig>()
+        .ok_or_else(|| generated_failed("recording plugin config is unavailable"))?;
+    if config_handle.read().is_err() {
+        return Err(generated_failed("recording plugin config lock is poisoned"));
+    }
+
+    let rolling_handle = rolling_handle()
+        .ok_or_else(|| generated_failed("recording rolling runtime handle is unavailable"))?;
+    let guard = rolling_handle
+        .read()
+        .map_err(|_| generated_failed("recording rolling runtime handle lock is poisoned"))?;
+    let rolling = guard
+        .0
+        .lock()
+        .map_err(|_| generated_failed("recording rolling runtime lock is poisoned"))?;
+    let runtime = rolling.as_ref().ok_or_else(|| {
+        generated_failed("recording cut requires rolling recording mode to be enabled")
+    })?;
+    // Quick check via the public status API that an active recording exists.
+    let has_active = runtime.status().active.is_some();
+    let _ = runtime; // end borrow from rolling before dropping the guard
+    drop(rolling);
+    drop(guard);
+    drop(rolling_handle);
+
+    if !has_active {
+        return Err(generated_failed(
+            "no active rolling recording available for cut",
+        ));
+    }
+
+    let cut_id = uuid::Uuid::new_v4();
+    publish_recording_cut_started(req.last_seconds, req.name.clone());
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("bmux-recording-cut-worker".to_string())
+        .spawn(move || match handle_cut(req.last_seconds, req.name) {
+            Ok(summary) => publish_recording_cut_completed(&summary),
+            Err(error) => publish_recording_cut_failed(error.to_string()),
+        })
+    {
+        let reason = format!("failed spawning cut worker thread: {error}");
+        publish_recording_cut_failed(reason.clone());
+        return Err(generated_failed(reason));
+    }
+
+    Ok(cut_id)
 }
 
 fn recording_rolling_start_generated(

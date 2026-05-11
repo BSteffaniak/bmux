@@ -8,10 +8,10 @@ mod rebuild;
 mod run_cmd;
 mod suggest;
 
-use bmux_plugin::HostRuntimeApi;
+use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext,
-    NativeCommandInvocationSource, PluginCommandError, RustPlugin,
+    NativeCommandInvocationSource, PluginCommandError, RustPlugin, ServiceKind,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
 use serde::Serialize;
@@ -82,22 +82,36 @@ fn should_run_core_proxy_in_background(
 
 fn run_core_proxy_command_background(
     context: &NativeCommandContext,
-    command_path: &[&str],
+    _command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
     bmux_plugin_sdk::record_command_outcome_metadata(
         bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
         serde_json::json!("recording cut queued"),
     );
+    // Parse optional flags from the command arguments.
+    let last_seconds = parse_last_seconds(&context.arguments);
+    let name = parse_name(&context.arguments);
+
     let context = context.clone();
-    let command_path = command_path
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
     std::thread::Builder::new()
         .name("bmux-recording-cut-command".to_string())
         .spawn(move || {
-            let command_path = command_path.iter().map(String::as_str).collect::<Vec<_>>();
-            let _ = run_core_proxy_command_sync(&context, &command_path);
+            #[derive(Serialize)]
+            struct QueueCutRequest {
+                last_seconds: Option<u64>,
+                name: Option<String>,
+            }
+            let req = QueueCutRequest { last_seconds, name };
+            let result = context.call_service::<QueueCutRequest, uuid::Uuid>(
+                "bmux.recording.write",
+                ServiceKind::Command,
+                "recording-commands",
+                "queue-cut",
+                &req,
+            );
+            if let Err(error) = result {
+                tracing::warn!("recording cut queue via service dispatch failed: {error}");
+            }
         })
         .map_err(|error| {
             PluginCommandError::failed(format!(
@@ -132,6 +146,29 @@ fn run_core_proxy_command_sync(
 fn has_flag(arguments: &[String], long_name: &str) -> bool {
     let long_flag = format!("--{long_name}");
     arguments.iter().any(|argument| argument == &long_flag)
+}
+
+fn parse_last_seconds(arguments: &[String]) -> Option<u64> {
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--last-seconds"
+            && let Some(value) = iter.next()
+            && let Ok(secs) = value.parse::<u64>()
+        {
+            return Some(secs);
+        }
+    }
+    None
+}
+
+fn parse_name(arguments: &[String]) -> Option<String> {
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--name" {
+            return iter.next().cloned();
+        }
+    }
+    None
 }
 
 fn plugin_roots(context: &NativeCommandContext) -> Vec<PathBuf> {

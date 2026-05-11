@@ -149,6 +149,9 @@ interface recording-commands {
     command cut(last_seconds: u64?, name: string?)
         -> result<recording-types.recording-summary, recording-types.recording-error>;
 
+    command queue-cut(last_seconds: u64?, name: string?)
+        -> uuid;
+
     command rolling-start(options: recording-types.recording-rolling-start-options)
         -> result<recording-types.recording-summary, recording-types.recording-error>;
 
