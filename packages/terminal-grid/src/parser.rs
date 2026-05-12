@@ -658,6 +658,20 @@ mod tests {
     }
 
     #[test]
+    fn cursor_save_restore_variants_restore_pending_wrap_state() {
+        let mut stream = TerminalGridStream::new(5, 3, GridLimits::default()).unwrap();
+
+        stream.process(b"AB\x1b7\x1b[1;5H!");
+        assert!(stream.grid().pending_wrap());
+
+        stream.process(b"\x1b8C");
+        let rows = stream.grid().viewport_rows();
+        assert_eq!(row_text(&rows[0]), "ABC !");
+        assert_eq!(stream.grid().cursor().row, 0);
+        assert_eq!(stream.grid().cursor().col, 3);
+    }
+
+    #[test]
     fn cursor_visibility_is_structured_state_and_survives_snapshot() {
         let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
         stream.process(b"\x1b[?25l");

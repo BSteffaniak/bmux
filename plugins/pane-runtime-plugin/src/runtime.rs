@@ -6133,6 +6133,7 @@ mod tests {
             scrollback_rows: 0,
             cursor: bmux_terminal_grid::CursorSnapshot::default(),
             saved_cursor: bmux_terminal_grid::CursorSnapshot::default(),
+            saved_pending_wrap: false,
             current_style: bmux_terminal_grid::Style::default(),
             autowrap: true,
             pending_wrap: false,

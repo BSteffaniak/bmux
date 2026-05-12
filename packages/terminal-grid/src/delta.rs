@@ -13,6 +13,10 @@ pub struct RowUpdateSnapshot {
 }
 
 /// Revisioned structured terminal update.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "serialized grid delta wire state intentionally carries independent terminal mode flags"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridDeltaBatch {
     /// Revision the receiver must already have before applying this delta.
@@ -26,6 +30,8 @@ pub struct GridDeltaBatch {
     pub cursor: CursorSnapshot,
     #[serde(default)]
     pub saved_cursor: CursorSnapshot,
+    #[serde(default)]
+    pub saved_pending_wrap: bool,
     #[serde(default)]
     pub current_style: Style,
     #[serde(default = "default_autowrap")]
@@ -89,6 +95,7 @@ impl GridDeltaBatch {
             scrollback_rows: after.scrollback_rows,
             cursor: after.cursor,
             saved_cursor: after.saved_cursor,
+            saved_pending_wrap: after.saved_pending_wrap,
             current_style: after.current_style,
             autowrap: after.autowrap,
             pending_wrap: after.pending_wrap,
@@ -139,6 +146,7 @@ impl GridDeltaBatch {
         snapshot.scrollback_rows = self.scrollback_rows;
         snapshot.cursor = self.cursor;
         snapshot.saved_cursor = self.saved_cursor;
+        snapshot.saved_pending_wrap = self.saved_pending_wrap;
         snapshot.current_style = self.current_style;
         snapshot.autowrap = self.autowrap;
         snapshot.pending_wrap = self.pending_wrap;

@@ -283,6 +283,7 @@ pub struct TerminalGrid {
     mode: GridMode,
     cursor: Cursor,
     saved_cursor: Cursor,
+    saved_pending_wrap: bool,
     current_style: Style,
     palette: StylePalette,
     revision: u64,
@@ -375,6 +376,7 @@ impl TerminalGrid {
                 visible: true,
             },
             saved_cursor: Cursor::default(),
+            saved_pending_wrap: false,
             current_style: Style::default(),
             palette: StylePalette::default(),
             revision: 0,
@@ -463,6 +465,7 @@ impl TerminalGrid {
                 visible: snapshot.cursor.visible,
             },
             saved_cursor: Cursor::default(),
+            saved_pending_wrap: snapshot.saved_pending_wrap,
             current_style: snapshot.current_style,
             palette,
             revision: snapshot.revision,
@@ -601,10 +604,12 @@ impl TerminalGrid {
 
     pub(crate) fn save_cursor(&mut self) {
         self.saved_cursor = self.cursor;
+        self.saved_pending_wrap = self.pending_wrap;
     }
 
     pub(crate) fn restore_cursor(&mut self) {
         self.cursor = self.saved_cursor;
+        self.pending_wrap = self.saved_pending_wrap;
         self.clamp_cursor();
         self.bump_revision();
     }
@@ -928,6 +933,11 @@ impl TerminalGrid {
     #[must_use]
     pub(crate) const fn saved_cursor(&self) -> Cursor {
         self.saved_cursor
+    }
+
+    #[must_use]
+    pub(crate) const fn saved_pending_wrap(&self) -> bool {
+        self.saved_pending_wrap
     }
 
     #[must_use]
