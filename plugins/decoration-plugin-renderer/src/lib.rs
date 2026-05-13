@@ -55,6 +55,7 @@ use uuid::Uuid;
 
 const VISUAL_REQUEST_BUDGET: Duration = Duration::from_millis(4);
 const SLOW_VISUAL_PROJECTION: Duration = Duration::from_millis(2);
+const VISUAL_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Shared cache of the decoration plugin's latest scene. Stored
 /// under `Arc<Mutex<_>>` so the render extension can refresh/read/write
@@ -69,6 +70,40 @@ struct DecorationRendererCache {
     visual_last_revision: BTreeMap<String, u64>,
     visual_last_payload_hash: BTreeMap<String, u64>,
     visual_adapter_cache: BTreeMap<String, Box<dyn std::any::Any + Send>>,
+    visual_stats: BTreeMap<String, VisualProjectionStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VisualProjectionStats {
+    projections: u64,
+    unchanged: u64,
+    updated: u64,
+    sent_updates: u64,
+    duplicate_suppressed: u64,
+    oversized: u64,
+    errors: u64,
+    budget_skips: u64,
+    payload_bytes: u64,
+    slow_projections: u64,
+    total_projection: Duration,
+    max_projection: Duration,
+    last_summary_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisualProjectionTelemetry {
+    Unchanged,
+    Updated { payload_len: usize, sent: bool },
+    Oversized,
+    Error,
+}
+
+struct VisualProjectionContext<'a> {
+    request: &'a AttachVisualAdapterRequest,
+    revision_key: String,
+    surface_id: Uuid,
+    content_revision: u64,
+    projection_elapsed: Duration,
 }
 
 impl DecorationRendererCache {
@@ -121,6 +156,7 @@ impl DecorationRendererCache {
             .retain(|key, _| !key.ends_with(&suffix));
         self.visual_adapter_cache
             .retain(|key, _| !key.ends_with(&suffix));
+        self.visual_stats.retain(|key, _| !key.ends_with(&suffix));
     }
 }
 
@@ -413,10 +449,13 @@ fn observe_visual_request(
     let mut projected = false;
     for index in 0..frame.surface_count() {
         if request_started.elapsed() > VISUAL_REQUEST_BUDGET {
+            let skipped = frame.surface_count().saturating_sub(index);
+            record_visual_budget_skip(cache, request, skipped);
             tracing::warn!(
                 request_id = %request.id,
                 adapter = %request.adapter,
                 budget_ms = VISUAL_REQUEST_BUDGET.as_millis(),
+                skipped_surfaces = skipped,
                 "visual adapter request exceeded frame budget; remaining surfaces deferred",
             );
             break;
@@ -477,26 +516,39 @@ fn observe_visual_surface(
             "slow visual adapter projection",
         );
     }
-    handle_visual_projection_result(
-        cache,
+    let context = VisualProjectionContext {
         request,
         revision_key,
+        surface_id: surface.surface_id(),
         content_revision,
-        result,
-        updates,
-    )
+        projection_elapsed,
+    };
+    handle_visual_projection_result(cache, context, result, updates)
 }
 
 fn handle_visual_projection_result(
     cache: &mut DecorationRendererCache,
-    request: &AttachVisualAdapterRequest,
-    revision_key: String,
-    content_revision: u64,
+    context: VisualProjectionContext<'_>,
     result: Result<AttachVisualProjectionResult, String>,
     updates: &mut Vec<AttachVisualProjectionUpdate>,
 ) -> bool {
+    let VisualProjectionContext {
+        request,
+        revision_key,
+        surface_id,
+        content_revision,
+        projection_elapsed,
+    } = context;
     match result {
         Ok(AttachVisualProjectionResult::Unchanged) => {
+            record_visual_projection_stats(
+                cache,
+                &revision_key,
+                request,
+                surface_id,
+                projection_elapsed,
+                VisualProjectionTelemetry::Unchanged,
+            );
             cache
                 .visual_last_revision
                 .insert(revision_key, content_revision);
@@ -505,13 +557,36 @@ fn handle_visual_projection_result(
         Ok(AttachVisualProjectionResult::Updated(output))
             if output.payload.len() <= request.max_bytes as usize =>
         {
+            let payload_len = output.payload.len();
             cache
                 .visual_last_revision
                 .insert(revision_key.clone(), content_revision);
-            maybe_push_visual_projection_update(cache, request, revision_key, output, updates);
+            let sent = maybe_push_visual_projection_update(
+                cache,
+                request,
+                revision_key.clone(),
+                output,
+                updates,
+            );
+            record_visual_projection_stats(
+                cache,
+                &revision_key,
+                request,
+                surface_id,
+                projection_elapsed,
+                VisualProjectionTelemetry::Updated { payload_len, sent },
+            );
             true
         }
         Ok(AttachVisualProjectionResult::Updated(_)) => {
+            record_visual_projection_stats(
+                cache,
+                &revision_key,
+                request,
+                surface_id,
+                projection_elapsed,
+                VisualProjectionTelemetry::Oversized,
+            );
             tracing::warn!(
                 request_id = %request.id,
                 adapter = %request.adapter,
@@ -521,6 +596,14 @@ fn handle_visual_projection_result(
             false
         }
         Err(error) => {
+            record_visual_projection_stats(
+                cache,
+                &revision_key,
+                request,
+                surface_id,
+                projection_elapsed,
+                VisualProjectionTelemetry::Error,
+            );
             tracing::warn!(
                 request_id = %request.id,
                 adapter = %request.adapter,
@@ -538,14 +621,14 @@ fn maybe_push_visual_projection_update(
     revision_key: String,
     output: bmux_plugin::AttachVisualAdapterOutput,
     updates: &mut Vec<AttachVisualProjectionUpdate>,
-) {
+) -> bool {
     let payload_hash = hash_visual_payload(&output.payload);
     if cache
         .visual_last_payload_hash
         .get(&revision_key)
         .is_some_and(|hash| *hash == payload_hash)
     {
-        return;
+        return false;
     }
     cache
         .visual_last_payload_hash
@@ -555,12 +638,117 @@ fn maybe_push_visual_projection_update(
         event_kind: request.event_kind.clone(),
         payload: output.payload,
     });
+    true
+}
+
+fn record_visual_budget_skip(
+    cache: &mut DecorationRendererCache,
+    request: &AttachVisualAdapterRequest,
+    skipped_surfaces: usize,
+) {
+    let key = visual_request_stats_key(request);
+    let stats = cache.visual_stats.entry(key.clone()).or_default();
+    stats.budget_skips = stats
+        .budget_skips
+        .saturating_add(u64::try_from(skipped_surfaces).unwrap_or(u64::MAX));
+    maybe_log_visual_stats(&key, request, None, stats);
+}
+
+fn record_visual_projection_stats(
+    cache: &mut DecorationRendererCache,
+    revision_key: &str,
+    request: &AttachVisualAdapterRequest,
+    surface_id: Uuid,
+    elapsed: Duration,
+    telemetry: VisualProjectionTelemetry,
+) {
+    let stats = cache
+        .visual_stats
+        .entry(revision_key.to_string())
+        .or_default();
+    stats.projections = stats.projections.saturating_add(1);
+    stats.total_projection += elapsed;
+    stats.max_projection = stats.max_projection.max(elapsed);
+    if elapsed > SLOW_VISUAL_PROJECTION {
+        stats.slow_projections = stats.slow_projections.saturating_add(1);
+    }
+    match telemetry {
+        VisualProjectionTelemetry::Unchanged => {
+            stats.unchanged = stats.unchanged.saturating_add(1);
+        }
+        VisualProjectionTelemetry::Updated { payload_len, sent } => {
+            stats.updated = stats.updated.saturating_add(1);
+            stats.payload_bytes = stats
+                .payload_bytes
+                .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
+            if sent {
+                stats.sent_updates = stats.sent_updates.saturating_add(1);
+            } else {
+                stats.duplicate_suppressed = stats.duplicate_suppressed.saturating_add(1);
+            }
+        }
+        VisualProjectionTelemetry::Oversized => {
+            stats.oversized = stats.oversized.saturating_add(1);
+        }
+        VisualProjectionTelemetry::Error => {
+            stats.errors = stats.errors.saturating_add(1);
+        }
+    }
+    maybe_log_visual_stats(revision_key, request, Some(surface_id), stats);
+}
+
+fn maybe_log_visual_stats(
+    stats_key: &str,
+    request: &AttachVisualAdapterRequest,
+    surface_id: Option<Uuid>,
+    stats: &mut VisualProjectionStats,
+) {
+    let now = Instant::now();
+    if let Some(last_summary_at) = stats.last_summary_at {
+        if now.duration_since(last_summary_at) < VISUAL_STATS_LOG_INTERVAL {
+            return;
+        }
+    } else {
+        stats.last_summary_at = Some(now);
+        return;
+    }
+    let average_projection_us = if stats.projections == 0 {
+        0
+    } else {
+        u64::try_from(stats.total_projection.as_micros() / u128::from(stats.projections))
+            .unwrap_or(u64::MAX)
+    };
+    let surface_id = surface_id.map_or_else(|| "request".to_string(), |id| id.to_string());
+    tracing::debug!(
+        request_id = %request.id,
+        adapter = %request.adapter,
+        surface_id = %surface_id,
+        stats_key,
+        projections = stats.projections,
+        unchanged = stats.unchanged,
+        updated = stats.updated,
+        sent_updates = stats.sent_updates,
+        duplicate_suppressed = stats.duplicate_suppressed,
+        oversized = stats.oversized,
+        errors = stats.errors,
+        budget_skips = stats.budget_skips,
+        payload_bytes = stats.payload_bytes,
+        slow_projections = stats.slow_projections,
+        avg_projection_us = average_projection_us,
+        max_projection_us = stats.max_projection.as_micros(),
+        "visual adapter projection stats",
+    );
+    stats.last_summary_at = Some(now);
 }
 
 fn hash_visual_payload(payload: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     payload.hash(&mut hasher);
     hasher.finish()
+}
+
+fn visual_request_stats_key(request: &AttachVisualAdapterRequest) -> String {
+    format!("{}:{}:request", request.id, request.adapter)
 }
 
 fn visual_projection_cache_key(request: &AttachVisualAdapterRequest, surface_id: Uuid) -> String {
@@ -1281,7 +1469,10 @@ mod tests {
         }
     }
 
-    fn extension_with_visual_request() -> DecorationRenderExtension {
+    fn extension_with_visual_request() -> (
+        DecorationRenderExtension,
+        Arc<Mutex<DecorationRendererCache>>,
+    ) {
         let scene = DecorationScene {
             revision: 1,
             surfaces: BTreeMap::new(),
@@ -1292,10 +1483,11 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(Arc::new(scene));
         let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
         cache.lock().expect("cache lock").set_scene_receiver(rx);
-        DecorationRenderExtension {
+        let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
-            cache,
-        }
+            cache: cache.clone(),
+        };
+        (extension, cache)
     }
 
     fn scene_style() -> SceneStyle {
@@ -1349,6 +1541,7 @@ mod tests {
             visual_last_revision: BTreeMap::new(),
             visual_last_payload_hash: BTreeMap::new(),
             visual_adapter_cache: BTreeMap::new(),
+            visual_stats: BTreeMap::new(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -1360,7 +1553,7 @@ mod tests {
     #[test]
     fn visual_adapter_dirty_only_uses_content_revision_and_suppresses_unchanged_payload() {
         install_test_visual_adapter();
-        let extension = extension_with_visual_request();
+        let (extension, cache) = extension_with_visual_request();
         let surface_id = Uuid::from_u128(7);
         let mut updates = Vec::new();
 
@@ -1399,6 +1592,18 @@ mod tests {
         );
         assert_eq!(TEST_VISUAL_ADAPTER_CALLS.load(Ordering::SeqCst), 2);
         assert_eq!(updates.len(), 1);
+
+        let guard = cache.lock().expect("cache lock");
+        let stats = guard
+            .visual_stats
+            .values()
+            .next()
+            .expect("visual stats recorded");
+        assert_eq!(stats.projections, 2);
+        assert_eq!(stats.updated, 2);
+        assert_eq!(stats.sent_updates, 1);
+        assert_eq!(stats.duplicate_suppressed, 1);
+        assert_eq!(stats.errors, 0);
     }
 
     #[test]

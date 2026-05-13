@@ -22,6 +22,7 @@ const PRESENCE_BITSET_ADAPTER_ID: &str = "bmux.visual.presence-bitset";
 const U32_JSON_SLOT_WIDTH: usize = 10;
 const U64_JSON_SLOT_WIDTH: usize = 20;
 const PRESENCE_ENCODING: &str = "u32-row-bitset-v1";
+const PRESENCE_STATS_LOG_EVERY: u64 = 256;
 
 #[derive(Default)]
 struct PresenceBitsetCache {
@@ -34,6 +35,14 @@ struct PresenceBitsetCache {
     payload: Vec<u8>,
     grid_revision_offset: Option<usize>,
     word_offsets: Vec<usize>,
+    projections: u64,
+    unchanged: u64,
+    updated: u64,
+    cache_rebuilds: u64,
+    emitted_bytes: u64,
+    rows_scanned: u64,
+    rows_reused_by_fingerprint: u64,
+    rows_changed: u64,
     #[cfg(test)]
     last_recomputed_rows: usize,
 }
@@ -50,6 +59,7 @@ fn project_presence_bitset(
     let height = surface.height();
     let words_per_row = width.saturating_add(31) / 32;
     let resized = ensure_presence_cache(surface, request, cache, width, height, words_per_row)?;
+    cache.projections = cache.projections.saturating_add(1);
 
     #[cfg(test)]
     {
@@ -65,9 +75,11 @@ fn project_presence_bitset(
             && row_fingerprint.is_some()
             && cache.row_fingerprints.get(row_index).copied().flatten() == row_fingerprint
         {
+            cache.rows_reused_by_fingerprint = cache.rows_reused_by_fingerprint.saturating_add(1);
             continue;
         }
 
+        cache.rows_scanned = cache.rows_scanned.saturating_add(1);
         row_words.fill(0);
         fill_presence_row_words(surface, width, words_per_row, y, &mut row_words);
         let row_hash = hash_presence_row(&row_words);
@@ -84,6 +96,7 @@ fn project_presence_bitset(
                 words.copy_from_slice(&row_words);
             }
             patch_presence_payload_row(cache, row_index)?;
+            cache.rows_changed = cache.rows_changed.saturating_add(1);
             changed = true;
             #[cfg(test)]
             {
@@ -93,10 +106,17 @@ fn project_presence_bitset(
     }
 
     if !changed {
+        cache.unchanged = cache.unchanged.saturating_add(1);
+        maybe_log_presence_stats(surface, request, cache);
         return Ok(AttachVisualProjectionResult::Unchanged);
     }
 
     patch_presence_payload_grid_revision(cache, surface.grid_revision())?;
+    cache.updated = cache.updated.saturating_add(1);
+    cache.emitted_bytes = cache
+        .emitted_bytes
+        .saturating_add(u64::try_from(cache.payload.len()).unwrap_or(u64::MAX));
+    maybe_log_presence_stats(surface, request, cache);
     out.clear();
     out.extend_from_slice(&cache.payload);
     Ok(AttachVisualProjectionResult::Updated(
@@ -131,6 +151,7 @@ fn ensure_presence_cache(
     cache.row_fingerprints = vec![None; usize::from(height)];
     cache.row_hashes = vec![None; usize::from(height)];
     cache.row_words = vec![0; word_count];
+    cache.cache_rebuilds = cache.cache_rebuilds.saturating_add(1);
     rebuild_presence_payload(surface, request, cache)?;
     Ok(true)
 }
@@ -252,6 +273,34 @@ fn cached_presence_output(
         encoding: "json".to_string(),
         payload: cache.payload.clone(),
     })
+}
+
+fn maybe_log_presence_stats(
+    surface: &dyn AttachVisualSurfaceView,
+    request: &AttachVisualAdapterRequest,
+    cache: &PresenceBitsetCache,
+) {
+    if !cache.projections.is_multiple_of(PRESENCE_STATS_LOG_EVERY) {
+        return;
+    }
+    tracing::debug!(
+        request_id = %request.id,
+        adapter = %request.adapter,
+        surface_id = %surface.surface_id(),
+        pane_id = %surface.pane_id(),
+        projections = cache.projections,
+        unchanged = cache.unchanged,
+        updated = cache.updated,
+        cache_rebuilds = cache.cache_rebuilds,
+        emitted_bytes = cache.emitted_bytes,
+        rows_scanned = cache.rows_scanned,
+        rows_reused_by_fingerprint = cache.rows_reused_by_fingerprint,
+        rows_changed = cache.rows_changed,
+        width = cache.width,
+        height = cache.height,
+        words_per_row = cache.words_per_row,
+        "presence-bitset visual adapter stats",
+    );
 }
 
 fn fill_presence_row_words(
@@ -471,6 +520,7 @@ mod tests {
             .project_incremental_cached(&surface, &request, Some(&mut cache), &mut out)
             .expect("second projection succeeds");
         assert_eq!(cache.last_recomputed_rows, 0);
+        assert_eq!(cache.rows_reused_by_fingerprint, 2);
         assert_eq!(second, AttachVisualProjectionResult::Unchanged);
 
         let changed = TestSurface::new(&[&["x", " ", "x"], &["z", "y", " "]], 2);
@@ -478,6 +528,10 @@ mod tests {
             .project_cached(&changed, &request, Some(&mut cache), &mut out)
             .expect("changed projection succeeds");
         assert_eq!(cache.last_recomputed_rows, 1);
+        assert_eq!(cache.projections, 3);
+        assert_eq!(cache.updated, 2);
+        assert_eq!(cache.unchanged, 1);
+        assert_eq!(cache.rows_reused_by_fingerprint, 3);
         assert_ne!(changed_output.payload, first_payload);
     }
 
