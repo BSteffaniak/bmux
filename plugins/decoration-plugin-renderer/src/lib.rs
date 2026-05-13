@@ -35,9 +35,10 @@ use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bmux_plugin::{
-    AttachRenderExtension, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
-    RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
-    RenderUnderCell, render_single_display_cell_char, render_text_width_u16,
+    AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
+    BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
+    RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
+    render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -276,6 +277,23 @@ impl AttachRenderExtension for DecorationRenderExtension {
         Some(extension_rect_from_scene(&surface.content_rect))
     }
 
+    fn input_hooks(&self) -> Vec<AttachInputHook> {
+        let Ok(cache) = self.cache.lock() else {
+            return Vec::new();
+        };
+        cache
+            .scene_rx
+            .as_ref()
+            .map(|rx| {
+                rx.borrow()
+                    .input_hooks
+                    .iter()
+                    .map(scene_input_hook_to_attach)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn surface_removed(&self, surface_id: Uuid) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.forget_surface(&surface_id);
@@ -309,6 +327,27 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
         y: rect.y,
         w: rect.w,
         h: rect.h,
+    }
+}
+
+fn scene_input_hook_to_attach(
+    hook: &bmux_scene_protocol::scene_protocol::InputHook,
+) -> AttachInputHook {
+    AttachInputHook {
+        id: hook.id.clone(),
+        owner_plugin_id: hook.owner_plugin_id.clone(),
+        priority: hook.priority,
+        endpoint: AttachInputEndpoint {
+            capability: hook.endpoint.capability.clone(),
+            interface_id: hook.endpoint.interface_id.clone(),
+            operation: hook.endpoint.operation.clone(),
+        },
+        filter: AttachInputHookFilter {
+            mouse_phases: hook.filter.mouse_phases.clone(),
+            keys: hook.filter.keys.clone(),
+            scope: hook.filter.scope.clone(),
+            min_interval_ms: hook.filter.min_interval_ms,
+        },
     }
 }
 
@@ -830,6 +869,7 @@ pub fn install() {
                 revision: 0,
                 surfaces: BTreeMap::new(),
                 animation: None,
+                input_hooks: Vec::new(),
             },
         );
         match bmux_plugin::global_event_bus().subscribe_state::<DecorationScene>(&SCENE_STATE_KIND)
@@ -932,6 +972,7 @@ mod tests {
             revision: 1,
             surfaces: BTreeMap::new(),
             animation: None,
+            input_hooks: Vec::new(),
         };
         let updated = DecorationScene {
             revision: 2,
@@ -949,6 +990,7 @@ mod tests {
                 ),
             )]),
             animation: None,
+            input_hooks: Vec::new(),
         };
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(initial));
         let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));

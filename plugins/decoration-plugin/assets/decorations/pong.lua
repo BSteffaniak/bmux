@@ -95,6 +95,7 @@ local function new_player(seed, side)
         base_lookahead_ms = rand_range(seed, salt, 5, 320, 520),
         max_lookahead_ms = rand_range(seed, salt, 6, 780, 1150),
         confidence = rand_range(seed, salt, 7, 0.58, 0.82),
+        manual = false,
         last_vx = 0,
         direction_changed_at = 0,
     }
@@ -220,6 +221,11 @@ local function update_player_target(game, player, side)
 end
 
 local function move_player(game, player, side)
+    if player.manual then
+        player.prev_center = player.center
+        player.center = clamp(player.target, 0, game.h - 1)
+        return
+    end
     local speed = update_player_target(game, player, side)
     local distance = math.abs(player.target - player.center)
     local boost = 0.85
@@ -428,6 +434,135 @@ local function render_pane(pane, message)
     return cmds
 end
 
+local function pane_from_input(input)
+    return input.hovered_pane or input.focused_pane
+end
+
+local function manual_player_for_side(game, side)
+    if side == "left" then return game.left end
+    if side == "right" then return game.right end
+    return nil
+end
+
+local function input_content_row(input, pane, clamp_outside)
+    if input.row == nil or pane == nil or pane.content_rect == nil then
+        return nil
+    end
+    local max_row = math.max(0, pane.content_rect.h - 1)
+    local row = input.row - pane.content_rect.y
+    if clamp_outside then
+        return clamp(row, 0, max_row)
+    end
+    if row < 0 or row > max_row then
+        return nil
+    end
+    return row
+end
+
+local function hit_paddle(game, pane, input)
+    if input.col == nil or input.row == nil or pane == nil then
+        return nil
+    end
+    local row = input_content_row(input, pane, false)
+    if row == nil then return nil end
+    local left_top = paddle_top(game, game.left)
+    local right_top = paddle_top(game, game.right)
+    if input.col == pane.rect.x and row >= left_top and row <= left_top + game.paddle_len - 1 then
+        return "left"
+    end
+    if input.col == pane.rect.x + pane.rect.w - 1 and row >= right_top and row <= right_top + game.paddle_len - 1 then
+        return "right"
+    end
+    return nil
+end
+
+local function set_manual_target(game, side, row)
+    local player = manual_player_for_side(game, side)
+    if player == nil then return end
+    player.manual = true
+    player.target = clamp(row, 0, game.h - 1)
+    player.center = player.target
+end
+
+local function handle_input(message)
+    local input = message.input or {}
+    local pane = pane_from_input(input)
+    if pane == nil or pane.pane_id == nil then
+        return { consumed = false }
+    end
+    local state = pane_states[tostring(pane.pane_id)]
+    if state == nil or state.game == nil then
+        return { consumed = false }
+    end
+    local game = state.game
+
+    if input.event_kind == "key" then
+        local side = state.captured_side
+        local player = manual_player_for_side(game, side)
+        if player == nil then
+            return { consumed = false }
+        end
+        if input.key == "esc" then
+            player.manual = false
+            state.captured_side = nil
+            return { consumed = true, release_capture = true, dirty = true }
+        end
+        local delta = input.key == "up" and -1 or (input.key == "down" and 1 or 0)
+        if delta == 0 then
+            return { consumed = false }
+        end
+        set_manual_target(game, side, player.target + delta)
+        return { consumed = true, capture_keyboard = { "up", "down", "esc" }, dirty = true }
+    end
+
+    if input.event_kind ~= "mouse" or input.button ~= "left" then
+        return { consumed = false }
+    end
+
+    local row = input_content_row(input, pane, input.phase == "drag" or input.phase == "up")
+    if row == nil then
+        return { consumed = false }
+    end
+
+    if input.phase == "down" then
+        local side = hit_paddle(game, pane, input)
+        if side == nil then
+            if state.captured_side ~= nil then
+                state.captured_side = nil
+                game.left.manual = false
+                game.right.manual = false
+                return { consumed = false, release_capture = true, dirty = true }
+            end
+            return { consumed = false }
+        end
+        state.captured_side = side
+        set_manual_target(game, side, row)
+        return {
+            consumed = true,
+            capture_pointer = true,
+            capture_keyboard = { "up", "down", "esc" },
+            dirty = true,
+        }
+    end
+
+    if input.phase == "drag" and state.captured_side ~= nil then
+        set_manual_target(game, state.captured_side, row)
+        return {
+            consumed = true,
+            capture_pointer = true,
+            capture_keyboard = { "up", "down", "esc" },
+            dirty = true,
+        }
+    end
+
+    if input.phase == "up" and state.captured_side ~= nil then
+        set_manual_target(game, state.captured_side, row)
+        return { consumed = true, capture_keyboard = { "up", "down", "esc" }, dirty = true }
+    end
+
+    return { consumed = false }
+end
+
 local function render(message)
     local surfaces = {}
     for _, pane in ipairs(message.panes or {}) do
@@ -442,6 +577,8 @@ end
 function decorate(message)
     if message.kind == "render" then
         return render(message)
+    elseif message.kind == "input" then
+        return handle_input(message)
     end
     return nil
 end

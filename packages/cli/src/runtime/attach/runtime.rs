@@ -29,6 +29,10 @@ use bmux_ipc::InvokeServiceKind;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
+use bmux_plugin::{
+    AttachInputEvent, AttachInputHook, AttachInputModifiers, AttachInputPaneContext,
+    AttachInputResult, ExtensionRect,
+};
 use bmux_plugin_sdk::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, HostScope, PluginCommandOutcome, ServiceKind,
     ServiceRequest,
@@ -85,17 +89,18 @@ use super::render::{
     render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
 };
 use super::state::{
-    AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseFloatingDrag,
-    AttachMouseResizeAxisDrag, AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag,
-    AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
-    AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
+    AttachDirtySource, AttachEventAction, AttachExitReason, AttachInputHookCapture,
+    AttachMouseFloatingDrag, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
+    AttachMouseSelectionDrag, AttachMouseTabDrag, AttachScrollbackCursor, AttachScrollbackPosition,
+    AttachTabDropPlacement, AttachTabDropTarget, AttachUiEffect, AttachUiMode, AttachUiReduction,
+    AttachViewState, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, attach_pane_grid_delta_state_streaming,
     attach_pane_grid_snapshot_state_streaming, attach_pane_grid_window_state_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
-use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderDamage, RenderOp, RenderStyle};
+use bmux_plugin::{BorderGlyphs, RenderDamage, RenderOp, RenderStyle};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
@@ -319,6 +324,7 @@ const fn empty_decoration_scene() -> bmux_scene_protocol::scene_protocol::Decora
         revision: 0,
         surfaces: BTreeMap::new(),
         animation: None,
+        input_hooks: Vec::new(),
     }
 }
 
@@ -7936,6 +7942,20 @@ pub async fn handle_attach_terminal_event(
         }
     }
 
+    if let Some(TerminalInputEvent::Key(key)) = &normalized_event {
+        match try_handle_attach_input_hook_key(client, view_state, key).await {
+            Ok(true) => return Ok(AttachLoopControl::Continue),
+            Ok(false) => {}
+            Err(error) => {
+                view_state.set_transient_status(
+                    format!("input hook failed: {}", map_attach_client_error(error)),
+                    now,
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+    }
+
     if matches!(&raw_event, Event::Key(_)) {
         let focused_input_mode = focused_attach_pane_input_mode(view_state);
         attach_input_processor.set_pane_input_mode(
@@ -8575,6 +8595,319 @@ pub const fn record_attach_mouse_event(
     view_state.mouse.last_event_at = Some(now);
 }
 
+fn attach_input_hooks() -> Vec<AttachInputHook> {
+    let mut hooks = Vec::new();
+    for extension in bmux_plugin::registered_render_extensions() {
+        extension.refresh_state();
+        hooks.extend(extension.input_hooks());
+    }
+    hooks.sort_by_key(|hook| std::cmp::Reverse(hook.priority));
+    hooks
+}
+
+async fn invoke_attach_input_hook(
+    client: &mut StreamingBmuxClient,
+    hook: &AttachInputHook,
+    event: AttachInputEvent,
+) -> std::result::Result<AttachInputResult, ClientError> {
+    let payload = bmux_codec::to_vec(&event).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding attach input hook event: {error}"),
+    })?;
+    let response = client
+        .invoke_service_raw(
+            hook.endpoint.capability.clone(),
+            InvokeServiceKind::Command,
+            hook.endpoint.interface_id.clone(),
+            hook.endpoint.operation.clone(),
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes::<AttachInputResult>(&response).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decoding attach input hook result: {error}"),
+        }
+    })
+}
+
+fn apply_attach_input_result(
+    view_state: &mut AttachViewState,
+    hook: AttachInputHook,
+    result: &AttachInputResult,
+) {
+    if result.release_capture {
+        view_state.mouse.input_capture = None;
+        return;
+    }
+    if result.capture_pointer || !result.capture_keyboard.is_empty() {
+        view_state.mouse.input_capture = Some(AttachInputHookCapture {
+            hook,
+            pointer: result.capture_pointer,
+            keyboard_keys: result.capture_keyboard.clone(),
+        });
+    }
+}
+
+const fn attach_input_event_modifiers(modifiers: KeyModifiers) -> AttachInputModifiers {
+    AttachInputModifiers {
+        shift: modifiers.contains(KeyModifiers::SHIFT),
+        alt: modifiers.contains(KeyModifiers::ALT),
+        control: modifiers.contains(KeyModifiers::CONTROL),
+        super_key: modifiers.contains(KeyModifiers::SUPER),
+        hyper: modifiers.contains(KeyModifiers::HYPER),
+        meta: modifiers.contains(KeyModifiers::META),
+    }
+}
+
+const fn attach_input_mouse_phase(kind: MouseEventKind) -> (&'static str, Option<&'static str>) {
+    match kind {
+        MouseEventKind::Down(button) => ("down", Some(mouse_button_name(button))),
+        MouseEventKind::Up(button) => ("up", Some(mouse_button_name(button))),
+        MouseEventKind::Drag(button) => ("drag", Some(mouse_button_name(button))),
+        MouseEventKind::Moved => ("move", None),
+        MouseEventKind::ScrollUp => ("scroll-up", None),
+        MouseEventKind::ScrollDown => ("scroll-down", None),
+        MouseEventKind::ScrollLeft => ("scroll-left", None),
+        MouseEventKind::ScrollRight => ("scroll-right", None),
+    }
+}
+
+const fn mouse_button_name(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+    }
+}
+
+fn attach_input_key_name(key: &TerminalKeyEvent) -> Option<String> {
+    if key.kind == super::input::TerminalKeyPhase::Release {
+        return None;
+    }
+    let name = match &key.code {
+        super::input::TerminalKeyCode::Up => "up".to_string(),
+        super::input::TerminalKeyCode::Down => "down".to_string(),
+        super::input::TerminalKeyCode::Left => "left".to_string(),
+        super::input::TerminalKeyCode::Right => "right".to_string(),
+        super::input::TerminalKeyCode::Esc => "esc".to_string(),
+        super::input::TerminalKeyCode::Enter => "enter".to_string(),
+        super::input::TerminalKeyCode::Tab => "tab".to_string(),
+        super::input::TerminalKeyCode::BackTab => "backtab".to_string(),
+        super::input::TerminalKeyCode::Char(ch) => ch.to_string(),
+        _ => return None,
+    };
+    Some(name)
+}
+
+fn attach_input_pane_context_for_id(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<AttachInputPaneContext> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    let focused = layout_state.focused_pane_id == pane_id;
+    layout_state
+        .scene
+        .surfaces
+        .iter()
+        .enumerate()
+        .filter(|(_, surface)| surface.visible && surface.pane_id == Some(pane_id))
+        .max_by_key(|(index, surface)| (surface.layer, surface.z, *index))
+        .map(|(_, surface)| AttachInputPaneContext {
+            pane_id,
+            surface_id: surface.id,
+            rect: extension_rect_from_attach_rect(surface.rect),
+            content_rect: extension_rect_from_attach_rect(surface.content_rect),
+            focused,
+        })
+}
+
+fn attach_input_focused_pane_context(
+    view_state: &AttachViewState,
+) -> Option<AttachInputPaneContext> {
+    let pane_id = view_state.cached_layout_state.as_ref()?.focused_pane_id;
+    attach_input_pane_context_for_id(view_state, pane_id)
+}
+
+fn attach_input_hovered_pane_context(
+    view_state: &AttachViewState,
+    col: u16,
+    row: u16,
+) -> Option<AttachInputPaneContext> {
+    attach_scene_pane_at(view_state, col, row)
+        .and_then(|pane_id| attach_input_pane_context_for_id(view_state, pane_id))
+}
+
+const fn extension_rect_from_attach_rect(rect: AttachRect) -> ExtensionRect {
+    ExtensionRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    }
+}
+
+fn hook_matches_mouse(
+    hook: &AttachInputHook,
+    phase: &str,
+    focused: Option<&AttachInputPaneContext>,
+    hovered: Option<&AttachInputPaneContext>,
+) -> bool {
+    if !hook.filter.mouse_phases.iter().any(|item| item == phase) {
+        return false;
+    }
+    match hook.filter.scope.as_str() {
+        "global" => true,
+        "hovered-pane" => hovered.is_some(),
+        _ => focused
+            .zip(hovered)
+            .is_some_and(|(focused, hovered)| focused.pane_id == hovered.pane_id),
+    }
+}
+
+fn hook_matches_key(hook: &AttachInputHook, key: &str) -> bool {
+    hook.filter.keys.iter().any(|item| item == key)
+}
+
+fn hook_throttled(view_state: &mut AttachViewState, hook: &AttachInputHook, now: Instant) -> bool {
+    let min_interval = Duration::from_millis(u64::from(hook.filter.min_interval_ms));
+    if min_interval.is_zero() {
+        view_state
+            .mouse
+            .input_hook_last_dispatched_at
+            .insert(hook.id.clone(), now);
+        return false;
+    }
+    if view_state
+        .mouse
+        .input_hook_last_dispatched_at
+        .get(&hook.id)
+        .is_some_and(|last| now.duration_since(*last) < min_interval)
+    {
+        return true;
+    }
+    view_state
+        .mouse
+        .input_hook_last_dispatched_at
+        .insert(hook.id.clone(), now);
+    false
+}
+
+async fn try_handle_attach_input_hook_mouse(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+    now: Instant,
+    capture_only: bool,
+) -> std::result::Result<bool, ClientError> {
+    let (phase, button) = attach_input_mouse_phase(mouse_event.kind);
+    let focused = attach_input_focused_pane_context(view_state);
+    let hovered =
+        attach_input_hovered_pane_context(view_state, mouse_event.column, mouse_event.row);
+    let hooks = if let Some(capture) = view_state.mouse.input_capture.clone() {
+        if capture.pointer {
+            vec![capture.hook]
+        } else if capture_only {
+            return Ok(false);
+        } else {
+            attach_input_hooks()
+        }
+    } else if capture_only {
+        return Ok(false);
+    } else {
+        attach_input_hooks()
+    };
+
+    for hook in hooks {
+        if !capture_only && !hook_matches_mouse(&hook, phase, focused.as_ref(), hovered.as_ref()) {
+            continue;
+        }
+        if matches!(phase, "drag" | "move") && hook_throttled(view_state, &hook, now) {
+            return Ok(true);
+        }
+        let event = AttachInputEvent {
+            hook_id: hook.id.clone(),
+            event_kind: "mouse".to_string(),
+            phase: phase.to_string(),
+            button: button.map(str::to_string),
+            key: None,
+            col: Some(mouse_event.column),
+            row: Some(mouse_event.row),
+            modifiers: attach_input_event_modifiers(mouse_event.modifiers),
+            focused_pane: focused.clone(),
+            hovered_pane: hovered.clone(),
+        };
+        let result = invoke_attach_input_hook(client, &hook, event).await?;
+        apply_attach_input_result(view_state, hook, &result);
+        if phase == "up"
+            && let Some(capture) = view_state.mouse.input_capture.as_mut()
+        {
+            capture.pointer = false;
+            if capture.keyboard_keys.is_empty() {
+                view_state.mouse.input_capture = None;
+            }
+        }
+        if result.consumed || result.capture_pointer {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn try_handle_attach_input_hook_key(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    key: &TerminalKeyEvent,
+) -> std::result::Result<bool, ClientError> {
+    let Some(key_name) = attach_input_key_name(key) else {
+        return Ok(false);
+    };
+    let hooks = if let Some(capture) = view_state.mouse.input_capture.clone() {
+        if capture.keyboard_keys.iter().any(|item| item == &key_name) || key_name == "esc" {
+            vec![capture.hook]
+        } else {
+            attach_input_hooks()
+        }
+    } else {
+        attach_input_hooks()
+    };
+    let focused = attach_input_focused_pane_context(view_state);
+    for hook in hooks {
+        if !hook_matches_key(&hook, &key_name) {
+            continue;
+        }
+        let event = AttachInputEvent {
+            hook_id: hook.id.clone(),
+            event_kind: "key".to_string(),
+            phase: match key.kind {
+                super::input::TerminalKeyPhase::Press => "press".to_string(),
+                super::input::TerminalKeyPhase::Repeat => "repeat".to_string(),
+                super::input::TerminalKeyPhase::Release => "release".to_string(),
+            },
+            button: None,
+            key: Some(key_name.clone()),
+            col: None,
+            row: None,
+            modifiers: AttachInputModifiers {
+                shift: key.modifiers.shift,
+                alt: key.modifiers.alt,
+                control: key.modifiers.control,
+                super_key: key.modifiers.super_key,
+                hyper: key.modifiers.hyper,
+                meta: key.modifiers.meta,
+            },
+            focused_pane: focused.clone(),
+            hovered_pane: None,
+        };
+        let result = invoke_attach_input_hook(client, &hook, event).await?;
+        apply_attach_input_result(view_state, hook, &result);
+        if result.consumed || !result.capture_keyboard.is_empty() || result.release_capture {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_attach_mouse_event_at(
     client: &mut StreamingBmuxClient,
@@ -8590,12 +8923,18 @@ async fn handle_attach_mouse_event_at(
         view_state.mouse.resize_drag = None;
         view_state.mouse.floating_drag = None;
         view_state.mouse.tab_drag = None;
+        view_state.mouse.input_capture = None;
         return Ok(());
     }
     if view_state.help_overlay_open || view_state.prompt.is_active() {
         view_state.mouse.resize_drag = None;
         view_state.mouse.floating_drag = None;
         view_state.mouse.tab_drag = None;
+        view_state.mouse.input_capture = None;
+        return Ok(());
+    }
+
+    if try_handle_attach_input_hook_mouse(client, view_state, mouse_event, now, true).await? {
         return Ok(());
     }
 
@@ -8609,6 +8948,10 @@ async fn handle_attach_mouse_event_at(
     )
     .await?
     {
+        return Ok(());
+    }
+
+    if try_handle_attach_input_hook_mouse(client, view_state, mouse_event, now, false).await? {
         return Ok(());
     }
 

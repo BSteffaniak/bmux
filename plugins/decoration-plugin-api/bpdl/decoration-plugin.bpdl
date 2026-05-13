@@ -60,6 +60,10 @@ interface decoration-state {
         // payloads; it subscribes/calls only the declared plugin APIs
         // and forwards JSON-shaped data into Lua.
         script-access: script-access-spec?,
+        // Optional coarse input interest for the top-level decoration
+        // script. The script owns exact hit-testing and decides whether
+        // each event is consumed.
+        input: decoration-input-spec?,
         // Optional named decoration components exported by a theme.
         // Component ids are the user-facing composition handles (for
         // example `performance.border`, `performance.header`, or
@@ -96,6 +100,22 @@ interface decoration-state {
         // with the rest of the component spec, allowing user config to
         // tune scripted components without plugin-specific host logic.
         settings: map<string, string>?,
+        // Optional coarse input interest for this component. Exact
+        // hit-testing remains script-owned.
+        input: decoration-input-spec?,
+    }
+
+    // Coarse input filter used to install efficient attach-side hooks.
+    // `mouse` contains phase strings such as `down`, `drag`, `up`,
+    // `move`, `scroll-up`, `scroll-down`; `keys` contains normalized
+    // key names such as `up`, `down`, `esc`. `scope` is a coarse host
+    // filter (`focused-pane`, `hovered-pane`, or `global`).
+    record decoration-input-spec {
+        mouse: list<string>?,
+        keys: list<string>?,
+        scope: string?,
+        priority: i16?,
+        min-interval-ms: u16?,
     }
 
     // Generic plugin access available to a decoration script. Channel

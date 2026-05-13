@@ -25,16 +25,16 @@ use std::time::{Duration, Instant};
 use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService, NotifyError};
 use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderSpec, BorderStyle, DecorationComponentSpec, DecorationStateService,
+    BorderSpec, BorderStyle, DecorationComponentSpec, DecorationInputSpec, DecorationStateService,
     DecorationThemeExtension, PaneActivity, PaneDecoration, PaneGeometry, PaneLifecycle,
     SetStyleError, ValidationError, ValidationResult,
 };
-use bmux_plugin::ServiceCaller;
+use bmux_plugin::{AttachInputEvent, AttachInputResult, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs, Color, DecorationScene, GradientAxis, InteractiveRegion, NamedColor,
-    PaintCommand, Rect, Style, SurfaceDecoration,
+    BorderGlyphs, Color, DecorationScene, GradientAxis, InputHook, InputHookEndpoint,
+    InputHookFilter, InteractiveRegion, NamedColor, PaintCommand, Rect, Style, SurfaceDecoration,
 };
 use uuid::Uuid;
 
@@ -384,6 +384,75 @@ impl DecorationCommandsService for DecorationServiceHandle {
     }
 }
 
+fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> AttachInputResult {
+    let mut result = AttachInputResult::default();
+    let message = ScriptMessage::Input(event);
+    if state
+        .current_theme
+        .as_ref()
+        .and_then(|theme| theme.input.as_ref())
+        .is_some()
+        && let Some(backend) = state.script_backend.as_ref()
+    {
+        match backend.invoke(&message) {
+            Ok(outcome) => {
+                merge_attach_input_result(&mut result, outcome.input_result);
+                record_script_perf(state, outcome.duration);
+            }
+            Err(error) => {
+                tracing::warn!(target: "decoration.script", error = %error, "decoration script input invocation failed");
+            }
+        }
+    }
+
+    for component in state.script_components.values_mut() {
+        if component.spec.input.is_none() {
+            continue;
+        }
+        let Some(backend) = component.backend.as_ref() else {
+            continue;
+        };
+        match backend.invoke(&message) {
+            Ok(outcome) => {
+                merge_attach_input_result(&mut result, outcome.input_result);
+                record_component_script_perf(component, outcome.duration);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "decoration.script",
+                    component_id = %component.id,
+                    error = %error,
+                    "decoration component input invocation failed",
+                );
+            }
+        }
+    }
+
+    if result.dirty {
+        bump_revision(state);
+    }
+    result
+}
+
+fn merge_attach_input_result(result: &mut AttachInputResult, next: Option<AttachInputResult>) {
+    let Some(next) = next else {
+        return;
+    };
+    result.consumed |= next.consumed;
+    result.capture_pointer |= next.capture_pointer;
+    result.release_capture |= next.release_capture;
+    result.dirty |= next.dirty;
+    for key in next.capture_keyboard {
+        if !result
+            .capture_keyboard
+            .iter()
+            .any(|existing| existing == &key)
+        {
+            result.capture_keyboard.push(key);
+        }
+    }
+}
+
 /// Apply a [`PaneEvent`] to the shared state. Pulled out so both the
 /// typed `notify_pane_event` command and the event-bus subscriber
 /// can share the same mutation path.
@@ -513,6 +582,7 @@ fn build_scene(state: &mut State) -> DecorationScene {
         revision: state.scene_revision,
         surfaces,
         animation: None,
+        input_hooks: input_hooks_for_state(state),
     }
 }
 
@@ -911,6 +981,74 @@ fn record_script_perf(state: &State, duration: Duration) {
     }
 }
 
+fn input_hooks_for_state(state: &State) -> Vec<InputHook> {
+    let Some(theme) = state.current_theme.as_ref() else {
+        return Vec::new();
+    };
+    let mut specs = Vec::new();
+    if let Some(input) = theme.input.as_ref() {
+        specs.push(input);
+    }
+    if let Some(components) = theme.components.as_ref() {
+        specs.extend(
+            components
+                .values()
+                .filter_map(|component| component.input.as_ref()),
+        );
+    }
+    let Some(filter) = combine_input_specs(&specs) else {
+        return Vec::new();
+    };
+    vec![InputHook {
+        id: "bmux.decoration.input".to_string(),
+        owner_plugin_id: DECORATION_PLUGIN_ID.to_string(),
+        priority: specs
+            .iter()
+            .filter_map(|spec| spec.priority)
+            .max()
+            .unwrap_or(0),
+        endpoint: InputHookEndpoint {
+            capability: "bmux.decoration.write".to_string(),
+            interface_id: DECORATION_INPUT_INTERFACE_ID.to_string(),
+            operation: DECORATION_INPUT_OPERATION.to_string(),
+        },
+        filter,
+    }]
+}
+
+fn combine_input_specs(specs: &[&DecorationInputSpec]) -> Option<InputHookFilter> {
+    let mut mouse = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    let mut scope = "focused-pane".to_string();
+    let mut min_interval_ms = u16::MAX;
+    for spec in specs {
+        mouse.extend(spec.mouse.as_deref().unwrap_or_default().iter().cloned());
+        keys.extend(spec.keys.as_deref().unwrap_or_default().iter().cloned());
+        if let Some(spec_scope) = spec.scope.as_deref()
+            && (spec_scope == "global" || (spec_scope == "hovered-pane" && scope != "global"))
+        {
+            scope = spec_scope.to_string();
+        }
+        if let Some(interval) = spec.min_interval_ms
+            && interval > 0
+        {
+            min_interval_ms = min_interval_ms.min(interval);
+        }
+    }
+    if mouse.is_empty() && keys.is_empty() {
+        return None;
+    }
+    if min_interval_ms == u16::MAX {
+        min_interval_ms = 0;
+    }
+    Some(InputHookFilter {
+        mouse_phases: mouse.into_iter().collect(),
+        keys: keys.into_iter().collect(),
+        scope,
+        min_interval_ms,
+    })
+}
+
 fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
     let (rect, content_rect) = geometry_for_pane(state, pane_id).map_or_else(
         || {
@@ -941,10 +1079,10 @@ fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
     }
 }
 
-/// Identifier the decoration plugin attributes to its own
-/// interactive regions. Used by the attach runtime's mouse hit-test
-/// to route clicks on decoration chrome back to this plugin.
+/// Identifier the decoration plugin attributes to its own generic hooks.
 const DECORATION_PLUGIN_ID: &str = "bmux.decoration";
+const DECORATION_INPUT_INTERFACE_ID: &str = "decoration-input-hooks";
+const DECORATION_INPUT_OPERATION: &str = "handle-input";
 
 /// Build the four edge regions (top / bottom / left / right) of a
 /// pane border as [`InteractiveRegion`]s owned by the decoration
@@ -1006,6 +1144,7 @@ fn empty_scene() -> DecorationScene {
         revision: 0,
         surfaces: BTreeMap::new(),
         animation: None,
+        input_hooks: Vec::new(),
     }
 }
 
@@ -1038,7 +1177,9 @@ fn bump_revision(state: &mut State) {
 }
 
 fn scene_output_matches(left: &DecorationScene, right: &DecorationScene) -> bool {
-    left.surfaces == right.surfaces && left.animation == right.animation
+    left.surfaces == right.surfaces
+        && left.animation == right.animation
+        && left.input_hooks == right.input_hooks
 }
 
 /// Parse a TOML string against the [`DecorationThemeExtension`]
@@ -2179,6 +2320,12 @@ impl RustPlugin for DecorationPlugin {
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
+            "decoration-input-hooks", "handle-input" => |req: AttachInputEvent, _ctx| {
+                let result = state
+                    .lock()
+                    .map_or_else(|_| AttachInputResult::default(), |mut state| handle_attach_input_event(&mut state, req));
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
+            },
         })
     }
 }
@@ -2845,6 +2992,7 @@ mod tests {
         ) -> Result<crate::scripting::DecorateOutcome, crate::scripting::ScriptError> {
             Ok(crate::scripting::DecorateOutcome {
                 surfaces: BTreeMap::new(),
+                input_result: None,
                 duration: Duration::from_millis(0),
             })
         }
@@ -2878,6 +3026,7 @@ mod tests {
             self.seen.lock().expect("seen lock").push(message.clone());
             Ok(crate::scripting::DecorateOutcome {
                 surfaces: BTreeMap::new(),
+                input_result: None,
                 duration: Duration::from_millis(0),
             })
         }
@@ -3085,6 +3234,7 @@ mod tests {
             animation: None,
             script: None,
             script_access: None,
+            input: None,
             components: None,
         }
     }
@@ -3189,7 +3339,7 @@ mod tests {
             .iter()
             .find_map(|message| match message {
                 ScriptMessage::Event(event) => Some(event),
-                ScriptMessage::Render(_) => None,
+                ScriptMessage::Input(_) | ScriptMessage::Render(_) => None,
             })
             .expect("snapshot event delivered to script backend");
         assert_eq!(event.source, kind);
@@ -4279,6 +4429,39 @@ exited = ""
             .iter()
             .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "◆"));
         assert!(has_snake_text, "rainbow snake text command emitted");
+    }
+
+    #[test]
+    fn decoration_input_spec_publishes_coarse_input_hook() {
+        let plugin = DecorationPlugin::new();
+        let mut theme = sample_theme();
+        theme.components = Some(BTreeMap::from([(
+            "demo.input".to_string(),
+            DecorationComponentSpec {
+                enabled: None,
+                script: Some("pong".to_string()),
+                entrypoint: None,
+                above: None,
+                below: None,
+                settings: None,
+                input: Some(DecorationInputSpec {
+                    mouse: Some(vec!["down".to_string(), "drag".to_string()]),
+                    keys: Some(vec!["up".to_string(), "esc".to_string()]),
+                    scope: Some("focused-pane".to_string()),
+                    priority: Some(42),
+                    min_interval_ms: Some(16),
+                }),
+            },
+        )]));
+        install_theme(&plugin, theme);
+        let scene = plugin.build_scene();
+        assert_eq!(scene.input_hooks.len(), 1);
+        let hook = &scene.input_hooks[0];
+        assert_eq!(hook.id, "bmux.decoration.input");
+        assert_eq!(hook.priority, 42);
+        assert_eq!(hook.filter.mouse_phases, vec!["down", "drag"]);
+        assert_eq!(hook.filter.keys, vec!["esc", "up"]);
+        assert_eq!(hook.filter.min_interval_ms, 16);
     }
 
     #[test]

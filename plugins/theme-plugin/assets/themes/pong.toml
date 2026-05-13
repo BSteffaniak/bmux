@@ -89,6 +89,12 @@ script     = "pong"
 rally_ms    = "5500"
 win_hold_ms = "3500"
 
+[plugins."bmux.decoration".components."pong.ball".input]
+keys            = ["up", "down", "esc"]
+min_interval_ms = 16
+mouse           = ["down", "drag", "up"]
+scope           = "focused-pane"
+
 [plugins."bmux.decoration".components."pong.paddles"]
 above      = ["pane.content"]
 entrypoint = "paddles"
@@ -98,6 +104,12 @@ script     = "pong"
 rally_ms    = "5500"
 win_hold_ms = "3500"
 
+[plugins."bmux.decoration".components."pong.paddles".input]
+keys            = ["up", "down", "esc"]
+min_interval_ms = 16
+mouse           = ["down", "drag", "up"]
+scope           = "focused-pane"
+
 [plugins."bmux.decoration".components."pong.score"]
 above      = ["pong.paddles"]
 entrypoint = "score"
@@ -106,3 +118,9 @@ script     = "pong"
 [plugins."bmux.decoration".components."pong.score".settings]
 rally_ms    = "5500"
 win_hold_ms = "3500"
+
+[plugins."bmux.decoration".components."pong.score".input]
+keys            = ["up", "down", "esc"]
+min_interval_ms = 16
+mouse           = ["down", "drag", "up"]
+scope           = "focused-pane"

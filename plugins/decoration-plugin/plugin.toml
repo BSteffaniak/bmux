@@ -31,6 +31,11 @@ interface_id = "decoration-commands"
 kind         = "command"
 
 [[services]]
+capability   = "bmux.decoration.write"
+interface_id = "decoration-input-hooks"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.decoration.read"
 interface_id = "scene-protocol"
 kind         = "event"

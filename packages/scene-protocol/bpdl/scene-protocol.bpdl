@@ -276,6 +276,30 @@ interface scene-protocol {
         target-hz: u16,
     }
 
+    // Coarse input hook published by a theme/plugin. Hooks describe
+    // broad event interest only; exact hit-testing and interaction
+    // state belong to the owning plugin/script.
+    record input-hook-endpoint {
+        capability: string,
+        interface-id: string,
+        operation: string,
+    }
+
+    record input-hook-filter {
+        mouse-phases: list<string>,
+        keys: list<string>,
+        scope: string,
+        min-interval-ms: u16,
+    }
+
+    record input-hook {
+        id: string,
+        owner-plugin-id: string,
+        priority: i16,
+        endpoint: input-hook-endpoint,
+        filter: input-hook-filter,
+    }
+
     // Snapshot of every decorated surface. Published by the decoration
     // plugin as retained typed event-bus state whenever its state changes
     // (focus, theme, per-pane override). Consumers replace their cached
@@ -285,6 +309,7 @@ interface scene-protocol {
         revision: u64,
         surfaces: map<uuid, surface-decoration>,
         animation: animation-hint?,
+        input-hooks: list<input-hook>,
     }
 
     @state events decoration-scene;

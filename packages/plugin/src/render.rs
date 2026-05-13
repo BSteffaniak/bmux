@@ -41,7 +41,7 @@ use uuid::Uuid;
 /// scene-protocol dependency: generic extensions (e.g. a future
 /// overlay plugin that doesn't produce scene-protocol output) can
 /// still speak the trait without importing wire-schema types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtensionRect {
     pub x: u16,
     pub y: u16,
@@ -99,6 +99,74 @@ impl ExtensionRect {
             h: bottom.saturating_sub(y),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputEndpoint {
+    pub capability: String,
+    pub interface_id: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputHookFilter {
+    pub mouse_phases: Vec<String>,
+    pub keys: Vec<String>,
+    pub scope: String,
+    pub min_interval_ms: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputHook {
+    pub id: String,
+    pub owner_plugin_id: String,
+    pub priority: i16,
+    pub endpoint: AttachInputEndpoint,
+    pub filter: AttachInputHookFilter,
+}
+
+#[allow(clippy::struct_excessive_bools)] // Mirrors terminal modifier flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+    pub super_key: bool,
+    pub hyper: bool,
+    pub meta: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputPaneContext {
+    pub pane_id: Uuid,
+    pub surface_id: Uuid,
+    pub rect: ExtensionRect,
+    pub content_rect: ExtensionRect,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputEvent {
+    pub hook_id: String,
+    pub event_kind: String,
+    pub phase: String,
+    pub button: Option<String>,
+    pub key: Option<String>,
+    pub col: Option<u16>,
+    pub row: Option<u16>,
+    pub modifiers: AttachInputModifiers,
+    pub focused_pane: Option<AttachInputPaneContext>,
+    pub hovered_pane: Option<AttachInputPaneContext>,
+}
+
+#[allow(clippy::struct_excessive_bools)] // Independent routing flags returned by plugin input hooks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputResult {
+    pub consumed: bool,
+    pub capture_pointer: bool,
+    pub capture_keyboard: Vec<String>,
+    pub release_capture: bool,
+    pub dirty: bool,
 }
 
 /// Return the Unicode display-cell width of `text`, saturated to `u16::MAX`.
@@ -797,6 +865,14 @@ pub trait AttachRenderExtension: Send + Sync {
     /// picks the narrowest inset.
     fn content_rect_override(&self, _surface_id: Uuid) -> Option<ExtensionRect> {
         None
+    }
+
+    /// Return coarse input hooks currently owned by this extension.
+    /// Hooks are event subscriptions, not hit-test regions: the host
+    /// applies the cheap filter and the owning plugin/script decides
+    /// whether a specific event is consumed.
+    fn input_hooks(&self) -> Vec<AttachInputHook> {
+        Vec::new()
     }
 
     /// Called when a surface is removed from the attach layout. The

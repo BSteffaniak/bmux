@@ -50,6 +50,7 @@
     clippy::doc_markdown
 )] // Bounded numeric casts + trait-method doc noise are out of scope for this module's style.
 
+use bmux_plugin::AttachInputResult;
 use bmux_scene_protocol::scene_protocol::PaintCommand;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -75,6 +76,7 @@ pub const WARN_COOLDOWN: Duration = Duration::from_mins(1);
 #[derive(Debug, Clone)]
 pub enum ScriptMessage {
     Event(ScriptEventMessage),
+    Input(bmux_plugin::AttachInputEvent),
     Render(ScriptRenderMessage),
 }
 
@@ -164,6 +166,7 @@ pub enum ScriptError {
 #[derive(Debug)]
 pub struct DecorateOutcome {
     pub surfaces: BTreeMap<String, Vec<PaintCommand>>,
+    pub input_result: Option<AttachInputResult>,
     pub duration: Duration,
 }
 
@@ -331,8 +334,8 @@ mod lua_backend {
     //! theme / script file changes.
 
     use super::{
-        DecorateOutcome, ScriptBackend, ScriptError, ScriptEventDelivery, ScriptHostAccess,
-        ScriptMessage, ScriptServiceCall, ScriptServiceGrant,
+        AttachInputResult, DecorateOutcome, ScriptBackend, ScriptError, ScriptEventDelivery,
+        ScriptHostAccess, ScriptMessage, ScriptServiceCall, ScriptServiceGrant,
     };
     use bmux_scene_protocol::scene_protocol::{
         Color, GradientAxis, NamedColor, PaintCommand, Rect, Style,
@@ -483,22 +486,33 @@ mod lua_backend {
                     message: e.to_string(),
                 })?;
             let duration = started_at.elapsed();
-            let surfaces = match result {
-                Value::Nil => BTreeMap::new(),
+            let (surfaces, input_result) = match result {
+                Value::Nil => (BTreeMap::new(), None),
                 Value::Table(t) => {
-                    result_table_to_surfaces(&t).map_err(|e| ScriptError::Runtime {
-                        path: path.clone(),
-                        message: format!("converting result: {e}"),
-                    })?
+                    let surfaces =
+                        result_table_to_surfaces(&t).map_err(|e| ScriptError::Runtime {
+                            path: path.clone(),
+                            message: format!("converting result: {e}"),
+                        })?;
+                    let input_result =
+                        result_table_to_input_result(&t).map_err(|e| ScriptError::Runtime {
+                            path: path.clone(),
+                            message: format!("converting input result: {e}"),
+                        })?;
+                    (surfaces, input_result)
                 }
                 other => {
                     return Err(ScriptError::Runtime {
                         path,
-                        message: format!("expected render result table, got {other:?}"),
+                        message: format!("expected script result table, got {other:?}"),
                     });
                 }
             };
-            Ok(DecorateOutcome { surfaces, duration })
+            Ok(DecorateOutcome {
+                surfaces,
+                input_result,
+                duration,
+            })
         }
 
         fn name(&self) -> &'static str {
@@ -529,6 +543,11 @@ mod lua_backend {
                 event_table.set("snapshot", event.snapshot)?;
                 event_table.set("payload", json_to_lua(lua, &event.payload)?)?;
                 t.set("event", event_table)?;
+            }
+            ScriptMessage::Input(input) => {
+                t.set("kind", "input")?;
+                let value = serde_json::to_value(input).map_err(mlua::Error::external)?;
+                t.set("input", json_to_lua(lua, &value)?)?;
             }
             ScriptMessage::Render(render) => {
                 t.set("kind", "render")?;
@@ -763,6 +782,36 @@ mod lua_backend {
             out.insert(pane_id, table_to_paint_commands(&commands)?);
         }
         Ok(out)
+    }
+
+    fn result_table_to_input_result(t: &Table) -> mlua::Result<Option<AttachInputResult>> {
+        let consumed = t.get::<Option<bool>>("consumed")?.unwrap_or(false);
+        let capture_pointer = t.get::<Option<bool>>("capture_pointer")?.unwrap_or(false);
+        let release_capture = t.get::<Option<bool>>("release_capture")?.unwrap_or(false);
+        let dirty = t.get::<Option<bool>>("dirty")?.unwrap_or(consumed);
+        let capture_keyboard = if let Some(keys) = t.get::<Option<Table>>("capture_keyboard")? {
+            keys.sequence_values::<String>()
+                .collect::<mlua::Result<Vec<_>>>()?
+        } else if t.get::<Option<bool>>("capture_keyboard")?.unwrap_or(false) {
+            vec!["up".to_string(), "down".to_string(), "esc".to_string()]
+        } else {
+            Vec::new()
+        };
+        if !consumed
+            && !capture_pointer
+            && !release_capture
+            && !dirty
+            && capture_keyboard.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(AttachInputResult {
+            consumed,
+            capture_pointer,
+            capture_keyboard,
+            release_capture,
+            dirty,
+        }))
     }
 
     fn table_to_paint_commands(t: &Table) -> mlua::Result<Vec<PaintCommand>> {

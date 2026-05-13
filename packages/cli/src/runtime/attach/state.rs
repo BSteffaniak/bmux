@@ -12,6 +12,7 @@ use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
+use bmux_plugin::AttachInputHook;
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
@@ -330,6 +331,8 @@ pub struct AttachMouseState {
     pub floating_drag: Option<AttachMouseFloatingDrag>,
     pub selection_drag: Option<AttachMouseSelectionDrag>,
     pub tab_drag: Option<AttachMouseTabDrag>,
+    pub input_capture: Option<AttachInputHookCapture>,
+    pub input_hook_last_dispatched_at: BTreeMap<String, Instant>,
 }
 
 impl Default for AttachMouseState {
@@ -346,8 +349,17 @@ impl Default for AttachMouseState {
             floating_drag: None,
             selection_drag: None,
             tab_drag: None,
+            input_capture: None,
+            input_hook_last_dispatched_at: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachInputHookCapture {
+    pub hook: AttachInputHook,
+    pub pointer: bool,
+    pub keyboard_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
