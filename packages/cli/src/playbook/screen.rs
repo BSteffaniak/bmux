@@ -533,6 +533,7 @@ impl ScreenInspector {
             ) {
                 let _ = stream.resize(cols.max(1), rows.max(1));
                 buffer.terminal_grid = stream;
+                buffer.visual_row_fingerprints.clear();
             }
             buffer.sync_update_in_progress = state.sync_update_active;
             buffer.expected_stream_start = state.expected_stream_start;

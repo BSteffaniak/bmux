@@ -1473,8 +1473,12 @@ pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
+    let previous_content_revision = buffer.terminal_grid.grid().content_revision();
     let outcome = buffer.protocol_tracker.process(bytes);
     buffer.terminal_grid.process(bytes);
+    if buffer.terminal_grid.grid().content_revision() != previous_content_revision {
+        buffer.visual_row_fingerprints.clear();
+    }
 
     if outcome.toggled_alternate {
         // Alternate-screen transitions can restore or replace rows without
@@ -1994,6 +1998,34 @@ struct AttachVisualSurfaceSnapshot<'a> {
     buffer: &'a PaneRenderBuffer,
 }
 
+impl AttachVisualSurfaceSnapshot<'_> {
+    fn compute_row_content_fingerprint(&self, row: u16) -> Option<u64> {
+        if row >= self.height() {
+            return None;
+        }
+        let row = self
+            .buffer
+            .terminal_grid
+            .grid()
+            .viewport_row_ref(usize::from(row))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.width().hash(&mut hasher);
+        row.wrapped().hash(&mut hasher);
+        for col in 0..usize::from(self.width()) {
+            if let Some(cell) = row.cells().get(col) {
+                cell.text().hash(&mut hasher);
+                cell.width().hash(&mut hasher);
+                cell.is_wide_continuation().hash(&mut hasher);
+            } else {
+                " ".hash(&mut hasher);
+                1_u8.hash(&mut hasher);
+                false.hash(&mut hasher);
+            }
+        }
+        Some(hasher.finish())
+    }
+}
+
 impl AttachVisualSurfaceView for AttachVisualSurfaceSnapshot<'_> {
     fn surface_id(&self) -> Uuid {
         self.surface_id
@@ -2024,29 +2056,13 @@ impl AttachVisualSurfaceView for AttachVisualSurfaceSnapshot<'_> {
     }
 
     fn row_content_fingerprint(&self, row: u16) -> Option<u64> {
-        if row >= self.height() {
-            return None;
-        }
-        let row = self
-            .buffer
-            .terminal_grid
-            .grid()
-            .viewport_row_ref(usize::from(row))?;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.width().hash(&mut hasher);
-        row.wrapped().hash(&mut hasher);
-        for col in 0..usize::from(self.width()) {
-            if let Some(cell) = row.cells().get(col) {
-                cell.text().hash(&mut hasher);
-                cell.width().hash(&mut hasher);
-                cell.is_wide_continuation().hash(&mut hasher);
-            } else {
-                " ".hash(&mut hasher);
-                1_u8.hash(&mut hasher);
-                false.hash(&mut hasher);
-            }
-        }
-        Some(hasher.finish())
+        self.buffer.visual_row_fingerprints.get_or_compute(
+            self.width(),
+            self.height(),
+            self.content_revision(),
+            row,
+            || self.compute_row_content_fingerprint(row),
+        )
     }
 
     fn width(&self) -> u16 {

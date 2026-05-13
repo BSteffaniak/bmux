@@ -451,6 +451,7 @@ impl AttachSimHarness {
             bmux_terminal_grid::GridLimits::default(),
         )
         .expect("attach-sim pane grid dimensions are valid");
+        buffer.visual_row_fingerprints.clear();
         let mut bytes = lines.join("\r\n").into_bytes();
         bytes.extend_from_slice(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
         append_sim_pane_output(buffer, &bytes);
@@ -697,8 +698,12 @@ impl AttachSimHarness {
 
 fn append_sim_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
     let was_alternate = buffer.protocol_tracker.alternate_screen();
+    let previous_content_revision = buffer.terminal_grid.grid().content_revision();
     let _ = buffer.protocol_tracker.process(bytes);
     buffer.terminal_grid.process(bytes);
+    if buffer.terminal_grid.grid().content_revision() != previous_content_revision {
+        buffer.visual_row_fingerprints.clear();
+    }
     if was_alternate != buffer.protocol_tracker.alternate_screen() {
         buffer.prev_rows.clear();
     }

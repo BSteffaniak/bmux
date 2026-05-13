@@ -165,6 +165,7 @@ impl AttachScenePipeline {
             let alternate_screen = stream.grid().mode() == GridMode::Alternate;
             let buffer = self.pane_buffers.entry(pane_snapshot.pane_id).or_default();
             buffer.terminal_grid = stream;
+            buffer.visual_row_fingerprints.clear();
             buffer.protocol_tracker.set_protocol_state(protocol);
             buffer
                 .protocol_tracker
@@ -351,6 +352,16 @@ impl AttachScenePipeline {
                 buffer
                     .terminal_grid
                     .apply_delta(batch, GridLimits::default())?;
+                let updated_rows = batch
+                    .row_updates
+                    .iter()
+                    .map(|update| update.row_index)
+                    .collect::<Vec<_>>();
+                buffer.visual_row_fingerprints.invalidate_rows(
+                    batch.reset_rows,
+                    batch.content_revision,
+                    &updated_rows,
+                );
                 applied = true;
             }
             if applied {

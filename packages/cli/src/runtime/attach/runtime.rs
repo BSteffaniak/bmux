@@ -7143,6 +7143,16 @@ async fn apply_attach_structured_grid_deltas(
                     needs_snapshot.push(delta_result.pane_id);
                     break;
                 }
+                let updated_rows = batch
+                    .row_updates
+                    .iter()
+                    .map(|update| update.row_index)
+                    .collect::<Vec<_>>();
+                buffer.visual_row_fingerprints.invalidate_rows(
+                    batch.reset_rows,
+                    batch.content_revision,
+                    &updated_rows,
+                );
                 pane_applied = true;
             }
             if pane_applied {
@@ -7236,6 +7246,7 @@ async fn hydrate_attach_structured_grid_snapshots(
         };
         let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
         buffer.terminal_grid = stream;
+        buffer.visual_row_fingerprints.clear();
         buffer.expected_stream_start = Some(snapshot.stream_end);
         buffer.scrollback_window = None;
         buffer.prev_rows.clear();
