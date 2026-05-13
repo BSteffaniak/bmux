@@ -6,6 +6,7 @@ local RALLY_MS = 2600
 local WIN_HOLD_MS = 3000
 local WIN_SCORE = 10
 local PADDLE_SIZE = 5
+local PADDLE_HIT_PADDING = 1.0
 local STEP_MS = 40
 local SPEEDUP_PER_HIT = 1.09
 local MAX_SPEED_MULT = 3.05
@@ -244,7 +245,7 @@ end
 local function paddle_contains(game, player, y)
     local max_top = math.max(0, game.h - game.paddle_len)
     local top = clamp(math.floor(player.center - game.paddle_len / 2 + 0.5), 0, max_top)
-    return y >= top - 0.25 and y <= top + game.paddle_len - 1 + 0.25
+    return y >= top - PADDLE_HIT_PADDING and y <= top + game.paddle_len - 1 + PADDLE_HIT_PADDING
 end
 
 local function bounce(game, player, side)
