@@ -64,6 +64,7 @@ struct DecorationRendererCache {
     visual_last_at: BTreeMap<String, Instant>,
     visual_last_revision: BTreeMap<String, u64>,
     visual_last_payload_hash: BTreeMap<String, u64>,
+    visual_adapter_cache: BTreeMap<String, Box<dyn std::any::Any + Send>>,
 }
 
 impl DecorationRendererCache {
@@ -113,6 +114,8 @@ impl DecorationRendererCache {
         self.visual_last_revision
             .retain(|key, _| !key.ends_with(&suffix));
         self.visual_last_payload_hash
+            .retain(|key, _| !key.ends_with(&suffix));
+        self.visual_adapter_cache
             .retain(|key, _| !key.ends_with(&suffix));
     }
 }
@@ -343,80 +346,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             .unwrap_or_default();
         let now = Instant::now();
         for request in requests {
-            let min_interval = Duration::from_millis(request.min_interval_ms());
-            if !min_interval.is_zero()
-                && cache
-                    .visual_last_at
-                    .get(&request.id)
-                    .is_some_and(|last| now.duration_since(*last) < min_interval)
-            {
-                continue;
-            }
-            let Some(adapter) = registered_visual_adapter(&request.adapter) else {
-                continue;
-            };
-            let mut projected = false;
-            for index in 0..frame.surface_count() {
-                let Some(surface) = frame.surface(index) else {
-                    continue;
-                };
-                if request.scope == "focused-pane" && !surface.focused() {
-                    continue;
-                }
-                let revision_key = format!("{}:{}", request.id, surface.surface_id());
-                let content_revision = surface.content_revision();
-                if request.dirty_only
-                    && cache
-                        .visual_last_revision
-                        .get(&revision_key)
-                        .is_some_and(|revision| *revision == content_revision)
-                {
-                    continue;
-                }
-                let mut scratch = Vec::new();
-                match adapter.project(surface, &request, &mut scratch) {
-                    Ok(output) if output.payload.len() <= request.max_bytes as usize => {
-                        projected = true;
-                        cache
-                            .visual_last_revision
-                            .insert(revision_key.clone(), content_revision);
-                        let payload_hash = hash_visual_payload(&output.payload);
-                        if cache
-                            .visual_last_payload_hash
-                            .get(&revision_key)
-                            .is_none_or(|hash| *hash != payload_hash)
-                        {
-                            cache
-                                .visual_last_payload_hash
-                                .insert(revision_key, payload_hash);
-                            updates.push(AttachVisualProjectionUpdate {
-                                request_id: request.id.clone(),
-                                event_kind: request.event_kind.clone(),
-                                payload: output.payload,
-                            });
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            request_id = %request.id,
-                            adapter = %request.adapter,
-                            max_bytes = request.max_bytes,
-                            "visual adapter output exceeded request limit",
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            request_id = %request.id,
-                            adapter = %request.adapter,
-                            %error,
-                            "visual adapter projection failed",
-                        );
-                    }
-                }
-            }
-            if projected {
-                cache.visual_last_at.insert(request.id.clone(), now);
-            }
+            observe_visual_request(&mut cache, frame, &request, now, updates);
         }
     }
 
@@ -456,10 +386,161 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
     }
 }
 
+fn observe_visual_request(
+    cache: &mut DecorationRendererCache,
+    frame: &dyn AttachVisualFrameView,
+    request: &AttachVisualAdapterRequest,
+    now: Instant,
+    updates: &mut Vec<AttachVisualProjectionUpdate>,
+) {
+    let min_interval = Duration::from_millis(request.min_interval_ms());
+    if !min_interval.is_zero()
+        && cache
+            .visual_last_at
+            .get(&request.id)
+            .is_some_and(|last| now.duration_since(*last) < min_interval)
+    {
+        return;
+    }
+    let Some(adapter) = registered_visual_adapter(&request.adapter) else {
+        return;
+    };
+    let mut projected = false;
+    for index in 0..frame.surface_count() {
+        let Some(surface) = frame.surface(index) else {
+            continue;
+        };
+        if request.scope == "focused-pane" && !surface.focused() {
+            continue;
+        }
+        projected |= observe_visual_surface(cache, surface, request, adapter.as_ref(), updates);
+    }
+    if projected {
+        cache.visual_last_at.insert(request.id.clone(), now);
+    }
+}
+
+fn observe_visual_surface(
+    cache: &mut DecorationRendererCache,
+    surface: &dyn bmux_plugin::AttachVisualSurfaceView,
+    request: &AttachVisualAdapterRequest,
+    adapter: &dyn bmux_plugin::AttachVisualAdapter,
+    updates: &mut Vec<AttachVisualProjectionUpdate>,
+) -> bool {
+    let revision_key = visual_projection_cache_key(request, surface.surface_id());
+    let content_revision = surface.content_revision();
+    if request.dirty_only
+        && cache
+            .visual_last_revision
+            .get(&revision_key)
+            .is_some_and(|revision| *revision == content_revision)
+    {
+        return false;
+    }
+    if !cache.visual_adapter_cache.contains_key(&revision_key)
+        && let Some(adapter_cache) = adapter.new_cache(request)
+    {
+        cache
+            .visual_adapter_cache
+            .insert(revision_key.clone(), adapter_cache);
+    }
+    let mut scratch = Vec::new();
+    let result = {
+        let adapter_cache = cache
+            .visual_adapter_cache
+            .get_mut(&revision_key)
+            .map(|adapter_cache| adapter_cache.as_mut() as &mut dyn std::any::Any);
+        adapter.project_cached(surface, request, adapter_cache, &mut scratch)
+    };
+    handle_visual_projection_result(
+        cache,
+        request,
+        revision_key,
+        content_revision,
+        result,
+        updates,
+    )
+}
+
+fn handle_visual_projection_result(
+    cache: &mut DecorationRendererCache,
+    request: &AttachVisualAdapterRequest,
+    revision_key: String,
+    content_revision: u64,
+    result: Result<bmux_plugin::AttachVisualAdapterOutput, String>,
+    updates: &mut Vec<AttachVisualProjectionUpdate>,
+) -> bool {
+    match result {
+        Ok(output) if output.payload.len() <= request.max_bytes as usize => {
+            cache
+                .visual_last_revision
+                .insert(revision_key.clone(), content_revision);
+            maybe_push_visual_projection_update(cache, request, revision_key, output, updates);
+            true
+        }
+        Ok(_) => {
+            tracing::warn!(
+                request_id = %request.id,
+                adapter = %request.adapter,
+                max_bytes = request.max_bytes,
+                "visual adapter output exceeded request limit",
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                request_id = %request.id,
+                adapter = %request.adapter,
+                %error,
+                "visual adapter projection failed",
+            );
+            false
+        }
+    }
+}
+
+fn maybe_push_visual_projection_update(
+    cache: &mut DecorationRendererCache,
+    request: &AttachVisualAdapterRequest,
+    revision_key: String,
+    output: bmux_plugin::AttachVisualAdapterOutput,
+    updates: &mut Vec<AttachVisualProjectionUpdate>,
+) {
+    let payload_hash = hash_visual_payload(&output.payload);
+    if cache
+        .visual_last_payload_hash
+        .get(&revision_key)
+        .is_some_and(|hash| *hash == payload_hash)
+    {
+        return;
+    }
+    cache
+        .visual_last_payload_hash
+        .insert(revision_key, payload_hash);
+    updates.push(AttachVisualProjectionUpdate {
+        request_id: request.id.clone(),
+        event_kind: request.event_kind.clone(),
+        payload: output.payload,
+    });
+}
+
 fn hash_visual_payload(payload: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     payload.hash(&mut hasher);
     hasher.finish()
+}
+
+fn visual_projection_cache_key(request: &AttachVisualAdapterRequest, surface_id: Uuid) -> String {
+    let mut settings_hash = std::collections::hash_map::DefaultHasher::new();
+    request.area.hash(&mut settings_hash);
+    request.settings.hash(&mut settings_hash);
+    format!(
+        "{}:{}:{}:{}",
+        request.id,
+        request.adapter,
+        settings_hash.finish(),
+        surface_id
+    )
 }
 
 fn scene_visual_adapter_request_to_attach(
@@ -1234,6 +1315,7 @@ mod tests {
             visual_last_at: BTreeMap::new(),
             visual_last_revision: BTreeMap::new(),
             visual_last_payload_hash: BTreeMap::new(),
+            visual_adapter_cache: BTreeMap::new(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),

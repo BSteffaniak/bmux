@@ -28,6 +28,7 @@
 //! data (e.g. a scene-protocol snapshot) changes less often than
 //! layout refreshes.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -238,6 +239,15 @@ pub struct AttachVisualAdapterOutput {
 pub trait AttachVisualAdapter: Send + Sync {
     fn id(&self) -> &str;
 
+    /// Create optional adapter-owned cache state for one request/surface pair.
+    ///
+    /// The host stores this value opaquely and passes it back to
+    /// [`Self::project_cached`]. Adapters that do not need state can rely on
+    /// the default `None`.
+    fn new_cache(&self, _request: &AttachVisualAdapterRequest) -> Option<Box<dyn Any + Send>> {
+        None
+    }
+
     /// Project a borrowed visual surface into an adapter-owned compact payload.
     ///
     /// # Errors
@@ -250,6 +260,23 @@ pub trait AttachVisualAdapter: Send + Sync {
         request: &AttachVisualAdapterRequest,
         out: &mut Vec<u8>,
     ) -> Result<AttachVisualAdapterOutput, String>;
+
+    /// Project with optional adapter-owned cache state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the adapter cannot encode the requested
+    /// payload. The default implementation preserves compatibility by calling
+    /// [`Self::project`].
+    fn project_cached(
+        &self,
+        surface: &dyn AttachVisualSurfaceView,
+        request: &AttachVisualAdapterRequest,
+        _cache: Option<&mut dyn Any>,
+        out: &mut Vec<u8>,
+    ) -> Result<AttachVisualAdapterOutput, String> {
+        self.project(surface, request, out)
+    }
 }
 
 /// Return the Unicode display-cell width of `text`, saturated to `u16::MAX`.
