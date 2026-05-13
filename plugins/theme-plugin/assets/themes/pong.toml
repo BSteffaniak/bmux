@@ -80,6 +80,12 @@ max     = 15000
 min     = 500
 type    = "integer"
 
+[[settings.forms.pong.fields]]
+default = false
+key     = "content_bounce"
+label   = "Bounce off terminal content"
+type    = "bool"
+
 [plugins."bmux.decoration".components."pong.ball"]
 below           = ["pane.content"]
 entrypoint      = "ball"

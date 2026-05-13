@@ -656,7 +656,8 @@ async fn configure_theme_settings_provider(
     settings: &ThemePluginSettings,
     all_plugin_ids: &[String],
 ) {
-    let defaults = effective_theme_settings_payload(context, provider_id, provider, settings);
+    let defaults =
+        effective_theme_settings_payload(context, theme, provider_id, provider, settings);
     let request = if let Some(form_endpoint) = provider.form.as_ref() {
         match call_theme_settings_service::<_, bmux_plugin_sdk::PromptRequest>(
             context,
@@ -739,7 +740,7 @@ fn apply_configured_theme_settings(
     settings: &ThemePluginSettings,
 ) {
     for (provider_id, provider) in &theme.settings.providers {
-        let payload = effective_theme_settings_payload(context, provider_id, provider, settings);
+        let payload = effective_theme_settings_overrides(context, provider_id, provider, settings);
         if payload.json.is_empty() {
             continue;
         }
@@ -775,6 +776,22 @@ fn apply_theme_settings_provider_payload(
 
 fn effective_theme_settings_payload(
     context: &impl ServiceCaller,
+    theme: &ResolvedTheme,
+    provider_id: &str,
+    provider: &ThemeSettingsProviderSpec,
+    settings: &ThemePluginSettings,
+) -> ThemeSettingsPayload {
+    let base = if theme.settings.component_settings.contains_key(provider_id) {
+        component_theme_settings_defaults(theme, provider_id)
+    } else {
+        ThemeSettingsPayload { json: Vec::new() }
+    };
+    let overlay = effective_theme_settings_overrides(context, provider_id, provider, settings);
+    merge_theme_settings_payloads(&base, &overlay)
+}
+
+fn effective_theme_settings_overrides(
+    context: &impl ServiceCaller,
     provider_id: &str,
     provider: &ThemeSettingsProviderSpec,
     settings: &ThemePluginSettings,
@@ -789,6 +806,63 @@ fn effective_theme_settings_payload(
         return payload;
     }
     ThemeSettingsPayload { json: Vec::new() }
+}
+
+fn merge_theme_settings_payloads(
+    base: &ThemeSettingsPayload,
+    overlay: &ThemeSettingsPayload,
+) -> ThemeSettingsPayload {
+    let base_value = payload_to_json_value(base);
+    let overlay_value = payload_to_json_value(overlay);
+    let merged = match (base_value, overlay_value) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                base.insert(key, value);
+            }
+            serde_json::Value::Object(base)
+        }
+        (_, serde_json::Value::Object(overlay)) if overlay.is_empty() => {
+            payload_to_json_value(base)
+        }
+        (_, overlay) => overlay,
+    };
+    ThemeSettingsPayload::from_value(&merged).unwrap_or(ThemeSettingsPayload { json: Vec::new() })
+}
+
+fn component_theme_settings_defaults(
+    theme: &ResolvedTheme,
+    provider_id: &str,
+) -> ThemeSettingsPayload {
+    let mut defaults = serde_json::Map::new();
+    let Some(spec) = theme.settings.component_settings.get(provider_id) else {
+        return ThemeSettingsPayload { json: Vec::new() };
+    };
+    let Some(components) = theme
+        .plugins
+        .get("bmux.decoration")
+        .and_then(toml::Value::as_table)
+        .and_then(|extension| extension.get("components"))
+        .and_then(toml::Value::as_table)
+    else {
+        return ThemeSettingsPayload { json: Vec::new() };
+    };
+    for component_id in &spec.components {
+        let Some(settings) = components
+            .get(component_id)
+            .and_then(toml::Value::as_table)
+            .and_then(|component| component.get("settings"))
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        for (key, value) in settings {
+            defaults
+                .entry(key.clone())
+                .or_insert_with(|| toml_to_json_value(value));
+        }
+    }
+    ThemeSettingsPayload::from_value(&serde_json::Value::Object(defaults))
+        .unwrap_or(ThemeSettingsPayload { json: Vec::new() })
 }
 
 fn read_persisted_theme_settings(
@@ -852,7 +926,7 @@ fn builtin_theme_settings_form_field(
         ThemeSettingsFormFieldType::Bool => bmux_plugin_sdk::PromptFormFieldKind::Bool {
             default: default
                 .as_ref()
-                .and_then(toml::Value::as_bool)
+                .and_then(toml_value_as_bool)
                 .unwrap_or(false),
         },
         ThemeSettingsFormFieldType::Text => bmux_plugin_sdk::PromptFormFieldKind::Text {
@@ -892,6 +966,37 @@ fn json_to_toml_value(value: &serde_json::Value) -> toml::Value {
         ),
         serde_json::Value::String(value) => toml::Value::String(value.clone()),
         other => toml::Value::String(other.to_string()),
+    }
+}
+
+fn toml_to_json_value(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::Boolean(value) => serde_json::Value::Bool(*value),
+        toml::Value::Integer(value) => serde_json::Value::Number((*value).into()),
+        toml::Value::Float(value) => serde_json::Number::from_f64(*value).map_or_else(
+            || serde_json::Value::String(value.to_string()),
+            serde_json::Value::Number,
+        ),
+        toml::Value::String(value) => serde_json::Value::String(value.clone()),
+        toml::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(toml_to_json_value).collect())
+        }
+        toml::Value::Table(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_to_json_value(value)))
+                .collect(),
+        ),
+        toml::Value::Datetime(value) => serde_json::Value::String(value.to_string()),
+    }
+}
+
+fn toml_value_as_bool(value: &toml::Value) -> Option<bool> {
+    match value {
+        toml::Value::Boolean(value) => Some(*value),
+        toml::Value::String(value) if value.eq_ignore_ascii_case("true") => Some(true),
+        toml::Value::String(value) if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
     }
 }
 
@@ -2057,6 +2162,90 @@ mod tests {
                 .and_then(|values| values.first())
                 .and_then(toml::Value::as_str),
             Some("performance.header")
+        );
+    }
+
+    #[test]
+    fn builtin_component_settings_form_defaults_follow_declared_component_settings() {
+        let theme: ThemeConfig = toml::from_str(
+            r#"
+            [settings.providers.pong]
+            storage_key = "theme_settings.pong"
+
+            [settings.component_settings.pong]
+            components = ["pong.ball", "pong.paddles"]
+
+            [[settings.forms.pong.fields]]
+            default = false
+            key = "content_bounce"
+            label = "Bounce off terminal content"
+            type = "bool"
+
+            [plugins."bmux.decoration".components."pong.ball".settings]
+            content_bounce = "true"
+
+            [plugins."bmux.decoration".components."pong.paddles".settings]
+            content_bounce = "true"
+            "#,
+        )
+        .expect("theme parses");
+        let catalog = vec![ThemeCatalogEntry {
+            name: "pong".to_string(),
+            theme,
+        }];
+        let resolved =
+            resolve_theme_stack(&catalog, &["pong".to_string()]).expect("theme resolves");
+        let provider = resolved
+            .settings
+            .providers
+            .get("pong")
+            .expect("provider exists");
+        let context = lifecycle_context(None);
+        let defaults = effective_theme_settings_payload(
+            &context,
+            &resolved,
+            "pong",
+            provider,
+            &ThemePluginSettings::default(),
+        );
+        let form = resolved.settings.forms.get("pong").expect("form exists");
+        let request = build_builtin_theme_settings_form("pong", form, &defaults);
+        let bmux_plugin_sdk::PromptField::Form { sections, .. } = request.field else {
+            panic!("settings prompt should be a form");
+        };
+        let field = sections
+            .first()
+            .and_then(|section| section.fields.first())
+            .expect("form field exists");
+        assert_eq!(field.id, "content_bounce");
+        assert_eq!(
+            field.kind,
+            bmux_plugin_sdk::PromptFormFieldKind::Bool { default: true }
+        );
+
+        let settings = ThemePluginSettings {
+            theme_settings: BTreeMap::from([(
+                "pong".to_string(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "content_bounce".to_string(),
+                    toml::Value::Boolean(false),
+                )])),
+            )]),
+            ..ThemePluginSettings::default()
+        };
+        let defaults =
+            effective_theme_settings_payload(&context, &resolved, "pong", provider, &settings);
+        let request = build_builtin_theme_settings_form("pong", form, &defaults);
+        let bmux_plugin_sdk::PromptField::Form { sections, .. } = request.field else {
+            panic!("settings prompt should be a form");
+        };
+        let field = sections
+            .first()
+            .and_then(|section| section.fields.first())
+            .expect("form field exists");
+        assert_eq!(
+            field.kind,
+            bmux_plugin_sdk::PromptFormFieldKind::Bool { default: false }
         );
     }
 
