@@ -2018,6 +2018,10 @@ impl AttachVisualSurfaceView for AttachVisualSurfaceSnapshot<'_> {
         self.buffer.terminal_grid.grid().revision()
     }
 
+    fn content_revision(&self) -> u64 {
+        self.buffer.terminal_grid.grid().content_revision()
+    }
+
     fn width(&self) -> u16 {
         self.content_rect.w
     }

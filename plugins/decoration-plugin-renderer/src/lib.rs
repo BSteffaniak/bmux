@@ -31,6 +31,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -62,6 +63,7 @@ struct DecorationRendererCache {
     scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
     visual_last_at: BTreeMap<String, Instant>,
     visual_last_revision: BTreeMap<String, u64>,
+    visual_last_payload_hash: BTreeMap<String, u64>,
 }
 
 impl DecorationRendererCache {
@@ -107,6 +109,11 @@ impl DecorationRendererCache {
     fn forget_surface(&mut self, surface_id: &Uuid) {
         self.rendered_surfaces.remove(surface_id);
         self.surfaces.remove(surface_id);
+        let suffix = format!(":{surface_id}");
+        self.visual_last_revision
+            .retain(|key, _| !key.ends_with(&suffix));
+        self.visual_last_payload_hash
+            .retain(|key, _| !key.ends_with(&suffix));
     }
 }
 
@@ -348,7 +355,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             let Some(adapter) = registered_visual_adapter(&request.adapter) else {
                 continue;
             };
-            let mut delivered = false;
+            let mut projected = false;
             for index in 0..frame.surface_count() {
                 let Some(surface) = frame.surface(index) else {
                     continue;
@@ -357,26 +364,37 @@ impl AttachRenderExtension for DecorationRenderExtension {
                     continue;
                 }
                 let revision_key = format!("{}:{}", request.id, surface.surface_id());
+                let content_revision = surface.content_revision();
                 if request.dirty_only
                     && cache
                         .visual_last_revision
                         .get(&revision_key)
-                        .is_some_and(|revision| *revision == surface.grid_revision())
+                        .is_some_and(|revision| *revision == content_revision)
                 {
                     continue;
                 }
                 let mut scratch = Vec::new();
                 match adapter.project(surface, &request, &mut scratch) {
                     Ok(output) if output.payload.len() <= request.max_bytes as usize => {
+                        projected = true;
                         cache
                             .visual_last_revision
-                            .insert(revision_key, surface.grid_revision());
-                        updates.push(AttachVisualProjectionUpdate {
-                            request_id: request.id.clone(),
-                            event_kind: request.event_kind.clone(),
-                            payload: output.payload,
-                        });
-                        delivered = true;
+                            .insert(revision_key.clone(), content_revision);
+                        let payload_hash = hash_visual_payload(&output.payload);
+                        if cache
+                            .visual_last_payload_hash
+                            .get(&revision_key)
+                            .is_none_or(|hash| *hash != payload_hash)
+                        {
+                            cache
+                                .visual_last_payload_hash
+                                .insert(revision_key, payload_hash);
+                            updates.push(AttachVisualProjectionUpdate {
+                                request_id: request.id.clone(),
+                                event_kind: request.event_kind.clone(),
+                                payload: output.payload,
+                            });
+                        }
                     }
                     Ok(_) => {
                         tracing::warn!(
@@ -396,7 +414,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
                     }
                 }
             }
-            if delivered {
+            if projected {
                 cache.visual_last_at.insert(request.id.clone(), now);
             }
         }
@@ -436,6 +454,12 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
         w: rect.w,
         h: rect.h,
     }
+}
+
+fn hash_visual_payload(payload: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn scene_visual_adapter_request_to_attach(
@@ -1035,6 +1059,130 @@ pub fn push_scene(scene: DecorationScene) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_VISUAL_ADAPTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestVisualAdapter;
+
+    impl bmux_plugin::AttachVisualAdapter for TestVisualAdapter {
+        fn id(&self) -> &'static str {
+            "test.visual.constant-output"
+        }
+
+        fn project(
+            &self,
+            _surface: &dyn bmux_plugin::AttachVisualSurfaceView,
+            _request: &AttachVisualAdapterRequest,
+            out: &mut Vec<u8>,
+        ) -> Result<bmux_plugin::AttachVisualAdapterOutput, String> {
+            TEST_VISUAL_ADAPTER_CALLS.fetch_add(1, Ordering::SeqCst);
+            out.extend_from_slice(b"same-payload");
+            Ok(bmux_plugin::AttachVisualAdapterOutput {
+                encoding: "test".to_string(),
+                payload: std::mem::take(out),
+            })
+        }
+    }
+
+    struct TestVisualFrame {
+        surface: TestVisualSurface,
+    }
+
+    impl bmux_plugin::AttachVisualFrameView for TestVisualFrame {
+        fn surface_count(&self) -> usize {
+            1
+        }
+
+        fn surface(&self, index: usize) -> Option<&dyn bmux_plugin::AttachVisualSurfaceView> {
+            (index == 0).then_some(&self.surface as &dyn bmux_plugin::AttachVisualSurfaceView)
+        }
+    }
+
+    struct TestVisualSurface {
+        surface_id: Uuid,
+        content_revision: u64,
+    }
+
+    impl bmux_plugin::AttachVisualSurfaceView for TestVisualSurface {
+        fn surface_id(&self) -> Uuid {
+            self.surface_id
+        }
+
+        fn pane_id(&self) -> Uuid {
+            Uuid::from_u128(42)
+        }
+
+        fn rect(&self) -> ExtensionRect {
+            ExtensionRect::new(0, 0, 2, 1)
+        }
+
+        fn content_rect(&self) -> ExtensionRect {
+            ExtensionRect::new(0, 0, 2, 1)
+        }
+
+        fn focused(&self) -> bool {
+            true
+        }
+
+        fn grid_revision(&self) -> u64 {
+            self.content_revision.saturating_add(100)
+        }
+
+        fn content_revision(&self) -> u64 {
+            self.content_revision
+        }
+
+        fn width(&self) -> u16 {
+            2
+        }
+
+        fn height(&self) -> u16 {
+            1
+        }
+
+        fn cell(&self, _x: u16, _y: u16) -> Option<bmux_plugin::AttachVisualCellRef<'_>> {
+            None
+        }
+    }
+
+    fn install_test_visual_adapter() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| bmux_plugin::register_visual_adapter(Arc::new(TestVisualAdapter)));
+        TEST_VISUAL_ADAPTER_CALLS.store(0, Ordering::SeqCst);
+    }
+
+    fn visual_request() -> VisualAdapterRequest {
+        VisualAdapterRequest {
+            id: "test.request".to_string(),
+            adapter: "test.visual.constant-output".to_string(),
+            owner_plugin_id: "test.owner".to_string(),
+            event_kind: "test.visual".to_string(),
+            scope: "focused-pane".to_string(),
+            area: "content".to_string(),
+            max_hz: 0,
+            dirty_only: true,
+            max_bytes: 1024,
+            settings: BTreeMap::new(),
+        }
+    }
+
+    fn extension_with_visual_request() -> DecorationRenderExtension {
+        let scene = DecorationScene {
+            revision: 1,
+            surfaces: BTreeMap::new(),
+            animation: None,
+            input_hooks: Vec::new(),
+            visual_adapters: vec![visual_request()],
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(Arc::new(scene));
+        let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
+        cache.lock().expect("cache lock").set_scene_receiver(rx);
+        DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache,
+        }
+    }
 
     fn scene_style() -> SceneStyle {
         SceneStyle {
@@ -1085,12 +1233,57 @@ mod tests {
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
             visual_last_revision: BTreeMap::new(),
+            visual_last_payload_hash: BTreeMap::new(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
             cache: cache.clone(),
         };
         (extension, cache)
+    }
+
+    #[test]
+    fn visual_adapter_dirty_only_uses_content_revision_and_suppresses_unchanged_payload() {
+        install_test_visual_adapter();
+        let extension = extension_with_visual_request();
+        let surface_id = Uuid::from_u128(7);
+        let mut updates = Vec::new();
+
+        extension.observe_visual_frame(
+            &TestVisualFrame {
+                surface: TestVisualSurface {
+                    surface_id,
+                    content_revision: 1,
+                },
+            },
+            &mut updates,
+        );
+        assert_eq!(TEST_VISUAL_ADAPTER_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(updates.len(), 1);
+
+        extension.observe_visual_frame(
+            &TestVisualFrame {
+                surface: TestVisualSurface {
+                    surface_id,
+                    content_revision: 1,
+                },
+            },
+            &mut updates,
+        );
+        assert_eq!(TEST_VISUAL_ADAPTER_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(updates.len(), 1);
+
+        extension.observe_visual_frame(
+            &TestVisualFrame {
+                surface: TestVisualSurface {
+                    surface_id,
+                    content_revision: 2,
+                },
+            },
+            &mut updates,
+        );
+        assert_eq!(TEST_VISUAL_ADAPTER_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(updates.len(), 1);
     }
 
     #[test]

@@ -216,6 +216,9 @@ pub trait AttachVisualSurfaceView {
     fn content_rect(&self) -> ExtensionRect;
     fn focused(&self) -> bool;
     fn grid_revision(&self) -> u64;
+    fn content_revision(&self) -> u64 {
+        self.grid_revision()
+    }
     fn width(&self) -> u16;
     fn height(&self) -> u16;
     fn cell(&self, x: u16, y: u16) -> Option<AttachVisualCellRef<'_>>;

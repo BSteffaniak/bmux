@@ -287,6 +287,7 @@ pub struct TerminalGrid {
     current_style: Style,
     palette: StylePalette,
     revision: u64,
+    content_revision: u64,
     total_scrolled_rows: u64,
     autowrap: bool,
     pending_wrap: bool,
@@ -380,6 +381,7 @@ impl TerminalGrid {
             current_style: Style::default(),
             palette: StylePalette::default(),
             revision: 0,
+            content_revision: 0,
             total_scrolled_rows: 0,
             autowrap: true,
             pending_wrap: false,
@@ -469,6 +471,7 @@ impl TerminalGrid {
             current_style: snapshot.current_style,
             palette,
             revision: snapshot.revision,
+            content_revision: snapshot.content_revision,
             total_scrolled_rows: u64::from(snapshot.scrollback_rows),
             autowrap: snapshot.autowrap,
             pending_wrap: snapshot.pending_wrap,
@@ -529,6 +532,11 @@ impl TerminalGrid {
     }
 
     #[must_use]
+    pub const fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    #[must_use]
     pub fn palette(&self) -> &StylePalette {
         &self.palette
     }
@@ -576,7 +584,7 @@ impl TerminalGrid {
         }
         self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
-        self.bump_revision();
+        self.bump_content_revision();
         Ok(())
     }
 
@@ -594,7 +602,7 @@ impl TerminalGrid {
         if mode == GridMode::Alternate {
             self.alt_rows = vec![PhysicalRow::new(); self.height];
         }
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn set_cursor_visible(&mut self, visible: bool) {
@@ -709,6 +717,7 @@ impl TerminalGrid {
 
     pub(crate) fn linefeed(&mut self) {
         self.pending_wrap = false;
+        let mut content_changed = false;
         let (top, bottom) = self.effective_scroll_region();
         if self.cursor.row == bottom {
             if self.mode == GridMode::Main && top == 0 && bottom + 1 == self.height {
@@ -716,28 +725,39 @@ impl TerminalGrid {
             } else {
                 self.scroll_region_up(top, bottom, 1);
             }
+            content_changed = true;
         } else if self.cursor.row < self.height.saturating_sub(1) {
             self.cursor.row += 1;
         }
-        self.bump_revision();
+        if content_changed {
+            self.bump_content_revision();
+        } else {
+            self.bump_revision();
+        }
     }
 
     pub(crate) fn reverse_index(&mut self) {
         self.pending_wrap = false;
+        let mut content_changed = false;
         let (top, bottom) = self.effective_scroll_region();
         if self.cursor.row == top {
             self.scroll_region_down(top, bottom, 1);
+            content_changed = true;
         } else {
             self.cursor.row = self.cursor.row.saturating_sub(1);
         }
-        self.bump_revision();
+        if content_changed {
+            self.bump_content_revision();
+        } else {
+            self.bump_revision();
+        }
     }
 
     pub(crate) fn print_char(&mut self, ch: char) {
         let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
         if char_width == 0 {
             self.append_combining(ch);
-            self.bump_revision();
+            self.bump_content_revision();
             return;
         }
         let char_width = char_width.min(2);
@@ -770,7 +790,7 @@ impl TerminalGrid {
             self.cursor.col = col + char_width;
             self.pending_wrap = false;
         }
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn erase_display(&mut self, mode: usize) {
@@ -799,7 +819,7 @@ impl TerminalGrid {
             }
             _ => {}
         }
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn erase_line(&mut self, mode: usize) {
@@ -814,7 +834,7 @@ impl TerminalGrid {
             2 => self.active_row_mut(row).clear_range(0, width),
             _ => {}
         }
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn erase_chars(&mut self, count: usize) {
@@ -822,7 +842,7 @@ impl TerminalGrid {
         let end = start.saturating_add(count.max(1)).min(self.width);
         let row = self.cursor_absolute_row();
         self.active_row_mut(row).clear_range(start, end);
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn insert_blank_chars(&mut self, count: usize) {
@@ -839,7 +859,7 @@ impl TerminalGrid {
             };
         }
         self.replace_active_row(row, cells);
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn delete_chars(&mut self, count: usize) {
@@ -856,7 +876,7 @@ impl TerminalGrid {
             };
         }
         self.replace_active_row(row, cells);
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn insert_blank_lines(&mut self, count: usize) {
@@ -865,7 +885,7 @@ impl TerminalGrid {
             return;
         }
         self.scroll_region_down(self.cursor.row, bottom, count.max(1));
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn delete_lines(&mut self, count: usize) {
@@ -874,7 +894,7 @@ impl TerminalGrid {
             return;
         }
         self.scroll_region_up(self.cursor.row, bottom, count.max(1));
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     pub(crate) fn set_graphic_rendition(&mut self, params: &[i64]) {
@@ -1064,6 +1084,11 @@ impl TerminalGrid {
 
     pub(crate) fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
+    }
+
+    pub(crate) fn bump_content_revision(&mut self) {
+        self.content_revision = self.content_revision.saturating_add(1);
+        self.bump_revision();
     }
 
     const fn cursor_absolute_row(&self) -> usize {
@@ -1588,6 +1613,31 @@ fn parse_extended_color(params: &[i64]) -> Option<(Color, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_revision_ignores_cursor_only_changes() {
+        let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
+        let initial_revision = grid.revision();
+        let initial_content_revision = grid.content_revision();
+
+        grid.process(b"\x1b[2;4H");
+
+        assert!(grid.revision() > initial_revision);
+        assert_eq!(grid.content_revision(), initial_content_revision);
+    }
+
+    #[test]
+    fn content_revision_tracks_visible_content_changes() {
+        let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
+        let initial_content_revision = grid.content_revision();
+
+        grid.process(b"x");
+        let printed_content_revision = grid.content_revision();
+        assert!(printed_content_revision > initial_content_revision);
+
+        grid.process(b"\x1b[K");
+        assert!(grid.content_revision() > printed_content_revision);
+    }
 
     #[test]
     fn plain_text_soft_wraps_and_reflows() {

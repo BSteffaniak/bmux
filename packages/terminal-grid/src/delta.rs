@@ -23,6 +23,8 @@ pub struct GridDeltaBatch {
     pub base_revision: u64,
     /// Revision after applying this delta.
     pub revision: u64,
+    #[serde(default)]
+    pub content_revision: u64,
     pub width: u16,
     pub height: u16,
     pub mode: String,
@@ -89,6 +91,7 @@ impl GridDeltaBatch {
         Some(Self {
             base_revision: before.revision,
             revision: after.revision,
+            content_revision: after.content_revision,
             width: after.width,
             height: after.height,
             mode: after.mode.clone(),
@@ -140,6 +143,7 @@ impl GridDeltaBatch {
             }
         }
         snapshot.revision = self.revision;
+        snapshot.content_revision = self.content_revision;
         snapshot.width = self.width;
         snapshot.height = self.height;
         snapshot.mode.clone_from(&self.mode);

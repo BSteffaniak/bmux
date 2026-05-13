@@ -31,6 +31,8 @@ pub struct ScrollRegionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridSnapshot {
     pub revision: u64,
+    #[serde(default)]
+    pub content_revision: u64,
     pub width: u16,
     pub height: u16,
     pub mode: String,
@@ -73,6 +75,7 @@ impl GridSnapshot {
         let cursor = cursor_snapshot(grid.cursor());
         Self {
             revision: grid.revision(),
+            content_revision: grid.content_revision(),
             width: u16::try_from(grid.width()).unwrap_or(u16::MAX),
             height: u16::try_from(grid.height()).unwrap_or(u16::MAX),
             mode: match grid.mode() {

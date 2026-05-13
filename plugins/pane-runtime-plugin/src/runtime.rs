@@ -6127,6 +6127,7 @@ mod tests {
         GridDeltaBatch {
             base_revision,
             revision,
+            content_revision: revision,
             width: 10,
             height: 2,
             mode: "main".to_string(),
