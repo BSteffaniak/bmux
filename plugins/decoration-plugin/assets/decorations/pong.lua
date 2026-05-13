@@ -136,6 +136,8 @@ local function new_game(seed, w, h, rally_ms)
         win = false,
         winner = nil,
         win_started_ms = nil,
+        visual_inside = nil,
+        visual_revision = nil,
         left = new_player(seed, "left"),
         right = new_player(seed, "right"),
     }
@@ -166,6 +168,8 @@ local function serve(game, scorer)
     game.speed_mult = 1.0
     game.x = (game.w - 1) / 2
     game.y = rand_range(game.seed, game.rally, 10, 0, math.max(0, game.h - 1))
+    game.visual_inside = nil
+    game.visual_revision = nil
     local dir = serve_direction(game, scorer)
     game.vx = game.base_vx * dir
     game.vy = rand_range(game.seed, game.rally, 12, -0.0062, 0.0062)
@@ -282,9 +286,26 @@ local function bounce_off_visual_content(game)
     end
     local x = clamp(math.floor(game.x + 0.5), 0, game.w - 1)
     local y = clamp(math.floor(game.y + 0.5), 0, game.h - 1)
-    if not visual_bitset_occupied(game.visual, x, y) then
+    local occupied = visual_bitset_occupied(game.visual, x, y)
+    local revision = game.visual.grid_revision
+
+    -- Content collisions are boundary crossings, not solid-volume physics.
+    -- If the ball starts inside content, or content appears over it, let it
+    -- pass through until it exits. Only an outside -> occupied transition
+    -- reflects the ball.
+    if game.visual_inside == nil or game.visual_revision ~= revision then
+        game.visual_inside = occupied
+        game.visual_revision = revision
         return
     end
+    if not occupied then
+        game.visual_inside = false
+        return
+    end
+    if game.visual_inside then
+        return
+    end
+
     local prev_x = clamp(math.floor((game.x - game.vx * STEP_MS) + 0.5), 0, game.w - 1)
     local prev_y = clamp(math.floor((game.y - game.vy * STEP_MS) + 0.5), 0, game.h - 1)
     local hit_x = visual_bitset_occupied(game.visual, x, prev_y)
@@ -302,6 +323,10 @@ local function bounce_off_visual_content(game)
         game.y = game.y + game.vy * STEP_MS * 0.35
     end
     game.vy = clamp(game.vy + rand_range(game.seed, game.rally + game.hits, 961, -0.001, 0.001), -math.abs(game.vx) * 1.1, math.abs(game.vx) * 1.1)
+
+    local next_x = clamp(math.floor(game.x + 0.5), 0, game.w - 1)
+    local next_y = clamp(math.floor(game.y + 0.5), 0, game.h - 1)
+    game.visual_inside = visual_bitset_occupied(game.visual, next_x, next_y)
 end
 
 local function paddle_contains(game, player, y)
