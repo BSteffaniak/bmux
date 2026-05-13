@@ -220,6 +220,18 @@ pub trait AttachVisualSurfaceView {
     fn content_revision(&self) -> u64 {
         self.grid_revision()
     }
+
+    /// Return a cheap row-level content fingerprint when available.
+    ///
+    /// Fingerprints are scoped to the current surface dimensions and should
+    /// change whenever text/wide-cell occupancy in that row changes. Adapters
+    /// can use this as an optional fast path to reuse cached per-row work
+    /// without pulling full grids through IPC. The default keeps the API
+    /// ergonomic for surfaces that only expose cells.
+    fn row_content_fingerprint(&self, _row: u16) -> Option<u64> {
+        None
+    }
+
     fn width(&self) -> u16;
     fn height(&self) -> u16;
     fn cell(&self, x: u16, y: u16) -> Option<AttachVisualCellRef<'_>>;
@@ -234,6 +246,12 @@ pub trait AttachVisualFrameView {
 pub struct AttachVisualAdapterOutput {
     pub encoding: String,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachVisualProjectionResult {
+    Unchanged,
+    Updated(AttachVisualAdapterOutput),
 }
 
 pub trait AttachVisualAdapter: Send + Sync {
@@ -276,6 +294,25 @@ pub trait AttachVisualAdapter: Send + Sync {
         out: &mut Vec<u8>,
     ) -> Result<AttachVisualAdapterOutput, String> {
         self.project(surface, request, out)
+    }
+
+    /// Project with optional cache state and allow adapters to report that the
+    /// compact semantic projection did not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the adapter cannot encode the requested
+    /// payload. The default preserves existing adapter ergonomics by wrapping
+    /// [`Self::project_cached`] in an updated result.
+    fn project_incremental_cached(
+        &self,
+        surface: &dyn AttachVisualSurfaceView,
+        request: &AttachVisualAdapterRequest,
+        cache: Option<&mut dyn Any>,
+        out: &mut Vec<u8>,
+    ) -> Result<AttachVisualProjectionResult, String> {
+        self.project_cached(surface, request, cache, out)
+            .map(AttachVisualProjectionResult::Updated)
     }
 }
 

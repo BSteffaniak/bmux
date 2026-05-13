@@ -23,6 +23,7 @@ use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::io;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -2020,6 +2021,32 @@ impl AttachVisualSurfaceView for AttachVisualSurfaceSnapshot<'_> {
 
     fn content_revision(&self) -> u64 {
         self.buffer.terminal_grid.grid().content_revision()
+    }
+
+    fn row_content_fingerprint(&self, row: u16) -> Option<u64> {
+        if row >= self.height() {
+            return None;
+        }
+        let row = self
+            .buffer
+            .terminal_grid
+            .grid()
+            .viewport_row_ref(usize::from(row))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.width().hash(&mut hasher);
+        row.wrapped().hash(&mut hasher);
+        for col in 0..usize::from(self.width()) {
+            if let Some(cell) = row.cells().get(col) {
+                cell.text().hash(&mut hasher);
+                cell.width().hash(&mut hasher);
+                cell.is_wide_continuation().hash(&mut hasher);
+            } else {
+                " ".hash(&mut hasher);
+                1_u8.hash(&mut hasher);
+                false.hash(&mut hasher);
+            }
+        }
+        Some(hasher.finish())
     }
 
     fn width(&self) -> u16 {

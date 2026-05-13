@@ -12,10 +12,9 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_plugin = { workspace = true }
-serde       = { workspace = true, features = ["derive", "std"] }
 serde_json  = { workspace = true }
 tracing     = { workspace = true, features = ["std"] }
-uuid        = { workspace = true, features = ["serde", "std"] }
+uuid        = { workspace = true, features = ["std"] }
 
 [features]
 default = []

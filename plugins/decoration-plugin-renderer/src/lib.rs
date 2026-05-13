@@ -38,10 +38,11 @@ use std::time::{Duration, Instant};
 
 use bmux_plugin::{
     AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
-    AttachVisualAdapterRequest, AttachVisualFrameView, AttachVisualProjectionUpdate,
-    BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
-    RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
-    registered_visual_adapter, render_single_display_cell_char, render_text_width_u16,
+    AttachVisualAdapterRequest, AttachVisualFrameView, AttachVisualProjectionResult,
+    AttachVisualProjectionUpdate, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
+    RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
+    RenderUnderCell, registered_visual_adapter, render_single_display_cell_char,
+    render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -51,6 +52,9 @@ use bmux_scene_protocol::scene_protocol::{
 };
 use bmux_scene_protocol_render::paint::{apply_paint_commands, interpolate_style};
 use uuid::Uuid;
+
+const VISUAL_REQUEST_BUDGET: Duration = Duration::from_millis(4);
+const SLOW_VISUAL_PROJECTION: Duration = Duration::from_millis(2);
 
 /// Shared cache of the decoration plugin's latest scene. Stored
 /// under `Arc<Mutex<_>>` so the render extension can refresh/read/write
@@ -405,8 +409,18 @@ fn observe_visual_request(
     let Some(adapter) = registered_visual_adapter(&request.adapter) else {
         return;
     };
+    let request_started = Instant::now();
     let mut projected = false;
     for index in 0..frame.surface_count() {
+        if request_started.elapsed() > VISUAL_REQUEST_BUDGET {
+            tracing::warn!(
+                request_id = %request.id,
+                adapter = %request.adapter,
+                budget_ms = VISUAL_REQUEST_BUDGET.as_millis(),
+                "visual adapter request exceeded frame budget; remaining surfaces deferred",
+            );
+            break;
+        }
         let Some(surface) = frame.surface(index) else {
             continue;
         };
@@ -445,13 +459,24 @@ fn observe_visual_surface(
             .insert(revision_key.clone(), adapter_cache);
     }
     let mut scratch = Vec::new();
+    let projection_started = Instant::now();
     let result = {
         let adapter_cache = cache
             .visual_adapter_cache
             .get_mut(&revision_key)
             .map(|adapter_cache| adapter_cache.as_mut() as &mut dyn std::any::Any);
-        adapter.project_cached(surface, request, adapter_cache, &mut scratch)
+        adapter.project_incremental_cached(surface, request, adapter_cache, &mut scratch)
     };
+    let projection_elapsed = projection_started.elapsed();
+    if projection_elapsed > SLOW_VISUAL_PROJECTION {
+        tracing::debug!(
+            request_id = %request.id,
+            adapter = %request.adapter,
+            surface_id = %surface.surface_id(),
+            elapsed_ms = projection_elapsed.as_millis(),
+            "slow visual adapter projection",
+        );
+    }
     handle_visual_projection_result(
         cache,
         request,
@@ -467,18 +492,26 @@ fn handle_visual_projection_result(
     request: &AttachVisualAdapterRequest,
     revision_key: String,
     content_revision: u64,
-    result: Result<bmux_plugin::AttachVisualAdapterOutput, String>,
+    result: Result<AttachVisualProjectionResult, String>,
     updates: &mut Vec<AttachVisualProjectionUpdate>,
 ) -> bool {
     match result {
-        Ok(output) if output.payload.len() <= request.max_bytes as usize => {
+        Ok(AttachVisualProjectionResult::Unchanged) => {
+            cache
+                .visual_last_revision
+                .insert(revision_key, content_revision);
+            true
+        }
+        Ok(AttachVisualProjectionResult::Updated(output))
+            if output.payload.len() <= request.max_bytes as usize =>
+        {
             cache
                 .visual_last_revision
                 .insert(revision_key.clone(), content_revision);
             maybe_push_visual_projection_update(cache, request, revision_key, output, updates);
             true
         }
-        Ok(_) => {
+        Ok(AttachVisualProjectionResult::Updated(_)) => {
             tracing::warn!(
                 request_id = %request.id,
                 adapter = %request.adapter,
