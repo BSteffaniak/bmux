@@ -7,6 +7,8 @@ local WIN_HOLD_MS = 3000
 local WIN_SCORE = 10
 local PADDLE_SIZE = 5
 local PADDLE_HIT_PADDING = 1.0
+-- Options: "alternate", "scorer", "scored_on", "random".
+local SERVE_DIRECTION_MODE = "alternate"
 local STEP_MS = 40
 local SPEEDUP_PER_HIT = 1.09
 local MAX_SPEED_MULT = 3.05
@@ -136,16 +138,25 @@ local function new_game(seed, w, h, rally_ms)
     return game
 end
 
+local function serve_direction(game, scorer)
+    if SERVE_DIRECTION_MODE == "alternate" then
+        return game.rally % 2 == 0 and -1 or 1
+    elseif SERVE_DIRECTION_MODE == "scorer" then
+        return scorer == "left" and 1 or -1
+    elseif SERVE_DIRECTION_MODE == "scored_on" then
+        return scorer == "left" and -1 or 1
+    end
+
+    return rand01(game.seed, game.rally, 11) < 0.5 and -1 or 1
+end
+
 local function serve(game, scorer)
     game.rally = game.rally + 1
     game.hits = 0
     game.speed_mult = 1.0
     game.x = (game.w - 1) / 2
     game.y = rand_range(game.seed, game.rally, 10, 0, math.max(0, game.h - 1))
-    local dir = scorer == "left" and 1 or -1
-    if scorer == nil then
-        dir = rand01(game.seed, game.rally, 11) < 0.5 and -1 or 1
-    end
+    local dir = serve_direction(game, scorer)
     game.vx = game.base_vx * dir
     game.vy = rand_range(game.seed, game.rally, 12, -0.0062, 0.0062)
     if math.abs(game.vy) < 0.0026 then
