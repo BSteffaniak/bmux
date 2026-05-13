@@ -345,6 +345,27 @@ impl EventBus {
     where
         T: Any + Send + Sync + Serialize + 'static + serde::de::DeserializeOwned,
     {
+        self.register_state_channel_with_bytes_decoder(interface, initial, |bytes| {
+            serde_json::from_slice(bytes).map_err(|err| EventBusBytesError::Decode(err.to_string()))
+        })
+    }
+
+    /// Register a retained state channel with a custom wire decoder.
+    ///
+    /// Use this for non-JSON binary state payloads that arrive through
+    /// [`Self::emit_from_bytes`]. The decoder converts each byte payload into
+    /// the retained state value published on the channel.
+    #[allow(clippy::needless_pass_by_value)] // Consumed via `.clone()` for registration and decoder capture; matches state-channel registration APIs.
+    pub fn register_state_channel_with_bytes_decoder<T, F>(
+        self: &Arc<Self>,
+        interface: PluginEventKind,
+        initial: T,
+        decode: F,
+    ) -> watch::Sender<Arc<T>>
+    where
+        T: Any + Send + Sync + Serialize + 'static,
+        F: Fn(&[u8]) -> Result<T, EventBusBytesError> + Send + Sync + 'static,
+    {
         let sender = self.register_state_channel::<T>(interface.clone(), initial);
         let bus = Arc::downgrade(self);
         let decoder_kind = interface.clone();
@@ -353,8 +374,7 @@ impl EventBus {
                 let Some(bus) = bus.upgrade() else {
                     return Err(EventBusBytesError::Decode("event bus dropped".to_string()));
                 };
-                let value: T = serde_json::from_slice(bytes)
-                    .map_err(|err| EventBusBytesError::Decode(err.to_string()))?;
+                let value = decode(bytes)?;
                 bus.publish_state::<T>(&decoder_kind, value)?;
                 Ok(())
             });

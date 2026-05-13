@@ -636,6 +636,7 @@ fn maybe_push_visual_projection_update(
     updates.push(AttachVisualProjectionUpdate {
         request_id: request.id.clone(),
         event_kind: request.event_kind.clone(),
+        encoding: output.encoding,
         payload: output.payload,
     });
     true

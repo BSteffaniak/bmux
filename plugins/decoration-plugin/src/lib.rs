@@ -145,8 +145,10 @@ struct State {
     /// Monotonic generation used to stop stale subscription threads
     /// after a theme/script reload.
     script_subscription_generation: u64,
-    /// Latest compact attach-local visual adapter payloads, keyed by request id.
+    /// Latest attach-local visual adapter metadata, keyed by request id.
     visual_projections: BTreeMap<String, serde_json::Value>,
+    /// Latest attach-local visual adapter byte payloads, keyed by request id.
+    visual_projection_bytes: BTreeMap<String, Vec<u8>>,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
     /// Diagnostic flag flipped on the first frame where the script was
@@ -638,6 +640,10 @@ fn script_visual_payload(state: &State) -> serde_json::Value {
     )
 }
 
+fn script_visual_bytes_payload(state: &State) -> BTreeMap<String, Vec<u8>> {
+    state.visual_projection_bytes.clone()
+}
+
 fn rect_json(rect: &Rect) -> serde_json::Value {
     serde_json::json!({
         "x": rect.x,
@@ -691,6 +697,7 @@ fn merge_script_paint_commands(
         frame: state.script_frame,
         panes: script_panes_payload(state),
         visual: script_visual_payload(state),
+        visual_bytes: script_visual_bytes_payload(state),
         component: None,
     });
     let outcome = match backend.invoke(&render) {
@@ -739,6 +746,7 @@ fn merge_script_paint_commands(
 struct ComponentRenderPassState<'a> {
     panes: &'a serde_json::Value,
     visual: serde_json::Value,
+    visual_bytes: BTreeMap<String, Vec<u8>>,
     instance_frames: BTreeMap<String, (u64, u64)>,
     event_instances: BTreeSet<String>,
 }
@@ -750,9 +758,11 @@ fn merge_component_paint_commands(
     let order = ordered_enabled_component_ids(state);
     let panes = script_panes_payload(state);
     let visual = script_visual_payload(state);
+    let visual_bytes = script_visual_bytes_payload(state);
     let mut pass = ComponentRenderPassState {
         panes: &panes,
         visual,
+        visual_bytes,
         instance_frames: BTreeMap::new(),
         event_instances: BTreeSet::new(),
     };
@@ -829,6 +839,7 @@ fn merge_component_paint_commands_for_id(
         frame,
         panes: pass.panes.clone(),
         visual: pass.visual.clone(),
+        visual_bytes: pass.visual_bytes.clone(),
         component: Some(ScriptComponentMessage {
             id: component.id.clone(),
             entrypoint: component.spec.entrypoint.clone(),
@@ -2265,11 +2276,6 @@ impl RustPlugin for DecorationPlugin {
                     revision: 0,
                 },
             );
-        let _ = bmux_plugin::global_event_bus()
-            .register_state_channel_with_decoder::<serde_json::Value>(
-                plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string()),
-                serde_json::json!({}),
-            );
         spawn_attach_layout_subscriber(self.state.clone_arc());
         spawn_visual_projection_subscriber(self.state.clone_arc());
         Ok(EXIT_OK)
@@ -2945,10 +2951,58 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
     });
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+struct VisualProjectionState {
+    request_id: String,
+    encoding: String,
+    payload: Vec<u8>,
+}
+
+fn decode_visual_projection_state(
+    bytes: &[u8],
+) -> Result<VisualProjectionState, bmux_plugin::EventBusBytesError> {
+    const MAGIC: &[u8; 4] = b"BVP1";
+    if bytes.len() < 8 || &bytes[0..4] != MAGIC {
+        return Err(bmux_plugin::EventBusBytesError::Decode(
+            "invalid visual projection envelope".to_string(),
+        ));
+    }
+    let request_len = usize::from(u16::from_le_bytes(bytes[4..6].try_into().map_err(
+        |_| bmux_plugin::EventBusBytesError::Decode("missing request length".to_string()),
+    )?));
+    let encoding_len = usize::from(u16::from_le_bytes(bytes[6..8].try_into().map_err(
+        |_| bmux_plugin::EventBusBytesError::Decode("missing encoding length".to_string()),
+    )?));
+    let request_start = 8;
+    let encoding_start = request_start + request_len;
+    let payload_start = encoding_start + encoding_len;
+    if payload_start > bytes.len() {
+        return Err(bmux_plugin::EventBusBytesError::Decode(
+            "truncated visual projection envelope".to_string(),
+        ));
+    }
+    let request_id = std::str::from_utf8(&bytes[request_start..encoding_start])
+        .map_err(|err| bmux_plugin::EventBusBytesError::Decode(err.to_string()))?
+        .to_string();
+    let encoding = std::str::from_utf8(&bytes[encoding_start..payload_start])
+        .map_err(|err| bmux_plugin::EventBusBytesError::Decode(err.to_string()))?
+        .to_string();
+    Ok(VisualProjectionState {
+        request_id,
+        encoding,
+        payload: bytes[payload_start..].to_vec(),
+    })
+}
+
 fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     let event_kind = plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string());
+    let _ = bmux_plugin::global_event_bus().register_state_channel_with_bytes_decoder(
+        event_kind.clone(),
+        VisualProjectionState::default(),
+        decode_visual_projection_state,
+    );
     let Ok((initial, mut rx)) =
-        bmux_plugin::global_event_bus().subscribe_state::<serde_json::Value>(&event_kind)
+        bmux_plugin::global_event_bus().subscribe_state::<VisualProjectionState>(&event_kind)
     else {
         tracing::warn!(
             kind = DECORATION_VISUAL_PROJECTION_KIND,
@@ -2979,17 +3033,24 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     });
 }
 
-fn apply_visual_projection(state: &mut State, payload: &serde_json::Value) {
-    let Some(request_id) = payload
-        .get("request_id")
-        .and_then(serde_json::Value::as_str)
-    else {
+fn apply_visual_projection(state: &mut State, projection: &VisualProjectionState) {
+    if projection.request_id.is_empty() {
         return;
-    };
-    let previous = state
+    }
+    let metadata = serde_json::json!({
+        "request_id": projection.request_id,
+        "encoding": projection.encoding,
+        "byte_length": projection.payload.len(),
+    });
+    let previous_metadata = state
         .visual_projections
-        .insert(request_id.to_string(), payload.clone());
-    if previous.as_ref() != Some(payload) {
+        .insert(projection.request_id.clone(), metadata.clone());
+    let previous_payload = state
+        .visual_projection_bytes
+        .insert(projection.request_id.clone(), projection.payload.clone());
+    if previous_metadata.as_ref() != Some(&metadata)
+        || previous_payload.as_ref() != Some(&projection.payload)
+    {
         bump_revision(state);
     }
 }
@@ -3214,6 +3275,25 @@ mod tests {
         fn is_functional(&self) -> bool {
             true
         }
+    }
+
+    fn visual_projection_envelope(request_id: &str, encoding: &str, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BVP1");
+        bytes.extend_from_slice(
+            &u16::try_from(request_id.len())
+                .expect("request len")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(
+            &u16::try_from(encoding.len())
+                .expect("encoding len")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.extend_from_slice(encoding.as_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
     }
 
     fn block_on<F: Future>(fut: F) -> F::Output {
@@ -4544,6 +4624,42 @@ exited = ""
             })
             .expect("script's text paint command must appear in the scene");
         assert_eq!(text_cmd, (3, 4, "hi".to_string()));
+    }
+
+    #[test]
+    fn visual_projection_envelope_decodes_binary_sidecar() {
+        let bytes = visual_projection_envelope(
+            "pong.content-presence",
+            "presence-bitset-bin-v1",
+            &[1, 2, 3, 4],
+        );
+        let decoded = decode_visual_projection_state(&bytes).expect("decode projection");
+        assert_eq!(decoded.request_id, "pong.content-presence");
+        assert_eq!(decoded.encoding, "presence-bitset-bin-v1");
+        assert_eq!(decoded.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn visual_projection_updates_script_metadata_and_byte_sidecar() {
+        let mut state = State::default();
+        let projection = VisualProjectionState {
+            request_id: "pong.content-presence".to_string(),
+            encoding: "presence-bitset-bin-v1".to_string(),
+            payload: vec![0, 1, 2, 3],
+        };
+        apply_visual_projection(&mut state, &projection);
+        assert_eq!(
+            script_visual_payload(&state)["pong.content-presence"],
+            json!({
+                "request_id": "pong.content-presence",
+                "encoding": "presence-bitset-bin-v1",
+                "byte_length": 4,
+            })
+        );
+        assert_eq!(
+            script_visual_bytes_payload(&state)["pong.content-presence"],
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]

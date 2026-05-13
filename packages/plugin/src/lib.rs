@@ -42,8 +42,8 @@ pub use discovery::{
     discover_registered_plugins_in_roots,
 };
 pub use event_bus::{
-    DEFAULT_EVENT_BUS_CAPACITY, DeliveryMode, EventBus, EventBusError, EventBusResult,
-    JsonPluginEvent, global_event_bus,
+    DEFAULT_EVENT_BUS_CAPACITY, DeliveryMode, EventBus, EventBusBytesError, EventBusError,
+    EventBusResult, JsonPluginEvent, global_event_bus,
 };
 pub use host_runtime::{HostRuntimeApi, ServiceCaller};
 pub use loader::{

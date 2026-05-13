@@ -267,15 +267,61 @@ local function move_player(game, player, side)
     player.center = clamp(player.center, 0, game.h - 1)
 end
 
+local function le_u16(bytes, offset)
+    local a, b = string.byte(bytes, offset, offset + 1)
+    if a == nil or b == nil then return nil end
+    return a + b * 256
+end
+
+local function le_u32(bytes, offset)
+    local a, b, c, d = string.byte(bytes, offset, offset + 3)
+    if a == nil or b == nil or c == nil or d == nil then return nil end
+    return a + b * 256 + c * 65536 + d * 16777216
+end
+
+local function le_u64_number(bytes, offset)
+    local lo = le_u32(bytes, offset)
+    local hi = le_u32(bytes, offset + 4)
+    if lo == nil or hi == nil then return nil end
+    return lo + hi * 4294967296
+end
+
+local function visual_bitset_decode(metadata, bytes)
+    if metadata == nil or metadata.encoding ~= "presence-bitset-bin-v1" or bytes == nil then
+        return nil
+    end
+    if string.len(bytes) < 20 or string.sub(bytes, 1, 4) ~= "PBB1" then
+        return nil
+    end
+    local width = le_u16(bytes, 5)
+    local height = le_u16(bytes, 7)
+    local words_per_row = le_u16(bytes, 9)
+    local grid_revision = le_u64_number(bytes, 13)
+    if width == nil or height == nil or words_per_row == nil or grid_revision == nil then
+        return nil
+    end
+    return {
+        width = width,
+        height = height,
+        words_per_row = words_per_row,
+        grid_revision = grid_revision,
+        bytes = bytes,
+    }
+end
+
+local function visual_bitset_word(visual, word_index)
+    return le_u32(visual.bytes, 21 + word_index * 4) or 0
+end
+
 local function visual_bitset_occupied(visual, x, y)
-    if visual == nil or visual.words == nil or visual.words_per_row == nil then
+    if visual == nil or visual.bytes == nil or visual.words_per_row == nil then
         return false
     end
     if x < 0 or y < 0 or x >= (visual.width or 0) or y >= (visual.height or 0) then
         return false
     end
-    local word_index = y * visual.words_per_row + math.floor(x / 32) + 1
-    local word = visual.words[word_index] or 0
+    local word_index = y * visual.words_per_row + math.floor(x / 32)
+    local word = visual_bitset_word(visual, word_index)
     local bit = x % 32
     return math.floor(word / (2 ^ bit)) % 2 == 1
 end
@@ -520,7 +566,9 @@ local function render_pane(pane, message)
     local win_hold_ms = component_setting_number(message, "win_hold_ms", WIN_HOLD_MS)
     local game = simulate(pane, state.active_ms, rally_ms, win_hold_ms)
     game.content_bounce = component_setting_bool(message, "content_bounce", false)
-    game.visual = message.visual and message.visual["pong.content-presence"] or nil
+    local visual_metadata = message.visual and message.visual["pong.content-presence"] or nil
+    local visual_bytes = message.visual_bytes and message.visual_bytes["pong.content-presence"] or nil
+    game.visual = visual_bitset_decode(visual_metadata, visual_bytes)
     local cmds = {}
     if entrypoint == "ball" or entrypoint == "all" then render_ball(cmds, pane, game) end
     if entrypoint == "paddles" or entrypoint == "all" then render_paddles(cmds, pane, game) end

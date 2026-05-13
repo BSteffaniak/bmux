@@ -127,6 +127,7 @@ pub struct ScriptRenderMessage {
     pub frame: u64,
     pub panes: JsonValue,
     pub visual: JsonValue,
+    pub visual_bytes: BTreeMap<String, Vec<u8>>,
     pub component: Option<ScriptComponentMessage>,
 }
 
@@ -556,6 +557,10 @@ mod lua_backend {
                 t.set("frame", render.frame)?;
                 t.set("panes", json_to_lua(lua, &render.panes)?)?;
                 t.set("visual", json_to_lua(lua, &render.visual)?)?;
+                t.set(
+                    "visual_bytes",
+                    visual_bytes_to_lua(lua, &render.visual_bytes)?,
+                )?;
                 if let Some(component) = &render.component {
                     let component_table = lua.create_table()?;
                     component_table.set("id", component.id.as_str())?;
@@ -568,6 +573,14 @@ mod lua_backend {
             }
         }
         Ok(t)
+    }
+
+    fn visual_bytes_to_lua(lua: &Lua, values: &BTreeMap<String, Vec<u8>>) -> mlua::Result<Value> {
+        let table = lua.create_table()?;
+        for (key, bytes) in values {
+            table.set(key.as_str(), lua.create_string(bytes)?)?;
+        }
+        Ok(Value::Table(table))
     }
 
     fn json_to_lua(lua: &Lua, value: &JsonValue) -> mlua::Result<Value> {
@@ -1096,6 +1109,7 @@ mod tests {
             ScriptRenderMessage, ScriptServiceGrant, make_backend,
         };
         use serde_json::json;
+        use std::collections::BTreeMap;
         use std::path::Path;
         use std::sync::Arc;
 
@@ -1118,6 +1132,25 @@ mod tests {
                     }
                 ]),
                 visual: json!({}),
+                visual_bytes: BTreeMap::new(),
+                component: None,
+            })
+        }
+
+        fn render_message_with_visual_bytes() -> ScriptMessage {
+            let mut visual_bytes = BTreeMap::new();
+            visual_bytes.insert("pong.content-presence".to_string(), vec![0, 1, 255]);
+            ScriptMessage::Render(ScriptRenderMessage {
+                time_ms: 500,
+                frame: 10,
+                panes: json!([]),
+                visual: json!({
+                    "pong.content-presence": {
+                        "encoding": "presence-bitset-bin-v1",
+                        "byte_length": 3,
+                    }
+                }),
+                visual_bytes,
                 component: None,
             })
         }
@@ -1185,6 +1218,30 @@ mod tests {
             deliver_test_state(backend.as_ref());
             let outcome = backend.invoke(&render_message()).expect("render invoke");
             assert_eq!(outcome.surfaces["test-pane"].len(), 1);
+        }
+
+        #[test]
+        fn render_message_exposes_visual_byte_sidecars() {
+            let backend = make_backend(ScriptHostAccess::default());
+            let source = r#"
+                function decorate(message)
+                    assert(message.kind == "render", "expected render message")
+                    assert(message.visual["pong.content-presence"].encoding == "presence-bitset-bin-v1")
+                    local bytes = message.visual_bytes["pong.content-presence"]
+                    assert(bytes ~= nil, "visual bytes should be exposed")
+                    assert(string.len(bytes) == 3, "visual byte length should be preserved")
+                    assert(string.byte(bytes, 1) == 0, "first byte should be zero")
+                    assert(string.byte(bytes, 3) == 255, "third byte should be 255")
+                    return { surfaces = {} }
+                end
+            "#;
+            backend
+                .compile(Path::new("<test>"), source)
+                .expect("compile");
+            let outcome = backend
+                .invoke(&render_message_with_visual_bytes())
+                .expect("render invoke");
+            assert!(outcome.surfaces.is_empty());
         }
 
         #[test]

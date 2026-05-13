@@ -31,7 +31,7 @@ use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
 use bmux_plugin::{
     AttachInputEvent, AttachInputHook, AttachInputModifiers, AttachInputPaneContext,
-    AttachInputResult, ExtensionRect,
+    AttachInputResult, AttachVisualProjectionUpdate, ExtensionRect,
 };
 use bmux_plugin_sdk::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, HostScope, PluginCommandOutcome, ServiceKind,
@@ -3289,14 +3289,35 @@ async fn handle_attach_stream_server_event(
     })
 }
 
+fn encode_visual_projection_update(update: &AttachVisualProjectionUpdate) -> Vec<u8> {
+    const MAGIC: &[u8; 4] = b"BVP1";
+    let request_id = update.request_id.as_bytes();
+    let encoding = update.encoding.as_bytes();
+    let request_len = u16::try_from(request_id.len()).unwrap_or(u16::MAX);
+    let encoding_len = u16::try_from(encoding.len()).unwrap_or(u16::MAX);
+    let request_id = &request_id[..usize::from(request_len)];
+    let encoding = &encoding[..usize::from(encoding_len)];
+    let mut payload = Vec::with_capacity(
+        MAGIC.len() + 4 + request_id.len() + encoding.len() + update.payload.len(),
+    );
+    payload.extend_from_slice(MAGIC);
+    payload.extend_from_slice(&request_len.to_le_bytes());
+    payload.extend_from_slice(&encoding_len.to_le_bytes());
+    payload.extend_from_slice(request_id);
+    payload.extend_from_slice(encoding);
+    payload.extend_from_slice(&update.payload);
+    payload
+}
+
 async fn flush_visual_projection_updates(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) {
     let updates = std::mem::take(&mut view_state.visual_projection_updates);
     for update in updates {
+        let payload = encode_visual_projection_update(&update);
         if let Err(error) = client
-            .emit_on_plugin_bus(update.event_kind.as_str(), update.payload)
+            .emit_on_plugin_bus(update.event_kind.as_str(), payload)
             .await
         {
             tracing::debug!(

@@ -9,7 +9,6 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::any::Any;
-use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Once};
 
@@ -19,9 +18,11 @@ use bmux_plugin::{
 };
 
 const PRESENCE_BITSET_ADAPTER_ID: &str = "bmux.visual.presence-bitset";
-const U32_JSON_SLOT_WIDTH: usize = 10;
-const U64_JSON_SLOT_WIDTH: usize = 20;
-const PRESENCE_ENCODING: &str = "u32-row-bitset-v1";
+const PRESENCE_ENCODING: &str = "presence-bitset-bin-v1";
+const PRESENCE_MAGIC: &[u8; 4] = b"PBB1";
+const PRESENCE_HEADER_LEN: usize = 20;
+const PRESENCE_GRID_REVISION_OFFSET: usize = 12;
+const PRESENCE_WORDS_OFFSET: usize = PRESENCE_HEADER_LEN;
 const PRESENCE_STATS_LOG_EVERY: u64 = 256;
 
 #[derive(Default)]
@@ -33,8 +34,6 @@ struct PresenceBitsetCache {
     row_hashes: Vec<Option<u64>>,
     row_words: Vec<u32>,
     payload: Vec<u8>,
-    grid_revision_offset: Option<usize>,
-    word_offsets: Vec<usize>,
     projections: u64,
     unchanged: u64,
     updated: u64,
@@ -58,7 +57,7 @@ fn project_presence_bitset(
     let width = surface.width();
     let height = surface.height();
     let words_per_row = width.saturating_add(31) / 32;
-    let resized = ensure_presence_cache(surface, request, cache, width, height, words_per_row)?;
+    let resized = ensure_presence_cache(cache, width, height, words_per_row)?;
     cache.projections = cache.projections.saturating_add(1);
 
     #[cfg(test)]
@@ -121,15 +120,13 @@ fn project_presence_bitset(
     out.extend_from_slice(&cache.payload);
     Ok(AttachVisualProjectionResult::Updated(
         AttachVisualAdapterOutput {
-            encoding: "json".to_string(),
+            encoding: PRESENCE_ENCODING.to_string(),
             payload: std::mem::take(out),
         },
     ))
 }
 
 fn ensure_presence_cache(
-    surface: &dyn AttachVisualSurfaceView,
-    request: &AttachVisualAdapterRequest,
     cache: &mut PresenceBitsetCache,
     width: u16,
     height: u16,
@@ -152,75 +149,42 @@ fn ensure_presence_cache(
     cache.row_hashes = vec![None; usize::from(height)];
     cache.row_words = vec![0; word_count];
     cache.cache_rebuilds = cache.cache_rebuilds.saturating_add(1);
-    rebuild_presence_payload(surface, request, cache)?;
+    rebuild_presence_payload(cache)?;
     Ok(true)
 }
 
-fn rebuild_presence_payload(
-    surface: &dyn AttachVisualSurfaceView,
-    request: &AttachVisualAdapterRequest,
-    cache: &mut PresenceBitsetCache,
-) -> Result<(), String> {
-    let mut payload = String::new();
-    cache.word_offsets.clear();
-    cache.grid_revision_offset = None;
-
-    payload.push('{');
-    push_json_string_field(&mut payload, "request_id", &request.id)?;
-    payload.push(',');
-    push_json_string_field(&mut payload, "adapter", &request.adapter)?;
-    payload.push(',');
-    push_json_string_field(
-        &mut payload,
-        "surface_id",
-        &surface.surface_id().to_string(),
-    )?;
-    payload.push(',');
-    push_json_string_field(&mut payload, "pane_id", &surface.pane_id().to_string())?;
-    payload.push_str(",\"grid_revision\":");
-    cache.grid_revision_offset = Some(payload.len());
-    push_fixed_u64(&mut payload, surface.grid_revision())?;
-    payload.push(',');
-    push_json_string_field(&mut payload, "encoding", PRESENCE_ENCODING)?;
-    write!(
-        payload,
-        ",\"width\":{},\"height\":{},\"words_per_row\":{},\"words\":[",
-        cache.width, cache.height, cache.words_per_row
-    )
-    .map_err(|error| error.to_string())?;
-    for index in 0..cache.row_words.len() {
-        if index > 0 {
-            payload.push(',');
-        }
-        cache.word_offsets.push(payload.len());
-        push_fixed_u32(&mut payload, cache.row_words[index])?;
+fn rebuild_presence_payload(cache: &mut PresenceBitsetCache) -> Result<(), String> {
+    let word_bytes = cache
+        .row_words
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| "presence-bitset payload is too large".to_string())?;
+    let payload_len = PRESENCE_HEADER_LEN
+        .checked_add(word_bytes)
+        .ok_or_else(|| "presence-bitset payload is too large".to_string())?;
+    cache.payload = vec![0; payload_len];
+    cache.payload[0..4].copy_from_slice(PRESENCE_MAGIC);
+    cache.payload[4..6].copy_from_slice(&cache.width.to_le_bytes());
+    cache.payload[6..8].copy_from_slice(&cache.height.to_le_bytes());
+    cache.payload[8..10].copy_from_slice(&cache.words_per_row.to_le_bytes());
+    cache.payload[10..12].copy_from_slice(&0_u16.to_le_bytes());
+    patch_presence_payload_grid_revision(cache, 0)?;
+    for row_index in 0..usize::from(cache.height) {
+        patch_presence_payload_row(cache, row_index)?;
     }
-    payload.push_str("]}");
-    cache.payload = payload.into_bytes();
     Ok(())
-}
-
-fn push_json_string_field(payload: &mut String, name: &str, value: &str) -> Result<(), String> {
-    let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
-    write!(payload, "\"{name}\":{value}").map_err(|error| error.to_string())
-}
-
-fn push_fixed_u32(payload: &mut String, value: u32) -> Result<(), String> {
-    write!(payload, "{value:>U32_JSON_SLOT_WIDTH$}").map_err(|error| error.to_string())
-}
-
-fn push_fixed_u64(payload: &mut String, value: u64) -> Result<(), String> {
-    write!(payload, "{value:>U64_JSON_SLOT_WIDTH$}").map_err(|error| error.to_string())
 }
 
 fn patch_presence_payload_grid_revision(
     cache: &mut PresenceBitsetCache,
     revision: u64,
 ) -> Result<(), String> {
-    let Some(offset) = cache.grid_revision_offset else {
-        return Err("presence-bitset payload grid revision offset is missing".to_string());
+    let end = PRESENCE_GRID_REVISION_OFFSET.saturating_add(std::mem::size_of::<u64>());
+    let Some(slot) = cache.payload.get_mut(PRESENCE_GRID_REVISION_OFFSET..end) else {
+        return Err("presence-bitset payload grid revision slot is missing".to_string());
     };
-    patch_fixed_number(&mut cache.payload, offset, U64_JSON_SLOT_WIDTH, revision)
+    slot.copy_from_slice(&revision.to_le_bytes());
+    Ok(())
 }
 
 fn patch_presence_payload_row(
@@ -231,35 +195,16 @@ fn patch_presence_payload_row(
     let word_start = row_index.saturating_mul(words_per_row);
     let word_end = word_start.saturating_add(words_per_row);
     for word_index in word_start..word_end {
-        let Some(offset) = cache.word_offsets.get(word_index).copied() else {
-            return Err("presence-bitset payload word offset is missing".to_string());
-        };
         let Some(word) = cache.row_words.get(word_index).copied() else {
             return Err("presence-bitset row word is missing".to_string());
         };
-        patch_fixed_number(&mut cache.payload, offset, U32_JSON_SLOT_WIDTH, word)?;
+        let offset = PRESENCE_WORDS_OFFSET.saturating_add(word_index.saturating_mul(4));
+        let end = offset.saturating_add(4);
+        let Some(slot) = cache.payload.get_mut(offset..end) else {
+            return Err("presence-bitset payload word slot is missing".to_string());
+        };
+        slot.copy_from_slice(&word.to_le_bytes());
     }
-    Ok(())
-}
-
-fn patch_fixed_number<T>(
-    payload: &mut [u8],
-    offset: usize,
-    width: usize,
-    value: T,
-) -> Result<(), String>
-where
-    T: std::fmt::Display,
-{
-    let encoded = format!("{value:>width$}");
-    if encoded.len() != width {
-        return Err("presence-bitset payload slot width is too small".to_string());
-    }
-    let end = offset.saturating_add(width);
-    let Some(slot) = payload.get_mut(offset..end) else {
-        return Err("presence-bitset payload slot is out of bounds".to_string());
-    };
-    slot.copy_from_slice(encoded.as_bytes());
     Ok(())
 }
 
@@ -270,7 +215,7 @@ fn cached_presence_output(
         return Err("presence-bitset cached payload is empty".to_string());
     }
     Ok(AttachVisualAdapterOutput {
-        encoding: "json".to_string(),
+        encoding: PRESENCE_ENCODING.to_string(),
         payload: cache.payload.clone(),
     })
 }
@@ -414,6 +359,36 @@ mod tests {
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
+    struct DecodedPresence<'a> {
+        width: u16,
+        height: u16,
+        words_per_row: u16,
+        grid_revision: u64,
+        words: Vec<u32>,
+        payload: &'a [u8],
+    }
+
+    fn decode_presence(payload: &[u8]) -> DecodedPresence<'_> {
+        assert!(payload.len() >= PRESENCE_HEADER_LEN);
+        assert_eq!(&payload[0..4], PRESENCE_MAGIC);
+        let width = u16::from_le_bytes(payload[4..6].try_into().expect("width"));
+        let height = u16::from_le_bytes(payload[6..8].try_into().expect("height"));
+        let words_per_row = u16::from_le_bytes(payload[8..10].try_into().expect("words_per_row"));
+        let grid_revision = u64::from_le_bytes(payload[12..20].try_into().expect("revision"));
+        let words = payload[PRESENCE_WORDS_OFFSET..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("word")))
+            .collect();
+        DecodedPresence {
+            width,
+            height,
+            words_per_row,
+            grid_revision,
+            words,
+            payload,
+        }
+    }
+
     struct TestSurface {
         surface_id: Uuid,
         pane_id: Uuid,
@@ -502,116 +477,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn presence_bitset_cache_reuses_unchanged_rows() {
-        let adapter = PresenceBitsetAdapter;
-        let request = request();
-        let mut cache = PresenceBitsetCache::default();
-        let surface = TestSurface::new(&[&["x", " ", "x"], &[" ", "y", " "]], 1);
-        let mut out = Vec::new();
-
-        let first = adapter
-            .project_cached(&surface, &request, Some(&mut cache), &mut out)
-            .expect("first projection succeeds");
-        assert_eq!(cache.last_recomputed_rows, 2);
-        let first_payload = first.payload;
-
-        let second = adapter
-            .project_incremental_cached(&surface, &request, Some(&mut cache), &mut out)
-            .expect("second projection succeeds");
-        assert_eq!(cache.last_recomputed_rows, 0);
-        assert_eq!(cache.rows_reused_by_fingerprint, 2);
-        assert_eq!(second, AttachVisualProjectionResult::Unchanged);
-
-        let changed = TestSurface::new(&[&["x", " ", "x"], &["z", "y", " "]], 2);
-        let changed_output = adapter
-            .project_cached(&changed, &request, Some(&mut cache), &mut out)
-            .expect("changed projection succeeds");
-        assert_eq!(cache.last_recomputed_rows, 1);
-        assert_eq!(cache.projections, 3);
-        assert_eq!(cache.updated, 2);
-        assert_eq!(cache.unchanged, 1);
-        assert_eq!(cache.rows_reused_by_fingerprint, 3);
-        assert_ne!(changed_output.payload, first_payload);
+    fn project(surface: &TestSurface) -> AttachVisualAdapterOutput {
+        PresenceBitsetAdapter
+            .project(surface, &request(), &mut Vec::new())
+            .expect("project")
     }
 
     #[test]
-    fn presence_bitset_cached_payload_matches_full_projection() {
+    fn presence_bitset_projects_binary_header_and_words() {
+        let surface = TestSurface::new(&[&["x", " ", "y"], &[" ", "z", " "]], 42);
+        let output = project(&surface);
+        assert_eq!(output.encoding, PRESENCE_ENCODING);
+        let decoded = decode_presence(&output.payload);
+        assert_eq!(decoded.width, 3);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.words_per_row, 1);
+        assert_eq!(decoded.grid_revision, 42);
+        assert_eq!(decoded.words, vec![0b101, 0b010]);
+        assert_eq!(decoded.payload.len(), PRESENCE_HEADER_LEN + 8);
+    }
+
+    #[test]
+    fn presence_bitset_cache_reuses_fingerprinted_rows() {
+        let mut cache = PresenceBitsetCache::default();
+        let mut out = Vec::new();
+        let surface = TestSurface::new(&[&["x", " ", "y"], &[" ", "z", " "]], 1);
+        let first =
+            project_presence_bitset(&surface, &request(), &mut cache, &mut out).expect("first");
+        assert!(matches!(first, AttachVisualProjectionResult::Updated(_)));
+        assert_eq!(cache.last_recomputed_rows, 2);
+
+        let surface = TestSurface::new(&[&["x", " ", "y"], &[" ", "z", " "]], 2);
+        let second =
+            project_presence_bitset(&surface, &request(), &mut cache, &mut out).expect("second");
+        assert_eq!(second, AttachVisualProjectionResult::Unchanged);
+        assert_eq!(cache.last_recomputed_rows, 0);
+        assert_eq!(cache.unchanged, 1);
+    }
+
+    #[test]
+    fn presence_bitset_cached_projection_matches_uncached_projection() {
+        let surface = TestSurface::new(&[&["x", " ", "y"], &[" ", "z", " "]], 7);
+        let uncached = project(&surface);
         let adapter = PresenceBitsetAdapter;
-        let request = request();
-        let surface = TestSurface::new(&[&["x", " ", "x"], &[" ", "y", " "]], 1);
-        let mut cached_cache = PresenceBitsetCache::default();
-        let mut cached = Vec::new();
-        let mut full = Vec::new();
-
+        let mut cache = adapter.new_cache(&request()).expect("cache");
         let cached = adapter
-            .project_cached(&surface, &request, Some(&mut cached_cache), &mut cached)
-            .expect("cached projection succeeds")
-            .payload;
-        let full = adapter
-            .project(&surface, &request, &mut full)
-            .expect("full projection succeeds")
-            .payload;
-
-        assert_eq!(cached, full);
+            .project_cached(&surface, &request(), Some(cache.as_mut()), &mut Vec::new())
+            .expect("cached");
+        assert_eq!(cached.encoding, uncached.encoding);
+        assert_eq!(cached.payload, uncached.payload);
     }
 
     #[test]
     fn presence_bitset_semantic_noop_returns_unchanged() {
-        let adapter = PresenceBitsetAdapter;
-        let request = request();
         let mut cache = PresenceBitsetCache::default();
         let mut out = Vec::new();
-        let initial = TestSurface::new(&[&["x", " ", "x"]], 1);
-        let renamed = TestSurface::new(&[&["z", " ", "q"]], 2);
+        let first_surface = TestSurface::new(&[&["x", " ", "y"]], 1);
+        let first = project_presence_bitset(&first_surface, &request(), &mut cache, &mut out)
+            .expect("first");
+        assert!(matches!(first, AttachVisualProjectionResult::Updated(_)));
 
-        assert!(matches!(
-            adapter
-                .project_incremental_cached(&initial, &request, Some(&mut cache), &mut out)
-                .expect("initial projection succeeds"),
-            AttachVisualProjectionResult::Updated(_)
-        ));
-        let noop = adapter
-            .project_incremental_cached(&renamed, &request, Some(&mut cache), &mut out)
-            .expect("semantic noop projection succeeds");
-
-        assert_eq!(noop, AttachVisualProjectionResult::Unchanged);
+        let second_surface = TestSurface::new(&[&["a", " ", "b"]], 2);
+        let second = project_presence_bitset(&second_surface, &request(), &mut cache, &mut out)
+            .expect("second");
+        assert_eq!(second, AttachVisualProjectionResult::Unchanged);
+        assert_eq!(cache.last_recomputed_rows, 0);
     }
 
     #[test]
-    fn presence_bitset_resize_invalidates_cache() {
-        let adapter = PresenceBitsetAdapter;
-        let request = request();
+    fn presence_bitset_resize_rebuilds_payload() {
         let mut cache = PresenceBitsetCache::default();
         let mut out = Vec::new();
-        let initial = TestSurface::new(&[&["x", " ", "x"]], 1);
-        let resized = TestSurface::new(&[&["x", " ", "x", " "]], 2);
+        let first_surface = TestSurface::new(&[&["x", " "]], 1);
+        let first = project_presence_bitset(&first_surface, &request(), &mut cache, &mut out)
+            .expect("first");
+        assert!(matches!(first, AttachVisualProjectionResult::Updated(_)));
 
-        adapter
-            .project_incremental_cached(&initial, &request, Some(&mut cache), &mut out)
-            .expect("initial projection succeeds");
-        let resized = adapter
-            .project_incremental_cached(&resized, &request, Some(&mut cache), &mut out)
-            .expect("resize projection succeeds");
-
-        assert!(matches!(resized, AttachVisualProjectionResult::Updated(_)));
-        assert_eq!(cache.width, 4);
+        let second_surface = TestSurface::new(&[&["x", " ", "y"], &[" ", "z", " "]], 2);
+        let second = project_presence_bitset(&second_surface, &request(), &mut cache, &mut out)
+            .expect("second");
+        assert!(matches!(second, AttachVisualProjectionResult::Updated(_)));
+        let decoded = decode_presence(&cache.payload);
+        assert_eq!(decoded.width, 3);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.words, vec![0b101, 0b010]);
     }
 
     #[test]
-    fn presence_bitset_payload_remains_json_compatible() {
-        let adapter = PresenceBitsetAdapter;
-        let request = request();
-        let surface = TestSurface::new(&[&["x", " ", "x"], &[" ", "y", " "]], 1);
+    fn presence_bitset_cached_payload_patches_changed_rows() {
+        let mut cache = PresenceBitsetCache::default();
         let mut out = Vec::new();
+        let first_surface = TestSurface::new(&[&["x", " ", "y"], &[" ", "z", " "]], 1);
+        let first = project_presence_bitset(&first_surface, &request(), &mut cache, &mut out)
+            .expect("first");
+        assert!(matches!(first, AttachVisualProjectionResult::Updated(_)));
 
-        let payload = adapter
-            .project(&surface, &request, &mut out)
-            .expect("projection succeeds")
-            .payload;
-        let decoded: serde_json::Value = serde_json::from_slice(&payload).expect("valid json");
-
-        assert_eq!(decoded["encoding"], PRESENCE_ENCODING);
-        assert_eq!(decoded["words"].as_array().expect("words array").len(), 2);
+        let second_surface = TestSurface::new(&[&["x", " ", "y"], &["q", "z", " "]], 2);
+        let second = project_presence_bitset(&second_surface, &request(), &mut cache, &mut out)
+            .expect("second");
+        assert!(matches!(second, AttachVisualProjectionResult::Updated(_)));
+        assert_eq!(cache.last_recomputed_rows, 1);
+        let decoded = decode_presence(&cache.payload);
+        assert_eq!(decoded.grid_revision, 2);
+        assert_eq!(decoded.words, vec![0b101, 0b011]);
     }
 }
