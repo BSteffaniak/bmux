@@ -53,7 +53,8 @@ const PANE_CONTENT_COMPONENT_ID: &str = "pane.content";
 struct ScriptComponentRuntime {
     id: String,
     spec: DecorationComponentSpec,
-    backend: Option<Box<dyn ScriptBackend>>,
+    instance_id: String,
+    backend: Option<Arc<dyn ScriptBackend>>,
     script_path: Option<PathBuf>,
     script_source_hash: Option<u64>,
     script_started_at: Option<Instant>,
@@ -62,11 +63,19 @@ struct ScriptComponentRuntime {
     script_events: VecDeque<ScriptEventMessage>,
 }
 
+struct CompiledScriptInstance {
+    backend: Option<Arc<dyn ScriptBackend>>,
+    script_path: Option<PathBuf>,
+    script_source_hash: Option<u64>,
+    script_started_at: Option<Instant>,
+}
+
 impl std::fmt::Debug for ScriptComponentRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScriptComponentRuntime")
             .field("id", &self.id)
             .field("spec", &self.spec)
+            .field("instance_id", &self.instance_id)
             .field("script_path", &self.script_path)
             .field("script_source_hash", &self.script_source_hash)
             .field("script_frame", &self.script_frame)
@@ -387,6 +396,7 @@ impl DecorationCommandsService for DecorationServiceHandle {
 fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> AttachInputResult {
     let mut result = AttachInputResult::default();
     let message = ScriptMessage::Input(event);
+    let mut invoked_instances = BTreeSet::<String>::new();
     if state
         .current_theme
         .as_ref()
@@ -412,6 +422,9 @@ fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> Atta
         let Some(backend) = component.backend.as_ref() else {
             continue;
         };
+        if !invoked_instances.insert(component.instance_id.clone()) {
+            continue;
+        }
         match backend.invoke(&message) {
             Ok(outcome) => {
                 merge_attach_input_result(&mut result, outcome.input_result);
@@ -708,12 +721,23 @@ fn merge_script_paint_commands(
     }
 }
 
+struct ComponentRenderPassState<'a> {
+    panes: &'a serde_json::Value,
+    instance_frames: BTreeMap<String, (u64, u64)>,
+    event_instances: BTreeSet<String>,
+}
+
 fn merge_component_paint_commands(
     state: &mut State,
     surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
 ) {
     let order = ordered_enabled_component_ids(state);
     let panes = script_panes_payload(state);
+    let mut pass = ComponentRenderPassState {
+        panes: &panes,
+        instance_frames: BTreeMap::new(),
+        event_instances: BTreeSet::new(),
+    };
     for (index, component_id) in order.iter().enumerate() {
         if component_id == PANE_CONTENT_COMPONENT_ID {
             continue;
@@ -728,8 +752,8 @@ fn merge_component_paint_commands(
             surfaces,
             component_id,
             index,
-            &panes,
             below_pane_content,
+            &mut pass,
         );
     }
 }
@@ -739,8 +763,8 @@ fn merge_component_paint_commands_for_id(
     surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
     component_id: &str,
     order_index: usize,
-    panes: &serde_json::Value,
     below_pane_content: bool,
+    pass: &mut ComponentRenderPassState<'_>,
 ) {
     let Some(component) = state.script_components.get_mut(component_id) else {
         return;
@@ -748,31 +772,44 @@ fn merge_component_paint_commands_for_id(
     let Some(backend) = component.backend.as_ref() else {
         return;
     };
-    while let Some(event) = component.script_events.pop_front() {
-        let message = ScriptMessage::Event(event);
-        let outcome = match backend.invoke(&message) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::warn!(
-                    target: "decoration.script",
-                    component_id,
-                    error = %error,
-                    "decoration component event invocation failed",
-                );
-                continue;
-            }
-        };
-        record_component_script_perf(component, outcome.duration);
+    if pass.event_instances.insert(component.instance_id.clone()) {
+        while let Some(event) = component.script_events.pop_front() {
+            let message = ScriptMessage::Event(event);
+            let outcome = match backend.invoke(&message) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "decoration.script",
+                        component_id,
+                        error = %error,
+                        "decoration component event invocation failed",
+                    );
+                    continue;
+                }
+            };
+            record_component_script_perf(component, outcome.duration);
+        }
+    } else {
+        component.script_events.clear();
     }
 
-    component.script_frame = component.script_frame.saturating_add(1);
-    let time_ms = component.script_started_at.map_or(0, |started_at| {
-        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-    });
+    let (frame, time_ms) =
+        if let Some((frame, time_ms)) = pass.instance_frames.get(&component.instance_id).copied() {
+            (frame, time_ms)
+        } else {
+            component.script_frame = component.script_frame.saturating_add(1);
+            let time_ms = component.script_started_at.map_or(0, |started_at| {
+                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+            let frame = component.script_frame;
+            pass.instance_frames
+                .insert(component.instance_id.clone(), (frame, time_ms));
+            (frame, time_ms)
+        };
     let render = ScriptMessage::Render(ScriptRenderMessage {
         time_ms,
-        frame: component.script_frame,
-        panes: panes.clone(),
+        frame,
+        panes: pass.panes.clone(),
         component: Some(ScriptComponentMessage {
             id: component.id.clone(),
             entrypoint: component.spec.entrypoint.clone(),
@@ -2389,21 +2426,13 @@ fn install_script_components(
     let Some(components) = extension.components.as_ref() else {
         return;
     };
+    let mut instances = BTreeMap::<String, CompiledScriptInstance>::new();
     for (id, spec) in components {
+        let instance_id = component_script_instance_id(id, spec);
         if !component_enabled(spec) {
             state.script_components.insert(
                 id.clone(),
-                ScriptComponentRuntime {
-                    id: id.clone(),
-                    spec: spec.clone(),
-                    backend: None,
-                    script_path: None,
-                    script_source_hash: None,
-                    script_started_at: None,
-                    script_frame: 0,
-                    script_perf: None,
-                    script_events: VecDeque::new(),
-                },
+                empty_script_component_runtime(id, spec, instance_id),
             );
             continue;
         }
@@ -2411,84 +2440,118 @@ fn install_script_components(
             .script
             .as_deref()
             .and_then(|script| resolve_decoration_script(config_dir_candidates, script));
-        let runtime = compile_script_component(id, spec, script, host_access.clone());
+        let instance_key = component_script_instance_key(&instance_id, script.as_ref());
+        let instance = instances
+            .entry(instance_key)
+            .or_insert_with(|| compile_script_component_instance(id, script, host_access.clone()));
+        let runtime = ScriptComponentRuntime {
+            id: id.clone(),
+            spec: spec.clone(),
+            instance_id,
+            backend: instance.backend.clone(),
+            script_path: instance.script_path.clone(),
+            script_source_hash: instance.script_source_hash,
+            script_started_at: instance.script_started_at,
+            script_frame: 0,
+            script_perf: instance
+                .script_path
+                .clone()
+                .map(|path| PerfTracker::new(path, crate::scripting::DEFAULT_WARN_MS)),
+            script_events: VecDeque::new(),
+        };
         state.script_components.insert(id.clone(), runtime);
     }
 }
 
-fn compile_script_component(
+fn component_script_instance_id(id: &str, spec: &DecorationComponentSpec) -> String {
+    spec.script_instance
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(id)
+        .to_string()
+}
+
+fn component_script_instance_key(instance_id: &str, script: Option<&ResolvedScript>) -> String {
+    let Some(script) = script else {
+        return format!("{instance_id}:<no-script>");
+    };
+    format!(
+        "{}:{}:{}",
+        instance_id,
+        script.path.display(),
+        script_source_hash(&script.path, &script.source)
+    )
+}
+
+fn empty_script_component_runtime(
     id: &str,
     spec: &DecorationComponentSpec,
+    instance_id: String,
+) -> ScriptComponentRuntime {
+    ScriptComponentRuntime {
+        id: id.to_string(),
+        spec: spec.clone(),
+        instance_id,
+        backend: None,
+        script_path: None,
+        script_source_hash: None,
+        script_started_at: None,
+        script_frame: 0,
+        script_perf: None,
+        script_events: VecDeque::new(),
+    }
+}
+
+fn compile_script_component_instance(
+    component_id: &str,
     script: Option<ResolvedScript>,
     host_access: ScriptHostAccess,
-) -> ScriptComponentRuntime {
+) -> CompiledScriptInstance {
     let Some(script) = script else {
-        return ScriptComponentRuntime {
-            id: id.to_string(),
-            spec: spec.clone(),
+        return CompiledScriptInstance {
             backend: None,
             script_path: None,
             script_source_hash: None,
             script_started_at: None,
-            script_frame: 0,
-            script_perf: None,
-            script_events: VecDeque::new(),
         };
     };
+    let source_hash = script_source_hash(&script.path, &script.source);
+    let script_path = script.path.clone();
     let backend = crate::scripting::make_backend(host_access);
     if !backend.is_functional() {
         tracing::warn!(
             target: "decoration.script",
-            component_id = id,
+            component_id,
             script = ?script.path,
             "decoration scripting is not compiled into this build — component script will be ignored",
         );
-        return ScriptComponentRuntime {
-            id: id.to_string(),
-            spec: spec.clone(),
+        return CompiledScriptInstance {
             backend: None,
-            script_path: Some(script.path),
+            script_path: Some(script_path),
             script_source_hash: None,
             script_started_at: None,
-            script_frame: 0,
-            script_perf: None,
-            script_events: VecDeque::new(),
         };
     }
     if let Err(error) = backend.compile(&script.path, &script.source) {
         tracing::warn!(
             target: "decoration.script",
-            component_id = id,
+            component_id,
             script = ?script.path,
             error = %error,
             "decoration component script failed to compile — component will be ignored",
         );
-        return ScriptComponentRuntime {
-            id: id.to_string(),
-            spec: spec.clone(),
+        return CompiledScriptInstance {
             backend: None,
-            script_path: Some(script.path),
+            script_path: Some(script_path),
             script_source_hash: None,
             script_started_at: None,
-            script_frame: 0,
-            script_perf: None,
-            script_events: VecDeque::new(),
         };
     }
-    let source_hash = script_source_hash(&script.path, &script.source);
-    ScriptComponentRuntime {
-        id: id.to_string(),
-        spec: spec.clone(),
-        backend: Some(backend),
-        script_path: Some(script.path.clone()),
+    CompiledScriptInstance {
+        backend: Some(Arc::from(backend)),
+        script_path: Some(script_path),
         script_source_hash: Some(source_hash),
         script_started_at: Some(Instant::now()),
-        script_frame: 0,
-        script_perf: Some(PerfTracker::new(
-            script.path,
-            crate::scripting::DEFAULT_WARN_MS,
-        )),
-        script_events: VecDeque::new(),
     }
 }
 
@@ -4440,6 +4503,7 @@ exited = ""
             DecorationComponentSpec {
                 enabled: None,
                 script: Some("pong".to_string()),
+                script_instance: None,
                 entrypoint: None,
                 above: None,
                 below: None,
@@ -4487,7 +4551,25 @@ exited = ""
                     component.script_path.as_deref(),
                     Some(Path::new("bundled:pong"))
                 );
+                assert_eq!(component.instance_id, "pong");
             }
+            let ball = state
+                .script_components
+                .get("pong.ball")
+                .and_then(|component| component.backend.as_ref())
+                .expect("ball backend");
+            let paddles = state
+                .script_components
+                .get("pong.paddles")
+                .and_then(|component| component.backend.as_ref())
+                .expect("paddles backend");
+            let score = state
+                .script_components
+                .get("pong.score")
+                .and_then(|component| component.backend.as_ref())
+                .expect("score backend");
+            assert!(Arc::ptr_eq(ball, paddles));
+            assert!(Arc::ptr_eq(ball, score));
         }
 
         let scene = plugin.build_scene();

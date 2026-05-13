@@ -81,9 +81,10 @@ min     = 500
 type    = "integer"
 
 [plugins."bmux.decoration".components."pong.ball"]
-below      = ["pane.content"]
-entrypoint = "ball"
-script     = "pong"
+below           = ["pane.content"]
+entrypoint      = "ball"
+script          = "pong"
+script_instance = "pong"
 
 [plugins."bmux.decoration".components."pong.ball".settings]
 rally_ms    = "5500"
@@ -96,9 +97,10 @@ mouse           = ["down", "drag", "up"]
 scope           = "focused-pane"
 
 [plugins."bmux.decoration".components."pong.paddles"]
-above      = ["pane.content"]
-entrypoint = "paddles"
-script     = "pong"
+above           = ["pane.content"]
+entrypoint      = "paddles"
+script          = "pong"
+script_instance = "pong"
 
 [plugins."bmux.decoration".components."pong.paddles".settings]
 rally_ms    = "5500"
@@ -111,9 +113,10 @@ mouse           = ["down", "drag", "up"]
 scope           = "focused-pane"
 
 [plugins."bmux.decoration".components."pong.score"]
-above      = ["pong.paddles"]
-entrypoint = "score"
-script     = "pong"
+above           = ["pong.paddles"]
+entrypoint      = "score"
+script          = "pong"
+script_instance = "pong"
 
 [plugins."bmux.decoration".components."pong.score".settings]
 rally_ms    = "5500"
