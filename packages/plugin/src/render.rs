@@ -28,6 +28,7 @@
 //! data (e.g. a scene-protocol snapshot) changes less often than
 //! layout refreshes.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, OnceLock, RwLock};
 use unicode_width::UnicodeWidthStr;
@@ -167,6 +168,85 @@ pub struct AttachInputResult {
     pub capture_keyboard: Vec<String>,
     pub release_capture: bool,
     pub dirty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachVisualAdapterRequest {
+    pub id: String,
+    pub adapter: String,
+    pub owner_plugin_id: String,
+    pub event_kind: String,
+    pub scope: String,
+    pub area: String,
+    pub max_hz: u16,
+    pub dirty_only: bool,
+    pub max_bytes: u32,
+    pub settings: BTreeMap<String, String>,
+}
+
+impl AttachVisualAdapterRequest {
+    #[must_use]
+    pub const fn min_interval_ms(&self) -> u64 {
+        if self.max_hz == 0 {
+            0
+        } else {
+            1_000_u64 / self.max_hz as u64
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachVisualProjectionUpdate {
+    pub request_id: String,
+    pub event_kind: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachVisualCellRef<'a> {
+    pub text: &'a str,
+    pub width: u8,
+    pub wide_continuation: bool,
+}
+
+pub trait AttachVisualSurfaceView {
+    fn surface_id(&self) -> Uuid;
+    fn pane_id(&self) -> Uuid;
+    fn rect(&self) -> ExtensionRect;
+    fn content_rect(&self) -> ExtensionRect;
+    fn focused(&self) -> bool;
+    fn grid_revision(&self) -> u64;
+    fn width(&self) -> u16;
+    fn height(&self) -> u16;
+    fn cell(&self, x: u16, y: u16) -> Option<AttachVisualCellRef<'_>>;
+}
+
+pub trait AttachVisualFrameView {
+    fn surface_count(&self) -> usize;
+    fn surface(&self, index: usize) -> Option<&dyn AttachVisualSurfaceView>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachVisualAdapterOutput {
+    pub encoding: String,
+    pub payload: Vec<u8>,
+}
+
+pub trait AttachVisualAdapter: Send + Sync {
+    fn id(&self) -> &str;
+
+    /// Project a borrowed visual surface into an adapter-owned compact payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the adapter cannot encode the requested
+    /// payload. Callers should treat adapter failures as non-fatal frame work.
+    fn project(
+        &self,
+        surface: &dyn AttachVisualSurfaceView,
+        request: &AttachVisualAdapterRequest,
+        out: &mut Vec<u8>,
+    ) -> Result<AttachVisualAdapterOutput, String>;
 }
 
 /// Return the Unicode display-cell width of `text`, saturated to `u16::MAX`.
@@ -875,6 +955,23 @@ pub trait AttachRenderExtension: Send + Sync {
         Vec::new()
     }
 
+    /// Return visual adapter requests currently owned by this extension.
+    /// Requests are coarse subscriptions over the attach-local visual frame;
+    /// exact extraction is delegated to plugin-owned visual adapters.
+    fn visual_adapter_requests(&self) -> Vec<AttachVisualAdapterRequest> {
+        Vec::new()
+    }
+
+    /// Observe the borrowed attach-local visual frame and emit compact,
+    /// plugin-owned projection updates. Implementations must be non-blocking
+    /// and should use registered visual adapters for hot-path extraction.
+    fn observe_visual_frame(
+        &self,
+        _frame: &dyn AttachVisualFrameView,
+        _updates: &mut Vec<AttachVisualProjectionUpdate>,
+    ) {
+    }
+
     /// Called when a surface is removed from the attach layout. The
     /// extension should evict any cached state for `surface_id`.
     fn surface_removed(&self, _surface_id: Uuid) {}
@@ -934,6 +1031,46 @@ impl RenderExtensionRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+#[derive(Default)]
+pub struct VisualAdapterRegistry {
+    entries: RwLock<BTreeMap<String, Arc<dyn AttachVisualAdapter>>>,
+}
+
+impl VisualAdapterRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, adapter: Arc<dyn AttachVisualAdapter>) {
+        if let Ok(mut guard) = self.entries.write() {
+            guard.insert(adapter.id().to_string(), adapter);
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<Arc<dyn AttachVisualAdapter>> {
+        self.entries.read().ok()?.get(id).cloned()
+    }
+}
+
+#[must_use]
+pub fn global_visual_adapter_registry() -> Arc<VisualAdapterRegistry> {
+    static GLOBAL: OnceLock<Arc<VisualAdapterRegistry>> = OnceLock::new();
+    GLOBAL
+        .get_or_init(|| Arc::new(VisualAdapterRegistry::new()))
+        .clone()
+}
+
+pub fn register_visual_adapter(adapter: Arc<dyn AttachVisualAdapter>) {
+    global_visual_adapter_registry().register(adapter);
+}
+
+#[must_use]
+pub fn registered_visual_adapter(id: &str) -> Option<Arc<dyn AttachVisualAdapter>> {
+    global_visual_adapter_registry().get(id)
 }
 
 /// Process-wide shared extension registry.

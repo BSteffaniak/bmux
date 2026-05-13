@@ -47,6 +47,16 @@ local function component_setting_number(message, key, default_value)
     return value
 end
 
+local function component_setting_bool(message, key, default_value)
+    local component = message.component or {}
+    local settings = component.settings or {}
+    local value = settings[key]
+    if value == nil then
+        return default_value
+    end
+    return value == true or value == "true" or value == "1" or value == "yes"
+end
+
 local function pane_seed(pane)
     local text = tostring(pane.id or "default")
     local hash = 5381
@@ -253,6 +263,47 @@ local function move_player(game, player, side)
     player.center = clamp(player.center, 0, game.h - 1)
 end
 
+local function visual_bitset_occupied(visual, x, y)
+    if visual == nil or visual.words == nil or visual.words_per_row == nil then
+        return false
+    end
+    if x < 0 or y < 0 or x >= (visual.width or 0) or y >= (visual.height or 0) then
+        return false
+    end
+    local word_index = y * visual.words_per_row + math.floor(x / 32) + 1
+    local word = visual.words[word_index] or 0
+    local bit = x % 32
+    return math.floor(word / (2 ^ bit)) % 2 == 1
+end
+
+local function bounce_off_visual_content(game)
+    if not game.content_bounce or game.visual == nil then
+        return
+    end
+    local x = clamp(math.floor(game.x + 0.5), 0, game.w - 1)
+    local y = clamp(math.floor(game.y + 0.5), 0, game.h - 1)
+    if not visual_bitset_occupied(game.visual, x, y) then
+        return
+    end
+    local prev_x = clamp(math.floor((game.x - game.vx * STEP_MS) + 0.5), 0, game.w - 1)
+    local prev_y = clamp(math.floor((game.y - game.vy * STEP_MS) + 0.5), 0, game.h - 1)
+    local hit_x = visual_bitset_occupied(game.visual, x, prev_y)
+    local hit_y = visual_bitset_occupied(game.visual, prev_x, y)
+    if hit_x and not hit_y then
+        game.vx = -game.vx
+        game.x = game.x + game.vx * STEP_MS * 0.35
+    elseif hit_y and not hit_x then
+        game.vy = -game.vy
+        game.y = game.y + game.vy * STEP_MS * 0.35
+    else
+        game.vx = -game.vx
+        game.vy = -game.vy
+        game.x = game.x + game.vx * STEP_MS * 0.35
+        game.y = game.y + game.vy * STEP_MS * 0.35
+    end
+    game.vy = clamp(game.vy + rand_range(game.seed, game.rally + game.hits, 961, -0.001, 0.001), -math.abs(game.vx) * 1.1, math.abs(game.vx) * 1.1)
+end
+
 local function paddle_contains(game, player, y)
     local max_top = math.max(0, game.h - game.paddle_len)
     local top = clamp(math.floor(player.center - game.paddle_len / 2 + 0.5), 0, max_top)
@@ -324,6 +375,8 @@ local function step_game(game)
         game.y = (game.h - 1) - (game.y - (game.h - 1))
         game.vy = -game.vy
     end
+
+    bounce_off_visual_content(game)
 
     if game.x <= 0 then
         if game.vx < 0 and paddle_contains(game, game.left, game.y) then
@@ -441,6 +494,8 @@ local function render_pane(pane, message)
     local rally_ms = component_setting_number(message, "rally_ms", RALLY_MS)
     local win_hold_ms = component_setting_number(message, "win_hold_ms", WIN_HOLD_MS)
     local game = simulate(pane, state.active_ms, rally_ms, win_hold_ms)
+    game.content_bounce = component_setting_bool(message, "content_bounce", false)
+    game.visual = message.visual and message.visual["pong.content-presence"] or nil
     local cmds = {}
     if entrypoint == "ball" or entrypoint == "all" then render_ball(cmds, pane, game) end
     if entrypoint == "paddles" or entrypoint == "all" then render_paddles(cmds, pane, game) end

@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled attach-local visual adapters for bmux render extensions"
+edition     = { workspace = true }
+keywords    = ["bmux", "visual", "plugin", "renderer"]
+license     = { workspace = true }
+name        = "bmux_visual_adapters_plugin_renderer"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_plugin = { workspace = true }
+serde       = { workspace = true, features = ["derive", "std"] }
+serde_json  = { workspace = true }
+tracing     = { workspace = true, features = ["std"] }
+uuid        = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default = []
+
+fail-on-warnings = ["bmux_plugin/fail-on-warnings"]

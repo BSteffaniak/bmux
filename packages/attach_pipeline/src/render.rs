@@ -10,9 +10,10 @@ use bmux_appearance::{
 };
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::{
-    AttachRenderExtension, BorderGlyphs, ExtensionRect, RenderColor, RenderDamage,
-    RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
-    clip_render_text_run_to_rect, render_text_width_u16,
+    AttachRenderExtension, AttachVisualCellRef, AttachVisualFrameView,
+    AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect,
+    RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
+    RenderUnderCell, clip_render_text_run_to_rect, render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -1965,6 +1966,152 @@ pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
         }
     }
     pane_ids.into_iter().collect()
+}
+
+struct AttachVisualFrameSnapshot<'a> {
+    surfaces: Vec<AttachVisualSurfaceSnapshot<'a>>,
+}
+
+impl AttachVisualFrameView for AttachVisualFrameSnapshot<'_> {
+    fn surface_count(&self) -> usize {
+        self.surfaces.len()
+    }
+
+    fn surface(&self, index: usize) -> Option<&dyn AttachVisualSurfaceView> {
+        self.surfaces
+            .get(index)
+            .map(|surface| surface as &dyn AttachVisualSurfaceView)
+    }
+}
+
+struct AttachVisualSurfaceSnapshot<'a> {
+    surface_id: Uuid,
+    pane_id: Uuid,
+    rect: ExtensionRect,
+    content_rect: ExtensionRect,
+    focused: bool,
+    buffer: &'a PaneRenderBuffer,
+}
+
+impl AttachVisualSurfaceView for AttachVisualSurfaceSnapshot<'_> {
+    fn surface_id(&self) -> Uuid {
+        self.surface_id
+    }
+
+    fn pane_id(&self) -> Uuid {
+        self.pane_id
+    }
+
+    fn rect(&self) -> ExtensionRect {
+        self.rect
+    }
+
+    fn content_rect(&self) -> ExtensionRect {
+        self.content_rect
+    }
+
+    fn focused(&self) -> bool {
+        self.focused
+    }
+
+    fn grid_revision(&self) -> u64 {
+        self.buffer.terminal_grid.grid().revision()
+    }
+
+    fn width(&self) -> u16 {
+        self.content_rect.w
+    }
+
+    fn height(&self) -> u16 {
+        self.content_rect.h
+    }
+
+    fn cell(&self, x: u16, y: u16) -> Option<AttachVisualCellRef<'_>> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+        let cell = self
+            .buffer
+            .terminal_grid
+            .grid()
+            .viewport_row_ref(usize::from(y))?
+            .cells()
+            .get(usize::from(x))?;
+        Some(AttachVisualCellRef {
+            text: cell.text(),
+            width: cell.width(),
+            wide_continuation: cell.is_wide_continuation(),
+        })
+    }
+}
+
+#[must_use]
+pub fn collect_visual_projection_updates(
+    scene: &AttachScene,
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+) -> Vec<AttachVisualProjectionUpdate> {
+    if !render_extensions
+        .iter()
+        .any(|extension| !extension.visual_adapter_requests().is_empty())
+    {
+        return Vec::new();
+    }
+
+    let focused_surface_id = match scene.focus {
+        AttachFocusTarget::Surface { surface_id } => Some(surface_id),
+        _ => None,
+    };
+    let focused_pane_id = match scene.focus {
+        AttachFocusTarget::Pane { pane_id } => Some(pane_id),
+        _ => None,
+    };
+    let surfaces = scene
+        .surfaces
+        .iter()
+        .filter_map(|surface| {
+            if !surface.visible
+                || !matches!(
+                    surface.kind,
+                    AttachSurfaceKind::Pane | AttachSurfaceKind::FloatingPane
+                )
+            {
+                return None;
+            }
+            let pane_id = surface.pane_id?;
+            let buffer = pane_buffers.get(&pane_id)?;
+            Some(AttachVisualSurfaceSnapshot {
+                surface_id: surface.id,
+                pane_id,
+                rect: ExtensionRect::new(
+                    surface.rect.x,
+                    surface.rect.y,
+                    surface.rect.w,
+                    surface.rect.h,
+                ),
+                content_rect: ExtensionRect::new(
+                    surface.content_rect.x,
+                    surface.content_rect.y,
+                    surface.content_rect.w,
+                    surface.content_rect.h,
+                ),
+                focused: surface.cursor_owner
+                    || focused_surface_id == Some(surface.id)
+                    || focused_pane_id == Some(pane_id),
+                buffer,
+            })
+        })
+        .collect::<Vec<_>>();
+    if surfaces.is_empty() {
+        return Vec::new();
+    }
+
+    let frame = AttachVisualFrameSnapshot { surfaces };
+    let mut updates = Vec::new();
+    for extension in render_extensions {
+        extension.observe_visual_frame(&frame, &mut updates);
+    }
+    updates
 }
 
 #[allow(

@@ -12,7 +12,7 @@ use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
-use bmux_plugin::AttachInputHook;
+use bmux_plugin::{AttachInputHook, AttachVisualProjectionUpdate};
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
@@ -278,6 +278,7 @@ pub struct AttachViewState {
     pub last_cursor_state: Option<AttachCursorState>,
     pub force_cursor_move_next_frame: bool,
     pub mouse: AttachMouseState,
+    pub visual_projection_updates: Vec<AttachVisualProjectionUpdate>,
     pub dirty: AttachDirtyFlags,
 
     // -- Image protocol support (feature-gated) --
@@ -520,6 +521,7 @@ impl AttachViewState {
                 config: MouseBehaviorConfig::default(),
                 ..AttachMouseState::default()
             },
+            visual_projection_updates: Vec::new(),
             dirty: AttachDirtyFlags::default(),
             #[cfg(any(
                 feature = "image-sixel",

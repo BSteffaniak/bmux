@@ -84,9 +84,10 @@ use super::prompt_ui::{
     AttachPromptOrigin, AttachPromptOverlayRender, PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, frame_damage_overlay_rects,
-    frame_damage_overlay_render_ops, opaque_row_text, queue_render_ops,
-    render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
+    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats,
+    collect_visual_projection_updates, frame_damage_overlay_rects, frame_damage_overlay_render_ops,
+    opaque_row_text, queue_render_ops, render_attach_scene_with_stats_and_trace,
+    visible_scene_pane_ids,
 };
 use super::state::{
     AttachDirtySource, AttachEventAction, AttachExitReason, AttachInputHookCapture,
@@ -325,6 +326,7 @@ const fn empty_decoration_scene() -> bmux_scene_protocol::scene_protocol::Decora
         surfaces: BTreeMap::new(),
         animation: None,
         input_hooks: Vec::new(),
+        visual_adapters: Vec::new(),
     }
 }
 
@@ -1695,6 +1697,10 @@ fn install_bundled_render_extensions() {
     {
         bmux_decoration_plugin_renderer::install();
     }
+    #[cfg(feature = "bundled-visual-adapters")]
+    {
+        bmux_visual_adapters_plugin_renderer::install();
+    }
 }
 
 #[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
@@ -2543,6 +2549,7 @@ pub async fn run_session_attach_with_client(
                 render_geometry,
                 None,
             )?;
+            flush_visual_projection_updates(&mut client, &mut view_state).await;
             let render_ms = duration_millis_u64(render_started_at.elapsed());
             if render_ms >= attach_config.logs.client.slow_frame_ms {
                 tracing::warn!(
@@ -2822,6 +2829,7 @@ pub async fn run_session_attach_with_client(
             render_geometry,
             None,
         )?;
+        flush_visual_projection_updates(&mut client, &mut view_state).await;
         let render_ms = duration_millis_u64(render_started_at.elapsed());
         if render_ms >= attach_config.logs.client.slow_frame_ms {
             tracing::warn!(
@@ -3245,6 +3253,15 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
+        } else if let Err(error) = bmux_plugin::global_event_bus().emit_from_bytes(
+            &bmux_plugin::PluginEventKind::from_owned(kind.clone()),
+            payload,
+        ) {
+            tracing::debug!(
+                kind = %kind,
+                error = %error,
+                "forwarded plugin-bus payload did not match a local typed channel",
+            );
         }
     } else {
         let control = handle_attach_loop_event(
@@ -3270,6 +3287,26 @@ async fn handle_attach_stream_server_event(
         control: AttachLoopControl::Continue,
         image_fetch_requested,
     })
+}
+
+async fn flush_visual_projection_updates(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) {
+    let updates = std::mem::take(&mut view_state.visual_projection_updates);
+    for update in updates {
+        if let Err(error) = client
+            .emit_on_plugin_bus(update.event_kind.as_str(), update.payload)
+            .await
+        {
+            tracing::debug!(
+                request_id = %update.request_id,
+                event_kind = %update.event_kind,
+                %error,
+                "emit_on_plugin_bus for visual projection failed",
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -6017,6 +6054,13 @@ pub fn render_attach_frame(
         // keeps the per-surface loop inside `render_attach_scene`
         // free of registry-lock churn.
         let extensions = bmux_plugin::registered_render_extensions();
+        view_state
+            .visual_projection_updates
+            .extend(collect_visual_projection_updates(
+                &layout_state.scene,
+                &view_state.pane_buffers,
+                &extensions,
+            ));
         let (cursor_state, stats) = render_attach_scene_with_stats_and_trace(
             &mut frame_bytes,
             &layout_state.scene,

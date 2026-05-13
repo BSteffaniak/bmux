@@ -93,6 +93,7 @@ fn decoration_scene_round_trips_through_json() {
         surfaces,
         animation: None,
         input_hooks: Vec::new(),
+        visual_adapters: Vec::new(),
     };
 
     let json = serde_json::to_string(&scene).expect("scene encodes");

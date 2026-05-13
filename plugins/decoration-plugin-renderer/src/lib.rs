@@ -33,18 +33,20 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use bmux_plugin::{
     AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
+    AttachVisualAdapterRequest, AttachVisualFrameView, AttachVisualProjectionUpdate,
     BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
     RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
-    render_single_display_cell_char, render_text_width_u16,
+    registered_visual_adapter, render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs as SceneBorderGlyphs, Cell as SceneCell, Color as SceneColor, DecorationScene,
     GradientAxis, NamedColor, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
-    Style as SceneStyle, SurfaceDecoration,
+    Style as SceneStyle, SurfaceDecoration, VisualAdapterRequest,
 };
 use bmux_scene_protocol_render::paint::{apply_paint_commands, interpolate_style};
 use uuid::Uuid;
@@ -58,6 +60,8 @@ struct DecorationRendererCache {
     surfaces: BTreeMap<Uuid, SurfaceDecoration>,
     rendered_surfaces: BTreeMap<Uuid, SurfaceDecoration>,
     scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
+    visual_last_at: BTreeMap<String, Instant>,
+    visual_last_revision: BTreeMap<String, u64>,
 }
 
 impl DecorationRendererCache {
@@ -294,6 +298,110 @@ impl AttachRenderExtension for DecorationRenderExtension {
             .unwrap_or_default()
     }
 
+    fn visual_adapter_requests(&self) -> Vec<AttachVisualAdapterRequest> {
+        let Ok(cache) = self.cache.lock() else {
+            return Vec::new();
+        };
+        cache
+            .scene_rx
+            .as_ref()
+            .map(|rx| {
+                rx.borrow()
+                    .visual_adapters
+                    .iter()
+                    .map(scene_visual_adapter_request_to_attach)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn observe_visual_frame(
+        &self,
+        frame: &dyn AttachVisualFrameView,
+        updates: &mut Vec<AttachVisualProjectionUpdate>,
+    ) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        let requests = cache
+            .scene_rx
+            .as_ref()
+            .map(|rx| {
+                rx.borrow()
+                    .visual_adapters
+                    .iter()
+                    .map(scene_visual_adapter_request_to_attach)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let now = Instant::now();
+        for request in requests {
+            let min_interval = Duration::from_millis(request.min_interval_ms());
+            if !min_interval.is_zero()
+                && cache
+                    .visual_last_at
+                    .get(&request.id)
+                    .is_some_and(|last| now.duration_since(*last) < min_interval)
+            {
+                continue;
+            }
+            let Some(adapter) = registered_visual_adapter(&request.adapter) else {
+                continue;
+            };
+            let mut delivered = false;
+            for index in 0..frame.surface_count() {
+                let Some(surface) = frame.surface(index) else {
+                    continue;
+                };
+                if request.scope == "focused-pane" && !surface.focused() {
+                    continue;
+                }
+                let revision_key = format!("{}:{}", request.id, surface.surface_id());
+                if request.dirty_only
+                    && cache
+                        .visual_last_revision
+                        .get(&revision_key)
+                        .is_some_and(|revision| *revision == surface.grid_revision())
+                {
+                    continue;
+                }
+                let mut scratch = Vec::new();
+                match adapter.project(surface, &request, &mut scratch) {
+                    Ok(output) if output.payload.len() <= request.max_bytes as usize => {
+                        cache
+                            .visual_last_revision
+                            .insert(revision_key, surface.grid_revision());
+                        updates.push(AttachVisualProjectionUpdate {
+                            request_id: request.id.clone(),
+                            event_kind: request.event_kind.clone(),
+                            payload: output.payload,
+                        });
+                        delivered = true;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            request_id = %request.id,
+                            adapter = %request.adapter,
+                            max_bytes = request.max_bytes,
+                            "visual adapter output exceeded request limit",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            request_id = %request.id,
+                            adapter = %request.adapter,
+                            %error,
+                            "visual adapter projection failed",
+                        );
+                    }
+                }
+            }
+            if delivered {
+                cache.visual_last_at.insert(request.id.clone(), now);
+            }
+        }
+    }
+
     fn surface_removed(&self, surface_id: Uuid) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.forget_surface(&surface_id);
@@ -327,6 +435,23 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
         y: rect.y,
         w: rect.w,
         h: rect.h,
+    }
+}
+
+fn scene_visual_adapter_request_to_attach(
+    request: &VisualAdapterRequest,
+) -> AttachVisualAdapterRequest {
+    AttachVisualAdapterRequest {
+        id: request.id.clone(),
+        adapter: request.adapter.clone(),
+        owner_plugin_id: request.owner_plugin_id.clone(),
+        event_kind: request.event_kind.clone(),
+        scope: request.scope.clone(),
+        area: request.area.clone(),
+        max_hz: request.max_hz,
+        dirty_only: request.dirty_only,
+        max_bytes: request.max_bytes,
+        settings: request.settings.clone(),
     }
 }
 
@@ -870,6 +995,7 @@ pub fn install() {
                 surfaces: BTreeMap::new(),
                 animation: None,
                 input_hooks: Vec::new(),
+                visual_adapters: Vec::new(),
             },
         );
         match bmux_plugin::global_event_bus().subscribe_state::<DecorationScene>(&SCENE_STATE_KIND)
@@ -957,6 +1083,8 @@ mod tests {
             surfaces: BTreeMap::from([(surface_id, surface(surface_id, paint_commands))]),
             rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
+            visual_last_at: BTreeMap::new(),
+            visual_last_revision: BTreeMap::new(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -973,6 +1101,7 @@ mod tests {
             surfaces: BTreeMap::new(),
             animation: None,
             input_hooks: Vec::new(),
+            visual_adapters: Vec::new(),
         };
         let updated = DecorationScene {
             revision: 2,
@@ -991,6 +1120,7 @@ mod tests {
             )]),
             animation: None,
             input_hooks: Vec::new(),
+            visual_adapters: Vec::new(),
         };
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(initial));
         let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));

@@ -963,6 +963,14 @@ impl TerminalGrid {
         }
     }
 
+    #[must_use]
+    pub fn viewport_row_ref(&self, row: usize) -> Option<&PhysicalRow> {
+        match self.mode {
+            GridMode::Main => self.main_rows.get(row),
+            GridMode::Alternate => self.alt_rows.get(row),
+        }
+    }
+
     pub(crate) fn display_rows_unpadded(
         &self,
         scrollback_offset: usize,

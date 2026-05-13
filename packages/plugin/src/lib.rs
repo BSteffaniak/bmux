@@ -64,11 +64,14 @@ pub use registry::{
 pub use render::{
     AttachInputEndpoint, AttachInputEvent, AttachInputHook, AttachInputHookFilter,
     AttachInputModifiers, AttachInputPaneContext, AttachInputResult, AttachRenderExtension,
-    BorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage, RenderExtensionLayer,
-    RenderExtensionRegistry, RenderNamedColor, RenderOp, RenderStyle, RenderTextSpan,
-    RenderUnderCell, clip_render_text_run_to_rect, global_render_extension_registry,
-    register_render_extension, registered_render_extensions, render_char_display_width_u16,
-    render_single_display_cell_char, render_text_width_u16,
+    AttachVisualAdapter, AttachVisualAdapterOutput, AttachVisualAdapterRequest,
+    AttachVisualCellRef, AttachVisualFrameView, AttachVisualProjectionUpdate,
+    AttachVisualSurfaceView, BorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
+    RenderExtensionLayer, RenderExtensionRegistry, RenderNamedColor, RenderOp, RenderStyle,
+    RenderTextSpan, RenderUnderCell, VisualAdapterRegistry, clip_render_text_run_to_rect,
+    global_render_extension_registry, global_visual_adapter_registry, register_render_extension,
+    register_visual_adapter, registered_render_extensions, registered_visual_adapter,
+    render_char_display_width_u16, render_single_display_cell_char, render_text_width_u16,
 };
 pub use service_location::{ServiceLocation, ServiceLocationMap, global_service_locations};
 pub use startup_gate::{

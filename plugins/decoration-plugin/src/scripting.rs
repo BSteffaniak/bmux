@@ -126,6 +126,7 @@ pub struct ScriptRenderMessage {
     pub time_ms: u64,
     pub frame: u64,
     pub panes: JsonValue,
+    pub visual: JsonValue,
     pub component: Option<ScriptComponentMessage>,
 }
 
@@ -554,6 +555,7 @@ mod lua_backend {
                 t.set("time_ms", render.time_ms)?;
                 t.set("frame", render.frame)?;
                 t.set("panes", json_to_lua(lua, &render.panes)?)?;
+                t.set("visual", json_to_lua(lua, &render.visual)?)?;
                 if let Some(component) = &render.component {
                     let component_table = lua.create_table()?;
                     component_table.set("id", component.id.as_str())?;
@@ -1115,6 +1117,7 @@ mod tests {
                         "status": "running"
                     }
                 ]),
+                visual: json!({}),
                 component: None,
             })
         }

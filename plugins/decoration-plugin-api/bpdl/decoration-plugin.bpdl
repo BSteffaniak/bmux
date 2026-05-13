@@ -108,6 +108,28 @@ interface decoration-state {
         // Optional coarse input interest for this component. Exact
         // hit-testing remains script-owned.
         input: decoration-input-spec?,
+        // Optional attach-local visual adapter requests. Adapter ids are
+        // plugin-owned; the decoration plugin only forwards compact adapter
+        // payloads to Lua under `message.visual`.
+        visual-adapters: list<decoration-visual-adapter-spec>?,
+    }
+
+    record decoration-visual-adapter-spec {
+        id: string,
+        adapter: string,
+        scope: string?,
+        area: string?,
+        max-hz: u16?,
+        dirty-only: bool?,
+        max-bytes: u32?,
+        settings: map<string, string>?,
+    }
+
+    record decoration-visual-projection-snapshot {
+        revision: u64,
+        request-id: string,
+        adapter: string,
+        payload: string,
     }
 
     // Coarse input filter used to install efficient attach-side hooks.

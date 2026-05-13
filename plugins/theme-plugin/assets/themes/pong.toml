@@ -87,8 +87,18 @@ script          = "pong"
 script_instance = "pong"
 
 [plugins."bmux.decoration".components."pong.ball".settings]
-rally_ms    = "5500"
-win_hold_ms = "3500"
+content_bounce = "false"
+rally_ms       = "5500"
+win_hold_ms    = "3500"
+
+[[plugins."bmux.decoration".components."pong.ball".visual_adapters]]
+adapter    = "bmux.visual.presence-bitset"
+area       = "content"
+dirty_only = true
+id         = "pong.content-presence"
+max_bytes  = 16384
+max_hz     = 30
+scope      = "focused-pane"
 
 [plugins."bmux.decoration".components."pong.ball".input]
 keys            = ["up", "down", "esc"]
@@ -103,8 +113,9 @@ script          = "pong"
 script_instance = "pong"
 
 [plugins."bmux.decoration".components."pong.paddles".settings]
-rally_ms    = "5500"
-win_hold_ms = "3500"
+content_bounce = "false"
+rally_ms       = "5500"
+win_hold_ms    = "3500"
 
 [plugins."bmux.decoration".components."pong.paddles".input]
 keys            = ["up", "down", "esc"]
@@ -119,8 +130,9 @@ script          = "pong"
 script_instance = "pong"
 
 [plugins."bmux.decoration".components."pong.score".settings]
-rally_ms    = "5500"
-win_hold_ms = "3500"
+content_bounce = "false"
+rally_ms       = "5500"
+win_hold_ms    = "3500"
 
 [plugins."bmux.decoration".components."pong.score".input]
 keys            = ["up", "down", "esc"]

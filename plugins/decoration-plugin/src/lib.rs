@@ -26,8 +26,8 @@ use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService,
 use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
     BorderSpec, BorderStyle, DecorationComponentSpec, DecorationInputSpec, DecorationStateService,
-    DecorationThemeExtension, PaneActivity, PaneDecoration, PaneGeometry, PaneLifecycle,
-    SetStyleError, ValidationError, ValidationResult,
+    DecorationThemeExtension, DecorationVisualAdapterSpec, PaneActivity, PaneDecoration,
+    PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
@@ -35,6 +35,7 @@ use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs, Color, DecorationScene, GradientAxis, InputHook, InputHookEndpoint,
     InputHookFilter, InteractiveRegion, NamedColor, PaintCommand, Rect, Style, SurfaceDecoration,
+    VisualAdapterRequest,
 };
 use uuid::Uuid;
 
@@ -144,6 +145,8 @@ struct State {
     /// Monotonic generation used to stop stale subscription threads
     /// after a theme/script reload.
     script_subscription_generation: u64,
+    /// Latest compact attach-local visual adapter payloads, keyed by request id.
+    visual_projections: BTreeMap<String, serde_json::Value>,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
     /// Diagnostic flag flipped on the first frame where the script was
@@ -596,6 +599,7 @@ fn build_scene(state: &mut State) -> DecorationScene {
         surfaces,
         animation: None,
         input_hooks: input_hooks_for_state(state),
+        visual_adapters: visual_adapter_requests_for_state(state),
     }
 }
 
@@ -622,6 +626,16 @@ fn script_pane_payload(state: &State, pane_id: Uuid) -> Option<serde_json::Value
             PaneLifecycle::Exited => "exited",
         },
     }))
+}
+
+fn script_visual_payload(state: &State) -> serde_json::Value {
+    serde_json::Value::Object(
+        state
+            .visual_projections
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 fn rect_json(rect: &Rect) -> serde_json::Value {
@@ -676,6 +690,7 @@ fn merge_script_paint_commands(
         time_ms,
         frame: state.script_frame,
         panes: script_panes_payload(state),
+        visual: script_visual_payload(state),
         component: None,
     });
     let outcome = match backend.invoke(&render) {
@@ -723,6 +738,7 @@ fn merge_script_paint_commands(
 
 struct ComponentRenderPassState<'a> {
     panes: &'a serde_json::Value,
+    visual: serde_json::Value,
     instance_frames: BTreeMap<String, (u64, u64)>,
     event_instances: BTreeSet<String>,
 }
@@ -733,8 +749,10 @@ fn merge_component_paint_commands(
 ) {
     let order = ordered_enabled_component_ids(state);
     let panes = script_panes_payload(state);
+    let visual = script_visual_payload(state);
     let mut pass = ComponentRenderPassState {
         panes: &panes,
+        visual,
         instance_frames: BTreeMap::new(),
         event_instances: BTreeSet::new(),
     };
@@ -810,6 +828,7 @@ fn merge_component_paint_commands_for_id(
         time_ms,
         frame,
         panes: pass.panes.clone(),
+        visual: pass.visual.clone(),
         component: Some(ScriptComponentMessage {
             id: component.id.clone(),
             entrypoint: component.spec.entrypoint.clone(),
@@ -1053,6 +1072,42 @@ fn input_hooks_for_state(state: &State) -> Vec<InputHook> {
     }]
 }
 
+fn visual_adapter_requests_for_state(state: &State) -> Vec<VisualAdapterRequest> {
+    let Some(theme) = state.current_theme.as_ref() else {
+        return Vec::new();
+    };
+    let mut requests = Vec::new();
+    if let Some(components) = theme.components.as_ref() {
+        for component in components.values() {
+            let Some(specs) = component.visual_adapters.as_ref() else {
+                continue;
+            };
+            for spec in specs {
+                requests.push(visual_adapter_request_from_spec(spec));
+            }
+        }
+    }
+    requests
+}
+
+fn visual_adapter_request_from_spec(spec: &DecorationVisualAdapterSpec) -> VisualAdapterRequest {
+    VisualAdapterRequest {
+        id: spec.id.clone(),
+        adapter: spec.adapter.clone(),
+        owner_plugin_id: DECORATION_PLUGIN_ID.to_string(),
+        event_kind: "bmux.decoration/visual-projection".to_string(),
+        scope: spec
+            .scope
+            .clone()
+            .unwrap_or_else(|| "focused-pane".to_string()),
+        area: spec.area.clone().unwrap_or_else(|| "content".to_string()),
+        max_hz: spec.max_hz.unwrap_or(30),
+        dirty_only: spec.dirty_only.unwrap_or(true),
+        max_bytes: spec.max_bytes.unwrap_or(16 * 1024),
+        settings: spec.settings.clone().unwrap_or_default(),
+    }
+}
+
 fn combine_input_specs(specs: &[&DecorationInputSpec]) -> Option<InputHookFilter> {
     let mut mouse = BTreeSet::new();
     let mut keys = BTreeSet::new();
@@ -1120,6 +1175,7 @@ fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
 const DECORATION_PLUGIN_ID: &str = "bmux.decoration";
 const DECORATION_INPUT_INTERFACE_ID: &str = "decoration-input-hooks";
 const DECORATION_INPUT_OPERATION: &str = "handle-input";
+const DECORATION_VISUAL_PROJECTION_KIND: &str = "bmux.decoration/visual-projection";
 
 /// Build the four edge regions (top / bottom / left / right) of a
 /// pane border as [`InteractiveRegion`]s owned by the decoration
@@ -1182,6 +1238,7 @@ fn empty_scene() -> DecorationScene {
         surfaces: BTreeMap::new(),
         animation: None,
         input_hooks: Vec::new(),
+        visual_adapters: Vec::new(),
     }
 }
 
@@ -1217,6 +1274,7 @@ fn scene_output_matches(left: &DecorationScene, right: &DecorationScene) -> bool
     left.surfaces == right.surfaces
         && left.animation == right.animation
         && left.input_hooks == right.input_hooks
+        && left.visual_adapters == right.visual_adapters
 }
 
 /// Parse a TOML string against the [`DecorationThemeExtension`]
@@ -2207,7 +2265,13 @@ impl RustPlugin for DecorationPlugin {
                     revision: 0,
                 },
             );
+        let _ = bmux_plugin::global_event_bus()
+            .register_state_channel_with_decoder::<serde_json::Value>(
+                plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string()),
+                serde_json::json!({}),
+            );
         spawn_attach_layout_subscriber(self.state.clone_arc());
+        spawn_visual_projection_subscriber(self.state.clone_arc());
         Ok(EXIT_OK)
     }
 
@@ -2879,6 +2943,55 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
             tracing::debug!("attach-layout subscriber loop exited");
         });
     });
+}
+
+fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
+    let event_kind = plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string());
+    let Ok((initial, mut rx)) =
+        bmux_plugin::global_event_bus().subscribe_state::<serde_json::Value>(&event_kind)
+    else {
+        tracing::warn!(
+            kind = DECORATION_VISUAL_PROJECTION_KIND,
+            "visual projection subscribe failed"
+        );
+        return;
+    };
+    if let Ok(mut guard) = state.lock() {
+        apply_visual_projection(&mut guard, initial.as_ref());
+    }
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("visual projection subscriber FAILED to build tokio runtime");
+            return;
+        };
+        rt.block_on(async move {
+            while rx.changed().await.is_ok() {
+                let snapshot = rx.borrow().clone();
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_visual_projection(&mut guard, snapshot.as_ref());
+            }
+        });
+    });
+}
+
+fn apply_visual_projection(state: &mut State, payload: &serde_json::Value) {
+    let Some(request_id) = payload
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let previous = state
+        .visual_projections
+        .insert(request_id.to_string(), payload.clone());
+    if previous.as_ref() != Some(payload) {
+        bump_revision(state);
+    }
 }
 
 /// Reconcile `state.geometry` against an [`AttachLayoutSnapshot`].
@@ -4515,6 +4628,7 @@ exited = ""
                     priority: Some(42),
                     min_interval_ms: Some(16),
                 }),
+                visual_adapters: None,
             },
         )]));
         install_theme(&plugin, theme);
