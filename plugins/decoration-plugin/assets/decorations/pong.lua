@@ -161,9 +161,11 @@ local function serve(game, scorer)
     local side_x = dir < 0 and 0 or (game.w - 1)
     local travel_ms = math.abs((side_x - game.x) / game.vx)
     local predicted = reflected_y(game.y, game.vy, travel_ms, game.h)
-    local center_y = (game.h - 1) / 2
-    local uncertainty = rand_range(game.seed, game.rally, 91, -1.2, 1.2)
-    receiver.target = clamp(predicted * 0.45 + game.y * 0.25 + center_y * 0.30 + uncertainty, 0, game.h - 1)
+    if not receiver.manual then
+        local center_y = (game.h - 1) / 2
+        local uncertainty = rand_range(game.seed, game.rally, 91, -1.2, 1.2)
+        receiver.target = clamp(predicted * 0.45 + game.y * 0.25 + center_y * 0.30 + uncertainty, 0, game.h - 1)
+    end
 end
 
 local function dynamic_prediction(game, player, side, travel_ms)
