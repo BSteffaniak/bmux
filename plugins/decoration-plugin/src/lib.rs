@@ -31,7 +31,7 @@ use bmux_decoration_plugin_api::decoration_state::{
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{HostAsyncHandle, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs, Color, DecorationScene, GradientAxis, InputHook, InputHookEndpoint,
     InputHookFilter, InteractiveRegion, NamedColor, PaintCommand, Rect, Style, SurfaceDecoration,
@@ -151,6 +151,10 @@ struct State {
     visual_projection_bytes: BTreeMap<String, Vec<u8>>,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
+    /// Host async runtime handle supplied by in-process activation.
+    /// Used to drive long-lived watch subscribers without constructing
+    /// plugin-local tokio runtimes.
+    host_async_handle: Option<HostAsyncHandle>,
     /// Diagnostic flag flipped on the first frame where the script was
     /// actually invoked against at least one pane's geometry. Paired
     /// with a one-shot info log so we can confirm the full
@@ -1464,6 +1468,22 @@ fn plugin_event_kind_from_string(kind: String) -> bmux_plugin_sdk::PluginEventKi
     bmux_plugin_sdk::PluginEventKind::from_static(Box::leak(kind.into_boxed_str()))
 }
 
+fn spawn_local_current_thread_runtime(
+    label: &'static str,
+    task: impl Future<Output = ()> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("{label} FAILED to build tokio runtime");
+            return;
+        };
+        rt.block_on(task);
+    });
+}
+
 fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generation: u64) {
     let event_kind = plugin_event_kind_from_string(kind.to_string());
     let Ok((initial, mut rx)) = bmux_plugin::global_event_bus().subscribe_state_json(&event_kind)
@@ -1475,23 +1495,23 @@ fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generat
         return;
     };
     enqueue_script_json_event(&state, initial.as_ref(), true, generation);
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::error!("script state subscriber FAILED to build tokio runtime");
-            return;
-        };
-        rt.block_on(async move {
-            while rx.changed().await.is_ok() {
-                let event = rx.borrow().clone();
-                if !enqueue_script_json_event(&state, event.as_ref(), false, generation) {
-                    break;
-                }
+    let host_async_handle = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.host_async_handle.clone());
+    let task = async move {
+        while rx.changed().await.is_ok() {
+            let event = rx.borrow().clone();
+            if !enqueue_script_json_event(&state, event.as_ref(), false, generation) {
+                break;
             }
-        });
-    });
+        }
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.script_state_subscriber", task);
+    } else {
+        spawn_local_current_thread_runtime("script state subscriber", task);
+    }
 }
 
 fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, generation: u64) {
@@ -2281,6 +2301,17 @@ impl RustPlugin for DecorationPlugin {
         Ok(EXIT_OK)
     }
 
+    fn activate_with_async(
+        &mut self,
+        context: NativeLifecycleContext,
+        async_handle: HostAsyncHandle,
+    ) -> Result<i32, PluginCommandError> {
+        if let Ok(mut guard) = self.state.inner.lock() {
+            guard.host_async_handle = Some(async_handle);
+        }
+        self.activate(context)
+    }
+
     fn register_typed_services(
         &self,
         _context: TypedServiceRegistrationContext<'_>,
@@ -2815,34 +2846,30 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
     if let Ok(mut guard) = state.lock() {
         apply_focus_state_map(&mut guard, initial.as_ref());
     }
-    std::thread::spawn(move || {
-        // Drive the watch receiver on a dedicated tokio runtime — we
-        // don't have an ambient runtime at this call site and the
-        // thread is plugin-lifetime long anyway, so the one-time
-        // construction cost is acceptable.
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::error!("focus-state subscriber thread FAILED to build tokio runtime");
-            return;
-        };
-        rt.block_on(async move {
-            while rx.changed().await.is_ok() {
-                let snapshot = rx.borrow().clone();
-                tracing::trace!(
-                    entries = snapshot.entries.len(),
-                    revision = snapshot.revision,
-                    "focus-state update"
-                );
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_focus_state_map(&mut guard, snapshot.as_ref());
-            }
-            tracing::debug!("focus-state subscriber loop exited");
-        });
-    });
+    let host_async_handle = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.host_async_handle.clone());
+    let task = async move {
+        while rx.changed().await.is_ok() {
+            let snapshot = rx.borrow().clone();
+            tracing::trace!(
+                entries = snapshot.entries.len(),
+                revision = snapshot.revision,
+                "focus-state update"
+            );
+            let Ok(mut guard) = state.lock() else {
+                break;
+            };
+            apply_focus_state_map(&mut guard, snapshot.as_ref());
+        }
+        tracing::debug!("focus-state subscriber loop exited");
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.focus_state_subscriber", task);
+    } else {
+        spawn_local_current_thread_runtime("focus-state subscriber", task);
+    }
 }
 
 /// Reconcile the decoration plugin's `state.activity` map against a
@@ -2925,30 +2952,30 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
     if let Ok(mut guard) = state.lock() {
         apply_attach_layout_snapshot(&mut guard, initial.as_ref());
     }
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::error!("attach-layout subscriber FAILED to build tokio runtime");
-            return;
-        };
-        rt.block_on(async move {
-            while rx.changed().await.is_ok() {
-                let snapshot = rx.borrow().clone();
-                tracing::trace!(
-                    surfaces = snapshot.surfaces.len(),
-                    revision = snapshot.revision,
-                    "attach-layout update"
-                );
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_attach_layout_snapshot(&mut guard, snapshot.as_ref());
-            }
-            tracing::debug!("attach-layout subscriber loop exited");
-        });
-    });
+    let host_async_handle = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.host_async_handle.clone());
+    let task = async move {
+        while rx.changed().await.is_ok() {
+            let snapshot = rx.borrow().clone();
+            tracing::trace!(
+                surfaces = snapshot.surfaces.len(),
+                revision = snapshot.revision,
+                "attach-layout update"
+            );
+            let Ok(mut guard) = state.lock() else {
+                break;
+            };
+            apply_attach_layout_snapshot(&mut guard, snapshot.as_ref());
+        }
+        tracing::debug!("attach-layout subscriber loop exited");
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.attach_layout_subscriber", task);
+    } else {
+        spawn_local_current_thread_runtime("attach-layout subscriber", task);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -3013,24 +3040,24 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     if let Ok(mut guard) = state.lock() {
         apply_visual_projection(&mut guard, initial.as_ref());
     }
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::error!("visual projection subscriber FAILED to build tokio runtime");
-            return;
-        };
-        rt.block_on(async move {
-            while rx.changed().await.is_ok() {
-                let snapshot = rx.borrow().clone();
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_visual_projection(&mut guard, snapshot.as_ref());
-            }
-        });
-    });
+    let host_async_handle = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.host_async_handle.clone());
+    let task = async move {
+        while rx.changed().await.is_ok() {
+            let snapshot = rx.borrow().clone();
+            let Ok(mut guard) = state.lock() else {
+                break;
+            };
+            apply_visual_projection(&mut guard, snapshot.as_ref());
+        }
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.visual_projection_subscriber", task);
+    } else {
+        spawn_local_current_thread_runtime("visual projection subscriber", task);
+    }
 }
 
 fn apply_visual_projection(state: &mut State, projection: &VisualProjectionState) {

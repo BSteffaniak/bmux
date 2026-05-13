@@ -1806,6 +1806,7 @@ dependencies = [
  "bmux_perf_telemetry",
  "serde",
  "serde_json",
+ "switchy",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
@@ -9863,6 +9864,7 @@ dependencies = [
  "switchy_upnp",
  "switchy_uuid",
  "switchy_web_server",
+ "switchy_web_server_core",
  "tokio",
 ]
 

@@ -1434,7 +1434,15 @@ pub(super) fn activate_loaded_plugins(
             registered_plugins.clone(),
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
-        if let Err(error) = plugin.activate(&context) {
+        // `map_or_else` trips `result_large_err` here because plugin activation
+        // returns the repository-wide `PluginError`; the explicit match keeps the
+        // large error type out of closure signatures.
+        #[allow(clippy::option_if_let_else)]
+        let activate_result = match bmux_plugin_sdk::HostAsyncHandle::try_current() {
+            Ok(async_handle) => plugin.activate_with_async(&context, async_handle),
+            Err(_) => plugin.activate(&context),
+        };
+        if let Err(error) = activate_result {
             emit_plugin_runtime_phase_timing(
                 &PhasePayload::new("plugin.lifecycle.activate")
                     .field("plugin_id", plugin.declaration.id.as_str())

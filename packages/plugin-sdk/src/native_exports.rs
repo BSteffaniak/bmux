@@ -5,6 +5,7 @@ use crate::{
 };
 use std::cell::RefCell;
 use std::ffi::{CString, c_char};
+use std::future::Future;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
@@ -235,6 +236,26 @@ pub trait RustPlugin: Default + Send + 'static {
         Ok(EXIT_OK)
     }
 
+    /// Called when the plugin is activated by an in-process host that can
+    /// provide access to its existing async runtime.
+    ///
+    /// The default delegates to [`Self::activate`], preserving synchronous
+    /// lifecycle behavior for plugins that do not need background async work.
+    /// Dynamic/process plugin backends continue to use [`Self::activate`]
+    /// because runtime handles are intentionally not serialized across plugin
+    /// boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] if activation fails.
+    fn activate_with_async(
+        &mut self,
+        context: NativeLifecycleContext,
+        _async_handle: HostAsyncHandle,
+    ) -> Result<i32, PluginCommandError> {
+        self.activate(context)
+    }
+
     /// Called when the plugin is deactivated by the host.
     ///
     /// The default returns `Ok(EXIT_OK)`.
@@ -349,6 +370,61 @@ pub struct TypedServiceRegistrationContext<'a> {
     pub plugin_settings_map: &'a std::collections::BTreeMap<String, toml::Value>,
 }
 
+/// Handle for scheduling plugin-owned background work on the host's existing
+/// async runtime.
+///
+/// This wrapper is intentionally exposed only through in-process Rust plugin
+/// hooks. It is not serialized into lifecycle contexts and should not be passed
+/// across process or dynamic-library ABI boundaries.
+#[derive(Debug, Clone)]
+pub struct HostAsyncHandle {
+    inner: switchy::unsync::runtime::Handle,
+}
+
+impl HostAsyncHandle {
+    /// Wrap a switchy async runtime handle.
+    #[must_use]
+    pub const fn new(inner: switchy::unsync::runtime::Handle) -> Self {
+        Self { inner }
+    }
+
+    /// Try to capture the async runtime currently entered on this thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when no runtime is currently entered.
+    pub fn try_current() -> std::result::Result<Self, String> {
+        switchy::unsync::runtime::Handle::try_current()
+            .map(Self::new)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Spawn a named `Send` future onto the host runtime.
+    pub fn spawn<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> switchy::unsync::task::JoinHandle<T> {
+        self.inner.spawn(future)
+    }
+
+    /// Spawn a named `Send` future onto the host runtime.
+    pub fn spawn_with_name<T: Send + 'static>(
+        &self,
+        name: &str,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> switchy::unsync::task::JoinHandle<T> {
+        self.inner.spawn_with_name(name, future)
+    }
+
+    /// Spawn blocking work onto the host runtime's blocking pool.
+    pub fn spawn_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> switchy::unsync::task::JoinHandle<T> {
+        self.inner.spawn_blocking(f)
+    }
+}
+
 // ── FFI helpers ──────────────────────────────────────────────────────────────
 
 #[doc(hidden)]
@@ -369,6 +445,18 @@ pub fn register_typed_services_bundled<P: RustPlugin>(
         plugin.register_typed_services(context, &mut registry);
     }
     registry
+}
+
+/// Invoke a bundled plugin's runtime-aware activation hook.
+#[doc(hidden)]
+pub fn activate_with_async_bundled<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    context: NativeLifecycleContext,
+    async_handle: HostAsyncHandle,
+) -> i32 {
+    instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+        result_to_exit_code(plugin.activate_with_async(context, async_handle))
+    })
 }
 
 /// Collect BPDL-generated service declarations from a bundled plugin instance.

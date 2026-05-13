@@ -102,8 +102,8 @@ macro_rules! storage_key {
     }};
 }
 pub use native_exports::{
-    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,
-    TypedServiceRegistrationContext, take_last_command_error,
+    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle, PluginCommandError,
+    RustPlugin, TypedServiceRegistrationContext, take_last_command_error,
 };
 pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
@@ -304,6 +304,7 @@ pub mod prelude {
         EXIT_UNAVAILABLE,
         EXIT_USAGE,
         // Context types
+        HostAsyncHandle,
         NativeCommandContext,
         NativeLifecycleContext,
         NativeServiceContext,
@@ -341,9 +342,9 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::native_exports::{
-        activate_export, deactivate_export, declared_services_bundled, handle_event_export,
-        invoke_service_export, manifest_toml_ptr, plugin_instance, register_typed_services_bundled,
-        run_command_export,
+        activate_export, activate_with_async_bundled, deactivate_export, declared_services_bundled,
+        handle_event_export, invoke_service_export, manifest_toml_ptr, plugin_instance,
+        register_typed_services_bundled, run_command_export,
     };
 }
 
@@ -467,6 +468,13 @@ macro_rules! bundled_plugin_vtable {
             $crate::__private::activate_export(__instance(), input_ptr, input_len)
         }
 
+        fn __activate_with_async(
+            context: $crate::NativeLifecycleContext,
+            async_handle: $crate::HostAsyncHandle,
+        ) -> i32 {
+            $crate::__private::activate_with_async_bundled(__instance(), context, async_handle)
+        }
+
         fn __deactivate(input_ptr: *const u8, input_len: usize) -> i32 {
             $crate::__private::deactivate_export(__instance(), input_ptr, input_len)
         }
@@ -506,6 +514,7 @@ macro_rules! bundled_plugin_vtable {
             entry: __entry,
             run_command_with_context: __run_command_with_context,
             activate: __activate,
+            activate_with_async: __activate_with_async,
             deactivate: __deactivate,
             handle_event: __handle_event,
             invoke_service: __invoke_service,
@@ -521,6 +530,7 @@ pub struct StaticPluginVtable {
     pub entry: fn() -> *const std::ffi::c_char,
     pub run_command_with_context: fn(*const u8, usize) -> i32,
     pub activate: fn(*const u8, usize) -> i32,
+    pub activate_with_async: fn(NativeLifecycleContext, HostAsyncHandle) -> i32,
     pub deactivate: fn(*const u8, usize) -> i32,
     pub handle_event: fn(*const u8, usize) -> i32,
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,

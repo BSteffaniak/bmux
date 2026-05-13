@@ -16,6 +16,7 @@ bmux_ipc            = { workspace = true }
 bmux_perf_telemetry = { workspace = true }
 serde               = { workspace = true, features = ["derive", "std"] }
 serde_json          = { workspace = true }
+switchy             = { workspace = true, features = ["async", "async-tokio"] }
 thiserror           = { workspace = true }
 toml                = { workspace = true, features = ["parse"] }
 uuid                = { workspace = true, features = ["serde", "std"] }
@@ -25,4 +26,4 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [features]
 default          = []
-fail-on-warnings = ["bmux_codec/fail-on-warnings"]
+fail-on-warnings = ["bmux_codec/fail-on-warnings", "switchy/fail-on-warnings"]

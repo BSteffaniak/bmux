@@ -1975,6 +1975,25 @@ impl LoadedPlugin {
         self.run_lifecycle_symbol(DEFAULT_NATIVE_ACTIVATE_SYMBOL, context)
     }
 
+    /// Activate an in-process static plugin with access to the host async
+    /// runtime. Non-static backends fall back to the serialized lifecycle path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when static activation reports failure or when fallback
+    /// lifecycle dispatch fails.
+    pub fn activate_with_async(
+        &self,
+        context: &NativeLifecycleContext,
+        async_handle: bmux_plugin_sdk::HostAsyncHandle,
+    ) -> Result<i32> {
+        if let PluginBackend::Static(vtable) = &self.backend {
+            Ok((vtable.activate_with_async)(context.clone(), async_handle))
+        } else {
+            self.activate(context)
+        }
+    }
+
     /// # Errors
     ///
     /// Returns an error when the lifecycle symbol cannot be loaded or the
@@ -3149,6 +3168,7 @@ minimum = "1.0"
             entry: test_static_plugin_entry,
             run_command_with_context: test_static_plugin_command_with_context,
             activate: test_static_plugin_lifecycle,
+            activate_with_async: |_context, _async_handle| 0,
             deactivate: test_static_plugin_lifecycle,
             handle_event: test_static_plugin_event,
             invoke_service: test_static_plugin_service,
