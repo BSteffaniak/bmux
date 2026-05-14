@@ -2190,8 +2190,20 @@ impl LoadedPlugin {
             self.native_service_buffers,
             |output, output_len| call_service(&payload, output, output_len),
         )?;
-        let call_us = call_started.elapsed().as_micros();
+        let call_elapsed = call_started.elapsed();
+        let call_us = call_elapsed.as_micros();
         let output_len = output.len();
+        if call_elapsed > std::time::Duration::from_millis(100) {
+            tracing::warn!(
+                plugin_id = self.declaration.id.as_str(),
+                backend,
+                capability = context.request.service.capability.as_str(),
+                interface = context.request.service.interface_id.as_str(),
+                operation = context.request.operation.as_str(),
+                call_us,
+                "plugin native service call exceeded latency budget",
+            );
+        }
 
         let decode_started = Instant::now();
         let (_, response) =

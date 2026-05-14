@@ -348,6 +348,15 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError>;
 
+    fn set_client_write_permission(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        allowed: bool,
+    );
+
+    fn client_can_write(&self, session_id: SessionId, client_id: ClientId) -> bool;
+
     fn read_output(
         &self,
         session_id: SessionId,
@@ -803,6 +812,16 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
+    }
+    fn set_client_write_permission(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _allowed: bool,
+    ) {
+    }
+    fn client_can_write(&self, _session_id: SessionId, _client_id: ClientId) -> bool {
+        true
     }
     fn read_output(
         &self,

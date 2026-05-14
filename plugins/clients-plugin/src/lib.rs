@@ -409,7 +409,7 @@ impl RustPlugin for ClientsPlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "clients-state", "list-clients" => |_req: (), _ctx| {
                 list_clients_local()

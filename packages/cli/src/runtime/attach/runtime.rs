@@ -97,8 +97,9 @@ use super::state::{
     AttachViewState, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
-    BmuxPaneRuntimeClientExt, PaneGridWindowRequest, attach_pane_grid_delta_state_streaming,
-    attach_pane_grid_snapshot_state_streaming, attach_pane_grid_window_state_streaming,
+    BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
+    attach_pane_grid_delta_state_streaming, attach_pane_grid_snapshot_state_streaming,
+    attach_pane_grid_window_state_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use bmux_plugin::{BorderGlyphs, RenderDamage, RenderOp, RenderStyle};
@@ -9692,7 +9693,7 @@ pub async fn maybe_forward_attach_mouse_event(
     };
 
     client
-        .pane_direct_input(view_state.attached_id, target_pane, bytes)
+        .send_one_way_pane_direct_input(view_state.attached_id, target_pane, bytes)
         .await?;
     Ok(true)
 }
@@ -10600,7 +10601,7 @@ async fn send_attach_bytes_to_focused_pane(
 ) -> std::result::Result<(), ClientError> {
     if let Some(pane_id) = focused_attach_pane_id(view_state) {
         client
-            .pane_direct_input(view_state.attached_id, pane_id, bytes)
+            .send_one_way_pane_direct_input(view_state.attached_id, pane_id, bytes)
             .await?;
     }
     Ok(())

@@ -357,8 +357,8 @@ macro_rules! export_plugin {
         /// suppressed to avoid duplicate `#[no_mangle]` symbol collisions.
         #[cfg(not(feature = "static-bundled"))]
         const _: () = {
-            fn __bmux_plugin_instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
-                static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
+            fn __bmux_plugin_instance() -> &'static ::std::sync::RwLock<$plugin_ty> {
+                static INSTANCE: ::std::sync::OnceLock<::std::sync::RwLock<$plugin_ty>> =
                     ::std::sync::OnceLock::new();
                 $crate::__private::plugin_instance(&INSTANCE)
             }
@@ -448,8 +448,8 @@ macro_rules! export_plugin {
 #[macro_export]
 macro_rules! bundled_plugin_vtable {
     ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {{
-        fn __instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
-            static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
+        fn __instance() -> &'static ::std::sync::RwLock<$plugin_ty> {
+            static INSTANCE: ::std::sync::OnceLock<::std::sync::RwLock<$plugin_ty>> =
                 ::std::sync::OnceLock::new();
             $crate::__private::plugin_instance(&INSTANCE)
         }

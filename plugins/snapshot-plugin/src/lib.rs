@@ -114,7 +114,7 @@ impl RustPlugin for SnapshotPlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             bmux_snapshot_plugin_api::snapshot_state::client::StatusEndpoint => |_req, _ctx| {
                 Ok(handle_status())

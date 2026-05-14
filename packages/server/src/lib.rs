@@ -2249,6 +2249,28 @@ async fn handle_request(
             // elapsed_ms here because the explicit `info!` already
             // carries them and double-recording produces a noisy
             // `outcome="ok" outcome="ok"` in the log.
+            if elapsed > Duration::from_millis(100) {
+                let level = if elapsed > Duration::from_secs(1) {
+                    "severe"
+                } else {
+                    "degraded"
+                };
+                tracing::warn!(
+                    target: "bmux_server::invoke_service",
+                    capability = %capability,
+                    interface = %interface_id,
+                    operation = %operation,
+                    kind = ?kind,
+                    client_id = ?client_id,
+                    elapsed_ms,
+                    dispatch_micros,
+                    registry_us,
+                    resolver_us,
+                    invocation_us,
+                    level,
+                    "typed service invocation exceeded latency budget",
+                );
+            }
             if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
                 let outcome_str = match &response {
                     Response::Ok(_) => "ok",

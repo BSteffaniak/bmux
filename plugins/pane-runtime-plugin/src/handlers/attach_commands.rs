@@ -102,6 +102,37 @@ fn caller_client_id(ctx: &NativeServiceContext) -> Result<ClientId, AttachComman
         .ok_or_else(|| failed("attach operation requires a caller client id"))
 }
 
+fn session_write_allowed(
+    ctx: &NativeServiceContext,
+    session_id: SessionId,
+    client_id: ClientId,
+) -> Result<bool, AttachCommandError> {
+    let principal_id = bmux_plugin::global_plugin_state_registry()
+        .get::<bmux_client_state::ClientPrincipalHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .and_then(|handle| handle.0.get(client_id))
+        .unwrap_or_else(Uuid::nil);
+
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+    match bmux_plugin::block_on_typed_dispatch(
+        bmux_permissions_plugin_api::session_policy_state::client::check(
+            &mut client,
+            session_id.0,
+            None,
+            client_id.0,
+            principal_id,
+            "pane.direct_input".to_string(),
+            None,
+            None,
+            None,
+        ),
+    ) {
+        Ok(response) => Ok(response.allowed),
+        Err(err) if err.to_string().contains("unsupported") => Ok(true),
+        Err(err) => Err(failed(format!("session policy check failed: {err}"))),
+    }
+}
+
 fn publish_pane_event(event: PaneEvent) {
     let _ = bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event);
 }
@@ -173,6 +204,9 @@ fn retarget_attach_stream(
     match retarget_result {
         Ok(viewport) => {
             if let Some(prev) = previous_to_detach {
+                runtime
+                    .0
+                    .set_client_write_permission(prev, client_id, false);
                 publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
             }
             follow
@@ -388,6 +422,9 @@ pub fn attach_open(
         && prev != session_id
     {
         runtime.0.end_attach(prev, client_id);
+        runtime
+            .0
+            .set_client_write_permission(prev, client_id, false);
         publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
     }
 
@@ -410,6 +447,10 @@ pub fn attach_open(
 
     match begin_result {
         Ok(()) => {
+            let can_write = session_write_allowed(ctx, session_id, client_id)?;
+            runtime
+                .0
+                .set_client_write_permission(session_id, client_id, can_write);
             follow
                 .0
                 .set_attached_stream_session(client_id, Some(session_id));
@@ -427,7 +468,7 @@ pub fn attach_open(
             Ok(AttachReady {
                 session_id: session_id.0,
                 context_id,
-                can_write: true,
+                can_write,
             })
         }
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
@@ -448,6 +489,11 @@ pub fn attach_input(
     let session_id = SessionId(req.session_id);
     let runtime = super::session_runtime_handle()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    if !runtime.0.client_can_write(session_id, client_id) {
+        return Err(AttachCommandError::Denied {
+            reason: "client does not have write permission for this attach stream".to_string(),
+        });
+    }
     let data_len = req.data.len();
     match runtime.0.write_input(session_id, client_id, req.data) {
         Ok((bytes, _pane_id)) => Ok(
@@ -582,11 +628,15 @@ pub fn attach_retarget_context(
         req.cell_pixel_width,
         req.cell_pixel_height,
     )?;
+    let can_write = req.can_write && session_write_allowed(ctx, next_session_id, client_id)?;
+    runtime
+        .0
+        .set_client_write_permission(next_session_id, client_id, can_write);
 
     Ok(AttachRetargetReady {
         session_id: next_session_id.0,
         context_id: Some(context_id),
-        can_write: req.can_write,
+        can_write,
         cols,
         rows,
         status_top_inset: top,
@@ -615,6 +665,9 @@ pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     if let Some(stream_session) = follow.0.attached_stream_session(client_id) {
         runtime.0.end_attach(stream_session, client_id);
+        runtime
+            .0
+            .set_client_write_permission(stream_session, client_id, false);
         follow.0.set_attached_stream_session(client_id, None);
         publish_pane_event(PaneEvent::ClientDetached {
             session_id: stream_session.0,

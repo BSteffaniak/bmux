@@ -19,6 +19,7 @@ bmux_clients_plugin_api     = { workspace = true }
 bmux_contexts_plugin_api    = { workspace = true }
 bmux_ipc                    = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                 = { workspace = true }
 bmux_plugin_sdk             = { workspace = true }
 bmux_sessions_plugin_api    = { workspace = true }
@@ -32,5 +33,6 @@ fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_permissions_plugin_api/fail-on-warnings",
+    "bmux_pane_runtime_plugin_api/fail-on-warnings",
 ]
 static-bundled = []

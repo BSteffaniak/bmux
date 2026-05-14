@@ -440,7 +440,7 @@ impl RustPlugin for ClusterPlugin {
         })
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "cluster-query/v1", "list_clusters" => |_: ClusterQueryListClustersRequest, ctx| {
                 let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
@@ -3067,7 +3067,7 @@ mod tests {
         }
 
         fn invoke<T: Serialize>(
-            &mut self,
+            &self,
             interface_id: &str,
             operation: &str,
             request: &T,
@@ -3086,7 +3086,7 @@ mod tests {
         }
 
         fn expect_error_code<T: Serialize>(
-            &mut self,
+            &self,
             interface_id: &str,
             operation: &str,
             request: &T,
@@ -3106,7 +3106,7 @@ mod tests {
 
     #[test]
     fn invoke_service_list_clusters_returns_inventory_from_settings() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         let response = harness.invoke(
             "cluster-query/v1",
             "list_clusters",
@@ -3124,7 +3124,7 @@ mod tests {
 
     #[test]
     fn invoke_service_status_returns_degraded_when_probe_runtime_is_unavailable() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         let response = harness.invoke(
             "cluster-query/v1",
             "status",
@@ -3148,7 +3148,7 @@ mod tests {
 
     #[test]
     fn invoke_service_up_maps_runtime_failures_to_up_failed() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         harness.expect_error_code(
             "cluster-command/v1",
             "up",
@@ -3162,7 +3162,7 @@ mod tests {
 
     #[test]
     fn invoke_service_pane_new_maps_runtime_failures_to_pane_new_failed() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         harness.expect_error_code(
             "cluster-command/v1",
             "pane_new",
@@ -3176,7 +3176,7 @@ mod tests {
 
     #[test]
     fn invoke_service_pane_retry_maps_runtime_failures_to_pane_retry_failed() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         harness.expect_error_code(
             "cluster-command/v1",
             "pane_retry",
@@ -3187,7 +3187,7 @@ mod tests {
 
     #[test]
     fn invoke_service_pane_move_maps_runtime_failures_to_pane_move_failed() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         harness.expect_error_code(
             "cluster-command/v1",
             "pane_move",
@@ -3201,7 +3201,7 @@ mod tests {
 
     #[test]
     fn invoke_service_events_list_maps_runtime_failures_to_connection_events_list_failed() {
-        let mut harness = ServiceTestHarness::new();
+        let harness = ServiceTestHarness::new();
         harness.expect_error_code(
             "cluster-connection-events/v1",
             "list",

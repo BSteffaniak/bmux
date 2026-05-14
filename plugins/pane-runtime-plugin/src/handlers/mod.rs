@@ -99,6 +99,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-commands", "pane-direct-input" => |req: pane_commands::PaneDirectInputArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::pane_direct_input(req, ctx))
         },
+        "pane-runtime-commands", "set-client-write-permission" => |req: pane_commands::SetClientWritePermissionArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::set_client_write_permission(&req))
+        },
         "pane-runtime-commands", "new-session-with-runtime" => |req: pane_commands::NewSessionArgs, _ctx| {
             Ok::<_, ServiceResponse>(pane_commands::new_session_with_runtime(&req))
         },

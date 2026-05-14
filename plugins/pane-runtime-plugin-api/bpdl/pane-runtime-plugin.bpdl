@@ -246,6 +246,15 @@ interface pane-runtime-commands {
         data: list<u8>,
     ) -> result<pane-ack, pane-command-error>;
 
+    // Update the cached write decision for an already-attached client.
+    // The permissions plugin calls this when a role changes so pane input
+    // stays hot-path local without becoming stale.
+    command set-client-write-permission(
+        session_id: uuid,
+        client_id: uuid,
+        allowed: bool,
+    ) -> result<u8, pane-command-error>;
+
     // Spin up a brand-new session runtime (session manager entry +
     // initial pane PTY). Sessions-plugin bridges `new-session` into
     // this operation.

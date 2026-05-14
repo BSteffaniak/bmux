@@ -388,7 +388,7 @@ impl RustPlugin for ContextsPlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "contexts-state", "list-contexts" => |_req: (), ctx| {
                 list_contexts_local(ctx)

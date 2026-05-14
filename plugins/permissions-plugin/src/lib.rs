@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bmux_pane_runtime_plugin_api::{capabilities::PANE_RUNTIME_WRITE, pane_runtime_commands};
 use bmux_permissions_plugin_api::permissions_commands::CommandAck;
 use bmux_permissions_plugin_api::permissions_commands::client::{GrantRequest, RevokeRequest};
 use bmux_permissions_plugin_api::permissions_state::PermissionEntry;
@@ -143,7 +144,7 @@ impl RustPlugin for PermissionsPlugin {
         Ok(EXIT_OK)
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "permissions-state", "list-permissions" => |req: ListPermissionsRequest, ctx| {
                 let entries = list_entries(ctx, &req.session)
@@ -420,6 +421,8 @@ fn grant_entry(caller: &(impl HostRuntimeApi + Sync), request: GrantRequest) -> 
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
     let entries = state.by_session_id.entry(session_id).or_default();
+    let allowed = evaluate_role_action(&request.role, "pane.direct_input").allowed;
+    let client_id = request.client_id.clone();
     if let Some(entry) = entries
         .iter_mut()
         .find(|entry| entry.client_id == request.client_id)
@@ -431,7 +434,9 @@ fn grant_entry(caller: &(impl HostRuntimeApi + Sync), request: GrantRequest) -> 
             role: request.role,
         });
     }
-    save_state(caller, &state)
+    save_state(caller, &state)?;
+    sync_pane_runtime_write_permission(caller, session_id, &client_id, allowed);
+    Ok(())
 }
 
 fn revoke_entry(
@@ -443,7 +448,9 @@ fn revoke_entry(
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
         entries.retain(|entry| entry.client_id != request.client_id);
     }
-    save_state(caller, &state)
+    save_state(caller, &state)?;
+    sync_pane_runtime_write_permission(caller, session_id, &request.client_id, true);
+    Ok(())
 }
 
 fn evaluate_policy(
@@ -945,8 +952,8 @@ fn classify_action(action: &str) -> PolicyActionKind {
     match normalized.as_str() {
         "admin" | "session.kill" => PolicyActionKind::Admin,
         "mutation" | "attach.input" | "session.select" | "pane.split" | "pane.focus"
-        | "pane.resize" | "pane.close" | "follow" | "unfollow" | "context.create"
-        | "context.select" | "context.close" => PolicyActionKind::Mutation,
+        | "pane.direct_input" | "pane.resize" | "pane.close" | "follow" | "unfollow"
+        | "context.create" | "context.select" | "context.close" => PolicyActionKind::Mutation,
         "read" | "list" | "status" | "context.list" => PolicyActionKind::Read,
         _ => PolicyActionKind::Unknown,
     }
@@ -973,6 +980,38 @@ fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result
         ))
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct SetClientWritePermissionRequest {
+    session_id: Uuid,
+    client_id: Uuid,
+    allowed: bool,
+}
+
+fn sync_pane_runtime_write_permission(
+    caller: &(impl HostRuntimeApi + Sync),
+    session_id: Uuid,
+    client_id: &str,
+    allowed: bool,
+) {
+    let Ok(client_id) = Uuid::parse_str(client_id) else {
+        return;
+    };
+    let request = SetClientWritePermissionRequest {
+        session_id,
+        client_id,
+        allowed,
+    };
+    match caller.call_service::<_, u8>(
+        PANE_RUNTIME_WRITE.as_str(),
+        ServiceKind::Command,
+        pane_runtime_commands::INTERFACE_ID.as_str(),
+        "set-client-write-permission",
+        &request,
+    ) {
+        Ok(_) | Err(_) => {}
+    }
 }
 
 fn resolve_session_id(
@@ -1710,7 +1749,7 @@ mod tests {
 
     #[test]
     fn invoke_service_grant_list_and_revoke_roundtrip() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4().to_string();
         let session_id = service_test_session_id().to_string();
@@ -1801,7 +1840,7 @@ mod tests {
 
     #[test]
     fn invoke_service_policy_check_denies_observer_mutation() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4();
         let session_id = service_test_session_id().to_string();
@@ -1858,7 +1897,7 @@ mod tests {
 
     #[test]
     fn invoke_service_grant_rejects_invalid_role() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
             "permissions-commands",
@@ -1882,7 +1921,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_invalid_grant_payload() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
             "permissions-commands",
@@ -1900,7 +1939,7 @@ mod tests {
 
     #[test]
     fn invoke_service_list_reports_missing_session() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
             "permissions-state",
@@ -1922,7 +1961,7 @@ mod tests {
 
     #[test]
     fn invoke_service_policy_defaults_to_allow_without_entry() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
             "session-policy-state",
@@ -1957,7 +1996,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_invalid_policy_payload() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
             "session-policy-state",
@@ -1975,7 +2014,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_unsupported_operation() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
             "permissions-commands",
@@ -1995,7 +2034,7 @@ mod tests {
 
     #[test]
     fn invoke_service_policy_denies_unknown_action() {
-        let mut plugin = PermissionsPlugin;
+        let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4();
         let session_id = service_test_session_id().to_string();

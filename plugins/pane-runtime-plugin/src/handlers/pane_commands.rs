@@ -168,6 +168,13 @@ pub struct PaneDirectInputArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetClientWritePermissionArgs {
+    pub session_id: Uuid,
+    pub client_id: Uuid,
+    pub allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSessionArgs {
     #[serde(default)]
     pub name: Option<String>,
@@ -793,7 +800,15 @@ pub fn pane_direct_input(
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
-    ensure_session_mutation_allowed(ctx, session_id, "pane.direct_input")?;
+    let client_id = ctx
+        .caller_client_id
+        .map(bmux_session_models::ClientId)
+        .ok_or_else(|| failed_command("pane direct input requires a caller client id"))?;
+    if !handle.0.client_can_write(session_id, client_id) {
+        return Err(PaneCommandError::Denied {
+            reason: "client does not have write permission for this attach stream".to_string(),
+        });
+    }
     match handle
         .0
         .write_input_to_pane(session_id, req.pane_id, req.data)
@@ -807,6 +822,19 @@ pub fn pane_direct_input(
         session_id: req.session_id,
         pane_id: req.pane_id,
     })
+}
+
+pub fn set_client_write_permission(
+    req: &SetClientWritePermissionArgs,
+) -> Result<u8, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    handle.0.set_client_write_permission(
+        SessionId(req.session_id),
+        bmux_session_models::ClientId(req.client_id),
+        req.allowed,
+    );
+    Ok(u8::from(req.allowed))
 }
 
 pub fn new_session_with_runtime(

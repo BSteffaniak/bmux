@@ -613,6 +613,13 @@ pub trait StreamingAttachInputExt {
         session_id: Uuid,
         data: Vec<u8>,
     ) -> impl Future<Output = ClientResult<()>> + Send;
+
+    fn send_one_way_pane_direct_input(
+        &mut self,
+        session_id: Uuid,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    ) -> impl Future<Output = ClientResult<()>> + Send;
 }
 
 #[allow(dead_code)]
@@ -637,6 +644,37 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
             kind: bmux_ipc::InvokeServiceKind::Command,
             interface_id: AttachCommands::INTERFACE_ID.as_str().to_string(),
             operation: "attach-input".to_string(),
+            payload: typed_payload,
+        })
+        .await
+    }
+
+    async fn send_one_way_pane_direct_input(
+        &mut self,
+        session_id: Uuid,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    ) -> ClientResult<()> {
+        #[derive(serde::Serialize)]
+        struct PaneDirectInputArgs {
+            session_id: Uuid,
+            pane_id: Uuid,
+            data: Vec<u8>,
+        }
+
+        let typed_payload = bmux_ipc::encode(&PaneDirectInputArgs {
+            session_id,
+            pane_id,
+            data,
+        })
+        .map_err(ClientError::from)?;
+        self.send_one_way(bmux_ipc::Request::InvokeService {
+            capability: bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE
+                .as_str()
+                .to_string(),
+            kind: bmux_ipc::InvokeServiceKind::Command,
+            interface_id: PaneCommands::INTERFACE_ID.as_str().to_string(),
+            operation: "pane-direct-input".to_string(),
             payload: typed_payload,
         })
         .await

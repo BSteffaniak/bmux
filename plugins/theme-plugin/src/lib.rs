@@ -65,7 +65,7 @@ impl RustPlugin for ThemePlugin {
         })
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "theme-state", "active-appearance" => |_req: (), ctx| {
                 let appearance = active_runtime_appearance(ctx).ok_or_else(|| {
@@ -1657,7 +1657,7 @@ mod tests {
 
     #[test]
     fn active_appearance_service_uses_declared_theme() {
-        let mut plugin = ThemePlugin::default();
+        let plugin = ThemePlugin::default();
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([(
             "theme".to_string(),
             toml::Value::String("rainbow-snake".to_string()),
@@ -1676,7 +1676,7 @@ mod tests {
     #[test]
     fn active_appearance_service_uses_persisted_theme_when_enabled() {
         let _router = install_persisted_theme_router(Some("hacker"));
-        let mut plugin = ThemePlugin::default();
+        let plugin = ThemePlugin::default();
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),

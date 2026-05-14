@@ -1060,7 +1060,7 @@ impl RustPlugin for WindowsPlugin {
     }
 
     #[allow(clippy::too_many_lines)] // route_service! covers every windows-commands op; the block is naturally long.
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "windows-state", "list-windows" => |req: ListWindowsArgs, ctx| {
                 let windows = list_windows(ctx, &self.runtime_state, req.session.as_deref())
@@ -5352,7 +5352,7 @@ mod tests {
     #[test]
     fn invoke_service_new_returns_ack_with_id() {
         let _router = install_context_test_router(false, false);
-        let mut plugin = WindowsPlugin::default();
+        let plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
             "new-window",
@@ -5378,7 +5378,7 @@ mod tests {
     #[test]
     fn invoke_service_new_surfaces_denied_error() {
         let _router = install_context_test_router(false, false);
-        let mut plugin = WindowsPlugin::default();
+        let plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
             "new-window",
@@ -5399,7 +5399,7 @@ mod tests {
     #[test]
     fn invoke_service_switch_returns_ack_with_selected_id() {
         let _router = install_context_test_router(false, false);
-        let mut plugin = WindowsPlugin::default();
+        let plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
             "switch-window",
@@ -5444,7 +5444,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_invalid_payload() {
-        let mut plugin = WindowsPlugin::default();
+        let plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
             "kill-window",
@@ -5461,7 +5461,7 @@ mod tests {
     #[test]
     fn invoke_service_kill_surfaces_denied_error() {
         let _router = install_context_test_router(false, true);
-        let mut plugin = WindowsPlugin::default();
+        let plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
             "kill-window",
@@ -5482,7 +5482,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_unsupported_operation() {
-        let mut plugin = WindowsPlugin::default();
+        let plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
             "unknown",

@@ -73,7 +73,7 @@ impl RustPlugin for PaneRuntimePlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         handlers::route(context)
     }
 

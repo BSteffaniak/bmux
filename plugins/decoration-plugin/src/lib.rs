@@ -2593,7 +2593,7 @@ impl RustPlugin for DecorationPlugin {
 
     #[allow(clippy::too_many_lines)] // route_service! naturally spans every typed op; splitting hurts readability.
     fn invoke_service(
-        &mut self,
+        &self,
         context: bmux_plugin_sdk::NativeServiceContext,
     ) -> bmux_plugin_sdk::ServiceResponse {
         // IPC-level dispatch for every typed op declared in the

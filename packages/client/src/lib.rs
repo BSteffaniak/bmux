@@ -692,6 +692,14 @@ impl TypedDispatchClient for BmuxClient {
 type PendingMap =
     Arc<tokio::sync::Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<Result<Response>>>>>;
 
+type TimedOutMap = Arc<tokio::sync::Mutex<BTreeMap<u64, TimedOutRequest>>>;
+
+#[derive(Debug, Clone)]
+struct TimedOutRequest {
+    request: &'static str,
+    elapsed_ms: u128,
+}
+
 fn store_stream_disconnect_reason(reason_slot: &Arc<StdMutex<Option<String>>>, reason: String) {
     if let Ok(mut slot) = reason_slot.lock()
         && slot.is_none()
@@ -738,6 +746,7 @@ pub struct StreamingBmuxClient {
     principal_id: Uuid,
     negotiated_protocol: Option<NegotiatedProtocol>,
     pending: PendingMap,
+    timed_out: TimedOutMap,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
     disconnect_reason: Arc<StdMutex<Option<String>>>,
     _reader_task: tokio::task::JoinHandle<()>,
@@ -836,13 +845,22 @@ impl StreamingBmuxClient {
         }
 
         let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let timed_out: TimedOutMap = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let disconnect_reason = Arc::new(StdMutex::new(None));
 
         let reader_pending = Arc::clone(&pending);
+        let reader_timed_out = Arc::clone(&timed_out);
         let reader_disconnect_reason = Arc::clone(&disconnect_reason);
         let reader_task = tokio::spawn(async move {
-            Self::reader_loop(reader, reader_pending, event_tx, reader_disconnect_reason).await;
+            Self::reader_loop(
+                reader,
+                reader_pending,
+                reader_timed_out,
+                event_tx,
+                reader_disconnect_reason,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -852,6 +870,7 @@ impl StreamingBmuxClient {
             principal_id,
             negotiated_protocol,
             pending,
+            timed_out,
             event_rx,
             disconnect_reason,
             _reader_task: reader_task,
@@ -867,6 +886,7 @@ impl StreamingBmuxClient {
     async fn reader_loop(
         mut reader: StreamingClientReader,
         pending: PendingMap,
+        timed_out: TimedOutMap,
         event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
         disconnect_reason: Arc<StdMutex<Option<String>>>,
     ) {
@@ -893,8 +913,8 @@ impl StreamingBmuxClient {
 
             match envelope.kind {
                 EnvelopeKind::Response => {
-                    let mut map = pending.lock().await;
-                    if let Some(tx) = map.remove(&envelope.request_id) {
+                    let response_tx = pending.lock().await.remove(&envelope.request_id);
+                    if let Some(tx) = response_tx {
                         match decode::<Response>(&envelope.payload) {
                             Ok(response) => {
                                 let _ = tx.send(Ok(response));
@@ -904,13 +924,24 @@ impl StreamingBmuxClient {
                             }
                         }
                     } else {
-                        // Expected when the caller used send_one_way() — the
-                        // server still sends a response but we have no pending
-                        // entry.  Log at trace to avoid noise.
-                        trace!(
-                            request_id = envelope.request_id,
-                            "streaming client received response for unknown request id"
-                        );
+                        let timed_out_response =
+                            timed_out.lock().await.remove(&envelope.request_id);
+                        if let Some(timed_out) = timed_out_response {
+                            warn!(
+                                request_id = envelope.request_id,
+                                request = timed_out.request,
+                                timed_out_elapsed_ms = timed_out.elapsed_ms,
+                                "streaming client received late response after timeout"
+                            );
+                        } else {
+                            // Expected when the caller used send_one_way() — the
+                            // server still sends a response but we have no pending
+                            // entry.  Log at trace to avoid noise.
+                            trace!(
+                                request_id = envelope.request_id,
+                                "streaming client received response for unknown request id"
+                            );
+                        }
                     }
                 }
                 EnvelopeKind::Event => match decode::<ServerEvent>(&envelope.payload) {
@@ -989,7 +1020,29 @@ impl StreamingBmuxClient {
         let recv_started = std::time::Instant::now();
         let response = tokio::time::timeout(self.timeout, rx)
             .await
-            .map_err(|_| ClientError::Timeout(self.timeout))?
+            .map_err(|_| {
+                let elapsed_ms = started_at.elapsed().as_millis();
+                warn!(
+                    request_id,
+                    request = request_kind,
+                    timeout_ms = self.timeout.as_millis(),
+                    elapsed_ms,
+                    "streaming_ipc.request.timeout"
+                );
+                let pending = Arc::clone(&self.pending);
+                let timed_out = Arc::clone(&self.timed_out);
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&request_id);
+                    timed_out.lock().await.insert(
+                        request_id,
+                        TimedOutRequest {
+                            request: request_kind,
+                            elapsed_ms,
+                        },
+                    );
+                });
+                ClientError::Timeout(self.timeout)
+            })?
             .map_err(|_| {
                 ClientError::Transport(IpcTransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,

@@ -2446,7 +2446,7 @@ impl bmux_plugin_sdk::RustPlugin for PerfNoopPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn invoke_service(
-        &mut self,
+        &self,
         context: bmux_plugin_sdk::NativeServiceContext,
     ) -> bmux_plugin_sdk::ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {

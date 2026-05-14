@@ -97,7 +97,7 @@ impl RustPlugin for ControlCatalogPlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "control-catalog-state", "snapshot" => |req: SnapshotArgs, _ctx| {
                 build_snapshot(req.since_revision)

@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::ffi::{CString, c_char};
 use std::future::Future;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 
 // ── Plugin exit codes ────────────────────────────────────────────────────────
 
@@ -281,7 +281,7 @@ pub trait RustPlugin: Default + Send + 'static {
     /// Handle an inbound service call from another plugin or the host.
     ///
     /// The default returns an "`unsupported_service`" error response.
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         ServiceResponse::error(
             "unsupported_service",
             format!(
@@ -428,8 +428,10 @@ impl HostAsyncHandle {
 // ── FFI helpers ──────────────────────────────────────────────────────────────
 
 #[doc(hidden)]
-pub fn plugin_instance<P: RustPlugin>(instance: &'static OnceLock<Mutex<P>>) -> &'static Mutex<P> {
-    instance.get_or_init(|| Mutex::new(P::default()))
+pub fn plugin_instance<P: RustPlugin>(
+    instance: &'static OnceLock<RwLock<P>>,
+) -> &'static RwLock<P> {
+    instance.get_or_init(|| RwLock::new(P::default()))
 }
 
 /// Invoke a bundled plugin's [`RustPlugin::register_typed_services`] hook
@@ -437,11 +439,11 @@ pub fn plugin_instance<P: RustPlugin>(instance: &'static OnceLock<Mutex<P>>) -> 
 /// [`bundled_plugin_vtable!`] macro.
 #[doc(hidden)]
 pub fn register_typed_services_bundled<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     context: TypedServiceRegistrationContext<'_>,
 ) -> TypedServiceRegistry {
     let mut registry = TypedServiceRegistry::new();
-    if let Ok(plugin) = instance.lock() {
+    if let Ok(plugin) = instance.read() {
         plugin.register_typed_services(context, &mut registry);
     }
     registry
@@ -450,11 +452,11 @@ pub fn register_typed_services_bundled<P: RustPlugin>(
 /// Invoke a bundled plugin's runtime-aware activation hook.
 #[doc(hidden)]
 pub fn activate_with_async_bundled<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     context: NativeLifecycleContext,
     async_handle: HostAsyncHandle,
 ) -> i32 {
-    instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+    instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
         result_to_exit_code(plugin.activate_with_async(context, async_handle))
     })
 }
@@ -478,14 +480,14 @@ pub fn manifest_toml_ptr(
 
 #[doc(hidden)]
 pub fn run_command_export<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     input_ptr: *const u8,
     input_len: usize,
 ) -> i32 {
     parse_binary_input::<NativeCommandContext>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+            instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
                 let result = plugin.run_command(payload);
                 if let Err(error) = &result {
                     store_last_command_error(error.clone());
@@ -498,14 +500,14 @@ pub fn run_command_export<P: RustPlugin>(
 
 #[doc(hidden)]
 pub fn activate_export<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     input_ptr: *const u8,
     input_len: usize,
 ) -> i32 {
     parse_binary_input::<NativeLifecycleContext>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+            instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
                 result_to_exit_code(plugin.activate(payload))
             })
         },
@@ -514,14 +516,14 @@ pub fn activate_export<P: RustPlugin>(
 
 #[doc(hidden)]
 pub fn deactivate_export<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     input_ptr: *const u8,
     input_len: usize,
 ) -> i32 {
     parse_binary_input::<NativeLifecycleContext>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+            instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
                 result_to_exit_code(plugin.deactivate(payload))
             })
         },
@@ -530,14 +532,14 @@ pub fn deactivate_export<P: RustPlugin>(
 
 #[doc(hidden)]
 pub fn handle_event_export<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     input_ptr: *const u8,
     input_len: usize,
 ) -> i32 {
     parse_binary_input::<PluginEvent>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+            instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
                 result_to_exit_code(plugin.handle_event(payload))
             })
         },
@@ -546,7 +548,7 @@ pub fn handle_event_export<P: RustPlugin>(
 
 #[doc(hidden)]
 pub fn invoke_service_export<P: RustPlugin>(
-    instance: &'static Mutex<P>,
+    instance: &'static RwLock<P>,
     input_ptr: *const u8,
     input_len: usize,
     output_ptr: *mut u8,
@@ -564,8 +566,8 @@ pub fn invoke_service_export<P: RustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
 
-    let response = match instance.lock() {
-        Ok(mut plugin) => plugin.invoke_service(context),
+    let response = match instance.read() {
+        Ok(plugin) => plugin.invoke_service(context),
         Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
     };
 

@@ -222,7 +222,7 @@ impl RustPlugin for RecordingPlugin {
         Err(PluginCommandError::unknown_command(""))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "recording-state", "status" => |_req: (), _ctx| {
                 Ok::<recording_types::RecordingStatus, ServiceResponse>(recording_status_generated())

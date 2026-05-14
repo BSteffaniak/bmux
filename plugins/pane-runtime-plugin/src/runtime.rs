@@ -30,7 +30,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -190,11 +190,20 @@ fn format_pane_exit_reason(status: &portable_pty::ExitStatus) -> String {
 
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
+    pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
+    client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
     shell: String,
     pane_term: String,
     protocol_profile: ProtocolProfile,
     shell_integration_root: Option<std::path::PathBuf>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
+}
+
+#[derive(Clone)]
+struct PaneInputHandle {
+    session_id: SessionId,
+    input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
+    exited: Arc<AtomicBool>,
 }
 
 struct SessionRuntimeHandle {
@@ -1387,7 +1396,26 @@ fn push_terminal_grid_delta(
     }
 }
 
+impl PaneInputHandle {
+    fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
+        if self.exited.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::Closed);
+        }
+        self.input_tx
+            .send(PaneRuntimeCommand::Input(data))
+            .map_err(|_| SessionRuntimeError::Closed)
+    }
+}
+
 impl PaneRuntimeHandle {
+    fn input_handle(&self, session_id: SessionId) -> PaneInputHandle {
+        PaneInputHandle {
+            session_id,
+            input_tx: self.input_tx.clone(),
+            exited: Arc::clone(&self.exited),
+        }
+    }
+
     fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
         self.input_tx
             .send(PaneRuntimeCommand::Input(data))
@@ -2449,7 +2477,7 @@ fn pane_launch_spec_from_command(command: PaneLaunchCommand) -> Result<PaneLaunc
 
 impl SessionRuntimeManager {
     #[allow(clippy::too_many_arguments)]
-    const fn new(
+    fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
@@ -2458,11 +2486,45 @@ impl SessionRuntimeManager {
     ) -> Self {
         Self {
             runtimes: BTreeMap::new(),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell,
             pane_term,
             protocol_profile,
             shell_integration_root,
             pane_exit_tx,
+        }
+    }
+
+    fn register_pane_input(&self, session_id: SessionId, pane: &PaneRuntimeHandle) {
+        if let Ok(mut index) = self.pane_input_index.write() {
+            index.insert(pane.meta.id, pane.input_handle(session_id));
+        }
+    }
+
+    fn unregister_pane_input(&self, pane_id: Uuid) {
+        if let Ok(mut index) = self.pane_input_index.write() {
+            index.remove(&pane_id);
+        }
+    }
+
+    fn unregister_session_inputs(
+        &self,
+        session_id: SessionId,
+        pane_ids: impl IntoIterator<Item = Uuid>,
+    ) {
+        if let Ok(mut index) = self.pane_input_index.write() {
+            for pane_id in pane_ids {
+                if index
+                    .get(&pane_id)
+                    .is_some_and(|handle| handle.session_id == session_id)
+                {
+                    index.remove(&pane_id);
+                }
+            }
+        }
+        if let Ok(mut permissions) = self.client_write_permissions.write() {
+            permissions.remove(&session_id);
         }
     }
 
@@ -2480,6 +2542,7 @@ impl SessionRuntimeManager {
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let first_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        self.register_pane_input(session_id, &first_pane);
         let mut panes = BTreeMap::new();
         panes.insert(first_pane_id, first_pane);
 
@@ -2542,6 +2605,7 @@ impl SessionRuntimeManager {
                 .copied()
                 .unwrap_or((24, 80));
             let pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), initial_size);
+            self.register_pane_input(session_id, &pane);
             runtime_panes.insert(pane_meta.id, pane);
         }
 
@@ -3227,6 +3291,7 @@ impl SessionRuntimeManager {
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let handle = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -3334,6 +3399,7 @@ impl SessionRuntimeManager {
             anyhow::bail!("cannot close the final pane without an explicit session action");
         }
 
+        let pane_input_index = Arc::clone(&self.pane_input_index);
         let session = self
             .runtimes
             .get_mut(&session_id)
@@ -3350,6 +3416,9 @@ impl SessionRuntimeManager {
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
+        if let Ok(mut index) = pane_input_index.write() {
+            index.remove(&pane_id);
+        }
         let anchored_floating_panes = session
             .floating_surfaces
             .iter()
@@ -3362,6 +3431,9 @@ impl SessionRuntimeManager {
         });
         for floating_pane_id in anchored_floating_panes {
             if let Some(floating_pane) = session.panes.remove(&floating_pane_id) {
+                if let Ok(mut index) = pane_input_index.write() {
+                    index.remove(&floating_pane_id);
+                }
                 tokio::spawn(async move {
                     shutdown_pane_handle(floating_pane).await;
                 });
@@ -3443,11 +3515,13 @@ impl SessionRuntimeManager {
                 .remove(&pane_meta.id)
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?
         };
+        self.unregister_pane_input(pane_meta.id);
         tokio::spawn(async move {
             shutdown_pane_handle(old_pane).await;
         });
 
         let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), (24, 80));
+        self.register_pane_input(session_id, &new_pane);
         let client_ids = {
             let session = self
                 .runtimes
@@ -3567,6 +3641,7 @@ impl SessionRuntimeManager {
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let handle = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -4203,6 +4278,7 @@ impl SessionRuntimeManager {
             .runtimes
             .remove(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        self.unregister_session_inputs(session_id, runtime.panes.keys().copied());
 
         Ok(RemovedRuntime {
             session_id,
@@ -4211,7 +4287,14 @@ impl SessionRuntimeManager {
     }
 
     fn remove_all_runtimes(&mut self) -> Vec<RemovedRuntime> {
-        std::mem::take(&mut self.runtimes)
+        let runtimes = std::mem::take(&mut self.runtimes);
+        if let Ok(mut index) = self.pane_input_index.write() {
+            index.clear();
+        }
+        if let Ok(mut permissions) = self.client_write_permissions.write() {
+            permissions.clear();
+        }
+        runtimes
             .into_iter()
             .map(|(session_id, runtime)| RemovedRuntime {
                 session_id,
@@ -4381,31 +4464,6 @@ impl SessionRuntimeManager {
         Ok((bytes, focused_pane_id))
     }
 
-    /// Write input bytes directly to a specific pane by ID, bypassing focus routing.
-    fn write_input_to_pane(
-        &mut self,
-        session_id: SessionId,
-        pane_id: Uuid,
-        data: Vec<u8>,
-    ) -> Result<usize, SessionRuntimeError> {
-        let owner_session_id = self
-            .pane_session_for_attach(session_id, pane_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        let pane = self
-            .runtimes
-            .get_mut(&owner_session_id)
-            .and_then(|runtime| runtime.panes.get_mut(&pane_id))
-            .ok_or(SessionRuntimeError::NotFound)?;
-
-        if pane.exited.load(Ordering::SeqCst) {
-            return Err(SessionRuntimeError::Closed);
-        }
-
-        let bytes = data.len();
-        pane.send_input(data)?;
-        Ok(bytes)
-    }
-
     fn read_output(
         &mut self,
         session_id: SessionId,
@@ -4494,19 +4552,75 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 
 struct ServerSessionRuntimeAdapter {
     inner: Arc<Mutex<SessionRuntimeManager>>,
+    pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
+    client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
 }
 
 impl ServerSessionRuntimeAdapter {
-    const fn new(inner: Arc<Mutex<SessionRuntimeManager>>) -> Self {
-        Self { inner }
+    fn new(inner: Arc<Mutex<SessionRuntimeManager>>) -> Self {
+        let (pane_input_index, client_write_permissions) = inner.lock().map_or_else(
+            |_| {
+                (
+                    Arc::new(RwLock::new(BTreeMap::new())),
+                    Arc::new(RwLock::new(BTreeMap::new())),
+                )
+            },
+            |manager| {
+                (
+                    Arc::clone(&manager.pane_input_index),
+                    Arc::clone(&manager.client_write_permissions),
+                )
+            },
+        );
+        Self {
+            inner,
+            pane_input_index,
+            client_write_permissions,
+        }
     }
 
     fn with_lock<R>(&self, f: impl FnOnce(&mut SessionRuntimeManager) -> R) -> Option<R> {
-        self.inner.lock().ok().map(|mut g| f(&mut g))
+        let wait_started = std::time::Instant::now();
+        let mut guard = self.inner.lock().ok()?;
+        let wait = wait_started.elapsed();
+        if wait > Duration::from_millis(10) {
+            warn!(
+                wait_ms = wait.as_millis(),
+                "pane runtime manager lock wait exceeded hot-path budget"
+            );
+        }
+        let hold_started = std::time::Instant::now();
+        let result = f(&mut guard);
+        let hold = hold_started.elapsed();
+        if hold > Duration::from_millis(10) {
+            warn!(
+                hold_ms = hold.as_millis(),
+                "pane runtime manager lock hold exceeded hot-path budget"
+            );
+        }
+        Some(result)
     }
 
     fn with_lock_read<R>(&self, f: impl FnOnce(&SessionRuntimeManager) -> R) -> Option<R> {
-        self.inner.lock().ok().map(|g| f(&g))
+        let wait_started = std::time::Instant::now();
+        let guard = self.inner.lock().ok()?;
+        let wait = wait_started.elapsed();
+        if wait > Duration::from_millis(10) {
+            warn!(
+                wait_ms = wait.as_millis(),
+                "pane runtime manager read lock wait exceeded hot-path budget"
+            );
+        }
+        let hold_started = std::time::Instant::now();
+        let result = f(&guard);
+        let hold = hold_started.elapsed();
+        if hold > Duration::from_millis(10) {
+            warn!(
+                hold_ms = hold.as_millis(),
+                "pane runtime manager read lock hold exceeded hot-path budget"
+            );
+        }
+        Some(result)
     }
 
     fn remove_to_info(
@@ -4850,8 +4964,51 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
-        self.with_lock(|m| m.write_input_to_pane(session_id, pane_id, data))
-            .unwrap_or(Err(SessionRuntimeError::Closed))
+        let lookup_started = std::time::Instant::now();
+        let pane = self
+            .pane_input_index
+            .read()
+            .ok()
+            .and_then(|index| index.get(&pane_id).cloned())
+            .filter(|handle| handle.session_id == session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let lookup = lookup_started.elapsed();
+        if lookup > Duration::from_millis(2) {
+            warn!(session_id = %session_id.0, %pane_id, lookup_us = lookup.as_micros(), "pane direct input lookup exceeded hot-path budget");
+        }
+
+        let bytes = data.len();
+        let send_started = std::time::Instant::now();
+        pane.send_input(data)?;
+        let send = send_started.elapsed();
+        if send > Duration::from_millis(2) {
+            warn!(session_id = %session_id.0, %pane_id, send_us = send.as_micros(), "pane direct input send exceeded hot-path budget");
+        }
+        Ok(bytes)
+    }
+
+    fn set_client_write_permission(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        allowed: bool,
+    ) {
+        if let Ok(mut permissions) = self.client_write_permissions.write() {
+            let writers = permissions.entry(session_id).or_default();
+            if allowed {
+                writers.insert(client_id);
+            } else {
+                writers.remove(&client_id);
+            }
+        }
+    }
+
+    fn client_can_write(&self, session_id: SessionId, client_id: ClientId) -> bool {
+        self.client_write_permissions
+            .read()
+            .ok()
+            .and_then(|permissions| permissions.get(&session_id).cloned())
+            .is_some_and(|writers| writers.contains(&client_id))
     }
 
     fn read_output(
@@ -6069,6 +6226,8 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         SessionRuntimeManager {
             runtimes: BTreeMap::from([(session_id, runtime)]),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -6468,6 +6627,8 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let empty_manager = SessionRuntimeManager {
             runtimes: BTreeMap::new(),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -6521,6 +6682,8 @@ mod tests {
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
             ]),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -6566,6 +6729,8 @@ mod tests {
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
             ]),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -6600,6 +6765,8 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
             runtimes: BTreeMap::from([(session_id, runtime)]),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -6641,6 +6808,8 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
             runtimes: BTreeMap::from([(session_id, runtime)]),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -6674,6 +6843,8 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
             runtimes: BTreeMap::from([(session_id, runtime)]),
+            pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
+            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
