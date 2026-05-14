@@ -20,9 +20,10 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService, NotifyError};
 use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
@@ -251,7 +252,7 @@ impl Default for DecorationReadModel {
 
 struct DecorationRuntime {
     command_tx: Mutex<Option<std::sync::mpsc::SyncSender<DecorationEngineCommand>>>,
-    read_model: RwLock<DecorationReadModel>,
+    read_model: ArcSwap<DecorationReadModel>,
     host_async_handle: Mutex<Option<HostAsyncHandle>>,
 }
 
@@ -259,7 +260,7 @@ impl Default for DecorationRuntime {
     fn default() -> Self {
         Self {
             command_tx: Mutex::new(None),
-            read_model: RwLock::new(DecorationReadModel::default()),
+            read_model: ArcSwap::from_pointee(DecorationReadModel::default()),
             host_async_handle: Mutex::new(None),
         }
     }
@@ -314,23 +315,14 @@ impl SharedState {
     }
 
     fn read_model<R>(&self, f: impl FnOnce(&DecorationReadModel) -> R) -> R {
-        match self.runtime.read_model.read() {
-            Ok(guard) => f(&guard),
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                f(&guard)
-            }
-        }
+        let model = self.runtime.read_model.load();
+        f(&model)
     }
 
     fn sync_read_model_from_state(&self, state: &mut State) {
-        match self.runtime.read_model.write() {
-            Ok(mut guard) => sync_read_model_from_state(&mut guard, state),
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                sync_read_model_from_state(&mut guard, state);
-            }
-        }
+        self.runtime
+            .read_model
+            .store(Arc::new(read_model_from_state(state)));
     }
 
     #[cfg(test)]
@@ -339,13 +331,15 @@ impl SharedState {
     }
 }
 
-fn sync_read_model_from_state(model: &mut DecorationReadModel, state: &mut State) {
-    model.panes.clone_from(&state.panes);
-    model.geometry.clone_from(&state.geometry);
-    model.activity.clone_from(&state.activity);
-    model.default_border = state.default_border;
-    model.current_theme.clone_from(&state.current_theme);
-    model.scene = scene_snapshot_from_state(state);
+fn read_model_from_state(state: &mut State) -> DecorationReadModel {
+    DecorationReadModel {
+        panes: state.panes.clone(),
+        geometry: state.geometry.clone(),
+        activity: state.activity.clone(),
+        default_border: state.default_border,
+        current_theme: state.current_theme.clone(),
+        scene: scene_snapshot_from_state(state),
+    }
 }
 
 fn pane_decoration_from_read_model(model: &DecorationReadModel, pane_id: Uuid) -> PaneDecoration {
@@ -535,7 +529,7 @@ impl DecorationCommandsService for DecorationServiceHandle {
 // Direct mutation helper for engine dispatch, pre-engine fallback paths, and
 // tests. Normal post-activation runtime mutations should enter through
 // `DecorationEngineCommand`.
-fn set_pane_border_direct(state: &mut State, pane_id: Uuid, border: BorderStyle) {
+fn set_pane_border_direct(state: &mut State, pane_id: Uuid, border: BorderStyle) -> bool {
     let focused = state.activity.get(&pane_id).is_some_and(|a| a.focused);
     let had_entry = state.panes.contains_key(&pane_id);
     let entry = state
@@ -543,29 +537,31 @@ fn set_pane_border_direct(state: &mut State, pane_id: Uuid, border: BorderStyle)
         .entry(pane_id)
         .or_insert_with(|| default_pane_decoration(pane_id, border, focused));
     if had_entry && entry.border == border && entry.focused == focused {
-        return;
+        return false;
     }
     entry.border = border;
     entry.focused = focused;
     publish_scene_if_changed(state);
+    true
 }
 
 // Direct mutation helper for engine dispatch, pre-engine fallback paths, and
 // tests. Normal post-activation runtime mutations should enter through
 // `DecorationEngineCommand`.
-fn set_default_border_direct(state: &mut State, border: BorderStyle) {
+fn set_default_border_direct(state: &mut State, border: BorderStyle) -> bool {
     if state.default_border == border {
-        return;
+        return false;
     }
     state.default_border = border;
     publish_scene_if_changed(state);
+    true
 }
 
 // Direct mutation helper for engine dispatch, pre-engine fallback paths, and
 // tests. Normal post-activation runtime mutations should enter through
 // `DecorationEngineCommand`.
-fn notify_pane_event_direct(state: &mut State, event: &PaneEvent) {
-    apply_pane_event(state, event);
+fn notify_pane_event_direct(state: &mut State, event: &PaneEvent) -> bool {
+    apply_pane_event(state, event)
 }
 
 fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> AttachInputResult {
@@ -644,7 +640,7 @@ fn merge_attach_input_result(result: &mut AttachInputResult, next: Option<Attach
 /// Apply a [`PaneEvent`] to the shared state. Pulled out so both the
 /// typed `notify_pane_event` command and the event-bus subscriber
 /// can share the same mutation path.
-fn apply_pane_event(state: &mut State, event: &PaneEvent) {
+fn apply_pane_event(state: &mut State, event: &PaneEvent) -> bool {
     let mut changed = false;
     match event {
         PaneEvent::Focused { pane_id } => {
@@ -715,6 +711,7 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
     if changed {
         publish_scene_if_changed(state);
     }
+    changed
 }
 
 /// Produce a scene describing the current state of `state`. Pulled
@@ -1468,7 +1465,7 @@ fn empty_scene() -> DecorationScene {
 /// value. Publication silently no-ops if the event-bus channel has not been
 /// registered yet (the decoration plugin registers it in
 /// [`DecorationPlugin::activate`]).
-fn publish_scene_if_changed(state: &mut State) {
+fn publish_scene_if_changed(state: &mut State) -> bool {
     // Build while we still hold the lock so script render output and revision
     // updates stay ordered from subscribers' perspective. The candidate scene
     // is compared without its revision so animation ticks that do not change
@@ -1479,7 +1476,7 @@ fn publish_scene_if_changed(state: &mut State) {
         .as_ref()
         .is_some_and(|previous| scene_output_matches(previous, &scene))
     {
-        return;
+        return false;
     }
 
     state.scene_revision = state.scene_revision.saturating_add(1);
@@ -1487,6 +1484,7 @@ fn publish_scene_if_changed(state: &mut State) {
     state.last_published_scene = Some(scene.clone());
     let _ = bmux_plugin::global_event_bus()
         .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
+    true
 }
 
 fn scene_output_matches(left: &DecorationScene, right: &DecorationScene) -> bool {
@@ -3099,7 +3097,7 @@ fn spawn_pane_runtime_focus_state_subscriber(state: SharedState) {
 fn apply_focus_state_map(
     state: &mut State,
     snapshot: &bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap,
-) {
+) -> bool {
     use std::collections::BTreeSet;
     let focused: BTreeSet<Uuid> = snapshot
         .entries
@@ -3143,6 +3141,7 @@ fn apply_focus_state_map(
     if changed {
         publish_scene_if_changed(state);
     }
+    changed
 }
 
 /// Subscribe to the attach-layout state channel and reconcile
@@ -3355,7 +3354,7 @@ fn spawn_visual_projection_subscriber(state: SharedState) {
     }
 }
 
-fn apply_visual_projection_batch(state: &mut State, batch: &VisualProjectionBatch) {
+fn apply_visual_projection_batch(state: &mut State, batch: &VisualProjectionBatch) -> bool {
     let mut changed = false;
     for projection in &batch.entries {
         if projection.request_id.is_empty() {
@@ -3396,6 +3395,7 @@ fn apply_visual_projection_batch(state: &mut State, batch: &VisualProjectionBatc
     if changed {
         publish_scene_if_changed(state);
     }
+    changed
 }
 
 fn retain_visual_projection_surfaces(state: &mut State, seen_surfaces: &BTreeSet<Uuid>) -> bool {
@@ -3446,7 +3446,7 @@ fn retain_visual_projection_surfaces(state: &mut State, seen_surfaces: &BTreeSet
 fn apply_attach_layout_snapshot(
     state: &mut State,
     snapshot: &bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
-) {
+) -> bool {
     use std::collections::BTreeSet;
     let mut changed = false;
     let mut seen_surfaces: BTreeSet<Uuid> = BTreeSet::new();
@@ -3489,6 +3489,7 @@ fn apply_attach_layout_snapshot(
     if changed {
         publish_scene_if_changed(state);
     }
+    changed
 }
 
 /// Translate a `windows.pane-event` enum value to the decoration

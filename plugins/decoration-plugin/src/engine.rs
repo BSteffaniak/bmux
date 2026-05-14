@@ -104,16 +104,17 @@ impl PendingCoalescedCommands {
     }
 
     fn flush(&mut self, engine: &mut DecorationEngine) {
+        let mut changed = false;
         if let Some(snapshot) = self.focus.take() {
-            apply_focus_state_map(&mut engine.state, &snapshot);
+            changed |= apply_focus_state_map(&mut engine.state, &snapshot);
         }
         if let Some(snapshot) = self.layout.take() {
-            apply_attach_layout_snapshot(&mut engine.state, &snapshot);
+            changed |= apply_attach_layout_snapshot(&mut engine.state, &snapshot);
         }
         if let Some(projection) = self.visual_projection.take() {
-            apply_visual_projection_batch(&mut engine.state, &projection);
+            changed |= apply_visual_projection_batch(&mut engine.state, &projection);
         }
-        engine.publish_read_model();
+        engine.publish_read_model_if(changed);
     }
 }
 
@@ -203,13 +204,13 @@ impl DecorationEngine {
                 border,
                 reply,
             } => {
-                set_pane_border_direct(&mut self.state, pane_id, border);
-                self.publish_read_model();
+                let changed = set_pane_border_direct(&mut self.state, pane_id, border);
+                self.publish_read_model_if(changed);
                 let _ = reply.send(Ok(()));
             }
             DecorationEngineCommand::SetDefaultBorder { border, reply } => {
-                set_default_border_direct(&mut self.state, border);
-                self.publish_read_model();
+                let changed = set_default_border_direct(&mut self.state, border);
+                self.publish_read_model_if(changed);
                 let _ = reply.send(Ok(()));
             }
             DecorationEngineCommand::ApplyThemeExtension {
@@ -230,30 +231,30 @@ impl DecorationEngine {
                 let _ = reply.send(outcome);
             }
             DecorationEngineCommand::NotifyPaneEvent { event, reply } => {
-                notify_pane_event_direct(&mut self.state, &event);
-                self.publish_read_model();
+                let changed = notify_pane_event_direct(&mut self.state, &event);
+                self.publish_read_model_if(changed);
                 let _ = reply.send(Ok(()));
             }
             DecorationEngineCommand::AttachInput { event, reply } => {
                 let result = handle_attach_input_event(&mut self.state, event);
-                self.publish_read_model();
+                self.publish_read_model_if(result.dirty);
                 let _ = reply.send(result);
             }
             DecorationEngineCommand::PaneEvent(event) => {
-                notify_pane_event_direct(&mut self.state, &event);
-                self.publish_read_model();
+                let changed = notify_pane_event_direct(&mut self.state, &event);
+                self.publish_read_model_if(changed);
             }
             DecorationEngineCommand::FocusSnapshot(snapshot) => {
-                apply_focus_state_map(&mut self.state, &snapshot);
-                self.publish_read_model();
+                let changed = apply_focus_state_map(&mut self.state, &snapshot);
+                self.publish_read_model_if(changed);
             }
             DecorationEngineCommand::AttachLayoutSnapshot(snapshot) => {
-                apply_attach_layout_snapshot(&mut self.state, &snapshot);
-                self.publish_read_model();
+                let changed = apply_attach_layout_snapshot(&mut self.state, &snapshot);
+                self.publish_read_model_if(changed);
             }
             DecorationEngineCommand::VisualProjection(projection) => {
-                apply_visual_projection_batch(&mut self.state, &projection);
-                self.publish_read_model();
+                let changed = apply_visual_projection_batch(&mut self.state, &projection);
+                self.publish_read_model_if(changed);
             }
             DecorationEngineCommand::ScriptJsonEvent {
                 event,
@@ -263,7 +264,7 @@ impl DecorationEngine {
             } => {
                 let accepted =
                     enqueue_script_json_event_direct(&mut self.state, &event, snapshot, generation);
-                self.publish_read_model();
+                self.publish_read_model_if(accepted);
                 if let Some(reply) = reply {
                     let _ = reply.send(accepted);
                 }
@@ -280,6 +281,12 @@ impl DecorationEngine {
                 self.publish_read_model();
                 let _ = reply.send(());
             }
+        }
+    }
+
+    fn publish_read_model_if(&mut self, changed: bool) {
+        if changed {
+            self.publish_read_model();
         }
     }
 

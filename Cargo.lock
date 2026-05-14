@@ -1377,6 +1377,7 @@ dependencies = [
 name = "bmux_decoration_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "arc-swap",
  "bmux_attach_layout_protocol",
  "bmux_decoration_plugin_api",
  "bmux_pane_runtime_plugin_api",
