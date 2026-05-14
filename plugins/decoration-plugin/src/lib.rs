@@ -218,8 +218,8 @@ impl std::fmt::Debug for State {
 }
 
 impl State {
-    /// Borrow-or-create activity for `pane_id`. Caller must bump the
-    /// revision when they observe a change.
+    /// Borrow-or-create activity for `pane_id`. Caller must publish the scene
+    /// when they observe a change.
     fn activity_mut(&mut self, pane_id: Uuid) -> &mut PaneActivity {
         self.activity
             .entry(pane_id)
@@ -445,6 +445,9 @@ impl DecorationCommandsService for DecorationServiceHandle {
     }
 }
 
+// Direct mutation helper for engine dispatch, pre-engine fallback paths, and
+// tests. Normal post-activation runtime mutations should enter through
+// `DecorationEngineCommand`.
 fn set_pane_border_direct(
     state: &Arc<Mutex<State>>,
     pane_id: Uuid,
@@ -468,6 +471,9 @@ fn set_pane_border_direct(
     Ok(())
 }
 
+// Direct mutation helper for engine dispatch, pre-engine fallback paths, and
+// tests. Normal post-activation runtime mutations should enter through
+// `DecorationEngineCommand`.
 fn set_default_border_direct(
     state: &Arc<Mutex<State>>,
     border: BorderStyle,
@@ -483,6 +489,9 @@ fn set_default_border_direct(
     Ok(())
 }
 
+// Direct mutation helper for engine dispatch, pre-engine fallback paths, and
+// tests. Normal post-activation runtime mutations should enter through
+// `DecorationEngineCommand`.
 fn notify_pane_event_direct(
     state: &Arc<Mutex<State>>,
     event: &PaneEvent,
@@ -2455,9 +2464,9 @@ impl RustPlugin for DecorationPlugin {
         }
         self.lifecycle_context = Some(context);
         // Register the retained scene channel before any mutator (including
-        // the initial revision bump below) tries to publish. Failure is
+        // the initial publication below) tries to publish. Failure is
         // non-fatal — the channel may already exist from a prior load;
-        // `bump_revision` tolerates a missing channel.
+        // scene publication tolerates a missing channel.
         let _ = bmux_plugin::global_event_bus()
             .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
                 bmux_scene_protocol::scene_protocol::STATE_KIND,
@@ -2470,11 +2479,10 @@ impl RustPlugin for DecorationPlugin {
         if let Ok(mut state) = self.state.inner.lock() {
             summary_theme_loaded = state.current_theme.is_some();
             summary_script_loaded = state.script_backend.is_some();
-            // Bump the scene revision so the first build_scene() call
-            // returns a non-zero revision, signalling consumers that
-            // the plugin has published at least once. Emission runs
-            // inside `bump_revision`, so subscribers see the initial
-            // scene on their next poll.
+            // Publish the initial scene so the first build_scene() call returns
+            // a non-zero revision, signalling consumers that the plugin has
+            // published at least once. Subscribers see the initial scene on
+            // their next poll.
             publish_scene_if_changed(&mut state);
         }
         tracing::debug!(
@@ -2869,7 +2877,7 @@ fn compile_script_component_instance(
 }
 
 /// Compile `script` into a fresh backend and install it on `state`.
-/// Invoked during `activate` before the first revision bump so the
+/// Invoked during `activate` before the first scene publication so the
 /// initial published scene already reflects any script output.
 ///
 /// Failure modes (compile error, stub backend when no `scripting-*`
@@ -3010,9 +3018,9 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
 /// The subscriber thread reconciles the full map against
 /// `state.activity` on every update: every pane listed as
 /// `focused_pane_id` gets `activity.focused = true`, every other
-/// known pane gets `focused = false`. A fresh revision bumps the
-/// scene so downstream consumers (attach renderer) pick up the
-/// change.
+/// known pane gets `focused = false`. Scene publication runs when the
+/// snapshot changes so downstream consumers (attach renderer) pick up
+/// the change.
 fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
     let subscribe_result = bmux_plugin::global_event_bus()
         .subscribe_state::<bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap>(
@@ -3076,7 +3084,7 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
 /// Reconcile the decoration plugin's `state.activity` map against a
 /// pane-runtime focus snapshot. Any pane listed as a focused pane in
 /// the snapshot is marked `focused = true`; all other known panes are
-/// unfocused. The scene revision bumps when anything changes.
+/// unfocused. The scene publishes when anything changes.
 fn apply_focus_state_map(
     state: &mut State,
     snapshot: &bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap,
@@ -3130,9 +3138,8 @@ fn apply_focus_state_map(
 /// incoming snapshots into `state.geometry`. Each snapshot carries
 /// the set of visible attach surfaces; we insert/update the
 /// `PaneGeometry` for every pane-backed surface and drop any panes
-/// that disappeared from the new snapshot. Bumping the scene
-/// revision after a change lets subscribers pick up the updated
-/// paint commands on the next frame.
+/// that disappeared from the new snapshot. Publishing after a change lets
+/// subscribers pick up the updated paint commands on the next frame.
 fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
     let subscribe_result = bmux_plugin::global_event_bus()
         .subscribe_state::<
@@ -3777,7 +3784,7 @@ mod tests {
     }
 
     #[test]
-    fn bump_revision_skips_publishing_when_scene_output_is_unchanged() {
+    fn publish_scene_if_changed_skips_when_scene_output_is_unchanged() {
         let mut state = State::default();
         let pane = Uuid::from_u128(0xa11);
         state.geometry.insert(
@@ -4315,7 +4322,7 @@ mod tests {
     }
 
     #[test]
-    fn setting_pane_border_bumps_revision_and_populates_scene() {
+    fn setting_pane_border_publishes_scene() {
         let plugin = DecorationPlugin::new();
         let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         let pane = Uuid::from_u128(42);
@@ -4351,7 +4358,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_bumps_revision_so_first_publish_is_visible() {
+    fn initial_scene_publication_is_visible() {
         let plugin = DecorationPlugin::new();
         let before = plugin.build_scene().revision;
         assert_eq!(before, 0);
@@ -4453,7 +4460,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_attach_layout_snapshot_caches_rects_and_bumps_revision() {
+    fn apply_attach_layout_snapshot_caches_rects_and_publishes_scene() {
         use bmux_attach_layout_protocol::attach_layout_protocol::{
             AttachLayoutSnapshot, AttachSurfaceSummary,
         };
@@ -4483,7 +4490,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_attach_layout_snapshot_skips_revision_bump_for_unchanged_rects() {
+    fn apply_attach_layout_snapshot_skips_publication_for_unchanged_rects() {
         use bmux_attach_layout_protocol::attach_layout_protocol::{
             AttachLayoutSnapshot, AttachSurfaceSummary,
         };
@@ -4509,7 +4516,7 @@ mod tests {
             apply_attach_layout_snapshot(&mut state, &snapshot);
         }
         let r2 = plugin.build_scene().revision;
-        assert_eq!(r1, r2, "unchanged geometry must not bump revision");
+        assert_eq!(r1, r2, "unchanged geometry must not publish a new revision");
     }
 
     #[test]
@@ -4762,7 +4769,7 @@ mod tests {
     // retained `DecorationScene` on the typed event bus every time state
     // mutates; late attach clients hydrate from the current value.
     #[test]
-    fn bump_revision_publishes_retained_scene_when_channel_registered() {
+    fn publish_scene_if_changed_publishes_retained_scene_when_channel_registered() {
         // Register the state channel first (as `activate()` would).
         let _sender = bmux_plugin::global_event_bus()
             .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(

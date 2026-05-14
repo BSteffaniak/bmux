@@ -1,3 +1,15 @@
+//! Private decoration runtime engine.
+//!
+//! This module owns the decoration plugin's command/scheduling boundary: theme
+//! applies, animation ticks, service mutations, input events, and event-bus
+//! subscribers all converge here before touching decoration state. Today the
+//! engine is a mutex-backed actor bridge: a single command loop serializes
+//! normal runtime mutations, while `State` remains behind `Arc<Mutex<_>>` so the
+//! plugin's synchronous service entrypoint and existing tests can fall back
+//! without deadlocking. The planned pure-ownership refactor will move `State`
+//! into the engine task directly and leave callers with only command handles and
+//! read-model snapshots.
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -211,6 +223,10 @@ pub(crate) fn notify_animation_driver(state: &State) {
 }
 
 fn has_animation_backend(state: &State) -> bool {
+    // Plugin-only client awareness: attach layout geometry is the decoration
+    // plugin's current signal that at least one visible surface can consume
+    // animation output. True per-client pause/throttle requires attach/client
+    // presence semantics that are not part of the decoration inputs yet.
     !state.geometry.is_empty()
         && (state.script_backend.is_some()
             || state
