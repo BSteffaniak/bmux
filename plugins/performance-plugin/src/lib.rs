@@ -79,8 +79,10 @@ impl RustPlugin for PerformancePlugin {
             |_| MetricsSnapshot::default(),
             |state| state.snapshot.clone(),
         );
-        global_event_bus()
-            .register_state_channel::<MetricsSnapshot>(METRICS_STATE_KIND, initial_snapshot);
+        global_event_bus().register_state_channel_with_json_projection::<MetricsSnapshot>(
+            METRICS_STATE_KIND,
+            initial_snapshot,
+        );
         ensure_metrics_worker();
         Ok(bmux_plugin_sdk::EXIT_OK)
     }

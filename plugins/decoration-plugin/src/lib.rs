@@ -1632,7 +1632,7 @@ fn install_script_event_subscriptions(
 }
 
 fn plugin_event_kind_from_string(kind: String) -> bmux_plugin_sdk::PluginEventKind {
-    bmux_plugin_sdk::PluginEventKind::from_static(Box::leak(kind.into_boxed_str()))
+    bmux_plugin_sdk::PluginEventKind::from_owned(kind)
 }
 
 fn spawn_local_current_thread_runtime(
@@ -3309,12 +3309,11 @@ fn read_visual_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, bmux_plugin::Ev
 
 fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     let event_kind = plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string());
-    let _ = bmux_plugin::global_event_bus()
-        .register_state_channel_with_bytes_decoder_without_json_mirror(
-            event_kind.clone(),
-            VisualProjectionBatch::default(),
-            decode_visual_projection_batch,
-        );
+    let _ = bmux_plugin::global_event_bus().register_state_channel_with_bytes_decoder(
+        event_kind.clone(),
+        VisualProjectionBatch::default(),
+        decode_visual_projection_batch,
+    );
     let Ok((initial, mut rx)) =
         bmux_plugin::global_event_bus().subscribe_state::<VisualProjectionBatch>(&event_kind)
     else {
@@ -4010,7 +4009,10 @@ mod tests {
         let kind = format!("test.decoration/state-{}", Uuid::new_v4());
         let event_kind = plugin_event_kind_from_string(kind.clone());
         bmux_plugin::global_event_bus()
-            .register_state_channel::<serde_json::Value>(event_kind, json!({ "value": 42 }));
+            .register_state_channel_with_json_projection::<serde_json::Value>(
+                event_kind,
+                json!({ "value": 42 }),
+            );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let generation = {
             let mut state = plugin.state.inner.lock().expect("lock");
