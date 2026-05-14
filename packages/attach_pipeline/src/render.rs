@@ -1713,6 +1713,7 @@ const fn selected_style(mut style: CellStyle) -> CellStyle {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CellCoverage {
     Transparent,
+    BackgroundOnly,
     Opaque,
 }
 
@@ -1727,15 +1728,33 @@ fn pane_cell_coverage(cell: Option<&Cell>, raw_style: CellStyle, selected: bool)
         return CellCoverage::Opaque;
     }
     let text = cell.text();
-    if (text.is_empty() || text == " ") && raw_style == CellStyle::default() {
-        CellCoverage::Transparent
+    if text.is_empty() || text == " " {
+        if raw_style == CellStyle::default() {
+            CellCoverage::Transparent
+        } else if !raw_style.inverse && !matches!(raw_style.bg, CellColor::Default) {
+            CellCoverage::BackgroundOnly
+        } else {
+            CellCoverage::Opaque
+        }
     } else {
         CellCoverage::Opaque
     }
 }
 
 fn push_under_cell(line: &mut String, current: &mut CellStyle, cell: &RenderUnderCell) {
-    let style = render_style_to_cell_style(cell.style);
+    push_under_cell_with_background(line, current, cell, None);
+}
+
+fn push_under_cell_with_background(
+    line: &mut String,
+    current: &mut CellStyle,
+    cell: &RenderUnderCell,
+    background: Option<CellColor>,
+) {
+    let mut style = render_style_to_cell_style(cell.style);
+    if let Some(background) = background {
+        style.bg = background;
+    }
     if style != *current {
         line.push_str(&style_sgr(style));
         *current = style;
@@ -1781,15 +1800,29 @@ fn render_grid_row_segment(
             grid_cell_style(context.palette.get(cell.style()))
         });
         let selected = cell_selected(context.selection, context.absolute_row, usize::from(col));
-        if matches!(
-            pane_cell_coverage(cell, raw_style, selected),
-            CellCoverage::Transparent
-        ) && let Some(under_cell) = context.before_content_cells.get(&col)
-        {
-            push_under_cell(&mut line, &mut current, under_cell);
-            emitted_cols = emitted_cols.saturating_add(1);
-            col = col.saturating_add(1);
-            continue;
+        let coverage = pane_cell_coverage(cell, raw_style, selected);
+        if let Some(under_cell) = context.before_content_cells.get(&col) {
+            match coverage {
+                CellCoverage::Transparent => {
+                    push_under_cell(&mut line, &mut current, under_cell);
+                    emitted_cols = emitted_cols.saturating_add(1);
+                    col = col.saturating_add(1);
+                    continue;
+                }
+                CellCoverage::BackgroundOnly => {
+                    let style = apply_content_effects(raw_style, context.runtime_appearance);
+                    push_under_cell_with_background(
+                        &mut line,
+                        &mut current,
+                        under_cell,
+                        Some(style.bg),
+                    );
+                    emitted_cols = emitted_cols.saturating_add(1);
+                    col = col.saturating_add(1);
+                    continue;
+                }
+                CellCoverage::Opaque => {}
+            }
         }
 
         let mut style = raw_style;
@@ -3033,11 +3066,11 @@ fn render_attach_scene_inner<W: io::Write>(
 mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
-        DamageCoalescingPolicy, DamageRect, FrameDamage, TerminalCommand, append_pane_output,
-        coalesce_render_damage, frame_damage_overlay_render_ops, opaque_row_text,
-        optimize_terminal_commands, queue_frame_damage_overlay,
+        DamageCoalescingPolicy, DamageRect, FrameDamage, GridRowRenderContext, TerminalCommand,
+        append_pane_output, coalesce_render_damage, frame_damage_overlay_render_ops,
+        opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
         queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
-        render_attach_scene, render_attach_scene_with_stats_and_trace,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -3049,7 +3082,7 @@ mod tests {
     };
     use bmux_plugin::{
         ExtensionRect, RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp,
-        RenderStyle,
+        RenderStyle, RenderUnderCell,
     };
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
@@ -3118,6 +3151,63 @@ mod tests {
             },
         );
         appearance
+    }
+
+    fn render_row_with_before_content_cell(content_bytes: &[u8]) -> String {
+        let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+            1,
+            1,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("test grid dimensions should be valid");
+        stream.process(content_bytes);
+        let grid = stream.grid();
+        let row = grid.viewport_row_ref(0).expect("row should exist");
+        let appearance = RuntimeAppearance::default();
+        let mut before_content_cells = BTreeMap::new();
+        before_content_cells.insert(
+            0,
+            RenderUnderCell {
+                ch: '●',
+                style: RenderStyle {
+                    fg: Some(RenderColor::Rgb {
+                        r: 95,
+                        g: 175,
+                        b: 255,
+                    }),
+                    ..RenderStyle::default()
+                },
+            },
+        );
+
+        render_grid_row_segment(
+            GridRowRenderContext {
+                row,
+                selection: None,
+                absolute_row: 0,
+                runtime_appearance: &appearance,
+                palette: grid.palette(),
+                before_content_cells: &before_content_cells,
+            },
+            0,
+            1,
+        )
+    }
+
+    #[test]
+    fn before_content_glyph_shows_through_background_only_cell() {
+        let rendered = render_row_with_before_content_cell(b"\x1b[48;2;10;20;30m \x1b[0m");
+
+        assert!(rendered.contains("●"), "{rendered:?}");
+        assert!(rendered.contains("48;2;10;20;30m●"), "{rendered:?}");
+    }
+
+    #[test]
+    fn before_content_glyph_stays_hidden_by_text_cell_with_background() {
+        let rendered = render_row_with_before_content_cell(b"\x1b[48;2;10;20;30mA\x1b[0m");
+
+        assert!(rendered.contains('A'), "{rendered:?}");
+        assert!(!rendered.contains('●'), "{rendered:?}");
     }
 
     #[test]
