@@ -340,9 +340,10 @@ impl DecorationStateService for DecorationServiceHandle {
 
     fn scene_snapshot<'a>(&'a self) -> Pin<Box<dyn Future<Output = DecorationScene> + Send + 'a>> {
         Box::pin(async move {
-            self.state
-                .lock()
-                .map_or_else(|_| empty_scene(), |mut state| build_scene(&mut state))
+            self.state.lock().map_or_else(
+                |_| empty_scene(),
+                |mut state| scene_snapshot_from_state(&mut state),
+            )
         })
     }
 
@@ -519,13 +520,17 @@ fn set_pane_border_direct(
         style: "<poisoned>".into(),
     })?;
     let focused = state.activity.get(&pane_id).is_some_and(|a| a.focused);
+    let had_entry = state.panes.contains_key(&pane_id);
     let entry = state
         .panes
         .entry(pane_id)
         .or_insert_with(|| default_pane_decoration(pane_id, border, focused));
+    if had_entry && entry.border == border && entry.focused == focused {
+        return Ok(());
+    }
     entry.border = border;
     entry.focused = focused;
-    bump_revision(&mut state);
+    publish_scene_if_changed(&mut state);
     Ok(())
 }
 
@@ -536,8 +541,11 @@ fn set_default_border_direct(
     let mut state = state.lock().map_err(|_| SetStyleError::StyleUnsupported {
         style: "<poisoned>".into(),
     })?;
+    if state.default_border == border {
+        return Ok(());
+    }
     state.default_border = border;
-    bump_revision(&mut state);
+    publish_scene_if_changed(&mut state);
     Ok(())
 }
 
@@ -601,7 +609,7 @@ fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> Atta
     }
 
     if result.dirty {
-        bump_revision(state);
+        publish_scene_if_changed(state);
     }
     result
 }
@@ -629,6 +637,7 @@ fn merge_attach_input_result(result: &mut AttachInputResult, next: Option<Attach
 /// typed `notify_pane_event` command and the event-bus subscriber
 /// can share the same mutation path.
 fn apply_pane_event(state: &mut State, event: &PaneEvent) {
+    let mut changed = false;
     match event {
         PaneEvent::Focused { pane_id } => {
             // Unfocus every other pane so the activity map has a
@@ -636,48 +645,67 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
             for (id, act) in &mut state.activity {
                 if *id != *pane_id && act.focused {
                     act.focused = false;
+                    changed = true;
                 }
             }
-            state.activity_mut(*pane_id).focused = true;
+            let act = state.activity_mut(*pane_id);
+            if !act.focused {
+                act.focused = true;
+                changed = true;
+            }
             state.sync_focused_mirror(*pane_id, true);
-            bump_revision(state);
         }
         PaneEvent::Unfocused { pane_id } => {
-            if let Some(act) = state.activity.get_mut(pane_id) {
+            if let Some(act) = state.activity.get_mut(pane_id)
+                && act.focused
+            {
                 act.focused = false;
+                changed = true;
             }
             state.sync_focused_mirror(*pane_id, false);
-            bump_revision(state);
         }
         PaneEvent::Zoomed { pane_id } => {
-            state.activity_mut(*pane_id).zoomed = true;
-            bump_revision(state);
+            let act = state.activity_mut(*pane_id);
+            if !act.zoomed {
+                act.zoomed = true;
+                changed = true;
+            }
         }
         PaneEvent::Unzoomed { pane_id } => {
-            if let Some(act) = state.activity.get_mut(pane_id) {
+            if let Some(act) = state.activity.get_mut(pane_id)
+                && act.zoomed
+            {
                 act.zoomed = false;
-                bump_revision(state);
+                changed = true;
             }
         }
         PaneEvent::Opened { pane_id, .. } => {
+            changed = !state.activity.contains_key(pane_id);
             state.activity_mut(*pane_id);
-            bump_revision(state);
         }
         PaneEvent::Closed { pane_id } => {
-            state.panes.remove(pane_id);
+            let panes_removed = state.panes.remove(pane_id).is_some();
+            let geometry_len = state.geometry.len();
             state.geometry.retain(|_, geom| geom.pane_id != *pane_id);
-            state.activity.remove(pane_id);
-            bump_revision(state);
+            let geometry_removed = state.geometry.len() != geometry_len;
+            let activity_removed = state.activity.remove(pane_id).is_some();
+            changed = panes_removed || geometry_removed || activity_removed;
         }
         PaneEvent::StatusChanged { pane_id, exited } => {
-            let act = state.activity_mut(*pane_id);
-            act.status = if *exited {
+            let status = if *exited {
                 PaneLifecycle::Exited
             } else {
                 PaneLifecycle::Running
             };
-            bump_revision(state);
+            let act = state.activity_mut(*pane_id);
+            if act.status != status {
+                act.status = status;
+                changed = true;
+            }
         }
+    }
+    if changed {
+        publish_scene_if_changed(state);
     }
 }
 
@@ -1414,7 +1442,7 @@ fn empty_scene() -> DecorationScene {
 /// value. Publication silently no-ops if the event-bus channel has not been
 /// registered yet (the decoration plugin registers it in
 /// [`DecorationPlugin::activate`]).
-fn bump_revision(state: &mut State) {
+fn publish_scene_if_changed(state: &mut State) {
     // Build while we still hold the lock so script render output and revision
     // updates stay ordered from subscribers' perspective. The candidate scene
     // is compared without its revision so animation ticks that do not change
@@ -1442,7 +1470,14 @@ fn scene_output_matches(left: &DecorationScene, right: &DecorationScene) -> bool
         && left.visual_adapters == right.visual_adapters
 }
 
-/// Parse a TOML string against the [`DecorationThemeExtension`]
+fn scene_snapshot_from_state(state: &mut State) -> DecorationScene {
+    state
+        .last_published_scene
+        .clone()
+        .unwrap_or_else(|| build_scene(state))
+}
+
+/// Start the private decoration engine loop if it is not already running.
 /// schema and return a structured [`ValidationResult`].
 ///
 /// Used by the `validate-theme-extension` query so external callers
@@ -1607,7 +1642,7 @@ fn apply_theme_extension_toml_direct(
             notify_animation_driver(&state);
             state.script_components.clear();
             install_script_backend(&mut state, None, ScriptHostAccess::default());
-            bump_revision(&mut state);
+            publish_scene_if_changed(&mut state);
         }
         return Ok(());
     }
@@ -1650,7 +1685,7 @@ fn apply_theme_extension_toml_direct(
         notify_animation_driver(&state);
         install_script_backend(&mut state, script, script_host_access);
         subscription_generation = Some(state.script_subscription_generation);
-        bump_revision(&mut state);
+        publish_scene_if_changed(&mut state);
     }
     if let Some(generation) = subscription_generation {
         install_script_event_subscriptions(state, script_access, generation);
@@ -1802,8 +1837,12 @@ fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, gen
         );
         return;
     };
-    std::thread::spawn(move || {
-        while let Ok(event) = rx.blocking_recv() {
+    let host_async_handle = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.host_async_handle.clone());
+    let task = async move {
+        while let Ok(event) = rx.recv().await {
             if !send_engine_fire_and_forget(
                 &state,
                 DecorationEngineCommand::ScriptJsonEvent {
@@ -1817,7 +1856,12 @@ fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, gen
                 break;
             }
         }
-    });
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.script_event_subscriber", task);
+    } else {
+        spawn_local_current_thread_runtime("script event subscriber", task);
+    }
 }
 
 #[cfg(test)]
@@ -1880,7 +1924,7 @@ fn enqueue_script_json_event_direct(
         }
         component.script_events.push_back(event_message.clone());
     }
-    bump_revision(&mut guard);
+    publish_scene_if_changed(&mut guard);
     true
 }
 
@@ -1908,10 +1952,10 @@ impl DecorationPlugin {
     /// to the default style and core paints nothing around them.
     #[must_use]
     pub fn build_scene(&self) -> DecorationScene {
-        self.state
-            .inner
-            .lock()
-            .map_or_else(|_| empty_scene(), |mut state| build_scene(&mut state))
+        self.state.inner.lock().map_or_else(
+            |_| empty_scene(),
+            |mut state| scene_snapshot_from_state(&mut state),
+        )
     }
 }
 
@@ -2569,7 +2613,7 @@ impl RustPlugin for DecorationPlugin {
             // the plugin has published at least once. Emission runs
             // inside `bump_revision`, so subscribers see the initial
             // scene on their next poll.
-            bump_revision(&mut state);
+            publish_scene_if_changed(&mut state);
         }
         tracing::debug!(
             theme_loaded = summary_theme_loaded,
@@ -2677,7 +2721,7 @@ impl RustPlugin for DecorationPlugin {
             "decoration-state", "scene-snapshot" => |_req: (), _ctx| {
                 let scene = state
                     .lock()
-                    .map_or_else(|_| empty_scene(), |mut s| build_scene(&mut s));
+                    .map_or_else(|_| empty_scene(), |mut s| scene_snapshot_from_state(&mut s));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(scene)
             },
             "decoration-state", "pane-geometry" => |req: PaneGeometryArgs, _ctx| {
@@ -3060,18 +3104,19 @@ fn notify_animation_driver(state: &State) {
 }
 
 fn has_animation_backend(state: &State) -> bool {
-    state.script_backend.is_some()
-        || state
-            .script_components
-            .values()
-            .any(|component| component.backend.is_some())
+    !state.geometry.is_empty()
+        && (state.script_backend.is_some()
+            || state
+                .script_components
+                .values()
+                .any(|component| component.backend.is_some()))
 }
 
 fn run_animation_tick_if_current(state: &mut State, policy: AnimationDriverPolicy) -> bool {
     if animation_driver_policy(state) != policy || !has_animation_backend(state) {
         return false;
     }
-    bump_revision(state);
+    publish_scene_if_changed(state);
     true
 }
 
@@ -3156,8 +3201,12 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
     ) else {
         return;
     };
-    std::thread::spawn(move || {
-        while let Ok(event) = rx.blocking_recv() {
+    let host_async_handle = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.host_async_handle.clone());
+    let task = async move {
+        while let Ok(event) = rx.recv().await {
             let event = translate_windows_event(&event);
             if !send_engine_fire_and_forget(
                 &state,
@@ -3169,7 +3218,12 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
                 apply_pane_event(&mut guard, &event);
             }
         }
-    });
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.windows_pane_event_subscriber", task);
+    } else {
+        spawn_local_current_thread_runtime("windows pane event subscriber", task);
+    }
 }
 
 /// Subscribe to the pane-runtime focus-state channel and keep
@@ -3299,7 +3353,7 @@ fn apply_focus_state_map(
         "apply_focus_state_map"
     );
     if changed {
-        bump_revision(state);
+        publish_scene_if_changed(state);
     }
 }
 
@@ -3474,7 +3528,7 @@ fn apply_visual_projection(state: &mut State, projection: &VisualProjectionState
     if previous_metadata.as_ref() != Some(&metadata)
         || previous_payload.as_ref() != Some(&projection.payload)
     {
-        bump_revision(state);
+        publish_scene_if_changed(state);
     }
 }
 
@@ -3526,7 +3580,7 @@ fn apply_attach_layout_snapshot(
         changed = true;
     }
     if changed {
-        bump_revision(state);
+        publish_scene_if_changed(state);
     }
 }
 
@@ -3832,14 +3886,55 @@ mod tests {
             },
         );
 
-        bump_revision(&mut state);
+        publish_scene_if_changed(&mut state);
         assert_eq!(state.scene_revision, 1);
-        bump_revision(&mut state);
+        publish_scene_if_changed(&mut state);
         assert_eq!(state.scene_revision, 1);
 
         state.activity_mut(pane).focused = true;
-        bump_revision(&mut state);
+        publish_scene_if_changed(&mut state);
         assert_eq!(state.scene_revision, 2);
+    }
+
+    #[test]
+    fn cached_scene_snapshot_does_not_advance_script_frame() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa12);
+        seed_geometry(&plugin, pane, 12, 5);
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            state.script_backend = Some(Box::new(TestScriptBackend));
+            publish_scene_if_changed(&mut state);
+            assert_eq!(state.script_frame, 1);
+        }
+
+        let first = plugin.build_scene();
+        let second = plugin.build_scene();
+
+        assert_eq!(first, second);
+        let state = plugin.state.inner.lock().expect("lock");
+        assert_eq!(
+            state.script_frame, 1,
+            "cached reads must be side-effect free"
+        );
+    }
+
+    #[test]
+    fn direct_noop_style_mutations_do_not_publish_new_revision() {
+        let plugin = DecorationPlugin::new();
+        let state = plugin.state.clone_arc();
+        set_default_border_direct(&state, BorderStyle::Single).expect("set default");
+        let first_revision = plugin.build_scene().revision;
+
+        set_default_border_direct(&state, BorderStyle::Single).expect("set default noop");
+        assert_eq!(plugin.build_scene().revision, first_revision);
+
+        let pane = Uuid::from_u128(0xa13);
+        seed_geometry(&plugin, pane, 12, 5);
+        set_pane_border_direct(&state, pane, BorderStyle::Double).expect("set pane");
+        let second_revision = plugin.build_scene().revision;
+        set_pane_border_direct(&state, pane, BorderStyle::Double).expect("set pane noop");
+        assert_eq!(plugin.build_scene().revision, second_revision);
     }
 
     // Helpers shared by the new theme-aware build-scene tests below.
@@ -4336,7 +4431,7 @@ mod tests {
         let before = plugin.build_scene().revision;
         assert_eq!(before, 0);
         if let Ok(mut state) = plugin.state.inner.lock() {
-            bump_revision(&mut state);
+            publish_scene_if_changed(&mut state);
         }
         let after = plugin.build_scene().revision;
         assert!(after > before);
@@ -5450,7 +5545,7 @@ exited = ""
     }
 
     #[test]
-    fn stale_same_hz_animation_policy_does_not_bump_revision() {
+    fn stale_same_hz_animation_policy_does_not_publish_scene_if_changed() {
         let plugin = DecorationPlugin::new();
         let mut state = plugin.state.inner.lock().expect("lock");
         state.animation_hz = Some(100);
