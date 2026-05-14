@@ -15,6 +15,8 @@ local MAX_SPEED_MULT = 3.05
 local COLLISION_EPS = 0.001
 local COLLISION_TIME_EPS = 0.000001
 local MAX_COLLISIONS_PER_STEP = 12
+local STUCK_RESPAWN_MS = 10000
+local STUCK_MOVE_EPS = 0.25
 local pane_states = {}
 
 local function pane_state(pane)
@@ -141,6 +143,9 @@ local function new_game(seed, w, h, rally_ms)
         win_started_ms = nil,
         visual_inside = nil,
         visual_revision = nil,
+        last_unstuck_x = nil,
+        last_unstuck_y = nil,
+        stuck_started_ms = nil,
         left = new_player(seed, "left"),
         right = new_player(seed, "right"),
     }
@@ -151,6 +156,42 @@ local function new_game(seed, w, h, rally_ms)
     game.right.prev_center = center_y
     game.right.target = center_y
     return game
+end
+
+local serve
+
+local function reset_stuck_tracker(game)
+    game.last_unstuck_x = game.x
+    game.last_unstuck_y = game.y
+    game.stuck_started_ms = nil
+end
+
+local function maybe_respawn_stuck_ball(game)
+    if game.win then
+        return false
+    end
+    if game.last_unstuck_x == nil or game.last_unstuck_y == nil then
+        reset_stuck_tracker(game)
+        return false
+    end
+
+    local dx = game.x - game.last_unstuck_x
+    local dy = game.y - game.last_unstuck_y
+    if dx * dx + dy * dy >= STUCK_MOVE_EPS * STUCK_MOVE_EPS then
+        reset_stuck_tracker(game)
+        return false
+    end
+
+    if game.stuck_started_ms == nil then
+        game.stuck_started_ms = game.now_ms
+        return false
+    end
+    if game.now_ms - game.stuck_started_ms < STUCK_RESPAWN_MS then
+        return false
+    end
+
+    serve(game, nil)
+    return true
 end
 
 local function serve_direction(game, scorer)
@@ -165,7 +206,7 @@ local function serve_direction(game, scorer)
     return rand01(game.seed, game.rally, 11) < 0.5 and -1 or 1
 end
 
-local function serve(game, scorer)
+function serve(game, scorer)
     game.rally = game.rally + 1
     game.hits = 0
     game.speed_mult = 1.0
@@ -173,6 +214,7 @@ local function serve(game, scorer)
     game.y = rand_range(game.seed, game.rally, 10, 0, math.max(0, game.h - 1))
     game.visual_inside = nil
     game.visual_revision = nil
+    reset_stuck_tracker(game)
     local dir = serve_direction(game, scorer)
     game.vx = game.base_vx * dir
     game.vy = rand_range(game.seed, game.rally, 12, -0.0062, 0.0062)
@@ -655,7 +697,10 @@ local function step_game(game)
 
     move_player(game, game.left, "left")
     move_player(game, game.right, "right")
-    advance_ball(game, STEP_MS)
+    local scored = advance_ball(game, STEP_MS)
+    if not scored then
+        maybe_respawn_stuck_ball(game)
+    end
 end
 
 local function start_game(seed, w, h, rally_ms, now_ms)

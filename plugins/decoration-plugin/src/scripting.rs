@@ -1378,6 +1378,7 @@ mod tests {
         }
 
         #[test]
+        #[allow(clippy::too_many_lines)] // Embedded Lua fixture keeps related Pong collision cases in one script.
         fn bundled_pong_script_sweeps_content_collisions() {
             let backend = make_backend(ScriptHostAccess::default());
             let source = format!(
@@ -1467,6 +1468,17 @@ mod tests {
                 advance_ball(game, 40)
                 assert(game.vx > 0, "starting inside content should not immediately reflect")
                 assert(game.x > 4, "starting inside content should still advance out of the cell")
+
+                game = make_test_game(10, 5, 1, 1, 0, 0, nil)
+                game.content_bounce = false
+                game.now_ms = 0
+                reset_stuck_tracker(game)
+                assert(not maybe_respawn_stuck_ball(game), "stuck ball should arm the respawn timer first")
+                game.now_ms = 9999
+                assert(not maybe_respawn_stuck_ball(game), "stuck ball should wait for the respawn threshold")
+                game.now_ms = 10000
+                assert(maybe_respawn_stuck_ball(game), "stuck ball should respawn after ten seconds")
+                assert(game.rally == 1, "stuck respawn should serve a new rally")
 
                 local wide_wall = make_visual(30, 5, { { 12, 2 } })
                 local pane = { id = "test-current-visual", content_rect = { w = 30, h = 5 } }

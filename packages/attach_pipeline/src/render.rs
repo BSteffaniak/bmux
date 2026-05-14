@@ -1741,10 +1741,6 @@ fn pane_cell_coverage(cell: Option<&Cell>, raw_style: CellStyle, selected: bool)
     }
 }
 
-fn push_under_cell(line: &mut String, current: &mut CellStyle, cell: &RenderUnderCell) {
-    push_under_cell_with_background(line, current, cell, None);
-}
-
 fn push_under_cell_with_background(
     line: &mut String,
     current: &mut CellStyle,
@@ -1804,7 +1800,14 @@ fn render_grid_row_segment(
         if let Some(under_cell) = context.before_content_cells.get(&col) {
             match coverage {
                 CellCoverage::Transparent => {
-                    push_under_cell(&mut line, &mut current, under_cell);
+                    let style =
+                        apply_content_effects(CellStyle::default(), context.runtime_appearance);
+                    push_under_cell_with_background(
+                        &mut line,
+                        &mut current,
+                        under_cell,
+                        (!matches!(style.bg, CellColor::Default)).then_some(style.bg),
+                    );
                     emitted_cols = emitted_cols.saturating_add(1);
                     col = col.saturating_add(1);
                     continue;
@@ -3154,6 +3157,16 @@ mod tests {
     }
 
     fn render_row_with_before_content_cell(content_bytes: &[u8]) -> String {
+        render_row_with_before_content_cell_and_appearance(
+            content_bytes,
+            &RuntimeAppearance::default(),
+        )
+    }
+
+    fn render_row_with_before_content_cell_and_appearance(
+        content_bytes: &[u8],
+        appearance: &RuntimeAppearance,
+    ) -> String {
         let mut stream = bmux_terminal_grid::TerminalGridStream::new(
             1,
             1,
@@ -3163,7 +3176,6 @@ mod tests {
         stream.process(content_bytes);
         let grid = stream.grid();
         let row = grid.viewport_row_ref(0).expect("row should exist");
-        let appearance = RuntimeAppearance::default();
         let mut before_content_cells = BTreeMap::new();
         before_content_cells.insert(
             0,
@@ -3185,7 +3197,7 @@ mod tests {
                 row,
                 selection: None,
                 absolute_row: 0,
-                runtime_appearance: &appearance,
+                runtime_appearance: appearance,
                 palette: grid.palette(),
                 before_content_cells: &before_content_cells,
             },
@@ -3208,6 +3220,15 @@ mod tests {
 
         assert!(rendered.contains('A'), "{rendered:?}");
         assert!(!rendered.contains('●'), "{rendered:?}");
+    }
+
+    #[test]
+    fn before_content_glyph_preserves_runtime_effect_background() {
+        let appearance = red_wash_appearance();
+        let rendered = render_row_with_before_content_cell_and_appearance(b" ", &appearance);
+
+        assert!(rendered.contains('●'), "{rendered:?}");
+        assert!(rendered.contains("48;2;25;0;0m●"), "{rendered:?}");
     }
 
     #[test]
