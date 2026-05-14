@@ -200,6 +200,8 @@ impl AttachVisualAdapterRequest {
 pub struct AttachVisualProjectionUpdate {
     pub request_id: String,
     pub event_kind: String,
+    pub surface_id: Uuid,
+    pub pane_id: Uuid,
     pub encoding: String,
     pub payload: Vec<u8>,
 }

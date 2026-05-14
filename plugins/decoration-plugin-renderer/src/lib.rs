@@ -102,6 +102,7 @@ struct VisualProjectionContext<'a> {
     request: &'a AttachVisualAdapterRequest,
     revision_key: String,
     surface_id: Uuid,
+    pane_id: Uuid,
     content_revision: u64,
     projection_elapsed: Duration,
 }
@@ -520,6 +521,7 @@ fn observe_visual_surface(
         request,
         revision_key,
         surface_id: surface.surface_id(),
+        pane_id: surface.pane_id(),
         content_revision,
         projection_elapsed,
     };
@@ -536,6 +538,7 @@ fn handle_visual_projection_result(
         request,
         revision_key,
         surface_id,
+        pane_id,
         content_revision,
         projection_elapsed,
     } = context;
@@ -564,6 +567,8 @@ fn handle_visual_projection_result(
             let sent = maybe_push_visual_projection_update(
                 cache,
                 request,
+                surface_id,
+                pane_id,
                 revision_key.clone(),
                 output,
                 updates,
@@ -618,6 +623,8 @@ fn handle_visual_projection_result(
 fn maybe_push_visual_projection_update(
     cache: &mut DecorationRendererCache,
     request: &AttachVisualAdapterRequest,
+    surface_id: Uuid,
+    pane_id: Uuid,
     revision_key: String,
     output: bmux_plugin::AttachVisualAdapterOutput,
     updates: &mut Vec<AttachVisualProjectionUpdate>,
@@ -636,6 +643,8 @@ fn maybe_push_visual_projection_update(
     updates.push(AttachVisualProjectionUpdate {
         request_id: request.id.clone(),
         event_kind: request.event_kind.clone(),
+        surface_id,
+        pane_id,
         encoding: output.encoding,
         payload: output.payload,
     });

@@ -32,7 +32,7 @@ struct PresenceBitsetCache {
     words_per_row: u16,
     row_fingerprints: Vec<Option<u64>>,
     row_hashes: Vec<Option<u64>>,
-    row_words: Vec<u32>,
+    scratch_row_words: Vec<u32>,
     payload: Vec<u8>,
     projections: u64,
     unchanged: u64,
@@ -66,7 +66,6 @@ fn project_presence_bitset(
     }
 
     let mut changed = resized;
-    let mut row_words = vec![0_u32; usize::from(words_per_row)];
     for y in 0..height {
         let row_index = usize::from(y);
         let row_fingerprint = surface.row_content_fingerprint(y);
@@ -79,20 +78,21 @@ fn project_presence_bitset(
         }
 
         cache.rows_scanned = cache.rows_scanned.saturating_add(1);
-        row_words.fill(0);
-        fill_presence_row_words(surface, width, words_per_row, y, &mut row_words);
-        let row_hash = hash_presence_row(&row_words);
+        cache.scratch_row_words.fill(0);
+        fill_presence_row_words(
+            surface,
+            width,
+            words_per_row,
+            y,
+            &mut cache.scratch_row_words,
+        );
+        let row_hash = hash_presence_row(&cache.scratch_row_words);
         if let Some(fingerprint) = cache.row_fingerprints.get_mut(row_index) {
             *fingerprint = row_fingerprint;
         }
         if cache.row_hashes.get(row_index).copied().flatten() != Some(row_hash) {
             if let Some(hash) = cache.row_hashes.get_mut(row_index) {
                 *hash = Some(row_hash);
-            }
-            let word_start = row_index.saturating_mul(usize::from(words_per_row));
-            let word_end = word_start.saturating_add(usize::from(words_per_row));
-            if let Some(words) = cache.row_words.get_mut(word_start..word_end) {
-                words.copy_from_slice(&row_words);
             }
             patch_presence_payload_row(cache, row_index)?;
             cache.rows_changed = cache.rows_changed.saturating_add(1);
@@ -133,11 +133,12 @@ fn ensure_presence_cache(
     words_per_row: u16,
 ) -> Result<bool, String> {
     let word_count = usize::from(words_per_row).saturating_mul(usize::from(height));
+    let expected_payload_len = PRESENCE_HEADER_LEN.saturating_add(word_count.saturating_mul(4));
     if cache.width == width
         && cache.height == height
         && cache.words_per_row == words_per_row
-        && cache.row_words.len() == word_count
-        && !cache.payload.is_empty()
+        && cache.scratch_row_words.len() == usize::from(words_per_row)
+        && cache.payload.len() == expected_payload_len
     {
         return Ok(false);
     }
@@ -147,16 +148,15 @@ fn ensure_presence_cache(
     cache.words_per_row = words_per_row;
     cache.row_fingerprints = vec![None; usize::from(height)];
     cache.row_hashes = vec![None; usize::from(height)];
-    cache.row_words = vec![0; word_count];
+    cache.scratch_row_words = vec![0; usize::from(words_per_row)];
     cache.cache_rebuilds = cache.cache_rebuilds.saturating_add(1);
     rebuild_presence_payload(cache)?;
     Ok(true)
 }
 
 fn rebuild_presence_payload(cache: &mut PresenceBitsetCache) -> Result<(), String> {
-    let word_bytes = cache
-        .row_words
-        .len()
+    let word_bytes = usize::from(cache.words_per_row)
+        .saturating_mul(usize::from(cache.height))
         .checked_mul(std::mem::size_of::<u32>())
         .ok_or_else(|| "presence-bitset payload is too large".to_string())?;
     let payload_len = PRESENCE_HEADER_LEN
@@ -169,9 +169,6 @@ fn rebuild_presence_payload(cache: &mut PresenceBitsetCache) -> Result<(), Strin
     cache.payload[8..10].copy_from_slice(&cache.words_per_row.to_le_bytes());
     cache.payload[10..12].copy_from_slice(&0_u16.to_le_bytes());
     patch_presence_payload_grid_revision(cache, 0)?;
-    for row_index in 0..usize::from(cache.height) {
-        patch_presence_payload_row(cache, row_index)?;
-    }
     Ok(())
 }
 
@@ -192,12 +189,12 @@ fn patch_presence_payload_row(
     row_index: usize,
 ) -> Result<(), String> {
     let words_per_row = usize::from(cache.words_per_row);
+    if cache.scratch_row_words.len() != words_per_row {
+        return Err("presence-bitset row scratch size mismatch".to_string());
+    }
     let word_start = row_index.saturating_mul(words_per_row);
-    let word_end = word_start.saturating_add(words_per_row);
-    for word_index in word_start..word_end {
-        let Some(word) = cache.row_words.get(word_index).copied() else {
-            return Err("presence-bitset row word is missing".to_string());
-        };
+    for (local_word_index, word) in cache.scratch_row_words.iter().copied().enumerate() {
+        let word_index = word_start.saturating_add(local_word_index);
         let offset = PRESENCE_WORDS_OFFSET.saturating_add(word_index.saturating_mul(4));
         let end = offset.saturating_add(4);
         let Some(slot) = cache.payload.get_mut(offset..end) else {

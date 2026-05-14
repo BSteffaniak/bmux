@@ -127,7 +127,7 @@ pub struct ScriptRenderMessage {
     pub frame: u64,
     pub panes: JsonValue,
     pub visual: JsonValue,
-    pub visual_bytes: BTreeMap<String, Vec<u8>>,
+    pub visual_bytes: BTreeMap<String, Arc<[u8]>>,
     pub component: Option<ScriptComponentMessage>,
 }
 
@@ -346,7 +346,7 @@ mod lua_backend {
     use serde_json::Value as JsonValue;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     const BACKEND_NAME: &str = {
@@ -575,10 +575,10 @@ mod lua_backend {
         Ok(t)
     }
 
-    fn visual_bytes_to_lua(lua: &Lua, values: &BTreeMap<String, Vec<u8>>) -> mlua::Result<Value> {
+    fn visual_bytes_to_lua(lua: &Lua, values: &BTreeMap<String, Arc<[u8]>>) -> mlua::Result<Value> {
         let table = lua.create_table()?;
         for (key, bytes) in values {
-            table.set(key.as_str(), lua.create_string(bytes)?)?;
+            table.set(key.as_str(), lua.create_string(bytes.as_ref())?)?;
         }
         Ok(Value::Table(table))
     }
@@ -1139,7 +1139,10 @@ mod tests {
 
         fn render_message_with_visual_bytes() -> ScriptMessage {
             let mut visual_bytes = BTreeMap::new();
-            visual_bytes.insert("pong.content-presence".to_string(), vec![0, 1, 255]);
+            visual_bytes.insert(
+                "pong.content-presence".to_string(),
+                Arc::<[u8]>::from([0, 1, 255]),
+            );
             ScriptMessage::Render(ScriptRenderMessage {
                 time_ms: 500,
                 frame: 10,

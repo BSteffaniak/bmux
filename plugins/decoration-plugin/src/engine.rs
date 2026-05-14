@@ -10,10 +10,11 @@ use uuid::Uuid;
 
 use crate::scripting::ScriptHostAccess;
 use crate::{
-    State, VisualProjectionState, apply_attach_layout_snapshot, apply_focus_state_map,
-    apply_theme_extension_toml_direct, apply_visual_projection, enqueue_script_json_event_direct,
-    handle_attach_input_event, notify_pane_event_direct, publish_scene_if_changed,
-    set_default_border_direct, set_pane_border_direct, spawn_local_current_thread_runtime,
+    State, VisualProjectionBatch, apply_attach_layout_snapshot, apply_focus_state_map,
+    apply_theme_extension_toml_direct, apply_visual_projection_batch,
+    enqueue_script_json_event_direct, handle_attach_input_event, notify_pane_event_direct,
+    publish_scene_if_changed, set_default_border_direct, set_pane_border_direct,
+    spawn_local_current_thread_runtime,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +50,7 @@ pub(crate) enum DecorationEngineCommand {
     PaneEvent(PaneEvent),
     FocusSnapshot(bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap),
     AttachLayoutSnapshot(bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot),
-    VisualProjection(VisualProjectionState),
+    VisualProjection(VisualProjectionBatch),
     ScriptJsonEvent {
         event: bmux_plugin::JsonPluginEvent,
         snapshot: bool,
@@ -174,7 +175,7 @@ fn handle_decoration_engine_command(state: &Arc<Mutex<State>>, command: Decorati
         }
         DecorationEngineCommand::VisualProjection(projection) => {
             if let Ok(mut guard) = state.lock() {
-                apply_visual_projection(&mut guard, &projection);
+                apply_visual_projection_batch(&mut guard, &projection);
             }
         }
         DecorationEngineCommand::ScriptJsonEvent {

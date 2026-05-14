@@ -3289,24 +3289,69 @@ async fn handle_attach_stream_server_event(
     })
 }
 
-fn encode_visual_projection_update(update: &AttachVisualProjectionUpdate) -> Vec<u8> {
-    const MAGIC: &[u8; 4] = b"BVP1";
-    let request_id = update.request_id.as_bytes();
-    let encoding = update.encoding.as_bytes();
-    let request_len = u16::try_from(request_id.len()).unwrap_or(u16::MAX);
-    let encoding_len = u16::try_from(encoding.len()).unwrap_or(u16::MAX);
-    let request_id = &request_id[..usize::from(request_len)];
-    let encoding = &encoding[..usize::from(encoding_len)];
-    let mut payload = Vec::with_capacity(
-        MAGIC.len() + 4 + request_id.len() + encoding.len() + update.payload.len(),
-    );
+fn encode_visual_projection_batch(
+    updates: &[AttachVisualProjectionUpdate],
+) -> Result<Vec<u8>, String> {
+    const MAGIC: &[u8; 4] = b"BVPB";
+    const VERSION: u16 = 1;
+    let entry_count = u16::try_from(updates.len())
+        .map_err(|_| "too many visual projection updates for one batch".to_string())?;
+    let mut capacity = MAGIC.len() + 4;
+    for update in updates {
+        let request_len = u16::try_from(update.request_id.len()).map_err(|_| {
+            format!(
+                "visual projection request id is too long: {}",
+                update.request_id
+            )
+        })?;
+        let encoding_len = u16::try_from(update.encoding.len()).map_err(|_| {
+            format!(
+                "visual projection encoding name is too long: {}",
+                update.encoding
+            )
+        })?;
+        let _payload_len = u32::try_from(update.payload.len()).map_err(|_| {
+            format!(
+                "visual projection payload is too large: {}",
+                update.request_id
+            )
+        })?;
+        capacity = capacity
+            .saturating_add(40)
+            .saturating_add(usize::from(request_len))
+            .saturating_add(usize::from(encoding_len))
+            .saturating_add(update.payload.len());
+    }
+
+    let mut payload = Vec::with_capacity(capacity);
     payload.extend_from_slice(MAGIC);
-    payload.extend_from_slice(&request_len.to_le_bytes());
-    payload.extend_from_slice(&encoding_len.to_le_bytes());
-    payload.extend_from_slice(request_id);
-    payload.extend_from_slice(encoding);
-    payload.extend_from_slice(&update.payload);
-    payload
+    payload.extend_from_slice(&VERSION.to_le_bytes());
+    payload.extend_from_slice(&entry_count.to_le_bytes());
+    for update in updates {
+        let request_id = update.request_id.as_bytes();
+        let encoding = update.encoding.as_bytes();
+        payload.extend_from_slice(
+            &u16::try_from(request_id.len())
+                .map_err(|_| "visual projection request id is too long".to_string())?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u16::try_from(encoding.len())
+                .map_err(|_| "visual projection encoding name is too long".to_string())?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u32::try_from(update.payload.len())
+                .map_err(|_| "visual projection payload is too large".to_string())?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(update.surface_id.as_bytes());
+        payload.extend_from_slice(update.pane_id.as_bytes());
+        payload.extend_from_slice(request_id);
+        payload.extend_from_slice(encoding);
+        payload.extend_from_slice(&update.payload);
+    }
+    Ok(payload)
 }
 
 async fn flush_visual_projection_updates(
@@ -3314,17 +3359,30 @@ async fn flush_visual_projection_updates(
     view_state: &mut AttachViewState,
 ) {
     let updates = std::mem::take(&mut view_state.visual_projection_updates);
+    let mut batches: BTreeMap<String, Vec<AttachVisualProjectionUpdate>> = BTreeMap::new();
     for update in updates {
-        let payload = encode_visual_projection_update(&update);
+        batches
+            .entry(update.event_kind.clone())
+            .or_default()
+            .push(update);
+    }
+    for (event_kind, updates) in batches {
+        let payload = match encode_visual_projection_batch(&updates) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(%event_kind, %error, "visual projection batch encode failed");
+                continue;
+            }
+        };
         if let Err(error) = client
-            .emit_on_plugin_bus(update.event_kind.as_str(), payload)
+            .emit_on_plugin_bus(event_kind.as_str(), payload)
             .await
         {
             tracing::debug!(
-                request_id = %update.request_id,
-                event_kind = %update.event_kind,
+                event_kind = %event_kind,
+                update_count = updates.len(),
                 %error,
-                "emit_on_plugin_bus for visual projection failed",
+                "emit_on_plugin_bus for visual projection batch failed",
             );
         }
     }

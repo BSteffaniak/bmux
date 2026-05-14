@@ -2304,8 +2304,7 @@ async fn handle_request(
             // up; channels without a decoder or not yet registered
             // silently drop the payload (returns `emitted: false`) so
             // early wire traffic from a client doesn't fail loudly.
-            let event_kind =
-                bmux_plugin_sdk::PluginEventKind::from_static(Box::leak(kind.into_boxed_str()));
+            let event_kind = bmux_plugin_sdk::PluginEventKind::from_owned(kind);
             match bmux_plugin::global_event_bus().emit_from_bytes(&event_kind, &payload) {
                 Ok(emitted) => Response::Ok(ResponsePayload::PluginBusEmitted { emitted }),
                 Err(error) => Response::Err(ErrorResponse {

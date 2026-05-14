@@ -157,7 +157,14 @@ struct State {
     /// Latest attach-local visual adapter metadata, keyed by request id.
     visual_projections: BTreeMap<String, serde_json::Value>,
     /// Latest attach-local visual adapter byte payloads, keyed by request id.
-    visual_projection_bytes: BTreeMap<String, Vec<u8>>,
+    visual_projection_bytes: BTreeMap<String, Arc<[u8]>>,
+    /// Authoritative attach-local visual adapter metadata keyed by request id,
+    /// then surface id. `visual_projections` keeps the latest entry per request
+    /// as a compatibility/convenience view for focused-pane consumers.
+    visual_projection_surfaces: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    /// Authoritative attach-local visual adapter byte payloads keyed by request
+    /// id, then surface id.
+    visual_projection_surface_bytes: BTreeMap<String, BTreeMap<String, Arc<[u8]>>>,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
     /// Monotonic token invalidating stale animation tick threads across
@@ -744,12 +751,30 @@ fn script_visual_payload(state: &State) -> serde_json::Value {
         state
             .visual_projections
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .map(|(key, value)| {
+                let mut value = value.clone();
+                if let Some(surfaces) = state.visual_projection_surfaces.get(key)
+                    && let serde_json::Value::Object(object) = &mut value
+                {
+                    object.insert(
+                        "surfaces".to_string(),
+                        serde_json::Value::Object(
+                            surfaces
+                                .iter()
+                                .map(|(surface_id, metadata)| {
+                                    (surface_id.clone(), metadata.clone())
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                (key.clone(), value)
+            })
             .collect(),
     )
 }
 
-fn script_visual_bytes_payload(state: &State) -> BTreeMap<String, Vec<u8>> {
+fn script_visual_bytes_payload(state: &State) -> BTreeMap<String, Arc<[u8]>> {
     state.visual_projection_bytes.clone()
 }
 
@@ -855,7 +880,7 @@ fn merge_script_paint_commands(
 struct ComponentRenderPassState<'a> {
     panes: &'a serde_json::Value,
     visual: serde_json::Value,
-    visual_bytes: BTreeMap<String, Vec<u8>>,
+    visual_bytes: BTreeMap<String, Arc<[u8]>>,
     instance_frames: BTreeMap<String, (u64, u64)>,
     event_instances: BTreeSet<String>,
 }
@@ -1469,6 +1494,7 @@ fn apply_theme_extension_toml_direct(
             state.animation_generation = state.animation_generation.saturating_add(1);
             notify_animation_driver(&state);
             state.script_components.clear();
+            clear_visual_projection_state(&mut state);
             install_script_backend(&mut state, None, ScriptHostAccess::default());
             publish_scene_if_changed(&mut state);
         }
@@ -1508,6 +1534,7 @@ fn apply_theme_extension_toml_direct(
             &script_host_access,
         );
         state.current_theme = Some(extension);
+        clear_visual_projection_state(&mut state);
         state.animation_hz = animation_hz;
         state.animation_generation = state.animation_generation.saturating_add(1);
         notify_animation_driver(&state);
@@ -1519,6 +1546,13 @@ fn apply_theme_extension_toml_direct(
         install_script_event_subscriptions(state, script_access, generation);
     }
     Ok(())
+}
+
+fn clear_visual_projection_state(state: &mut State) {
+    state.visual_projections.clear();
+    state.visual_projection_bytes.clear();
+    state.visual_projection_surfaces.clear();
+    state.visual_projection_surface_bytes.clear();
 }
 
 fn script_service_grants(
@@ -3154,58 +3188,135 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-struct VisualProjectionState {
-    request_id: String,
-    encoding: String,
-    payload: Vec<u8>,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VisualProjectionBatch {
+    entries: Vec<VisualProjectionEntry>,
 }
 
-fn decode_visual_projection_state(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisualProjectionEntry {
+    request_id: String,
+    surface_id: Uuid,
+    pane_id: Uuid,
+    encoding: String,
+    payload: Arc<[u8]>,
+}
+
+fn decode_visual_projection_batch(
     bytes: &[u8],
-) -> Result<VisualProjectionState, bmux_plugin::EventBusBytesError> {
-    const MAGIC: &[u8; 4] = b"BVP1";
+) -> Result<VisualProjectionBatch, bmux_plugin::EventBusBytesError> {
+    const MAGIC: &[u8; 4] = b"BVPB";
+    const VERSION: u16 = 1;
     if bytes.len() < 8 || &bytes[0..4] != MAGIC {
         return Err(bmux_plugin::EventBusBytesError::Decode(
-            "invalid visual projection envelope".to_string(),
+            "invalid visual projection batch envelope".to_string(),
         ));
     }
-    let request_len = usize::from(u16::from_le_bytes(bytes[4..6].try_into().map_err(
-        |_| bmux_plugin::EventBusBytesError::Decode("missing request length".to_string()),
-    )?));
-    let encoding_len = usize::from(u16::from_le_bytes(bytes[6..8].try_into().map_err(
-        |_| bmux_plugin::EventBusBytesError::Decode("missing encoding length".to_string()),
-    )?));
-    let request_start = 8;
-    let encoding_start = request_start + request_len;
-    let payload_start = encoding_start + encoding_len;
-    if payload_start > bytes.len() {
+    let version = read_visual_u16(bytes, 4)?;
+    if version != VERSION {
+        return Err(bmux_plugin::EventBusBytesError::Decode(format!(
+            "unsupported visual projection batch version: {version}"
+        )));
+    }
+    let entry_count = usize::from(read_visual_u16(bytes, 6)?);
+    let mut offset = 8;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let request_len = usize::from(read_visual_u16(bytes, offset)?);
+        offset += 2;
+        let encoding_len = usize::from(read_visual_u16(bytes, offset)?);
+        offset += 2;
+        let payload_len = usize::try_from(read_visual_u32(bytes, offset)?).map_err(|_| {
+            bmux_plugin::EventBusBytesError::Decode("payload length overflow".to_string())
+        })?;
+        offset += 4;
+        let surface_id = read_visual_uuid(bytes, offset)?;
+        offset += 16;
+        let pane_id = read_visual_uuid(bytes, offset)?;
+        offset += 16;
+        let request_end = offset.checked_add(request_len).ok_or_else(|| {
+            bmux_plugin::EventBusBytesError::Decode("visual request id length overflow".to_string())
+        })?;
+        let encoding_end = request_end.checked_add(encoding_len).ok_or_else(|| {
+            bmux_plugin::EventBusBytesError::Decode("visual encoding length overflow".to_string())
+        })?;
+        let payload_end = encoding_end.checked_add(payload_len).ok_or_else(|| {
+            bmux_plugin::EventBusBytesError::Decode("visual payload length overflow".to_string())
+        })?;
+        if payload_end > bytes.len() {
+            return Err(bmux_plugin::EventBusBytesError::Decode(
+                "truncated visual projection batch envelope".to_string(),
+            ));
+        }
+        let request_id = std::str::from_utf8(&bytes[offset..request_end])
+            .map_err(|err| bmux_plugin::EventBusBytesError::Decode(err.to_string()))?
+            .to_string();
+        let encoding = std::str::from_utf8(&bytes[request_end..encoding_end])
+            .map_err(|err| bmux_plugin::EventBusBytesError::Decode(err.to_string()))?
+            .to_string();
+        entries.push(VisualProjectionEntry {
+            request_id,
+            surface_id,
+            pane_id,
+            encoding,
+            payload: Arc::from(&bytes[encoding_end..payload_end]),
+        });
+        offset = payload_end;
+    }
+    if offset != bytes.len() {
         return Err(bmux_plugin::EventBusBytesError::Decode(
-            "truncated visual projection envelope".to_string(),
+            "trailing bytes in visual projection batch envelope".to_string(),
         ));
     }
-    let request_id = std::str::from_utf8(&bytes[request_start..encoding_start])
-        .map_err(|err| bmux_plugin::EventBusBytesError::Decode(err.to_string()))?
-        .to_string();
-    let encoding = std::str::from_utf8(&bytes[encoding_start..payload_start])
-        .map_err(|err| bmux_plugin::EventBusBytesError::Decode(err.to_string()))?
-        .to_string();
-    Ok(VisualProjectionState {
-        request_id,
-        encoding,
-        payload: bytes[payload_start..].to_vec(),
-    })
+    Ok(VisualProjectionBatch { entries })
+}
+
+fn read_visual_u16(bytes: &[u8], offset: usize) -> Result<u16, bmux_plugin::EventBusBytesError> {
+    let end = offset.saturating_add(2);
+    let Some(slice) = bytes.get(offset..end) else {
+        return Err(bmux_plugin::EventBusBytesError::Decode(
+            "truncated visual u16".to_string(),
+        ));
+    };
+    Ok(u16::from_le_bytes(slice.try_into().map_err(|_| {
+        bmux_plugin::EventBusBytesError::Decode("invalid visual u16".to_string())
+    })?))
+}
+
+fn read_visual_u32(bytes: &[u8], offset: usize) -> Result<u32, bmux_plugin::EventBusBytesError> {
+    let end = offset.saturating_add(4);
+    let Some(slice) = bytes.get(offset..end) else {
+        return Err(bmux_plugin::EventBusBytesError::Decode(
+            "truncated visual u32".to_string(),
+        ));
+    };
+    Ok(u32::from_le_bytes(slice.try_into().map_err(|_| {
+        bmux_plugin::EventBusBytesError::Decode("invalid visual u32".to_string())
+    })?))
+}
+
+fn read_visual_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, bmux_plugin::EventBusBytesError> {
+    let end = offset.saturating_add(16);
+    let Some(slice) = bytes.get(offset..end) else {
+        return Err(bmux_plugin::EventBusBytesError::Decode(
+            "truncated visual uuid".to_string(),
+        ));
+    };
+    Ok(Uuid::from_bytes(slice.try_into().map_err(|_| {
+        bmux_plugin::EventBusBytesError::Decode("invalid visual uuid".to_string())
+    })?))
 }
 
 fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     let event_kind = plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string());
-    let _ = bmux_plugin::global_event_bus().register_state_channel_with_bytes_decoder(
-        event_kind.clone(),
-        VisualProjectionState::default(),
-        decode_visual_projection_state,
-    );
+    let _ = bmux_plugin::global_event_bus()
+        .register_state_channel_with_bytes_decoder_without_json_mirror(
+            event_kind.clone(),
+            VisualProjectionBatch::default(),
+            decode_visual_projection_batch,
+        );
     let Ok((initial, mut rx)) =
-        bmux_plugin::global_event_bus().subscribe_state::<VisualProjectionState>(&event_kind)
+        bmux_plugin::global_event_bus().subscribe_state::<VisualProjectionBatch>(&event_kind)
     else {
         tracing::warn!(
             kind = DECORATION_VISUAL_PROJECTION_KIND,
@@ -3218,7 +3329,7 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
         DecorationEngineCommand::VisualProjection(initial.as_ref().clone()),
     ) && let Ok(mut guard) = state.lock()
     {
-        apply_visual_projection(&mut guard, initial.as_ref());
+        apply_visual_projection_batch(&mut guard, initial.as_ref());
     }
     let host_async_handle = state
         .lock()
@@ -3234,7 +3345,7 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
                 let Ok(mut guard) = state.lock() else {
                     break;
                 };
-                apply_visual_projection(&mut guard, snapshot.as_ref());
+                apply_visual_projection_batch(&mut guard, snapshot.as_ref());
             }
         }
     };
@@ -3245,26 +3356,87 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     }
 }
 
-fn apply_visual_projection(state: &mut State, projection: &VisualProjectionState) {
-    if projection.request_id.is_empty() {
-        return;
+fn apply_visual_projection_batch(state: &mut State, batch: &VisualProjectionBatch) {
+    let mut changed = false;
+    for projection in &batch.entries {
+        if projection.request_id.is_empty() {
+            continue;
+        }
+        let surface_key = projection.surface_id.to_string();
+        let metadata = serde_json::json!({
+            "request_id": projection.request_id,
+            "surface_id": projection.surface_id,
+            "pane_id": projection.pane_id,
+            "encoding": projection.encoding,
+            "byte_length": projection.payload.len(),
+        });
+        let request_surfaces = state
+            .visual_projection_surfaces
+            .entry(projection.request_id.clone())
+            .or_default();
+        let previous_surface_metadata =
+            request_surfaces.insert(surface_key.clone(), metadata.clone());
+        let request_surface_bytes = state
+            .visual_projection_surface_bytes
+            .entry(projection.request_id.clone())
+            .or_default();
+        let previous_surface_payload =
+            request_surface_bytes.insert(surface_key, Arc::clone(&projection.payload));
+        let previous_metadata = state
+            .visual_projections
+            .insert(projection.request_id.clone(), metadata.clone());
+        let previous_payload = state.visual_projection_bytes.insert(
+            projection.request_id.clone(),
+            Arc::clone(&projection.payload),
+        );
+        changed |= previous_surface_metadata.as_ref() != Some(&metadata);
+        changed |= previous_surface_payload.as_deref() != Some(projection.payload.as_ref());
+        changed |= previous_metadata.as_ref() != Some(&metadata);
+        changed |= previous_payload.as_deref() != Some(projection.payload.as_ref());
     }
-    let metadata = serde_json::json!({
-        "request_id": projection.request_id,
-        "encoding": projection.encoding,
-        "byte_length": projection.payload.len(),
-    });
-    let previous_metadata = state
-        .visual_projections
-        .insert(projection.request_id.clone(), metadata.clone());
-    let previous_payload = state
-        .visual_projection_bytes
-        .insert(projection.request_id.clone(), projection.payload.clone());
-    if previous_metadata.as_ref() != Some(&metadata)
-        || previous_payload.as_ref() != Some(&projection.payload)
-    {
+    if changed {
         publish_scene_if_changed(state);
     }
+}
+
+fn retain_visual_projection_surfaces(state: &mut State, seen_surfaces: &BTreeSet<Uuid>) -> bool {
+    let seen_surface_keys = seen_surfaces
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<BTreeSet<_>>();
+    let before_metadata = state.visual_projection_surfaces.clone();
+    let before_bytes = state.visual_projection_surface_bytes.clone();
+    state.visual_projection_surfaces.retain(|_, surfaces| {
+        surfaces.retain(|surface_id, _| seen_surface_keys.contains(surface_id));
+        !surfaces.is_empty()
+    });
+    state.visual_projection_surface_bytes.retain(|_, surfaces| {
+        surfaces.retain(|surface_id, _| seen_surface_keys.contains(surface_id));
+        !surfaces.is_empty()
+    });
+
+    state.visual_projections.clear();
+    state.visual_projection_bytes.clear();
+    for (request_id, surfaces) in &state.visual_projection_surfaces {
+        let Some((surface_id, metadata)) = surfaces.iter().next_back() else {
+            continue;
+        };
+        state
+            .visual_projections
+            .insert(request_id.clone(), metadata.clone());
+        if let Some(bytes) = state
+            .visual_projection_surface_bytes
+            .get(request_id)
+            .and_then(|surface_bytes| surface_bytes.get(surface_id))
+        {
+            state
+                .visual_projection_bytes
+                .insert(request_id.clone(), Arc::clone(bytes));
+        }
+    }
+
+    before_metadata != state.visual_projection_surfaces
+        || before_bytes != state.visual_projection_surface_bytes
 }
 
 /// Reconcile `state.geometry` against an [`AttachLayoutSnapshot`].
@@ -3314,6 +3486,7 @@ fn apply_attach_layout_snapshot(
         }
         changed = true;
     }
+    changed |= retain_visual_projection_surfaces(state, &seen_surfaces);
     if changed {
         publish_scene_if_changed(state);
     }
@@ -3489,9 +3662,17 @@ mod tests {
         }
     }
 
-    fn visual_projection_envelope(request_id: &str, encoding: &str, payload: &[u8]) -> Vec<u8> {
+    fn visual_projection_envelope(
+        request_id: &str,
+        surface_id: Uuid,
+        pane_id: Uuid,
+        encoding: &str,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"BVP1");
+        bytes.extend_from_slice(b"BVPB");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(
             &u16::try_from(request_id.len())
                 .expect("request len")
@@ -3502,6 +3683,13 @@ mod tests {
                 .expect("encoding len")
                 .to_le_bytes(),
         );
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("payload len")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(surface_id.as_bytes());
+        bytes.extend_from_slice(pane_id.as_bytes());
         bytes.extend_from_slice(request_id.as_bytes());
         bytes.extend_from_slice(encoding.as_bytes());
         bytes.extend_from_slice(payload);
@@ -4881,37 +5069,54 @@ exited = ""
 
     #[test]
     fn visual_projection_envelope_decodes_binary_sidecar() {
+        let surface_id = Uuid::from_u128(7);
+        let pane_id = Uuid::from_u128(8);
         let bytes = visual_projection_envelope(
             "pong.content-presence",
+            surface_id,
+            pane_id,
             "presence-bitset-bin-v1",
             &[1, 2, 3, 4],
         );
-        let decoded = decode_visual_projection_state(&bytes).expect("decode projection");
-        assert_eq!(decoded.request_id, "pong.content-presence");
-        assert_eq!(decoded.encoding, "presence-bitset-bin-v1");
-        assert_eq!(decoded.payload, vec![1, 2, 3, 4]);
+        let decoded = decode_visual_projection_batch(&bytes).expect("decode projection");
+        assert_eq!(decoded.entries.len(), 1);
+        let entry = &decoded.entries[0];
+        assert_eq!(entry.request_id, "pong.content-presence");
+        assert_eq!(entry.surface_id, surface_id);
+        assert_eq!(entry.pane_id, pane_id);
+        assert_eq!(entry.encoding, "presence-bitset-bin-v1");
+        assert_eq!(entry.payload.as_ref(), &[1, 2, 3, 4]);
     }
 
     #[test]
     fn visual_projection_updates_script_metadata_and_byte_sidecar() {
         let mut state = State::default();
-        let projection = VisualProjectionState {
-            request_id: "pong.content-presence".to_string(),
-            encoding: "presence-bitset-bin-v1".to_string(),
-            payload: vec![0, 1, 2, 3],
+        let surface_id = Uuid::from_u128(7);
+        let pane_id = Uuid::from_u128(8);
+        let projection = VisualProjectionBatch {
+            entries: vec![VisualProjectionEntry {
+                request_id: "pong.content-presence".to_string(),
+                surface_id,
+                pane_id,
+                encoding: "presence-bitset-bin-v1".to_string(),
+                payload: Arc::<[u8]>::from([0, 1, 2, 3]),
+            }],
         };
-        apply_visual_projection(&mut state, &projection);
+        apply_visual_projection_batch(&mut state, &projection);
+        let visual = script_visual_payload(&state);
+        let metadata = &visual["pong.content-presence"];
+        assert_eq!(metadata["request_id"], json!("pong.content-presence"));
+        assert_eq!(metadata["surface_id"], json!(surface_id));
+        assert_eq!(metadata["pane_id"], json!(pane_id));
+        assert_eq!(metadata["encoding"], json!("presence-bitset-bin-v1"));
+        assert_eq!(metadata["byte_length"], json!(4));
         assert_eq!(
-            script_visual_payload(&state)["pong.content-presence"],
-            json!({
-                "request_id": "pong.content-presence",
-                "encoding": "presence-bitset-bin-v1",
-                "byte_length": 4,
-            })
+            metadata["surfaces"][surface_id.to_string()]["encoding"],
+            json!("presence-bitset-bin-v1")
         );
         assert_eq!(
-            script_visual_bytes_payload(&state)["pong.content-presence"],
-            vec![0, 1, 2, 3]
+            script_visual_bytes_payload(&state)["pong.content-presence"].as_ref(),
+            &[0, 1, 2, 3]
         );
     }
 

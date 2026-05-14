@@ -113,6 +113,11 @@ pub enum EventBusError {
         /// The delivery mode the registered channel actually uses.
         actual: DeliveryMode,
     },
+    /// The channel exists but was registered without a type-erased JSON mirror.
+    JsonMirrorUnavailable {
+        /// The interface id involved.
+        interface: String,
+    },
 }
 
 impl std::fmt::Display for EventBusError {
@@ -138,6 +143,10 @@ impl std::fmt::Display for EventBusError {
                 f,
                 "event channel for `{interface}` is a {actual} channel; \
                  caller's API is {expected}"
+            ),
+            Self::JsonMirrorUnavailable { interface } => write!(
+                f,
+                "event channel for `{interface}` was registered without a JSON mirror"
             ),
         }
     }
@@ -181,7 +190,7 @@ struct ChannelEntry {
     /// [`EventBus::publish_state`] / [`EventBus::emit`] APIs; they
     /// simply can't accept wire-encoded payloads.
     decoder: Option<BytesDecoder>,
-    json: JsonMirror,
+    json: Option<JsonMirror>,
 }
 
 /// Error surface for `emit_from_bytes` decoder invocation.
@@ -261,10 +270,10 @@ impl EventBus {
             payload_type_id: TypeId::of::<E>(),
             payload_type_name: std::any::type_name::<E>(),
             decoder: None,
-            json: JsonMirror {
+            json: Some(JsonMirror {
                 broadcast: json_sender,
                 state: None,
-            },
+            }),
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
@@ -310,10 +319,40 @@ impl EventBus {
             payload_type_id: TypeId::of::<T>(),
             payload_type_name: std::any::type_name::<T>(),
             decoder: None,
-            json: JsonMirror {
+            json: Some(JsonMirror {
                 broadcast: json_broadcast_sender,
                 state: Some(json_state_sender),
-            },
+            }),
+        };
+        let mut guard = self.entries.write().expect("event bus lock poisoned");
+        guard.insert(interface, entry);
+        sender
+    }
+
+    /// Register a retained state channel without a type-erased JSON mirror.
+    ///
+    /// Use this for internal binary-heavy state where typed subscribers are the
+    /// only intended consumers. Publishing on channels registered this way avoids
+    /// serializing payloads into JSON side mirrors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal lock is poisoned.
+    pub fn register_state_channel_without_json_mirror<T>(
+        &self,
+        interface: PluginEventKind,
+        initial: T,
+    ) -> watch::Sender<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let (sender, _) = watch::channel::<Arc<T>>(Arc::new(initial));
+        let entry = ChannelEntry {
+            kind: ChannelKind::State(Arc::new(sender.clone())),
+            payload_type_id: TypeId::of::<T>(),
+            payload_type_name: std::any::type_name::<T>(),
+            decoder: None,
+            json: None,
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
@@ -367,6 +406,37 @@ impl EventBus {
         F: Fn(&[u8]) -> Result<T, EventBusBytesError> + Send + Sync + 'static,
     {
         let sender = self.register_state_channel::<T>(interface.clone(), initial);
+        self.install_state_bytes_decoder(&interface, decode);
+        sender
+    }
+
+    /// Register a retained state channel with a custom wire decoder but without
+    /// a type-erased JSON mirror.
+    ///
+    /// This is intended for internal binary-heavy channels whose payloads would
+    /// be wasteful or misleading when represented as JSON.
+    #[allow(clippy::needless_pass_by_value)] // Consumed via `.clone()` for registration and decoder capture; matches state-channel registration APIs.
+    pub fn register_state_channel_with_bytes_decoder_without_json_mirror<T, F>(
+        self: &Arc<Self>,
+        interface: PluginEventKind,
+        initial: T,
+        decode: F,
+    ) -> watch::Sender<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T, EventBusBytesError> + Send + Sync + 'static,
+    {
+        let sender =
+            self.register_state_channel_without_json_mirror::<T>(interface.clone(), initial);
+        self.install_state_bytes_decoder_without_json_mirror(&interface, decode);
+        sender
+    }
+
+    fn install_state_bytes_decoder<T, F>(self: &Arc<Self>, interface: &PluginEventKind, decode: F)
+    where
+        T: Any + Send + Sync + Serialize + 'static,
+        F: Fn(&[u8]) -> Result<T, EventBusBytesError> + Send + Sync + 'static,
+    {
         let bus = Arc::downgrade(self);
         let decoder_kind = interface.clone();
         let decoder: BytesDecoder =
@@ -378,12 +448,37 @@ impl EventBus {
                 bus.publish_state::<T>(&decoder_kind, value)?;
                 Ok(())
             });
+        self.set_bytes_decoder(interface, decoder);
+    }
+
+    fn install_state_bytes_decoder_without_json_mirror<T, F>(
+        self: &Arc<Self>,
+        interface: &PluginEventKind,
+        decode: F,
+    ) where
+        T: Any + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T, EventBusBytesError> + Send + Sync + 'static,
+    {
+        let bus = Arc::downgrade(self);
+        let decoder_kind = interface.clone();
+        let decoder: BytesDecoder =
+            Arc::new(move |bytes: &[u8]| -> Result<(), EventBusBytesError> {
+                let Some(bus) = bus.upgrade() else {
+                    return Err(EventBusBytesError::Decode("event bus dropped".to_string()));
+                };
+                let value = decode(bytes)?;
+                bus.publish_state_without_json_mirror::<T>(&decoder_kind, value)?;
+                Ok(())
+            });
+        self.set_bytes_decoder(interface, decoder);
+    }
+
+    fn set_bytes_decoder(&self, interface: &PluginEventKind, decoder: BytesDecoder) {
         if let Ok(mut guard) = self.entries.write()
-            && let Some(entry) = guard.get_mut(&interface)
+            && let Some(entry) = guard.get_mut(interface)
         {
             entry.decoder = Some(decoder);
         }
-        sender
     }
 
     /// Publish a wire-encoded payload on the channel registered for
@@ -465,8 +560,12 @@ impl EventBus {
     where
         T: Any + Send + Sync + Serialize + 'static,
     {
-        let json_payload = serde_json::to_value(&value).ok();
         let sender = self.state_sender::<T>(interface)?;
+        let json_payload = if self.has_json_mirror(interface) {
+            serde_json::to_value(&value).ok()
+        } else {
+            None
+        };
         // `send_replace` always updates the retained value, even when
         // no receivers are live. Using `send` would return an error
         // in that case and leave late subscribers with stale data.
@@ -474,6 +573,28 @@ impl EventBus {
         if let Some(payload) = json_payload {
             self.publish_json_mirror(interface, DeliveryMode::State, payload);
         }
+        Ok(())
+    }
+
+    /// Publish a retained state value without updating a JSON mirror.
+    ///
+    /// This is the matching publish path for channels registered with
+    /// [`Self::register_state_channel_without_json_mirror`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventBusError`] when the channel is missing, is not a state
+    /// channel, or was registered for a different payload type.
+    pub fn publish_state_without_json_mirror<T>(
+        &self,
+        interface: &PluginEventKind,
+        value: T,
+    ) -> EventBusResult<()>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let sender = self.state_sender::<T>(interface)?;
+        sender.send_replace(Arc::new(value));
         Ok(())
     }
 
@@ -552,7 +673,12 @@ impl EventBus {
                     actual: DeliveryMode::State,
                 });
             }
-            entry.json.broadcast.clone()
+            let Some(json) = entry.json.as_ref() else {
+                return Err(EventBusError::JsonMirrorUnavailable {
+                    interface: interface.as_str().to_string(),
+                });
+            };
+            json.broadcast.clone()
         };
         Ok(sender.subscribe())
     }
@@ -581,7 +707,12 @@ impl EventBus {
                     .ok_or_else(|| EventBusError::ChannelNotRegistered {
                         interface: interface.as_str().to_string(),
                     })?;
-            let Some(sender) = entry.json.state.as_ref() else {
+            let Some(json) = entry.json.as_ref() else {
+                return Err(EventBusError::JsonMirrorUnavailable {
+                    interface: interface.as_str().to_string(),
+                });
+            };
+            let Some(sender) = json.state.as_ref() else {
                 return Err(EventBusError::ChannelDeliveryMismatch {
                     interface: interface.as_str().to_string(),
                     expected: DeliveryMode::State,
@@ -662,6 +793,14 @@ impl EventBus {
         Ok((*downcast).clone())
     }
 
+    fn has_json_mirror(&self, interface: &PluginEventKind) -> bool {
+        self.entries.read().is_ok_and(|guard| {
+            guard
+                .get(interface)
+                .is_some_and(|entry| entry.json.is_some())
+        })
+    }
+
     fn publish_json_mirror(
         &self,
         interface: &PluginEventKind,
@@ -679,8 +818,11 @@ impl EventBus {
         let Some(entry) = guard.get(interface) else {
             return;
         };
-        let _ = entry.json.broadcast.send(event.clone());
-        if let Some(sender) = entry.json.state.as_ref() {
+        let Some(json) = entry.json.as_ref() else {
+            return;
+        };
+        let _ = json.broadcast.send(event.clone());
+        if let Some(sender) = json.state.as_ref() {
             sender.send_replace(event);
         }
     }
@@ -935,6 +1077,20 @@ mod tests {
                 revision: 2,
             },
         );
+    }
+
+    #[tokio::test]
+    async fn state_channel_without_json_mirror_rejects_json_subscriber() {
+        let bus = EventBus::new();
+        bus.register_state_channel_without_json_mirror::<FocusSnapshot>(
+            STATE_IFACE,
+            FocusSnapshot {
+                focused: None,
+                revision: 0,
+            },
+        );
+        let err = bus.subscribe_state_json(&STATE_IFACE).unwrap_err();
+        assert!(matches!(err, EventBusError::JsonMirrorUnavailable { .. }));
     }
 
     #[tokio::test]
