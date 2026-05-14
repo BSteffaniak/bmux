@@ -399,6 +399,29 @@ local function crossing_time(position, velocity, boundary)
     return math.max(0, t)
 end
 
+local function resolve_content_hit_axes(game, cell_x, cell_y, prev_x, prev_y, hit_x, hit_y)
+    if not hit_x or not hit_y then
+        return hit_x, hit_y
+    end
+
+    local x_neighbor = visual_bitset_occupied(game.visual, cell_x, prev_y)
+    local y_neighbor = visual_bitset_occupied(game.visual, prev_x, cell_y)
+    if x_neighbor and not y_neighbor then
+        return true, false
+    end
+    if y_neighbor and not x_neighbor then
+        return false, true
+    end
+
+    -- A diagonal entry into a cell corner used to flip both axes, which often
+    -- looked like the ball reversing back along its incoming path. Prefer the
+    -- dominant travel axis so the bounce keeps more of its original inertia.
+    if math.abs(game.vy) > math.abs(game.vx) then
+        return false, true
+    end
+    return true, false
+end
+
 local function visual_collision_candidate(game, max_ms)
     if not game.content_bounce or game.visual == nil or max_ms <= 0 then
         return nil
@@ -446,6 +469,8 @@ local function visual_collision_candidate(game, max_ms)
         end
         local hit_x = t_max_x <= t_next + COLLISION_TIME_EPS
         local hit_y = t_max_y <= t_next + COLLISION_TIME_EPS
+        local prev_x = cell_x
+        local prev_y = cell_y
         if hit_x then
             cell_x = cell_x + step_x
             t_max_x = t_max_x + t_delta_x
@@ -457,6 +482,7 @@ local function visual_collision_candidate(game, max_ms)
 
         local occupied = visual_bitset_occupied(game.visual, cell_x, cell_y)
         if occupied and not inside then
+            hit_x, hit_y = resolve_content_hit_axes(game, cell_x, cell_y, prev_x, prev_y, hit_x, hit_y)
             return {
                 kind = "content",
                 time = math.max(0, t_next * max_ms),

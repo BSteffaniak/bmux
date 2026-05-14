@@ -1454,8 +1454,8 @@ mod tests {
                 local corner_wall = make_visual(10, 5, { { 4, 3 } })
                 game = make_test_game(10, 5, 3, 2, 0.1, 0.1, corner_wall)
                 advance_ball(game, 20)
-                assert(game.vx < 0, "corner hit should reverse x velocity")
-                assert(game.vy < 0, "corner hit should reverse y velocity")
+                assert(game.vx < 0, "corner hit should reverse one axis")
+                assert(game.vy > 0, "corner hit should preserve one axis instead of reversing back")
 
                 local later_wall = make_visual(10, 5, { { 6, 1 } })
                 game = make_test_game(10, 5, 4, 1, 0.1, -0.1, later_wall)
