@@ -51,6 +51,12 @@ use crate::scripting::{
 const PANE_CONTENT_COMPONENT_ID: &str = "pane.content";
 const MAX_ANIMATION_HZ: u16 = 60;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnimationDriverPolicy {
+    hz: Option<u16>,
+    generation: u64,
+}
+
 /// Runtime state for one user-composable decoration component.
 struct ScriptComponentRuntime {
     id: String,
@@ -155,6 +161,9 @@ struct State {
     /// Monotonic token invalidating stale animation tick threads across
     /// theme reapplies, including reapplies that keep the same tick rate.
     animation_generation: u64,
+    /// Single animation driver policy channel. Theme application only updates
+    /// this channel; it never spawns per-apply tick threads.
+    animation_driver_tx: Option<tokio::sync::watch::Sender<AnimationDriverPolicy>>,
     /// Host async runtime handle supplied by in-process activation.
     /// Used to drive long-lived watch subscribers without constructing
     /// plugin-local tokio runtimes.
@@ -187,6 +196,10 @@ impl std::fmt::Debug for State {
             )
             .field("animation_hz", &self.animation_hz)
             .field("animation_generation", &self.animation_generation)
+            .field(
+                "animation_driver_active",
+                &self.animation_driver_tx.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1341,6 +1354,7 @@ fn apply_theme_extension_toml(
             state.current_theme = None;
             state.animation_hz = None;
             state.animation_generation = state.animation_generation.saturating_add(1);
+            notify_animation_driver(&state);
             state.script_components.clear();
             install_script_backend(&mut state, None, ScriptHostAccess::default());
             bump_revision(&mut state);
@@ -1373,7 +1387,6 @@ fn apply_theme_extension_toml(
     let mut script_host_access = script_host_access;
     script_host_access.service_grants = script_service_grants(script_access.as_ref());
     let mut subscription_generation = None;
-    let mut animation_generation = None;
     if let Ok(mut state) = state.lock() {
         install_script_components(
             &mut state,
@@ -1384,18 +1397,13 @@ fn apply_theme_extension_toml(
         state.current_theme = Some(extension);
         state.animation_hz = animation_hz;
         state.animation_generation = state.animation_generation.saturating_add(1);
-        animation_generation = Some(state.animation_generation);
+        notify_animation_driver(&state);
         install_script_backend(&mut state, script, script_host_access);
         subscription_generation = Some(state.script_subscription_generation);
         bump_revision(&mut state);
     }
     if let Some(generation) = subscription_generation {
         install_script_event_subscriptions(state, script_access, generation);
-    }
-    if let (Some(hz), Some(generation)) = (animation_hz, animation_generation)
-        && hz > 0
-    {
-        spawn_animation_tick_thread(Arc::downgrade(state), hz, generation);
     }
     Ok(())
 }
@@ -2261,6 +2269,7 @@ impl RustPlugin for DecorationPlugin {
                 bmux_scene_protocol::scene_protocol::STATE_KIND,
                 empty_scene(),
             );
+        ensure_animation_driver(&self.state.inner);
         let mut summary_theme_loaded = false;
         let mut summary_script_loaded = false;
         if let Ok(mut state) = self.state.inner.lock() {
@@ -2752,39 +2761,91 @@ fn script_source_hash(path: &std::path::Path, source: &str) -> u64 {
     hasher.finish()
 }
 
-/// Background timer that re-invokes the decoration script at `hz`
-/// ticks per second while the plugin's shared state is alive. The
-/// thread holds a [`Weak`] reference so it terminates cleanly when
-/// the plugin (and thus the `Arc<Mutex<State>>`) is dropped.
-fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16, generation: u64) {
-    // `u16` hz * `Duration::from_micros` keeps arithmetic safe up to
-    // 65535 Hz. Theme application clamps user-provided rates before
-    // starting tickers so bundled animations cannot request unbounded CPU.
-    let period = Duration::from_micros((1_000_000u64 / u64::from(hz.max(1))).max(1));
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(period);
-            let Some(arc) = state.upgrade() else {
-                return;
-            };
-            let Ok(mut guard) = arc.lock() else {
-                return;
-            };
-            if guard.animation_hz != Some(hz) || guard.animation_generation != generation {
+fn animation_driver_policy(state: &State) -> AnimationDriverPolicy {
+    AnimationDriverPolicy {
+        hz: state.animation_hz,
+        generation: state.animation_generation,
+    }
+}
+
+fn notify_animation_driver(state: &State) {
+    if let Some(tx) = state.animation_driver_tx.as_ref() {
+        let _ = tx.send(animation_driver_policy(state));
+    }
+}
+
+fn has_animation_backend(state: &State) -> bool {
+    state.script_backend.is_some()
+        || state
+            .script_components
+            .values()
+            .any(|component| component.backend.is_some())
+}
+
+fn run_animation_tick_if_current(state: &mut State, policy: AnimationDriverPolicy) -> bool {
+    if animation_driver_policy(state) != policy || !has_animation_backend(state) {
+        return false;
+    }
+    bump_revision(state);
+    true
+}
+
+fn ensure_animation_driver(state: &Arc<Mutex<State>>) {
+    let (rx, host_async_handle) = {
+        let Ok(mut guard) = state.lock() else {
+            return;
+        };
+        if guard.animation_driver_tx.is_some() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::watch::channel(animation_driver_policy(&guard));
+        guard.animation_driver_tx = Some(tx);
+        (rx, guard.host_async_handle.clone())
+    };
+    let task = animation_driver_loop(Arc::downgrade(state), rx);
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.animation_driver", task);
+    } else {
+        spawn_local_current_thread_runtime("animation driver", task);
+    }
+}
+
+async fn animation_driver_loop(
+    state: Weak<Mutex<State>>,
+    mut rx: tokio::sync::watch::Receiver<AnimationDriverPolicy>,
+) {
+    let mut policy = *rx.borrow();
+    loop {
+        let Some(hz) = policy.hz.filter(|hz| *hz > 0) else {
+            if rx.changed().await.is_err() {
                 return;
             }
-            // Skip the tick entirely if scripts were unloaded
-            // between frames — avoids a useless revision bump.
-            if guard.script_backend.is_some()
-                || guard
-                    .script_components
-                    .values()
-                    .any(|component| component.backend.is_some())
-            {
-                bump_revision(&mut guard);
+            policy = *rx.borrow();
+            continue;
+        };
+        let period = Duration::from_micros((1_000_000u64 / u64::from(hz)).max(1));
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                policy = *rx.borrow();
+            }
+            () = tokio::time::sleep(period) => {
+                let Some(arc) = state.upgrade() else {
+                    return;
+                };
+                let Ok(mut guard) = arc.lock() else {
+                    return;
+                };
+                if animation_driver_policy(&guard) != policy {
+                    policy = animation_driver_policy(&guard);
+                    continue;
+                }
+                run_animation_tick_if_current(&mut guard, policy);
             }
         }
-    });
+    }
 }
 
 /// Subscribe to the windows plugin's `pane-event` topic on the typed
@@ -5046,40 +5107,43 @@ exited = ""
     }
 
     #[test]
-    fn tick_thread_exits_cleanly_when_plugin_is_dropped() {
+    fn animation_driver_policy_notification_updates_existing_driver() {
         let plugin = DecorationPlugin::new();
-        let weak = Arc::downgrade(&plugin.state.inner);
-        spawn_animation_tick_thread(weak.clone(), 100, 0);
-        drop(plugin);
-        // After the strong arc is dropped, the Weak upgrade must
-        // fail; the thread either already exited or is blocked in
-        // sleep and will exit on the next iteration. Give it a
-        // moment and confirm the weak count drops to zero.
-        std::thread::sleep(Duration::from_millis(50));
+        let mut state = plugin.state.inner.lock().expect("lock");
+        let (tx, rx) = tokio::sync::watch::channel(animation_driver_policy(&state));
+        state.animation_driver_tx = Some(tx);
+        state.animation_hz = Some(12);
+        state.animation_generation = 7;
+
+        notify_animation_driver(&state);
+
         assert_eq!(
-            weak.strong_count(),
-            0,
-            "plugin state must be fully released after drop",
+            *rx.borrow(),
+            AnimationDriverPolicy {
+                hz: Some(12),
+                generation: 7,
+            },
         );
     }
 
     #[test]
-    fn stale_same_hz_tick_thread_exits_without_bumping_revision() {
+    fn stale_same_hz_animation_policy_does_not_bump_revision() {
         let plugin = DecorationPlugin::new();
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
-            state.animation_hz = Some(100);
-            state.animation_generation = 2;
-            state.script_backend = Some(Box::new(TestScriptBackend));
-        }
+        let mut state = plugin.state.inner.lock().expect("lock");
+        state.animation_hz = Some(100);
+        state.animation_generation = 2;
+        state.script_backend = Some(Box::new(TestScriptBackend));
 
-        spawn_animation_tick_thread(Arc::downgrade(&plugin.state.inner), 100, 1);
-        std::thread::sleep(Duration::from_millis(50));
-
-        let state = plugin.state.inner.lock().expect("lock");
+        assert!(!run_animation_tick_if_current(
+            &mut state,
+            AnimationDriverPolicy {
+                hz: Some(100),
+                generation: 1,
+            },
+        ));
         assert_eq!(
             state.scene_revision, 0,
-            "stale same-hz animation ticker must not publish a scene",
+            "stale same-hz animation policy must not publish a scene",
         );
     }
 
