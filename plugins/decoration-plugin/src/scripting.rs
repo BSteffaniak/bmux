@@ -1378,6 +1378,112 @@ mod tests {
         }
 
         #[test]
+        fn bundled_pong_script_sweeps_content_collisions() {
+            let backend = make_backend(ScriptHostAccess::default());
+            let source = format!(
+                "{}\n{}",
+                include_str!("../assets/decorations/pong.lua"),
+                r#"
+                local function le16(n)
+                    return string.char(n % 256, math.floor(n / 256) % 256)
+                end
+
+                local function le32(n)
+                    return string.char(
+                        n % 256,
+                        math.floor(n / 256) % 256,
+                        math.floor(n / 65536) % 256,
+                        math.floor(n / 16777216) % 256
+                    )
+                end
+
+                local function make_visual(width, height, occupied_cells)
+                    local words_per_row = math.floor((width + 31) / 32)
+                    local words = {}
+                    for i = 1, words_per_row * height do
+                        words[i] = 0
+                    end
+                    for _, cell in ipairs(occupied_cells) do
+                        local x = cell[1]
+                        local y = cell[2]
+                        local word_index = y * words_per_row + math.floor(x / 32) + 1
+                        words[word_index] = words[word_index] + (2 ^ (x % 32))
+                    end
+                    local bytes = "PBB1" .. le16(width) .. le16(height) .. le16(words_per_row) .. le16(0)
+                        .. string.char(1, 0, 0, 0, 0, 0, 0, 0)
+                    for _, word in ipairs(words) do
+                        bytes = bytes .. le32(word)
+                    end
+                    return {
+                        width = width,
+                        height = height,
+                        words_per_row = words_per_row,
+                        grid_revision = 1,
+                        bytes = bytes,
+                    }
+                end
+
+                local function make_test_game(width, height, x, y, vx, vy, visual)
+                    local game = new_game(1, width, height, 5500)
+                    game.x = x
+                    game.y = y
+                    game.vx = vx
+                    game.vy = vy
+                    game.content_bounce = true
+                    game.visual = visual
+                    game.visual_inside = nil
+                    game.visual_revision = nil
+                    game.left.center = y
+                    game.right.center = y
+                    return game
+                end
+
+                local vertical_wall = make_visual(10, 5, { { 5, 2 } })
+                local game = make_test_game(10, 5, 3, 2, 0.2, 0, vertical_wall)
+                advance_ball(game, 20)
+                assert(game.vx < 0, "fast horizontal content hit should reverse x velocity")
+                assert(game.x < 5, "fast horizontal content hit should stop before the occupied cell")
+
+                local diagonal_wall = make_visual(10, 5, { { 5, 3 } })
+                game = make_test_game(10, 5, 3, 2, 0.1, 0.05, diagonal_wall)
+                advance_ball(game, 30)
+                assert(game.vx < 0, "diagonal vertical-face hit should reverse x velocity")
+                assert(game.vy > 0, "diagonal vertical-face hit should preserve y direction")
+
+                local corner_wall = make_visual(10, 5, { { 4, 3 } })
+                game = make_test_game(10, 5, 3, 2, 0.1, 0.1, corner_wall)
+                advance_ball(game, 20)
+                assert(game.vx < 0, "corner hit should reverse x velocity")
+                assert(game.vy < 0, "corner hit should reverse y velocity")
+
+                local later_wall = make_visual(10, 5, { { 6, 1 } })
+                game = make_test_game(10, 5, 4, 1, 0.1, -0.1, later_wall)
+                advance_ball(game, 40)
+                assert(game.vy > 0, "top wall collision should be handled inside the frame")
+                assert(game.vx < 0, "later content collision should also be handled inside the frame")
+
+                local start_inside = make_visual(10, 5, { { 3, 2 } })
+                game = make_test_game(10, 5, 3, 2, 0.1, 0, start_inside)
+                advance_ball(game, 40)
+                assert(game.vx > 0, "starting inside content should not immediately reflect")
+                assert(game.x > 4, "starting inside content should still advance out of the cell")
+
+                local wide_wall = make_visual(30, 5, { { 12, 2 } })
+                local pane = { id = "test-current-visual", content_rect = { w = 30, h = 5 } }
+                local state = pane_state(pane)
+                state.game = make_test_game(30, 5, 10, 2, 0.1, 0, wide_wall)
+                state.game_key = simulation_cache_key(pane, 30, 5, 5500)
+                state.game_active_ms = 0
+                local simulated = simulate(pane, 40, 5500, 3500, true, wide_wall)
+                assert(simulated.vx < 0, "simulate should use the current visual projection before stepping")
+                "#,
+            );
+            backend
+                .compile(Path::new("pong.lua"), &source)
+                .expect("compile");
+        }
+
+        #[test]
         fn bundled_performance_header_script_uses_metrics_state() {
             let backend = make_backend(ScriptHostAccess::default());
             backend

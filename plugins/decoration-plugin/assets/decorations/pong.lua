@@ -12,6 +12,9 @@ local SERVE_DIRECTION_MODE = "alternate"
 local STEP_MS = 40
 local SPEEDUP_PER_HIT = 1.09
 local MAX_SPEED_MULT = 3.05
+local COLLISION_EPS = 0.001
+local COLLISION_TIME_EPS = 0.000001
+local MAX_COLLISIONS_PER_STEP = 12
 local pane_states = {}
 
 local function pane_state(pane)
@@ -326,53 +329,179 @@ local function visual_bitset_occupied(visual, x, y)
     return math.floor(word / (2 ^ bit)) % 2 == 1
 end
 
-local function bounce_off_visual_content(game)
+local function ball_cell(game)
+    return clamp(math.floor(game.x + 0.5), 0, game.w - 1), clamp(math.floor(game.y + 0.5), 0, game.h - 1)
+end
+
+local function update_visual_inside(game)
     if not game.content_bounce or game.visual == nil then
-        return
+        game.visual_inside = nil
+        game.visual_revision = nil
+        return false
     end
-    local x = clamp(math.floor(game.x + 0.5), 0, game.w - 1)
-    local y = clamp(math.floor(game.y + 0.5), 0, game.h - 1)
+    local x, y = ball_cell(game)
     local occupied = visual_bitset_occupied(game.visual, x, y)
+    game.visual_inside = occupied
+    game.visual_revision = game.visual.grid_revision
+    return occupied
+end
+
+local function crossing_time(position, velocity, boundary)
+    if velocity == 0 then
+        return nil
+    end
+    local t = (boundary - position) / velocity
+    if t < -COLLISION_TIME_EPS then
+        return nil
+    end
+    return math.max(0, t)
+end
+
+local function visual_collision_candidate(game, max_ms)
+    if not game.content_bounce or game.visual == nil or max_ms <= 0 then
+        return nil
+    end
+
     local revision = game.visual.grid_revision
-
-    -- Content collisions are boundary crossings, not solid-volume physics.
-    -- If the ball starts inside content, or content appears over it, let it
-    -- pass through until it exits. Only an outside -> occupied transition
-    -- reflects the ball.
+    local cell_x = math.floor(game.x + 0.5)
+    local cell_y = math.floor(game.y + 0.5)
+    local start_occupied = visual_bitset_occupied(game.visual, cell_x, cell_y)
+    local inside = game.visual_inside or false
     if game.visual_inside == nil or game.visual_revision ~= revision then
-        game.visual_inside = occupied
+        inside = start_occupied
+        game.visual_inside = start_occupied
         game.visual_revision = revision
-        return
-    end
-    if not occupied then
-        game.visual_inside = false
-        return
-    end
-    if game.visual_inside then
-        return
     end
 
-    local prev_x = clamp(math.floor((game.x - game.vx * STEP_MS) + 0.5), 0, game.w - 1)
-    local prev_y = clamp(math.floor((game.y - game.vy * STEP_MS) + 0.5), 0, game.h - 1)
-    local hit_x = visual_bitset_occupied(game.visual, x, prev_y)
-    local hit_y = visual_bitset_occupied(game.visual, prev_x, y)
-    if hit_x and not hit_y then
-        game.vx = -game.vx
-        game.x = game.x + game.vx * STEP_MS * 0.35
-    elseif hit_y and not hit_x then
-        game.vy = -game.vy
-        game.y = game.y + game.vy * STEP_MS * 0.35
-    else
-        game.vx = -game.vx
-        game.vy = -game.vy
-        game.x = game.x + game.vx * STEP_MS * 0.35
-        game.y = game.y + game.vy * STEP_MS * 0.35
+    local dx = game.vx * max_ms
+    local dy = game.vy * max_ms
+    if dx == 0 and dy == 0 then
+        return nil, inside
     end
-    game.vy = clamp(game.vy + rand_range(game.seed, game.rally + game.hits, 961, -0.001, 0.001), -math.abs(game.vx) * 1.1, math.abs(game.vx) * 1.1)
 
-    local next_x = clamp(math.floor(game.x + 0.5), 0, game.w - 1)
-    local next_y = clamp(math.floor(game.y + 0.5), 0, game.h - 1)
-    game.visual_inside = visual_bitset_occupied(game.visual, next_x, next_y)
+    local step_x = dx > 0 and 1 or (dx < 0 and -1 or 0)
+    local step_y = dy > 0 and 1 or (dy < 0 and -1 or 0)
+    local t_max_x = math.huge
+    local t_max_y = math.huge
+    local t_delta_x = math.huge
+    local t_delta_y = math.huge
+    if step_x ~= 0 then
+        local boundary_x = cell_x + (step_x > 0 and 0.5 or -0.5)
+        t_max_x = math.max(0, (boundary_x - game.x) / dx)
+        t_delta_x = 1 / math.abs(dx)
+    end
+    if step_y ~= 0 then
+        local boundary_y = cell_y + (step_y > 0 and 0.5 or -0.5)
+        t_max_y = math.max(0, (boundary_y - game.y) / dy)
+        t_delta_y = 1 / math.abs(dy)
+    end
+
+    local max_steps = math.max(1, game.w + game.h + 8)
+    for _ = 1, max_steps do
+        local t_next = math.min(t_max_x, t_max_y)
+        if t_next > 1 + COLLISION_TIME_EPS then
+            break
+        end
+        local hit_x = t_max_x <= t_next + COLLISION_TIME_EPS
+        local hit_y = t_max_y <= t_next + COLLISION_TIME_EPS
+        if hit_x then
+            cell_x = cell_x + step_x
+            t_max_x = t_max_x + t_delta_x
+        end
+        if hit_y then
+            cell_y = cell_y + step_y
+            t_max_y = t_max_y + t_delta_y
+        end
+
+        local occupied = visual_bitset_occupied(game.visual, cell_x, cell_y)
+        if occupied and not inside then
+            return {
+                kind = "content",
+                time = math.max(0, t_next * max_ms),
+                hit_x = hit_x,
+                hit_y = hit_y,
+            }
+        end
+        inside = occupied
+    end
+
+    local end_x = math.floor((game.x + dx) + 0.5)
+    local end_y = math.floor((game.y + dy) + 0.5)
+    return nil, visual_bitset_occupied(game.visual, end_x, end_y)
+end
+
+local function merge_simultaneous_collision(a, b)
+    if b == nil or b.time == nil then
+        return a
+    end
+    if a == nil or a.time == nil then
+        return b
+    end
+    if b.time < a.time - COLLISION_TIME_EPS then
+        return b
+    end
+    if math.abs(b.time - a.time) <= COLLISION_TIME_EPS then
+        if a.kind == "content" and b.kind == "wall_y" then
+            a.hit_y = true
+        elseif a.kind == "wall_y" and b.kind == "content" then
+            b.hit_y = true
+            return b
+        end
+    end
+    return a
+end
+
+local function motion_collision_candidate(game, max_ms)
+    local candidate = nil
+    local content_collision, visual_inside_after = visual_collision_candidate(game, max_ms)
+    candidate = merge_simultaneous_collision(candidate, content_collision)
+
+    if game.h > 1 then
+        if game.vy < 0 then
+            candidate = merge_simultaneous_collision(candidate, {
+                kind = "wall_y",
+                time = crossing_time(game.y, game.vy, 0),
+                hit_y = true,
+            })
+        elseif game.vy > 0 then
+            candidate = merge_simultaneous_collision(candidate, {
+                kind = "wall_y",
+                time = crossing_time(game.y, game.vy, game.h - 1),
+                hit_y = true,
+            })
+        end
+    end
+
+    if game.vx < 0 then
+        candidate = merge_simultaneous_collision(candidate, {
+            kind = "side",
+            side = "left",
+            time = crossing_time(game.x, game.vx, 0),
+        })
+    elseif game.vx > 0 then
+        candidate = merge_simultaneous_collision(candidate, {
+            kind = "side",
+            side = "right",
+            time = crossing_time(game.x, game.vx, game.w - 1),
+        })
+    end
+
+    if candidate == nil or candidate.time == nil or candidate.time > max_ms + COLLISION_TIME_EPS then
+        return nil, visual_inside_after
+    end
+    candidate.time = clamp(candidate.time, 0, max_ms)
+    return candidate, visual_inside_after
+end
+
+local function nudge_after_collision(game, hit_x, hit_y)
+    if hit_x and game.vx ~= 0 then
+        game.x = game.x + (game.vx > 0 and COLLISION_EPS or -COLLISION_EPS)
+    end
+    if hit_y and game.vy ~= 0 then
+        game.y = game.y + (game.vy > 0 and COLLISION_EPS or -COLLISION_EPS)
+    end
+    game.x = clamp(game.x, 0, game.w - 1)
+    game.y = clamp(game.y, 0, game.h - 1)
 end
 
 local function paddle_contains(game, player, y)
@@ -428,6 +557,97 @@ local function score(game, scorer)
     serve(game, scorer)
 end
 
+local function apply_content_bounce(game, collision)
+    if collision.hit_x then
+        game.vx = -game.vx
+    end
+    if collision.hit_y then
+        game.vy = -game.vy
+    end
+    game.vy = clamp(
+        game.vy + rand_range(game.seed, game.rally + game.hits, 961, -0.001, 0.001),
+        -math.abs(game.vx) * 1.1,
+        math.abs(game.vx) * 1.1
+    )
+    nudge_after_collision(game, collision.hit_x, collision.hit_y)
+    update_visual_inside(game)
+end
+
+local function apply_wall_bounce(game)
+    game.vy = -game.vy
+    game.y = clamp(game.y, 0, game.h - 1)
+    nudge_after_collision(game, false, true)
+end
+
+local function apply_side_collision(game, side)
+    if side == "left" then
+        game.x = 0
+        if game.vx < 0 and paddle_contains(game, game.left, game.y) then
+            bounce(game, game.left, "left")
+            nudge_after_collision(game, true, false)
+            return false
+        end
+        score(game, "right")
+        return true
+    end
+
+    game.x = game.w - 1
+    if game.vx > 0 and paddle_contains(game, game.right, game.y) then
+        bounce(game, game.right, "right")
+        nudge_after_collision(game, true, false)
+        return false
+    end
+    score(game, "left")
+    return true
+end
+
+local function advance_ball(game, dt_ms)
+    local remaining = dt_ms
+    for _ = 1, MAX_COLLISIONS_PER_STEP do
+        if remaining <= COLLISION_TIME_EPS or game.win then
+            break
+        end
+
+        local collision, visual_inside_after = motion_collision_candidate(game, remaining)
+        if collision == nil then
+            game.x = game.x + game.vx * remaining
+            game.y = game.y + game.vy * remaining
+            game.x = clamp(game.x, 0, game.w - 1)
+            game.y = clamp(game.y, 0, game.h - 1)
+            if game.content_bounce and game.visual ~= nil then
+                game.visual_inside = visual_inside_after
+                game.visual_revision = game.visual.grid_revision
+            end
+            return false
+        end
+
+        local consumed = clamp(collision.time, 0, remaining)
+        game.x = game.x + game.vx * consumed
+        game.y = game.y + game.vy * consumed
+        game.x = clamp(game.x, 0, game.w - 1)
+        game.y = clamp(game.y, 0, game.h - 1)
+        remaining = remaining - consumed
+
+        if collision.kind == "content" then
+            apply_content_bounce(game, collision)
+        elseif collision.kind == "wall_y" then
+            apply_wall_bounce(game)
+        elseif collision.kind == "side" then
+            if apply_side_collision(game, collision.side) then
+                return true
+            end
+        end
+    end
+
+    if not game.win then
+        -- Too many same-frame collisions usually means the ball is trapped in a
+        -- dense corner. Stop at the last resolved safe position instead of
+        -- taking an unchecked catch-up step through content.
+        update_visual_inside(game)
+    end
+    return false
+end
+
 local function step_game(game)
     if game.win then
         return
@@ -435,33 +655,7 @@ local function step_game(game)
 
     move_player(game, game.left, "left")
     move_player(game, game.right, "right")
-
-    game.x = game.x + game.vx * STEP_MS
-    game.y = game.y + game.vy * STEP_MS
-
-    if game.y < 0 then
-        game.y = -game.y
-        game.vy = -game.vy
-    elseif game.y > game.h - 1 then
-        game.y = (game.h - 1) - (game.y - (game.h - 1))
-        game.vy = -game.vy
-    end
-
-    bounce_off_visual_content(game)
-
-    if game.x <= 0 then
-        if game.vx < 0 and paddle_contains(game, game.left, game.y) then
-            bounce(game, game.left, "left")
-        else
-            score(game, "right")
-        end
-    elseif game.x >= game.w - 1 then
-        if game.vx > 0 and paddle_contains(game, game.right, game.y) then
-            bounce(game, game.right, "right")
-        else
-            score(game, "left")
-        end
-    end
+    advance_ball(game, STEP_MS)
 end
 
 local function start_game(seed, w, h, rally_ms, now_ms)
@@ -475,7 +669,16 @@ local function simulation_cache_key(pane, w, h, rally_ms)
     return tostring(pane.id or "default") .. ":" .. tostring(w) .. "x" .. tostring(h) .. ":" .. tostring(rally_ms)
 end
 
-local function simulate(pane, active_ms, rally_ms, win_hold_ms)
+local function apply_collision_inputs(game, content_bounce, visual)
+    game.content_bounce = content_bounce
+    game.visual = visual
+    if not content_bounce or visual == nil then
+        game.visual_inside = nil
+        game.visual_revision = nil
+    end
+end
+
+local function simulate(pane, active_ms, rally_ms, win_hold_ms, content_bounce, visual)
     local content = pane.content_rect
     local w = math.max(2, content.w)
     local h = math.max(1, content.h)
@@ -485,11 +688,13 @@ local function simulate(pane, active_ms, rally_ms, win_hold_ms)
 
     if state.game == nil or state.game_key ~= cache_key or active_ms < (state.game_active_ms or 0) then
         state.game = start_game(seed, w, h, rally_ms, 0)
+        apply_collision_inputs(state.game, content_bounce, visual)
         state.game_key = cache_key
         state.game_active_ms = 0
     end
 
     local game = state.game
+    apply_collision_inputs(game, content_bounce, visual)
     local simulated_ms = state.game_active_ms or 0
     while simulated_ms + STEP_MS <= active_ms do
         simulated_ms = simulated_ms + STEP_MS
@@ -497,6 +702,7 @@ local function simulate(pane, active_ms, rally_ms, win_hold_ms)
         if game.win then
             if game.now_ms - game.win_started_ms >= win_hold_ms then
                 game = start_game(seed, w, h, rally_ms, simulated_ms)
+                apply_collision_inputs(game, content_bounce, visual)
                 state.game = game
             end
         else
@@ -564,11 +770,11 @@ local function render_pane(pane, message)
     local entrypoint = message.component and message.component.entrypoint or "all"
     local rally_ms = component_setting_number(message, "rally_ms", RALLY_MS)
     local win_hold_ms = component_setting_number(message, "win_hold_ms", WIN_HOLD_MS)
-    local game = simulate(pane, state.active_ms, rally_ms, win_hold_ms)
-    game.content_bounce = component_setting_bool(message, "content_bounce", false)
+    local content_bounce = component_setting_bool(message, "content_bounce", false)
     local visual_metadata = message.visual and message.visual["pong.content-presence"] or nil
     local visual_bytes = message.visual_bytes and message.visual_bytes["pong.content-presence"] or nil
-    game.visual = visual_bitset_decode(visual_metadata, visual_bytes)
+    local visual = visual_bitset_decode(visual_metadata, visual_bytes)
+    local game = simulate(pane, state.active_ms, rally_ms, win_hold_ms, content_bounce, visual)
     local cmds = {}
     if entrypoint == "ball" or entrypoint == "all" then render_ball(cmds, pane, game) end
     if entrypoint == "paddles" or entrypoint == "all" then render_paddles(cmds, pane, game) end
