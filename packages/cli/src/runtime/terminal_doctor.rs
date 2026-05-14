@@ -538,10 +538,13 @@ where
 }
 
 pub(super) fn profile_for_term(term: &str) -> TerminalProfile {
-    match term {
-        "bmux-256color" => TerminalProfile::Bmux256Color,
-        "screen-256color" | "tmux-256color" => TerminalProfile::Screen256Color,
-        "xterm-256color" => TerminalProfile::Xterm256Color,
+    let normalized = term.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "bmux" | "bmux-256color" => TerminalProfile::Bmux256Color,
+        "screen" | "screen-256color" | "tmux" | "tmux-256color" => TerminalProfile::Screen256Color,
+        "xterm" | "xterm-color" | "xterm-256color" | "xterm-direct" => {
+            TerminalProfile::Xterm256Color
+        }
         _ => TerminalProfile::Conservative,
     }
 }
@@ -776,6 +779,11 @@ mod tests {
         );
         assert_eq!(
             profile_for_term("xterm-256color"),
+            TerminalProfile::Xterm256Color
+        );
+        assert_eq!(profile_for_term("xterm"), TerminalProfile::Xterm256Color);
+        assert_eq!(
+            profile_for_term("xterm-direct"),
             TerminalProfile::Xterm256Color
         );
         assert_eq!(

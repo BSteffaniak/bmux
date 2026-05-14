@@ -263,6 +263,27 @@ enum PaneShellMetadataEvent {
     Prompt { cwd: String },
 }
 
+fn apply_shell_metadata_events_and_take_prompt_replay(
+    state: &mut PaneResurrectionRuntime,
+    pending_replay_command: &mut Option<String>,
+    events: impl IntoIterator<Item = PaneShellMetadataEvent>,
+) -> Option<String> {
+    let mut replay_command = None;
+    for event in events {
+        let is_prompt = matches!(event, PaneShellMetadataEvent::Prompt { .. });
+        state.apply_event(event);
+        if is_prompt
+            && replay_command.is_none()
+            && let Some(command) = pending_replay_command.take()
+        {
+            state.active_command = Some(command.clone());
+            state.active_command_source = Some(PaneCommandSource::Verbatim);
+            replay_command = Some(command);
+        }
+    }
+    replay_command
+}
+
 struct PaneRuntimeHandle {
     meta: PaneRuntimeMeta,
     process_id: Arc<std::sync::Mutex<Option<u32>>>,
@@ -1258,7 +1279,8 @@ end
 
 #[allow(clippy::literal_string_with_formatting_args)]
 const fn shell_integration_nu_config() -> &'static str {
-    r#"const __bmux_user_config = ($nu.default-config-dir | path join "config.nu")
+    r#"const __bmux_user_config_path = ($nu.default-config-dir | path join "config.nu")
+const __bmux_user_config = if ($__bmux_user_config_path | path exists) { $__bmux_user_config_path } else { null }
 source $__bmux_user_config
 
 def __bmux_hook_list [value] {
@@ -1272,19 +1294,44 @@ def __bmux_hook_list [value] {
   }
 }
 
-def __bmux_emit_start [command: string, cwd: string] {
-  let command_b64 = ($command | encode base64)
-  let cwd_b64 = ($cwd | encode base64)
-  ^printf '\033]633;bmux;start;%s;%s\a' $command_b64 $cwd_b64
+def __bmux_marker [kind: string, fields: list<string>] {
+  let esc = (char -u "1b")
+  let bel = (char bel)
+  let encoded = ($fields | each {|field| $field | encode base64 } | str join ";")
+  if (($encoded | str length) == 0) {
+    $"($esc)]633;bmux;($kind)($bel)"
+  } else {
+    $"($esc)]633;bmux;($kind);($encoded)($bel)"
+  }
 }
 
-def __bmux_emit_prompt [cwd: string] {
-  let cwd_b64 = ($cwd | encode base64)
-  ^printf '\033]633;bmux;prompt;%s\a' $cwd_b64
+def __bmux_emit_start [command: string, cwd: string] {
+  print --no-newline (__bmux_marker "start" [$command $cwd])
+}
+
+def __bmux_prompt_marker [cwd: string] {
+  __bmux_marker "prompt" [$cwd]
+}
+
+def __bmux_render_prompt_command [value] {
+  let kind = ($value | describe)
+  if ($kind | str starts-with "closure") {
+    do $value
+  } else if $kind == "nothing" {
+    ""
+  } else {
+    $value | into string
+  }
 }
 
 let __bmux_pre_execution_hooks = (__bmux_hook_list ($env.config | get -o hooks.pre_execution))
-let __bmux_pre_prompt_hooks = (__bmux_hook_list ($env.config | get -o hooks.pre_prompt))
+let __bmux_original_prompt_command = ($env | get -o PROMPT_COMMAND)
+
+$env.PROMPT_COMMAND = {||
+  let marker = (__bmux_prompt_marker ($env.PWD | into string))
+  let prompt = (__bmux_render_prompt_command $__bmux_original_prompt_command)
+  $"($marker)($prompt)"
+}
 
 $env.config = (
   $env.config
@@ -1295,12 +1342,6 @@ $env.config = (
           if (($command | str trim | str length) > 0) {
             __bmux_emit_start $command ($env.PWD | into string)
           }
-        }
-    )
-  | upsert hooks.pre_prompt (
-      $__bmux_pre_prompt_hooks
-      | append {||
-          __bmux_emit_prompt ($env.PWD | into string)
         }
     )
 )
@@ -2670,6 +2711,8 @@ impl SessionRuntimeManager {
         ));
         let resurrection_state_for_reader = Arc::clone(&resurrection_state);
         let resurrection_state_for_waiter_seed = Arc::clone(&resurrection_state);
+        let pending_prompt_replay = Arc::new(std::sync::Mutex::new(None::<String>));
+        let pending_prompt_replay_for_reader = Arc::clone(&pending_prompt_replay);
         let exit_reason = Arc::new(std::sync::Mutex::new(None::<String>));
         let exit_reason_for_task = Arc::clone(&exit_reason);
         let exited = Arc::new(AtomicBool::new(false));
@@ -2733,41 +2776,49 @@ impl SessionRuntimeManager {
                 return;
             };
 
-            let (command, failed_spawn_label) = launch.as_ref().map_or_else(
-                || {
-                    let mut command = CommandBuilder::new(&shell);
-                    command.env("TERM", &pane_term);
-                    if let Some(cwd) = initial_cwd.as_deref()
-                        && !cwd.is_empty()
-                    {
-                        command.cwd(cwd);
-                    }
-                    if let Err(error) = configure_shell_integration_command(
-                        &mut command,
-                        &shell,
-                        shell_integration_root.as_deref(),
-                    ) {
+            let mut replay_on_prompt = false;
+            let (command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
+                let mut command = CommandBuilder::new(&launch.program);
+                command.env("TERM", &pane_term);
+                for arg in &launch.args {
+                    command.arg(arg);
+                }
+                for (key, value) in &launch.env {
+                    command.env(key, value);
+                }
+                if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref())
+                    && !cwd.is_empty()
+                {
+                    command.cwd(cwd);
+                }
+                (command, format!("command '{}'", launch.program))
+            } else {
+                let mut command = CommandBuilder::new(&shell);
+                command.env("TERM", &pane_term);
+                if let Some(cwd) = initial_cwd.as_deref()
+                    && !cwd.is_empty()
+                {
+                    command.cwd(cwd);
+                }
+                let integration_configured = configure_shell_integration_command(
+                    &mut command,
+                    &shell,
+                    shell_integration_root.as_deref(),
+                )
+                .map_or_else(
+                    |error| {
                         warn!("failed configuring shell integration for pane {pane_id}: {error:#}");
-                    }
-                    (command, format!("shell '{shell}'"))
-                },
-                |launch| {
-                    let mut command = CommandBuilder::new(&launch.program);
-                    command.env("TERM", &pane_term);
-                    for arg in &launch.args {
-                        command.arg(arg);
-                    }
-                    for (key, value) in &launch.env {
-                        command.env(key, value);
-                    }
-                    if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref())
-                        && !cwd.is_empty()
-                    {
-                        command.cwd(cwd);
-                    }
-                    (command, format!("command '{}'", launch.program))
-                },
-            );
+                        false
+                    },
+                    |()| shell_integration_root.is_some(),
+                );
+                replay_on_prompt = integration_configured
+                    && matches!(
+                        shell_kind_for_path(&shell),
+                        ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish | ShellKind::Nu
+                    );
+                (command, format!("shell '{shell}'"))
+            };
             let Ok(mut child) = pty_pair.slave.spawn_command(command) else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
                     *reason = Some(format!("failed to spawn {failed_spawn_label}"));
@@ -2822,12 +2873,17 @@ impl SessionRuntimeManager {
 
             if launch.is_none()
                 && let Some(command_text) = replay_command.as_deref()
-                && let Ok(mut writer_guard) = writer.lock()
             {
-                let mut replay_bytes = command_text.as_bytes().to_vec();
-                replay_bytes.push(b'\n');
-                if writer_guard.write_all(&replay_bytes).is_ok() {
-                    let _ = writer_guard.flush();
+                if replay_on_prompt {
+                    if let Ok(mut pending) = pending_prompt_replay.lock() {
+                        *pending = Some(command_text.to_string());
+                    }
+                } else if let Ok(mut writer_guard) = writer.lock() {
+                    let mut replay_bytes = command_text.as_bytes().to_vec();
+                    replay_bytes.push(b'\n');
+                    if writer_guard.write_all(&replay_bytes).is_ok() {
+                        let _ = writer_guard.flush();
+                    }
                 }
             }
 
@@ -2982,11 +3038,32 @@ impl SessionRuntimeManager {
 
                                 let metadata = shell_metadata_parser.process_chunk(chunk);
                                 if !metadata.events.is_empty() {
+                                    let mut replay_command = None;
                                     if let Ok(mut resurrection_state) =
                                         resurrection_state_for_reader.lock()
                                     {
-                                        for event in metadata.events {
-                                            resurrection_state.apply_event(event);
+                                        if let Ok(mut pending_replay) =
+                                            pending_prompt_replay_for_reader.lock()
+                                        {
+                                            replay_command =
+                                                apply_shell_metadata_events_and_take_prompt_replay(
+                                                    &mut resurrection_state,
+                                                    &mut pending_replay,
+                                                    metadata.events,
+                                                );
+                                        } else {
+                                            for event in metadata.events {
+                                                resurrection_state.apply_event(event);
+                                            }
+                                        }
+                                    }
+                                    if let Some(command_text) = replay_command
+                                        && let Ok(mut writer) = writer_for_reader.lock()
+                                    {
+                                        let mut replay_bytes = command_text.as_bytes().to_vec();
+                                        replay_bytes.push(b'\n');
+                                        if writer.write_all(&replay_bytes).is_ok() {
+                                            let _ = writer.flush();
                                         }
                                     }
                                     mark_snapshot_dirty_flag();
@@ -7112,6 +7189,70 @@ mod tests {
         assert_eq!(state.active_command, None);
         assert_eq!(state.active_command_source, None);
         assert_eq!(state.last_known_cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn prompt_replay_waits_for_shell_prompt_and_marks_command_active() {
+        let mut state = PaneResurrectionRuntime {
+            active_command: Some("lazygit".to_string()),
+            active_command_source: Some(PaneCommandSource::Verbatim),
+            last_known_cwd: Some("/work".to_string()),
+        };
+        let mut pending_replay = Some("lazygit".to_string());
+
+        let replay = apply_shell_metadata_events_and_take_prompt_replay(
+            &mut state,
+            &mut pending_replay,
+            [PaneShellMetadataEvent::Prompt {
+                cwd: "/work".to_string(),
+            }],
+        );
+
+        assert_eq!(replay.as_deref(), Some("lazygit"));
+        assert_eq!(pending_replay, None);
+        assert_eq!(state.active_command.as_deref(), Some("lazygit"));
+        assert_eq!(
+            state.active_command_source,
+            Some(PaneCommandSource::Verbatim)
+        );
+        assert_eq!(state.last_known_cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn prompt_replay_is_one_shot_then_later_prompt_clears_command() {
+        let mut state = PaneResurrectionRuntime::default();
+        let mut pending_replay = Some("lazygit".to_string());
+
+        let replay = apply_shell_metadata_events_and_take_prompt_replay(
+            &mut state,
+            &mut pending_replay,
+            [PaneShellMetadataEvent::Prompt {
+                cwd: "/work".to_string(),
+            }],
+        );
+        assert_eq!(replay.as_deref(), Some("lazygit"));
+
+        let replay = apply_shell_metadata_events_and_take_prompt_replay(
+            &mut state,
+            &mut pending_replay,
+            [PaneShellMetadataEvent::Prompt {
+                cwd: "/work".to_string(),
+            }],
+        );
+
+        assert_eq!(replay, None);
+        assert_eq!(state.active_command, None);
+        assert_eq!(state.active_command_source, None);
+    }
+
+    #[test]
+    fn nu_shell_integration_wraps_prompt_command_for_prompt_marker() {
+        let config = shell_integration_nu_config();
+
+        assert!(config.contains("$env.PROMPT_COMMAND = {||"));
+        assert!(config.contains("__bmux_original_prompt_command"));
+        assert!(config.contains("__bmux_prompt_marker"));
+        assert!(!config.contains("hooks.pre_prompt"));
     }
 
     #[test]

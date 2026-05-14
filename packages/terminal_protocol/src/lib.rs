@@ -411,10 +411,11 @@ pub fn secondary_da_for_profile(profile: ProtocolProfile) -> &'static [u8] {
 
 #[must_use]
 pub fn protocol_profile_for_term(term: &str) -> ProtocolProfile {
-    match term {
-        "bmux-256color" => ProtocolProfile::Bmux,
-        "screen-256color" | "tmux-256color" => ProtocolProfile::Screen,
-        "xterm-256color" => ProtocolProfile::Xterm,
+    let normalized = term.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "bmux" | "bmux-256color" => ProtocolProfile::Bmux,
+        "screen" | "screen-256color" | "tmux" | "tmux-256color" => ProtocolProfile::Screen,
+        "xterm" | "xterm-color" | "xterm-256color" | "xterm-direct" => ProtocolProfile::Xterm,
         _ => ProtocolProfile::Conservative,
     }
 }
@@ -631,6 +632,21 @@ fn dec_dsr_cursor_response(cursor_pos: (u16, u16)) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_profile_for_term_recognizes_common_aliases() {
+        assert_eq!(protocol_profile_for_term("bmux"), ProtocolProfile::Bmux);
+        assert_eq!(protocol_profile_for_term("tmux"), ProtocolProfile::Screen);
+        assert_eq!(protocol_profile_for_term("xterm"), ProtocolProfile::Xterm);
+        assert_eq!(
+            protocol_profile_for_term("xterm-direct"),
+            ProtocolProfile::Xterm
+        );
+        assert_eq!(
+            protocol_profile_for_term("weird-term"),
+            ProtocolProfile::Conservative
+        );
+    }
 
     #[cfg(feature = "kitty-keyboard")]
     #[test]

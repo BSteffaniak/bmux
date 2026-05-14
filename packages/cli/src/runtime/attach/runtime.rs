@@ -7324,8 +7324,14 @@ async fn hydrate_attach_structured_grid_snapshots(
                 continue;
             }
         };
+        let protocol = stream.grid().protocol_state();
+        let alternate_screen = stream.grid().mode() == bmux_terminal_grid::GridMode::Alternate;
         let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
         buffer.terminal_grid = stream;
+        buffer.protocol_tracker.set_protocol_state(protocol);
+        buffer
+            .protocol_tracker
+            .set_alternate_screen(alternate_screen);
         buffer.visual_row_fingerprints.clear();
         buffer.expected_stream_start = Some(snapshot.stream_end);
         buffer.scrollback_window = None;
