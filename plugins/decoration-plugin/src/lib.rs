@@ -57,6 +57,43 @@ struct AnimationDriverPolicy {
     generation: u64,
 }
 
+enum DecorationEngineCommand {
+    SetPaneBorder {
+        pane_id: Uuid,
+        border: BorderStyle,
+        reply: tokio::sync::oneshot::Sender<Result<(), SetStyleError>>,
+    },
+    SetDefaultBorder {
+        border: BorderStyle,
+        reply: tokio::sync::oneshot::Sender<Result<(), SetStyleError>>,
+    },
+    ApplyThemeExtension {
+        toml_text: String,
+        config_dir_candidates: Vec<PathBuf>,
+        script_host_access: ScriptHostAccess,
+        reply: tokio::sync::oneshot::Sender<Result<(), ValidationResult>>,
+    },
+    NotifyPaneEvent {
+        event: PaneEvent,
+        reply: tokio::sync::oneshot::Sender<Result<(), NotifyError>>,
+    },
+    AttachInput {
+        event: AttachInputEvent,
+        reply: tokio::sync::oneshot::Sender<AttachInputResult>,
+    },
+    PaneEvent(PaneEvent),
+    FocusSnapshot(bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap),
+    AttachLayoutSnapshot(bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot),
+    VisualProjection(VisualProjectionState),
+    ScriptJsonEvent {
+        event: bmux_plugin::JsonPluginEvent,
+        snapshot: bool,
+        generation: u64,
+        reply: Option<tokio::sync::oneshot::Sender<bool>>,
+    },
+    AnimationTick(AnimationDriverPolicy),
+}
+
 /// Runtime state for one user-composable decoration component.
 struct ScriptComponentRuntime {
     id: String,
@@ -161,6 +198,9 @@ struct State {
     /// Monotonic token invalidating stale animation tick threads across
     /// theme reapplies, including reapplies that keep the same tick rate.
     animation_generation: u64,
+    /// Single engine command channel. External event subscribers and timers
+    /// feed this channel instead of mutating decoration state directly.
+    engine_tx: Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>>,
     /// Single animation driver policy channel. Theme application only updates
     /// this channel; it never spawns per-apply tick threads.
     animation_driver_tx: Option<tokio::sync::watch::Sender<AnimationDriverPolicy>>,
@@ -196,6 +236,7 @@ impl std::fmt::Debug for State {
             )
             .field("animation_hz", &self.animation_hz)
             .field("animation_generation", &self.animation_generation)
+            .field("engine_active", &self.engine_tx.is_some())
             .field(
                 "animation_driver_active",
                 &self.animation_driver_tx.is_some(),
@@ -342,6 +383,44 @@ impl DecorationStateService for DecorationServiceHandle {
     }
 }
 
+fn decoration_engine_tx(
+    state: &Arc<Mutex<State>>,
+) -> Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>> {
+    state.lock().ok().and_then(|guard| guard.engine_tx.clone())
+}
+
+async fn send_engine_command<T>(
+    state: &Arc<Mutex<State>>,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> DecorationEngineCommand,
+) -> Option<T> {
+    let tx = decoration_engine_tx(state)?;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(build(reply)).ok()?;
+    rx.await.ok()
+}
+
+fn send_engine_command_blocking<T>(
+    state: &Arc<Mutex<State>>,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> DecorationEngineCommand,
+) -> Option<T> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return None;
+    }
+    let tx = decoration_engine_tx(state)?;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(build(reply)).ok()?;
+    rx.blocking_recv().ok()
+}
+
+fn send_engine_fire_and_forget(
+    state: &Arc<Mutex<State>>,
+    command: DecorationEngineCommand,
+) -> bool {
+    decoration_engine_tx(state)
+        .and_then(|tx| tx.send(command).ok())
+        .is_some()
+}
+
 impl DecorationCommandsService for DecorationServiceHandle {
     fn set_pane_border<'a>(
         &'a self,
@@ -349,21 +428,18 @@ impl DecorationCommandsService for DecorationServiceHandle {
         border: BorderStyle,
     ) -> Pin<Box<dyn Future<Output = Result<(), SetStyleError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| SetStyleError::StyleUnsupported {
-                    style: "<poisoned>".into(),
-                })?;
-            let focused = state.activity.get(&pane_id).is_some_and(|a| a.focused);
-            let entry = state
-                .panes
-                .entry(pane_id)
-                .or_insert_with(|| default_pane_decoration(pane_id, border, focused));
-            entry.border = border;
-            entry.focused = focused;
-            bump_revision(&mut state);
-            Ok(())
+            if let Some(outcome) = send_engine_command(&self.state, |reply| {
+                DecorationEngineCommand::SetPaneBorder {
+                    pane_id,
+                    border,
+                    reply,
+                }
+            })
+            .await
+            {
+                return outcome;
+            }
+            set_pane_border_direct(&self.state, pane_id, border)
         })
     }
 
@@ -372,15 +448,14 @@ impl DecorationCommandsService for DecorationServiceHandle {
         border: BorderStyle,
     ) -> Pin<Box<dyn Future<Output = Result<(), SetStyleError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| SetStyleError::StyleUnsupported {
-                    style: "<poisoned>".into(),
-                })?;
-            state.default_border = border;
-            bump_revision(&mut state);
-            Ok(())
+            if let Some(outcome) = send_engine_command(&self.state, |reply| {
+                DecorationEngineCommand::SetDefaultBorder { border, reply }
+            })
+            .await
+            {
+                return outcome;
+            }
+            set_default_border_direct(&self.state, border)
         })
     }
 
@@ -394,7 +469,19 @@ impl DecorationCommandsService for DecorationServiceHandle {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            apply_theme_extension_toml(
+            if let Some(outcome) = send_engine_command(&self.state, |reply| {
+                DecorationEngineCommand::ApplyThemeExtension {
+                    toml_text: toml_text.clone(),
+                    config_dir_candidates: candidates.clone(),
+                    script_host_access: ScriptHostAccess::default(),
+                    reply,
+                }
+            })
+            .await
+            {
+                return outcome;
+            }
+            apply_theme_extension_toml_direct(
                 &self.state,
                 &toml_text,
                 &candidates,
@@ -408,16 +495,61 @@ impl DecorationCommandsService for DecorationServiceHandle {
         event: PaneEvent,
     ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| NotifyError::InvalidArgument {
-                    reason: "decoration state mutex poisoned".to_string(),
-                })?;
-            apply_pane_event(&mut state, &event);
-            Ok(())
+            if let Some(outcome) = send_engine_command(&self.state, |reply| {
+                DecorationEngineCommand::NotifyPaneEvent {
+                    event: event.clone(),
+                    reply,
+                }
+            })
+            .await
+            {
+                return outcome;
+            }
+            notify_pane_event_direct(&self.state, &event)
         })
     }
+}
+
+fn set_pane_border_direct(
+    state: &Arc<Mutex<State>>,
+    pane_id: Uuid,
+    border: BorderStyle,
+) -> Result<(), SetStyleError> {
+    let mut state = state.lock().map_err(|_| SetStyleError::StyleUnsupported {
+        style: "<poisoned>".into(),
+    })?;
+    let focused = state.activity.get(&pane_id).is_some_and(|a| a.focused);
+    let entry = state
+        .panes
+        .entry(pane_id)
+        .or_insert_with(|| default_pane_decoration(pane_id, border, focused));
+    entry.border = border;
+    entry.focused = focused;
+    bump_revision(&mut state);
+    Ok(())
+}
+
+fn set_default_border_direct(
+    state: &Arc<Mutex<State>>,
+    border: BorderStyle,
+) -> Result<(), SetStyleError> {
+    let mut state = state.lock().map_err(|_| SetStyleError::StyleUnsupported {
+        style: "<poisoned>".into(),
+    })?;
+    state.default_border = border;
+    bump_revision(&mut state);
+    Ok(())
+}
+
+fn notify_pane_event_direct(
+    state: &Arc<Mutex<State>>,
+    event: &PaneEvent,
+) -> Result<(), NotifyError> {
+    let mut state = state.lock().map_err(|_| NotifyError::InvalidArgument {
+        reason: "decoration state mutex poisoned".to_string(),
+    })?;
+    apply_pane_event(&mut state, event);
+    Ok(())
 }
 
 fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> AttachInputResult {
@@ -1316,6 +1448,105 @@ fn scene_output_matches(left: &DecorationScene, right: &DecorationScene) -> bool
 /// Used by the `validate-theme-extension` query so external callers
 /// (tests, a future `bmux config validate` CLI) can round-trip a
 /// theme file without reaching into plugin internals.
+fn ensure_decoration_engine(state: &Arc<Mutex<State>>) {
+    let (mut rx, host_async_handle) = {
+        let Ok(mut guard) = state.lock() else {
+            return;
+        };
+        if guard.engine_tx.is_some() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        guard.engine_tx = Some(tx);
+        (rx, guard.host_async_handle.clone())
+    };
+    let state = Arc::clone(state);
+    let task = async move {
+        while let Some(command) = rx.recv().await {
+            handle_decoration_engine_command(&state, command);
+        }
+        tracing::debug!("decoration engine loop exited");
+    };
+    if let Some(async_handle) = host_async_handle {
+        async_handle.spawn_with_name("decoration.engine", task);
+    } else {
+        spawn_local_current_thread_runtime("decoration engine", task);
+    }
+}
+
+fn handle_decoration_engine_command(state: &Arc<Mutex<State>>, command: DecorationEngineCommand) {
+    match command {
+        DecorationEngineCommand::SetPaneBorder {
+            pane_id,
+            border,
+            reply,
+        } => {
+            let _ = reply.send(set_pane_border_direct(state, pane_id, border));
+        }
+        DecorationEngineCommand::SetDefaultBorder { border, reply } => {
+            let _ = reply.send(set_default_border_direct(state, border));
+        }
+        DecorationEngineCommand::ApplyThemeExtension {
+            toml_text,
+            config_dir_candidates,
+            script_host_access,
+            reply,
+        } => {
+            let outcome = apply_theme_extension_toml_direct(
+                state,
+                &toml_text,
+                &config_dir_candidates,
+                script_host_access,
+            );
+            let _ = reply.send(outcome);
+        }
+        DecorationEngineCommand::NotifyPaneEvent { event, reply } => {
+            let _ = reply.send(notify_pane_event_direct(state, &event));
+        }
+        DecorationEngineCommand::AttachInput { event, reply } => {
+            let result = state.lock().map_or_else(
+                |_| AttachInputResult::default(),
+                |mut state| handle_attach_input_event(&mut state, event),
+            );
+            let _ = reply.send(result);
+        }
+        DecorationEngineCommand::PaneEvent(event) => {
+            let _ = notify_pane_event_direct(state, &event);
+        }
+        DecorationEngineCommand::FocusSnapshot(snapshot) => {
+            if let Ok(mut guard) = state.lock() {
+                apply_focus_state_map(&mut guard, &snapshot);
+            }
+        }
+        DecorationEngineCommand::AttachLayoutSnapshot(snapshot) => {
+            if let Ok(mut guard) = state.lock() {
+                apply_attach_layout_snapshot(&mut guard, &snapshot);
+            }
+        }
+        DecorationEngineCommand::VisualProjection(projection) => {
+            if let Ok(mut guard) = state.lock() {
+                apply_visual_projection(&mut guard, &projection);
+            }
+        }
+        DecorationEngineCommand::ScriptJsonEvent {
+            event,
+            snapshot,
+            generation,
+            reply,
+        } => {
+            let accepted = enqueue_script_json_event_direct(state, &event, snapshot, generation);
+            if let Some(reply) = reply {
+                let _ = reply.send(accepted);
+            }
+        }
+        DecorationEngineCommand::AnimationTick(policy) => {
+            if let Ok(mut guard) = state.lock() {
+                run_animation_tick_if_current(&mut guard, policy);
+            }
+        }
+    }
+}
+
 fn validate_theme_extension_toml(text: &str) -> ValidationResult {
     // Parse as generic TOML first so individual field errors can be
     // attributed to paths. `try_into::<DecorationThemeExtension>()`
@@ -1344,6 +1575,25 @@ fn validate_theme_extension_toml(text: &str) -> ValidationResult {
 }
 
 fn apply_theme_extension_toml(
+    state: &Arc<Mutex<State>>,
+    text: &str,
+    config_dir_candidates: &[PathBuf],
+    script_host_access: ScriptHostAccess,
+) -> Result<(), ValidationResult> {
+    if let Some(outcome) = send_engine_command_blocking(state, |reply| {
+        DecorationEngineCommand::ApplyThemeExtension {
+            toml_text: text.to_string(),
+            config_dir_candidates: config_dir_candidates.to_vec(),
+            script_host_access: script_host_access.clone(),
+            reply,
+        }
+    }) {
+        return outcome;
+    }
+    apply_theme_extension_toml_direct(state, text, config_dir_candidates, script_host_access)
+}
+
+fn apply_theme_extension_toml_direct(
     state: &Arc<Mutex<State>>,
     text: &str,
     config_dir_candidates: &[PathBuf],
@@ -1514,7 +1764,7 @@ fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generat
         );
         return;
     };
-    enqueue_script_json_event(&state, initial.as_ref(), true, generation);
+    enqueue_script_json_event_direct(&state, initial.as_ref(), true, generation);
     let host_async_handle = state
         .lock()
         .ok()
@@ -1522,7 +1772,16 @@ fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generat
     let task = async move {
         while rx.changed().await.is_ok() {
             let event = rx.borrow().clone();
-            if !enqueue_script_json_event(&state, event.as_ref(), false, generation) {
+            if !send_engine_fire_and_forget(
+                &state,
+                DecorationEngineCommand::ScriptJsonEvent {
+                    event: event.as_ref().clone(),
+                    snapshot: false,
+                    generation,
+                    reply: None,
+                },
+            ) && !enqueue_script_json_event_direct(&state, event.as_ref(), false, generation)
+            {
                 break;
             }
         }
@@ -1545,14 +1804,43 @@ fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, gen
     };
     std::thread::spawn(move || {
         while let Ok(event) = rx.blocking_recv() {
-            if !enqueue_script_json_event(&state, event.as_ref(), false, generation) {
+            if !send_engine_fire_and_forget(
+                &state,
+                DecorationEngineCommand::ScriptJsonEvent {
+                    event: event.as_ref().clone(),
+                    snapshot: false,
+                    generation,
+                    reply: None,
+                },
+            ) && !enqueue_script_json_event_direct(&state, event.as_ref(), false, generation)
+            {
                 break;
             }
         }
     });
 }
 
+#[cfg(test)]
 fn enqueue_script_json_event(
+    state: &Arc<Mutex<State>>,
+    event: &bmux_plugin::JsonPluginEvent,
+    snapshot: bool,
+    generation: u64,
+) -> bool {
+    if let Some(accepted) =
+        send_engine_command_blocking(state, |reply| DecorationEngineCommand::ScriptJsonEvent {
+            event: event.clone(),
+            snapshot,
+            generation,
+            reply: Some(reply),
+        })
+    {
+        return accepted;
+    }
+    enqueue_script_json_event_direct(state, event, snapshot, generation)
+}
+
+fn enqueue_script_json_event_direct(
     state: &Arc<Mutex<State>>,
     event: &bmux_plugin::JsonPluginEvent,
     snapshot: bool,
@@ -2269,6 +2557,7 @@ impl RustPlugin for DecorationPlugin {
                 bmux_scene_protocol::scene_protocol::STATE_KIND,
                 empty_scene(),
             );
+        ensure_decoration_engine(&self.state.inner);
         ensure_animation_driver(&self.state.inner);
         let mut summary_theme_loaded = false;
         let mut summary_script_loaded = false;
@@ -2410,35 +2699,24 @@ impl RustPlugin for DecorationPlugin {
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(validate_theme_extension_toml(&req.toml))
             },
             "decoration-commands", "set-pane-border" => |req: SetPaneBorderArgs, _ctx| {
-                let outcome: Result<(), SetStyleError> = (|| {
-                    let mut state = state
-                        .lock()
-                        .map_err(|_| SetStyleError::StyleUnsupported {
-                            style: "<poisoned>".into(),
-                        })?;
-                    let focused = state.activity.get(&req.pane_id).is_some_and(|a| a.focused);
-                    let entry = state
-                        .panes
-                        .entry(req.pane_id)
-                        .or_insert_with(|| default_pane_decoration(req.pane_id, req.border, focused));
-                    entry.border = req.border;
-                    entry.focused = focused;
-                    bump_revision(&mut state);
-                    Ok(())
-                })();
+                let outcome = send_engine_command_blocking(&state, |reply| {
+                    DecorationEngineCommand::SetPaneBorder {
+                        pane_id: req.pane_id,
+                        border: req.border,
+                        reply,
+                    }
+                })
+                .unwrap_or_else(|| set_pane_border_direct(&state, req.pane_id, req.border));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-commands", "set-default-border" => |req: SetDefaultBorderArgs, _ctx| {
-                let outcome: Result<(), SetStyleError> = (|| {
-                    let mut state = state
-                        .lock()
-                        .map_err(|_| SetStyleError::StyleUnsupported {
-                            style: "<poisoned>".into(),
-                        })?;
-                    state.default_border = req.border;
-                    bump_revision(&mut state);
-                    Ok(())
-                })();
+                let outcome = send_engine_command_blocking(&state, |reply| {
+                    DecorationEngineCommand::SetDefaultBorder {
+                        border: req.border,
+                        reply,
+                    }
+                })
+                .unwrap_or_else(|| set_default_border_direct(&state, req.border));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-commands", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, ctx| {
@@ -2468,21 +2746,28 @@ impl RustPlugin for DecorationPlugin {
                 ))
             },
             "decoration-commands", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
-                let outcome: Result<(), NotifyError> = (|| {
-                    let mut state = state
-                        .lock()
-                        .map_err(|_| NotifyError::InvalidArgument {
-                            reason: "decoration state mutex poisoned".to_string(),
-                        })?;
-                    apply_pane_event(&mut state, &req.event);
-                    Ok(())
-                })();
+                let outcome = send_engine_command_blocking(&state, |reply| {
+                    DecorationEngineCommand::NotifyPaneEvent {
+                        event: req.event.clone(),
+                        reply,
+                    }
+                })
+                .unwrap_or_else(|| notify_pane_event_direct(&state, &req.event));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-input-hooks", "handle-input" => |req: AttachInputEvent, _ctx| {
-                let result = state
-                    .lock()
-                    .map_or_else(|_| AttachInputResult::default(), |mut state| handle_attach_input_event(&mut state, req));
+                let result = send_engine_command_blocking(&state, |reply| {
+                    DecorationEngineCommand::AttachInput {
+                        event: req.clone(),
+                        reply,
+                    }
+                })
+                .unwrap_or_else(|| {
+                    state.lock().map_or_else(
+                        |_| AttachInputResult::default(),
+                        |mut state| handle_attach_input_event(&mut state, req),
+                    )
+                });
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
             },
         })
@@ -2835,14 +3120,19 @@ async fn animation_driver_loop(
                 let Some(arc) = state.upgrade() else {
                     return;
                 };
-                let Ok(mut guard) = arc.lock() else {
+                let Ok(guard) = arc.lock() else {
                     return;
                 };
                 if animation_driver_policy(&guard) != policy {
                     policy = animation_driver_policy(&guard);
                     continue;
                 }
-                run_animation_tick_if_current(&mut guard, policy);
+                drop(guard);
+                if !send_engine_fire_and_forget(&arc, DecorationEngineCommand::AnimationTick(policy))
+                    && let Ok(mut guard) = arc.lock()
+                {
+                    run_animation_tick_if_current(&mut guard, policy);
+                }
             }
         }
     }
@@ -2868,10 +3158,16 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
     };
     std::thread::spawn(move || {
         while let Ok(event) = rx.blocking_recv() {
-            let Ok(mut guard) = state.lock() else {
-                break;
-            };
-            apply_pane_event(&mut guard, &translate_windows_event(&event));
+            let event = translate_windows_event(&event);
+            if !send_engine_fire_and_forget(
+                &state,
+                DecorationEngineCommand::PaneEvent(event.clone()),
+            ) {
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_pane_event(&mut guard, &event);
+            }
         }
     });
 }
@@ -2916,7 +3212,11 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
         revision = initial.revision,
         "focus-state initial applied"
     );
-    if let Ok(mut guard) = state.lock() {
+    if !send_engine_fire_and_forget(
+        &state,
+        DecorationEngineCommand::FocusSnapshot(initial.as_ref().clone()),
+    ) && let Ok(mut guard) = state.lock()
+    {
         apply_focus_state_map(&mut guard, initial.as_ref());
     }
     let host_async_handle = state
@@ -2931,10 +3231,15 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
                 revision = snapshot.revision,
                 "focus-state update"
             );
-            let Ok(mut guard) = state.lock() else {
-                break;
-            };
-            apply_focus_state_map(&mut guard, snapshot.as_ref());
+            if !send_engine_fire_and_forget(
+                &state,
+                DecorationEngineCommand::FocusSnapshot(snapshot.as_ref().clone()),
+            ) {
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_focus_state_map(&mut guard, snapshot.as_ref());
+            }
         }
         tracing::debug!("focus-state subscriber loop exited");
     };
@@ -3022,7 +3327,11 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
             return;
         }
     };
-    if let Ok(mut guard) = state.lock() {
+    if !send_engine_fire_and_forget(
+        &state,
+        DecorationEngineCommand::AttachLayoutSnapshot(initial.as_ref().clone()),
+    ) && let Ok(mut guard) = state.lock()
+    {
         apply_attach_layout_snapshot(&mut guard, initial.as_ref());
     }
     let host_async_handle = state
@@ -3037,10 +3346,15 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
                 revision = snapshot.revision,
                 "attach-layout update"
             );
-            let Ok(mut guard) = state.lock() else {
-                break;
-            };
-            apply_attach_layout_snapshot(&mut guard, snapshot.as_ref());
+            if !send_engine_fire_and_forget(
+                &state,
+                DecorationEngineCommand::AttachLayoutSnapshot(snapshot.as_ref().clone()),
+            ) {
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_attach_layout_snapshot(&mut guard, snapshot.as_ref());
+            }
         }
         tracing::debug!("attach-layout subscriber loop exited");
     };
@@ -3110,7 +3424,11 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
         );
         return;
     };
-    if let Ok(mut guard) = state.lock() {
+    if !send_engine_fire_and_forget(
+        &state,
+        DecorationEngineCommand::VisualProjection(initial.as_ref().clone()),
+    ) && let Ok(mut guard) = state.lock()
+    {
         apply_visual_projection(&mut guard, initial.as_ref());
     }
     let host_async_handle = state
@@ -3120,10 +3438,15 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
     let task = async move {
         while rx.changed().await.is_ok() {
             let snapshot = rx.borrow().clone();
-            let Ok(mut guard) = state.lock() else {
-                break;
-            };
-            apply_visual_projection(&mut guard, snapshot.as_ref());
+            if !send_engine_fire_and_forget(
+                &state,
+                DecorationEngineCommand::VisualProjection(snapshot.as_ref().clone()),
+            ) {
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_visual_projection(&mut guard, snapshot.as_ref());
+            }
         }
     };
     if let Some(async_handle) = host_async_handle {
