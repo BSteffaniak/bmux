@@ -2,16 +2,11 @@
 //!
 //! This module owns the decoration plugin's command/scheduling boundary: theme
 //! applies, animation ticks, service mutations, input events, and event-bus
-//! subscribers all converge here before touching decoration state. Today the
-//! engine is a mutex-backed actor bridge: a single command loop serializes
-//! normal runtime mutations, while `State` remains behind `Arc<Mutex<_>>` so the
-//! plugin's synchronous service entrypoint and existing tests can fall back
-//! without deadlocking. The planned pure-ownership refactor will move `State`
-//! into the engine task directly and leave callers with only command handles and
-//! read-model snapshots.
+//! subscribers all converge here before touching decoration state. The engine
+//! task owns `State` directly; callers interact through command handles and the
+//! read model snapshot maintained by the engine.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bmux_decoration_plugin_api::decoration_commands::NotifyError;
@@ -22,7 +17,7 @@ use uuid::Uuid;
 
 use crate::scripting::ScriptHostAccess;
 use crate::{
-    State, VisualProjectionBatch, apply_attach_layout_snapshot, apply_focus_state_map,
+    SharedState, State, VisualProjectionBatch, apply_attach_layout_snapshot, apply_focus_state_map,
     apply_theme_extension_toml_direct, apply_visual_projection_batch,
     enqueue_script_json_event_direct, handle_attach_input_event, notify_pane_event_direct,
     publish_scene_if_changed, set_default_border_direct, set_pane_border_direct,
@@ -70,62 +65,68 @@ pub(crate) enum DecorationEngineCommand {
         reply: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     AnimationTick(AnimationDriverPolicy),
-}
-
-pub(crate) fn decoration_engine_tx(
-    state: &Arc<Mutex<State>>,
-) -> Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>> {
-    state.lock().ok().and_then(|guard| guard.engine_tx.clone())
+    PublishInitialScene {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    WithState {
+        f: Box<dyn FnOnce(&mut State) + Send>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 pub(crate) async fn send_engine_command<T>(
-    state: &Arc<Mutex<State>>,
+    state: &SharedState,
     build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> DecorationEngineCommand,
 ) -> Option<T> {
-    let tx = decoration_engine_tx(state)?;
+    ensure_decoration_engine(state);
+    let tx = state.command_tx()?;
     let (reply, rx) = tokio::sync::oneshot::channel();
     tx.send(build(reply)).ok()?;
     rx.await.ok()
 }
 
 pub(crate) fn send_engine_command_blocking<T>(
-    state: &Arc<Mutex<State>>,
+    state: &SharedState,
     build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> DecorationEngineCommand,
 ) -> Option<T> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return None;
     }
-    let tx = decoration_engine_tx(state)?;
+    ensure_decoration_engine(state);
+    let tx = state.command_tx()?;
     let (reply, rx) = tokio::sync::oneshot::channel();
     tx.send(build(reply)).ok()?;
     rx.blocking_recv().ok()
 }
 
 pub(crate) fn send_engine_fire_and_forget(
-    state: &Arc<Mutex<State>>,
+    state: &SharedState,
     command: DecorationEngineCommand,
 ) -> bool {
-    decoration_engine_tx(state)
+    ensure_decoration_engine(state);
+    state
+        .command_tx()
         .and_then(|tx| tx.send(command).ok())
         .is_some()
 }
 
-pub(crate) fn ensure_decoration_engine(state: &Arc<Mutex<State>>) {
-    let (mut rx, host_async_handle) = {
-        let Ok(mut guard) = state.lock() else {
-            return;
-        };
-        if guard.engine_tx.is_some() {
-            return;
-        }
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        guard.engine_tx = Some(tx);
-        (rx, guard.host_async_handle.clone())
-    };
-    let state = Arc::clone(state);
+pub(crate) fn ensure_decoration_engine(shared: &SharedState) {
+    if shared.command_tx().is_some() {
+        return;
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    if !shared.set_command_tx(tx) {
+        return;
+    }
+    let shared = shared.clone();
+    let host_async_handle = shared.host_async_handle();
     let task = async move {
+        let mut state = State::default();
+        shared.sync_read_model_from_state(&mut state);
         while let Some(command) = rx.recv().await {
-            handle_decoration_engine_command(&state, command);
+            handle_decoration_engine_command(&shared, &mut state, command);
+            shared.sync_read_model_from_state(&mut state);
         }
         tracing::debug!("decoration engine loop exited");
     };
@@ -136,17 +137,25 @@ pub(crate) fn ensure_decoration_engine(state: &Arc<Mutex<State>>) {
     }
 }
 
-fn handle_decoration_engine_command(state: &Arc<Mutex<State>>, command: DecorationEngineCommand) {
+fn handle_decoration_engine_command(
+    shared: &SharedState,
+    state: &mut State,
+    command: DecorationEngineCommand,
+) {
     match command {
         DecorationEngineCommand::SetPaneBorder {
             pane_id,
             border,
             reply,
         } => {
-            let _ = reply.send(set_pane_border_direct(state, pane_id, border));
+            set_pane_border_direct(state, pane_id, border);
+            shared.sync_read_model_from_state(state);
+            let _ = reply.send(Ok(()));
         }
         DecorationEngineCommand::SetDefaultBorder { border, reply } => {
-            let _ = reply.send(set_default_border_direct(state, border));
+            set_default_border_direct(state, border);
+            shared.sync_read_model_from_state(state);
+            let _ = reply.send(Ok(()));
         }
         DecorationEngineCommand::ApplyThemeExtension {
             toml_text,
@@ -155,40 +164,36 @@ fn handle_decoration_engine_command(state: &Arc<Mutex<State>>, command: Decorati
             reply,
         } => {
             let outcome = apply_theme_extension_toml_direct(
+                shared,
                 state,
                 &toml_text,
                 &config_dir_candidates,
-                script_host_access,
+                &script_host_access,
             );
+            shared.sync_read_model_from_state(state);
             let _ = reply.send(outcome);
         }
         DecorationEngineCommand::NotifyPaneEvent { event, reply } => {
-            let _ = reply.send(notify_pane_event_direct(state, &event));
+            notify_pane_event_direct(state, &event);
+            shared.sync_read_model_from_state(state);
+            let _ = reply.send(Ok(()));
         }
         DecorationEngineCommand::AttachInput { event, reply } => {
-            let result = state.lock().map_or_else(
-                |_| AttachInputResult::default(),
-                |mut state| handle_attach_input_event(&mut state, event),
-            );
+            let result = handle_attach_input_event(state, event);
+            shared.sync_read_model_from_state(state);
             let _ = reply.send(result);
         }
         DecorationEngineCommand::PaneEvent(event) => {
-            let _ = notify_pane_event_direct(state, &event);
+            notify_pane_event_direct(state, &event);
         }
         DecorationEngineCommand::FocusSnapshot(snapshot) => {
-            if let Ok(mut guard) = state.lock() {
-                apply_focus_state_map(&mut guard, &snapshot);
-            }
+            apply_focus_state_map(state, &snapshot);
         }
         DecorationEngineCommand::AttachLayoutSnapshot(snapshot) => {
-            if let Ok(mut guard) = state.lock() {
-                apply_attach_layout_snapshot(&mut guard, &snapshot);
-            }
+            apply_attach_layout_snapshot(state, &snapshot);
         }
         DecorationEngineCommand::VisualProjection(projection) => {
-            if let Ok(mut guard) = state.lock() {
-                apply_visual_projection_batch(&mut guard, &projection);
-            }
+            apply_visual_projection_batch(state, &projection);
         }
         DecorationEngineCommand::ScriptJsonEvent {
             event,
@@ -202,9 +207,18 @@ fn handle_decoration_engine_command(state: &Arc<Mutex<State>>, command: Decorati
             }
         }
         DecorationEngineCommand::AnimationTick(policy) => {
-            if let Ok(mut guard) = state.lock() {
-                run_animation_tick_if_current(&mut guard, policy);
-            }
+            run_animation_tick_if_current(state, policy);
+        }
+        DecorationEngineCommand::PublishInitialScene { reply } => {
+            publish_scene_if_changed(state);
+            shared.sync_read_model_from_state(state);
+            let _ = reply.send(());
+        }
+        #[cfg(test)]
+        DecorationEngineCommand::WithState { f, reply } => {
+            f(state);
+            shared.sync_read_model_from_state(state);
+            let _ = reply.send(());
         }
     }
 }
@@ -216,8 +230,8 @@ pub(crate) fn animation_driver_policy(state: &State) -> AnimationDriverPolicy {
     }
 }
 
-pub(crate) fn notify_animation_driver(state: &State) {
-    if let Some(tx) = state.animation_driver_tx.as_ref() {
+pub(crate) fn notify_animation_driver(shared: &SharedState, state: &State) {
+    if let Some(tx) = shared.animation_driver_tx() {
         let _ = tx.send(animation_driver_policy(state));
     }
 }
@@ -246,20 +260,16 @@ pub(crate) fn run_animation_tick_if_current(
     true
 }
 
-pub(crate) fn ensure_animation_driver(state: &Arc<Mutex<State>>) {
-    let (rx, host_async_handle) = {
-        let Ok(mut guard) = state.lock() else {
-            return;
-        };
-        if guard.animation_driver_tx.is_some() {
-            return;
-        }
-        let (tx, rx) = tokio::sync::watch::channel(animation_driver_policy(&guard));
-        guard.animation_driver_tx = Some(tx);
-        (rx, guard.host_async_handle.clone())
-    };
-    let task = animation_driver_loop(Arc::downgrade(state), rx);
-    if let Some(async_handle) = host_async_handle {
+pub(crate) fn ensure_animation_driver(shared: &SharedState) {
+    let (tx, rx) = tokio::sync::watch::channel(AnimationDriverPolicy {
+        hz: None,
+        generation: 0,
+    });
+    if !shared.set_animation_driver_tx(tx) {
+        return;
+    }
+    let task = animation_driver_loop(shared.clone(), rx);
+    if let Some(async_handle) = shared.host_async_handle() {
         async_handle.spawn_with_name("decoration.animation_driver", task);
     } else {
         spawn_local_current_thread_runtime("animation driver", task);
@@ -267,7 +277,7 @@ pub(crate) fn ensure_animation_driver(state: &Arc<Mutex<State>>) {
 }
 
 async fn animation_driver_loop(
-    state: Weak<Mutex<State>>,
+    shared: SharedState,
     mut rx: tokio::sync::watch::Receiver<AnimationDriverPolicy>,
 ) {
     let mut policy = *rx.borrow();
@@ -288,23 +298,39 @@ async fn animation_driver_loop(
                 policy = *rx.borrow();
             }
             () = tokio::time::sleep(period) => {
-                let Some(arc) = state.upgrade() else {
+                if !send_engine_fire_and_forget(&shared, DecorationEngineCommand::AnimationTick(policy)) {
                     return;
-                };
-                let Ok(guard) = arc.lock() else {
-                    return;
-                };
-                if animation_driver_policy(&guard) != policy {
-                    policy = animation_driver_policy(&guard);
-                    continue;
-                }
-                drop(guard);
-                if !send_engine_fire_and_forget(&arc, DecorationEngineCommand::AnimationTick(policy))
-                    && let Ok(mut guard) = arc.lock()
-                {
-                    run_animation_tick_if_current(&mut guard, policy);
                 }
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn with_engine_state<R: Send + 'static>(
+    shared: &SharedState,
+    f: impl FnOnce(&mut State) -> R + Send + 'static,
+) -> R {
+    use std::sync::{Arc, Mutex};
+
+    let result = Arc::new(Mutex::new(None));
+    let result_for_command = Arc::clone(&result);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let command = DecorationEngineCommand::WithState {
+        f: Box::new(move |state| {
+            if let Ok(mut guard) = result_for_command.lock() {
+                *guard = Some(f(state));
+            }
+        }),
+        reply: done_tx,
+    };
+    assert!(
+        send_engine_fire_and_forget(shared, command),
+        "decoration engine is unavailable"
+    );
+    done_rx
+        .blocking_recv()
+        .expect("engine state command replied");
+    let mut guard = result.lock().expect("result lock");
+    guard.take().expect("engine state command produced result")
 }

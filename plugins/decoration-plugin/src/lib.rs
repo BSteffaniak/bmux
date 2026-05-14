@@ -20,7 +20,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService, NotifyError};
@@ -46,7 +46,7 @@ use crate::engine::{
     send_engine_command_blocking, send_engine_fire_and_forget,
 };
 #[cfg(test)]
-use crate::engine::{animation_driver_policy, run_animation_tick_if_current};
+use crate::engine::{animation_driver_policy, run_animation_tick_if_current, with_engine_state};
 use crate::scripting::{
     PerfTracker, ScriptBackend, ScriptComponentMessage, ScriptEventDelivery, ScriptEventMessage,
     ScriptHostAccess, ScriptMessage, ScriptRenderMessage, ScriptServiceCall, ScriptServiceGrant,
@@ -170,16 +170,6 @@ struct State {
     /// Monotonic token invalidating stale animation tick threads across
     /// theme reapplies, including reapplies that keep the same tick rate.
     animation_generation: u64,
-    /// Single engine command channel. External event subscribers and timers
-    /// feed this channel instead of mutating decoration state directly.
-    engine_tx: Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>>,
-    /// Single animation driver policy channel. Theme application only updates
-    /// this channel; it never spawns per-apply tick threads.
-    animation_driver_tx: Option<tokio::sync::watch::Sender<AnimationDriverPolicy>>,
-    /// Host async runtime handle supplied by in-process activation.
-    /// Used to drive long-lived watch subscribers without constructing
-    /// plugin-local tokio runtimes.
-    host_async_handle: Option<HostAsyncHandle>,
     /// Diagnostic flag flipped on the first frame where the script was
     /// actually invoked against at least one pane's geometry. Paired
     /// with a one-shot info log so we can confirm the full
@@ -208,11 +198,6 @@ impl std::fmt::Debug for State {
             )
             .field("animation_hz", &self.animation_hz)
             .field("animation_generation", &self.animation_generation)
-            .field("engine_active", &self.engine_tx.is_some())
-            .field(
-                "animation_driver_active",
-                &self.animation_driver_tx.is_some(),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -242,41 +227,177 @@ impl State {
     }
 }
 
-/// Shared decoration state.
+#[derive(Clone, Debug)]
+struct DecorationReadModel {
+    panes: HashMap<Uuid, PaneDecoration>,
+    geometry: HashMap<Uuid, PaneGeometry>,
+    activity: HashMap<Uuid, PaneActivity>,
+    default_border: BorderStyle,
+    current_theme: Option<DecorationThemeExtension>,
+    scene: DecorationScene,
+}
+
+impl Default for DecorationReadModel {
+    fn default() -> Self {
+        Self {
+            panes: HashMap::new(),
+            geometry: HashMap::new(),
+            activity: HashMap::new(),
+            default_border: BorderStyle::default(),
+            current_theme: None,
+            scene: empty_scene(),
+        }
+    }
+}
+
+struct DecorationRuntime {
+    command_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>>>,
+    read_model: RwLock<DecorationReadModel>,
+    host_async_handle: Mutex<Option<HostAsyncHandle>>,
+    animation_driver_tx: Mutex<Option<tokio::sync::watch::Sender<AnimationDriverPolicy>>>,
+}
+
+impl Default for DecorationRuntime {
+    fn default() -> Self {
+        Self {
+            command_tx: Mutex::new(None),
+            read_model: RwLock::new(DecorationReadModel::default()),
+            host_async_handle: Mutex::new(None),
+            animation_driver_tx: Mutex::new(None),
+        }
+    }
+}
+
+/// Shared decoration runtime handle.
 ///
-/// Held behind an `Arc<Mutex<State>>` so the `RustPlugin` instance and
-/// the typed service provider can observe the same view. The typed
-/// service implementation ([`DecorationServiceHandle`]) is a thin
-/// wrapper that holds a clone of the same Arc and implements
-/// [`DecorationStateService`].
-#[derive(Debug, Default)]
+/// Production callers never own or lock [`State`] directly. They either send
+/// commands to the decoration engine or read the latest projected
+/// [`DecorationReadModel`].
+#[derive(Clone, Default)]
 struct SharedState {
-    inner: Arc<Mutex<State>>,
+    runtime: Arc<DecorationRuntime>,
 }
 
 impl SharedState {
     fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(State::default())),
+        Self::default()
+    }
+
+    fn command_tx(&self) -> Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>> {
+        self.runtime
+            .command_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn set_command_tx(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>,
+    ) -> bool {
+        let Ok(mut guard) = self.runtime.command_tx.lock() else {
+            return false;
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(tx);
+        true
+    }
+
+    fn set_host_async_handle(&self, handle: HostAsyncHandle) {
+        if let Ok(mut guard) = self.runtime.host_async_handle.lock() {
+            *guard = Some(handle);
         }
     }
 
-    fn clone_arc(&self) -> Arc<Mutex<State>> {
-        Arc::clone(&self.inner)
+    fn host_async_handle(&self) -> Option<HostAsyncHandle> {
+        self.runtime
+            .host_async_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
+
+    fn animation_driver_tx(&self) -> Option<tokio::sync::watch::Sender<AnimationDriverPolicy>> {
+        self.runtime
+            .animation_driver_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn set_animation_driver_tx(
+        &self,
+        tx: tokio::sync::watch::Sender<AnimationDriverPolicy>,
+    ) -> bool {
+        let Ok(mut guard) = self.runtime.animation_driver_tx.lock() else {
+            return false;
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(tx);
+        true
+    }
+
+    fn read_model<R>(&self, f: impl FnOnce(&DecorationReadModel) -> R) -> R {
+        if let Ok(guard) = self.runtime.read_model.read() {
+            f(&guard)
+        } else {
+            f(&DecorationReadModel::default())
+        }
+    }
+
+    fn sync_read_model_from_state(&self, state: &mut State) {
+        if let Ok(mut guard) = self.runtime.read_model.write() {
+            sync_read_model_from_state(&mut guard, state);
+        }
+    }
+
+    #[cfg(test)]
+    fn with_state<R: Send + 'static>(&self, f: impl FnOnce(&mut State) -> R + Send + 'static) -> R {
+        with_engine_state(self, f)
+    }
+}
+
+fn sync_read_model_from_state(model: &mut DecorationReadModel, state: &mut State) {
+    model.panes.clone_from(&state.panes);
+    model.geometry.clone_from(&state.geometry);
+    model.activity.clone_from(&state.activity);
+    model.default_border = state.default_border;
+    model.current_theme.clone_from(&state.current_theme);
+    model.scene = scene_snapshot_from_state(state);
+}
+
+fn pane_decoration_from_read_model(model: &DecorationReadModel, pane_id: Uuid) -> PaneDecoration {
+    model.panes.get(&pane_id).cloned().unwrap_or_else(|| {
+        let focused = model.activity.get(&pane_id).is_some_and(|a| a.focused);
+        default_pane_decoration(pane_id, model.default_border, focused)
+    })
+}
+
+fn geometry_for_pane_read_model(
+    model: &DecorationReadModel,
+    pane_id: Uuid,
+) -> Option<PaneGeometry> {
+    model
+        .geometry
+        .values()
+        .find(|geometry| geometry.pane_id == pane_id)
+        .cloned()
 }
 
 /// Typed-service provider handle.
 ///
-/// Wraps a shared [`Arc<Mutex<State>>`] so multiple consumers (the
-/// plugin host's event loop + any consumer plugin resolving the typed
-/// service) observe the same store.
+/// Wraps the shared decoration runtime so typed service consumers read from
+/// the latest read model and send mutations through the engine command loop.
 struct DecorationServiceHandle {
-    state: Arc<Mutex<State>>,
+    state: SharedState,
 }
 
 impl DecorationServiceHandle {
-    fn new(state: Arc<Mutex<State>>) -> Self {
+    fn new(state: SharedState) -> Self {
         Self { state }
     }
 }
@@ -287,36 +408,21 @@ impl DecorationStateService for DecorationServiceHandle {
         pane_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Option<PaneDecoration>> + Send + 'a>> {
         Box::pin(async move {
-            let state = self.state.lock().ok()?;
-            if let Some(p) = state.panes.get(&pane_id) {
-                return Some(p.clone());
-            }
-            let focused = state.activity.get(&pane_id).is_some_and(|a| a.focused);
-            Some(default_pane_decoration(
-                pane_id,
-                state.default_border,
-                focused,
-            ))
+            Some(
+                self.state
+                    .read_model(|model| pane_decoration_from_read_model(model, pane_id)),
+            )
         })
     }
 
     fn default_border_style<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = BorderStyle> + Send + 'a>> {
-        Box::pin(async move {
-            self.state
-                .lock()
-                .map_or_else(|_| BorderStyle::default(), |s| s.default_border)
-        })
+        Box::pin(async move { self.state.read_model(|model| model.default_border) })
     }
 
     fn scene_snapshot<'a>(&'a self) -> Pin<Box<dyn Future<Output = DecorationScene> + Send + 'a>> {
-        Box::pin(async move {
-            self.state.lock().map_or_else(
-                |_| empty_scene(),
-                |mut state| scene_snapshot_from_state(&mut state),
-            )
-        })
+        Box::pin(async move { self.state.read_model(|model| model.scene.clone()) })
     }
 
     fn pane_geometry<'a>(
@@ -324,8 +430,8 @@ impl DecorationStateService for DecorationServiceHandle {
         pane_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Option<PaneGeometry>> + Send + 'a>> {
         Box::pin(async move {
-            let state = self.state.lock().ok()?;
-            geometry_for_pane(&state, pane_id).cloned()
+            self.state
+                .read_model(|model| geometry_for_pane_read_model(model, pane_id))
         })
     }
 
@@ -334,18 +440,15 @@ impl DecorationStateService for DecorationServiceHandle {
         pane_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Option<PaneActivity>> + Send + 'a>> {
         Box::pin(async move {
-            let state = self.state.lock().ok()?;
-            state.activity.get(&pane_id).cloned()
+            self.state
+                .read_model(|model| model.activity.get(&pane_id).cloned())
         })
     }
 
     fn current_theme_extension<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Option<DecorationThemeExtension>> + Send + 'a>> {
-        Box::pin(async move {
-            let state = self.state.lock().ok()?;
-            state.current_theme.clone()
-        })
+        Box::pin(async move { self.state.read_model(|model| model.current_theme.clone()) })
     }
 
     fn validate_theme_extension<'a>(
@@ -374,7 +477,9 @@ impl DecorationCommandsService for DecorationServiceHandle {
             {
                 return outcome;
             }
-            set_pane_border_direct(&self.state, pane_id, border)
+            Err(SetStyleError::StyleUnsupported {
+                style: "decoration engine unavailable".to_string(),
+            })
         })
     }
 
@@ -390,7 +495,9 @@ impl DecorationCommandsService for DecorationServiceHandle {
             {
                 return outcome;
             }
-            set_default_border_direct(&self.state, border)
+            Err(SetStyleError::StyleUnsupported {
+                style: "decoration engine unavailable".to_string(),
+            })
         })
     }
 
@@ -416,12 +523,12 @@ impl DecorationCommandsService for DecorationServiceHandle {
             {
                 return outcome;
             }
-            apply_theme_extension_toml_direct(
-                &self.state,
-                &toml_text,
-                &candidates,
-                ScriptHostAccess::default(),
-            )
+            Err(ValidationResult::Errors {
+                errors: vec![ValidationError {
+                    path: "<engine>".to_string(),
+                    message: "decoration engine unavailable".to_string(),
+                }],
+            })
         })
     }
 
@@ -440,7 +547,9 @@ impl DecorationCommandsService for DecorationServiceHandle {
             {
                 return outcome;
             }
-            notify_pane_event_direct(&self.state, &event)
+            Err(NotifyError::InvalidArgument {
+                reason: "decoration engine unavailable".to_string(),
+            })
         })
     }
 }
@@ -448,14 +557,7 @@ impl DecorationCommandsService for DecorationServiceHandle {
 // Direct mutation helper for engine dispatch, pre-engine fallback paths, and
 // tests. Normal post-activation runtime mutations should enter through
 // `DecorationEngineCommand`.
-fn set_pane_border_direct(
-    state: &Arc<Mutex<State>>,
-    pane_id: Uuid,
-    border: BorderStyle,
-) -> Result<(), SetStyleError> {
-    let mut state = state.lock().map_err(|_| SetStyleError::StyleUnsupported {
-        style: "<poisoned>".into(),
-    })?;
+fn set_pane_border_direct(state: &mut State, pane_id: Uuid, border: BorderStyle) {
     let focused = state.activity.get(&pane_id).is_some_and(|a| a.focused);
     let had_entry = state.panes.contains_key(&pane_id);
     let entry = state
@@ -463,44 +565,29 @@ fn set_pane_border_direct(
         .entry(pane_id)
         .or_insert_with(|| default_pane_decoration(pane_id, border, focused));
     if had_entry && entry.border == border && entry.focused == focused {
-        return Ok(());
+        return;
     }
     entry.border = border;
     entry.focused = focused;
-    publish_scene_if_changed(&mut state);
-    Ok(())
+    publish_scene_if_changed(state);
 }
 
 // Direct mutation helper for engine dispatch, pre-engine fallback paths, and
 // tests. Normal post-activation runtime mutations should enter through
 // `DecorationEngineCommand`.
-fn set_default_border_direct(
-    state: &Arc<Mutex<State>>,
-    border: BorderStyle,
-) -> Result<(), SetStyleError> {
-    let mut state = state.lock().map_err(|_| SetStyleError::StyleUnsupported {
-        style: "<poisoned>".into(),
-    })?;
+fn set_default_border_direct(state: &mut State, border: BorderStyle) {
     if state.default_border == border {
-        return Ok(());
+        return;
     }
     state.default_border = border;
-    publish_scene_if_changed(&mut state);
-    Ok(())
+    publish_scene_if_changed(state);
 }
 
 // Direct mutation helper for engine dispatch, pre-engine fallback paths, and
 // tests. Normal post-activation runtime mutations should enter through
 // `DecorationEngineCommand`.
-fn notify_pane_event_direct(
-    state: &Arc<Mutex<State>>,
-    event: &PaneEvent,
-) -> Result<(), NotifyError> {
-    let mut state = state.lock().map_err(|_| NotifyError::InvalidArgument {
-        reason: "decoration state mutex poisoned".to_string(),
-    })?;
-    apply_pane_event(&mut state, event);
-    Ok(())
+fn notify_pane_event_direct(state: &mut State, event: &PaneEvent) {
+    apply_pane_event(state, event);
 }
 
 fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> AttachInputResult {
@@ -1472,41 +1559,45 @@ fn validate_theme_extension_toml(text: &str) -> ValidationResult {
 }
 
 fn apply_theme_extension_toml(
-    state: &Arc<Mutex<State>>,
+    state: &SharedState,
     text: &str,
     config_dir_candidates: &[PathBuf],
-    script_host_access: ScriptHostAccess,
+    script_host_access: &ScriptHostAccess,
 ) -> Result<(), ValidationResult> {
-    if let Some(outcome) = send_engine_command_blocking(state, |reply| {
+    send_engine_command_blocking(state, |reply| {
         DecorationEngineCommand::ApplyThemeExtension {
             toml_text: text.to_string(),
             config_dir_candidates: config_dir_candidates.to_vec(),
             script_host_access: script_host_access.clone(),
             reply,
         }
-    }) {
-        return outcome;
-    }
-    apply_theme_extension_toml_direct(state, text, config_dir_candidates, script_host_access)
+    })
+    .unwrap_or_else(|| {
+        Err(ValidationResult::Errors {
+            errors: vec![ValidationError {
+                path: "<engine>".to_string(),
+                message: "decoration engine unavailable".to_string(),
+            }],
+        })
+    })
 }
 
 fn apply_theme_extension_toml_direct(
-    state: &Arc<Mutex<State>>,
+    shared: &SharedState,
+    state: &mut State,
     text: &str,
     config_dir_candidates: &[PathBuf],
-    script_host_access: ScriptHostAccess,
+    script_host_access: &ScriptHostAccess,
 ) -> Result<(), ValidationResult> {
     if text.trim().is_empty() {
-        if let Ok(mut state) = state.lock() {
-            state.current_theme = None;
-            state.animation_hz = None;
-            state.animation_generation = state.animation_generation.saturating_add(1);
-            notify_animation_driver(&state);
-            state.script_components.clear();
-            clear_visual_projection_state(&mut state);
-            install_script_backend(&mut state, None, ScriptHostAccess::default());
-            publish_scene_if_changed(&mut state);
-        }
+        state.current_theme = None;
+        state.animation_hz = None;
+        state.animation_generation = state.animation_generation.saturating_add(1);
+        notify_animation_driver(shared, state);
+        state.script_components.clear();
+        clear_visual_projection_state(state);
+        install_script_backend(state, None, ScriptHostAccess::default());
+        publish_scene_if_changed(state);
         return Ok(());
     }
 
@@ -1532,28 +1623,23 @@ fn apply_theme_extension_toml_direct(
         .as_ref()
         .map(|animation| animation.hz.min(MAX_ANIMATION_HZ));
     let script_access = extension.script_access.clone();
-    let mut script_host_access = script_host_access;
+    let mut script_host_access = script_host_access.clone();
     script_host_access.service_grants = script_service_grants(script_access.as_ref());
-    let mut subscription_generation = None;
-    if let Ok(mut state) = state.lock() {
-        install_script_components(
-            &mut state,
-            &extension,
-            config_dir_candidates,
-            &script_host_access,
-        );
-        state.current_theme = Some(extension);
-        clear_visual_projection_state(&mut state);
-        state.animation_hz = animation_hz;
-        state.animation_generation = state.animation_generation.saturating_add(1);
-        notify_animation_driver(&state);
-        install_script_backend(&mut state, script, script_host_access);
-        subscription_generation = Some(state.script_subscription_generation);
-        publish_scene_if_changed(&mut state);
-    }
-    if let Some(generation) = subscription_generation {
-        install_script_event_subscriptions(state, script_access, generation);
-    }
+    install_script_components(
+        state,
+        &extension,
+        config_dir_candidates,
+        &script_host_access,
+    );
+    state.current_theme = Some(extension);
+    clear_visual_projection_state(state);
+    state.animation_hz = animation_hz;
+    state.animation_generation = state.animation_generation.saturating_add(1);
+    notify_animation_driver(shared, state);
+    install_script_backend(state, script, script_host_access.clone());
+    let subscription_generation = state.script_subscription_generation;
+    publish_scene_if_changed(state);
+    install_script_event_subscriptions(shared, state, script_access, subscription_generation);
     Ok(())
 }
 
@@ -1617,26 +1703,25 @@ const MAX_SCRIPT_EVENT_QUEUE: usize = 256;
 const DEFAULT_STARTUP_READY_GATE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn install_script_event_subscriptions(
-    state: &Arc<Mutex<State>>,
+    shared: &SharedState,
+    state: &mut State,
     access: Option<bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec>,
     generation: u64,
 ) {
     let Some(access) = access else {
         return;
     };
-    if let Ok(mut guard) = state.lock() {
-        guard.script_event_subscriptions = access
-            .state_channels
-            .iter()
-            .chain(access.event_channels.iter())
-            .cloned()
-            .collect();
-    }
+    state.script_event_subscriptions = access
+        .state_channels
+        .iter()
+        .chain(access.event_channels.iter())
+        .cloned()
+        .collect();
     for kind in &access.state_channels {
-        spawn_script_state_subscription(Arc::clone(state), kind, generation);
+        spawn_script_state_subscription(shared.clone(), state, kind, generation);
     }
     for kind in &access.event_channels {
-        spawn_script_broadcast_subscription(Arc::clone(state), kind, generation);
+        spawn_script_broadcast_subscription(shared.clone(), kind, generation);
     }
 }
 
@@ -1660,7 +1745,12 @@ fn spawn_local_current_thread_runtime(
     });
 }
 
-fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generation: u64) {
+fn spawn_script_state_subscription(
+    shared: SharedState,
+    state: &mut State,
+    kind: &str,
+    generation: u64,
+) {
     let event_kind = plugin_event_kind_from_string(kind.to_string());
     let Ok((initial, mut rx)) = bmux_plugin::global_event_bus().subscribe_state_json(&event_kind)
     else {
@@ -1670,24 +1760,20 @@ fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generat
         );
         return;
     };
-    enqueue_script_json_event_direct(&state, initial.as_ref(), true, generation);
-    let host_async_handle = state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.host_async_handle.clone());
+    enqueue_script_json_event_direct(state, initial.as_ref(), true, generation);
+    let host_async_handle = shared.host_async_handle();
     let task = async move {
         while rx.changed().await.is_ok() {
             let event = rx.borrow().clone();
             if !send_engine_fire_and_forget(
-                &state,
+                &shared,
                 DecorationEngineCommand::ScriptJsonEvent {
                     event: event.as_ref().clone(),
                     snapshot: false,
                     generation,
                     reply: None,
                 },
-            ) && !enqueue_script_json_event_direct(&state, event.as_ref(), false, generation)
-            {
+            ) {
                 break;
             }
         }
@@ -1699,7 +1785,7 @@ fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generat
     }
 }
 
-fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, generation: u64) {
+fn spawn_script_broadcast_subscription(shared: SharedState, kind: &str, generation: u64) {
     let event_kind = plugin_event_kind_from_string(kind.to_string());
     let Ok(mut rx) = bmux_plugin::global_event_bus().subscribe_json(&event_kind) else {
         tracing::debug!(
@@ -1708,22 +1794,18 @@ fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, gen
         );
         return;
     };
-    let host_async_handle = state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.host_async_handle.clone());
+    let host_async_handle = shared.host_async_handle();
     let task = async move {
         while let Ok(event) = rx.recv().await {
             if !send_engine_fire_and_forget(
-                &state,
+                &shared,
                 DecorationEngineCommand::ScriptJsonEvent {
                     event: event.as_ref().clone(),
                     snapshot: false,
                     generation,
                     reply: None,
                 },
-            ) && !enqueue_script_json_event_direct(&state, event.as_ref(), false, generation)
-            {
+            ) {
                 break;
             }
         }
@@ -1737,44 +1819,37 @@ fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, gen
 
 #[cfg(test)]
 fn enqueue_script_json_event(
-    state: &Arc<Mutex<State>>,
+    state: &SharedState,
     event: &bmux_plugin::JsonPluginEvent,
     snapshot: bool,
     generation: u64,
 ) -> bool {
-    if let Some(accepted) =
-        send_engine_command_blocking(state, |reply| DecorationEngineCommand::ScriptJsonEvent {
-            event: event.clone(),
-            snapshot,
-            generation,
-            reply: Some(reply),
-        })
-    {
-        return accepted;
-    }
-    enqueue_script_json_event_direct(state, event, snapshot, generation)
+    send_engine_command_blocking(state, |reply| DecorationEngineCommand::ScriptJsonEvent {
+        event: event.clone(),
+        snapshot,
+        generation,
+        reply: Some(reply),
+    })
+    .unwrap_or(false)
 }
 
 fn enqueue_script_json_event_direct(
-    state: &Arc<Mutex<State>>,
+    state: &mut State,
     event: &bmux_plugin::JsonPluginEvent,
     snapshot: bool,
     generation: u64,
 ) -> bool {
-    let Ok(mut guard) = state.lock() else {
-        return false;
-    };
-    let has_component_backend = guard
+    let has_component_backend = state
         .script_components
         .values()
         .any(|component| component.backend.is_some());
-    if guard.script_subscription_generation != generation
-        || (guard.script_backend.is_none() && !has_component_backend)
+    if state.script_subscription_generation != generation
+        || (state.script_backend.is_none() && !has_component_backend)
     {
         return false;
     }
-    if guard.script_events.len() >= MAX_SCRIPT_EVENT_QUEUE {
-        guard.script_events.pop_front();
+    if state.script_events.len() >= MAX_SCRIPT_EVENT_QUEUE {
+        state.script_events.pop_front();
     }
     let source = event.interface.as_str().to_string();
     let delivery = match event.delivery {
@@ -1788,14 +1863,14 @@ fn enqueue_script_json_event_direct(
         payload: event.payload.clone(),
         snapshot,
     };
-    guard.script_events.push_back(event_message.clone());
-    for component in guard.script_components.values_mut() {
+    state.script_events.push_back(event_message.clone());
+    for component in state.script_components.values_mut() {
         if component.script_events.len() >= MAX_SCRIPT_EVENT_QUEUE {
             component.script_events.pop_front();
         }
         component.script_events.push_back(event_message.clone());
     }
-    publish_scene_if_changed(&mut guard);
+    publish_scene_if_changed(state);
     true
 }
 
@@ -1823,10 +1898,7 @@ impl DecorationPlugin {
     /// to the default style and core paints nothing around them.
     #[must_use]
     pub fn build_scene(&self) -> DecorationScene {
-        self.state.inner.lock().map_or_else(
-            |_| empty_scene(),
-            |mut state| scene_snapshot_from_state(&mut state),
-        )
+        self.state.read_model(|model| model.scene.clone())
     }
 }
 
@@ -2472,19 +2544,13 @@ impl RustPlugin for DecorationPlugin {
                 bmux_scene_protocol::scene_protocol::STATE_KIND,
                 empty_scene(),
             );
-        ensure_decoration_engine(&self.state.inner);
-        ensure_animation_driver(&self.state.inner);
-        let mut summary_theme_loaded = false;
-        let mut summary_script_loaded = false;
-        if let Ok(mut state) = self.state.inner.lock() {
-            summary_theme_loaded = state.current_theme.is_some();
-            summary_script_loaded = state.script_backend.is_some();
-            // Publish the initial scene so the first build_scene() call returns
-            // a non-zero revision, signalling consumers that the plugin has
-            // published at least once. Subscribers see the initial scene on
-            // their next poll.
-            publish_scene_if_changed(&mut state);
-        }
+        ensure_decoration_engine(&self.state);
+        ensure_animation_driver(&self.state);
+        let summary_theme_loaded = self.state.read_model(|model| model.current_theme.is_some());
+        let summary_script_loaded = false;
+        let _ = send_engine_command_blocking(&self.state, |reply| {
+            DecorationEngineCommand::PublishInitialScene { reply }
+        });
         tracing::debug!(
             theme_loaded = summary_theme_loaded,
             script_loaded = summary_script_loaded,
@@ -2497,13 +2563,13 @@ impl RustPlugin for DecorationPlugin {
         // initial focus event; the state-channel subscriber below
         // covers that gap with `subscribe_state` semantics (new
         // subscribers receive the current value immediately).
-        spawn_windows_pane_event_subscriber(self.state.clone_arc());
+        spawn_windows_pane_event_subscriber(self.state.clone());
         // Spawn the pane-runtime focus-state subscriber. Unlike the
         // broadcast subscriber above, this one is race-free: the
         // event bus replays the most recently published
         // `SessionFocusStateMap` to late subscribers before any live
         // updates arrive.
-        spawn_pane_runtime_focus_state_subscriber(self.state.clone_arc());
+        spawn_pane_runtime_focus_state_subscriber(self.state.clone());
         // Register the attach-layout state channel with a JSON
         // decoder so the attach runtime can relay layout snapshots
         // across the client/server boundary via
@@ -2520,8 +2586,8 @@ impl RustPlugin for DecorationPlugin {
                     revision: 0,
                 },
             );
-        spawn_attach_layout_subscriber(self.state.clone_arc());
-        spawn_visual_projection_subscriber(self.state.clone_arc());
+        spawn_attach_layout_subscriber(self.state.clone());
+        spawn_visual_projection_subscriber(self.state.clone());
         Ok(EXIT_OK)
     }
 
@@ -2530,9 +2596,7 @@ impl RustPlugin for DecorationPlugin {
         context: NativeLifecycleContext,
         async_handle: HostAsyncHandle,
     ) -> Result<i32, PluginCommandError> {
-        if let Ok(mut guard) = self.state.inner.lock() {
-            guard.host_async_handle = Some(async_handle);
-        }
+        self.state.set_host_async_handle(async_handle);
         self.activate(context)
     }
 
@@ -2541,7 +2605,7 @@ impl RustPlugin for DecorationPlugin {
         _context: TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let handle = Arc::new(DecorationServiceHandle::new(self.state.clone_arc()));
+        let handle = Arc::new(DecorationServiceHandle::new(self.state.clone()));
         let state_service: Arc<dyn DecorationStateService + Send + Sync> = handle.clone();
         let command_service: Arc<dyn DecorationCommandsService + Send + Sync> = handle;
         let _ = bmux_decoration_plugin_api::decoration_state::register_provider(
@@ -2567,46 +2631,30 @@ impl RustPlugin for DecorationPlugin {
         // `bmux_codec`-encoded payload, runs the same logic the
         // `DecorationStateService` trait methods use against the
         // shared state, and encodes the response back.
-        let state = self.state.clone_arc();
+        let state = self.state.clone();
         bmux_plugin_sdk::route_service!(context, {
             "decoration-state", "pane-decoration" => |req: PaneDecorationArgs, _ctx| {
-                let result = state
-                    .lock()
-                    .ok()
-                    .map(|s| {
-                        if let Some(p) = s.panes.get(&req.pane_id) {
-                            return p.clone();
-                        }
-                        let focused = s.activity.get(&req.pane_id).is_some_and(|a| a.focused);
-                        default_pane_decoration(req.pane_id, s.default_border, focused)
-                    });
+                let result = state.read_model(|model| Some(pane_decoration_from_read_model(model, req.pane_id)));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
             },
             "decoration-state", "default-border-style" => |_req: (), _ctx| {
-                let border = state
-                    .lock()
-                    .map_or(BorderStyle::default(), |s| s.default_border);
+                let border = state.read_model(|model| model.default_border);
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(border)
             },
             "decoration-state", "scene-snapshot" => |_req: (), _ctx| {
-                let scene = state
-                    .lock()
-                    .map_or_else(|_| empty_scene(), |mut s| scene_snapshot_from_state(&mut s));
+                let scene = state.read_model(|model| model.scene.clone());
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(scene)
             },
             "decoration-state", "pane-geometry" => |req: PaneGeometryArgs, _ctx| {
-                let geom = state
-                    .lock()
-                    .ok()
-                    .and_then(|s| geometry_for_pane(&s, req.pane_id).cloned());
+                let geom = state.read_model(|model| geometry_for_pane_read_model(model, req.pane_id));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(geom)
             },
             "decoration-state", "pane-activity" => |req: PaneActivityArgs, _ctx| {
-                let activity = state.lock().ok().and_then(|s| s.activity.get(&req.pane_id).cloned());
+                let activity = state.read_model(|model| model.activity.get(&req.pane_id).cloned());
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(activity)
             },
             "decoration-state", "current-theme-extension" => |_req: (), _ctx| {
-                let theme = state.lock().ok().and_then(|s| s.current_theme.clone());
+                let theme = state.read_model(|model| model.current_theme.clone());
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(theme)
             },
             "decoration-state", "validate-theme-extension" => |req: ValidateThemeExtensionArgs, _ctx| {
@@ -2620,7 +2668,9 @@ impl RustPlugin for DecorationPlugin {
                         reply,
                     }
                 })
-                .unwrap_or_else(|| set_pane_border_direct(&state, req.pane_id, req.border));
+                .unwrap_or_else(|| Err(SetStyleError::StyleUnsupported {
+                    style: "decoration engine unavailable".to_string(),
+                }));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-commands", "set-default-border" => |req: SetDefaultBorderArgs, _ctx| {
@@ -2630,7 +2680,9 @@ impl RustPlugin for DecorationPlugin {
                         reply,
                     }
                 })
-                .unwrap_or_else(|| set_default_border_direct(&state, req.border));
+                .unwrap_or_else(|| Err(SetStyleError::StyleUnsupported {
+                    style: "decoration engine unavailable".to_string(),
+                }));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-commands", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, ctx| {
@@ -2639,11 +2691,12 @@ impl RustPlugin for DecorationPlugin {
                     .into_iter()
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
+                let script_host_access = script_host_access_from_context(ctx);
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(apply_theme_extension_toml(
                     &state,
                     &req.toml,
                     &candidates,
-                    script_host_access_from_context(ctx),
+                    &script_host_access,
                 ))
             },
             "theme-extension", "apply" => |req: ApplyThemeExtensionArgs, ctx| {
@@ -2652,11 +2705,12 @@ impl RustPlugin for DecorationPlugin {
                     .into_iter()
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
+                let script_host_access = script_host_access_from_context(ctx);
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(apply_theme_extension_toml(
                     &state,
                     &req.toml,
                     &candidates,
-                    script_host_access_from_context(ctx),
+                    &script_host_access,
                 ))
             },
             "decoration-commands", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
@@ -2666,7 +2720,9 @@ impl RustPlugin for DecorationPlugin {
                         reply,
                     }
                 })
-                .unwrap_or_else(|| notify_pane_event_direct(&state, &req.event));
+                .unwrap_or_else(|| Err(NotifyError::InvalidArgument {
+                    reason: "decoration engine unavailable".to_string(),
+                }));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-input-hooks", "handle-input" => |req: AttachInputEvent, _ctx| {
@@ -2676,12 +2732,7 @@ impl RustPlugin for DecorationPlugin {
                         reply,
                     }
                 })
-                .unwrap_or_else(|| {
-                    state.lock().map_or_else(
-                        |_| AttachInputResult::default(),
-                        |mut state| handle_attach_input_event(&mut state, req),
-                    )
-                });
+                .unwrap_or_default();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
             },
         })
@@ -2965,7 +3016,7 @@ fn script_source_hash(path: &std::path::Path, source: &str) -> u64 {
 /// Silently no-ops when the bus channel hasn't been registered yet
 /// (e.g. the windows plugin is not loaded, or activates later than
 /// the decoration plugin — the bus does not buffer missed events).
-fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
+fn spawn_windows_pane_event_subscriber(state: SharedState) {
     // The bus channel is registered by the windows plugin's
     // `activate()` via `global_event_bus().register_channel::<PaneEvent>(...)`.
     // We tolerate "channel not registered yet" by just bailing out;
@@ -2978,10 +3029,7 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
     ) else {
         return;
     };
-    let host_async_handle = state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.host_async_handle.clone());
+    let host_async_handle = state.host_async_handle();
     let task = async move {
         while let Ok(event) = rx.recv().await {
             let event = translate_windows_event(&event);
@@ -2989,10 +3037,7 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
                 &state,
                 DecorationEngineCommand::PaneEvent(event.clone()),
             ) {
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_pane_event(&mut guard, &event);
+                break;
             }
         }
     };
@@ -3021,7 +3066,7 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
 /// known pane gets `focused = false`. Scene publication runs when the
 /// snapshot changes so downstream consumers (attach renderer) pick up
 /// the change.
-fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
+fn spawn_pane_runtime_focus_state_subscriber(state: SharedState) {
     let subscribe_result = bmux_plugin::global_event_bus()
         .subscribe_state::<bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap>(
         &bmux_pane_runtime_plugin_api::pane_runtime_focus::STATE_KIND,
@@ -3043,17 +3088,11 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
         revision = initial.revision,
         "focus-state initial applied"
     );
-    if !send_engine_fire_and_forget(
+    let _ = send_engine_fire_and_forget(
         &state,
         DecorationEngineCommand::FocusSnapshot(initial.as_ref().clone()),
-    ) && let Ok(mut guard) = state.lock()
-    {
-        apply_focus_state_map(&mut guard, initial.as_ref());
-    }
-    let host_async_handle = state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.host_async_handle.clone());
+    );
+    let host_async_handle = state.host_async_handle();
     let task = async move {
         while rx.changed().await.is_ok() {
             let snapshot = rx.borrow().clone();
@@ -3066,10 +3105,7 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
                 &state,
                 DecorationEngineCommand::FocusSnapshot(snapshot.as_ref().clone()),
             ) {
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_focus_state_map(&mut guard, snapshot.as_ref());
+                break;
             }
         }
         tracing::debug!("focus-state subscriber loop exited");
@@ -3140,7 +3176,7 @@ fn apply_focus_state_map(
 /// `PaneGeometry` for every pane-backed surface and drop any panes
 /// that disappeared from the new snapshot. Publishing after a change lets
 /// subscribers pick up the updated paint commands on the next frame.
-fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
+fn spawn_attach_layout_subscriber(state: SharedState) {
     let subscribe_result = bmux_plugin::global_event_bus()
         .subscribe_state::<
             bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
@@ -3157,17 +3193,11 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
             return;
         }
     };
-    if !send_engine_fire_and_forget(
+    let _ = send_engine_fire_and_forget(
         &state,
         DecorationEngineCommand::AttachLayoutSnapshot(initial.as_ref().clone()),
-    ) && let Ok(mut guard) = state.lock()
-    {
-        apply_attach_layout_snapshot(&mut guard, initial.as_ref());
-    }
-    let host_async_handle = state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.host_async_handle.clone());
+    );
+    let host_async_handle = state.host_async_handle();
     let task = async move {
         while rx.changed().await.is_ok() {
             let snapshot = rx.borrow().clone();
@@ -3180,10 +3210,7 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
                 &state,
                 DecorationEngineCommand::AttachLayoutSnapshot(snapshot.as_ref().clone()),
             ) {
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_attach_layout_snapshot(&mut guard, snapshot.as_ref());
+                break;
             }
         }
         tracing::debug!("attach-layout subscriber loop exited");
@@ -3314,7 +3341,7 @@ fn read_visual_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, bmux_plugin::Ev
     })?))
 }
 
-fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
+fn spawn_visual_projection_subscriber(state: SharedState) {
     let event_kind = plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string());
     let _ = bmux_plugin::global_event_bus().register_state_channel_with_bytes_decoder(
         event_kind.clone(),
@@ -3330,17 +3357,11 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
         );
         return;
     };
-    if !send_engine_fire_and_forget(
+    let _ = send_engine_fire_and_forget(
         &state,
         DecorationEngineCommand::VisualProjection(initial.as_ref().clone()),
-    ) && let Ok(mut guard) = state.lock()
-    {
-        apply_visual_projection_batch(&mut guard, initial.as_ref());
-    }
-    let host_async_handle = state
-        .lock()
-        .ok()
-        .and_then(|guard| guard.host_async_handle.clone());
+    );
+    let host_async_handle = state.host_async_handle();
     let task = async move {
         while rx.changed().await.is_ok() {
             let snapshot = rx.borrow().clone();
@@ -3348,10 +3369,7 @@ fn spawn_visual_projection_subscriber(state: Arc<Mutex<State>>) {
                 &state,
                 DecorationEngineCommand::VisualProjection(snapshot.as_ref().clone()),
             ) {
-                let Ok(mut guard) = state.lock() else {
-                    break;
-                };
-                apply_visual_projection_batch(&mut guard, snapshot.as_ref());
+                break;
             }
         }
     };
@@ -3723,7 +3741,7 @@ mod tests {
     #[test]
     fn new_plugin_has_ascii_default_border() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let style = block_on(handle.default_border_style());
         assert_eq!(style, BorderStyle::Ascii);
     }
@@ -3736,7 +3754,7 @@ mod tests {
     #[test]
     fn query_unknown_pane_returns_default_style() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let decoration = block_on(handle.pane_decoration(Uuid::nil()))
             .expect("default decoration always present");
         assert_eq!(decoration.border, BorderStyle::Ascii);
@@ -3747,7 +3765,7 @@ mod tests {
     #[test]
     fn set_pane_border_persists_override() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(7);
         let res = block_on(handle.set_pane_border(pane, BorderStyle::Double));
         assert!(res.is_ok());
@@ -3758,7 +3776,7 @@ mod tests {
     #[test]
     fn set_default_border_changes_global_default() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let res = block_on(handle.set_default_border(BorderStyle::None));
         assert!(res.is_ok());
         let default = block_on(handle.default_border_style());
@@ -3830,40 +3848,42 @@ mod tests {
         let plugin = DecorationPlugin::new();
         let pane = Uuid::from_u128(0xa12);
         seed_geometry(&plugin, pane, 12, 5);
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(|state| {
             state.script_backend = Some(Box::new(TestScriptBackend));
-            publish_scene_if_changed(&mut state);
+            publish_scene_if_changed(state);
             assert_eq!(state.script_frame, 1);
-        }
+        });
 
         let first = plugin.build_scene();
         let second = plugin.build_scene();
 
         assert_eq!(first, second);
-        let state = plugin.state.inner.lock().expect("lock");
-        assert_eq!(
-            state.script_frame, 1,
-            "cached reads must be side-effect free"
-        );
+        let script_frame = plugin.state.with_state(|state| state.script_frame);
+        assert_eq!(script_frame, 1, "cached reads must be side-effect free");
     }
 
     #[test]
     fn direct_noop_style_mutations_do_not_publish_new_revision() {
-        let plugin = DecorationPlugin::new();
-        let state = plugin.state.clone_arc();
-        set_default_border_direct(&state, BorderStyle::Single).expect("set default");
-        let first_revision = plugin.build_scene().revision;
+        let mut state = State::default();
+        set_default_border_direct(&mut state, BorderStyle::Single);
+        let first_revision = state.scene_revision;
 
-        set_default_border_direct(&state, BorderStyle::Single).expect("set default noop");
-        assert_eq!(plugin.build_scene().revision, first_revision);
+        set_default_border_direct(&mut state, BorderStyle::Single);
+        assert_eq!(state.scene_revision, first_revision);
 
         let pane = Uuid::from_u128(0xa13);
-        seed_geometry(&plugin, pane, 12, 5);
-        set_pane_border_direct(&state, pane, BorderStyle::Double).expect("set pane");
-        let second_revision = plugin.build_scene().revision;
-        set_pane_border_direct(&state, pane, BorderStyle::Double).expect("set pane noop");
-        assert_eq!(plugin.build_scene().revision, second_revision);
+        state.geometry.insert(
+            pane,
+            PaneGeometry {
+                pane_id: pane,
+                rect: rect(0, 0, 12, 5),
+                content_rect: rect(1, 1, 10, 3),
+            },
+        );
+        set_pane_border_direct(&mut state, pane, BorderStyle::Double);
+        let second_revision = state.scene_revision;
+        set_pane_border_direct(&mut state, pane, BorderStyle::Double);
+        assert_eq!(state.scene_revision, second_revision);
     }
 
     // Helpers shared by the new theme-aware build-scene tests below.
@@ -3871,7 +3891,7 @@ mod tests {
     // each test exercise `build_scene` without routing through the
     // full IPC path.
     fn seed_geometry(plugin: &DecorationPlugin, pane: Uuid, w: u16, h: u16) {
-        if let Ok(mut state) = plugin.state.inner.lock() {
+        plugin.state.with_state(move |state| {
             state.geometry.insert(
                 pane,
                 PaneGeometry {
@@ -3885,11 +3905,11 @@ mod tests {
                     },
                 },
             );
-        }
+        });
     }
 
     fn set_activity(plugin: &DecorationPlugin, pane: Uuid, focused: bool, zoomed: bool) {
-        if let Ok(mut state) = plugin.state.inner.lock() {
+        plugin.state.with_state(move |state| {
             let entry = state.activity.entry(pane).or_insert(PaneActivity {
                 pane_id: pane,
                 focused: false,
@@ -3898,7 +3918,7 @@ mod tests {
             });
             entry.focused = focused;
             entry.zoomed = zoomed;
-        }
+        });
     }
 
     fn sample_theme() -> DecorationThemeExtension {
@@ -3943,9 +3963,9 @@ mod tests {
     }
 
     fn install_theme(plugin: &DecorationPlugin, theme: DecorationThemeExtension) {
-        if let Ok(mut state) = plugin.state.inner.lock() {
+        plugin.state.with_state(move |state| {
             state.current_theme = Some(theme);
-        }
+        });
     }
 
     fn decoration_extension_from_theme(theme: &str) -> DecorationThemeExtension {
@@ -4021,25 +4041,28 @@ mod tests {
                 json!({ "value": 42 }),
             );
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let generation = {
-            let mut state = plugin.state.inner.lock().expect("lock");
-            state.script_backend = Some(Box::new(RecordingScriptBackend {
-                seen: Arc::clone(&seen),
-            }));
-            state.script_subscription_generation = 7;
-            state.script_subscription_generation
-        };
-        install_script_event_subscriptions(
-            &plugin.state.clone_arc(),
-            Some(
-                bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec {
-                    state_channels: vec![kind.clone()],
-                    event_channels: Vec::new(),
-                    services: Vec::new(),
-                },
-            ),
-            generation,
-        );
+        let shared = plugin.state.clone();
+        let kind_for_subscription = kind.clone();
+        plugin.state.with_state({
+            let seen = Arc::clone(&seen);
+            move |state| {
+                state.script_backend = Some(Box::new(RecordingScriptBackend { seen }));
+                state.script_subscription_generation = 7;
+                let generation = state.script_subscription_generation;
+                install_script_event_subscriptions(
+                    &shared,
+                    state,
+                    Some(
+                        bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec {
+                            state_channels: vec![kind_for_subscription.clone()],
+                            event_channels: Vec::new(),
+                            services: Vec::new(),
+                        },
+                    ),
+                    generation,
+                );
+            }
+        });
         let seen = seen.lock().expect("seen lock");
         let event = seen
             .iter()
@@ -4059,20 +4082,21 @@ mod tests {
         let plugin = DecorationPlugin::new();
         let kind =
             plugin_event_kind_from_string(format!("test.decoration/stale-{}", Uuid::new_v4()));
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(|state| {
             state.script_backend = Some(Box::new(TestScriptBackend));
             state.script_subscription_generation = 2;
-        }
+        });
         let event = bmux_plugin::JsonPluginEvent {
             interface: kind,
             delivery: bmux_plugin::DeliveryMode::State,
             payload: json!({ "value": "stale" }),
         };
-        let accepted = enqueue_script_json_event(&plugin.state.inner, &event, false, 1);
+        let accepted = enqueue_script_json_event(&plugin.state, &event, false, 1);
         assert!(!accepted, "stale subscription generation must stop");
-        let state = plugin.state.inner.lock().expect("lock");
-        assert!(state.script_events.is_empty());
+        let script_events_empty = plugin
+            .state
+            .with_state(|state| state.script_events.is_empty());
+        assert!(script_events_empty);
     }
 
     fn install_extension_with_script(
@@ -4083,11 +4107,12 @@ mod tests {
             .script
             .as_deref()
             .and_then(|spec| resolve_decoration_script(&[], spec));
-        let mut state = plugin.state.inner.lock().expect("lock");
-        state.animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
-        install_script_components(&mut state, &extension, &[], &ScriptHostAccess::default());
-        state.current_theme = Some(extension);
-        install_script_backend(&mut state, script, ScriptHostAccess::default());
+        plugin.state.with_state(move |state| {
+            state.animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
+            install_script_components(state, &extension, &[], &ScriptHostAccess::default());
+            state.current_theme = Some(extension);
+            install_script_backend(state, script, ScriptHostAccess::default());
+        });
     }
 
     fn box_border_of(scene: &DecorationScene, pane: &Uuid) -> PaintCommand {
@@ -4212,7 +4237,7 @@ mod tests {
     #[test]
     fn build_scene_override_wins_over_theme() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(0xa6);
         seed_geometry(&plugin, pane, 20, 5);
         set_activity(&plugin, pane, false, false);
@@ -4324,14 +4349,14 @@ mod tests {
     #[test]
     fn setting_pane_border_publishes_scene() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(42);
         // Seed geometry first — `build_scene` now uses `state.geometry`
         // as the authoritative set of visible panes. Setting an
         // override via `set-pane-border` only affects paint-command
         // selection for panes that also have geometry reported to the
         // plugin.
-        if let Ok(mut state) = plugin.state.inner.lock() {
+        plugin.state.with_state(move |state| {
             state.geometry.insert(
                 pane,
                 PaneGeometry {
@@ -4350,7 +4375,7 @@ mod tests {
                     },
                 },
             );
-        }
+        });
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
         let scene = plugin.build_scene();
         assert!(scene.revision >= 1);
@@ -4362,9 +4387,9 @@ mod tests {
         let plugin = DecorationPlugin::new();
         let before = plugin.build_scene().revision;
         assert_eq!(before, 0);
-        if let Ok(mut state) = plugin.state.inner.lock() {
-            publish_scene_if_changed(&mut state);
-        }
+        let _ = send_engine_command_blocking(&plugin.state, |reply| {
+            DecorationEngineCommand::PublishInitialScene { reply }
+        });
         let after = plugin.build_scene().revision;
         assert!(after > before);
     }
@@ -4477,13 +4502,12 @@ mod tests {
             }],
             revision: 1,
         };
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &snapshot);
-        }
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &snapshot);
+        });
         let after = plugin.build_scene().revision;
         assert!(after > before);
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let geom = block_on(handle.pane_geometry(pane)).expect("geometry cached");
         assert_eq!(geom.rect, rect(0, 0, 20, 5));
         assert_eq!(geom.content_rect, rect(1, 1, 18, 3));
@@ -4506,15 +4530,14 @@ mod tests {
             }],
             revision: 1,
         };
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &snapshot);
-        }
+        let snapshot_for_first = snapshot.clone();
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &snapshot_for_first);
+        });
         let r1 = plugin.build_scene().revision;
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &snapshot);
-        }
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &snapshot);
+        });
         let r2 = plugin.build_scene().revision;
         assert_eq!(r1, r2, "unchanged geometry must not publish a new revision");
     }
@@ -4522,7 +4545,7 @@ mod tests {
     #[test]
     fn pane_event_focused_updates_activity_and_override() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(200);
         // Pre-populate an override so we can verify the focus mirror.
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
@@ -4536,7 +4559,7 @@ mod tests {
     #[test]
     fn pane_event_focused_unfocuses_other_panes() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let a = Uuid::from_u128(301);
         let b = Uuid::from_u128(302);
         block_on(handle.notify_pane_event(PaneEvent::Focused { pane_id: a })).expect("a");
@@ -4553,7 +4576,7 @@ mod tests {
     #[test]
     fn pane_event_zoomed_sets_zoom_flag() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(400);
         block_on(handle.notify_pane_event(PaneEvent::Zoomed { pane_id: pane })).expect("zoom");
         let a = block_on(handle.pane_activity(pane)).expect("cached");
@@ -4566,7 +4589,7 @@ mod tests {
     #[test]
     fn pane_event_status_changed_sets_lifecycle() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(500);
         block_on(handle.notify_pane_event(PaneEvent::StatusChanged {
             pane_id: pane,
@@ -4583,7 +4606,7 @@ mod tests {
             AttachLayoutSnapshot, AttachSurfaceSummary,
         };
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(600);
         block_on(handle.set_pane_border(pane, BorderStyle::Double)).expect("set");
         let snapshot = AttachLayoutSnapshot {
@@ -4596,10 +4619,10 @@ mod tests {
             }],
             revision: 1,
         };
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &snapshot);
-        }
+        let snapshot_for_apply = snapshot.clone();
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &snapshot_for_apply);
+        });
         block_on(handle.notify_pane_event(PaneEvent::Focused { pane_id: pane })).expect("focus");
         // Empty snapshot — pane disappears from the attach layout and
         // the decoration plugin drops all state for it.
@@ -4607,10 +4630,9 @@ mod tests {
             surfaces: Vec::new(),
             revision: 2,
         };
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &empty);
-        }
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &empty);
+        });
         assert!(block_on(handle.pane_geometry(pane)).is_none());
         assert!(block_on(handle.pane_activity(pane)).is_none());
         let deco = block_on(handle.pane_decoration(pane)).expect("default");
@@ -4635,10 +4657,9 @@ mod tests {
             }],
             revision: 1,
         };
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &snapshot);
-        }
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &snapshot);
+        });
         let scene = plugin.build_scene();
         assert!(!scene.surfaces.contains_key(&pane));
         let surface = scene
@@ -4662,7 +4683,7 @@ mod tests {
             AttachLayoutSnapshot, AttachSurfaceSummary,
         };
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(700);
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
         let snapshot = AttachLayoutSnapshot {
@@ -4675,10 +4696,9 @@ mod tests {
             }],
             revision: 1,
         };
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
-            apply_attach_layout_snapshot(&mut state, &snapshot);
-        }
+        plugin.state.with_state(move |state| {
+            apply_attach_layout_snapshot(state, &snapshot);
+        });
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface present");
         assert_eq!(surface.rect, rect(2, 3, 20, 5));
@@ -4707,12 +4727,11 @@ mod tests {
         );
 
         let plugin = DecorationPlugin::new();
-        spawn_windows_pane_event_subscriber(plugin.state.clone_arc());
+        spawn_windows_pane_event_subscriber(plugin.state.clone());
         let pane = Uuid::from_u128(701);
-        {
-            let mut state = plugin.state.inner.lock().expect("state");
+        plugin.state.with_state(move |state| {
             apply_attach_layout_snapshot(
-                &mut state,
+                state,
                 &AttachLayoutSnapshot {
                     surfaces: vec![AttachSurfaceSummary {
                         surface_id: pane,
@@ -4724,7 +4743,7 @@ mod tests {
                     revision: 1,
                 },
             );
-        }
+        });
 
         bus.emit(
             &bmux_windows_plugin_api::windows_events::EVENT_KIND,
@@ -4784,7 +4803,7 @@ mod tests {
             .expect("subscribe");
 
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(900);
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
 
@@ -4856,7 +4875,7 @@ mod tests {
     #[test]
     fn current_theme_extension_returns_none_on_fresh_plugin() {
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
         assert!(block_on(handle.current_theme_extension()).is_none());
     }
 
@@ -4939,34 +4958,30 @@ exited = ""
 
     #[test]
     fn install_script_backend_compiles_and_stores_backend() {
-        let plugin = DecorationPlugin::new();
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
-            install_script_backend(
-                &mut state,
-                Some(ResolvedScript {
-                    path: PathBuf::from("bundled:test"),
-                    source: "function decorate(message) return {} end".into(),
-                }),
-                ScriptHostAccess::default(),
-            );
-            assert!(
-                state.script_backend.is_some(),
-                "backend must be installed after a successful compile"
-            );
-            assert_eq!(
-                state.script_path.as_deref(),
-                Some(Path::new("bundled:test"))
-            );
-            assert!(state.script_started_at.is_some());
-            assert!(state.script_source_hash.is_some());
-        }
+        let mut state = State::default();
+        install_script_backend(
+            &mut state,
+            Some(ResolvedScript {
+                path: PathBuf::from("bundled:test"),
+                source: "function decorate(message) return {} end".into(),
+            }),
+            ScriptHostAccess::default(),
+        );
+        assert!(
+            state.script_backend.is_some(),
+            "backend must be installed after a successful compile"
+        );
+        assert_eq!(
+            state.script_path.as_deref(),
+            Some(Path::new("bundled:test"))
+        );
+        assert!(state.script_started_at.is_some());
+        assert!(state.script_source_hash.is_some());
     }
 
     #[test]
     fn install_script_backend_preserves_identical_script_backend() {
-        let plugin = DecorationPlugin::new();
-        let mut state = plugin.state.inner.lock().expect("lock");
+        let mut state = State::default();
         let script = ResolvedScript {
             path: PathBuf::from("bundled:test"),
             source: "function decorate(message) return {} end".into(),
@@ -4993,8 +5008,7 @@ exited = ""
 
     #[test]
     fn install_script_backend_discards_on_compile_failure() {
-        let plugin = DecorationPlugin::new();
-        let mut state = plugin.state.inner.lock().expect("lock");
+        let mut state = State::default();
         install_script_backend(
             &mut state,
             Some(ResolvedScript {
@@ -5013,10 +5027,9 @@ exited = ""
     fn build_scene_merges_script_paint_commands_for_known_geometry() {
         let plugin = DecorationPlugin::new();
         let pane = Uuid::from_u128(777);
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(move |state| {
             install_script_backend(
-                &mut state,
+                state,
                 Some(ResolvedScript {
                     path: PathBuf::from("bundled:test"),
                     source: r#"
@@ -5062,7 +5075,8 @@ exited = ""
                     },
                 },
             );
-        }
+            publish_scene_if_changed(state);
+        });
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
         let text_cmd = surface
@@ -5140,14 +5154,13 @@ exited = ""
         let extension = decoration_extension_from_theme(theme);
         install_extension_with_script(&plugin, extension);
 
-        {
-            let state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(|state| {
             assert!(state.script_backend.is_some(), "script backend installed");
             assert_eq!(
                 state.script_path.as_deref(),
                 Some(Path::new("bundled:pulse"))
             );
-        }
+        });
 
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
@@ -5168,8 +5181,7 @@ exited = ""
         let extension = decoration_extension_from_theme(theme);
         install_extension_with_script(&plugin, extension);
 
-        {
-            let state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(|state| {
             let component = state
                 .script_components
                 .get("snake")
@@ -5179,7 +5191,7 @@ exited = ""
                 component.script_path.as_deref(),
                 Some(Path::new("bundled:rainbow_snake")),
             );
-        }
+        });
 
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
@@ -5236,8 +5248,7 @@ exited = ""
         let extension = decoration_extension_from_theme(theme);
         install_extension_with_script(&plugin, extension);
 
-        {
-            let state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(|state| {
             for id in ["pong.ball", "pong.paddles", "pong.score"] {
                 let component = state
                     .script_components
@@ -5267,7 +5278,7 @@ exited = ""
                 .expect("score backend");
             assert!(Arc::ptr_eq(ball, paddles));
             assert!(Arc::ptr_eq(ball, score));
-        }
+        });
 
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
@@ -5342,16 +5353,16 @@ exited = ""
         write_component_test_script(&config_dir, "border", "B");
         write_component_test_script(&config_dir, "snake", "S");
         write_component_test_script(&config_dir, "header", "H");
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(move |state| {
             install_script_components(
-                &mut state,
+                state,
                 &extension,
                 std::slice::from_ref(&config_dir),
                 &ScriptHostAccess::default(),
             );
             state.current_theme = Some(extension);
-        }
+            publish_scene_if_changed(state);
+        });
 
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
@@ -5418,16 +5429,16 @@ exited = ""
         std::fs::create_dir_all(config_dir.join("decorations")).expect("mkdir decorations");
         write_component_test_script(&config_dir, "ball", "B");
         write_component_test_script(&config_dir, "score", "S");
-        {
-            let mut state = plugin.state.inner.lock().expect("lock");
+        plugin.state.with_state(move |state| {
             install_script_components(
-                &mut state,
+                state,
                 &extension,
                 std::slice::from_ref(&config_dir),
                 &ScriptHostAccess::default(),
             );
             state.current_theme = Some(extension);
-        }
+            publish_scene_if_changed(state);
+        });
 
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
@@ -5476,13 +5487,13 @@ exited = ""
     #[test]
     fn animation_driver_policy_notification_updates_existing_driver() {
         let plugin = DecorationPlugin::new();
-        let mut state = plugin.state.inner.lock().expect("lock");
+        let mut state = State::default();
         let (tx, rx) = tokio::sync::watch::channel(animation_driver_policy(&state));
-        state.animation_driver_tx = Some(tx);
+        assert!(plugin.state.set_animation_driver_tx(tx));
         state.animation_hz = Some(12);
         state.animation_generation = 7;
 
-        notify_animation_driver(&state);
+        notify_animation_driver(&plugin.state, &state);
 
         assert_eq!(
             *rx.borrow(),
@@ -5495,11 +5506,12 @@ exited = ""
 
     #[test]
     fn stale_same_hz_animation_policy_does_not_publish_scene_if_changed() {
-        let plugin = DecorationPlugin::new();
-        let mut state = plugin.state.inner.lock().expect("lock");
-        state.animation_hz = Some(100);
-        state.animation_generation = 2;
-        state.script_backend = Some(Box::new(TestScriptBackend));
+        let mut state = State {
+            animation_hz: Some(100),
+            animation_generation: 2,
+            script_backend: Some(Box::new(TestScriptBackend)),
+            ..State::default()
+        };
 
         assert!(!run_animation_tick_if_current(
             &mut state,
@@ -5516,8 +5528,7 @@ exited = ""
 
     #[test]
     fn script_backend_not_installed_when_theme_has_no_script() {
-        let plugin = DecorationPlugin::new();
-        let mut state = plugin.state.inner.lock().expect("lock");
+        let mut state = State::default();
         install_script_backend(&mut state, None, ScriptHostAccess::default());
         assert!(
             state.script_backend.is_none(),
@@ -5527,8 +5538,7 @@ exited = ""
 
     #[test]
     fn install_script_backend_none_clears_existing_backend() {
-        let plugin = DecorationPlugin::new();
-        let mut state = plugin.state.inner.lock().expect("lock");
+        let mut state = State::default();
         install_script_backend(
             &mut state,
             Some(ResolvedScript {
