@@ -152,11 +152,16 @@ impl RustPlugin for PermissionsPlugin {
                 Ok(entries)
             },
             "permissions-commands", "grant" => |req: GrantRequest, ctx| {
-                grant_entry(ctx, req).map_err(|e| ServiceResponse::error("grant_failed", e))?;
+                let mutation = grant_entry(ctx, req)
+                    .map_err(|e| ServiceResponse::error("grant_failed", e))?;
+                apply_permission_cache_mutation(ctx, &mutation)
+                    .map_err(|e| ServiceResponse::error("grant_failed", e))?;
                 Ok(CommandAck { ok: true })
             },
             "permissions-commands", "revoke" => |req: RevokeRequest, ctx| {
-                revoke_entry(ctx, &req)
+                let mutation = revoke_entry(ctx, &req)
+                    .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
+                apply_permission_cache_mutation(ctx, &mutation)
                     .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
                 Ok(CommandAck { ok: true })
             },
@@ -246,7 +251,8 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 client_id: required_option_value(&context.arguments, "client")?,
                 role: required_option_value(&context.arguments, "role")?,
             };
-            grant_entry(context, request)?;
+            let mutation = grant_entry(context, request)?;
+            apply_permission_cache_mutation(context, &mutation)?;
             if emit_to_stdout {
                 println!("granted permission");
             }
@@ -257,7 +263,8 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 session: required_option_value(&context.arguments, "session")?,
                 client_id: required_option_value(&context.arguments, "client")?,
             };
-            revoke_entry(context, &request)?;
+            let mutation = revoke_entry(context, &request)?;
+            apply_permission_cache_mutation(context, &mutation)?;
             if emit_to_stdout {
                 println!("revoked permission");
             }
@@ -416,41 +423,78 @@ fn list_entries(
         .unwrap_or_default())
 }
 
-fn grant_entry(caller: &(impl HostRuntimeApi + Sync), request: GrantRequest) -> Result<(), String> {
+#[derive(Debug, Clone, Copy)]
+struct PermissionCacheUpdate {
+    session_id: Uuid,
+    client_id: Uuid,
+    allowed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PermissionMutation {
+    cache_update: PermissionCacheUpdate,
+    rollback_state: StoredPermissions,
+}
+
+fn parse_client_id(client_id: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(client_id).map_err(|_| "client-id must be a UUID".to_string())
+}
+
+fn grant_entry(
+    caller: &(impl HostRuntimeApi + Sync),
+    request: GrantRequest,
+) -> Result<PermissionMutation, String> {
     validate_role(&request.role)?;
     let session_id = resolve_session_id(caller, &request.session)?;
-    let mut state = load_state(caller)?;
-    let entries = state.by_session_id.entry(session_id).or_default();
+    let client_id = parse_client_id(&request.client_id)?;
+    let normalized_client_id = client_id.to_string();
     let allowed = evaluate_role_action(&request.role, "pane.direct_input").allowed;
-    let client_id = request.client_id.clone();
+    let mut state = load_state(caller)?;
+    let rollback_state = state.clone();
+    let entries = state.by_session_id.entry(session_id).or_default();
     if let Some(entry) = entries
         .iter_mut()
-        .find(|entry| entry.client_id == request.client_id)
+        .find(|entry| entry.client_id == normalized_client_id)
     {
         entry.role = request.role;
     } else {
         entries.push(PermissionEntry {
-            client_id: request.client_id,
+            client_id: normalized_client_id,
             role: request.role,
         });
     }
     save_state(caller, &state)?;
-    sync_pane_runtime_write_permission(caller, session_id, &client_id, allowed);
-    Ok(())
+    Ok(PermissionMutation {
+        cache_update: PermissionCacheUpdate {
+            session_id,
+            client_id,
+            allowed,
+        },
+        rollback_state,
+    })
 }
 
 fn revoke_entry(
     caller: &(impl HostRuntimeApi + Sync),
     request: &RevokeRequest,
-) -> Result<(), String> {
+) -> Result<PermissionMutation, String> {
     let session_id = resolve_session_id(caller, &request.session)?;
+    let client_id = parse_client_id(&request.client_id)?;
+    let normalized_client_id = client_id.to_string();
     let mut state = load_state(caller)?;
+    let rollback_state = state.clone();
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
-        entries.retain(|entry| entry.client_id != request.client_id);
+        entries.retain(|entry| entry.client_id != normalized_client_id);
     }
     save_state(caller, &state)?;
-    sync_pane_runtime_write_permission(caller, session_id, &request.client_id, true);
-    Ok(())
+    Ok(PermissionMutation {
+        cache_update: PermissionCacheUpdate {
+            session_id,
+            client_id,
+            allowed: true,
+        },
+        rollback_state,
+    })
 }
 
 fn evaluate_policy(
@@ -991,27 +1035,45 @@ struct SetClientWritePermissionRequest {
 
 fn sync_pane_runtime_write_permission(
     caller: &(impl HostRuntimeApi + Sync),
-    session_id: Uuid,
-    client_id: &str,
-    allowed: bool,
-) {
-    let Ok(client_id) = Uuid::parse_str(client_id) else {
-        return;
-    };
+    update: &PermissionCacheUpdate,
+) -> Result<(), String> {
     let request = SetClientWritePermissionRequest {
-        session_id,
-        client_id,
-        allowed,
+        session_id: update.session_id,
+        client_id: update.client_id,
+        allowed: update.allowed,
     };
-    match caller.call_service::<_, u8>(
-        PANE_RUNTIME_WRITE.as_str(),
-        ServiceKind::Command,
-        pane_runtime_commands::INTERFACE_ID.as_str(),
-        "set-client-write-permission",
-        &request,
-    ) {
-        Ok(_) | Err(_) => {}
+    caller
+        .call_service::<_, u8>(
+            PANE_RUNTIME_WRITE.as_str(),
+            ServiceKind::Command,
+            pane_runtime_commands::INTERFACE_ID.as_str(),
+            "set-client-write-permission",
+            &request,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "failed syncing pane-runtime write permission cache for session {} client {} allowed={}: {error}",
+                update.session_id, update.client_id, update.allowed
+            )
+        })
+}
+
+fn apply_permission_cache_mutation(
+    caller: &(impl HostRuntimeApi + Sync),
+    mutation: &PermissionMutation,
+) -> Result<(), String> {
+    if let Err(error) = sync_pane_runtime_write_permission(caller, &mutation.cache_update) {
+        return match save_state(caller, &mutation.rollback_state) {
+            Ok(()) => Err(format!(
+                "{error}; rolled back stored permissions to avoid stale direct-input authorization"
+            )),
+            Err(rollback_error) => Err(format!(
+                "{error}; additionally failed rolling back stored permissions: {rollback_error}"
+            )),
+        };
     }
+    Ok(())
 }
 
 fn resolve_session_id(
@@ -1095,12 +1157,15 @@ bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"
 mod tests {
     use super::*;
     use bmux_plugin::ServiceCaller;
+    use bmux_plugin::test_support::{
+        TestServiceRouter, TestServiceRouterGuard, install_test_service_router,
+    };
     use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
         NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
     };
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct MockHost {
         sessions: Vec<SessionSummary>,
@@ -1300,6 +1365,50 @@ mod tests {
         Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa)
     }
 
+    // Test router signature is fixed by bmux_plugin::test_support and returns
+    // bmux_plugin_sdk::Result, whose PluginError is intentionally rich.
+    #[allow(clippy::result_large_err)]
+    fn install_service_test_router() -> TestServiceRouterGuard {
+        let storage = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+        let router_storage = Arc::clone(&storage);
+        let router: TestServiceRouter = Arc::new(
+            move |_caller_plugin,
+                  _caller_client,
+                  _capability,
+                  _kind,
+                  interface_id,
+                  operation,
+                  payload| {
+                match (interface_id, operation) {
+                    ("storage-query/v1", "get") => {
+                        let request: StorageGetRequest = decode_service_message(&payload)?;
+                        let value = router_storage
+                            .lock()
+                            .expect("storage lock should succeed")
+                            .get(request.key.as_str())
+                            .cloned();
+                        encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
+                    }
+                    ("storage-command/v1", "set") => {
+                        let request: StorageSetRequest = decode_service_message(&payload)?;
+                        router_storage
+                            .lock()
+                            .expect("storage lock should succeed")
+                            .insert(request.key.to_string(), request.value);
+                        encode_service_message(&())
+                    }
+                    ("pane-runtime-commands", "set-client-write-permission") => {
+                        encode_service_message(&0_u8)
+                    }
+                    _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "test_router",
+                    }),
+                }
+            },
+        );
+        install_test_service_router(router)
+    }
+
     fn service_test_context(
         interface_id: &str,
         operation: &str,
@@ -1339,6 +1448,13 @@ mod tests {
                 interface_id: "storage-command/v1".to_string(),
                 provider: ProviderId::Host,
             },
+            RegisteredService {
+                capability: HostScope::new("bmux.pane_runtime.write")
+                    .expect("capability should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "pane-runtime-commands".to_string(),
+                provider: ProviderId::Plugin("bmux.pane-runtime".to_string()),
+            },
         ];
 
         NativeServiceContext {
@@ -1358,6 +1474,7 @@ mod tests {
                 "bmux.commands".to_string(),
                 "bmux.sessions.read".to_string(),
                 "bmux.clients.read".to_string(),
+                "bmux.pane_runtime.write".to_string(),
                 "bmux.storage".to_string(),
             ],
             provided_capabilities: vec![
@@ -1369,6 +1486,7 @@ mod tests {
             available_capabilities: vec![
                 "bmux.sessions.read".to_string(),
                 "bmux.clients.read".to_string(),
+                "bmux.pane_runtime.write".to_string(),
                 "bmux.storage".to_string(),
             ],
             enabled_plugins: vec!["bmux.permissions".to_string()],
@@ -1749,6 +1867,7 @@ mod tests {
 
     #[test]
     fn invoke_service_grant_list_and_revoke_roundtrip() {
+        let _router = install_service_test_router();
         let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4().to_string();
@@ -1840,6 +1959,7 @@ mod tests {
 
     #[test]
     fn invoke_service_policy_check_denies_observer_mutation() {
+        let _router = install_service_test_router();
         let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4();
@@ -2034,6 +2154,7 @@ mod tests {
 
     #[test]
     fn invoke_service_policy_denies_unknown_action() {
+        let _router = install_service_test_router();
         let plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4();

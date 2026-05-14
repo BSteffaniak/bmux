@@ -22,6 +22,7 @@ required_capabilities = [
     "bmux.clients.read",
     "bmux.commands",
     "bmux.contexts.read",
+    "bmux.pane_runtime.write",
     "bmux.sessions.read",
     "bmux.storage",
 ]

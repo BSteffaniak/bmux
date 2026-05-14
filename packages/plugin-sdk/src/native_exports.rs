@@ -8,6 +8,9 @@ use std::ffi::{CString, c_char};
 use std::future::Future;
 use std::ptr;
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+const PLUGIN_LOCK_LATENCY_BUDGET: Duration = Duration::from_millis(10);
 
 // ── Plugin exit codes ────────────────────────────────────────────────────────
 
@@ -566,9 +569,40 @@ pub fn invoke_service_export<P: RustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
 
-    let response = match instance.read() {
-        Ok(plugin) => plugin.invoke_service(context),
-        Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
+    let plugin_id = context.plugin_id.clone();
+    let interface_id = context.request.service.interface_id.clone();
+    let operation = context.request.operation.clone();
+    let lock_started = Instant::now();
+    let response = {
+        let Ok(plugin) = instance.read() else {
+            return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+        };
+        let lock_wait = lock_started.elapsed();
+        if lock_wait > PLUGIN_LOCK_LATENCY_BUDGET {
+            tracing::warn!(
+                request_id,
+                plugin_id = plugin_id.as_str(),
+                interface_id = interface_id.as_str(),
+                operation = operation.as_str(),
+                wait_us = lock_wait.as_micros(),
+                "plugin service read lock wait exceeded latency budget"
+            );
+        }
+
+        let call_started = Instant::now();
+        let response = plugin.invoke_service(context);
+        let lock_hold = call_started.elapsed();
+        if lock_hold > PLUGIN_LOCK_LATENCY_BUDGET {
+            tracing::warn!(
+                request_id,
+                plugin_id = plugin_id.as_str(),
+                interface_id = interface_id.as_str(),
+                operation = operation.as_str(),
+                hold_us = lock_hold.as_micros(),
+                "plugin service read lock hold exceeded latency budget"
+            );
+        }
+        response
     };
 
     let Ok(encoded) = encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response)

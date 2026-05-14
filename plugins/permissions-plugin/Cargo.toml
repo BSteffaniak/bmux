@@ -15,17 +15,17 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bmux_clients_plugin_api     = { workspace = true }
-bmux_contexts_plugin_api    = { workspace = true }
-bmux_ipc                    = { workspace = true }
-bmux_permissions_plugin_api = { workspace = true }
+bmux_clients_plugin_api      = { workspace = true }
+bmux_contexts_plugin_api     = { workspace = true }
+bmux_ipc                     = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
-bmux_plugin                 = { workspace = true }
-bmux_plugin_sdk             = { workspace = true }
-bmux_sessions_plugin_api    = { workspace = true }
-serde                       = { workspace = true, features = ["derive", "std"] }
-serde_json                  = { workspace = true }
-uuid                        = { workspace = true, features = ["std"] }
+bmux_permissions_plugin_api  = { workspace = true }
+bmux_plugin                  = { workspace = true }
+bmux_plugin_sdk              = { workspace = true }
+bmux_sessions_plugin_api     = { workspace = true }
+serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true }
+uuid                         = { workspace = true, features = ["std"] }
 
 [features]
 fail-on-warnings = [
