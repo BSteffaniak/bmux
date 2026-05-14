@@ -49,6 +49,7 @@ use crate::scripting::{
 /// Components ordered below this anchor render before the PTY content;
 /// components ordered above it render after the PTY content.
 const PANE_CONTENT_COMPONENT_ID: &str = "pane.content";
+const MAX_ANIMATION_HZ: u16 = 60;
 
 /// Runtime state for one user-composable decoration component.
 struct ScriptComponentRuntime {
@@ -151,6 +152,9 @@ struct State {
     visual_projection_bytes: BTreeMap<String, Vec<u8>>,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
+    /// Monotonic token invalidating stale animation tick threads across
+    /// theme reapplies, including reapplies that keep the same tick rate.
+    animation_generation: u64,
     /// Host async runtime handle supplied by in-process activation.
     /// Used to drive long-lived watch subscribers without constructing
     /// plugin-local tokio runtimes.
@@ -182,6 +186,7 @@ impl std::fmt::Debug for State {
                 &self.script_components.keys().collect::<Vec<_>>(),
             )
             .field("animation_hz", &self.animation_hz)
+            .field("animation_generation", &self.animation_generation)
             .finish_non_exhaustive()
     }
 }
@@ -1335,6 +1340,7 @@ fn apply_theme_extension_toml(
         if let Ok(mut state) = state.lock() {
             state.current_theme = None;
             state.animation_hz = None;
+            state.animation_generation = state.animation_generation.saturating_add(1);
             state.script_components.clear();
             install_script_backend(&mut state, None, ScriptHostAccess::default());
             bump_revision(&mut state);
@@ -1359,11 +1365,15 @@ fn apply_theme_extension_toml(
         .script
         .as_deref()
         .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
-    let animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
+    let animation_hz = extension
+        .animation
+        .as_ref()
+        .map(|animation| animation.hz.min(MAX_ANIMATION_HZ));
     let script_access = extension.script_access.clone();
     let mut script_host_access = script_host_access;
     script_host_access.service_grants = script_service_grants(script_access.as_ref());
     let mut subscription_generation = None;
+    let mut animation_generation = None;
     if let Ok(mut state) = state.lock() {
         install_script_components(
             &mut state,
@@ -1373,6 +1383,8 @@ fn apply_theme_extension_toml(
         );
         state.current_theme = Some(extension);
         state.animation_hz = animation_hz;
+        state.animation_generation = state.animation_generation.saturating_add(1);
+        animation_generation = Some(state.animation_generation);
         install_script_backend(&mut state, script, script_host_access);
         subscription_generation = Some(state.script_subscription_generation);
         bump_revision(&mut state);
@@ -1380,10 +1392,10 @@ fn apply_theme_extension_toml(
     if let Some(generation) = subscription_generation {
         install_script_event_subscriptions(state, script_access, generation);
     }
-    if let Some(hz) = animation_hz
+    if let (Some(hz), Some(generation)) = (animation_hz, animation_generation)
         && hz > 0
     {
-        spawn_animation_tick_thread(Arc::downgrade(state), hz);
+        spawn_animation_tick_thread(Arc::downgrade(state), hz, generation);
     }
     Ok(())
 }
@@ -2744,10 +2756,10 @@ fn script_source_hash(path: &std::path::Path, source: &str) -> u64 {
 /// ticks per second while the plugin's shared state is alive. The
 /// thread holds a [`Weak`] reference so it terminates cleanly when
 /// the plugin (and thus the `Arc<Mutex<State>>`) is dropped.
-fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16) {
+fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16, generation: u64) {
     // `u16` hz * `Duration::from_micros` keeps arithmetic safe up to
-    // 65535 Hz. We do not clamp — users are responsible for the CPU
-    // cost of their chosen frame rate.
+    // 65535 Hz. Theme application clamps user-provided rates before
+    // starting tickers so bundled animations cannot request unbounded CPU.
     let period = Duration::from_micros((1_000_000u64 / u64::from(hz.max(1))).max(1));
     std::thread::spawn(move || {
         loop {
@@ -2758,7 +2770,7 @@ fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16) {
             let Ok(mut guard) = arc.lock() else {
                 return;
             };
-            if guard.animation_hz != Some(hz) {
+            if guard.animation_hz != Some(hz) || guard.animation_generation != generation {
                 return;
             }
             // Skip the tick entirely if scripts were unloaded
@@ -5037,7 +5049,7 @@ exited = ""
     fn tick_thread_exits_cleanly_when_plugin_is_dropped() {
         let plugin = DecorationPlugin::new();
         let weak = Arc::downgrade(&plugin.state.inner);
-        spawn_animation_tick_thread(weak.clone(), 100);
+        spawn_animation_tick_thread(weak.clone(), 100, 0);
         drop(plugin);
         // After the strong arc is dropped, the Weak upgrade must
         // fail; the thread either already exited or is blocked in
@@ -5048,6 +5060,26 @@ exited = ""
             weak.strong_count(),
             0,
             "plugin state must be fully released after drop",
+        );
+    }
+
+    #[test]
+    fn stale_same_hz_tick_thread_exits_without_bumping_revision() {
+        let plugin = DecorationPlugin::new();
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            state.animation_hz = Some(100);
+            state.animation_generation = 2;
+            state.script_backend = Some(Box::new(TestScriptBackend));
+        }
+
+        spawn_animation_tick_thread(Arc::downgrade(&plugin.state.inner), 100, 1);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let state = plugin.state.inner.lock().expect("lock");
+        assert_eq!(
+            state.scene_revision, 0,
+            "stale same-hz animation ticker must not publish a scene",
         );
     }
 
