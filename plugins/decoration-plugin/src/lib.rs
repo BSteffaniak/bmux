@@ -40,13 +40,12 @@ use bmux_scene_protocol::scene_protocol::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::engine::{AnimationDriverPolicy, run_animation_tick_if_current, with_engine_state};
 use crate::engine::{
-    AnimationDriverPolicy, DecorationEngineCommand, ensure_animation_driver,
-    ensure_decoration_engine, notify_animation_driver, send_engine_command,
+    DecorationEngineCommand, ensure_decoration_engine, send_engine_command,
     send_engine_command_blocking, send_engine_fire_and_forget,
 };
-#[cfg(test)]
-use crate::engine::{animation_driver_policy, run_animation_tick_if_current, with_engine_state};
 use crate::scripting::{
     PerfTracker, ScriptBackend, ScriptComponentMessage, ScriptEventDelivery, ScriptEventMessage,
     ScriptHostAccess, ScriptMessage, ScriptRenderMessage, ScriptServiceCall, ScriptServiceGrant,
@@ -251,10 +250,9 @@ impl Default for DecorationReadModel {
 }
 
 struct DecorationRuntime {
-    command_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>>>,
+    command_tx: Mutex<Option<std::sync::mpsc::SyncSender<DecorationEngineCommand>>>,
     read_model: RwLock<DecorationReadModel>,
     host_async_handle: Mutex<Option<HostAsyncHandle>>,
-    animation_driver_tx: Mutex<Option<tokio::sync::watch::Sender<AnimationDriverPolicy>>>,
 }
 
 impl Default for DecorationRuntime {
@@ -263,7 +261,6 @@ impl Default for DecorationRuntime {
             command_tx: Mutex::new(None),
             read_model: RwLock::new(DecorationReadModel::default()),
             host_async_handle: Mutex::new(None),
-            animation_driver_tx: Mutex::new(None),
         }
     }
 }
@@ -283,7 +280,7 @@ impl SharedState {
         Self::default()
     }
 
-    fn command_tx(&self) -> Option<tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>> {
+    fn command_tx(&self) -> Option<std::sync::mpsc::SyncSender<DecorationEngineCommand>> {
         self.runtime
             .command_tx
             .lock()
@@ -291,10 +288,7 @@ impl SharedState {
             .and_then(|guard| guard.clone())
     }
 
-    fn set_command_tx(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<DecorationEngineCommand>,
-    ) -> bool {
+    fn set_command_tx(&self, tx: std::sync::mpsc::SyncSender<DecorationEngineCommand>) -> bool {
         let Ok(mut guard) = self.runtime.command_tx.lock() else {
             return false;
         };
@@ -319,39 +313,23 @@ impl SharedState {
             .and_then(|guard| guard.clone())
     }
 
-    fn animation_driver_tx(&self) -> Option<tokio::sync::watch::Sender<AnimationDriverPolicy>> {
-        self.runtime
-            .animation_driver_tx
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-    }
-
-    fn set_animation_driver_tx(
-        &self,
-        tx: tokio::sync::watch::Sender<AnimationDriverPolicy>,
-    ) -> bool {
-        let Ok(mut guard) = self.runtime.animation_driver_tx.lock() else {
-            return false;
-        };
-        if guard.is_some() {
-            return false;
-        }
-        *guard = Some(tx);
-        true
-    }
-
     fn read_model<R>(&self, f: impl FnOnce(&DecorationReadModel) -> R) -> R {
-        if let Ok(guard) = self.runtime.read_model.read() {
-            f(&guard)
-        } else {
-            f(&DecorationReadModel::default())
+        match self.runtime.read_model.read() {
+            Ok(guard) => f(&guard),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                f(&guard)
+            }
         }
     }
 
     fn sync_read_model_from_state(&self, state: &mut State) {
-        if let Ok(mut guard) = self.runtime.read_model.write() {
-            sync_read_model_from_state(&mut guard, state);
+        match self.runtime.read_model.write() {
+            Ok(mut guard) => sync_read_model_from_state(&mut guard, state),
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                sync_read_model_from_state(&mut guard, state);
+            }
         }
     }
 
@@ -1593,7 +1571,6 @@ fn apply_theme_extension_toml_direct(
         state.current_theme = None;
         state.animation_hz = None;
         state.animation_generation = state.animation_generation.saturating_add(1);
-        notify_animation_driver(shared, state);
         state.script_components.clear();
         clear_visual_projection_state(state);
         install_script_backend(state, None, ScriptHostAccess::default());
@@ -1635,7 +1612,6 @@ fn apply_theme_extension_toml_direct(
     clear_visual_projection_state(state);
     state.animation_hz = animation_hz;
     state.animation_generation = state.animation_generation.saturating_add(1);
-    notify_animation_driver(shared, state);
     install_script_backend(state, script, script_host_access.clone());
     let subscription_generation = state.script_subscription_generation;
     publish_scene_if_changed(state);
@@ -2545,7 +2521,6 @@ impl RustPlugin for DecorationPlugin {
                 empty_scene(),
             );
         ensure_decoration_engine(&self.state);
-        ensure_animation_driver(&self.state);
         let summary_theme_loaded = self.state.read_model(|model| model.current_theme.is_some());
         let summary_script_loaded = false;
         let _ = send_engine_command_blocking(&self.state, |reply| {
@@ -5482,26 +5457,6 @@ exited = ""
             ),
         )
         .expect("write script");
-    }
-
-    #[test]
-    fn animation_driver_policy_notification_updates_existing_driver() {
-        let plugin = DecorationPlugin::new();
-        let mut state = State::default();
-        let (tx, rx) = tokio::sync::watch::channel(animation_driver_policy(&state));
-        assert!(plugin.state.set_animation_driver_tx(tx));
-        state.animation_hz = Some(12);
-        state.animation_generation = 7;
-
-        notify_animation_driver(&plugin.state, &state);
-
-        assert_eq!(
-            *rx.borrow(),
-            AnimationDriverPolicy {
-                hz: Some(12),
-                generation: 7,
-            },
-        );
     }
 
     #[test]
