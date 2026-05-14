@@ -1463,6 +1463,22 @@ mod tests {
                 assert(game.vy > 0, "top wall collision should be handled inside the frame")
                 assert(game.vx < 0, "later content collision should also be handled inside the frame")
 
+                game = make_test_game(20, 10, 0, 4, -0.02, 0.012, nil)
+                game.base_vx = 0.02
+                game.left.center = 4
+                game.left.prev_center = 4.2
+                game.left.target = 4
+                bounce(game, game.left, "left")
+                assert(game.vy > 0, "centered paddle hit should usually preserve incoming vertical inertia")
+
+                game = make_test_game(20, 10, 0, 1, -0.02, 0.012, nil)
+                game.base_vx = 0.02
+                game.left.center = 4
+                game.left.prev_center = 5.2
+                game.left.target = 4
+                bounce(game, game.left, "left")
+                assert(game.vy < 0, "strong edge paddle hit may cut the ball back")
+
                 local start_inside = make_visual(10, 5, { { 3, 2 } })
                 game = make_test_game(10, 5, 3, 2, 0.1, 0, start_inside)
                 advance_ball(game, 40)

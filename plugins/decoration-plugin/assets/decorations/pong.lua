@@ -593,17 +593,28 @@ local function bounce(game, player, side)
     game.speed_mult = math.min(MAX_SPEED_MULT, game.speed_mult * SPEEDUP_PER_HIT)
     game.vx = game.base_vx * game.speed_mult * (game.vx < 0 and -1 or 1)
 
-    -- A moving paddle imparts "spin". This keeps well-centered hits from
-    -- degenerating into flat horizontal rallies and makes aggressive last-
-    -- moment corrections both powerful and risky.
-    local spin_vy = paddle_vy * (0.55 + game.speed_mult * 0.28)
-    local next_vy = incoming_vy * 0.32 + rel * (0.0045 + game.speed_mult * 0.0033) + spin_vy + aim_jitter
+    -- A moving paddle imparts "spin", but natural reflection should usually
+    -- dominate. Only strong edge hits or fast paddle motion are allowed to cut
+    -- the ball back against its incoming vertical inertia.
+    local spin_vy = paddle_vy * (0.25 + game.speed_mult * 0.12)
+    local next_vy = incoming_vy * 0.62 + rel * (0.0032 + game.speed_mult * 0.0024) + spin_vy + aim_jitter
     local min_angle_vy = math.abs(game.vx) * 0.26
     local max_angle_vy = math.abs(game.vx) * 0.95
+    if incoming_vy ~= 0 and next_vy * incoming_vy < 0 then
+        local edge_hit = math.abs(rel) > 0.72
+        local strong_spin = math.abs(paddle_vy) > math.abs(game.vx) * 0.38
+        local shallow_incoming = math.abs(incoming_vy) < math.abs(game.vx) * 0.34
+        if not (edge_hit or strong_spin or shallow_incoming) then
+            next_vy = (incoming_vy < 0 and -1 or 1) * math.max(math.abs(next_vy) * 0.45, min_angle_vy)
+        end
+    end
     if math.abs(next_vy) < min_angle_vy then
         local fallback_sign = next_vy < 0 and -1 or 1
         if next_vy == 0 then
-            fallback_sign = rand01(game.seed, game.rally + game.hits, 701) < 0.5 and -1 or 1
+            fallback_sign = incoming_vy < 0 and -1 or 1
+            if incoming_vy == 0 then
+                fallback_sign = rand01(game.seed, game.rally + game.hits, 701) < 0.5 and -1 or 1
+            end
         end
         next_vy = fallback_sign * rand_range(game.seed, game.rally + game.hits, 702, min_angle_vy, min_angle_vy * 1.45)
     end
