@@ -321,9 +321,15 @@ struct ThemePluginSettings {
     #[serde(default)]
     themes: Vec<String>,
     #[serde(default)]
+    appearance_themes: Vec<String>,
+    #[serde(default)]
+    component_themes: Vec<String>,
+    #[serde(default)]
     persistence: ThemePersistence,
     #[serde(default)]
     components: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    component_targets: BTreeMap<String, toml::Value>,
     #[serde(default)]
     theme_settings: BTreeMap<String, toml::Value>,
 }
@@ -1234,10 +1240,61 @@ fn resolve_theme_stack_with_settings(
     stack: &[String],
     settings: &ThemePluginSettings,
 ) -> Option<ResolvedTheme> {
-    let mut theme = resolve_theme_stack(catalog, stack)?;
-    apply_settings_component_overrides(&mut theme, &settings.components);
+    let mut theme = if settings.appearance_themes.is_empty() && settings.component_themes.is_empty()
+    {
+        resolve_theme_stack(catalog, stack)?
+    } else {
+        resolve_split_theme_stack(catalog, stack, settings)?
+    };
     apply_theme_settings_component_overrides(&mut theme, &settings.theme_settings);
+    apply_settings_component_overrides(&mut theme, &settings.components);
+    apply_settings_component_target_overrides(&mut theme, &settings.component_targets);
     Some(theme)
+}
+
+fn resolve_split_theme_stack(
+    catalog: &[ThemeCatalogEntry],
+    active_stack: &[String],
+    settings: &ThemePluginSettings,
+) -> Option<ResolvedTheme> {
+    let appearance_stack = if settings.appearance_themes.is_empty() {
+        active_stack.to_vec()
+    } else {
+        normalize_theme_name_list(&settings.appearance_themes)
+    };
+    let component_stack = if settings.component_themes.is_empty() {
+        active_stack.to_vec()
+    } else {
+        normalize_theme_name_list(&settings.component_themes)
+    };
+    if appearance_stack.is_empty() && component_stack.is_empty() {
+        return None;
+    }
+    let mut appearance = RuntimeAppearance::default();
+    let mut plugins = BTreeMap::new();
+    let mut theme_settings = ThemeSettingsConfig::default();
+    for name in filter_existing_theme_names(catalog, appearance_stack) {
+        let theme = theme_by_name(catalog, &name)?;
+        apply_theme_appearance_layer(&mut appearance, theme);
+        apply_theme_plugin_layer(&mut plugins, &appearance_only_plugin_extensions(theme));
+        apply_theme_settings_layer(&mut theme_settings, &theme.settings);
+    }
+    for name in filter_existing_theme_names(catalog, component_stack) {
+        let theme = theme_by_name(catalog, &name)?;
+        apply_theme_component_layer(&mut plugins, &mut theme_settings, theme);
+    }
+    Some(ResolvedTheme {
+        appearance,
+        plugins,
+        settings: theme_settings,
+    })
+}
+
+fn normalize_theme_name_list(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|name| normalized_theme_name(name))
+        .collect()
 }
 
 fn apply_settings_component_overrides(
@@ -1248,6 +1305,55 @@ fn apply_settings_component_overrides(
         return;
     }
     merge_decoration_component_overrides(theme, components);
+}
+
+fn apply_settings_component_target_overrides(
+    theme: &mut ResolvedTheme,
+    targets: &BTreeMap<String, toml::Value>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let Some(component_ids) = decoration_component_ids(theme) else {
+        return;
+    };
+    let mut components = BTreeMap::new();
+    for component_id in component_ids {
+        for (pattern, target) in targets {
+            if component_target_pattern_matches(pattern, &component_id) {
+                components.insert(
+                    component_id.clone(),
+                    toml::Value::Table(toml::map::Map::from_iter([(
+                        "target".to_string(),
+                        target.clone(),
+                    )])),
+                );
+            }
+        }
+    }
+    merge_decoration_component_overrides(theme, &components);
+}
+
+fn decoration_component_ids(theme: &ResolvedTheme) -> Option<Vec<String>> {
+    let components = theme
+        .plugins
+        .get("bmux.decoration")?
+        .as_table()?
+        .get("components")?
+        .as_table()?;
+    Some(components.keys().cloned().collect())
+}
+
+fn component_target_pattern_matches(pattern: &str, component_id: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        return component_id
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('.'));
+    }
+    pattern == component_id
 }
 
 fn apply_theme_settings_component_overrides(
@@ -1331,6 +1437,12 @@ fn apply_theme_layer(
     settings: &mut ThemeSettingsConfig,
     theme: &ThemeConfig,
 ) {
+    apply_theme_appearance_layer(appearance, theme);
+    apply_theme_plugin_layer(plugins, &theme.plugins);
+    apply_theme_settings_layer(settings, &theme.settings);
+}
+
+fn apply_theme_appearance_layer(appearance: &mut RuntimeAppearance, theme: &ThemeConfig) {
     appearance.apply_patch(&RuntimeAppearancePatch::from(theme));
     for (mode_id, mode_theme) in &theme.modes {
         let patch = appearance
@@ -1339,7 +1451,33 @@ fn apply_theme_layer(
             .or_default();
         patch.merge(&RuntimeAppearancePatch::from(mode_theme));
     }
-    for (plugin_id, extension) in &theme.plugins {
+}
+
+fn apply_theme_component_layer(
+    plugins: &mut BTreeMap<String, toml::Value>,
+    settings: &mut ThemeSettingsConfig,
+    theme: &ThemeConfig,
+) {
+    let component_plugins = theme
+        .plugins
+        .iter()
+        .map(|(plugin_id, extension)| {
+            (
+                plugin_id.clone(),
+                component_only_plugin_extension(plugin_id, extension),
+            )
+        })
+        .filter(|(_, extension)| !extension_is_empty(extension))
+        .collect::<BTreeMap<_, _>>();
+    apply_theme_plugin_layer(plugins, &component_plugins);
+    apply_theme_settings_layer(settings, &theme.settings);
+}
+
+fn apply_theme_plugin_layer(
+    plugins: &mut BTreeMap<String, toml::Value>,
+    plugin_extensions: &BTreeMap<String, toml::Value>,
+) {
+    for (plugin_id, extension) in plugin_extensions {
         match plugins.get_mut(plugin_id) {
             Some(existing) => merge_toml_value(existing, extension),
             None => {
@@ -1347,17 +1485,77 @@ fn apply_theme_layer(
             }
         }
     }
-    for (provider_id, provider) in &theme.settings.providers {
+}
+
+fn appearance_only_plugin_extensions(theme: &ThemeConfig) -> BTreeMap<String, toml::Value> {
+    theme
+        .plugins
+        .iter()
+        .map(|(plugin_id, extension)| {
+            (
+                plugin_id.clone(),
+                appearance_only_plugin_extension(plugin_id, extension),
+            )
+        })
+        .filter(|(_, extension)| !extension_is_empty(extension))
+        .collect()
+}
+
+fn appearance_only_plugin_extension(plugin_id: &str, extension: &toml::Value) -> toml::Value {
+    if plugin_id != "bmux.decoration" {
+        return extension.clone();
+    }
+    let Some(table) = extension.as_table() else {
+        return extension.clone();
+    };
+    let mut filtered = table.clone();
+    for key in [
+        "animation",
+        "components",
+        "input",
+        "script",
+        "script_access",
+    ] {
+        filtered.remove(key);
+    }
+    toml::Value::Table(filtered)
+}
+
+fn component_only_plugin_extension(plugin_id: &str, extension: &toml::Value) -> toml::Value {
+    if plugin_id != "bmux.decoration" {
+        return extension.clone();
+    }
+    let Some(table) = extension.as_table() else {
+        return extension.clone();
+    };
+    let mut filtered = toml::map::Map::new();
+    for key in ["components", "script_access", "animation", "input"] {
+        if let Some(value) = table.get(key) {
+            filtered.insert(key.to_string(), value.clone());
+        }
+    }
+    toml::Value::Table(filtered)
+}
+
+fn extension_is_empty(extension: &toml::Value) -> bool {
+    extension.as_table().is_some_and(toml::map::Map::is_empty)
+}
+
+fn apply_theme_settings_layer(
+    settings: &mut ThemeSettingsConfig,
+    theme_settings: &ThemeSettingsConfig,
+) {
+    for (provider_id, provider) in &theme_settings.providers {
         settings
             .providers
             .insert(provider_id.clone(), provider.clone());
     }
-    for (settings_id, component_settings) in &theme.settings.component_settings {
+    for (settings_id, component_settings) in &theme_settings.component_settings {
         settings
             .component_settings
             .insert(settings_id.clone(), component_settings.clone());
     }
-    for (form_id, form) in &theme.settings.forms {
+    for (form_id, form) in &theme_settings.forms {
         settings.forms.insert(form_id.clone(), form.clone());
     }
 }
@@ -2163,6 +2361,158 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("performance.header")
         );
+    }
+
+    fn performance_theme_with_component() -> ThemeConfig {
+        toml::from_str(
+            r##"
+            name = "performance"
+            foreground = "#ffffff"
+
+            [plugins."bmux.decoration".focused]
+            bg = ""
+            fg = "#ffaf00"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "thick"
+
+            [plugins."bmux.decoration".unfocused]
+            bg = ""
+            fg = "#444444"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "single-line"
+
+            [plugins."bmux.decoration".zoomed]
+            bg = ""
+            fg = "#ff5f5f"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "double"
+
+            [plugins."bmux.decoration".badges]
+            exited = "x"
+            running = ">"
+
+            [plugins."bmux.decoration".components."performance.border"]
+            script = "performance_header"
+            "##,
+        )
+        .expect("performance theme parses")
+    }
+
+    fn pong_theme_with_component() -> ThemeConfig {
+        toml::from_str(
+            r##"
+            name = "pong"
+            foreground = "#00ffff"
+
+            [plugins."bmux.decoration".focused]
+            bg = ""
+            fg = "#ffffff"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "rounded"
+
+            [plugins."bmux.decoration".components."pong.ball"]
+            script = "pong"
+            "##,
+        )
+        .expect("pong theme parses")
+    }
+
+    fn split_stack_catalog() -> Vec<ThemeCatalogEntry> {
+        vec![
+            ThemeCatalogEntry {
+                name: "performance".to_string(),
+                theme: performance_theme_with_component(),
+            },
+            ThemeCatalogEntry {
+                name: "pong".to_string(),
+                theme: pong_theme_with_component(),
+            },
+        ]
+    }
+
+    #[test]
+    fn split_stacks_keep_appearance_base_and_apply_component_targets() {
+        let settings = ThemePluginSettings {
+            appearance_themes: vec!["performance".to_string()],
+            component_themes: vec!["performance".to_string(), "pong".to_string()],
+            component_targets: BTreeMap::from([(
+                "pong.*".to_string(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "kind".to_string(),
+                    toml::Value::String("unfocused-panes".to_string()),
+                )])),
+            )]),
+            ..ThemePluginSettings::default()
+        };
+        let resolved = resolve_theme_stack_with_settings(
+            &split_stack_catalog(),
+            &["performance".to_string()],
+            &settings,
+        )
+        .expect("split stack resolves");
+        let decoration = resolved
+            .plugins
+            .get("bmux.decoration")
+            .and_then(toml::Value::as_table)
+            .expect("decoration extension exists");
+        let components = decoration
+            .get("components")
+            .and_then(toml::Value::as_table)
+            .expect("components exist");
+
+        assert_eq!(resolved.appearance.foreground, "#ffffff");
+        assert_eq!(
+            decoration
+                .get("focused")
+                .and_then(toml::Value::as_table)
+                .and_then(|focused| focused.get("style"))
+                .and_then(toml::Value::as_str),
+            Some("thick")
+        );
+        assert!(components.contains_key("performance.border"));
+        assert_eq!(
+            components
+                .get("pong.ball")
+                .and_then(toml::Value::as_table)
+                .and_then(|component| component.get("target"))
+                .and_then(toml::Value::as_table)
+                .and_then(|target| target.get("kind"))
+                .and_then(toml::Value::as_str),
+            Some("unfocused-panes")
+        );
+    }
+
+    #[test]
+    fn split_stacks_strip_appearance_only_decoration_components() {
+        let settings = ThemePluginSettings {
+            appearance_themes: vec!["performance".to_string()],
+            component_themes: vec!["pong".to_string()],
+            ..ThemePluginSettings::default()
+        };
+        let resolved = resolve_theme_stack_with_settings(
+            &split_stack_catalog(),
+            &["performance".to_string()],
+            &settings,
+        )
+        .expect("split stack resolves");
+        let components = resolved
+            .plugins
+            .get("bmux.decoration")
+            .and_then(toml::Value::as_table)
+            .and_then(|decoration| decoration.get("components"))
+            .and_then(toml::Value::as_table)
+            .expect("component stack components exist");
+
+        assert!(!components.contains_key("performance.border"));
+        assert!(components.contains_key("pong.ball"));
     }
 
     #[test]

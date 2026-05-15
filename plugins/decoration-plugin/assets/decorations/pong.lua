@@ -834,9 +834,32 @@ local function render_score(cmds, pane, game)
     end
 end
 
+local function component_active(pane)
+    if pane.component_active ~= nil then
+        return pane.component_active
+    end
+    return pane.focused
+end
+
+local function visual_for_pane(message, pane)
+    local request_id = "pong.content-presence"
+    local metadata = message.visual and message.visual[request_id] or nil
+    local bytes = message.visual_bytes and message.visual_bytes[request_id] or nil
+    local surface_id = tostring(pane.surface_id or pane.id or "")
+    if metadata ~= nil and metadata.surfaces ~= nil and metadata.surfaces[surface_id] ~= nil then
+        metadata = metadata.surfaces[surface_id]
+    end
+    if message.visual_surface_bytes ~= nil
+        and message.visual_surface_bytes[request_id] ~= nil
+        and message.visual_surface_bytes[request_id][surface_id] ~= nil then
+        bytes = message.visual_surface_bytes[request_id][surface_id]
+    end
+    return visual_bitset_decode(metadata, bytes)
+end
+
 local function render_pane(pane, message)
     local state = pane_state(pane)
-    if not pane.focused then
+    if not component_active(pane) then
         state.last_focus_ms = nil
         return {}
     end
@@ -853,9 +876,7 @@ local function render_pane(pane, message)
     local rally_ms = component_setting_number(message, "rally_ms", RALLY_MS)
     local win_hold_ms = component_setting_number(message, "win_hold_ms", WIN_HOLD_MS)
     local content_bounce = component_setting_bool(message, "content_bounce", false)
-    local visual_metadata = message.visual and message.visual["pong.content-presence"] or nil
-    local visual_bytes = message.visual_bytes and message.visual_bytes["pong.content-presence"] or nil
-    local visual = visual_bitset_decode(visual_metadata, visual_bytes)
+    local visual = visual_for_pane(message, pane)
     local game = simulate(pane, state.active_ms, rally_ms, win_hold_ms, content_bounce, visual)
     local cmds = {}
     if entrypoint == "ball" or entrypoint == "all" then render_ball(cmds, pane, game) end

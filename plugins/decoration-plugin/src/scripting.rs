@@ -128,6 +128,7 @@ pub struct ScriptRenderMessage {
     pub panes: JsonValue,
     pub visual: JsonValue,
     pub visual_bytes: BTreeMap<String, Arc<[u8]>>,
+    pub visual_surface_bytes: BTreeMap<String, BTreeMap<String, Arc<[u8]>>>,
     pub component: Option<ScriptComponentMessage>,
 }
 
@@ -561,6 +562,10 @@ mod lua_backend {
                     "visual_bytes",
                     visual_bytes_to_lua(lua, &render.visual_bytes)?,
                 )?;
+                t.set(
+                    "visual_surface_bytes",
+                    visual_surface_bytes_to_lua(lua, &render.visual_surface_bytes)?,
+                )?;
                 if let Some(component) = &render.component {
                     let component_table = lua.create_table()?;
                     component_table.set("id", component.id.as_str())?;
@@ -579,6 +584,21 @@ mod lua_backend {
         let table = lua.create_table()?;
         for (key, bytes) in values {
             table.set(key.as_str(), lua.create_string(bytes.as_ref())?)?;
+        }
+        Ok(Value::Table(table))
+    }
+
+    fn visual_surface_bytes_to_lua(
+        lua: &Lua,
+        values: &BTreeMap<String, BTreeMap<String, Arc<[u8]>>>,
+    ) -> mlua::Result<Value> {
+        let table = lua.create_table()?;
+        for (request_id, surfaces) in values {
+            let surface_table = lua.create_table()?;
+            for (surface_id, bytes) in surfaces {
+                surface_table.set(surface_id.as_str(), lua.create_string(bytes.as_ref())?)?;
+            }
+            table.set(request_id.as_str(), surface_table)?;
         }
         Ok(Value::Table(table))
     }
@@ -1133,6 +1153,7 @@ mod tests {
                 ]),
                 visual: json!({}),
                 visual_bytes: BTreeMap::new(),
+                visual_surface_bytes: BTreeMap::new(),
                 component: None,
             })
         }
@@ -1154,6 +1175,7 @@ mod tests {
                     }
                 }),
                 visual_bytes,
+                visual_surface_bytes: BTreeMap::new(),
                 component: None,
             })
         }

@@ -27,9 +27,10 @@ use arc_swap::ArcSwap;
 use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService, NotifyError};
 use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderSpec, BorderStyle, DecorationComponentSpec, DecorationInputSpec, DecorationStateService,
-    DecorationThemeExtension, DecorationVisualAdapterSpec, PaneActivity, PaneDecoration,
-    PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
+    BorderSpec, BorderStyle, DecorationComponentSpec, DecorationComponentTargetSpec,
+    DecorationInputSpec, DecorationStateService, DecorationThemeExtension,
+    DecorationVisualAdapterSpec, PaneActivity, PaneDecoration, PaneGeometry, PaneLifecycle,
+    SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
@@ -105,6 +106,9 @@ struct State {
     /// the pane id as their surface id, but floating panes have distinct surface
     /// ids while still pointing at a pane-backed PTY.
     geometry: HashMap<Uuid, PaneGeometry>,
+    /// Visible pane-backed surface ids in attach layout order. Target selectors
+    /// use this for stable visible-index matching and script payload ordering.
+    visible_surface_order: Vec<Uuid>,
     /// Per-pane focus/zoom/lifecycle. Kept separate from
     /// `panes` (style) so mutators don't have to allocate a
     /// `PaneDecoration` row just to flip a focus bit.
@@ -185,6 +189,7 @@ impl std::fmt::Debug for State {
         f.debug_struct("State")
             .field("panes", &self.panes)
             .field("geometry", &self.geometry)
+            .field("visible_surface_order", &self.visible_surface_order)
             .field("activity", &self.activity)
             .field("default_border", &self.default_border)
             .field("scene_revision", &self.scene_revision)
@@ -691,6 +696,9 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) -> bool {
             let panes_removed = state.panes.remove(pane_id).is_some();
             let geometry_len = state.geometry.len();
             state.geometry.retain(|_, geom| geom.pane_id != *pane_id);
+            state
+                .visible_surface_order
+                .retain(|surface_id| state.geometry.contains_key(surface_id));
             let geometry_removed = state.geometry.len() != geometry_len;
             let activity_removed = state.activity.remove(pane_id).is_some();
             changed = panes_removed || geometry_removed || activity_removed;
@@ -799,13 +807,22 @@ fn geometry_for_pane(state: &State, pane_id: Uuid) -> Option<&PaneGeometry> {
         .find(|geometry| geometry.pane_id == pane_id)
 }
 
-fn script_pane_payload(state: &State, pane_id: Uuid) -> Option<serde_json::Value> {
-    let geom = geometry_for_pane(state, pane_id)?;
+fn script_pane_payload_for_surface(
+    state: &State,
+    surface_id: Uuid,
+    visible_index: usize,
+    component_active: bool,
+) -> Option<serde_json::Value> {
+    let geom = state.geometry.get(&surface_id)?;
+    let pane_id = geom.pane_id;
     let activity = state.activity.get(&pane_id);
     let (focused, zoomed) = activity.map_or((false, false), |a| (a.focused, a.zoomed));
     let status = activity.map_or(PaneLifecycle::Running, |a| a.status);
-    Some(serde_json::json!({
-        "id": pane_id.to_string(),
+    let mut payload = serde_json::json!({
+        "id": surface_id.to_string(),
+        "pane_id": pane_id.to_string(),
+        "surface_id": surface_id.to_string(),
+        "visible_index": visible_index,
         "rect": rect_json(&geom.rect),
         "content_rect": rect_json(&geom.content_rect),
         "focused": focused,
@@ -814,7 +831,54 @@ fn script_pane_payload(state: &State, pane_id: Uuid) -> Option<serde_json::Value
             PaneLifecycle::Running => "running",
             PaneLifecycle::Exited => "exited",
         },
-    }))
+    });
+    if component_active && let serde_json::Value::Object(object) = &mut payload {
+        object.insert(
+            "component_active".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    Some(payload)
+}
+
+fn component_target_matches(
+    state: &State,
+    target: Option<&DecorationComponentTargetSpec>,
+    surface_id: Uuid,
+    visible_index: usize,
+) -> bool {
+    let Some(target) = target else {
+        return true;
+    };
+    let kind = target.kind.trim();
+    if kind.eq_ignore_ascii_case("all-panes") || kind.eq_ignore_ascii_case("all") {
+        return true;
+    }
+    let focused = state
+        .geometry
+        .get(&surface_id)
+        .and_then(|geometry| state.activity.get(&geometry.pane_id))
+        .is_some_and(|activity| activity.focused);
+    if kind.eq_ignore_ascii_case("focused-pane") || kind.eq_ignore_ascii_case("focused") {
+        return focused;
+    }
+    if kind.eq_ignore_ascii_case("unfocused-panes") || kind.eq_ignore_ascii_case("unfocused") {
+        return !focused;
+    }
+    if kind.eq_ignore_ascii_case("visible-index") {
+        return target
+            .index
+            .is_some_and(|index| usize::from(index) == visible_index);
+    }
+    if kind.eq_ignore_ascii_case("visible-index-mod") {
+        let modulo = target.modulo.filter(|value| *value > 0).unwrap_or(1);
+        let remainder = target.remainder.unwrap_or(0) % modulo;
+        let Ok(index) = u16::try_from(visible_index) else {
+            return false;
+        };
+        return index % modulo == remainder;
+    }
+    false
 }
 
 fn script_visual_payload(state: &State) -> serde_json::Value {
@@ -847,6 +911,12 @@ fn script_visual_payload(state: &State) -> serde_json::Value {
 
 fn script_visual_bytes_payload(state: &State) -> BTreeMap<String, Arc<[u8]>> {
     state.visual_projection_bytes.clone()
+}
+
+fn script_visual_surface_bytes_payload(
+    state: &State,
+) -> BTreeMap<String, BTreeMap<String, Arc<[u8]>>> {
+    state.visual_projection_surface_bytes.clone()
 }
 
 fn rect_json(rect: &Rect) -> serde_json::Value {
@@ -903,6 +973,7 @@ fn merge_script_paint_commands(
         panes: script_panes_payload(state),
         visual: script_visual_payload(state),
         visual_bytes: script_visual_bytes_payload(state),
+        visual_surface_bytes: script_visual_surface_bytes_payload(state),
         component: None,
     });
     let outcome = match backend.invoke(&render) {
@@ -948,10 +1019,10 @@ fn merge_script_paint_commands(
     }
 }
 
-struct ComponentRenderPassState<'a> {
-    panes: &'a serde_json::Value,
+struct ComponentRenderPassState {
     visual: serde_json::Value,
     visual_bytes: BTreeMap<String, Arc<[u8]>>,
+    visual_surface_bytes: BTreeMap<String, BTreeMap<String, Arc<[u8]>>>,
     instance_frames: BTreeMap<String, (u64, u64)>,
     event_instances: BTreeSet<String>,
 }
@@ -961,13 +1032,13 @@ fn merge_component_paint_commands(
     surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
 ) {
     let order = ordered_enabled_component_ids(state);
-    let panes = script_panes_payload(state);
     let visual = script_visual_payload(state);
     let visual_bytes = script_visual_bytes_payload(state);
+    let visual_surface_bytes = script_visual_surface_bytes_payload(state);
     let mut pass = ComponentRenderPassState {
-        panes: &panes,
         visual,
         visual_bytes,
+        visual_surface_bytes,
         instance_frames: BTreeMap::new(),
         event_instances: BTreeSet::new(),
     };
@@ -997,8 +1068,13 @@ fn merge_component_paint_commands_for_id(
     component_id: &str,
     order_index: usize,
     below_pane_content: bool,
-    pass: &mut ComponentRenderPassState<'_>,
+    pass: &mut ComponentRenderPassState,
 ) {
+    let target = state
+        .script_components
+        .get(component_id)
+        .and_then(|component| component.spec.target.clone());
+    let panes = script_panes_payload_for_component(state, target.as_ref());
     let Some(component) = state.script_components.get_mut(component_id) else {
         return;
     };
@@ -1042,9 +1118,10 @@ fn merge_component_paint_commands_for_id(
     let render = ScriptMessage::Render(ScriptRenderMessage {
         time_ms,
         frame,
-        panes: pass.panes.clone(),
+        panes,
         visual: pass.visual.clone(),
         visual_bytes: pass.visual_bytes.clone(),
+        visual_surface_bytes: pass.visual_surface_bytes.clone(),
         component: Some(ScriptComponentMessage {
             id: component.id.clone(),
             entrypoint: component.spec.entrypoint.clone(),
@@ -1236,13 +1313,45 @@ fn set_paint_command_z(command: &mut PaintCommand, next_z: i16) {
 }
 
 fn script_panes_payload(state: &State) -> serde_json::Value {
+    script_panes_payload_for_component(state, None)
+}
+
+fn script_panes_payload_for_component(
+    state: &State,
+    target: Option<&DecorationComponentTargetSpec>,
+) -> serde_json::Value {
     serde_json::Value::Array(
-        state
-            .geometry
-            .keys()
-            .filter_map(|pane_id| script_pane_payload(state, *pane_id))
+        ordered_surface_ids(state)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(visible_index, surface_id)| {
+                let matches = component_target_matches(state, target, surface_id, visible_index);
+                if target.is_some() && !matches {
+                    return None;
+                }
+                script_pane_payload_for_surface(state, surface_id, visible_index, target.is_some())
+            })
             .collect(),
     )
+}
+
+fn ordered_surface_ids(state: &State) -> Vec<Uuid> {
+    let mut ids = Vec::with_capacity(state.geometry.len());
+    let mut seen = BTreeSet::new();
+    for surface_id in &state.visible_surface_order {
+        if state.geometry.contains_key(surface_id) && seen.insert(*surface_id) {
+            ids.push(*surface_id);
+        }
+    }
+    let mut remaining = state
+        .geometry
+        .keys()
+        .filter(|surface_id| !seen.contains(surface_id))
+        .copied()
+        .collect::<Vec<_>>();
+    remaining.sort_unstable();
+    ids.extend(remaining);
+    ids
 }
 
 fn record_script_perf(state: &State, duration: Duration) {
@@ -1593,10 +1702,7 @@ fn apply_theme_extension_toml_direct(
         .script
         .as_deref()
         .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
-    let animation_hz = extension
-        .animation
-        .as_ref()
-        .map(|animation| animation.hz.min(MAX_ANIMATION_HZ));
+    let animation_hz = effective_animation_hz(&extension);
     let script_access = extension.script_access.clone();
     let mut script_host_access = script_host_access.clone();
     script_host_access.service_grants = script_service_grants(script_access.as_ref());
@@ -1615,6 +1721,23 @@ fn apply_theme_extension_toml_direct(
     publish_scene_if_changed(state);
     install_script_event_subscriptions(shared, state, script_access, subscription_generation);
     Ok(())
+}
+
+fn effective_animation_hz(extension: &DecorationThemeExtension) -> Option<u16> {
+    let top_level = extension.animation.as_ref().map(|animation| animation.hz);
+    let component_level = extension.components.as_ref().and_then(|components| {
+        components
+            .values()
+            .filter(|component| component_enabled(component))
+            .filter_map(|component| component.animation.as_ref().map(|animation| animation.hz))
+            .max()
+    });
+    top_level
+        .into_iter()
+        .chain(component_level)
+        .filter(|hz| *hz > 0)
+        .max()
+        .map(|hz| hz.min(MAX_ANIMATION_HZ))
 }
 
 fn clear_visual_projection_state(state: &mut State) {
@@ -3450,6 +3573,7 @@ fn apply_attach_layout_snapshot(
     use std::collections::BTreeSet;
     let mut changed = false;
     let mut seen_surfaces: BTreeSet<Uuid> = BTreeSet::new();
+    let mut visible_surface_order = Vec::new();
     for surface in &snapshot.surfaces {
         let Some(pane_id) = surface.pane_id else {
             continue;
@@ -3458,6 +3582,7 @@ fn apply_attach_layout_snapshot(
             continue;
         }
         seen_surfaces.insert(surface.surface_id);
+        visible_surface_order.push(surface.surface_id);
         let new_geometry = PaneGeometry {
             pane_id,
             rect: surface.rect.clone(),
@@ -3467,6 +3592,10 @@ fn apply_attach_layout_snapshot(
         if prev.as_ref() != state.geometry.get(&surface.surface_id) {
             changed = true;
         }
+    }
+    if state.visible_surface_order != visible_surface_order {
+        state.visible_surface_order = visible_surface_order;
+        changed = true;
     }
     // Drop panes that are no longer in the visible set.
     let drop_ids: Vec<Uuid> = state
@@ -5179,6 +5308,67 @@ exited = ""
     }
 
     #[test]
+    fn component_target_filters_render_payload_to_unfocused_panes() {
+        let plugin = DecorationPlugin::new();
+        let focused = Uuid::from_u128(0xf100);
+        let unfocused = Uuid::from_u128(0xf101);
+        seed_geometry(&plugin, focused, 20, 5);
+        seed_geometry(&plugin, unfocused, 20, 5);
+        set_activity(&plugin, focused, true, false);
+        set_activity(&plugin, unfocused, false, false);
+
+        let mut theme = sample_theme();
+        theme.animation = Some(
+            bmux_decoration_plugin_api::decoration_state::AnimationSpec {
+                kind: "rainbow_snake".to_string(),
+                hz: 12,
+            },
+        );
+        theme.components = Some(BTreeMap::from([(
+            "snake".to_string(),
+            DecorationComponentSpec {
+                enabled: None,
+                script: Some("rainbow_snake".to_string()),
+                script_instance: None,
+                entrypoint: None,
+                above: None,
+                below: None,
+                target: Some(DecorationComponentTargetSpec {
+                    kind: "unfocused-panes".to_string(),
+                    index: None,
+                    modulo: None,
+                    remainder: None,
+                }),
+                animation: None,
+                settings: None,
+                input: None,
+                visual_adapters: None,
+            },
+        )]));
+        install_extension_with_script(&plugin, theme);
+
+        let scene = plugin.build_scene();
+        let focused_surface = scene
+            .surfaces
+            .get(&focused)
+            .expect("focused surface emitted");
+        let unfocused_surface = scene
+            .surfaces
+            .get(&unfocused)
+            .expect("unfocused surface emitted");
+        let focused_has_snake = focused_surface
+            .paint_commands
+            .iter()
+            .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "◆"));
+        let unfocused_has_snake = unfocused_surface
+            .paint_commands
+            .iter()
+            .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "◆"));
+        assert!(!focused_has_snake, "target excludes focused pane");
+        assert!(unfocused_has_snake, "target includes unfocused pane");
+    }
+
+    #[test]
     fn decoration_input_spec_publishes_coarse_input_hook() {
         let plugin = DecorationPlugin::new();
         let mut theme = sample_theme();
@@ -5191,6 +5381,8 @@ exited = ""
                 entrypoint: None,
                 above: None,
                 below: None,
+                target: None,
+                animation: None,
                 settings: None,
                 input: Some(DecorationInputSpec {
                     mouse: Some(vec!["down".to_string(), "drag".to_string()]),

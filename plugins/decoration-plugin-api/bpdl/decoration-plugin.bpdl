@@ -100,6 +100,16 @@ interface decoration-state {
         above: list<string>?,
         // Paint this component before the listed component ids.
         below: list<string>?,
+        // Optional generic pane targeting. Missing preserves legacy script
+        // behavior: the component receives all panes and the script decides
+        // where to paint. When present, the decoration plugin filters the
+        // render payload to panes matching this selector and marks those panes
+        // as `component_active = true` for target-aware scripts.
+        target: decoration-component-target-spec?,
+        // Optional component-local animation hint. The decoration plugin uses
+        // the maximum active component/top-level hz, capped internally, so
+        // independently-stacked animated components can coexist.
+        animation: animation-spec?,
         // Optional component-local settings forwarded to scripts as
         // `message.component.settings`. Theme stacks deep-merge this map
         // with the rest of the component spec, allowing user config to
@@ -112,6 +122,17 @@ interface decoration-state {
         // plugin-owned; the decoration plugin only forwards compact adapter
         // payloads to Lua under `message.visual`.
         visual-adapters: list<decoration-visual-adapter-spec>?,
+    }
+
+    record decoration-component-target-spec {
+        // Supported kinds: all-panes, focused-pane, unfocused-panes,
+        // visible-index, visible-index-mod. Unknown values match no panes.
+        kind: string,
+        // For visible-index, the zero-based visible pane index to match.
+        index: u16?,
+        // For visible-index-mod, match `visible_index % modulo == remainder`.
+        modulo: u16?,
+        remainder: u16?,
     }
 
     record decoration-visual-adapter-spec {

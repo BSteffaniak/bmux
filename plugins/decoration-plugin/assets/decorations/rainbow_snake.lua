@@ -213,9 +213,16 @@ local function render_death(cmds, state, raw_total, visual_total)
     return true
 end
 
+local function component_active(pane)
+    if pane.component_active ~= nil then
+        return pane.component_active
+    end
+    return pane.focused
+end
+
 local function render_pane(pane, message)
     local state = pane_state(pane)
-    if not pane.focused then
+    if not component_active(pane) then
         state.last_focus_ms = nil
         return {}
     end

@@ -24,7 +24,12 @@ local function heat_color(cpu)
 end
 
 local function pane_metrics(pane)
-    local metrics = latest.panes and latest.panes[pane.id]
+    local pane_id = pane.pane_id or pane.id
+    local metrics = latest.panes and latest.panes[pane_id]
+    if metrics ~= nil and metrics.available then
+        return metrics
+    end
+    metrics = latest.panes and latest.panes[pane.id]
     if metrics ~= nil and metrics.available then
         return metrics
     end
