@@ -96,7 +96,10 @@ local function render(message)
         local r, g, b = heat_color(cpu)
         local glyphs = "single-line"
         local z = 11
-        if cpu >= 80 then
+        if pane.focused then
+            glyphs = "thick"
+            z = 14
+        elseif cpu >= 80 then
             glyphs = "thick"
             z = 14
         elseif cpu >= 50 then
