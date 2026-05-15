@@ -97,7 +97,7 @@ local function render(message)
         local glyphs = "single-line"
         local z = 11
         if pane.focused then
-            glyphs = "heavy_double"
+            glyphs = "thick"
             z = 14
         elseif cpu >= 80 then
             glyphs = "thick"
@@ -113,7 +113,7 @@ local function render(message)
                 rect = pane.rect,
                 z = z,
                 glyphs = glyphs,
-                style = { fg = bmux.rgb(r, g, b), bold = cpu >= 50 },
+                style = { fg = bmux.rgb(r, g, b), bold = pane.focused or cpu >= 50 },
             })
         end
         if entrypoint == "all" or entrypoint == "header" then

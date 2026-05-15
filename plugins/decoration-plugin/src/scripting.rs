@@ -1567,9 +1567,10 @@ mod tests {
             assert!(commands.iter().any(|command| matches!(
                 command,
                 bmux_scene_protocol::scene_protocol::PaintCommand::BoxBorder {
-                    glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::HeavyDouble,
+                    glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::Thick,
+                    style,
                     ..
-                }
+                } if style.bold
             )));
             assert!(commands.iter().any(|command| matches!(
                 command,
