@@ -56,55 +56,6 @@ local function process_count_label(metrics)
     return string.format("P %d", metrics.process_count)
 end
 
-local function contrast_color(r, g, b)
-    local luminance = (0.299 * r) + (0.587 * g) + (0.114 * b)
-    if luminance > 150 then
-        return bmux.rgb(10, 14, 10)
-    end
-    return bmux.rgb(255, 255, 255)
-end
-
-local function add_solid_border(cmds, rect, z, color)
-    if rect.w <= 0 or rect.h <= 0 then
-        return
-    end
-    local style = { bg = color }
-    table.insert(cmds, {
-        kind = "filled_rect",
-        rect = { x = rect.x, y = rect.y, w = rect.w, h = 1 },
-        z = z,
-        glyph = " ",
-        style = style,
-    })
-    if rect.h > 1 then
-        table.insert(cmds, {
-            kind = "filled_rect",
-            rect = { x = rect.x, y = rect.y + rect.h - 1, w = rect.w, h = 1 },
-            z = z,
-            glyph = " ",
-            style = style,
-        })
-    end
-    if rect.h > 2 then
-        table.insert(cmds, {
-            kind = "filled_rect",
-            rect = { x = rect.x, y = rect.y + 1, w = 1, h = rect.h - 2 },
-            z = z,
-            glyph = " ",
-            style = style,
-        })
-        if rect.w > 1 then
-            table.insert(cmds, {
-                kind = "filled_rect",
-                rect = { x = rect.x + rect.w - 1, y = rect.y + 1, w = 1, h = rect.h - 2 },
-                z = z,
-                glyph = " ",
-                style = style,
-            })
-        end
-    end
-end
-
 local function label_for(metrics)
     local cpu = cpu_for(metrics)
     local parts = { string.format("CPU %d%%", math.floor(cpu + 0.5)) }
@@ -143,10 +94,10 @@ local function render(message)
         local metrics = pane_metrics(pane)
         local label, cpu = label_for(metrics)
         local r, g, b = heat_color(cpu)
-        local color = bmux.rgb(r, g, b)
         local glyphs = "single-line"
         local z = 11
         if pane.focused then
+            glyphs = "thick"
             z = 14
         elseif cpu >= 80 then
             glyphs = "thick"
@@ -157,30 +108,22 @@ local function render(message)
         end
         local cmds = {}
         if entrypoint == "all" or entrypoint == "border" then
-            if pane.focused then
-                add_solid_border(cmds, pane.rect, z, color)
-            else
-                table.insert(cmds, {
-                    kind = "box_border",
-                    rect = pane.rect,
-                    z = z,
-                    glyphs = glyphs,
-                    style = { fg = color, bold = cpu >= 50 },
-                })
-            end
+            table.insert(cmds, {
+                kind = "box_border",
+                rect = pane.rect,
+                z = z,
+                glyphs = glyphs,
+                style = { fg = bmux.rgb(r, g, b), bold = pane.focused or cpu >= 50 },
+            })
         end
         if entrypoint == "all" or entrypoint == "header" then
-            local header_style = { fg = color, bold = true }
-            if pane.focused then
-                header_style = { fg = contrast_color(r, g, b), bg = color, bold = true }
-            end
             table.insert(cmds, {
                 kind = "text",
                 col = pane.rect.x + 2,
                 row = pane.rect.y,
                 z = z + 1,
                 text = label,
-                style = header_style,
+                style = { fg = bmux.rgb(r, g, b), bold = true },
             })
         end
         surfaces[pane.id] = cmds

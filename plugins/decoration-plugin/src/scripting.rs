@@ -1566,11 +1566,11 @@ mod tests {
             let commands = &outcome.surfaces["test-pane"];
             assert!(commands.iter().any(|command| matches!(
                 command,
-                bmux_scene_protocol::scene_protocol::PaintCommand::FilledRect {
-                    rect,
+                bmux_scene_protocol::scene_protocol::PaintCommand::BoxBorder {
+                    glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::Thick,
                     style,
                     ..
-                } if rect.h == 1 && rect.w == 20 && style.bg.is_some()
+                } if style.bold
             )));
             assert!(commands.iter().any(|command| matches!(
                 command,
