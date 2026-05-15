@@ -1,49 +1,60 @@
 # bmux_ipc
 
-Wire protocol, framing, transport, and compression for bmux IPC.
+Cross-platform IPC protocol models and transport primitives for bmux.
 
 ## Overview
 
-Defines the complete client-server wire protocol for bmux. This is the shared
-contract between the client and server crates -- all request/response types,
-protocol version negotiation, frame encoding, transport abstraction, and
-optional compression live here. The largest model crate in the workspace.
+This crate defines the core wire envelope used between bmux clients and the
+server: endpoint addressing, protocol negotiation, request/response envelopes,
+event delivery, service invocation, framing, transport, and optional
+compression. Product-domain models and behavior live in plugin API, protocol,
+or neutral state crates; IPC carries encoded payloads and generic routing data
+for those domains.
 
-## Features
+## Responsibilities
 
-- Cross-platform IPC endpoints (Unix domain sockets, Windows named pipes)
-- Protocol version negotiation with capability advertisement
-- Length-delimited framing with CRC integrity checks
-- Optional zstd and LZ4 frame compression (`compression` feature)
-- Complete request/response envelope types for all server operations
-- Session, pane, client, and context summary models
-- Attach scene graph types (surfaces, layers, pane chunks)
-- Recording profile and status types
+- Represent Unix socket and Windows named-pipe endpoints.
+- Negotiate wire epoch, protocol revision, and supported capabilities.
+- Encode and decode top-level request/response/event envelopes.
+- Route generic service invocations by capability, interface, and operation.
+- Support service pipelines with encoded or JSON-template payloads.
+- Provide local transport and length-delimited frame helpers.
+- Offer optional payload/transport compression behind feature flags.
 
-## Core Types
+## Core types
 
-- **`IpcEndpoint`**: `UnixSocket(PathBuf)` or `WindowsNamedPipe(String)`
-- **`Envelope`**: Top-level wire message with `EnvelopeKind` discriminant
-- **`Request`** / **`Response`**: Typed request and response payloads
-- **`ProtocolContract`**: Advertised capabilities and version
-- **`NegotiatedProtocol`**: Result of capability negotiation
-- **`AttachGrant`**: Server-issued attach token with layout state
-- **`AttachPaneChunk`**: Streamed pane output during attach
+- **`IpcEndpoint`**: Cross-platform local server endpoint.
+- **`Envelope`** and **`EnvelopeKind`**: Top-level framed wire message.
+- **`Request`** and **`ResponsePayload`**: Core control, event, and generic
+  service transport payloads.
+- **`ProtocolContract`** and **`NegotiatedProtocol`**: Capability and protocol
+  compatibility negotiation.
+- **`InvokeServiceKind`**, **`ServicePipelineRequest`**, and related service
+  pipeline types: generic dispatch vocabulary for plugin/service calls.
 
 ## Modules
 
-- **`transport`**: `LocalIpcListener`, `LocalIpcStream`, `IpcStreamWriter`/`Reader`
-- **`frame`**: Length-delimited frame encoding/decoding with optional compression
-- **`compression`**: Pluggable zstd/LZ4 codecs behind feature flags
-- **`compressed_stream`**: Streaming compression wrapper for `AsyncWrite`
+- **`transport`**: `LocalIpcListener`, `LocalIpcStream`, and async reader/writer
+  traits.
+- **`frame`**: Length-delimited frame encoding and decoding.
+- **`compression`**: zstd/LZ4 payload compression support behind feature flags.
+- **`compressed_stream`**: Streaming compression wrappers for async I/O.
 
 ## Usage
 
-```rust
-use bmux_ipc::{IpcEndpoint, encode, decode};
+```rust,no_run
 use bmux_ipc::transport::LocalIpcListener;
+use bmux_ipc::IpcEndpoint;
 
-let endpoint = IpcEndpoint::from_session_name("my-session");
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = IpcEndpoint::unix_socket("/tmp/bmux.sock");
 let listener = LocalIpcListener::bind(&endpoint)?;
 let stream = listener.accept().await?;
+# let _ = stream;
+# Ok(())
+# }
 ```
+
+Domain-specific callers should prefer typed plugin API crates for request and
+response payloads, using IPC only as the core transport and service-routing
+layer.
