@@ -293,18 +293,22 @@ image-iterm2 = [
     "dep:bmux_image",
     "dep:image",
     "bmux_image/iterm2",
+    "bmux_decoration_plugin_renderer?/image-iterm2",
     "bmux_pane_runtime_plugin/image-registry",
 ]
 image-kitty = [
     "dep:bmux_image",
     "dep:image",
     "bmux_image/kitty",
+    "bmux_attach_pipeline/image-kitty",
+    "bmux_decoration_plugin_renderer?/image-kitty",
     "bmux_pane_runtime_plugin/image-registry",
 ]
 image-protocols = ["image-sixel", "image-kitty", "image-iterm2"]
 image-sixel = [
     "dep:bmux_image",
     "bmux_image/sixel",
+    "bmux_decoration_plugin_renderer?/image-sixel",
     "bmux_pane_runtime_plugin/image-registry",
 ]
 

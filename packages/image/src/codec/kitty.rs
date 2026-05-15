@@ -155,12 +155,29 @@ pub fn encode_transmit(
         KittyFormat::Png => 100,
     };
     let b64 = base64_encode(data);
-    format!("Ga=t,i={image_id},f={fmt},s={width},v={height};{b64}").into_bytes()
+    // q=2 suppresses terminal replies. Without it, Kitty-compatible terminals
+    // send APC acknowledgements on stdin, which attach clients may forward to
+    // the running pane as literal text.
+    format!("Ga=t,i={image_id},f={fmt},s={width},v={height},q=2;{b64}").into_bytes()
 }
 
-/// Encode a kitty graphics placement command.
-pub fn encode_place(image_id: u32, placement_id: u32, row: u16, col: u16) -> Vec<u8> {
-    format!("Ga=p,i={image_id},p={placement_id},C={col},R={row}").into_bytes()
+/// Encode a kitty graphics placement command for the current cursor cell.
+pub fn encode_place(image_id: u32, placement_id: u32, _row: u16, _col: u16) -> Vec<u8> {
+    encode_place_with_z(image_id, placement_id, 0)
+}
+
+/// Encode a kitty graphics placement command for the current cursor cell with a z-index.
+pub fn encode_place_with_z(image_id: u32, placement_id: u32, z_index: i16) -> Vec<u8> {
+    // q=2 suppresses terminal replies for the same reason as transmit. BMUX
+    // positions Kitty graphics by moving the cursor before placement; embedding
+    // non-standard row/column parameters makes placement terminal-dependent.
+    format!("Ga=p,i={image_id},p={placement_id},z={z_index},q=2").into_bytes()
+}
+
+/// Encode a kitty graphics delete-by-image-id command.
+pub fn encode_delete_image(image_id: u32) -> Vec<u8> {
+    // q=2 suppresses delete acknowledgements too.
+    format!("Ga=d,d=i,i={image_id},q=2").into_bytes()
 }
 
 fn parse_u32(params: &std::collections::HashMap<&str, &str>, key: &str) -> Option<u32> {
@@ -209,6 +226,22 @@ mod tests {
             }
             _ => panic!("expected Place"),
         }
+    }
+
+    #[test]
+    fn encode_commands_suppress_terminal_replies() {
+        let transmit = String::from_utf8(encode_transmit(42, KittyFormat::Rgba, b"abc", 1, 1))
+            .expect("kitty transmit command should be utf8");
+        assert!(transmit.contains(",q=2;"), "{transmit}");
+
+        let place = String::from_utf8(encode_place(42, 42, 1, 2))
+            .expect("kitty place command should be utf8");
+        assert_eq!(place, "Ga=p,i=42,p=42,z=0,q=2");
+        assert!(place.ends_with(",q=2"), "{place}");
+
+        let delete = String::from_utf8(encode_delete_image(42))
+            .expect("kitty delete command should be utf8");
+        assert_eq!(delete, "Ga=d,d=i,i=42,q=2");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use bmux_attach_layout_protocol::{AttachInputModeState, AttachMouseProtocolState};
-use bmux_plugin::{ExtensionRect, RenderDamage};
+use bmux_plugin::{ExtensionRect, RenderDamage, TerminalGraphicFill, TerminalRgba};
 use bmux_terminal_grid::{GridLimits, PhysicalRow, TerminalGridStream, TerminalProtocolTracker};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -49,7 +49,23 @@ pub struct PaneRenderBuffer {
     pub expected_stream_start: Option<u64>,
     pub scrollback_window: Option<PaneScrollbackWindow>,
     pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
+    pub terminal_graphics_cache: BTreeMap<u64, TerminalGraphicCacheEntry>,
     pub visual_row_fingerprints: PaneVisualRowFingerprintCache,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalGraphicCacheEntry {
+    pub surface_id: Uuid,
+    pub signature: TerminalGraphicSignature,
+    pub host_image_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerminalGraphicSignature {
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub color: TerminalRgba,
+    pub fill: TerminalGraphicFill,
 }
 
 #[derive(Default)]
@@ -155,6 +171,7 @@ impl Default for PaneRenderBuffer {
             expected_stream_start: None,
             scrollback_window: None,
             extension_render_cache: BTreeMap::new(),
+            terminal_graphics_cache: BTreeMap::new(),
             visual_row_fingerprints: PaneVisualRowFingerprintCache::default(),
         }
     }

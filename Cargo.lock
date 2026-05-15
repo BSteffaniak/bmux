@@ -1016,6 +1016,7 @@ dependencies = [
  "bmux_attach_pipeline_models",
  "bmux_attach_view_protocol",
  "bmux_client",
+ "bmux_image",
  "bmux_plugin",
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",

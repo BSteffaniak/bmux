@@ -68,12 +68,12 @@ pub use render::{
     AttachVisualCellRef, AttachVisualFrameView, AttachVisualProjectionResult,
     AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer,
-    RenderExtensionRegistry, RenderNamedColor, RenderOp, RenderStyle, RenderTextSpan,
-    RenderUnderCell, TerminalRenderCapabilities, VisualAdapterRegistry,
-    clip_render_text_run_to_rect, global_render_extension_registry, global_visual_adapter_registry,
-    register_render_extension, register_visual_adapter, registered_render_extensions,
-    registered_visual_adapter, render_char_display_width_u16, render_single_display_cell_char,
-    render_text_width_u16,
+    RenderExtensionRegistry, RenderLayerItem, RenderNamedColor, RenderOp, RenderStyle,
+    RenderTextSpan, RenderUnderCell, TerminalGraphicFill, TerminalGraphicOverlay,
+    TerminalRenderCapabilities, TerminalRgba, VisualAdapterRegistry, clip_render_text_run_to_rect,
+    global_render_extension_registry, global_visual_adapter_registry, register_render_extension,
+    register_visual_adapter, registered_render_extensions, registered_visual_adapter,
+    render_char_display_width_u16, render_single_display_cell_char, render_text_width_u16,
 };
 pub use service_location::{ServiceLocation, ServiceLocationMap, global_service_locations};
 pub use startup_gate::{

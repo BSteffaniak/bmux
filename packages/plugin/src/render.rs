@@ -43,7 +43,7 @@ use uuid::Uuid;
 /// scene-protocol dependency: generic extensions (e.g. a future
 /// overlay plugin that doesn't produce scene-protocol output) can
 /// still speak the trait without importing wire-schema types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExtensionRect {
     pub x: u16,
     pub y: u16,
@@ -921,6 +921,57 @@ impl TerminalRenderCapabilities {
     }
 }
 
+/// RGBA color used by terminal graphics primitives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TerminalRgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// Pixel mask applied to a solid terminal graphics primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum TerminalGraphicFill {
+    Full,
+    Top { thickness_px: u16 },
+    Bottom { thickness_px: u16 },
+    Left { thickness_px: u16 },
+    Right { thickness_px: u16 },
+}
+
+/// Generic terminal graphics overlay primitive.
+///
+/// The host attach renderer owns protocol selection, image caching, placement,
+/// and cleanup. Extensions provide stable semantic/pixel intent only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TerminalGraphicOverlay {
+    /// Stable extension-owned key for this graphic within a surface/layer.
+    pub key: u64,
+    /// Cell-aligned placement rectangle in absolute terminal coordinates.
+    pub cell_rect: ExtensionRect,
+    /// Pixel dimensions of the transmitted image. These normally correspond to
+    /// `cell_rect` multiplied by the detected cell pixel dimensions.
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub color: TerminalRgba,
+    pub fill: TerminalGraphicFill,
+    /// Z-order hint for protocols that support it. Positive values render above
+    /// terminal text in Kitty-compatible terminals.
+    pub z_index: i16,
+}
+
+/// A z-ordered item emitted by a render extension.
+///
+/// Text/cell items and terminal graphics share one ordering stream so
+/// extensions do not need an imperative raw-protocol escape hatch to preserve
+/// paint order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderLayerItem {
+    Op(RenderOp),
+    Graphic(TerminalGraphicOverlay),
+}
+
 /// Context supplied to render extensions for one render pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RenderExtensionContext {
@@ -1075,6 +1126,22 @@ pub trait AttachRenderExtension: Send + Sync {
         _surface_rect: &ExtensionRect,
         _damage: &RenderDamage,
     ) -> Option<Vec<RenderOp>> {
+        None
+    }
+
+    /// Return z-ordered declarative render items for one layer and damaged
+    /// region of `surface_rect`. Returning `None` asks the host to fall back to
+    /// [`Self::render_layer_ops_with_context`] and then the imperative escape
+    /// hatch. The default preserves existing operation-only extensions.
+    fn render_layer_items_with_context(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Option<Vec<RenderLayerItem>> {
+        let _ = (surface_id, surface_rect, damage, layer, context);
         None
     }
 

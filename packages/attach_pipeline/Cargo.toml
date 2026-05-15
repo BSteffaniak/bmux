@@ -16,6 +16,7 @@ bmux_attach_layout_protocol = { workspace = true }
 bmux_attach_pipeline_models = { workspace = true }
 bmux_attach_view_protocol   = { workspace = true }
 bmux_client                 = { workspace = true }
+bmux_image                  = { workspace = true, optional = true }
 bmux_plugin                 = { workspace = true }
 bmux_scene_protocol         = { workspace = true }
 bmux_scene_protocol_render  = { workspace = true }
@@ -30,12 +31,15 @@ uuid          = { workspace = true, features = ["std"] }
 [features]
 default = []
 
+image-kitty = ["dep:bmux_image", "bmux_image/kitty"]
+
 fail-on-warnings = [
     "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_attach_pipeline_models/fail-on-warnings",
     "bmux_attach_view_protocol/fail-on-warnings",
     "bmux_appearance/fail-on-warnings",
     "bmux_client/fail-on-warnings",
+    "bmux_image?/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_scene_protocol/fail-on-warnings",
     "bmux_scene_protocol_render/fail-on-warnings",

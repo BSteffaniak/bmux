@@ -22,6 +22,11 @@ uuid    = { workspace = true, features = ["std"] }
 [features]
 default = []
 
+image-iterm2    = []
+image-kitty     = []
+image-protocols = ["image-sixel", "image-kitty", "image-iterm2"]
+image-sixel     = []
+
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_scene_protocol/fail-on-warnings",

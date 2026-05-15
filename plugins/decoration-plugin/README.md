@@ -146,9 +146,14 @@ table.insert(cmds, {
 })
 ```
 
-Today, semantic borders lower to the same Unicode/text border fallback. The
-capability plumbing is in place so a later renderer can emit pixel-precise
-Kitty/Sixel/iTerm2-backed borders without changing script authoring.
+When `bmux_decoration_plugin_renderer` and the attach pipeline are built with
+`image-kitty` and the attached terminal reports Kitty graphics, alpha support,
+and cell pixel metrics, semantic borders emit pixel-backed border segments via
+the attach renderer's generic terminal-graphics compositor. Sixel and iTerm2
+inline images are intentionally not used for semantic borders because they do
+not provide safe transparent overlay semantics for pane chrome. Unsupported
+terminals deterministically fall back to the configured Unicode/text border
+glyphs.
 See `assets/decorations/pulse.lua` for a fully-worked example.
 
 ### `bmux.*` helper table
