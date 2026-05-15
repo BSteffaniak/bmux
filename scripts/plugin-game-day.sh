@@ -37,13 +37,17 @@ run_policy_denial_contract_scenario() {
 run_perf_regression_drill() {
 	echo
 	echo "[scenario 3] perf threshold regression drill"
+	local perf_output_file
+	perf_output_file="$(mktemp "${TMPDIR:-/tmp}/bmux-plugin-game-day-perf.XXXXXX")"
+	trap 'rm -f "$perf_output_file"' RETURN
+
 	set +e
 	./scripts/perf-plugin-command-latency.sh \
 		--iterations 1 \
 		--warmup 0 \
 		--max-p95-ms 1 \
 		--max-p99-ms 1 \
-		-- plugin list --json >/tmp/bmux-plugin-game-day-perf.txt 2>&1
+		-- plugin list --json >"$perf_output_file" 2>&1
 	local status=$?
 	set -e
 
@@ -53,7 +57,7 @@ run_perf_regression_drill() {
 	fi
 
 	local perf_output
-	perf_output="$(cat /tmp/bmux-plugin-game-day-perf.txt)"
+	perf_output="$(<"$perf_output_file")"
 	if [[ "$perf_output" != *"SLO check failed"* ]]; then
 		echo "scenario 3 missing perf failure marker" >&2
 		exit 1
