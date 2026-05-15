@@ -97,7 +97,7 @@ local function render(message)
         local glyphs = "single-line"
         local z = 11
         if pane.focused then
-            glyphs = "thick"
+            glyphs = "heavy_double"
             z = 14
         elseif cpu >= 80 then
             glyphs = "thick"
