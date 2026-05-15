@@ -1,29 +1,49 @@
 # bmux_server
 
-Server-side functionality for bmux terminal multiplexer.
+Core server host for bmux IPC and plugin services.
 
 ## Overview
 
-This package implements the bmux server, handling client connections, session management, and coordinating all server-side operations.
+This crate hosts the bmux server event loop and core IPC request handling. It
+owns generic server plumbing such as endpoint binding, protocol negotiation,
+event delivery, service dispatch, and shutdown coordination. Product-domain
+behavior is implemented by plugins or neutral state crates and is reached
+through generic request/service paths.
 
-## Features
+## Responsibilities
 
-- Client connection handling
-- Session orchestration
-- Server lifecycle management
-- Inter-process communication
+- Bind a local IPC endpoint and accept client connections.
+- Negotiate protocol contracts with clients.
+- Handle core control requests such as ping, status, event subscription, and
+  server shutdown.
+- Route generic service invocations to registered plugin/service handlers.
+- Broadcast wire events to polling or server-push clients.
+- Provide host-side runtime plumbing for recording, performance, and plugin
+  state replayers without embedding domain convenience APIs.
 
-## Core Components
+## Core types
 
-- **BmuxServer**: Main server implementation
-- **ClientHandler**: Individual client management
-- **ServerState**: Global server state
+- **`BmuxServer`**: Server handle with explicit-endpoint and config-derived
+  constructors.
+- **`ServiceRoute`**: Capability/interface/operation route for service dispatch.
+- **`ServiceInvokeContext`**: Per-call context available to service handlers.
+- **`ServiceInvokeOutput`**: Encoded service response payload plus metadata.
 
 ## Usage
 
-```rust
+```rust,no_run
+use bmux_ipc::IpcEndpoint;
 use bmux_server::BmuxServer;
 
-let server = BmuxServer::new(socket_path)?;
+# async fn example() -> anyhow::Result<()> {
+let endpoint = IpcEndpoint::unix_socket("/tmp/bmux.sock");
+let server = BmuxServer::new(endpoint);
+
 server.run().await?;
+# Ok(())
+# }
 ```
+
+Callers that already have resolved bmux paths can use
+`BmuxServer::from_config_paths` to derive the platform-specific endpoint from
+configuration.
