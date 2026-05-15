@@ -341,7 +341,8 @@ mod lua_backend {
         ScriptHostAccess, ScriptMessage, ScriptServiceCall, ScriptServiceGrant,
     };
     use bmux_scene_protocol::scene_protocol::{
-        Color, GradientAxis, NamedColor, PaintCommand, Rect, Style,
+        Color, GradientAxis, NamedColor, PaintCommand, Rect, Style, TerminalCapability,
+        TerminalCapabilityQuery,
     };
     use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value};
     use serde_json::Value as JsonValue;
@@ -920,6 +921,7 @@ mod lua_backend {
                         style,
                     });
                 }
+                "semantic_border" => out.push(semantic_border_from_table(&entry, z)?),
                 other => {
                     tracing::warn!(
                         target: "decoration.script",
@@ -931,6 +933,33 @@ mod lua_backend {
         Ok(out)
     }
 
+    fn semantic_border_from_table(entry: &Table, z: i16) -> mlua::Result<PaintCommand> {
+        let rect_tbl: Table = entry.get("rect")?;
+        let rect = rect_from_table(&rect_tbl)?;
+        let glyphs_name: String = entry
+            .get("fallback_glyphs")
+            .or_else(|_| entry.get("glyphs"))
+            .unwrap_or_else(|_| "single_line".to_string());
+        let fallback_glyphs = crate::glyphs::parse_border_glyphs(&glyphs_name);
+        let style = style_from_table(entry.get("style").ok());
+        let thickness_px = entry.get("thickness_px").unwrap_or(1);
+        let radius_px = entry.get("radius_px").unwrap_or(0);
+        let when = if let Some(when_tbl) = entry.get::<Option<Table>>("when")? {
+            Some(capability_query_from_table(&when_tbl)?)
+        } else {
+            None
+        };
+        Ok(PaintCommand::SemanticBorder {
+            rect,
+            z,
+            style,
+            fallback_glyphs,
+            thickness_px,
+            radius_px,
+            when,
+        })
+    }
+
     fn rect_from_table(t: &Table) -> mlua::Result<Rect> {
         Ok(Rect {
             x: t.get("x")?,
@@ -938,6 +967,38 @@ mod lua_backend {
             w: t.get("w")?,
             h: t.get("h")?,
         })
+    }
+
+    fn capability_query_from_table(t: &Table) -> mlua::Result<TerminalCapabilityQuery> {
+        Ok(TerminalCapabilityQuery {
+            all: capability_list_from_table(t.get::<Option<Table>>("all")?)?,
+            any: capability_list_from_table(t.get::<Option<Table>>("any")?)?,
+            none: capability_list_from_table(t.get::<Option<Table>>("none")?)?,
+        })
+    }
+
+    fn capability_list_from_table(t: Option<Table>) -> mlua::Result<Vec<TerminalCapability>> {
+        let Some(t) = t else {
+            return Ok(Vec::new());
+        };
+        t.sequence_values::<String>()
+            .map(|value| value.map(|value| parse_terminal_capability(&value)))
+            .collect()
+    }
+
+    fn parse_terminal_capability(value: &str) -> TerminalCapability {
+        match value {
+            "unicode_box_drawing" | "unicode-box-drawing" => TerminalCapability::UnicodeBoxDrawing,
+            "unicode_block_elements" | "unicode-block-elements" => {
+                TerminalCapability::UnicodeBlockElements
+            }
+            "graphics_kitty" | "graphics-kitty" | "kitty" => TerminalCapability::GraphicsKitty,
+            "graphics_sixel" | "graphics-sixel" | "sixel" => TerminalCapability::GraphicsSixel,
+            "graphics_iterm2" | "graphics-iterm2" | "iterm2" => TerminalCapability::GraphicsIterm2,
+            "graphics_alpha" | "graphics-alpha" | "alpha" => TerminalCapability::GraphicsAlpha,
+            "cell_pixels" | "cell-pixels" => TerminalCapability::CellPixels,
+            _ => TerminalCapability::Truecolor,
+        }
     }
 
     fn style_from_table(t: Option<Table>) -> Style {
@@ -1566,8 +1627,9 @@ mod tests {
             let commands = &outcome.surfaces["test-pane"];
             assert!(commands.iter().any(|command| matches!(
                 command,
-                bmux_scene_protocol::scene_protocol::PaintCommand::BoxBorder {
-                    glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::Thick,
+                bmux_scene_protocol::scene_protocol::PaintCommand::SemanticBorder {
+                    fallback_glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::Thick,
+                    thickness_px: 3,
                     style,
                     ..
                 } if style.bold

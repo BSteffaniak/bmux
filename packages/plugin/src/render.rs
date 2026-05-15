@@ -863,6 +863,70 @@ impl RenderDamage {
     }
 }
 
+/// Rendering capabilities detected for the attached terminal.
+///
+/// These fields are intentionally generic host facts, not decoration-specific
+/// policy. Render extensions can use them to choose deterministic fallbacks
+/// without probing the terminal themselves.
+#[allow(clippy::struct_excessive_bools)] // Independent terminal feature flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TerminalRenderCapabilities {
+    pub truecolor: bool,
+    pub unicode_box_drawing: bool,
+    pub unicode_block_elements: bool,
+    pub kitty_graphics: bool,
+    pub sixel: bool,
+    pub iterm2_inline_images: bool,
+    pub graphics_alpha: bool,
+    pub cell_pixel_width: u16,
+    pub cell_pixel_height: u16,
+}
+
+impl Default for TerminalRenderCapabilities {
+    fn default() -> Self {
+        Self {
+            truecolor: true,
+            unicode_box_drawing: true,
+            unicode_block_elements: true,
+            kitty_graphics: false,
+            sixel: false,
+            iterm2_inline_images: false,
+            graphics_alpha: false,
+            cell_pixel_width: 0,
+            cell_pixel_height: 0,
+        }
+    }
+}
+
+impl TerminalRenderCapabilities {
+    /// Compact stable-ish key suitable for extension render cache partitioning.
+    #[must_use]
+    pub fn cache_key(self) -> u64 {
+        let mut key = 0_u64;
+        key |= u64::from(self.truecolor);
+        key |= u64::from(self.unicode_box_drawing) << 1;
+        key |= u64::from(self.unicode_block_elements) << 2;
+        key |= u64::from(self.kitty_graphics) << 3;
+        key |= u64::from(self.sixel) << 4;
+        key |= u64::from(self.iterm2_inline_images) << 5;
+        key |= u64::from(self.graphics_alpha) << 6;
+        key |= u64::from(self.cell_pixel_width) << 16;
+        key |= u64::from(self.cell_pixel_height) << 32;
+        key
+    }
+
+    #[must_use]
+    pub const fn has_cell_pixels(self) -> bool {
+        self.cell_pixel_width > 0 && self.cell_pixel_height > 0
+    }
+}
+
+/// Context supplied to render extensions for one render pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RenderExtensionContext {
+    pub capabilities: TerminalRenderCapabilities,
+}
+
 /// Host-supplied trait objects that plugins implement to paint
 /// per-surface chrome on top of pane content.
 ///
@@ -961,6 +1025,45 @@ pub trait AttachRenderExtension: Send + Sync {
         }
     }
 
+    /// Context-aware counterpart to [`Self::render_surface`]. The default
+    /// preserves existing extension behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from queueing bytes onto `stdout`.
+    fn render_surface_with_context(
+        &self,
+        stdout: &mut dyn io::Write,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        _context: &RenderExtensionContext,
+    ) -> io::Result<bool> {
+        self.render_surface(stdout, surface_id, surface_rect, damage)
+    }
+
+    /// Context-aware counterpart to [`Self::render_layer_surface`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from queueing bytes onto `stdout`.
+    fn render_layer_surface_with_context(
+        &self,
+        stdout: &mut dyn io::Write,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> io::Result<bool> {
+        match layer {
+            RenderExtensionLayer::BeforePaneContent => Ok(false),
+            RenderExtensionLayer::AfterPaneContent => {
+                self.render_surface_with_context(stdout, surface_id, surface_rect, damage, context)
+            }
+        }
+    }
+
     /// Return declarative render operations for the damaged region of
     /// `surface_rect`. Returning `None` asks the host to call
     /// [`Self::render_surface`] as an imperative escape hatch. Returning
@@ -995,6 +1098,35 @@ pub trait AttachRenderExtension: Send + Sync {
         }
     }
 
+    /// Context-aware counterpart to [`Self::render_ops`]. The default
+    /// preserves existing extension behavior.
+    fn render_ops_with_context(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        _context: &RenderExtensionContext,
+    ) -> Option<Vec<RenderOp>> {
+        self.render_ops(surface_id, surface_rect, damage)
+    }
+
+    /// Context-aware counterpart to [`Self::render_layer_ops`].
+    fn render_layer_ops_with_context(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Option<Vec<RenderOp>> {
+        match layer {
+            RenderExtensionLayer::BeforePaneContent => Some(Vec::new()),
+            RenderExtensionLayer::AfterPaneContent => {
+                self.render_ops_with_context(surface_id, surface_rect, damage, context)
+            }
+        }
+    }
+
     /// Return before-content cells for the damaged region of `surface_rect`.
     /// This is the composited counterpart to [`Self::render_layer_ops`] for
     /// [`RenderExtensionLayer::BeforePaneContent`]: cells returned here are
@@ -1006,6 +1138,17 @@ pub trait AttachRenderExtension: Send + Sync {
         _damage: &RenderDamage,
     ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
         Some(Vec::new())
+    }
+
+    /// Context-aware counterpart to [`Self::render_before_content_cells`].
+    fn render_before_content_cells_with_context(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        _context: &RenderExtensionContext,
+    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
+        self.render_before_content_cells(surface_id, surface_rect, damage)
     }
 
     /// Override the surface's content-rect inset. Returning `Some`

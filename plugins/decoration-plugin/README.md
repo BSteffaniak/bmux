@@ -115,7 +115,40 @@ Each pane has `id`, `rect`, `content_rect`, `focused`, `zoomed`, and
 scripts can cache plugin-defined signals.
 
 Paint-command tables carry a `kind` string plus the variant fields; the
-supported kinds are `text`, `filled_rect`, `gradient_run`, `box_border`.
+supported kinds are `text`, `filled_rect`, `gradient_run`, `box_border`, and
+`semantic_border`. `semantic_border` is the ergonomic choice for adaptive
+chrome: provide `fallback_glyphs`, `thickness_px`, and optional capability
+predicates, and the renderer selects the best available path for the attached
+terminal while preserving the glyph fallback.
+
+```lua
+table.insert(cmds, {
+  kind = "semantic_border",
+  rect = pane.rect,
+  z = 10,
+  fallback_glyphs = "thick",
+  thickness_px = 3,
+  radius_px = 2,
+  style = { fg = bmux.rgb(255, 180, 90), bold = true },
+})
+
+-- Explicit advanced branch. The text renderer skips this unless Kitty
+-- graphics and cell pixel metrics are known; pair it with an ungated or
+-- inverse-gated fallback command for deterministic behavior everywhere.
+table.insert(cmds, {
+  kind = "semantic_border",
+  rect = pane.rect,
+  z = 10,
+  fallback_glyphs = "thick",
+  thickness_px = 3,
+  when = { all = { "graphics-kitty", "cell-pixels" } },
+  style = { fg = bmux.rgb(255, 180, 90) },
+})
+```
+
+Today, semantic borders lower to the same Unicode/text border fallback. The
+capability plumbing is in place so a later renderer can emit pixel-precise
+Kitty/Sixel/iTerm2-backed borders without changing script authoring.
 See `assets/decorations/pulse.lua` for a fully-worked example.
 
 ### `bmux.*` helper table

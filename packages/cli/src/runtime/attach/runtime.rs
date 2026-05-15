@@ -86,7 +86,7 @@ use super::prompt_ui::{
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats,
     collect_visual_projection_updates, frame_damage_overlay_rects, frame_damage_overlay_render_ops,
-    opaque_row_text, queue_render_ops, render_attach_scene_with_stats_and_trace,
+    opaque_row_text, queue_render_ops, render_attach_scene_with_stats_and_trace_with_capabilities,
     visible_scene_pane_ids,
 };
 use super::state::{
@@ -5944,6 +5944,33 @@ fn frame_uses_synchronized_update(frame_damage: &bmux_attach_pipeline::FrameDama
     frame_damage.scene_damaged() || frame_damage.overlay_damaged()
 }
 
+fn terminal_render_capabilities(
+    view_state: &AttachViewState,
+) -> bmux_plugin::TerminalRenderCapabilities {
+    let mut capabilities = bmux_plugin::TerminalRenderCapabilities::default();
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    {
+        capabilities.kitty_graphics = view_state.host_image_caps.kitty_graphics;
+        capabilities.sixel = view_state.host_image_caps.sixel;
+        capabilities.iterm2_inline_images = view_state.host_image_caps.iterm2_inline;
+        capabilities.graphics_alpha =
+            view_state.host_image_caps.kitty_graphics || view_state.host_image_caps.iterm2_inline;
+        capabilities.cell_pixel_width = view_state.host_image_caps.cell_pixel_width;
+        capabilities.cell_pixel_height = view_state.host_image_caps.cell_pixel_height;
+    }
+    #[cfg(not(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    )))]
+    let _ = view_state;
+    capabilities
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_attach_frame(
     client: &mut StreamingBmuxClient,
@@ -6141,7 +6168,8 @@ pub fn render_attach_frame(
                 &view_state.pane_buffers,
                 &extensions,
             ));
-        let (cursor_state, stats) = render_attach_scene_with_stats_and_trace(
+        let terminal_render_capabilities = terminal_render_capabilities(view_state);
+        let (cursor_state, stats) = render_attach_scene_with_stats_and_trace_with_capabilities(
             &mut frame_bytes,
             &layout_state.scene,
             &layout_state.panes,
@@ -6158,6 +6186,7 @@ pub fn render_attach_frame(
             &active_runtime_appearance,
             damage_policy,
             &extensions,
+            terminal_render_capabilities,
             render_trace.as_deref_mut(),
         )?;
         scene_render_stats = stats;

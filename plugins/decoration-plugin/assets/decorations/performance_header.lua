@@ -109,10 +109,12 @@ local function render(message)
         local cmds = {}
         if entrypoint == "all" or entrypoint == "border" then
             table.insert(cmds, {
-                kind = "box_border",
+                kind = "semantic_border",
                 rect = pane.rect,
                 z = z,
-                glyphs = glyphs,
+                fallback_glyphs = glyphs,
+                thickness_px = pane.focused and 3 or 1,
+                radius_px = pane.focused and 2 or 0,
                 style = { fg = bmux.rgb(r, g, b), bold = pane.focused or cpu >= 50 },
             })
         end

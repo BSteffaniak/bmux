@@ -18,10 +18,15 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod capabilities;
 pub mod glyphs;
 pub mod paint;
 pub mod sgr;
 
+pub use capabilities::{SceneRenderCapabilities, capability_query_matches};
 pub use glyphs::{BorderGlyphSet, border_glyphs_corners, border_glyphs_corners_or_custom};
-pub use paint::{apply_paint_command, apply_paint_commands, opaque_row_text};
+pub use paint::{
+    apply_paint_command, apply_paint_command_with_capabilities, apply_paint_commands,
+    apply_paint_commands_with_capabilities, opaque_row_text,
+};
 pub use sgr::scene_style_sgr_prelude;

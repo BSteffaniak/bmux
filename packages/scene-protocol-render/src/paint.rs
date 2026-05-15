@@ -24,6 +24,7 @@ use crossterm::style::Print;
 use std::io;
 use unicode_width::UnicodeWidthStr;
 
+use crate::capabilities::{SceneRenderCapabilities, capability_query_matches};
 use crate::glyphs::border_glyphs_corners_or_custom;
 use crate::sgr::scene_style_sgr_prelude;
 
@@ -56,13 +57,26 @@ pub fn apply_paint_commands<W: io::Write>(
     stdout: &mut W,
     surface: &SurfaceDecoration,
 ) -> Result<()> {
+    apply_paint_commands_with_capabilities(stdout, surface, SceneRenderCapabilities::default())
+}
+
+/// Apply paint commands using terminal capability predicates.
+///
+/// # Errors
+///
+/// Returns any error from queueing cursor movement or text output.
+pub fn apply_paint_commands_with_capabilities<W: io::Write>(
+    stdout: &mut W,
+    surface: &SurfaceDecoration,
+    capabilities: SceneRenderCapabilities,
+) -> Result<()> {
     let mut ordered: Vec<(usize, &PaintCommand)> =
         surface.paint_commands.iter().enumerate().collect();
     ordered.sort_by_key(|(i, cmd)| (paint_command_z(cmd), *i));
 
     let mut emitted_any = false;
     for (_, command) in ordered {
-        emitted_any |= apply_paint_command(stdout, command)?;
+        emitted_any |= apply_paint_command_with_capabilities(stdout, command, capabilities)?;
     }
     if emitted_any {
         queue!(stdout, Print("\x1b[0m")).context("failed resetting paint-command surface style")?;
@@ -78,7 +92,8 @@ const fn paint_command_z(command: &PaintCommand) -> i16 {
         | PaintCommand::FilledRect { z, .. }
         | PaintCommand::GradientRun { z, .. }
         | PaintCommand::CellGrid { z, .. }
-        | PaintCommand::BoxBorder { z, .. } => *z,
+        | PaintCommand::BoxBorder { z, .. }
+        | PaintCommand::SemanticBorder { z, .. } => *z,
     }
 }
 
@@ -90,6 +105,19 @@ const fn paint_command_z(command: &PaintCommand) -> i16 {
 ///
 /// Returns any error from queueing cursor movement or text output.
 pub fn apply_paint_command<W: io::Write>(stdout: &mut W, command: &PaintCommand) -> Result<bool> {
+    apply_paint_command_with_capabilities(stdout, command, SceneRenderCapabilities::default())
+}
+
+/// Apply a single paint command using terminal capability predicates.
+///
+/// # Errors
+///
+/// Returns any error from queueing cursor movement or text output.
+pub fn apply_paint_command_with_capabilities<W: io::Write>(
+    stdout: &mut W,
+    command: &PaintCommand,
+    capabilities: SceneRenderCapabilities,
+) -> Result<bool> {
     match command {
         PaintCommand::Text {
             col,
@@ -142,6 +170,19 @@ pub fn apply_paint_command<W: io::Write>(stdout: &mut W, command: &PaintCommand)
             ..
         } => {
             queue_box_border(stdout, rect, glyphs, style)?;
+            Ok(rect.w >= 2 && rect.h >= 2)
+        }
+        PaintCommand::SemanticBorder {
+            rect,
+            style,
+            fallback_glyphs,
+            when,
+            ..
+        } => {
+            if !capability_query_matches(when.as_ref(), capabilities) {
+                return Ok(false);
+            }
+            queue_box_border(stdout, rect, fallback_glyphs, style)?;
             Ok(rect.w >= 2 && rect.h >= 2)
         }
     }

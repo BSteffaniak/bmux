@@ -1298,7 +1298,8 @@ const fn paint_command_z(command: &PaintCommand) -> i16 {
         | PaintCommand::FilledRect { z, .. }
         | PaintCommand::GradientRun { z, .. }
         | PaintCommand::CellGrid { z, .. }
-        | PaintCommand::BoxBorder { z, .. } => *z,
+        | PaintCommand::BoxBorder { z, .. }
+        | PaintCommand::SemanticBorder { z, .. } => *z,
     }
 }
 
@@ -1308,7 +1309,8 @@ fn set_paint_command_z(command: &mut PaintCommand, next_z: i16) {
         | PaintCommand::FilledRect { z, .. }
         | PaintCommand::GradientRun { z, .. }
         | PaintCommand::CellGrid { z, .. }
-        | PaintCommand::BoxBorder { z, .. } => *z = next_z,
+        | PaintCommand::BoxBorder { z, .. }
+        | PaintCommand::SemanticBorder { z, .. } => *z = next_z,
     }
 }
 

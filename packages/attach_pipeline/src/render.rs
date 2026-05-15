@@ -12,8 +12,9 @@ use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceK
 use bmux_plugin::{
     AttachRenderExtension, AttachVisualCellRef, AttachVisualFrameView,
     AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect,
-    RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
-    RenderUnderCell, clip_render_text_run_to_rect, render_text_width_u16,
+    RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderNamedColor,
+    RenderOp, RenderStyle, RenderUnderCell, TerminalRenderCapabilities,
+    clip_render_text_run_to_rect, render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -2226,6 +2227,7 @@ pub fn render_attach_scene<W: io::Write>(
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
 ) -> Result<Option<AttachCursorState>> {
+    let render_context = RenderExtensionContext::default();
     render_attach_scene_inner(
         stdout,
         scene,
@@ -2243,6 +2245,7 @@ pub fn render_attach_scene<W: io::Write>(
         runtime_appearance,
         damage_policy,
         render_extensions,
+        &render_context,
         None,
         None,
     )
@@ -2332,7 +2335,63 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
+    render_attach_scene_with_stats_and_trace_with_capabilities(
+        stdout,
+        scene,
+        panes,
+        pane_buffers,
+        frame_damage,
+        status_top_inset,
+        status_bottom_inset,
+        scrollback_active,
+        scrollback_offset,
+        scrollback_cursor,
+        selection_anchor,
+        zoomed,
+        terminal_size,
+        runtime_appearance,
+        damage_policy,
+        render_extensions,
+        TerminalRenderCapabilities::default(),
+        render_trace,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::fn_params_excessive_bools // explicit render-state flags keep hot-path call sites readable
+)]
+/// Render a composed attach scene frame with attached-terminal capabilities.
+///
+/// # Errors
+///
+/// Returns an error when queueing frame bytes fails.
+pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    panes: &[PaneSummary],
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    frame_damage: &FrameDamage,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    scrollback_active: bool,
+    scrollback_offset: usize,
+    scrollback_cursor: Option<AttachScrollbackCursor>,
+    selection_anchor: Option<AttachScrollbackPosition>,
+    zoomed: bool,
+    terminal_size: (u16, u16),
+    runtime_appearance: &RuntimeAppearance,
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    terminal_capabilities: TerminalRenderCapabilities,
+    render_trace: Option<&mut AttachRenderTrace>,
+) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
     let mut stats = AttachSceneRenderStats::default();
+    let render_context = RenderExtensionContext {
+        capabilities: terminal_capabilities,
+    };
     let cursor_state = render_attach_scene_inner(
         stdout,
         scene,
@@ -2350,6 +2409,7 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
         runtime_appearance,
         damage_policy,
         render_extensions,
+        &render_context,
         Some(&mut stats),
         render_trace,
     )?;
@@ -2365,6 +2425,7 @@ fn before_content_cells_for_surface(
     frame_damage: &FrameDamage,
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    render_context: &RenderExtensionContext,
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
 ) -> (BTreeMap<(u16, u16), RenderUnderCell>, Vec<DamageRect>) {
     let ext_rect = bmux_plugin::ExtensionRect {
@@ -2422,7 +2483,12 @@ fn before_content_cells_for_surface(
             }
             RenderDamage::None => {}
         }
-        if let Some(layer_cells) = ext.render_before_content_cells(surface.id, &ext_rect, &damage) {
+        if let Some(layer_cells) = ext.render_before_content_cells_with_context(
+            surface.id,
+            &ext_rect,
+            &damage,
+            render_context,
+        ) {
             for (col, row, cell) in layer_cells {
                 if col >= content.x
                     && col < content.x.saturating_add(content.w)
@@ -2432,11 +2498,12 @@ fn before_content_cells_for_surface(
                     cells.insert((col.saturating_sub(content.x), row), cell);
                 }
             }
-        } else if let Some(ops) = ext.render_layer_ops(
+        } else if let Some(ops) = ext.render_layer_ops_with_context(
             surface.id,
             &ext_rect,
             &damage,
             RenderExtensionLayer::BeforePaneContent,
+            render_context,
         ) {
             for ((col, row), cell) in render_ops_to_cells(&ops) {
                 if col >= content.x
@@ -2475,6 +2542,7 @@ fn render_attach_scene_inner<W: io::Write>(
     runtime_appearance: &RuntimeAppearance,
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    render_context: &RenderExtensionContext,
     mut render_stats: Option<&mut AttachSceneRenderStats>,
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<Option<AttachCursorState>> {
@@ -2573,6 +2641,7 @@ fn render_attach_scene_inner<W: io::Write>(
             frame_damage,
             damage_policy,
             render_extensions,
+            render_context,
             &mut render_stats,
         );
         let before_content_cells = before_content.0;
@@ -2664,9 +2733,10 @@ fn render_attach_scene_inner<W: io::Write>(
                     ext.render_layer_revision(surface.id, RenderExtensionLayer::AfterPaneContent);
                 let cache_key = (
                     format!(
-                        "{}::{:?}",
+                        "{}::{:?}::caps={}",
                         ext.name(),
-                        RenderExtensionLayer::AfterPaneContent
+                        RenderExtensionLayer::AfterPaneContent,
+                        render_context.capabilities.cache_key()
                     ),
                     surface.id,
                 );
@@ -2690,11 +2760,12 @@ fn render_attach_scene_inner<W: io::Write>(
                     continue;
                 }
 
-                if let Some(ops) = ext.render_layer_ops(
+                if let Some(ops) = ext.render_layer_ops_with_context(
                     surface.id,
                     &ext_rect,
                     &damage,
                     RenderExtensionLayer::AfterPaneContent,
+                    render_context,
                 ) {
                     if ops.is_empty() {
                         continue;
@@ -2758,12 +2829,13 @@ fn render_attach_scene_inner<W: io::Write>(
                         });
                     }
                     let dyn_writer: &mut dyn io::Write = stdout;
-                    if let Err(err) = ext.render_layer_surface(
+                    if let Err(err) = ext.render_layer_surface_with_context(
                         dyn_writer,
                         surface.id,
                         &ext_rect,
                         &damage,
                         RenderExtensionLayer::AfterPaneContent,
+                        render_context,
                     ) {
                         tracing::warn!(
                             extension = ext.name(),

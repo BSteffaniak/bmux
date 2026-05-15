@@ -6,7 +6,8 @@
 
 use bmux_scene_protocol::scene_protocol::{
     AnimationHint, BorderGlyphs, Cell, Color, DecorationScene, GradientAxis, INTERFACE_ID,
-    NamedColor, PaintCommand, Rect, Style, SurfaceDecoration,
+    NamedColor, PaintCommand, Rect, Style, SurfaceDecoration, TerminalCapability,
+    TerminalCapabilityQuery,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -193,6 +194,24 @@ fn paint_command_variants_round_trip_through_json() {
             z: 10,
             glyphs: BorderGlyphs::Rounded,
             style: style.clone(),
+        },
+        PaintCommand::SemanticBorder {
+            rect: Rect {
+                x: 1,
+                y: 1,
+                w: 12,
+                h: 4,
+            },
+            z: 11,
+            style: style.clone(),
+            fallback_glyphs: BorderGlyphs::Thick,
+            thickness_px: 3,
+            radius_px: 2,
+            when: Some(TerminalCapabilityQuery {
+                all: vec![TerminalCapability::GraphicsKitty],
+                any: Vec::new(),
+                none: vec![TerminalCapability::GraphicsSixel],
+            }),
         },
     ];
 

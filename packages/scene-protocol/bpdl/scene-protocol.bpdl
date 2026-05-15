@@ -76,6 +76,30 @@ interface scene-protocol {
         strikethrough: bool,
     }
 
+    // Terminal capabilities that can gate advanced paint commands.
+    // Capability matching is evaluated per attached terminal because one bmux
+    // server may have multiple terminals with different graphics support.
+    enum terminal-capability {
+        @default truecolor,
+        unicode-box-drawing,
+        unicode-block-elements,
+        graphics-kitty,
+        graphics-sixel,
+        graphics-iterm2,
+        graphics-alpha,
+        cell-pixels,
+    }
+
+    // Capability predicate used by advanced paint commands. Empty lists are
+    // ignored. A command matches when all `all` entries are present, at least
+    // one `any` entry is present (unless `any` is empty), and no `none` entry
+    // is present.
+    record terminal-capability-query {
+        all: list<terminal-capability>,
+        any: list<terminal-capability>,
+        none: list<terminal-capability>,
+    }
+
     // Variants of paint commands that can appear inside a
     // `surface-decoration`. The renderer dispatches on the tag and
     // applies the variant's geometry. All coordinates are in outer
@@ -143,6 +167,19 @@ interface scene-protocol {
             z: i16,
             glyphs: border-glyphs,
             style: style,
+        },
+        // Semantic border that asks the renderer for the best available
+        // backend. Text renderers lower this to `fallback-glyphs`; graphics
+        // renderers may use `thickness-px`/`radius-px` for pixel-precise
+        // output when the optional capability predicate matches.
+        semantic-border {
+            rect: rect,
+            z: i16,
+            style: style,
+            fallback-glyphs: border-glyphs,
+            thickness-px: u16,
+            radius-px: u16,
+            when: terminal-capability-query?,
         },
     }
 

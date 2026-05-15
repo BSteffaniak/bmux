@@ -40,9 +40,9 @@ use bmux_plugin::{
     AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
     AttachVisualAdapterRequest, AttachVisualFrameView, AttachVisualProjectionResult,
     AttachVisualProjectionUpdate, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
-    RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
-    RenderUnderCell, registered_visual_adapter, render_single_display_cell_char,
-    render_text_width_u16,
+    RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderNamedColor,
+    RenderOp, RenderStyle, RenderUnderCell, TerminalRenderCapabilities, registered_visual_adapter,
+    render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -50,6 +50,7 @@ use bmux_scene_protocol::scene_protocol::{
     GradientAxis, NamedColor, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
     Style as SceneStyle, SurfaceDecoration, VisualAdapterRequest,
 };
+use bmux_scene_protocol_render::capabilities::{SceneRenderCapabilities, capability_query_matches};
 use bmux_scene_protocol_render::paint::{apply_paint_commands, interpolate_style};
 use uuid::Uuid;
 
@@ -168,6 +169,67 @@ struct DecorationRenderExtension {
     cache: Arc<Mutex<DecorationRendererCache>>,
 }
 
+impl DecorationRenderExtension {
+    fn render_layer_ops_with_capabilities(
+        &self,
+        surface_id: Uuid,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+        capabilities: SceneRenderCapabilities,
+    ) -> Option<Vec<RenderOp>> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Some(Vec::new());
+        };
+        let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        };
+        if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let surface = filter_surface_layer_for_damage(surface, damage, layer);
+        if layer_paint_commands(&surface, layer).is_empty() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let ops = render_ops_for_surface_layer_with_capabilities(&surface, layer, capabilities)?;
+        cache.mark_rendered(surface_id);
+        Some(ops)
+    }
+
+    fn render_before_content_cells_with_capabilities(
+        &self,
+        surface_id: Uuid,
+        damage: &RenderDamage,
+        capabilities: SceneRenderCapabilities,
+    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Some(Vec::new());
+        };
+        let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        };
+        if surface.before_content_paint_commands.is_empty() || damage.is_none() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let surface = filter_surface_layer_for_damage(
+            surface,
+            damage,
+            RenderExtensionLayer::BeforePaneContent,
+        );
+        let ops = render_ops_for_surface_layer_with_capabilities(
+            &surface,
+            RenderExtensionLayer::BeforePaneContent,
+            capabilities,
+        )?;
+        cache.mark_rendered(surface_id);
+        Some(render_ops_to_under_cells(&ops))
+    }
+}
+
 impl AttachRenderExtension for DecorationRenderExtension {
     fn name(&self) -> &str {
         &self.name
@@ -251,25 +313,28 @@ impl AttachRenderExtension for DecorationRenderExtension {
         damage: &RenderDamage,
         layer: RenderExtensionLayer,
     ) -> Option<Vec<RenderOp>> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Some(Vec::new());
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        };
-        if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        }
-        let surface = filter_surface_layer_for_damage(surface, damage, layer);
-        if layer_paint_commands(&surface, layer).is_empty() {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        }
-        let ops = render_ops_for_surface_layer(&surface, layer)?;
-        cache.mark_rendered(surface_id);
-        Some(ops)
+        self.render_layer_ops_with_capabilities(
+            surface_id,
+            damage,
+            layer,
+            SceneRenderCapabilities::default(),
+        )
+    }
+
+    fn render_layer_ops_with_context(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Option<Vec<RenderOp>> {
+        self.render_layer_ops_with_capabilities(
+            surface_id,
+            damage,
+            layer,
+            scene_capabilities_from_terminal(context.capabilities),
+        )
     }
 
     fn render_before_content_cells(
@@ -278,25 +343,25 @@ impl AttachRenderExtension for DecorationRenderExtension {
         _surface_rect: &ExtensionRect,
         damage: &RenderDamage,
     ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Some(Vec::new());
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        };
-        if surface.before_content_paint_commands.is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        }
-        let surface = filter_surface_layer_for_damage(
-            surface,
+        self.render_before_content_cells_with_capabilities(
+            surface_id,
             damage,
-            RenderExtensionLayer::BeforePaneContent,
-        );
-        let ops = render_ops_for_surface_layer(&surface, RenderExtensionLayer::BeforePaneContent)?;
-        cache.mark_rendered(surface_id);
-        Some(render_ops_to_under_cells(&ops))
+            SceneRenderCapabilities::default(),
+        )
+    }
+
+    fn render_before_content_cells_with_context(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+        context: &RenderExtensionContext,
+    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
+        self.render_before_content_cells_with_capabilities(
+            surface_id,
+            damage,
+            scene_capabilities_from_terminal(context.capabilities),
+        )
     }
 
     fn render_ops(
@@ -424,6 +489,21 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
         y: rect.y,
         w: rect.w,
         h: rect.h,
+    }
+}
+
+const fn scene_capabilities_from_terminal(
+    capabilities: TerminalRenderCapabilities,
+) -> SceneRenderCapabilities {
+    SceneRenderCapabilities {
+        truecolor: capabilities.truecolor,
+        unicode_box_drawing: capabilities.unicode_box_drawing,
+        unicode_block_elements: capabilities.unicode_block_elements,
+        graphics_kitty: capabilities.kitty_graphics,
+        graphics_sixel: capabilities.sixel,
+        graphics_iterm2: capabilities.iterm2_inline_images,
+        graphics_alpha: capabilities.graphics_alpha,
+        cell_pixels: capabilities.has_cell_pixels(),
     }
 }
 
@@ -904,7 +984,23 @@ pub fn render_ops_for_surface_layer(
     surface: &SurfaceDecoration,
     layer: RenderExtensionLayer,
 ) -> Option<Vec<RenderOp>> {
-    render_ops_for_paint_commands(layer_paint_commands(surface, layer))
+    render_ops_for_surface_layer_with_capabilities(
+        surface,
+        layer,
+        SceneRenderCapabilities::default(),
+    )
+}
+
+#[must_use]
+pub fn render_ops_for_surface_layer_with_capabilities(
+    surface: &SurfaceDecoration,
+    layer: RenderExtensionLayer,
+    capabilities: SceneRenderCapabilities,
+) -> Option<Vec<RenderOp>> {
+    render_ops_for_paint_commands_with_capabilities(
+        layer_paint_commands(surface, layer),
+        capabilities,
+    )
 }
 
 #[must_use]
@@ -914,12 +1010,23 @@ pub fn render_ops_for_surface(surface: &SurfaceDecoration) -> Option<Vec<RenderO
 
 #[must_use]
 pub fn render_ops_for_paint_commands(paint_commands: &[PaintCommand]) -> Option<Vec<RenderOp>> {
+    render_ops_for_paint_commands_with_capabilities(
+        paint_commands,
+        SceneRenderCapabilities::default(),
+    )
+}
+
+#[must_use]
+pub fn render_ops_for_paint_commands_with_capabilities(
+    paint_commands: &[PaintCommand],
+    capabilities: SceneRenderCapabilities,
+) -> Option<Vec<RenderOp>> {
     let mut ordered: Vec<(usize, &PaintCommand)> = paint_commands.iter().enumerate().collect();
     ordered.sort_by_key(|(index, command)| (paint_command_z(command), *index));
 
     let mut ops = Vec::new();
     for (_, command) in ordered {
-        push_render_ops_for_command(&mut ops, command)?;
+        push_render_ops_for_command(&mut ops, command, capabilities)?;
     }
     Some(ops)
 }
@@ -976,7 +1083,11 @@ fn render_ops_to_under_cells(ops: &[RenderOp]) -> Vec<(u16, u16, RenderUnderCell
     cells
 }
 
-fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) -> Option<()> {
+fn push_render_ops_for_command(
+    ops: &mut Vec<RenderOp>,
+    command: &PaintCommand,
+    capabilities: SceneRenderCapabilities,
+) -> Option<()> {
     match command {
         PaintCommand::Text {
             col,
@@ -1046,16 +1157,38 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
             style,
             ..
         } => {
-            if rect.w < 2 || rect.h < 2 || matches!(glyphs, SceneBorderGlyphs::None) {
+            push_border_render_op(ops, rect, glyphs, style)?;
+        }
+        PaintCommand::SemanticBorder {
+            rect,
+            style,
+            fallback_glyphs,
+            when,
+            ..
+        } => {
+            if !capability_query_matches(when.as_ref(), capabilities) {
                 return Some(());
             }
-            ops.push(RenderOp::Border {
-                rect: extension_rect_from_scene(rect),
-                glyphs: render_border_glyphs(glyphs)?,
-                style: render_style_from_scene(style),
-            });
+            push_border_render_op(ops, rect, fallback_glyphs, style)?;
         }
     }
+    Some(())
+}
+
+fn push_border_render_op(
+    ops: &mut Vec<RenderOp>,
+    rect: &SceneRect,
+    glyphs: &SceneBorderGlyphs,
+    style: &SceneStyle,
+) -> Option<()> {
+    if rect.w < 2 || rect.h < 2 || matches!(glyphs, SceneBorderGlyphs::None) {
+        return Some(());
+    }
+    ops.push(RenderOp::Border {
+        rect: extension_rect_from_scene(rect),
+        glyphs: render_border_glyphs(glyphs)?,
+        style: render_style_from_scene(style),
+    });
     Some(())
 }
 
@@ -1065,7 +1198,8 @@ const fn paint_command_z(command: &PaintCommand) -> i16 {
         | PaintCommand::FilledRect { z, .. }
         | PaintCommand::GradientRun { z, .. }
         | PaintCommand::CellGrid { z, .. }
-        | PaintCommand::BoxBorder { z, .. } => *z,
+        | PaintCommand::BoxBorder { z, .. }
+        | PaintCommand::SemanticBorder { z, .. } => *z,
     }
 }
 
@@ -1254,7 +1388,9 @@ fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = Extensio
                 h: rows,
             }]
         }
-        PaintCommand::BoxBorder { rect, .. } => border_damage_rects(rect),
+        PaintCommand::BoxBorder { rect, .. } | PaintCommand::SemanticBorder { rect, .. } => {
+            border_damage_rects(rect)
+        }
     };
     rects.into_iter()
 }
@@ -1371,6 +1507,7 @@ pub fn push_scene(scene: DecorationScene) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_scene_protocol::scene_protocol::{TerminalCapability, TerminalCapabilityQuery};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_VISUAL_ADAPTER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1807,6 +1944,71 @@ mod tests {
                     RenderCell { ch: Some('A'), style: RenderStyle::default() },
                     RenderCell { ch: None, style: RenderStyle::default() },
                 ]]
+        ));
+    }
+
+    #[test]
+    fn render_ops_filters_semantic_border_by_capability_context() {
+        let surface_id = Uuid::from_u128(17);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::SemanticBorder {
+                rect: SceneRect {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 3,
+                },
+                z: 0,
+                style: scene_style(),
+                fallback_glyphs: SceneBorderGlyphs::Thick,
+                thickness_px: 3,
+                radius_px: 2,
+                when: Some(TerminalCapabilityQuery {
+                    all: vec![TerminalCapability::GraphicsKitty],
+                    any: Vec::new(),
+                    none: Vec::new(),
+                }),
+            }],
+        );
+
+        let rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let no_graphics = extension
+            .render_layer_ops_with_context(
+                surface_id,
+                &rect,
+                &RenderDamage::FullSurface,
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext::default(),
+            )
+            .expect("semantic borders should remain declarative");
+        assert!(no_graphics.is_empty());
+
+        let kitty = extension
+            .render_layer_ops_with_context(
+                surface_id,
+                &rect,
+                &RenderDamage::FullSurface,
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext {
+                    capabilities: TerminalRenderCapabilities {
+                        kitty_graphics: true,
+                        cell_pixel_width: 8,
+                        cell_pixel_height: 16,
+                        ..TerminalRenderCapabilities::default()
+                    },
+                },
+            )
+            .expect("semantic borders should remain declarative");
+        assert!(matches!(
+            &kitty[..],
+            [RenderOp::Border { glyphs, .. }]
+                if glyphs.top_left == '┏' && glyphs.horizontal == '━' && glyphs.vertical == '┃'
         ));
     }
 
