@@ -34,8 +34,8 @@ component_themes  = ["performance", "pong", "rainbow-snake"]
 `component_themes` supplies theme settings and plugin-owned component
 definitions. For `bmux.decoration`, appearance layers keep base border chrome
 while stripping scripted components; component-only layers preserve component
-maps, script access, input, and animation hints without letting fun component
-packs replace the base border chrome.
+maps, top-level scripts, script access, input, and animation hints without
+letting fun component packs replace the base border chrome.
 
 When only `theme` is set, BMUX treats it as the base theme and applies the
 bundled `mode-aware` layer by default. `mode-aware` adds visible mode cues

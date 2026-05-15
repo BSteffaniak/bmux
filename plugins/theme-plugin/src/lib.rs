@@ -1529,7 +1529,13 @@ fn component_only_plugin_extension(plugin_id: &str, extension: &toml::Value) -> 
         return extension.clone();
     };
     let mut filtered = toml::map::Map::new();
-    for key in ["components", "script_access", "animation", "input"] {
+    for key in [
+        "components",
+        "script",
+        "script_access",
+        "animation",
+        "input",
+    ] {
         if let Some(value) = table.get(key) {
             filtered.insert(key.to_string(), value.clone());
         }

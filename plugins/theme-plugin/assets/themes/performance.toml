@@ -17,6 +17,7 @@ foreground     = "#f4f1e8"
 mode_indicator = "#ff5f5f"
 
 [plugins."bmux.decoration"]
+script = "performance_header"
 
 [plugins."bmux.decoration".unfocused]
 bg            = ""
@@ -28,19 +29,19 @@ style         = "single-line"
 
 [plugins."bmux.decoration".focused]
 bg            = ""
-fg            = "#ffaf00"
+fg            = "#444444"
 glyphs_custom = []
-gradient_from = "#5fd75f"
-gradient_to   = "#ff5f5f"
-style         = "thick"
+gradient_from = ""
+gradient_to   = ""
+style         = "single-line"
 
 [plugins."bmux.decoration".zoomed]
 bg            = ""
-fg            = "#ff5f5f"
+fg            = "#444444"
 glyphs_custom = []
-gradient_from = "#ffaf00"
-gradient_to   = "#ff5f5f"
-style         = "double"
+gradient_from = ""
+gradient_to   = ""
+style         = "single-line"
 
 [plugins."bmux.decoration".badges]
 exited  = "x"
