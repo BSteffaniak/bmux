@@ -395,15 +395,19 @@ impl AttachRenderExtension for DecorationRenderExtension {
 
         let scene_capabilities = scene_capabilities_from_terminal(context.capabilities);
         let previous_used_graphics = previous_surface.as_ref().is_some_and(|previous| {
-            layer_paint_commands(previous, layer).iter().any(|command| {
-                raster_border::semantic_border_graphic_items(
-                    surface_id,
-                    command,
-                    context.capabilities,
-                    scene_capabilities,
-                )
-                .is_some()
-            })
+            layer_paint_commands(previous, layer)
+                .iter()
+                .enumerate()
+                .any(|(semantic_index, command)| {
+                    raster_border::semantic_border_graphic_items(
+                        surface_id,
+                        u64::try_from(semantic_index).unwrap_or(u64::MAX),
+                        command,
+                        context.capabilities,
+                        scene_capabilities,
+                    )
+                    .is_some()
+                })
         });
 
         let mut ordered: Vec<(usize, &PaintCommand)> = layer_paint_commands(surface, layer)
@@ -414,9 +418,10 @@ impl AttachRenderExtension for DecorationRenderExtension {
 
         let mut used_graphics = previous_used_graphics;
         let mut items = Vec::new();
-        for (_, command) in ordered {
+        for (command_index, command) in ordered {
             if let Some(graphics) = raster_border::semantic_border_graphic_items(
                 surface_id,
+                u64::try_from(command_index).unwrap_or(u64::MAX),
                 command,
                 context.capabilities,
                 scene_capabilities,

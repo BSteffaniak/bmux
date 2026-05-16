@@ -28,6 +28,7 @@ struct RasterSegment {
 #[must_use]
 pub fn semantic_border_graphic_items(
     surface_id: Uuid,
+    semantic_key: u64,
     command: &PaintCommand,
     capabilities: TerminalRenderCapabilities,
     scene_capabilities: SceneRenderCapabilities,
@@ -61,7 +62,7 @@ pub fn semantic_border_graphic_items(
             .enumerate()
             .map(|(index, segment)| {
                 RenderLayerItem::Graphic(TerminalGraphicOverlay {
-                    key: raster_image_key(surface_id, *z, index, segment, color),
+                    key: raster_image_key(surface_id, semantic_key, index),
                     cell_rect: bmux_plugin::ExtensionRect::new(
                         segment.col,
                         segment.row,
@@ -230,23 +231,11 @@ const fn color_cube_channel(value: u8) -> u8 {
     if value == 0 { 0 } else { 55 + value * 40 }
 }
 
-fn raster_image_key(
-    surface_id: Uuid,
-    z: i16,
-    segment_index: usize,
-    segment: RasterSegment,
-    color: TerminalRgba,
-) -> u64 {
+fn raster_image_key(surface_id: Uuid, semantic_key: u64, segment_index: usize) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     surface_id.hash(&mut hash);
-    z.hash(&mut hash);
+    semantic_key.hash(&mut hash);
     segment_index.hash(&mut hash);
-    segment.col.hash(&mut hash);
-    segment.row.hash(&mut hash);
-    segment.width_px.hash(&mut hash);
-    segment.height_px.hash(&mut hash);
-    segment.fill.hash(&mut hash);
-    color.hash(&mut hash);
     hash.finish().max(1)
 }
 
@@ -283,6 +272,7 @@ mod tests {
         assert!(
             semantic_border_graphic_items(
                 Uuid::from_u128(1),
+                0,
                 &command,
                 TerminalRenderCapabilities {
                     kitty_graphics: true,
@@ -298,6 +288,7 @@ mod tests {
         assert!(
             semantic_border_graphic_items(
                 Uuid::from_u128(1),
+                0,
                 &command,
                 TerminalRenderCapabilities {
                     sixel: true,

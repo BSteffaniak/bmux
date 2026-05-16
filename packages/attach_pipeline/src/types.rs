@@ -56,16 +56,23 @@ pub struct PaneRenderBuffer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalGraphicCacheEntry {
     pub surface_id: Uuid,
-    pub signature: TerminalGraphicSignature,
+    pub source: TerminalGraphicSourceSignature,
+    pub placement: Option<TerminalGraphicPlacementSignature>,
     pub host_image_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TerminalGraphicSignature {
+pub struct TerminalGraphicSourceSignature {
     pub pixel_width: u32,
     pub pixel_height: u32,
     pub color: TerminalRgba,
     pub fill: TerminalGraphicFill,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerminalGraphicPlacementSignature {
+    pub cell_rect: ExtensionRect,
+    pub z_index: i16,
 }
 
 #[derive(Default)]
