@@ -807,7 +807,7 @@ impl PlaybookRenderTraceState {
         let surface_panes = trace_surface_pane_indexes(&layout);
         Ok(Some(summarize_attach_render_trace(
             &trace,
-            facts,
+            &facts,
             &surface_panes,
         )))
     }
@@ -1016,7 +1016,7 @@ const fn render_segment_ref_to_trace_op(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PlaybookAttachRenderFrameFacts {
     pub scene_render: AttachSceneRenderStats,
     pub frame_bytes: usize,
@@ -1031,10 +1031,10 @@ pub struct PlaybookAttachRenderFrameFacts {
 #[must_use]
 pub fn summarize_attach_render_trace(
     trace: &AttachRenderTrace,
-    facts: PlaybookAttachRenderFrameFacts,
+    facts: &PlaybookAttachRenderFrameFacts,
     surface_pane_indexes: &BTreeMap<usize, u32>,
 ) -> PlaybookRenderSummary {
-    let stats = facts.scene_render;
+    let stats = &facts.scene_render;
     let mut summary = PlaybookRenderSummary {
         frames: u64::from(attach_render_facts_has_frame(trace, facts)),
         full_frame_frames: u64::from(facts.full_frame_fallback || stats.full_frame),
@@ -1064,7 +1064,7 @@ pub fn summarize_attach_render_trace(
 
 fn attach_render_facts_has_frame(
     trace: &AttachRenderTrace,
-    facts: PlaybookAttachRenderFrameFacts,
+    facts: &PlaybookAttachRenderFrameFacts,
 ) -> bool {
     facts.frame_bytes > 0
         || facts.full_frame_fallback
@@ -4950,23 +4950,20 @@ assert-state path='windows.names' equals='["two","three","one"]'
         });
         let mut surface_panes = BTreeMap::new();
         surface_panes.insert(0, 1);
-        let summary = summarize_attach_render_trace(
-            &trace,
-            PlaybookAttachRenderFrameFacts {
-                scene_render: AttachSceneRenderStats {
-                    pane_row_segments_emitted: 1,
-                    pane_cells_emitted: 6,
-                    extension_cache_hits: 1,
-                    ..AttachSceneRenderStats::default()
-                },
-                frame_bytes: 256,
-                damage_rects: 2,
-                damage_area_cells: 12,
-                full_surface_fallbacks: 1,
-                ..PlaybookAttachRenderFrameFacts::default()
+        let facts = PlaybookAttachRenderFrameFacts {
+            scene_render: AttachSceneRenderStats {
+                pane_row_segments_emitted: 1,
+                pane_cells_emitted: 6,
+                extension_cache_hits: 1,
+                ..AttachSceneRenderStats::default()
             },
-            &surface_panes,
-        );
+            frame_bytes: 256,
+            damage_rects: 2,
+            damage_area_cells: 12,
+            full_surface_fallbacks: 1,
+            ..PlaybookAttachRenderFrameFacts::default()
+        };
+        let summary = summarize_attach_render_trace(&trace, &facts, &surface_panes);
 
         assert_eq!(summary.frames, 1);
         assert_eq!(summary.row_segments_emitted, 1);

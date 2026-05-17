@@ -1586,6 +1586,19 @@ struct PerfOutlierSample {
     ts_epoch_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct PerfRenderOutlierSample {
+    reason: String,
+    frame_index: Option<u64>,
+    since_attach_start_ms: Option<u64>,
+    frame_render_ms: Option<u64>,
+    frame_bytes: Option<u64>,
+    full_frame_fallback: bool,
+    full_surface_fallbacks: u64,
+    dirty_reasons: Vec<String>,
+    extension_stats: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
 #[derive(Debug, Clone)]
 struct PerfTimingSample {
     event_name: String,
@@ -1608,8 +1621,10 @@ struct PerfAnalysisReport {
     by_level: BTreeMap<String, u64>,
     attach_window_counters: BTreeMap<String, u64>,
     overrender_counters: BTreeMap<String, u64>,
+    extension_counters: BTreeMap<String, BTreeMap<String, u64>>,
     timings_ms: BTreeMap<String, PerfTimingSummary>,
     outlier_samples: Vec<PerfOutlierSample>,
+    render_outliers: Vec<PerfRenderOutlierSample>,
     connect_to_first_frame_ms: Option<u64>,
     connect_to_interactive_ms: Option<u64>,
     reconnect_outage_max_ms: Option<u64>,
@@ -1655,6 +1670,117 @@ fn perf_counter(counters: &BTreeMap<String, u64>, name: &str) -> u64 {
     counters.get(name).copied().unwrap_or(0)
 }
 
+fn parse_extension_stats(
+    value: Option<&serde_json::Value>,
+) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let Some(object) = value.and_then(serde_json::Value::as_object) else {
+        return BTreeMap::new();
+    };
+    object
+        .iter()
+        .filter_map(|(extension_name, counters)| {
+            let counters = counters.as_object()?;
+            let parsed = counters
+                .iter()
+                .filter_map(|(counter_name, value)| {
+                    value
+                        .as_u64()
+                        .map(|counter| (counter_name.clone(), counter))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!parsed.is_empty()).then(|| (extension_name.clone(), parsed))
+        })
+        .collect()
+}
+
+fn aggregate_extension_counters(
+    target: &mut BTreeMap<String, BTreeMap<String, u64>>,
+    source: &BTreeMap<String, BTreeMap<String, u64>>,
+) {
+    for (extension_name, counters) in source {
+        let target_counters = target.entry(extension_name.clone()).or_default();
+        for (counter_name, value) in counters {
+            let target_value = target_counters.entry(counter_name.clone()).or_default();
+            *target_value = target_value.saturating_add(*value);
+        }
+    }
+}
+
+fn string_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Vec<String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn render_outlier_from_frame_trace(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<PerfRenderOutlierSample> {
+    let full_frame_fallback = object
+        .get("full_frame_fallback")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let extension_render_calls = object
+        .get("extension_render_calls")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let extension_cache_hits = object
+        .get("extension_cache_hits")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let extension_imperative_calls = object
+        .get("extension_imperative_calls")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let extension_cache_misses = extension_render_calls.saturating_sub(extension_cache_hits);
+    let extension_pressure = extension_render_calls > 0
+        && extension_cache_misses.saturating_add(extension_imperative_calls) > 0;
+    if !full_frame_fallback && !extension_pressure {
+        return None;
+    }
+
+    let reason = match (full_frame_fallback, extension_pressure) {
+        (true, true) => "full_frame_and_extension_pressure",
+        (true, false) => "full_frame_fallback",
+        (false, true) => "extension_cache_miss_or_imperative",
+        (false, false) => return None,
+    }
+    .to_string();
+
+    Some(PerfRenderOutlierSample {
+        reason,
+        frame_index: object
+            .get("frame_index")
+            .and_then(serde_json::Value::as_u64),
+        since_attach_start_ms: object
+            .get("since_attach_start_ms")
+            .and_then(serde_json::Value::as_u64),
+        frame_render_ms: object
+            .get("frame_render_ms")
+            .and_then(serde_json::Value::as_u64),
+        frame_bytes: object
+            .get("frame_bytes")
+            .and_then(serde_json::Value::as_u64),
+        full_frame_fallback,
+        full_surface_fallbacks: object
+            .get("full_surface_fallbacks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        dirty_reasons: string_array_field(object, "dirty_reasons"),
+        extension_stats: parse_extension_stats(object.get("extension_stats")),
+    })
+}
+
 fn append_attach_window_counter_hints(hints: &mut Vec<String>, counters: &BTreeMap<String, u64>) {
     let render_frames = perf_counter(counters, "render_frames");
     if perf_counter(counters, "terminal_graphic_deletes") > 0 {
@@ -1674,6 +1800,27 @@ fn append_attach_window_counter_hints(hints: &mut Vec<String>, counters: &BTreeM
             < perf_counter(counters, "viewport_cells")
     {
         hints.push("full-frame fallback was observed without a matching full viewport damage area; inspect damage coalescing and dirty reason promotion".to_string());
+    }
+}
+
+fn append_extension_counter_hints(
+    hints: &mut Vec<String>,
+    extension_counters: &BTreeMap<String, BTreeMap<String, u64>>,
+) {
+    let Some((extension_name, counters)) = extension_counters
+        .iter()
+        .max_by_key(|(_, counters)| perf_counter(counters, "render_calls"))
+    else {
+        return;
+    };
+    let render_calls = perf_counter(counters, "render_calls");
+    if render_calls > 0 {
+        let cache_hits = perf_counter(counters, "cache_hits");
+        let imperative_calls = perf_counter(counters, "imperative_calls");
+        let full_surface_calls = perf_counter(counters, "full_surface_calls");
+        hints.push(format!(
+            "top render extension by call count was {extension_name} (calls={render_calls}, cache_hits={cache_hits}, imperative={imperative_calls}, full_surface={full_surface_calls})"
+        ));
     }
 }
 
@@ -1760,6 +1907,7 @@ fn derive_perf_hints(
 
     append_overrender_perf_hints(&mut hints, &report.overrender_counters);
     append_attach_window_counter_hints(&mut hints, &report.attach_window_counters);
+    append_extension_counter_hints(&mut hints, &report.extension_counters);
 
     if let Some(drain_ipc_max) = report.timings_ms.get("drain_ipc_ms_max")
         && drain_ipc_max.p95_ms > 20
@@ -1846,6 +1994,8 @@ fn analyze_perf_events(
             .and_then(serde_json::Value::as_u64);
 
         if name == "attach.window" {
+            let extension_stats = parse_extension_stats(object.get("extension_stats"));
+            aggregate_extension_counters(&mut report.extension_counters, &extension_stats);
             for (field, value) in object {
                 if matches!(field.as_str(), "schema_version" | "ts_epoch_ms")
                     || field.ends_with("_ms")
@@ -1879,6 +2029,12 @@ fn analyze_perf_events(
                     .entry(field.to_string())
                     .or_default() += value;
             }
+        }
+
+        if name == "attach.frame.trace"
+            && let Some(outlier) = render_outlier_from_frame_trace(object)
+        {
+            report.render_outliers.push(outlier);
         }
 
         if name == "iroh.connect.summary" && first_connect_ts_epoch_ms.is_none() {
@@ -1964,6 +2120,14 @@ fn analyze_perf_events(
         .outlier_samples
         .sort_by_key(|sample| std::cmp::Reverse(sample.value_ms));
     report.outlier_samples.truncate(20);
+    report.render_outliers.sort_by(|left, right| {
+        right
+            .frame_bytes
+            .unwrap_or(0)
+            .cmp(&left.frame_bytes.unwrap_or(0))
+            .then_with(|| left.frame_index.cmp(&right.frame_index))
+    });
+    report.render_outliers.truncate(20);
 
     if let (Some(connect_ts_epoch_ms), Some(first_frame_ts_epoch_ms)) = (
         first_connect_ts_epoch_ms,
@@ -2000,6 +2164,48 @@ fn print_nonzero_perf_counters(label: &str, counters: &BTreeMap<String, u64>) {
         if *value > 0 {
             println!("  {name}: {value}");
         }
+    }
+}
+
+fn print_extension_counters(counters: &BTreeMap<String, BTreeMap<String, u64>>) {
+    if counters.is_empty() {
+        return;
+    }
+    println!("extension counters:");
+    for (extension_name, extension_counters) in counters {
+        let summary = extension_counters
+            .iter()
+            .filter(|(_, value)| **value > 0)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !summary.is_empty() {
+            println!("  {extension_name}: {summary}");
+        }
+    }
+}
+
+fn print_render_outliers(outliers: &[PerfRenderOutlierSample]) {
+    if outliers.is_empty() {
+        return;
+    }
+    println!("render outliers:");
+    for outlier in outliers.iter().take(10) {
+        println!(
+            "  frame={} reason={} bytes={} render_ms={} full_frame={} dirty={}",
+            outlier
+                .frame_index
+                .map_or_else(|| "?".to_string(), |value| value.to_string()),
+            outlier.reason,
+            outlier
+                .frame_bytes
+                .map_or_else(|| "?".to_string(), |value| value.to_string()),
+            outlier
+                .frame_render_ms
+                .map_or_else(|| "?".to_string(), |value| value.to_string()),
+            outlier.full_frame_fallback,
+            outlier.dirty_reasons.join("+")
+        );
     }
 }
 
@@ -2048,6 +2254,7 @@ fn print_perf_analysis_text(report: &PerfAnalysisReport) {
 
     print_nonzero_perf_counters("attach window counters", &report.attach_window_counters);
     print_nonzero_perf_counters("render inefficiency counters", &report.overrender_counters);
+    print_extension_counters(&report.extension_counters);
 
     if !report.timings_ms.is_empty() {
         println!("timings (ms):");
@@ -2083,7 +2290,7 @@ fn print_perf_analysis_text(report: &PerfAnalysisReport) {
     }
 
     if !report.outlier_samples.is_empty() {
-        println!("outliers:");
+        println!("timing outliers:");
         for outlier in report.outlier_samples.iter().take(10) {
             if let Some(ts_epoch_ms) = outlier.ts_epoch_ms {
                 println!(
@@ -2102,6 +2309,8 @@ fn print_perf_analysis_text(report: &PerfAnalysisReport) {
             }
         }
     }
+
+    print_render_outliers(&report.render_outliers);
 
     if !report.hints.is_empty() {
         println!("hints:");

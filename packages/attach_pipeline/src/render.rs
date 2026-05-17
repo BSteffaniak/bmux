@@ -1273,6 +1273,16 @@ pub struct FrameDamageStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionRenderStats {
+    pub render_calls: u64,
+    pub render_op_calls: u64,
+    pub imperative_calls: u64,
+    pub cache_hits: u64,
+    pub full_surface_calls: u64,
+    pub region_count: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttachSceneRenderStats {
     pub full_frame: bool,
     pub viewport_cells: u64,
@@ -1293,10 +1303,57 @@ pub struct AttachSceneRenderStats {
     pub extension_cache_hits: u64,
     pub extension_full_surface_calls: u64,
     pub extension_region_count: u64,
+    pub extension_stats: BTreeMap<String, ExtensionRenderStats>,
     pub terminal_graphic_transmits: u64,
     pub terminal_graphic_places: u64,
     pub terminal_graphic_deletes: u64,
     pub terminal_graphic_bytes: u64,
+}
+
+impl AttachSceneRenderStats {
+    fn extension_entry(&mut self, extension_name: &str) -> &mut ExtensionRenderStats {
+        self.extension_stats
+            .entry(extension_name.to_string())
+            .or_default()
+    }
+
+    fn record_extension_render_call(&mut self, extension_name: &str, damage: &RenderDamage) {
+        let full_surface = matches!(damage, RenderDamage::FullSurface);
+        let region_count = match damage {
+            RenderDamage::Regions(regions) => u64::try_from(regions.len()).unwrap_or(u64::MAX),
+            RenderDamage::FullSurface | RenderDamage::None => 0,
+        };
+        self.extension_render_calls = self.extension_render_calls.saturating_add(1);
+        if full_surface {
+            self.extension_full_surface_calls = self.extension_full_surface_calls.saturating_add(1);
+        }
+        self.extension_region_count = self.extension_region_count.saturating_add(region_count);
+
+        let stats = self.extension_entry(extension_name);
+        stats.render_calls = stats.render_calls.saturating_add(1);
+        if full_surface {
+            stats.full_surface_calls = stats.full_surface_calls.saturating_add(1);
+        }
+        stats.region_count = stats.region_count.saturating_add(region_count);
+    }
+
+    fn record_extension_render_op_call(&mut self, extension_name: &str) {
+        self.extension_render_op_calls = self.extension_render_op_calls.saturating_add(1);
+        let stats = self.extension_entry(extension_name);
+        stats.render_op_calls = stats.render_op_calls.saturating_add(1);
+    }
+
+    fn record_extension_imperative_call(&mut self, extension_name: &str) {
+        self.extension_imperative_calls = self.extension_imperative_calls.saturating_add(1);
+        let stats = self.extension_entry(extension_name);
+        stats.imperative_calls = stats.imperative_calls.saturating_add(1);
+    }
+
+    fn record_extension_cache_hit(&mut self, extension_name: &str) {
+        self.extension_cache_hits = self.extension_cache_hits.saturating_add(1);
+        let stats = self.extension_entry(extension_name);
+        stats.cache_hits = stats.cache_hits.saturating_add(1);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2971,7 +3028,7 @@ fn before_content_cells_for_surface(
             continue;
         }
         if let Some(stats) = render_stats.as_deref_mut() {
-            stats.extension_render_calls = stats.extension_render_calls.saturating_add(1);
+            stats.record_extension_render_call(ext.name(), &damage);
         }
         match &damage {
             RenderDamage::FullSurface => {
@@ -3283,19 +3340,7 @@ fn render_attach_scene_inner<W: io::Write>(
                     continue;
                 }
                 if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.extension_render_calls = stats.extension_render_calls.saturating_add(1);
-                    match &damage {
-                        RenderDamage::FullSurface => {
-                            stats.extension_full_surface_calls =
-                                stats.extension_full_surface_calls.saturating_add(1);
-                        }
-                        RenderDamage::Regions(regions) => {
-                            stats.extension_region_count = stats
-                                .extension_region_count
-                                .saturating_add(u64::try_from(regions.len()).unwrap_or(u64::MAX));
-                        }
-                        RenderDamage::None => {}
-                    }
+                    stats.record_extension_render_call(ext.name(), &damage);
                 }
 
                 let revision =
@@ -3321,7 +3366,7 @@ fn render_attach_scene_inner<W: io::Write>(
                         .write_all(&entry.bytes)
                         .context("failed replaying cached declarative render ops")?;
                     if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.extension_cache_hits = stats.extension_cache_hits.saturating_add(1);
+                        stats.record_extension_cache_hit(ext.name());
                     }
                     if let Some(trace) = render_trace.as_deref_mut() {
                         trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
@@ -3338,8 +3383,7 @@ fn render_attach_scene_inner<W: io::Write>(
                 ) {
                     if !items.is_empty() {
                         if let Some(stats) = render_stats.as_deref_mut() {
-                            stats.extension_render_op_calls =
-                                stats.extension_render_op_calls.saturating_add(1);
+                            stats.record_extension_render_op_call(ext.name());
                         }
                         if let Some(trace) = render_trace.as_deref_mut() {
                             let (regions, full_surface) = render_damage_trace_shape(&damage);
@@ -3380,8 +3424,7 @@ fn render_attach_scene_inner<W: io::Write>(
                         continue;
                     }
                     if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.extension_render_op_calls =
-                            stats.extension_render_op_calls.saturating_add(1);
+                        stats.record_extension_render_op_call(ext.name());
                     }
                     if let Some(trace) = render_trace.as_deref_mut() {
                         let (regions, full_surface) = render_damage_trace_shape(&damage);
@@ -3426,8 +3469,7 @@ fn render_attach_scene_inner<W: io::Write>(
                     // trait's object-safe signature sees a dyn writer
                     // regardless of the concrete `W` the caller passed.
                     if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.extension_imperative_calls =
-                            stats.extension_imperative_calls.saturating_add(1);
+                        stats.record_extension_imperative_call(ext.name());
                     }
                     if let Some(trace) = render_trace.as_deref_mut() {
                         let (regions, full_surface) = render_damage_trace_shape(&damage);

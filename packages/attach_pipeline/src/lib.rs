@@ -36,7 +36,7 @@ pub use mouse::{
 };
 pub use render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, DamageCoalescingPolicy,
-    DamageRect, FrameDamage, FrameDamageStats, frame_damage_overlay_rects,
+    DamageRect, ExtensionRenderStats, FrameDamage, FrameDamageStats, frame_damage_overlay_rects,
     frame_damage_overlay_render_ops, queue_frame_damage_overlay,
     queue_frame_damage_overlay_with_trace,
 };

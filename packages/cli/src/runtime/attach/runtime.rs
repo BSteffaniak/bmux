@@ -301,7 +301,7 @@ use super::prompt_ui::{
     AttachPromptOrigin, AttachPromptOverlayRender, PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats,
+    AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
     collect_visual_projection_updates, frame_damage_overlay_rects, frame_damage_overlay_render_ops,
     opaque_row_text, queue_render_ops, render_attach_scene_with_stats_and_trace_with_capabilities,
     visible_scene_pane_ids,
@@ -882,7 +882,7 @@ async fn recover_attach_output_desync_for_pane(
         .await
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // Independent frame facts keep telemetry aggregation explicit.
 pub struct AttachFrameRenderStats {
     pub frame_bytes: usize,
@@ -1073,6 +1073,32 @@ impl AttachDirtyReasons {
     const fn contains(self, flag: u8) -> bool {
         self.bits & flag != 0
     }
+
+    fn labels(self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if self.contains(Self::STATUS) {
+            labels.push("status");
+        }
+        if self.contains(Self::FULL_PANE) {
+            labels.push("full_pane");
+        }
+        if self.contains(Self::OVERLAY) {
+            labels.push("overlay");
+        }
+        if self.contains(Self::PANE_DIRTY) {
+            labels.push("pane_dirty");
+        }
+        if self.contains(Self::LAYOUT) {
+            labels.push("layout");
+        }
+        if self.contains(Self::SCENE_HYDRATED) {
+            labels.push("scene_hydrated");
+        }
+        if self.contains(Self::EXTENSION) {
+            labels.push("extension");
+        }
+        labels
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1106,6 +1132,7 @@ struct AttachPerfWindow {
     extension_imperative_calls: u64,
     extension_cache_hits: u64,
     extension_full_surface_calls: u64,
+    extension_stats: BTreeMap<String, ExtensionRenderStats>,
     terminal_graphic_transmits: u64,
     terminal_graphic_places: u64,
     terminal_graphic_deletes: u64,
@@ -1173,6 +1200,7 @@ impl AttachPerfWindow {
             extension_imperative_calls: 0,
             extension_cache_hits: 0,
             extension_full_surface_calls: 0,
+            extension_stats: BTreeMap::new(),
             terminal_graphic_transmits: 0,
             terminal_graphic_places: 0,
             terminal_graphic_deletes: 0,
@@ -1235,8 +1263,8 @@ impl AttachPerfWindow {
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
-    fn record_render_frame(&mut self, elapsed_ms: u64, stats: AttachFrameRenderStats) {
-        let inefficiency_flags = classify_attach_render_inefficiency(&stats);
+    fn record_render_frame(&mut self, elapsed_ms: u64, stats: &AttachFrameRenderStats) {
+        let inefficiency_flags = classify_attach_render_inefficiency(stats);
         self.render_frames = self.render_frames.saturating_add(1);
         self.render_ms_sum = self.render_ms_sum.saturating_add(elapsed_ms);
         self.render_ms_max = self.render_ms_max.max(elapsed_ms);
@@ -1287,6 +1315,10 @@ impl AttachPerfWindow {
         self.extension_full_surface_calls = self
             .extension_full_surface_calls
             .saturating_add(stats.scene_render.extension_full_surface_calls);
+        aggregate_extension_render_stats(
+            &mut self.extension_stats,
+            &stats.scene_render.extension_stats,
+        );
         self.terminal_graphic_transmits = self
             .terminal_graphic_transmits
             .saturating_add(stats.scene_render.terminal_graphic_transmits);
@@ -1532,6 +1564,48 @@ async fn publish_attach_layout_snapshot(
     }
 }
 
+fn aggregate_extension_render_stats(
+    target: &mut BTreeMap<String, ExtensionRenderStats>,
+    source: &BTreeMap<String, ExtensionRenderStats>,
+) {
+    for (name, stats) in source {
+        let entry = target.entry(name.clone()).or_default();
+        entry.render_calls = entry.render_calls.saturating_add(stats.render_calls);
+        entry.render_op_calls = entry.render_op_calls.saturating_add(stats.render_op_calls);
+        entry.imperative_calls = entry
+            .imperative_calls
+            .saturating_add(stats.imperative_calls);
+        entry.cache_hits = entry.cache_hits.saturating_add(stats.cache_hits);
+        entry.full_surface_calls = entry
+            .full_surface_calls
+            .saturating_add(stats.full_surface_calls);
+        entry.region_count = entry.region_count.saturating_add(stats.region_count);
+    }
+}
+
+fn extension_render_stats_payload(
+    extension_stats: &BTreeMap<String, ExtensionRenderStats>,
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        extension_stats
+            .iter()
+            .map(|(name, stats)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "render_calls": stats.render_calls,
+                        "render_op_calls": stats.render_op_calls,
+                        "imperative_calls": stats.imperative_calls,
+                        "cache_hits": stats.cache_hits,
+                        "full_surface_calls": stats.full_surface_calls,
+                        "region_count": stats.region_count,
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn insert_attach_terminal_graphics_payload(
     object: &mut serde_json::Map<String, serde_json::Value>,
     window: &AttachPerfWindow,
@@ -1602,6 +1676,12 @@ fn insert_attach_render_work_payload(
         "extension_full_surface_calls".to_string(),
         window.extension_full_surface_calls.into(),
     );
+    if !window.extension_stats.is_empty() {
+        object.insert(
+            "extension_stats".to_string(),
+            extension_render_stats_payload(&window.extension_stats),
+        );
+    }
     insert_attach_terminal_graphics_payload(object, window);
     object.insert(
         "status_rendered_frames".to_string(),
@@ -1870,6 +1950,50 @@ async fn maybe_emit_attach_perf_window(
 }
 
 #[allow(clippy::too_many_arguments)] // keep frame/attach telemetry emit context explicit
+fn attach_frame_trace_payload(
+    rendered_frame_count: u64,
+    since_attach_start_ms: u64,
+    frame_render_ms: u64,
+    scene_hydrated: bool,
+    dirty_reasons: AttachDirtyReasons,
+    frame_stats: &AttachFrameRenderStats,
+) -> serde_json::Value {
+    serde_json::json!({
+        "frame_render_ms": frame_render_ms,
+        "frame_index": rendered_frame_count,
+        "since_attach_start_ms": since_attach_start_ms,
+        "scene_hydrated": scene_hydrated,
+        "frame_bytes": frame_stats.frame_bytes,
+        "terminal_write_ms": frame_stats.terminal_write_ms,
+        "damage_rects": frame_stats.damage_rects,
+        "damage_area_cells": frame_stats.damage_area_cells,
+        "full_surface_fallbacks": frame_stats.full_surface_fallbacks,
+        "full_frame_fallback": frame_stats.full_frame_fallback,
+        "status_rendered": frame_stats.status_rendered,
+        "overlay_rendered": frame_stats.overlay_rendered,
+        "synchronized_update": frame_stats.synchronized_update,
+        "dirty_event_count": frame_stats.dirty_event_count,
+        "dirty_reasons": dirty_reasons.labels(),
+        "pane_rows_examined": frame_stats.scene_render.pane_rows_examined,
+        "pane_rows_emitted": frame_stats.scene_render.pane_rows_emitted,
+        "pane_row_segments_emitted": frame_stats.scene_render.pane_row_segments_emitted,
+        "pane_rows_cached_skipped": frame_stats.scene_render.pane_rows_cached_skipped,
+        "pane_cells_emitted": frame_stats.scene_render.pane_cells_emitted,
+        "extension_render_calls": frame_stats.scene_render.extension_render_calls,
+        "extension_render_op_calls": frame_stats.scene_render.extension_render_op_calls,
+        "extension_imperative_calls": frame_stats.scene_render.extension_imperative_calls,
+        "extension_cache_hits": frame_stats.scene_render.extension_cache_hits,
+        "extension_full_surface_calls": frame_stats.scene_render.extension_full_surface_calls,
+        "extension_region_count": frame_stats.scene_render.extension_region_count,
+        "extension_stats": extension_render_stats_payload(&frame_stats.scene_render.extension_stats),
+        "terminal_graphic_transmits": frame_stats.scene_render.terminal_graphic_transmits,
+        "terminal_graphic_places": frame_stats.scene_render.terminal_graphic_places,
+        "terminal_graphic_deletes": frame_stats.scene_render.terminal_graphic_deletes,
+        "terminal_graphic_bytes": frame_stats.scene_render.terminal_graphic_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // keep frame/attach telemetry emit context explicit
 async fn maybe_emit_attach_frame_perf(
     perf_emitter: &mut recording::PerfEventEmitter,
     client: &mut StreamingBmuxClient,
@@ -1878,6 +2002,8 @@ async fn maybe_emit_attach_frame_perf(
     rendered_frame_count: u64,
     frame_render_ms: u64,
     scene_hydrated: bool,
+    dirty_reasons: AttachDirtyReasons,
+    frame_stats: &AttachFrameRenderStats,
     first_frame_emitted: &mut bool,
     interactive_ready_emitted: &mut bool,
 ) -> Result<()> {
@@ -1931,12 +2057,14 @@ async fn maybe_emit_attach_frame_perf(
                 Some(session_id),
                 None,
                 "attach.frame.trace",
-                serde_json::json!({
-                    "frame_render_ms": frame_render_ms,
-                    "frame_index": rendered_frame_count,
-                    "since_attach_start_ms": since_attach_start_ms,
-                    "scene_hydrated": scene_hydrated,
-                }),
+                attach_frame_trace_payload(
+                    rendered_frame_count,
+                    since_attach_start_ms,
+                    frame_render_ms,
+                    scene_hydrated,
+                    dirty_reasons,
+                    frame_stats,
+                ),
             )
             .await?;
     }
@@ -2798,11 +2926,9 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         };
 
         if scene_hydrated {
-            perf_window.record_dirty_reasons(AttachDirtyReasons::from_view_state(
-                &view_state,
-                dirty_layout_frame,
-                true,
-            ));
+            let dirty_reasons =
+                AttachDirtyReasons::from_view_state(&view_state, dirty_layout_frame, true);
+            perf_window.record_dirty_reasons(dirty_reasons);
             let help_scroll = view_state.help_overlay_scroll;
             let render_started_at = SystemAttachClock.now();
             let render_geometry = terminal.geometry();
@@ -2835,7 +2961,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                     "attach.render.slow_frame"
                 );
             }
-            perf_window.record_render_frame(render_ms, frame_stats);
+            perf_window.record_render_frame(render_ms, &frame_stats);
             rendered_frame_count = rendered_frame_count.saturating_add(1);
             maybe_emit_attach_frame_perf(
                 &mut perf_emitter,
@@ -2845,6 +2971,8 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 rendered_frame_count,
                 render_ms,
                 true,
+                dirty_reasons,
+                &frame_stats,
                 &mut first_frame_emitted,
                 &mut interactive_ready_emitted,
             )
@@ -3085,11 +3213,9 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             continue;
         }
 
-        perf_window.record_dirty_reasons(AttachDirtyReasons::from_view_state(
-            &view_state,
-            dirty_layout_frame,
-            false,
-        ));
+        let dirty_reasons =
+            AttachDirtyReasons::from_view_state(&view_state, dirty_layout_frame, false);
+        perf_window.record_dirty_reasons(dirty_reasons);
         let help_scroll = view_state.help_overlay_scroll;
         let render_started_at = SystemAttachClock.now();
         let render_geometry = terminal.geometry();
@@ -3122,7 +3248,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 "attach.render.slow_frame"
             );
         }
-        perf_window.record_render_frame(render_ms, frame_stats);
+        perf_window.record_render_frame(render_ms, &frame_stats);
         rendered_frame_count = rendered_frame_count.saturating_add(1);
         maybe_emit_attach_frame_perf(
             &mut perf_emitter,
@@ -3132,6 +3258,8 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             rendered_frame_count,
             render_ms,
             false,
+            dirty_reasons,
+            &frame_stats,
             &mut first_frame_emitted,
             &mut interactive_ready_emitted,
         )
