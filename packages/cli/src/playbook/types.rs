@@ -471,6 +471,10 @@ pub struct PlaybookRenderSummary {
     pub frame_bytes: u64,
     pub status_rendered_frames: u64,
     pub overlay_rendered_frames: u64,
+    pub terminal_graphic_transmits: u64,
+    pub terminal_graphic_places: u64,
+    pub terminal_graphic_deletes: u64,
+    pub terminal_graphic_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emitted_rows: Vec<PlaybookRenderRowRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -993,6 +993,10 @@ pub fn summarize_attach_render_trace(
         frame_bytes: u64::try_from(facts.frame_bytes).unwrap_or(u64::MAX),
         status_rendered_frames: u64::from(facts.status_rendered),
         overlay_rendered_frames: u64::from(facts.overlay_rendered),
+        terminal_graphic_transmits: stats.terminal_graphic_transmits,
+        terminal_graphic_places: stats.terminal_graphic_places,
+        terminal_graphic_deletes: stats.terminal_graphic_deletes,
+        terminal_graphic_bytes: stats.terminal_graphic_bytes,
         ..PlaybookRenderSummary::default()
     };
     if facts.full_frame_fallback || stats.full_frame {
@@ -1292,6 +1296,18 @@ fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRe
             acc.overlay_rendered_frames = acc
                 .overlay_rendered_frames
                 .saturating_add(summary.overlay_rendered_frames);
+            acc.terminal_graphic_transmits = acc
+                .terminal_graphic_transmits
+                .saturating_add(summary.terminal_graphic_transmits);
+            acc.terminal_graphic_places = acc
+                .terminal_graphic_places
+                .saturating_add(summary.terminal_graphic_places);
+            acc.terminal_graphic_deletes = acc
+                .terminal_graphic_deletes
+                .saturating_add(summary.terminal_graphic_deletes);
+            acc.terminal_graphic_bytes = acc
+                .terminal_graphic_bytes
+                .saturating_add(summary.terminal_graphic_bytes);
             acc.emitted_rows
                 .extend(summary.emitted_rows.iter().copied());
             acc.emitted_row_segments

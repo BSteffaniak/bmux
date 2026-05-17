@@ -1,0 +1,19 @@
+{
+  "description": "Layout churn may redraw, but should remain bounded and avoid full-surface fallbacks.",
+  "ignore_actions": ["new-session", "send-keys", "wait-for"],
+  "max_total_elapsed_ms": 15000,
+  "max_step_elapsed_ms": 5000,
+  "render": {
+    "max_full_surface_fallbacks": 0,
+    "max_rows_emitted": 600,
+    "max_cells_emitted": 90000,
+    "max_frame_bytes": 220000
+  },
+  "perf": {
+    "require_events": false,
+    "max_malformed_payloads": 0,
+    "max_dropped_events_reported": 0,
+    "max_render_p95_ms": 16,
+    "max_drain_ipc_p95_ms": 20
+  }
+}

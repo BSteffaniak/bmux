@@ -1,0 +1,20 @@
+{
+  "description": "Idle should not render after warmup.",
+  "ignore_actions": ["new-session"],
+  "max_total_elapsed_ms": 5000,
+  "max_step_elapsed_ms": 1000,
+  "render": {
+    "max_frames": 0,
+    "max_full_frame_frames": 0,
+    "max_rows_emitted": 0,
+    "max_cells_emitted": 0,
+    "max_frame_bytes": 0,
+    "max_terminal_graphic_transmits": 0,
+    "max_terminal_graphic_deletes": 0
+  },
+  "perf": {
+    "require_events": false,
+    "max_malformed_payloads": 0,
+    "max_dropped_events_reported": 0
+  }
+}
