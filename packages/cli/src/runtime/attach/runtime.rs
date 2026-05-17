@@ -889,6 +889,10 @@ struct AttachPerfWindow {
     extension_imperative_calls: u64,
     extension_cache_hits: u64,
     extension_full_surface_calls: u64,
+    terminal_graphic_transmits: u64,
+    terminal_graphic_places: u64,
+    terminal_graphic_deletes: u64,
+    terminal_graphic_bytes: u64,
     status_rendered_frames: u64,
     overlay_rendered_frames: u64,
     synchronized_update_frames: u64,
@@ -952,6 +956,10 @@ impl AttachPerfWindow {
             extension_imperative_calls: 0,
             extension_cache_hits: 0,
             extension_full_surface_calls: 0,
+            terminal_graphic_transmits: 0,
+            terminal_graphic_places: 0,
+            terminal_graphic_deletes: 0,
+            terminal_graphic_bytes: 0,
             status_rendered_frames: 0,
             overlay_rendered_frames: 0,
             synchronized_update_frames: 0,
@@ -1062,6 +1070,18 @@ impl AttachPerfWindow {
         self.extension_full_surface_calls = self
             .extension_full_surface_calls
             .saturating_add(stats.scene_render.extension_full_surface_calls);
+        self.terminal_graphic_transmits = self
+            .terminal_graphic_transmits
+            .saturating_add(stats.scene_render.terminal_graphic_transmits);
+        self.terminal_graphic_places = self
+            .terminal_graphic_places
+            .saturating_add(stats.scene_render.terminal_graphic_places);
+        self.terminal_graphic_deletes = self
+            .terminal_graphic_deletes
+            .saturating_add(stats.scene_render.terminal_graphic_deletes);
+        self.terminal_graphic_bytes = self
+            .terminal_graphic_bytes
+            .saturating_add(stats.scene_render.terminal_graphic_bytes);
         if stats.status_rendered {
             self.status_rendered_frames = self.status_rendered_frames.saturating_add(1);
         }
@@ -1295,6 +1315,28 @@ async fn publish_attach_layout_snapshot(
     }
 }
 
+fn insert_attach_terminal_graphics_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    window: &AttachPerfWindow,
+) {
+    object.insert(
+        "terminal_graphic_transmits".to_string(),
+        window.terminal_graphic_transmits.into(),
+    );
+    object.insert(
+        "terminal_graphic_places".to_string(),
+        window.terminal_graphic_places.into(),
+    );
+    object.insert(
+        "terminal_graphic_deletes".to_string(),
+        window.terminal_graphic_deletes.into(),
+    );
+    object.insert(
+        "terminal_graphic_bytes".to_string(),
+        window.terminal_graphic_bytes.into(),
+    );
+}
+
 fn insert_attach_render_work_payload(
     object: &mut serde_json::Map<String, serde_json::Value>,
     window: &AttachPerfWindow,
@@ -1343,6 +1385,7 @@ fn insert_attach_render_work_payload(
         "extension_full_surface_calls".to_string(),
         window.extension_full_surface_calls.into(),
     );
+    insert_attach_terminal_graphics_payload(object, window);
     object.insert(
         "status_rendered_frames".to_string(),
         window.status_rendered_frames.into(),

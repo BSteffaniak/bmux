@@ -18,11 +18,13 @@ use bmux_client::{AttachLayoutState, BmuxClient};
 use bmux_contexts_plugin_api::contexts_state;
 use bmux_ipc::InvokeServiceKind;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
+use bmux_performance_plugin_api::{performance_commands, performance_state};
+use bmux_performance_state::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
 use bmux_plugin_sdk::{
     PluginCliCommandRequest, PluginCliCommandResponse, TypedServiceEndpoint,
     perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
 };
-use bmux_recording_plugin_api::recording_commands;
+use bmux_recording_plugin_api::{recording_commands, recording_types::RecordingEventKind};
 use bmux_recording_protocol::{DisplayActivityKind, RecordingSummary};
 use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
@@ -2269,6 +2271,11 @@ async fn run_playbook_inner(
     let mut events_subscribed = false;
     let mut attach_runtime: Option<AttachInputRuntime> = None;
     let mut display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
+    let previous_perf_settings = if should_record {
+        set_playbook_perf_recording_level(&mut client).await
+    } else {
+        None
+    };
 
     // Start recording before any steps execute so that all events (including
     // NewSession) are captured. Uses session_id: None since no session exists
@@ -2668,10 +2675,9 @@ async fn run_playbook_inner(
         warn!("failed to finish display track: {e:#}");
     }
 
-    // Copy recording dir to user recordings dir before sandbox shutdown.
+    // Stop recording before sandbox shutdown so the server finalizes files.
     let mut recording_path: Option<std::path::PathBuf> = None;
-    if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
-        // Stop recording first so the server finalizes the binary files.
+    if let Some(rid) = recording_id {
         match recording_commands::client::stop(&mut client, Some(rid)).await {
             Ok(Ok(stopped_id)) => {
                 info!("recording stopped: {stopped_id}");
@@ -2685,20 +2691,24 @@ async fn run_playbook_inner(
             }
         }
 
-        // Copy recording dir from sandbox to user recordings dir.
-        let src_dir = sb.paths().recordings_dir().join(rid.to_string());
-        let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
-        let dest_dir = user_recordings.join(rid.to_string());
+        if let Some(sb) = &sandbox {
+            // Copy recording dir from sandbox to user recordings dir.
+            let src_dir = sb.paths().recordings_dir().join(rid.to_string());
+            let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
+            let dest_dir = user_recordings.join(rid.to_string());
 
-        if src_dir.exists() {
-            if let Err(e) = copy_dir_recursive(&src_dir, &dest_dir) {
-                warn!("failed to copy recording to user dir: {e:#}");
-            } else {
-                info!("recording copied to {}", dest_dir.display());
-                recording_path = Some(dest_dir);
+            if src_dir.exists() {
+                if let Err(e) = copy_dir_recursive(&src_dir, &dest_dir) {
+                    warn!("failed to copy recording to user dir: {e:#}");
+                } else {
+                    info!("recording copied to {}", dest_dir.display());
+                    recording_path = Some(dest_dir);
+                }
             }
         }
     }
+
+    restore_playbook_perf_recording_level(&mut client, previous_perf_settings).await;
 
     #[allow(clippy::cast_possible_truncation)]
     let total_elapsed_ms = started.elapsed().as_millis() as u64;
@@ -3211,16 +3221,82 @@ async fn run_interactive_dsl_command(
     Ok(())
 }
 
+fn playbook_recording_event_kinds() -> Vec<RecordingEventKind> {
+    vec![
+        RecordingEventKind::PaneInputRaw,
+        RecordingEventKind::PaneOutputRaw,
+        RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKind::PaneImage,
+        RecordingEventKind::ServerEvent,
+        RecordingEventKind::RequestStart,
+        RecordingEventKind::RequestDone,
+        RecordingEventKind::RequestError,
+        RecordingEventKind::Custom,
+    ]
+}
+
+fn playbook_perf_recording_level_from_env() -> Option<PerformanceRecordingLevel> {
+    let raw = std::env::var("BMUX_PLAYBOOK_PERF_RECORDING_LEVEL").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "inherit" => None,
+        "off" => Some(PerformanceRecordingLevel::Off),
+        "basic" => Some(PerformanceRecordingLevel::Basic),
+        "detailed" | "detail" => Some(PerformanceRecordingLevel::Detailed),
+        "trace" => Some(PerformanceRecordingLevel::Trace),
+        other => {
+            warn!("ignoring invalid BMUX_PLAYBOOK_PERF_RECORDING_LEVEL={other:?}");
+            None
+        }
+    }
+}
+
+async fn set_playbook_perf_recording_level(
+    client: &mut BmuxClient,
+) -> Option<PerformanceRuntimeSettings> {
+    let level = playbook_perf_recording_level_from_env()?;
+    let Ok(current_plugin_settings) = performance_state::client::get_settings(client).await else {
+        warn!("failed to read performance settings; playbook perf telemetry level not changed");
+        return None;
+    };
+    let current: PerformanceRuntimeSettings = current_plugin_settings.into();
+    if current.recording_level == level {
+        return Some(current);
+    }
+    let mut updated = current.clone();
+    updated.recording_level = level;
+    match performance_commands::client::set_settings(client, updated.into()).await {
+        Ok(_) => Some(current),
+        Err(error) => {
+            warn!(%error, "failed to set playbook performance recording level");
+            None
+        }
+    }
+}
+
+async fn restore_playbook_perf_recording_level(
+    client: &mut BmuxClient,
+    previous: Option<PerformanceRuntimeSettings>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if let Err(error) = performance_commands::client::set_settings(client, previous.into()).await {
+        warn!(%error, "failed to restore playbook performance recording level");
+    }
+}
+
 /// Start a recording on the server, optionally filtered to a specific session.
 pub(super) async fn start_recording(
     client: &mut BmuxClient,
     session_id: Option<Uuid>,
 ) -> Result<Uuid> {
     let summary: RecordingSummary = recording_commands::client::start(
-        client, session_id, true, // capture_input
+        client,
+        session_id,
+        true, // capture_input
         None, // name
         None, // profile: server default (Functional)
-        None, // event_kinds: server default
+        Some(playbook_recording_event_kinds()),
     )
     .await?
     .map(Into::into)

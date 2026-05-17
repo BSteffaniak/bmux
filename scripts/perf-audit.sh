@@ -3,8 +3,9 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/perf-audit.sh [--quick|--full] [--target-server] [--output-dir DIR]
-                             [--playbook-dir DIR] [--budget-dir DIR] [--keep-going]
+Usage: scripts/perf-audit.sh [--quick|--full] [--target-server] [--require-perf-events]
+                             [--output-dir DIR] [--playbook-dir DIR] [--budget-dir DIR]
+                             [--keep-going]
 
 Runs bmux perf playbooks, records each run, analyzes recording perf telemetry
 when available, and evaluates scenario budgets.
@@ -15,6 +16,7 @@ EOF
 
 MODE="quick"
 TARGET_SERVER=0
+REQUIRE_PERF_EVENTS=0
 KEEP_GOING=0
 PLAYBOOK_DIR="tests/perf/playbooks"
 BUDGET_DIR="tests/perf/budgets"
@@ -25,6 +27,7 @@ while [[ $# -gt 0 ]]; do
     --quick) MODE="quick"; shift ;;
     --full) MODE="full"; shift ;;
     --target-server) TARGET_SERVER=1; shift ;;
+    --require-perf-events) REQUIRE_PERF_EVENTS=1; shift ;;
     --keep-going) KEEP_GOING=1; shift ;;
     --output-dir) OUTPUT_DIR="${2:?missing --output-dir value}"; shift 2 ;;
     --playbook-dir) PLAYBOOK_DIR="${2:?missing --playbook-dir value}"; shift 2 ;;
@@ -69,6 +72,7 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
   perf_json="$scenario_dir/perf.json"
   metrics_json="$scenario_dir/metrics.json"
   violations_json="$scenario_dir/violations.json"
+  recommendations_json="$scenario_dir/recommendations.json"
   log_file="$scenario_dir/run.log"
   budget_json="$BUDGET_DIR/$scenario.json"
   if [[ ! -f "$budget_json" ]]; then
@@ -83,7 +87,7 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
   if [[ "$TARGET_SERVER" -eq 1 ]]; then
     args+=(--target-server)
   fi
-  if bmux "${args[@]}" > "$result_json" 2> "$log_file"; then
+  if BMUX_PLAYBOOK_PERF_RECORDING_LEVEL="${BMUX_PLAYBOOK_PERF_RECORDING_LEVEL:-trace}" bmux "${args[@]}" > "$result_json" 2> "$log_file"; then
     run_status=0
   else
     run_status=$?
@@ -169,13 +173,14 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
           reconnect_outage_max_ms: n($p.reconnect_outage_max_ms),
           render_p95_ms: n($p.timings_ms.render_ms_max.p95_ms),
           drain_ipc_p95_ms: n($p.timings_ms.drain_ipc_ms_max.p95_ms),
+          attach_window_counters: ($p.attach_window_counters // {}),
           hints: ($p.hints // []),
           outlier_samples: ($p.outlier_samples // [])
         }
       }
     ' > "$metrics_json"
 
-  jq -n --slurpfile m "$metrics_json" --slurpfile b "$budget_json" '
+  jq -n --argjson require_perf_events "$REQUIRE_PERF_EVENTS" --slurpfile m "$metrics_json" --slurpfile b "$budget_json" '
     def check_max($name; $actual; $max):
       if $max == null then empty
       elif $actual <= $max then empty
@@ -209,7 +214,7 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
       check_max("render.terminal_graphic_places"; $m.render.terminal_graphic_places; $r.max_terminal_graphic_places),
       check_max("render.terminal_graphic_deletes"; $m.render.terminal_graphic_deletes; $r.max_terminal_graphic_deletes),
       check_max("render.terminal_graphic_bytes"; $m.render.terminal_graphic_bytes; $r.max_terminal_graphic_bytes),
-      (if ($p.require_events // false) and ($m.perf.perf_events <= 0)
+      (if (($p.require_events // false) or ($require_perf_events == 1)) and ($m.perf.perf_events <= 0)
        then {kind:"min", name:"perf.perf_events", actual:$m.perf.perf_events, expected:">0"}
        else empty end),
       check_max("perf.malformed_payloads"; $m.perf.malformed_payloads; $p.max_malformed_payloads),
@@ -221,6 +226,29 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
       (if $m.perf.perf_events > 0 then check_max("perf.drain_ipc_p95_ms"; $m.perf.drain_ipc_p95_ms; $p.max_drain_ipc_p95_ms) else empty end)
     ]
   ' > "$violations_json"
+
+  jq -n --slurpfile m "$metrics_json" --slurpfile v "$violations_json" '
+    def rec($severity; $category; $message; $next):
+      {severity:$severity, category:$category, message:$message, next:$next};
+    ($m[0]) as $m |
+    ($v[0]) as $v |
+    [
+      ($v[]? | rec("error"; "budget"; "budget violation: \(.name) actual=\(.actual) expected=\(.expected)"; "Open metrics.json and compare this scenario against its budget.")),
+      (if $m.perf.perf_events == 0 then
+        rec("error"; "instrumentation"; "recording contains no bmux.perf custom events"; "Use a real attach-driven scenario and ensure recordings include custom events with performance recording level trace/detailed.")
+       else empty end),
+      ($m.perf.hints[]? | rec("warning"; "telemetry"; .; "Inspect perf.json outliers and attach_window_counters for the matching scenario.")),
+      (if ($m.render.terminal_graphic_deletes // 0) > 0 then
+        rec("warning"; "graphics"; "playbook render summary observed retained graphics deletes"; "Check whether deletes are limited to expected layout/tab teardown, not steady-state focus/hover.")
+       else empty end),
+      (if (($m.perf.attach_window_counters.terminal_graphic_transmits // 0) > 0 and ($m.perf.attach_window_counters.terminal_graphic_deletes // 0) > 0) then
+        rec("warning"; "graphics"; "real attach telemetry observed graphics transmit/delete churn"; "Inspect retained graphics keys/signatures and damage-triggered reconciliation.")
+       else empty end),
+      (if (($m.perf.attach_window_counters.full_frame_fallbacks // 0) > 0) then
+        rec("warning"; "render"; "real attach telemetry observed full-frame fallback"; "Inspect dirty reason promotion and damage coalescing around this scenario.")
+       else empty end)
+    ]
+  ' > "$recommendations_json"
 
   violation_count="$(jq 'length' "$violations_json")"
   if [[ "$violation_count" -eq 0 ]]; then
@@ -250,6 +278,12 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
       $artifact
     ] | @tsv
   ' "$metrics_json" >> "$SUMMARY_TSV"
+
+  recommendation_count="$(jq 'length' "$recommendations_json")"
+  if [[ "$recommendation_count" -gt 0 ]]; then
+    echo "recommendations for $scenario:" >&2
+    jq -r '.[] | "  - [\(.severity)] \(.category): \(.message)"' "$recommendations_json" >&2
+  fi
 
   if [[ "$status" == "FAIL" ]]; then
     echo "FAIL $scenario — violations:" >&2

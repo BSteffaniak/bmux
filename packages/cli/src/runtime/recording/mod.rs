@@ -1606,6 +1606,7 @@ struct PerfAnalysisReport {
     span_ms: Option<u64>,
     by_event_name: BTreeMap<String, u64>,
     by_level: BTreeMap<String, u64>,
+    attach_window_counters: BTreeMap<String, u64>,
     overrender_counters: BTreeMap<String, u64>,
     timings_ms: BTreeMap<String, PerfTimingSummary>,
     outlier_samples: Vec<PerfOutlierSample>,
@@ -1650,27 +1651,49 @@ fn timing_summary_from_values(values: &[u64]) -> PerfTimingSummary {
     }
 }
 
-fn overrender_counter(counters: &BTreeMap<String, u64>, name: &str) -> u64 {
+fn perf_counter(counters: &BTreeMap<String, u64>, name: &str) -> u64 {
     counters.get(name).copied().unwrap_or(0)
 }
 
+fn append_attach_window_counter_hints(hints: &mut Vec<String>, counters: &BTreeMap<String, u64>) {
+    let render_frames = perf_counter(counters, "render_frames");
+    if perf_counter(counters, "terminal_graphic_deletes") > 0 {
+        hints.push("retained terminal graphics were deleted during captured attach windows; if this occurs outside tab/layout teardown, inspect graphic identity and lifecycle reconciliation".to_string());
+    }
+    if perf_counter(counters, "terminal_graphic_transmits") > 0
+        && perf_counter(counters, "terminal_graphic_places")
+            > render_frames.max(1).saturating_mul(2)
+    {
+        hints.push("terminal graphics placements greatly exceed rendered frames; inspect retained graphics placement stability and damage intersection checks".to_string());
+    }
+    if perf_counter(counters, "terminal_graphic_bytes") > 512 * 1024 {
+        hints.push("terminal graphics uploaded more than 512KiB of raw pixels; prefer small retained sources and placement scaling for stable decorations".to_string());
+    }
+    if perf_counter(counters, "full_frame_fallbacks") > 0
+        && perf_counter(counters, "damage_area_cells_max")
+            < perf_counter(counters, "viewport_cells")
+    {
+        hints.push("full-frame fallback was observed without a matching full viewport damage area; inspect damage coalescing and dirty reason promotion".to_string());
+    }
+}
+
 fn append_overrender_perf_hints(hints: &mut Vec<String>, counters: &BTreeMap<String, u64>) {
-    if overrender_counter(counters, "dirty_no_visible_row_change_frames") > 0 {
+    if perf_counter(counters, "dirty_no_visible_row_change_frames") > 0 {
         hints.push("attach rendered dirty frames with no visible pane row changes; inspect dirty-source tracking for no-op invalidations".to_string());
     }
-    if overrender_counter(counters, "full_frame_fallback_flagged_frames") > 0 {
+    if perf_counter(counters, "full_frame_fallback_flagged_frames") > 0 {
         hints.push("attach used full-frame damage fallbacks; inspect layout/resize/overlay churn before optimizing terminal throughput".to_string());
     }
-    if overrender_counter(counters, "extension_full_surface_excessive_frames") > 0 {
+    if perf_counter(counters, "extension_full_surface_excessive_frames") > 0 {
         hints.push("extension rendering frequently fell back to full-surface damage; prefer precise extension regions when possible".to_string());
     }
-    if overrender_counter(counters, "extension_imperative_or_cache_miss_frames") > 0 {
+    if perf_counter(counters, "extension_imperative_or_cache_miss_frames") > 0 {
         hints.push("extension rendering had imperative fallback or cache-miss pressure; check render-op revisions and cacheability".to_string());
     }
-    if overrender_counter(counters, "status_overlay_only_emits_pane_work_frames") > 0 {
+    if perf_counter(counters, "status_overlay_only_emits_pane_work_frames") > 0 {
         hints.push("status/overlay-only frames emitted pane content; inspect damage classification for unnecessary scene redraws".to_string());
     }
-    if overrender_counter(counters, "slow_terminal_write_per_kib_frames") > 0 {
+    if perf_counter(counters, "slow_terminal_write_per_kib_frames") > 0 {
         hints.push("terminal writes were slow per KiB; host terminal throughput may be the bottleneck after render work is bounded".to_string());
     }
 }
@@ -1689,7 +1712,7 @@ fn derive_perf_hints(
             );
         } else {
             hints.push(
-                "no bmux.perf events found; set `performance.recording_level` and reproduce with recording enabled"
+                "no bmux.perf events found; drive a telemetry-emitting path (for example real attach/runtime activity) and ensure `performance.recording_level` is enabled"
                     .to_string(),
             );
         }
@@ -1736,6 +1759,7 @@ fn derive_perf_hints(
     }
 
     append_overrender_perf_hints(&mut hints, &report.overrender_counters);
+    append_attach_window_counter_hints(&mut hints, &report.attach_window_counters);
 
     if let Some(drain_ipc_max) = report.timings_ms.get("drain_ipc_ms_max")
         && drain_ipc_max.p95_ms > 20
@@ -1822,6 +1846,19 @@ fn analyze_perf_events(
             .and_then(serde_json::Value::as_u64);
 
         if name == "attach.window" {
+            for (field, value) in object {
+                if matches!(field.as_str(), "schema_version" | "ts_epoch_ms")
+                    || field.ends_with("_ms")
+                {
+                    continue;
+                }
+                if let Some(counter) = value.as_u64() {
+                    *report
+                        .attach_window_counters
+                        .entry(field.clone())
+                        .or_default() += counter;
+                }
+            }
             for field in [
                 "overrender_flagged_frames",
                 "dirty_no_visible_row_change_frames",
@@ -1954,15 +1991,14 @@ fn analyze_perf_events(
     report
 }
 
-fn print_perf_overrender_counters(report: &PerfAnalysisReport) {
-    if !report.overrender_counters.is_empty()
-        && report.overrender_counters.values().any(|value| *value > 0)
-    {
-        println!("render inefficiency counters:");
-        for (name, value) in &report.overrender_counters {
-            if *value > 0 {
-                println!("  {name}: {value}");
-            }
+fn print_nonzero_perf_counters(label: &str, counters: &BTreeMap<String, u64>) {
+    if counters.is_empty() || !counters.values().any(|value| *value > 0) {
+        return;
+    }
+    println!("{label}:");
+    for (name, value) in counters {
+        if *value > 0 {
+            println!("  {name}: {value}");
         }
     }
 }
@@ -2010,7 +2046,8 @@ fn print_perf_analysis_text(report: &PerfAnalysisReport) {
         }
     }
 
-    print_perf_overrender_counters(report);
+    print_nonzero_perf_counters("attach window counters", &report.attach_window_counters);
+    print_nonzero_perf_counters("render inefficiency counters", &report.overrender_counters);
 
     if !report.timings_ms.is_empty() {
         println!("timings (ms):");
@@ -7734,6 +7771,7 @@ mod tests {
                     "dropped_payload_bytes_since_emit": 64_u64,
                     "dirty_no_visible_row_change_frames": 3_u64,
                     "extension_imperative_or_cache_miss_frames": 2_u64,
+                    "terminal_graphic_deletes": 1_u64,
                 }),
             ),
             perf_custom_event(
@@ -7759,6 +7797,12 @@ mod tests {
         );
         assert_eq!(
             report
+                .attach_window_counters
+                .get("terminal_graphic_deletes"),
+            Some(&1)
+        );
+        assert_eq!(
+            report
                 .timings_ms
                 .get("connect_ms")
                 .map(|timing| timing.p95_ms),
@@ -7777,6 +7821,13 @@ mod tests {
                 .iter()
                 .any(|hint| hint.contains("no-op invalidations")),
             "expected render inefficiency hint in analysis output"
+        );
+        assert!(
+            report
+                .hints
+                .iter()
+                .any(|hint| hint.contains("retained terminal graphics")),
+            "expected retained graphics hint in analysis output"
         );
     }
 

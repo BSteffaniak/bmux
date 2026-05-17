@@ -20,16 +20,19 @@ Artifacts are written to `target/perf-audit/<timestamp>/` and include:
 - `perf.json` — `bmux recording analyze --perf --json` output when telemetry exists
 - `metrics.json` — normalized metrics used for budget checks
 - `violations.json` — failed budget checks
+- `recommendations.json` — actionable findings derived from budgets, real perf telemetry, and render summaries
 - `run.log` — command stderr/log output
 
-The suite intentionally combines two signal sources:
+The suite treats production `bmux.perf` recording telemetry as the source of
+truth for real performance. `scripts/perf-audit.sh` runs playbooks with
+`BMUX_PLAYBOOK_PERF_RECORDING_LEVEL=trace` by default, and playbook recordings
+explicitly include the `custom` event kind so real attach/server telemetry is
+available whenever the scenario drives those production paths.
 
-1. **Playbook render summaries** from `@render-trace true`, which are deterministic
-   in sandbox runs and include rows/cells/frame bytes plus terminal graphics
-   transmit/place/delete counters.
-2. **Recording perf telemetry** from `bmux recording analyze --perf --json`, which
-   is best-effort for playbook recordings and richer for live/manual recordings
-   that include `bmux.perf` custom events.
+Playbook render summaries from `@render-trace true` remain useful deterministic
+fallback signals for CI budgets. They include rows/cells/frame bytes plus
+terminal graphics transmit/place/delete counters, but they should not replace
+real attach telemetry for diagnosing runtime performance.
 
 Budgets live in `tests/perf/budgets/*.json` and are matched by scenario name.
 Use `ignore_actions` to exclude warmup/setup steps such as `new-session` from
@@ -41,4 +44,10 @@ For local config/plugin validation against an already-running BMUX server, use:
 ./scripts/perf-audit.sh --target-server --quick
 ```
 
-For CI, prefer the default sandbox mode for determinism.
+Use `--require-perf-events` for real-runtime audits that should fail when a
+scenario does not produce `bmux.perf` events. This is the preferred guard for
+live/nightly suites once scenarios drive the real attach runtime.
+
+For CI, prefer the default sandbox mode for deterministic render-summary
+budgets, and add real-runtime jobs with `--require-perf-events` where a TTY/PTY
+attach harness is available.
