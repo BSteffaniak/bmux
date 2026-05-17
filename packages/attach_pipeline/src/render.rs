@@ -1,8 +1,10 @@
 use crate::compositor::retained_repaint_plan_from_frame_damage;
+#[cfg(feature = "image-kitty")]
+use crate::types::TerminalGraphicCacheEntry;
 use crate::types::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, ExtensionRenderCacheEntry,
-    PaneRect, PaneRenderBuffer, TerminalGraphicCacheEntry, TerminalGraphicPlacementSignature,
-    TerminalGraphicSourceSignature,
+    PaneRect, PaneRenderBuffer, TerminalGraphicPlacementSignature, TerminalGraphicSourceSignature,
+    TerminalGraphicsCache,
 };
 use anyhow::{Context, Result};
 use bmux_appearance::{
@@ -250,20 +252,63 @@ pub fn queue_render_items<W: io::Write>(
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
     items: &[RenderLayerItem],
-    graphics_cache: &mut BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &mut TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+    mut render_stats: Option<&mut AttachSceneRenderStats>,
+) -> Result<bool> {
+    let mut active_graphics = BTreeSet::new();
+    let wrote = queue_render_items_for_frame(
+        stdout,
+        surface_id,
+        surface_id,
+        surface_rect,
+        damage,
+        items,
+        graphics_cache,
+        &mut active_graphics,
+        capabilities,
+        render_stats.as_deref_mut(),
+    )?;
+    Ok(wrote
+        | cleanup_stale_terminal_graphics(
+            stdout,
+            &active_graphics,
+            graphics_cache,
+            capabilities,
+            render_stats,
+        )?)
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit hot-path render state keeps call sites allocation-free.
+fn queue_render_items_for_frame<W: io::Write>(
+    stdout: &mut W,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    items: &[RenderLayerItem],
+    graphics_cache: &mut TerminalGraphicsCache,
+    active_graphics: &mut BTreeSet<u64>,
     capabilities: TerminalRenderCapabilities,
     mut render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
     let mut wrote = false;
-    let active_graphics = active_terminal_graphic_keys(items, capabilities);
+    active_graphics.extend(active_terminal_graphic_keys(
+        pane_id,
+        surface_id,
+        items,
+        capabilities,
+    ));
     let mut pending_ops = Vec::new();
     for item in items {
         match item {
             RenderLayerItem::Op(op) => pending_ops.push(op.clone()),
             RenderLayerItem::Graphic(graphic) => {
                 wrote |= flush_render_item_ops(stdout, surface_rect, damage, &mut pending_ops)?;
+                let instance_key = terminal_graphic_instance_key(pane_id, surface_id, graphic.key);
                 if terminal_graphic_needs_reconcile(
                     graphic,
+                    instance_key,
                     surface_rect,
                     damage,
                     graphics_cache,
@@ -271,8 +316,9 @@ pub fn queue_render_items<W: io::Write>(
                 ) {
                     wrote |= queue_terminal_graphic_overlay(
                         stdout,
+                        pane_id,
                         surface_id,
-                        surface_rect,
+                        instance_key,
                         graphic,
                         graphics_cache,
                         capabilities,
@@ -283,14 +329,6 @@ pub fn queue_render_items<W: io::Write>(
         }
     }
     wrote |= flush_render_item_ops(stdout, surface_rect, damage, &mut pending_ops)?;
-    wrote |= cleanup_stale_terminal_graphics(
-        stdout,
-        surface_id,
-        &active_graphics,
-        graphics_cache,
-        capabilities,
-        render_stats,
-    )?;
     Ok(wrote)
 }
 
@@ -725,6 +763,8 @@ fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
 }
 
 fn active_terminal_graphic_keys(
+    pane_id: Uuid,
+    surface_id: Uuid,
     items: &[RenderLayerItem],
     capabilities: TerminalRenderCapabilities,
 ) -> BTreeSet<u64> {
@@ -734,10 +774,22 @@ fn active_terminal_graphic_keys(
     items
         .iter()
         .filter_map(|item| match item {
-            RenderLayerItem::Graphic(graphic) => Some(graphic.key),
+            RenderLayerItem::Graphic(graphic) => Some(terminal_graphic_instance_key(
+                pane_id,
+                surface_id,
+                graphic.key,
+            )),
             RenderLayerItem::Op(_) => None,
         })
         .collect()
+}
+
+fn terminal_graphic_instance_key(pane_id: Uuid, surface_id: Uuid, graphic_key: u64) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pane_id.hash(&mut hasher);
+    surface_id.hash(&mut hasher);
+    graphic_key.hash(&mut hasher);
+    hasher.finish().max(1)
 }
 
 const fn terminal_graphic_can_render(capabilities: TerminalRenderCapabilities) -> bool {
@@ -746,9 +798,10 @@ const fn terminal_graphic_can_render(capabilities: TerminalRenderCapabilities) -
 
 fn terminal_graphic_needs_reconcile(
     graphic: &TerminalGraphicOverlay,
+    instance_key: u64,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
-    graphics_cache: &BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
 ) -> bool {
     if !terminal_graphic_can_render(capabilities) || !graphic.cell_rect.intersects(surface_rect) {
@@ -757,7 +810,7 @@ fn terminal_graphic_needs_reconcile(
     if terminal_graphic_intersects_damage(graphic, damage) {
         return true;
     }
-    let Some(entry) = graphics_cache.get(&graphic.key) else {
+    let Some(entry) = graphics_cache.get(&instance_key) else {
         return true;
     };
     entry.source != terminal_graphic_source_signature(graphic)
@@ -798,24 +851,27 @@ const fn terminal_graphic_placement_signature(
     }
 }
 
-#[allow(unused_variables)]
+#[allow(
+    clippy::too_many_arguments, // Explicit graphics identity fields keep cache reconciliation call sites clear.
+    unused_variables
+)]
 fn queue_terminal_graphic_overlay<W: io::Write>(
     stdout: &mut W,
+    pane_id: Uuid,
     surface_id: Uuid,
-    surface_rect: ExtensionRect,
+    instance_key: u64,
     graphic: &TerminalGraphicOverlay,
-    graphics_cache: &mut BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
-    if !graphic.cell_rect.intersects(surface_rect) {
-        return Ok(false);
-    }
     #[cfg(feature = "image-kitty")]
     {
         queue_kitty_graphic_overlay(
             stdout,
+            pane_id,
             surface_id,
+            instance_key,
             graphic,
             graphics_cache,
             capabilities,
@@ -829,11 +885,14 @@ fn queue_terminal_graphic_overlay<W: io::Write>(
 }
 
 #[cfg(feature = "image-kitty")]
+#[allow(clippy::too_many_arguments)] // Kitty reconciliation needs identity, payload, cache, capability, and stats state.
 fn queue_kitty_graphic_overlay<W: io::Write>(
     stdout: &mut W,
+    pane_id: Uuid,
     surface_id: Uuid,
+    instance_key: u64,
     graphic: &TerminalGraphicOverlay,
-    graphics_cache: &mut BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     mut render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
@@ -842,17 +901,17 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     }
     let source = terminal_graphic_source_signature(graphic);
     let placement = terminal_graphic_placement_signature(graphic);
-    let host_image_id = terminal_graphic_host_image_id(graphic.key);
-    let previous = graphics_cache.get(&graphic.key).cloned();
+    let host_image_id = terminal_graphic_host_image_id(instance_key);
+    let previous = graphics_cache.get(&instance_key).cloned();
     let source_changed = previous
         .as_ref()
         .is_some_and(|entry| entry.source != source || entry.host_image_id != host_image_id);
     let previous_placement = previous.as_ref().and_then(|entry| entry.placement);
     let placement_changed = previous_placement.is_some_and(|old| old != placement);
-    if previous_placement.is_some() && (placement_changed || source_changed) {
+    let needs_replace = previous.is_some() && (placement_changed || source_changed);
+    if needs_replace {
         stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_delete_placement(
-            host_image_id,
+        stdout.write_all(&bmux_image::codec::kitty::encode_delete_image(
             host_image_id,
         ))?;
         stdout.write_all(b"\x1b\\")?;
@@ -860,7 +919,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
             stats.terminal_graphic_deletes = stats.terminal_graphic_deletes.saturating_add(1);
         }
     }
-    let needs_transmit = previous.is_none() || source_changed;
+    let needs_transmit = previous.is_none() || needs_replace;
     if needs_transmit {
         let pixels = terminal_graphic_pixels(graphic);
         stdout.write_all(b"\x1b_")?;
@@ -873,8 +932,9 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
         ))?;
         stdout.write_all(b"\x1b\\")?;
         graphics_cache.insert(
-            graphic.key,
+            instance_key,
             TerminalGraphicCacheEntry {
+                pane_id,
                 surface_id,
                 source,
                 placement: None,
@@ -904,7 +964,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
             graphic.cell_rect.h,
         ))?;
         stdout.write_all(b"\x1b\\")?;
-        if let Some(entry) = graphics_cache.get_mut(&graphic.key) {
+        if let Some(entry) = graphics_cache.get_mut(&instance_key) {
             entry.placement = Some(placement);
         }
         if let Some(stats) = render_stats.as_mut() {
@@ -914,50 +974,17 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     Ok(placement_changed || needs_transmit || needs_place)
 }
 
-fn cleanup_terminal_graphics_for_inactive_surfaces<W: io::Write>(
-    stdout: &mut W,
-    active_surface_ids: &BTreeSet<Uuid>,
-    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
-    capabilities: TerminalRenderCapabilities,
-    mut render_stats: Option<&mut AttachSceneRenderStats>,
-) -> Result<bool> {
-    let mut wrote = false;
-    for buffer in pane_buffers.values_mut() {
-        let stale = buffer
-            .terminal_graphics_cache
-            .iter()
-            .filter_map(|(key, entry)| {
-                (!active_surface_ids.contains(&entry.surface_id))
-                    .then_some((*key, entry.host_image_id))
-            })
-            .collect::<Vec<_>>();
-        if stale.is_empty() {
-            continue;
-        }
-        wrote |= cleanup_stale_terminal_graphics_by_key(
-            stdout,
-            &stale,
-            &mut buffer.terminal_graphics_cache,
-            capabilities,
-            render_stats.as_deref_mut(),
-        )?;
-    }
-    Ok(wrote)
-}
-
 fn cleanup_stale_terminal_graphics<W: io::Write>(
     stdout: &mut W,
-    surface_id: Uuid,
     active_graphics: &BTreeSet<u64>,
-    graphics_cache: &mut BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
     let stale = graphics_cache
         .iter()
         .filter_map(|(key, entry)| {
-            (entry.surface_id == surface_id && !active_graphics.contains(key))
-                .then_some((*key, entry.host_image_id))
+            (!active_graphics.contains(key)).then_some((*key, entry.host_image_id))
         })
         .collect::<Vec<_>>();
     if stale.is_empty() {
@@ -975,7 +1002,7 @@ fn cleanup_stale_terminal_graphics<W: io::Write>(
 fn cleanup_stale_terminal_graphics_by_key<W: io::Write>(
     stdout: &mut W,
     stale: &[(u64, u32)],
-    graphics_cache: &mut BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
@@ -997,7 +1024,7 @@ fn cleanup_stale_terminal_graphics_by_key<W: io::Write>(
 fn cleanup_stale_kitty_graphics<W: io::Write>(
     stdout: &mut W,
     stale: &[(u64, u32)],
-    graphics_cache: &mut BTreeMap<u64, TerminalGraphicCacheEntry>,
+    graphics_cache: &mut TerminalGraphicsCache,
     _capabilities: TerminalRenderCapabilities,
     mut render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
@@ -2650,11 +2677,68 @@ pub fn render_attach_scene<W: io::Write>(
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
 ) -> Result<Option<AttachCursorState>> {
     let render_context = RenderExtensionContext::default();
+    let mut terminal_graphics_cache = TerminalGraphicsCache::new();
     render_attach_scene_inner(
         stdout,
         scene,
         panes,
         pane_buffers,
+        &mut terminal_graphics_cache,
+        frame_damage,
+        status_top_inset,
+        status_bottom_inset,
+        scrollback_active,
+        scrollback_offset,
+        scrollback_cursor,
+        selection_anchor,
+        zoomed,
+        terminal_size,
+        runtime_appearance,
+        damage_policy,
+        render_extensions,
+        &render_context,
+        None,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::fn_params_excessive_bools // explicit render-state flags keep hot-path call sites readable
+)]
+/// Render a composed attach scene frame using a terminal-scoped graphics cache.
+///
+/// # Errors
+///
+/// Returns an error when queueing frame bytes fails.
+pub fn render_attach_scene_with_terminal_graphics_cache<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    panes: &[PaneSummary],
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    frame_damage: &FrameDamage,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    scrollback_active: bool,
+    scrollback_offset: usize,
+    scrollback_cursor: Option<AttachScrollbackCursor>,
+    selection_anchor: Option<AttachScrollbackPosition>,
+    zoomed: bool,
+    terminal_size: (u16, u16),
+    runtime_appearance: &RuntimeAppearance,
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+) -> Result<Option<AttachCursorState>> {
+    let render_context = RenderExtensionContext::default();
+    render_attach_scene_inner(
+        stdout,
+        scene,
+        panes,
+        pane_buffers,
+        terminal_graphics_cache,
         frame_damage,
         status_top_inset,
         status_bottom_inset,
@@ -2757,11 +2841,13 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
+    let mut terminal_graphics_cache = TerminalGraphicsCache::new();
     render_attach_scene_with_stats_and_trace_with_capabilities(
         stdout,
         scene,
         panes,
         pane_buffers,
+        &mut terminal_graphics_cache,
         frame_damage,
         status_top_inset,
         status_bottom_inset,
@@ -2795,6 +2881,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
@@ -2819,6 +2906,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
         scene,
         panes,
         pane_buffers,
+        terminal_graphics_cache,
         frame_damage,
         status_top_inset,
         status_bottom_inset,
@@ -2952,6 +3040,7 @@ fn render_attach_scene_inner<W: io::Write>(
     scene: &AttachScene,
     _panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
@@ -2976,6 +3065,7 @@ fn render_attach_scene_inner<W: io::Write>(
         stats.full_frame = frame_damage.is_full_frame();
         stats.viewport_cells = u64::from(cols).saturating_mul(u64::from(rows));
     }
+    let mut active_terminal_graphics = BTreeSet::new();
 
     for ext in render_extensions {
         ext.refresh_state();
@@ -3203,16 +3293,15 @@ fn render_attach_scene_inner<W: io::Write>(
                             });
                         }
                     }
-                    let Some(buffer) = pane_buffers.get_mut(&pane_id) else {
-                        continue;
-                    };
-                    if let Err(err) = queue_render_items(
+                    if let Err(err) = queue_render_items_for_frame(
                         stdout,
+                        pane_id,
                         surface.id,
                         ext_rect,
                         &damage,
                         &items,
-                        &mut buffer.terminal_graphics_cache,
+                        terminal_graphics_cache,
+                        &mut active_terminal_graphics,
                         render_context.capabilities,
                         render_stats.as_deref_mut(),
                     ) {
@@ -3597,16 +3686,10 @@ fn render_attach_scene_inner<W: io::Write>(
         }
     }
 
-    let active_surface_ids = scene
-        .surfaces
-        .iter()
-        .filter(|surface| surface.visible)
-        .map(|surface| surface.id)
-        .collect::<BTreeSet<_>>();
-    cleanup_terminal_graphics_for_inactive_surfaces(
+    cleanup_stale_terminal_graphics(
         stdout,
-        &active_surface_ids,
-        pane_buffers,
+        &active_terminal_graphics,
+        terminal_graphics_cache,
         render_context.capabilities,
         render_stats,
     )?;
@@ -3645,10 +3728,14 @@ mod tests {
     use crossterm::queue;
     use crossterm::style::Print;
     use std::collections::BTreeMap;
+    #[cfg(feature = "image-kitty")]
+    use std::collections::BTreeSet;
     use uuid::Uuid;
 
     #[cfg(feature = "image-kitty")]
-    use super::queue_render_items;
+    use super::{
+        cleanup_stale_terminal_graphics, queue_render_items, queue_render_items_for_frame,
+    };
 
     fn content_damage(pane_id: Uuid) -> FrameDamage {
         let mut damage = FrameDamage::default();
@@ -4267,8 +4354,8 @@ mod tests {
             .expect("moved cached kitty graphic should place")
         );
         let third = String::from_utf8(third).expect("kitty command should be utf8");
-        assert!(!third.contains("Ga=t,"), "{third:?}");
-        assert!(third.contains("Ga=d,d=p,"), "{third:?}");
+        assert!(third.contains("Ga=d,d=i,"), "{third:?}");
+        assert!(third.contains("Ga=t,"), "{third:?}");
         assert!(third.contains("Ga=p,"), "{third:?}");
         assert!(third.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{third:?}");
 
@@ -4335,9 +4422,102 @@ mod tests {
             .expect("moved graphic should reconcile despite no text damage")
         );
         let moved = String::from_utf8(moved).expect("kitty command should be utf8");
-        assert!(!moved.contains("Ga=t,"), "{moved:?}");
-        assert!(moved.contains("Ga=d,d=p,"), "{moved:?}");
+        assert!(moved.contains("Ga=d,d=i,"), "{moved:?}");
+        assert!(moved.contains("Ga=t,"), "{moved:?}");
         assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn terminal_graphics_cache_distinguishes_panes_reusing_surface_ids() {
+        let capabilities = test_kitty_capabilities();
+        let mut cache = BTreeMap::new();
+        let surface_id = Uuid::from_u128(7);
+        let pane_a = Uuid::from_u128(101);
+        let pane_b = Uuid::from_u128(202);
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 4,
+        };
+        let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
+        let mut active = BTreeSet::new();
+        let mut first = Vec::new();
+        queue_render_items_for_frame(
+            &mut first,
+            pane_a,
+            surface_id,
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &items,
+            &mut cache,
+            &mut active,
+            capabilities,
+            None,
+        )
+        .expect("initial pane graphic should queue");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_a);
+
+        active.clear();
+        let mut second = Vec::new();
+        queue_render_items_for_frame(
+            &mut second,
+            pane_b,
+            surface_id,
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &items,
+            &mut cache,
+            &mut active,
+            capabilities,
+            None,
+        )
+        .expect("new pane graphic should queue despite same surface/key");
+        cleanup_stale_terminal_graphics(&mut second, &active, &mut cache, capabilities, None)
+            .expect("old pane graphic should be deleted");
+        let second = String::from_utf8(second).expect("kitty command should be utf8");
+        assert!(second.contains("Ga=t,"), "{second:?}");
+        assert!(second.contains("Ga=d,d=i,"), "{second:?}");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_b);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn terminal_graphics_cleanup_does_not_depend_on_pane_buffers() {
+        let capabilities = test_kitty_capabilities();
+        let mut cache = BTreeMap::new();
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 4,
+        };
+        let mut active = BTreeSet::new();
+        queue_render_items_for_frame(
+            &mut Vec::new(),
+            Uuid::from_u128(101),
+            Uuid::from_u128(7),
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+            &mut cache,
+            &mut active,
+            capabilities,
+            None,
+        )
+        .expect("initial pane graphic should queue");
+        assert_eq!(cache.len(), 1);
+
+        active.clear();
+        let mut deleted = Vec::new();
+        cleanup_stale_terminal_graphics(&mut deleted, &active, &mut cache, capabilities, None)
+            .expect("terminal-scoped cleanup should delete stale image");
+        let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
+        assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
+        assert!(cache.is_empty());
     }
 
     #[cfg(feature = "image-kitty")]

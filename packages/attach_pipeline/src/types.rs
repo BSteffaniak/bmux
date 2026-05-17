@@ -49,12 +49,14 @@ pub struct PaneRenderBuffer {
     pub expected_stream_start: Option<u64>,
     pub scrollback_window: Option<PaneScrollbackWindow>,
     pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
-    pub terminal_graphics_cache: BTreeMap<u64, TerminalGraphicCacheEntry>,
     pub visual_row_fingerprints: PaneVisualRowFingerprintCache,
 }
 
+pub type TerminalGraphicsCache = BTreeMap<u64, TerminalGraphicCacheEntry>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalGraphicCacheEntry {
+    pub pane_id: Uuid,
     pub surface_id: Uuid,
     pub source: TerminalGraphicSourceSignature,
     pub placement: Option<TerminalGraphicPlacementSignature>,
@@ -178,7 +180,6 @@ impl Default for PaneRenderBuffer {
             expected_stream_start: None,
             scrollback_window: None,
             extension_render_cache: BTreeMap::new(),
-            terminal_graphics_cache: BTreeMap::new(),
             visual_row_fingerprints: PaneVisualRowFingerprintCache::default(),
         }
     }

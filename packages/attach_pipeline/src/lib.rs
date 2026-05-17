@@ -44,6 +44,7 @@ pub use scene_pipeline::AttachScenePipeline;
 pub use types::{
     AttachCursorState, AttachPaneMouseProtocolHints, AttachScrollbackCursor,
     AttachScrollbackPosition, PaneRect, PaneRenderBuffer, PaneScrollbackWindow,
+    TerminalGraphicsCache,
 };
 
 pub fn apply_attach_output_chunk(

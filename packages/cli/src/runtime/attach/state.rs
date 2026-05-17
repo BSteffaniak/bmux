@@ -6,7 +6,7 @@ use bmux_attach_layout_protocol::{
 pub use bmux_attach_pipeline::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
 };
-use bmux_attach_pipeline::{FrameDamage, RetainedCompositor};
+use bmux_attach_pipeline::{FrameDamage, RetainedCompositor, TerminalGraphicsCache};
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
@@ -267,6 +267,7 @@ pub struct AttachViewState {
     pub cached_sessions: Vec<SessionRow>,
     pub cached_context_session_bindings: Vec<ContextSessionBinding>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    pub terminal_graphics_cache: TerminalGraphicsCache,
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
     pub status_position: StatusPosition,
@@ -507,6 +508,7 @@ impl AttachViewState {
             cached_sessions: Vec::new(),
             cached_context_session_bindings: Vec::new(),
             pane_buffers: BTreeMap::new(),
+            terminal_graphics_cache: TerminalGraphicsCache::new(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
             status_position: StatusPosition::Bottom,

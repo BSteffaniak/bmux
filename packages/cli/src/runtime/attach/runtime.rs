@@ -6174,6 +6174,7 @@ pub fn render_attach_frame(
             &layout_state.scene,
             &layout_state.panes,
             &mut view_state.pane_buffers,
+            &mut view_state.terminal_graphics_cache,
             &frame_damage,
             status_top_inset,
             status_bottom_inset,

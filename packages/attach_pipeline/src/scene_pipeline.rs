@@ -5,9 +5,10 @@ use crate::reconcile::{
     resize_attach_grids_for_scene_with_size,
 };
 use crate::render::{
-    DamageCoalescingPolicy, FrameDamage, render_attach_scene, visible_scene_pane_ids,
+    DamageCoalescingPolicy, FrameDamage, render_attach_scene_with_terminal_graphics_cache,
+    visible_scene_pane_ids,
 };
-use crate::types::{AttachCursorState, PaneRenderBuffer};
+use crate::types::{AttachCursorState, PaneRenderBuffer, TerminalGraphicsCache};
 use crate::update_protocol_hints_from_state;
 use anyhow::Result;
 use bmux_attach_layout_protocol::{
@@ -44,6 +45,7 @@ pub struct AttachScenePipeline {
     viewport: AttachViewport,
     pub layout_state: Option<AttachLayoutState>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: TerminalGraphicsCache,
     pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
     dirty_pane_ids: BTreeSet<Uuid>,
@@ -62,6 +64,7 @@ impl AttachScenePipeline {
             viewport,
             layout_state: None,
             pane_buffers: BTreeMap::new(),
+            terminal_graphics_cache: TerminalGraphicsCache::new(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
             dirty_pane_ids: BTreeSet::new(),
@@ -427,11 +430,12 @@ impl AttachScenePipeline {
 
         let mut frame_bytes = Vec::new();
         queue!(frame_bytes, BeginSynchronizedUpdate, SavePosition, Hide)?;
-        let cursor_state = render_attach_scene(
+        let cursor_state = render_attach_scene_with_terminal_graphics_cache(
             &mut frame_bytes,
             &layout_state.scene,
             &layout_state.panes,
             &mut self.pane_buffers,
+            &mut self.terminal_graphics_cache,
             &frame_damage,
             self.viewport.status_top_inset,
             self.viewport.status_bottom_inset,
