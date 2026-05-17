@@ -1547,7 +1547,7 @@ fn mark_pane_surface_dirty(
         if !surface.visible || surface.pane_id != Some(pane_id) {
             continue;
         }
-        dirty.mark_surface_dirty(surface.id, source);
+        dirty.mark_surface_changed(surface.id, source);
         marked = true;
     }
     marked

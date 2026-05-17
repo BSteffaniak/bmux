@@ -164,8 +164,9 @@ impl AttachDirtyFlags {
         self.push_event(source, AttachDirtyKind::Extension, None);
     }
 
-    pub fn mark_surface_dirty(&mut self, surface_id: Uuid, source: AttachDirtySource) {
-        self.precise_frame_damage.mark_extension_surface(surface_id);
+    pub fn mark_surface_changed(&mut self, surface_id: Uuid, source: AttachDirtySource) {
+        self.precise_frame_damage
+            .mark_extension_surface_query(surface_id);
         self.push_event(source, AttachDirtyKind::PreciseDamage, None);
     }
 
@@ -214,9 +215,8 @@ impl AttachDirtyFlags {
             damage.mark_content_surface(*pane_id);
         }
         if self.extension_needs_redraw {
-            for surface in &scene.surfaces {
-                damage.mark_extension_surface(surface.id);
-            }
+            let _ = scene;
+            damage.mark_extension_query();
         }
         if self.status_needs_redraw {
             damage.mark_status();

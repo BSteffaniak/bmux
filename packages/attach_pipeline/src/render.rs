@@ -58,7 +58,7 @@ fn coalesce_render_damage(
         return damage;
     };
 
-    let mut merged = Vec::new();
+    let mut merged: Vec<ExtensionRect> = Vec::new();
     for rect in rects {
         let Some(rect) = clip_extension_rect(rect, surface_rect) else {
             continue;
@@ -66,7 +66,7 @@ fn coalesce_render_damage(
         let mut index = 0;
         let mut next = rect;
         while index < merged.len() {
-            if extension_rect_touches_or_overlaps(merged[index], next) {
+            if merged[index].intersects(next) {
                 next = merged.swap_remove(index).union(next);
                 index = 0;
             } else {
@@ -80,15 +80,7 @@ fn coalesce_render_damage(
         return RenderDamage::None;
     }
 
-    let surface_area = u32::from(surface_rect.w) * u32::from(surface_rect.h);
-    if surface_area == 0 {
-        return RenderDamage::None;
-    }
-    let damaged_area = merged.iter().fold(0_u32, |area, rect| {
-        area.saturating_add(u32::from(rect.w) * u32::from(rect.h))
-    });
-    let area_percent = damaged_area.saturating_mul(100) / surface_area;
-    if merged.len() > policy.max_rects || area_percent >= u32::from(policy.max_area_percent) {
+    if merged.len() > policy.max_rects {
         RenderDamage::FullSurface
     } else {
         RenderDamage::Regions(merged)
@@ -105,7 +97,7 @@ fn extension_render_damage_for_frame(
     policy: DamageCoalescingPolicy,
 ) -> RenderDamage {
     let extension_rect_damage = frame_damage.extension_surface_rects(surface_id);
-    if frame_damage.is_full_frame() {
+    if frame_damage.is_full_frame() || frame_damage.extension_surfaces.contains(&surface_id) {
         return RenderDamage::FullSurface;
     }
     if !extension_rect_damage.is_empty() {
@@ -140,10 +132,6 @@ fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<Ext
             h: y2.saturating_sub(y1),
         })
     }
-}
-
-const fn extension_rect_touches_or_overlaps(a: ExtensionRect, b: ExtensionRect) -> bool {
-    a.x <= b.right() && b.x <= a.right() && a.y <= b.bottom() && b.y <= a.bottom()
 }
 
 fn frame_rects_to_render_damage(rects: &[DamageRect], surface_rect: ExtensionRect) -> RenderDamage {
@@ -1472,12 +1460,15 @@ impl AttachRenderTrace {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent dirty domains keep damage merges explicit.
 pub struct FrameDamage {
     full_frame: bool,
     content_surfaces: BTreeSet<Uuid>,
     content_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
     extension_surfaces: BTreeSet<Uuid>,
     extension_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
+    extension_query_surfaces: BTreeSet<Uuid>,
+    extension_query: bool,
     status: bool,
     overlay: bool,
 }
@@ -1491,6 +1482,8 @@ impl FrameDamage {
             content_surface_rects: BTreeMap::new(),
             extension_surfaces: BTreeSet::new(),
             extension_surface_rects: BTreeMap::new(),
+            extension_query_surfaces: BTreeSet::new(),
+            extension_query: false,
             status: true,
             overlay: true,
         }
@@ -1508,6 +1501,8 @@ impl FrameDamage {
             && self.content_surface_rects.is_empty()
             && self.extension_surfaces.is_empty()
             && self.extension_surface_rects.is_empty()
+            && self.extension_query_surfaces.is_empty()
+            && !self.extension_query
             && !self.status
             && !self.overlay
     }
@@ -1519,6 +1514,8 @@ impl FrameDamage {
             || !self.content_surface_rects.is_empty()
             || !self.extension_surfaces.is_empty()
             || !self.extension_surface_rects.is_empty()
+            || !self.extension_query_surfaces.is_empty()
+            || self.extension_query
     }
 
     pub fn mark_full_frame(&mut self) {
@@ -1552,6 +1549,7 @@ impl FrameDamage {
 
     pub fn mark_extension_surface(&mut self, surface_id: Uuid) {
         self.extension_surface_rects.remove(&surface_id);
+        self.extension_query_surfaces.remove(&surface_id);
         self.extension_surfaces.insert(surface_id);
     }
 
@@ -1575,6 +1573,18 @@ impl FrameDamage {
         }
     }
 
+    pub fn mark_extension_surface_query(&mut self, surface_id: Uuid) {
+        if !self.full_frame && !self.extension_surfaces.contains(&surface_id) {
+            self.extension_query_surfaces.insert(surface_id);
+        }
+    }
+
+    pub const fn mark_extension_query(&mut self) {
+        if !self.full_frame {
+            self.extension_query = true;
+        }
+    }
+
     pub const fn mark_status(&mut self) {
         self.status = true;
     }
@@ -1593,6 +1603,8 @@ impl FrameDamage {
     #[must_use]
     pub fn extension_surface_damaged(&self, surface_id: Uuid, pane_id: Uuid) -> bool {
         self.full_frame
+            || self.extension_query
+            || self.extension_query_surfaces.contains(&surface_id)
             || self.extension_surfaces.contains(&surface_id)
             || self.extension_surface_rects.contains_key(&surface_id)
             || self.content_surfaces.contains(&pane_id)
@@ -1662,6 +1674,10 @@ impl FrameDamage {
                 .or_default()
                 .extend(rects.iter().copied());
         }
+        for surface_id in &other.extension_query_surfaces {
+            self.mark_extension_surface_query(*surface_id);
+        }
+        self.extension_query |= other.extension_query;
         self.status |= other.status;
         self.overlay |= other.overlay;
     }
@@ -4015,6 +4031,47 @@ mod tests {
         );
 
         assert_eq!(damage, RenderDamage::FullSurface);
+    }
+
+    #[test]
+    fn render_damage_policy_preserves_adjacent_edge_regions() {
+        let damage = coalesce_render_damage(
+            RenderDamage::Regions(vec![
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 1,
+                },
+                ExtensionRect {
+                    x: 0,
+                    y: 1,
+                    w: 1,
+                    h: 8,
+                },
+                ExtensionRect {
+                    x: 9,
+                    y: 1,
+                    w: 1,
+                    h: 8,
+                },
+                ExtensionRect {
+                    x: 0,
+                    y: 9,
+                    w: 10,
+                    h: 1,
+                },
+            ]),
+            ExtensionRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert!(matches!(damage, RenderDamage::Regions(regions) if regions.len() == 4));
     }
 
     #[test]

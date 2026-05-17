@@ -111,8 +111,14 @@ pub fn attach_scene_damage_between(
                 absolute_damage.push(surface_outer_rect(previous_surface));
                 absolute_damage.push(surface_outer_rect(next_surface));
             }
+            Some(next_surface) if previous_surface.content_rect != next_surface.content_rect => {
+                if let Some(pane_id) = next_surface.pane_id {
+                    damage.mark_content_surface(pane_id);
+                }
+                damage.mark_extension_surface_query(next_surface.id);
+            }
             Some(next_surface) if surface_is_pane(next_surface) => {
-                damage.mark_extension_surface(next_surface.id);
+                damage.mark_extension_surface_query(next_surface.id);
             }
             Some(_) => {}
             None => absolute_damage.push(surface_outer_rect(previous_surface)),
@@ -180,7 +186,6 @@ fn surface_requires_outer_damage(previous: &AttachSurface, next: &AttachSurface)
         || previous.layer != next.layer
         || previous.z != next.z
         || previous.rect != next.rect
-        || previous.content_rect != next.content_rect
         || previous.opaque != next.opaque
         || previous.visible != next.visible
         || previous.pane_id != next.pane_id
@@ -199,7 +204,7 @@ fn mark_focus_target_surface_damage(
                 .iter()
                 .filter(|surface| surface.visible && surface.pane_id == Some(*pane_id))
             {
-                damage.mark_extension_surface(surface.id);
+                damage.mark_extension_surface_query(surface.id);
             }
         }
         AttachFocusTarget::Surface { surface_id } => {
@@ -208,7 +213,7 @@ fn mark_focus_target_surface_damage(
                 .iter()
                 .any(|surface| surface.visible && surface.id == *surface_id)
             {
-                damage.mark_extension_surface(*surface_id);
+                damage.mark_extension_surface_query(*surface_id);
             }
         }
     }

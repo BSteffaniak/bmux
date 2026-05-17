@@ -15,6 +15,9 @@
     "max_malformed_payloads": 0,
     "max_dropped_events_reported": 0,
     "max_render_p95_ms": 16,
-    "max_drain_ipc_p95_ms": 20
+    "max_drain_ipc_p95_ms": 20,
+    "full_surface_outlier_after_ms": 500,
+    "max_full_surface_render_outliers_after_ms": 0,
+    "max_extension_full_surface_calls_after_ms": 0
   }
 }

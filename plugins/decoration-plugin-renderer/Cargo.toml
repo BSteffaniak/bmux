@@ -15,9 +15,11 @@ bmux_plugin                = { workspace = true }
 bmux_scene_protocol        = { workspace = true }
 bmux_scene_protocol_render = { workspace = true }
 
-tokio   = { workspace = true, features = ["rt", "macros", "sync"] }
-tracing = { workspace = true, features = ["std"] }
-uuid    = { workspace = true, features = ["std"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true, features = ["rt", "macros", "sync"] }
+tracing    = { workspace = true, features = ["std"] }
+uuid       = { workspace = true, features = ["std"] }
 
 [features]
 default = []

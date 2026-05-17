@@ -17,6 +17,7 @@ send-keys keys='printf "pane3-ready\n"\r' pane=3
 wait-for pattern='pane1-ready' pane=1 timeout=5000
 wait-for pattern='pane2-ready' pane=2 timeout=5000
 wait-for pattern='pane3-ready' pane=3 timeout=5000
+sleep ms=150
 render-mark id='focus-start'
 focus-pane target=1
 focus-pane target=2
@@ -24,4 +25,4 @@ focus-pane target=1
 focus-pane target=2
 focus-pane target=1
 focus-pane target=2
-assert-render since='focus-start' max_full_surface_fallbacks=0 max_frame_bytes=120000
+assert-render since='focus-start' max_full_frame_frames=0 max_full_surface_fallbacks=0 max_frame_bytes=120000

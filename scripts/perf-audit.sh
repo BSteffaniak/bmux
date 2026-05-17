@@ -176,6 +176,14 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
           render_p95_ms: n($p.timings_ms.render_ms_max.p95_ms),
           drain_ipc_p95_ms: n($p.timings_ms.drain_ipc_ms_max.p95_ms),
           attach_window_counters: ($p.attach_window_counters // {}),
+          render_outliers: ($p.render_outliers // []),
+          full_surface_render_outliers_after_ms: (($p.render_outliers // []) | map(select(
+            ((.since_attach_start_ms // 0) >= (($b.perf.full_surface_outlier_after_ms // $b.perf.outlier_after_ms // 0)))
+            and (((.full_frame_fallback // false) == true) or (((.extension_stats // {}) | to_entries | map(.value.full_surface_calls // 0) | add // 0) > 0))
+          )) | length),
+          extension_full_surface_calls_after_ms: (($p.render_outliers // []) | map(select(
+            ((.since_attach_start_ms // 0) >= (($b.perf.full_surface_outlier_after_ms // $b.perf.outlier_after_ms // 0)))
+          ) | ((.extension_stats // {}) | to_entries | map(.value.full_surface_calls // 0) | add // 0)) | add // 0),
           hints: ($p.hints // []),
           outlier_samples: ($p.outlier_samples // [])
         }
@@ -225,7 +233,9 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
       check_max("perf.connect_to_interactive_ms"; $m.perf.connect_to_interactive_ms; $p.max_connect_to_interactive_ms),
       check_max("perf.reconnect_outage_max_ms"; $m.perf.reconnect_outage_max_ms; $p.max_reconnect_outage_max_ms),
       (if $m.perf.perf_events > 0 then check_max("perf.render_p95_ms"; $m.perf.render_p95_ms; $p.max_render_p95_ms) else empty end),
-      (if $m.perf.perf_events > 0 then check_max("perf.drain_ipc_p95_ms"; $m.perf.drain_ipc_p95_ms; $p.max_drain_ipc_p95_ms) else empty end)
+      (if $m.perf.perf_events > 0 then check_max("perf.drain_ipc_p95_ms"; $m.perf.drain_ipc_p95_ms; $p.max_drain_ipc_p95_ms) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.full_surface_render_outliers_after_ms"; $m.perf.full_surface_render_outliers_after_ms; $p.max_full_surface_render_outliers_after_ms) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.extension_full_surface_calls_after_ms"; $m.perf.extension_full_surface_calls_after_ms; $p.max_extension_full_surface_calls_after_ms) else empty end)
     ]
   ' > "$violations_json"
 

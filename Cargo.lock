@@ -1416,6 +1416,8 @@ dependencies = [
  "bmux_plugin",
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",

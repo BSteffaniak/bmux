@@ -313,9 +313,16 @@ impl AttachRenderExtension for DecorationRenderExtension {
         decoration_surface_damage(previous, current)
     }
 
-    fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
+    fn render_revision(&self, surface_id: Uuid) -> Option<u64> {
         let cache = self.cache.lock().ok()?;
-        Some(cache.revision)
+        cache.surface(&surface_id).map(surface_revision)
+    }
+
+    fn render_layer_revision(&self, surface_id: Uuid, layer: RenderExtensionLayer) -> Option<u64> {
+        let cache = self.cache.lock().ok()?;
+        cache
+            .surface(&surface_id)
+            .map(|surface| surface_layer_revision(surface, layer))
     }
 
     fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
@@ -1045,17 +1052,11 @@ fn decoration_surface_layer_damage(
     layer: RenderExtensionLayer,
 ) -> RenderDamage {
     match (previous, current) {
-        (None, None) => RenderDamage::None,
-        (Some(previous), Some(current)) if previous.content_rect != current.content_rect => {
-            RenderDamage::FullSurface
-        }
-        (previous, current) => {
-            RenderDamage::from_rects(previous.into_iter().chain(current).flat_map(|surface| {
-                layer_paint_commands(surface, layer)
-                    .iter()
-                    .flat_map(paint_command_damage)
-            }))
-        }
+        (None, None) | (Some(_), Some(_)) if previous == current => RenderDamage::None,
+        (previous, current) => paint_command_list_damage(
+            previous.map(|surface| layer_paint_commands(surface, layer)),
+            current.map(|surface| layer_paint_commands(surface, layer)),
+        ),
     }
 }
 
@@ -1064,16 +1065,60 @@ fn decoration_surface_damage(
     current: Option<&SurfaceDecoration>,
 ) -> RenderDamage {
     match (previous, current) {
-        (None, None) => RenderDamage::None,
-        (Some(previous), Some(current)) if previous.content_rect != current.content_rect => {
-            RenderDamage::FullSurface
-        }
-        (previous, current) => RenderDamage::from_rects(
-            previous
+        (None, None) | (Some(_), Some(_)) if previous == current => RenderDamage::None,
+        (previous, current) => paint_command_list_damage(
+            previous.map(|surface| surface.paint_commands.as_slice()),
+            current.map(|surface| surface.paint_commands.as_slice()),
+        ),
+    }
+}
+
+fn paint_command_list_damage(
+    previous: Option<&[PaintCommand]>,
+    current: Option<&[PaintCommand]>,
+) -> RenderDamage {
+    let previous = previous.unwrap_or_default();
+    let current = current.unwrap_or_default();
+    let max_len = previous.len().max(current.len());
+    RenderDamage::from_rects((0..max_len).flat_map(|index| {
+        match (previous.get(index), current.get(index)) {
+            (Some(previous), Some(current)) if previous == current => Vec::new(),
+            (previous, current) => previous
                 .into_iter()
                 .chain(current)
-                .flat_map(|surface| surface.paint_commands.iter().flat_map(paint_command_damage)),
-        ),
+                .flat_map(paint_command_damage)
+                .collect(),
+        }
+    }))
+}
+
+fn surface_revision(surface: &SurfaceDecoration) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_revision_part(&mut hasher, &surface.rect);
+    hash_revision_part(&mut hasher, &surface.content_rect);
+    hash_revision_part(&mut hasher, &surface.before_content_paint_commands);
+    hash_revision_part(&mut hasher, &surface.paint_commands);
+    hasher.finish()
+}
+
+fn surface_layer_revision(surface: &SurfaceDecoration, layer: RenderExtensionLayer) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_revision_part(&mut hasher, &surface.rect);
+    hash_revision_part(&mut hasher, &surface.content_rect);
+    match layer {
+        RenderExtensionLayer::BeforePaneContent => {
+            hash_revision_part(&mut hasher, &surface.before_content_paint_commands);
+        }
+        RenderExtensionLayer::AfterPaneContent => {
+            hash_revision_part(&mut hasher, &surface.paint_commands);
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_revision_part(hasher: &mut impl Hasher, value: &impl serde::Serialize) {
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        bytes.hash(hasher);
     }
 }
 
@@ -1828,6 +1873,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decoration_damage_uses_paint_regions_when_content_rect_changes() {
+        let surface_id = Uuid::from_u128(100);
+        let mut previous = surface(
+            surface_id,
+            vec![PaintCommand::BoxBorder {
+                rect: SceneRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                z: 0,
+                glyphs: SceneBorderGlyphs::Ascii,
+                style: scene_style(),
+            }],
+        );
+        let mut current = previous.clone();
+        previous.content_rect.w = 18;
+        current.content_rect.w = 16;
+        current.paint_commands = vec![PaintCommand::BoxBorder {
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 10,
+            },
+            z: 0,
+            glyphs: SceneBorderGlyphs::Ascii,
+            style: scene_style(),
+        }];
+
+        let damage = decoration_surface_layer_damage(
+            Some(&previous),
+            Some(&current),
+            RenderExtensionLayer::AfterPaneContent,
+        );
+
+        assert!(matches!(damage, RenderDamage::Regions(_)));
+    }
+
+    #[test]
+    fn surface_layer_revision_changes_only_for_changed_layer() {
+        let surface_id = Uuid::from_u128(101);
+        let mut decoration = surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 1,
+                row: 1,
+                z: 0,
+                text: "after".to_string(),
+                style: scene_style(),
+            }],
+        );
+        decoration.before_content_paint_commands = vec![PaintCommand::Text {
+            col: 1,
+            row: 0,
+            z: 0,
+            text: "before".to_string(),
+            style: scene_style(),
+        }];
+        let before_revision =
+            surface_layer_revision(&decoration, RenderExtensionLayer::BeforePaneContent);
+        let after_revision =
+            surface_layer_revision(&decoration, RenderExtensionLayer::AfterPaneContent);
+
+        decoration.paint_commands = vec![PaintCommand::Text {
+            col: 1,
+            row: 1,
+            z: 0,
+            text: "after changed".to_string(),
+            style: scene_style(),
+        }];
+
+        assert_eq!(
+            before_revision,
+            surface_layer_revision(&decoration, RenderExtensionLayer::BeforePaneContent)
+        );
+        assert_ne!(
+            after_revision,
+            surface_layer_revision(&decoration, RenderExtensionLayer::AfterPaneContent)
+        );
+    }
+
     fn extension_with_surface(
         surface_id: Uuid,
         paint_commands: Vec<PaintCommand>,
@@ -1968,18 +2097,20 @@ mod tests {
     #[test]
     fn render_ops_converts_supported_text_and_marks_rendered() {
         let surface_id = Uuid::from_u128(1);
-        let (extension, cache) = extension_with_surface(
-            surface_id,
-            vec![PaintCommand::Text {
-                col: 2,
-                row: 3,
-                z: 0,
-                text: "hello".to_string(),
-                style: scene_style(),
-            }],
-        );
+        let paint_commands = vec![PaintCommand::Text {
+            col: 2,
+            row: 3,
+            z: 0,
+            text: "hello".to_string(),
+            style: scene_style(),
+        }];
+        let expected_revision = surface_revision(&surface(surface_id, paint_commands.clone()));
+        let (extension, cache) = extension_with_surface(surface_id, paint_commands);
 
-        assert_eq!(extension.render_revision(surface_id), Some(7));
+        assert_eq!(
+            extension.render_revision(surface_id),
+            Some(expected_revision)
+        );
         let ops = extension
             .render_ops(
                 surface_id,
