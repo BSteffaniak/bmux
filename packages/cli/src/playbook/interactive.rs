@@ -1321,6 +1321,7 @@ async fn run_repl(
             &mut no_display_track,
             runtime_vars,
             &mut no_visual_interactive,
+            None,
             step.index,
             step.index.saturating_add(1),
         )

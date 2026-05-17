@@ -45,6 +45,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
+use crate::runtime::attach::runtime::{
+    HeadlessAttachTerminal, HeadlessAttachTerminalHandle, run_session_attach_with_terminal,
+};
 
 use super::RunOptions;
 use super::parse_dsl::parse_action_line;
@@ -631,6 +634,55 @@ pub(super) struct AttachInputState {
     window_context_ids: Vec<Uuid>,
     scrollback_active: bool,
     scrollback_offset: usize,
+}
+
+pub(super) struct RealAttachPlaybookRuntime {
+    terminal: HeadlessAttachTerminalHandle,
+    task: tokio::task::JoinHandle<Result<crate::runtime::attach::runtime::AttachRunOutcome>>,
+}
+
+impl RealAttachPlaybookRuntime {
+    async fn send_chord(&self, chord: &str) -> Result<()> {
+        let strokes = crate::input::parse_key_chord(chord)
+            .map_err(|error| anyhow::anyhow!("invalid attach key chord '{chord}': {error}"))?;
+        for stroke in strokes {
+            self.terminal
+                .send_event(crossterm_event_from_stroke(stroke))?;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        Ok(())
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.terminal.resize(cols, rows)
+    }
+
+    async fn detach(self) {
+        let _ = self.terminal.send_event(CrosstermEvent::Key(KeyEvent {
+            code: CrosstermKeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }));
+        let _ = self.terminal.send_event(CrosstermEvent::Key(KeyEvent {
+            code: CrosstermKeyCode::Char('d'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }));
+        let captured_bytes = self.terminal.output_bytes().len();
+        if tokio::time::timeout(Duration::from_secs(2), self.task)
+            .await
+            .is_err()
+        {
+            warn!(
+                captured_bytes,
+                "timed out waiting for real-attach playbook runtime to detach"
+            );
+        } else {
+            debug!(captured_bytes, "real-attach playbook runtime detached");
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2334,6 +2386,7 @@ async fn run_playbook_inner(
         None
     };
     let mut render_trace_state = PlaybookRenderTraceState::new(playbook.config.render_trace);
+    let mut real_attach_runtime: Option<RealAttachPlaybookRuntime> = None;
     let mut interactive_abort_from_step: Option<usize> = None;
 
     if matches!(interactive_mode, PlaybookInteractiveMode::Prompt) && options.interactive {
@@ -2495,6 +2548,7 @@ async fn run_playbook_inner(
             &mut display_track,
             &mut runtime_vars,
             &mut visual_interactive,
+            real_attach_runtime.as_ref(),
             step_position,
             total_steps,
         )
@@ -2511,6 +2565,22 @@ async fn run_playbook_inner(
                     step.action.name(),
                     elapsed_ms
                 );
+                if matches!(playbook.config.driver, PlaybookDriver::RealAttach)
+                    && real_attach_runtime.is_none()
+                    && matches!(step.action, Action::NewSession { .. })
+                    && let Some(sid) = session_id
+                {
+                    match start_real_attach_playbook_runtime(
+                        sandbox.as_ref(),
+                        sid,
+                        (playbook.config.viewport.cols, playbook.config.viewport.rows),
+                    )
+                    .await
+                    {
+                        Ok(runtime) => real_attach_runtime = Some(runtime),
+                        Err(error) => warn!(%error, "failed starting real-attach playbook runtime"),
+                    }
+                }
                 let detail_for_visual = detail.clone();
                 let render_after = inspector.capture_all_safe();
                 let render_summary = render_trace_state
@@ -2666,6 +2736,10 @@ async fn run_playbook_inner(
                 continue_on_error: skipped_step.continue_on_error,
             });
         }
+    }
+
+    if let Some(runtime) = real_attach_runtime.take() {
+        runtime.detach().await;
     }
 
     // Finish display track before stopping the recording.
@@ -2879,6 +2953,7 @@ async fn run_visual_dsl_command(
         display_track,
         runtime_vars,
         &mut no_visual,
+        None,
         step_position,
         total_steps,
     )
@@ -3200,6 +3275,7 @@ async fn run_interactive_dsl_command(
         display_track,
         runtime_vars,
         visual_interactive,
+        None,
         step_position,
         total_steps,
     )
@@ -3235,6 +3311,17 @@ fn playbook_recording_event_kinds() -> Vec<RecordingEventKind> {
     ]
 }
 
+fn playbook_perf_window_ms_from_env() -> Option<u64> {
+    let raw = std::env::var("BMUX_PLAYBOOK_PERF_WINDOW_MS").ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => {
+            warn!("ignoring invalid BMUX_PLAYBOOK_PERF_WINDOW_MS={raw:?}");
+            None
+        }
+    }
+}
+
 fn playbook_perf_recording_level_from_env() -> Option<PerformanceRecordingLevel> {
     let raw = std::env::var("BMUX_PLAYBOOK_PERF_RECORDING_LEVEL").ok()?;
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -3259,11 +3346,17 @@ async fn set_playbook_perf_recording_level(
         return None;
     };
     let current: PerformanceRuntimeSettings = current_plugin_settings.into();
-    if current.recording_level == level {
+    let requested_window_ms = playbook_perf_window_ms_from_env();
+    if current.recording_level == level
+        && requested_window_ms.is_none_or(|window_ms| current.window_ms == window_ms)
+    {
         return Some(current);
     }
     let mut updated = current.clone();
     updated.recording_level = level;
+    if let Some(window_ms) = requested_window_ms {
+        updated.window_ms = window_ms;
+    }
     match performance_commands::client::set_settings(client, updated.into()).await {
         Ok(_) => Some(current),
         Err(error) => {
@@ -3305,6 +3398,38 @@ pub(super) async fn start_recording(
     Ok(summary.id)
 }
 
+async fn start_real_attach_playbook_runtime(
+    sandbox: Option<&SandboxServer>,
+    session_id: Uuid,
+    viewport: (u16, u16),
+) -> Result<RealAttachPlaybookRuntime> {
+    let attach_client = if let Some(sb) = sandbox {
+        sb.connect("bmux-playbook-real-attach").await?
+    } else {
+        BmuxClient::connect_default("bmux-playbook-real-attach")
+            .await
+            .map_err(|error| anyhow::anyhow!("failed connecting real-attach driver: {error}"))?
+    };
+    let (mut terminal, handle) = HeadlessAttachTerminal::new(viewport.0, viewport.1);
+    let target = session_id.to_string();
+    let task = tokio::spawn(async move {
+        run_session_attach_with_terminal(
+            attach_client,
+            Some(target.as_str()),
+            None,
+            false,
+            None,
+            &mut terminal,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok(RealAttachPlaybookRuntime {
+        terminal: handle,
+        task,
+    })
+}
+
 /// Execute a single step.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
@@ -3323,6 +3448,7 @@ pub(super) async fn execute_step(
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
     runtime_vars: &mut RuntimeVars,
     visual_interactive: &mut Option<VisualInteractiveState>,
+    real_attach_runtime: Option<&RealAttachPlaybookRuntime>,
     _step_position: usize,
     _total_steps: usize,
 ) -> Result<Option<String>> {
@@ -3841,6 +3967,11 @@ pub(super) async fn execute_step(
                     .map_err(|e| anyhow::anyhow!("resize-viewport failed: {e}"))?;
             }
             inspector.update_viewport(*cols, *rows);
+            if let Some(real_attach) = real_attach_runtime {
+                real_attach
+                    .resize(*cols, *rows)
+                    .map_err(|e| anyhow::anyhow!("real-attach resize failed: {e}"))?;
+            }
             if let Some(ref mut dt) = *display_track {
                 let _ = dt.record_resize(*cols, *rows);
             }
@@ -3848,6 +3979,23 @@ pub(super) async fn execute_step(
         }
 
         Action::SendAttach { key } => {
+            if let Some(real_attach) = real_attach_runtime {
+                execute_real_attach_chord(
+                    key,
+                    real_attach,
+                    client,
+                    inspector,
+                    *session_id,
+                    runtime_vars,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("send-attach failed: {e}"))?;
+                return Ok(Some(format!(
+                    "real_attach_output_bytes={}",
+                    real_attach.terminal.output_bytes().len()
+                )));
+            }
+
             execute_attach_chord(
                 key,
                 client,
@@ -3870,6 +4018,23 @@ pub(super) async fn execute_step(
 
         Action::PrefixKey { key } => {
             let key = format!("ctrl+a {key}");
+            if let Some(real_attach) = real_attach_runtime {
+                execute_real_attach_chord(
+                    &key,
+                    real_attach,
+                    client,
+                    inspector,
+                    *session_id,
+                    runtime_vars,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("prefix-key failed: {e}"))?;
+                return Ok(Some(format!(
+                    "real_attach_output_bytes={}",
+                    real_attach.terminal.output_bytes().len()
+                )));
+            }
+
             execute_attach_chord(
                 &key,
                 client,
@@ -4029,6 +4194,24 @@ pub(super) async fn execute_step(
             bail!("attach simulation actions require @driver attach-sim")
         }
     }
+}
+
+async fn execute_real_attach_chord(
+    chord: &str,
+    real_attach: &RealAttachPlaybookRuntime,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: Option<Uuid>,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<()> {
+    let sid = require_session(session_id)?;
+    real_attach.send_chord(chord).await?;
+    let snapshot = inspector.refresh(client, sid).await?;
+    runtime_vars.pane_count = u32::try_from(snapshot.panes.len()).unwrap_or(u32::MAX);
+    if let Some(focused) = snapshot.panes.iter().find(|pane| pane.focused) {
+        runtime_vars.focused_pane = focused.index;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

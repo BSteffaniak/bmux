@@ -87,7 +87,9 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
   if [[ "$TARGET_SERVER" -eq 1 ]]; then
     args+=(--target-server)
   fi
-  if BMUX_PLAYBOOK_PERF_RECORDING_LEVEL="${BMUX_PLAYBOOK_PERF_RECORDING_LEVEL:-trace}" bmux "${args[@]}" > "$result_json" 2> "$log_file"; then
+  if BMUX_PLAYBOOK_PERF_RECORDING_LEVEL="${BMUX_PLAYBOOK_PERF_RECORDING_LEVEL:-trace}" \
+    BMUX_PLAYBOOK_PERF_WINDOW_MS="${BMUX_PLAYBOOK_PERF_WINDOW_MS:-100}" \
+    bmux "${args[@]}" > "$result_json" 2> "$log_file"; then
     run_status=0
   else
     run_status=$?

@@ -97,8 +97,11 @@ fn parse_config_directive(
         "driver" => {
             config.driver = match rest.trim() {
                 "sandbox" => PlaybookDriver::Sandbox,
+                "real-attach" => PlaybookDriver::RealAttach,
                 "attach-sim" => PlaybookDriver::AttachSim,
-                other => bail!("@driver must be 'sandbox' or 'attach-sim', got '{other}'"),
+                other => bail!(
+                    "@driver must be 'sandbox', 'real-attach', or 'attach-sim', got '{other}'"
+                ),
             };
         }
         "name" => {

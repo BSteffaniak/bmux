@@ -1,5 +1,6 @@
 @name perf-many-panes
 @record true
+@driver real-attach
 @render-trace true
 @viewport cols=160 rows=48
 @shell sh

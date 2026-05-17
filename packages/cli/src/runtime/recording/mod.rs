@@ -1913,7 +1913,7 @@ fn analyze_perf_events(
             );
 
         for (field, value) in object {
-            if !field.ends_with("_ms") {
+            if !field.ends_with("_ms") && !field.contains("_ms_") {
                 continue;
             }
             let Some(ms) = value.as_u64() else {

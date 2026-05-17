@@ -1,5 +1,6 @@
 @name perf-tui-churn
 @record true
+@driver real-attach
 @render-trace true
 @viewport cols=120 rows=40
 @shell sh

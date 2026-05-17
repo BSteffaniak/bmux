@@ -53,11 +53,228 @@ use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchron
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
+
+pub type AttachTerminalEventFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Event>>> + Send + 'a>>;
+
+pub trait AttachTerminal: Write {
+    fn geometry(&self) -> TerminalGeometry;
+
+    fn enter_attach_mode(
+        &mut self,
+        kitty_keyboard_enabled: bool,
+        mouse_capture_enabled: bool,
+    ) -> Result<bool>;
+
+    fn next_event(&mut self) -> AttachTerminalEventFuture<'_>;
+
+    fn restore_after_attach_ui(&mut self) -> Result<()>;
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities;
+}
+
+pub struct RealAttachTerminal {
+    stdout: io::Stdout,
+    event_stream: Option<crossterm::event::EventStream>,
+    raw_mode_guard: Option<RawModeGuard>,
+}
+
+impl RealAttachTerminal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stdout: io::stdout(),
+            event_stream: None,
+            raw_mode_guard: None,
+        }
+    }
+}
+
+impl Default for RealAttachTerminal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Write for RealAttachTerminal {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stdout.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stdout.flush()
+    }
+}
+
+#[derive(Clone)]
+pub struct HeadlessAttachTerminalHandle {
+    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    geometry: Arc<Mutex<TerminalGeometry>>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl HeadlessAttachTerminalHandle {
+    pub fn send_event(&self, event: Event) -> Result<()> {
+        self.event_tx
+            .send(event)
+            .map_err(|_| anyhow::anyhow!("headless attach terminal event receiver closed"))
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        *self
+            .geometry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("headless attach terminal geometry lock poisoned"))? =
+            TerminalGeometry { cols, rows };
+        self.send_event(Event::Resize(cols, rows))
+    }
+
+    #[must_use]
+    pub fn output_bytes(&self) -> Vec<u8> {
+        self.output
+            .lock()
+            .map_or_else(|_| Vec::new(), |out| out.clone())
+    }
+}
+
+pub struct HeadlessAttachTerminal {
+    geometry: Arc<Mutex<TerminalGeometry>>,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl HeadlessAttachTerminal {
+    #[must_use]
+    pub fn new(cols: u16, rows: u16) -> (Self, HeadlessAttachTerminalHandle) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let geometry = Arc::new(Mutex::new(TerminalGeometry { cols, rows }));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                geometry: Arc::clone(&geometry),
+                event_rx,
+                output: Arc::clone(&output),
+            },
+            HeadlessAttachTerminalHandle {
+                event_tx,
+                geometry,
+                output,
+            },
+        )
+    }
+}
+
+impl Write for HeadlessAttachTerminal {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output
+            .lock()
+            .map_err(|_| io::Error::other("headless attach terminal output lock poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AttachTerminal for HeadlessAttachTerminal {
+    fn geometry(&self) -> TerminalGeometry {
+        self.geometry
+            .lock()
+            .map_or(TerminalGeometry { cols: 80, rows: 24 }, |geometry| {
+                *geometry
+            })
+    }
+
+    fn enter_attach_mode(
+        &mut self,
+        _kitty_keyboard_enabled: bool,
+        _mouse_capture_enabled: bool,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn next_event(&mut self) -> AttachTerminalEventFuture<'_> {
+        Box::pin(async move { Ok(self.event_rx.recv().await) })
+    }
+
+    fn restore_after_attach_ui(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
+        bmux_image::host_caps::HostImageCapabilities::default()
+    }
+}
+
+impl AttachTerminal for RealAttachTerminal {
+    fn geometry(&self) -> TerminalGeometry {
+        current_attach_terminal_geometry()
+    }
+
+    fn enter_attach_mode(
+        &mut self,
+        kitty_keyboard_enabled: bool,
+        mouse_capture_enabled: bool,
+    ) -> Result<bool> {
+        let guard = RawModeGuard::enable(kitty_keyboard_enabled, mouse_capture_enabled)
+            .context("failed to enable raw mode for attach")?;
+        let keyboard_enhanced = guard.keyboard_enhanced;
+        self.raw_mode_guard = Some(guard);
+        self.event_stream = Some(crossterm::event::EventStream::new());
+        Ok(keyboard_enhanced)
+    }
+
+    fn next_event(&mut self) -> AttachTerminalEventFuture<'_> {
+        Box::pin(async move {
+            let Some(stream) = self.event_stream.as_mut() else {
+                anyhow::bail!("attach terminal event stream was not initialized");
+            };
+            match stream.next().await {
+                Some(result) => Ok(Some(result.context("failed reading terminal event")?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn restore_after_attach_ui(&mut self) -> Result<()> {
+        self.event_stream = None;
+        self.raw_mode_guard = None;
+        restore_terminal_after_attach_ui()
+    }
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
+        let mut caps = bmux_image::host_caps::detect_with_queries();
+        let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
+        caps.cell_pixel_width = cpw;
+        caps.cell_pixel_height = cph;
+        caps
+    }
+}
 
 use super::super::prompt::{self, PromptOption, PromptRequest, PromptResponse, PromptValue};
 use super::super::{
@@ -1747,13 +1964,33 @@ fn install_bundled_render_extensions() {
     }
 }
 
-#[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
 pub async fn run_session_attach_with_client(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+) -> Result<AttachRunOutcome> {
+    let mut terminal = RealAttachTerminal::new();
+    run_session_attach_with_terminal(
+        client,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+        &mut terminal,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
+pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
+    terminal: &mut T,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -1892,14 +2129,15 @@ pub async fn run_session_attach_with_client(
     };
 
     if let Some(leader_client_id) = follow_target_id {
-        println!(
+        writeln!(
+            terminal,
             "attached to session: {} (following {}{})",
             attach_info.session_id,
             leader_client_id,
             if global { ", global" } else { "" }
-        );
+        )?;
     } else {
-        println!("attached to session: {}", attach_info.session_id);
+        writeln!(terminal, "attached to session: {}", attach_info.session_id)?;
     }
 
     let capture_targets = match recording_state::client::capture_targets(&mut client).await {
@@ -2002,10 +2240,11 @@ pub async fn run_session_attach_with_client(
         }
     }
 
-    update_attach_viewport(
+    update_attach_viewport_with_geometry(
         &mut client,
         view_state.attached_id,
         view_state.status_position,
+        terminal.geometry(),
     )
     .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
@@ -2030,21 +2269,19 @@ pub async fn run_session_attach_with_client(
     );
 
     if !view_state.can_write {
-        println!("read-only attach: input disabled");
+        writeln!(terminal, "read-only attach: input disabled")?;
     }
     if let Some(detach_key) = attach_keymap.primary_binding_for_action(&RuntimeAction::Detach) {
-        println!("press {detach_key} to detach");
+        writeln!(terminal, "press {detach_key} to detach")?;
     } else {
-        println!("detach is unbound in current keymap");
+        writeln!(terminal, "detach is unbound in current keymap")?;
     }
 
-    let raw_mode_guard = RawModeGuard::enable(
+    let keyboard_enhanced = terminal.enter_attach_mode(
         attach_config.behavior.kitty_keyboard,
         attach_config.attach_mouse_config().enabled,
-    )
-    .context("failed to enable raw mode for attach")?;
-    let mut attach_input_processor =
-        InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
+    )?;
+    let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
     let _prompt_host_guard = prompt::register_host(prompt_host_tx);
     let (action_dispatch_tx, mut action_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2062,11 +2299,7 @@ pub async fn run_session_attach_with_client(
         feature = "image-iterm2"
     ))]
     {
-        let mut caps = bmux_image::host_caps::detect_with_queries();
-        let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
-        caps.cell_pixel_width = cpw;
-        caps.cell_pixel_height = cph;
-        view_state.host_image_caps = caps;
+        view_state.host_image_caps = terminal.detect_image_capabilities();
         // Cache the decode mode from config so we don't read config per-frame.
         let img_cfg = attach_config.behavior.images.decode_mode;
         view_state.image_decode_mode = match img_cfg {
@@ -2078,8 +2311,6 @@ pub async fn run_session_attach_with_client(
         };
     }
 
-    // Async terminal event stream — replaces spawn_blocking + poll(15ms).
-    let mut terminal_stream = crossterm::event::EventStream::new();
     let mut pane_output_pending = false;
     #[cfg(any(
         feature = "image-sixel",
@@ -2207,16 +2438,16 @@ pub async fn run_session_attach_with_client(
             }
 
             // Terminal input (keyboard, mouse, resize) via async EventStream.
-            terminal_result = terminal_stream.next() => {
-                let Some(result) = terminal_result else {
+            terminal_result = terminal.next_event() => {
+                let Some(result) = terminal_result? else {
                     // Terminal stream ended unexpectedly.
                     exit_reason = AttachExitReason::StreamClosed;
                     break;
                 };
                 let terminal_event = AttachTerminalEvent::from_crossterm(
-                    result.context("failed reading terminal event")?,
+                    result,
                     SystemAttachClock.now(),
-                    current_attach_terminal_geometry(),
+                    terminal.geometry(),
                 );
                 perf_window.record_wake(AttachWakeSource::Terminal);
 
@@ -2574,8 +2805,9 @@ pub async fn run_session_attach_with_client(
             ));
             let help_scroll = view_state.help_overlay_scroll;
             let render_started_at = SystemAttachClock.now();
-            let render_geometry = current_attach_terminal_geometry();
-            let frame_stats = render_attach_frame(
+            let render_geometry = terminal.geometry();
+            let frame_stats = render_attach_frame_to_writer(
+                terminal,
                 &mut client,
                 &mut view_state,
                 &layout_state,
@@ -2628,7 +2860,13 @@ pub async fn run_session_attach_with_client(
             continue;
         }
 
-        resize_attach_grids_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+        let geometry = terminal.geometry();
+        resize_attach_grids_for_scene_with_size(
+            &mut view_state.pane_buffers,
+            &layout_state.scene,
+            geometry.cols,
+            geometry.rows,
+        );
 
         // Only fetch pane output when new pane bytes are pending.
         // Pure redraw dirty flags (layout/status/overlay) must not trigger
@@ -2854,8 +3092,9 @@ pub async fn run_session_attach_with_client(
         ));
         let help_scroll = view_state.help_overlay_scroll;
         let render_started_at = SystemAttachClock.now();
-        let render_geometry = current_attach_terminal_geometry();
-        let frame_stats = render_attach_frame(
+        let render_geometry = terminal.geometry();
+        let frame_stats = render_attach_frame_to_writer(
+            terminal,
             &mut client,
             &mut view_state,
             &layout_state,
@@ -2906,12 +3145,6 @@ pub async fn run_session_attach_with_client(
         .await?;
     }
 
-    // Stop the crossterm event stream before terminal restoration and async
-    // runtime shutdown. Leaving it alive until the end of the function can keep
-    // its terminal reader task around after a normal detach under pseudo-TTY
-    // harnesses such as `script(1)`.
-    drop(terminal_stream);
-
     if perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
         let mut payload = serde_json::json!({
             "attach_runtime_ms": duration_millis_u64(attach_started_at.elapsed()),
@@ -2946,8 +3179,7 @@ pub async fn run_session_attach_with_client(
         "attach.runtime.end"
     );
 
-    drop(raw_mode_guard);
-    restore_terminal_after_attach_ui()?;
+    terminal.restore_after_attach_ui()?;
 
     if exit_reason != AttachExitReason::Detached {
         let _ = client.detach().await;
@@ -2961,7 +3193,7 @@ pub async fn run_session_attach_with_client(
         .await;
     }
     if let Some(message) = attach_exit_message(exit_reason) {
-        println!("{message}");
+        writeln!(terminal, "{message}")?;
     }
     display_capture.close_all();
     Ok(AttachRunOutcome {
@@ -6015,7 +6247,8 @@ fn terminal_render_capabilities(
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub fn render_attach_frame(
+pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
+    terminal_writer: &mut W,
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
@@ -6401,12 +6634,12 @@ pub fn render_attach_frame(
     }
 
     let terminal_write_started_at = Instant::now();
-    let stdout = io::stdout();
-    let mut stdout = io::BufWriter::new(stdout.lock());
-    stdout
+    terminal_writer
         .write_all(&frame_bytes)
         .context("failed writing attach frame")?;
-    stdout.flush().context("failed flushing attach frame")?;
+    terminal_writer
+        .flush()
+        .context("failed flushing attach frame")?;
     let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
     if terminal_write_ms >= slow_terminal_write_ms {
         tracing::warn!(

@@ -54,6 +54,7 @@ pub struct PlaybookConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybookDriver {
     Sandbox,
+    RealAttach,
     AttachSim,
 }
 

@@ -272,21 +272,21 @@ Directives set playbook-wide configuration. They must appear before any action
 lines (or be interspersed; order relative to actions does not matter since
 directives are processed in a first pass).
 
-| Directive       | Syntax                                          | Default        | Description                                                                                  |
-| --------------- | ----------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------- |
-| `@viewport`     | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                                                                 |
-| `@driver`       | `@driver sandbox\|attach-sim`                   | `sandbox`      | Execution backend; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
-| `@shell`        | `@shell <path>`                                 | system default | Shell binary for the sandbox                                                                 |
-| `@timeout`      | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds                                                  |
-| `@record`       | `@record true\|false`                           | `false`        | Enable recording of the execution                                                            |
-| `@render-trace` | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries                                                  |
-| `@name`         | `@name <string>`                                | none           | Playbook name (included in JSON output)                                                      |
-| `@description`  | `@description <string>`                         | none           | Playbook description                                                                         |
-| `@plugin`       | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                                                              |
-| `@var`          | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution                                          |
-| `@env`          | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process                                           |
-| `@env-mode`     | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                                                           |
-| `@include`      | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10)                                      |
+| Directive       | Syntax                                          | Default        | Description                                                                                                                                                                        |
+| --------------- | ----------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@viewport`     | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                                                                                                                                                       |
+| `@driver`       | `@driver sandbox\|real-attach\|attach-sim`      | `sandbox`      | Execution backend; `real-attach` runs the production attach runtime against a headless terminal adapter; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
+| `@shell`        | `@shell <path>`                                 | system default | Shell binary for the sandbox                                                                                                                                                       |
+| `@timeout`      | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds                                                                                                                                        |
+| `@record`       | `@record true\|false`                           | `false`        | Enable recording of the execution                                                                                                                                                  |
+| `@render-trace` | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries                                                                                                                                        |
+| `@name`         | `@name <string>`                                | none           | Playbook name (included in JSON output)                                                                                                                                            |
+| `@description`  | `@description <string>`                         | none           | Playbook description                                                                                                                                                               |
+| `@plugin`       | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                                                                                                                                                    |
+| `@var`          | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution                                                                                                                                |
+| `@env`          | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process                                                                                                                                 |
+| `@env-mode`     | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                                                                                                                                                 |
+| `@include`      | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10)                                                                                                                            |
 
 ### Environment Modes
 
@@ -301,6 +301,20 @@ environment variable (if set) > `inherit`.
 ______________________________________________________________________
 
 ## Actions Reference
+
+### Real Attach Runtime Driver
+
+Use `@driver real-attach` for performance/runtime scenarios that should exercise
+the same attach loop as the interactive app. The driver still uses the normal
+sandbox or target server setup, but after `new-session` it starts the production
+attach runtime with a headless terminal adapter. Playbook actions can continue to
+use setup-oriented service calls, while the real attach loop receives server
+pushes, drains pane output, renders frames, writes to the terminal adapter, and
+emits normal `bmux.perf` recording telemetry.
+
+This is the preferred driver for perf audits that use `--require-perf-events`.
+Use `@driver sandbox` for deterministic API/render-summary tests and
+`@driver attach-sim` for pure UI reducer tests.
 
 ### Deterministic Attach Simulation
 
