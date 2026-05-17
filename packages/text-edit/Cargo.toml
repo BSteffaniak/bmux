@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "text-editors"]
+description = "Unicode-aware terminal text editing primitives for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "text", "input"]
+license     = { workspace = true }
+name        = "bmux_text_edit"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde                = { workspace = true, features = ["derive", "std"], optional = true }
+unicode-segmentation = { workspace = true }
+unicode-width        = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+serde            = ["dep:serde"]

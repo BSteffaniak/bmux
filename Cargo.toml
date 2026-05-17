@@ -51,6 +51,7 @@ members = [
     "packages/terminal_protocol",
     "packages/terminal-grid",
     "packages/keyboard",
+    "packages/text-edit",
     "packages/mobile-core",
     "packages/mobile-ffi",
     "packages/image",
@@ -179,6 +180,7 @@ bmux_snapshot_protocol      = { version = "0.0.1-alpha.0", default-features = fa
 bmux_snapshot_runtime       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/snapshot-runtime" }
 bmux_terminal_grid          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal-grid" }
 bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
+bmux_text_edit              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/text-edit" }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
 bmux_clients_plugin                  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clients-plugin" }
@@ -301,6 +303,7 @@ tracing-log = { version = "0.2.0", default-features = false }
 tracing-subscriber = { version = "0.3.20", default-features = false }
 trybuild = { version = "1.0.101" }
 ttf-parser = { version = "0.25.1", default-features = true }
+unicode-segmentation = { version = "1.12.0", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 uniffi = { version = "0.31.0" }
 uuid = { version = "1.21.0", default-features = false }

@@ -1111,6 +1111,7 @@ dependencies = [
  "bmux_snapshot_plugin_api",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
+ "bmux_text_edit",
  "bmux_theme_plugin",
  "bmux_visual_adapters_plugin_renderer",
  "bmux_windows_plugin",
@@ -1552,6 +1553,7 @@ dependencies = [
 name = "bmux_keyboard"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "crossterm",
  "serde",
 ]
 
@@ -2108,6 +2110,15 @@ name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bmux_text_edit"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

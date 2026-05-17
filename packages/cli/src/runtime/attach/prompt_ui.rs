@@ -10,6 +10,7 @@ use bmux_attach_layout_protocol::{
     AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind,
 };
 use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderOp, RenderStyle};
+use bmux_text_edit::{TextEditBuffer, TextMotion};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -75,8 +76,7 @@ enum PromptWidgetState {
         selected_yes: bool,
     },
     TextInput {
-        value: String,
-        cursor: usize,
+        buffer: TextEditBuffer,
         /// Inline validation error shown when the user tries to submit
         /// invalid input.  Cleared on the next keystroke.
         error: Option<String>,
@@ -117,14 +117,10 @@ impl ActivePrompt {
             PromptField::Confirm { default, .. } => PromptWidgetState::Confirm {
                 selected_yes: *default,
             },
-            PromptField::TextInput { initial_value, .. } => {
-                let cursor = initial_value.chars().count();
-                PromptWidgetState::TextInput {
-                    value: initial_value.clone(),
-                    cursor,
-                    error: None,
-                }
-            }
+            PromptField::TextInput { initial_value, .. } => PromptWidgetState::TextInput {
+                buffer: TextEditBuffer::from_text(initial_value.clone()),
+                error: None,
+            },
             PromptField::SingleSelect {
                 options,
                 default_index,
@@ -310,58 +306,51 @@ impl AttachPromptState {
                         initial_value: _,
                         validation,
                     },
-                    PromptWidgetState::TextInput {
-                        value,
-                        cursor,
-                        error,
-                    },
+                    PromptWidgetState::TextInput { buffer, error },
                 ) => match key.code {
                     KeyCode::Char(ch)
                         if !key
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
-                        insert_char(value, *cursor, ch);
-                        *cursor = cursor.saturating_add(1);
+                        buffer.insert_char(ch);
                         *error = None;
                     }
                     KeyCode::Backspace => {
-                        if *cursor > 0 {
-                            *cursor = cursor.saturating_sub(1);
-                            remove_char(value, *cursor);
-                        }
+                        buffer.delete_backward();
                         *error = None;
                     }
                     KeyCode::Delete => {
-                        remove_char(value, *cursor);
+                        buffer.delete_forward();
                         *error = None;
                     }
                     KeyCode::Left => {
-                        *cursor = cursor.saturating_sub(1);
+                        buffer.move_cursor(TextMotion::Left);
                     }
                     KeyCode::Right => {
-                        *cursor = cursor.saturating_add(1).min(value.chars().count());
+                        buffer.move_cursor(TextMotion::Right);
                     }
                     KeyCode::Home => {
-                        *cursor = 0;
+                        buffer.move_cursor(TextMotion::Start);
                     }
                     KeyCode::End => {
-                        *cursor = value.chars().count();
+                        buffer.move_cursor(TextMotion::End);
                     }
                     KeyCode::Enter => {
-                        if *required && value.trim().is_empty() {
+                        if *required && buffer.text().trim().is_empty() {
                             *error = Some("value is required".to_string());
                             return PromptKeyDisposition::Consumed;
                         }
-                        if (!value.trim().is_empty() || *required)
+                        if (!buffer.text().trim().is_empty() || *required)
                             && let Some(rule) = validation
-                            && let Err(msg) = run_prompt_validation(rule, value)
+                            && let Err(msg) = run_prompt_validation(rule, buffer.text())
                         {
                             *error = Some(msg);
                             return PromptKeyDisposition::Consumed;
                         }
-                        completion =
-                            Some(PromptResponse::Submitted(PromptValue::Text(value.clone())));
+                        completion = Some(PromptResponse::Submitted(PromptValue::Text(
+                            buffer.text().to_string(),
+                        )));
                     }
                     _ => {}
                 },
@@ -1382,26 +1371,19 @@ fn render_prompt_body(
         }
         (
             PromptField::TextInput { placeholder, .. },
-            PromptWidgetState::TextInput {
-                value,
-                cursor: pos,
-                error,
-            },
+            PromptWidgetState::TextInput { buffer, error },
         ) => {
             let visible_width = text_width.saturating_sub(2).max(1);
-            let char_len = value.chars().count();
-            let bounded_cursor = (*pos).min(char_len);
-            let offset = bounded_cursor.saturating_sub(visible_width.saturating_sub(1));
-            let visible = take_chars(value, offset, visible_width);
-            let rendered = if visible.is_empty() {
+            let viewport = buffer.line_viewport(visible_width);
+            let rendered = if viewport.text.is_empty() {
                 placeholder
                     .as_ref()
                     .map_or_else(String::new, |hint| truncate_chars(hint, visible_width))
             } else {
-                visible
+                viewport.text
             };
             let row = format!("> {}", opaque_row_text(&rendered, visible_width));
-            cursor = Some((lines.len(), 2 + bounded_cursor.saturating_sub(offset)));
+            cursor = Some((lines.len(), 2 + viewport.cursor_col));
             field_lines.push(row);
             if let Some(err_msg) = error {
                 let err_display = format!(
@@ -1718,34 +1700,6 @@ fn wrap_lines(input: &str, width: usize) -> Vec<String> {
 
 fn truncate_chars(input: &str, width: usize) -> String {
     input.chars().take(width).collect::<String>()
-}
-
-fn take_chars(input: &str, start: usize, count: usize) -> String {
-    input.chars().skip(start).take(count).collect::<String>()
-}
-
-fn byte_index_for_char(input: &str, char_index: usize) -> usize {
-    if char_index == 0 {
-        return 0;
-    }
-    input
-        .char_indices()
-        .nth(char_index)
-        .map_or(input.len(), |(index, _)| index)
-}
-
-fn insert_char(input: &mut String, char_index: usize, ch: char) {
-    let byte_index = byte_index_for_char(input, char_index);
-    input.insert(byte_index, ch);
-}
-
-fn remove_char(input: &mut String, char_index: usize) {
-    if char_index >= input.chars().count() {
-        return;
-    }
-    let start = byte_index_for_char(input, char_index);
-    let end = byte_index_for_char(input, char_index.saturating_add(1));
-    input.replace_range(start..end, "");
 }
 
 /// Run validation for a text input value.

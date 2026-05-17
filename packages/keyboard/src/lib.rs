@@ -10,10 +10,14 @@
 //! - Legacy VT/xterm encoding and decoding ([`legacy`])
 //! - Unified encoding entry point ([`encode`])
 
+#[cfg(feature = "crossterm")]
+pub mod crossterm;
 #[cfg(feature = "csi-u")]
 pub mod csi_u;
 pub mod encode;
 pub mod legacy;
+pub mod parse;
 pub mod types;
 
+pub use parse::{ParseKeyError, parse_key_chord, parse_key_stroke};
 pub use types::{KeyCode, KeyStroke, Modifiers};
