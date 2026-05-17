@@ -3029,6 +3029,50 @@ fn before_content_cells_for_surface(
     (cells, damage_rects)
 }
 
+fn retain_cached_terminal_graphics_for_visible_surfaces(
+    scene: &AttachScene,
+    graphics_cache: &TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+    active_terminal_graphics: &mut BTreeSet<u64>,
+) {
+    if !terminal_graphic_can_render(capabilities) {
+        return;
+    }
+    let visible_surfaces = scene
+        .surfaces
+        .iter()
+        .filter_map(|surface| {
+            if !surface.visible
+                || !matches!(
+                    surface.kind,
+                    AttachSurfaceKind::Pane | AttachSurfaceKind::FloatingPane
+                )
+            {
+                return None;
+            }
+            surface.pane_id.map(|pane_id| (pane_id, surface.id))
+        })
+        .collect::<BTreeSet<_>>();
+    active_terminal_graphics.extend(graphics_cache.iter().filter_map(|(key, entry)| {
+        visible_surfaces
+            .contains(&(entry.pane_id, entry.surface_id))
+            .then_some(*key)
+    }));
+}
+
+fn discard_active_terminal_graphics_for_surface(
+    pane_id: Uuid,
+    surface_id: Uuid,
+    graphics_cache: &TerminalGraphicsCache,
+    active_terminal_graphics: &mut BTreeSet<u64>,
+) {
+    for key in graphics_cache.iter().filter_map(|(key, entry)| {
+        (entry.pane_id == pane_id && entry.surface_id == surface_id).then_some(*key)
+    }) {
+        active_terminal_graphics.remove(&key);
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -3070,6 +3114,13 @@ fn render_attach_scene_inner<W: io::Write>(
     for ext in render_extensions {
         ext.refresh_state();
     }
+
+    retain_cached_terminal_graphics_for_visible_surfaces(
+        scene,
+        terminal_graphics_cache,
+        render_context.capabilities,
+        &mut active_terminal_graphics,
+    );
 
     let mut cursor_state = None;
     if frame_damage.is_full_frame() {
@@ -3191,6 +3242,12 @@ fn render_attach_scene_inner<W: io::Write>(
             continue;
         }
         if should_draw_extensions {
+            discard_active_terminal_graphics_for_surface(
+                pane_id,
+                surface.id,
+                terminal_graphics_cache,
+                &mut active_terminal_graphics,
+            );
             // Consult every registered render extension for this
             // surface. Extensions report generic surface damage;
             // unknown damage safely falls back to full-surface
@@ -3735,7 +3792,10 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     use super::{
         cleanup_stale_terminal_graphics, queue_render_items, queue_render_items_for_frame,
+        render_attach_scene_with_stats_and_trace_with_capabilities,
     };
+    #[cfg(feature = "image-kitty")]
+    use crate::types::TerminalGraphicsCache;
 
     fn content_damage(pane_id: Uuid) -> FrameDamage {
         let mut damage = FrameDamage::default();
@@ -4518,6 +4578,179 @@ mod tests {
         let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Fixture builds a two-pane scene to cover partial-damage graphics lifecycle.
+    fn partial_damage_keeps_undamaged_surface_graphics_active() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::{io, sync::Arc};
+
+        struct GraphicsExtension;
+
+        impl AttachRenderExtension for GraphicsExtension {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.graphics"
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn render_layer_items_with_context(
+                &self,
+                _surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                damage: &RenderDamage,
+                layer: RenderExtensionLayer,
+                _context: &bmux_plugin::RenderExtensionContext,
+            ) -> Option<Vec<RenderLayerItem>> {
+                if damage.is_none() {
+                    return None;
+                }
+                (layer == RenderExtensionLayer::AfterPaneContent).then(|| {
+                    vec![RenderLayerItem::Graphic(TerminalGraphicOverlay {
+                        key: 1,
+                        cell_rect: *surface_rect,
+                        pixel_width: 8,
+                        pixel_height: 16,
+                        color: TerminalRgba {
+                            r: 1,
+                            g: 200,
+                            b: 3,
+                            a: 255,
+                        },
+                        fill: TerminalGraphicFill::Left { thickness_px: 3 },
+                        z_index: 8,
+                    })]
+                })
+            }
+        }
+
+        let pane_a = Uuid::from_u128(801);
+        let pane_b = Uuid::from_u128(802);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(800),
+            focus: AttachFocusTarget::Pane { pane_id: pane_a },
+            surfaces: vec![
+                AttachSurface {
+                    id: Uuid::from_u128(811),
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 6,
+                    },
+                    content_rect: AttachRect {
+                        x: 1,
+                        y: 1,
+                        w: 18,
+                        h: 4,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_a),
+                },
+                AttachSurface {
+                    id: Uuid::from_u128(812),
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 20,
+                        y: 0,
+                        w: 20,
+                        h: 6,
+                    },
+                    content_rect: AttachRect {
+                        x: 21,
+                        y: 1,
+                        w: 18,
+                        h: 4,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: false,
+                    pane_id: Some(pane_b),
+                },
+            ],
+        };
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(GraphicsExtension) as Arc<dyn AttachRenderExtension>];
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_a, PaneRenderBuffer::default());
+        pane_buffers.insert(pane_b, PaneRenderBuffer::default());
+        let mut graphics_cache = TerminalGraphicsCache::new();
+        let capabilities = test_kitty_capabilities();
+
+        render_attach_scene_with_stats_and_trace_with_capabilities(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &mut graphics_cache,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (40, 6),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            capabilities,
+            None,
+        )
+        .expect("initial full render should queue both graphics");
+        assert_eq!(graphics_cache.len(), 2);
+
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface(pane_a);
+        let mut partial = Vec::new();
+        render_attach_scene_with_stats_and_trace_with_capabilities(
+            &mut partial,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &mut graphics_cache,
+            &damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (40, 6),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            capabilities,
+            None,
+        )
+        .expect("partial render should keep undamaged graphics active");
+        let partial = String::from_utf8(partial).expect("kitty command should be utf8");
+        assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
+        assert_eq!(graphics_cache.len(), 2);
     }
 
     #[cfg(feature = "image-kitty")]
