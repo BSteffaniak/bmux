@@ -10,13 +10,14 @@ use bmux_appearance::{
     RuntimeContentEffectScope,
 };
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
+#[cfg(feature = "image-kitty")]
+use bmux_plugin::TerminalGraphicFill;
 use bmux_plugin::{
     AttachRenderExtension, AttachVisualCellRef, AttachVisualFrameView,
     AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
-    RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell, TerminalGraphicFill,
-    TerminalGraphicOverlay, TerminalRenderCapabilities, clip_render_text_run_to_rect,
-    render_text_width_u16,
+    RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell, TerminalGraphicOverlay,
+    TerminalRenderCapabilities, clip_render_text_run_to_rect, render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -843,9 +844,23 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     let placement = terminal_graphic_placement_signature(graphic);
     let host_image_id = terminal_graphic_host_image_id(graphic.key);
     let previous = graphics_cache.get(&graphic.key).cloned();
-    let needs_transmit = previous
+    let source_changed = previous
         .as_ref()
-        .is_none_or(|entry| entry.source != source || entry.host_image_id != host_image_id);
+        .is_some_and(|entry| entry.source != source || entry.host_image_id != host_image_id);
+    let previous_placement = previous.as_ref().and_then(|entry| entry.placement);
+    let placement_changed = previous_placement.is_some_and(|old| old != placement);
+    if previous_placement.is_some() && (placement_changed || source_changed) {
+        stdout.write_all(b"\x1b_")?;
+        stdout.write_all(&bmux_image::codec::kitty::encode_delete_placement(
+            host_image_id,
+            host_image_id,
+        ))?;
+        stdout.write_all(b"\x1b\\")?;
+        if let Some(stats) = render_stats.as_mut() {
+            stats.terminal_graphic_deletes = stats.terminal_graphic_deletes.saturating_add(1);
+        }
+    }
+    let needs_transmit = previous.is_none() || source_changed;
     if needs_transmit {
         let pixels = terminal_graphic_pixels(graphic);
         stdout.write_all(b"\x1b_")?;
@@ -881,10 +896,12 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
         queue!(stdout, MoveTo(graphic.cell_rect.x, graphic.cell_rect.y))
             .context("failed moving cursor for kitty graphic placement")?;
         stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_place_with_z(
+        stdout.write_all(&bmux_image::codec::kitty::encode_place_with_z_and_cells(
             host_image_id,
             host_image_id,
             graphic.z_index,
+            graphic.cell_rect.w,
+            graphic.cell_rect.h,
         ))?;
         stdout.write_all(b"\x1b\\")?;
         if let Some(entry) = graphics_cache.get_mut(&graphic.key) {
@@ -894,7 +911,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
             stats.terminal_graphic_places = stats.terminal_graphic_places.saturating_add(1);
         }
     }
-    Ok(needs_transmit || needs_place)
+    Ok(placement_changed || needs_transmit || needs_place)
 }
 
 fn cleanup_terminal_graphics_for_inactive_surfaces<W: io::Write>(
@@ -3172,20 +3189,19 @@ fn render_attach_scene_inner<W: io::Write>(
                     RenderExtensionLayer::AfterPaneContent,
                     render_context,
                 ) {
-                    if items.is_empty() {
-                        continue;
-                    }
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.extension_render_op_calls =
-                            stats.extension_render_op_calls.saturating_add(1);
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        let (regions, full_surface) = render_damage_trace_shape(&damage);
-                        trace.push(AttachRenderTraceOp::ExtensionOps {
-                            surface_index,
-                            regions,
-                            full_surface,
-                        });
+                    if !items.is_empty() {
+                        if let Some(stats) = render_stats.as_deref_mut() {
+                            stats.extension_render_op_calls =
+                                stats.extension_render_op_calls.saturating_add(1);
+                        }
+                        if let Some(trace) = render_trace.as_deref_mut() {
+                            let (regions, full_surface) = render_damage_trace_shape(&damage);
+                            trace.push(AttachRenderTraceOp::ExtensionOps {
+                                surface_index,
+                                regions,
+                                full_surface,
+                            });
+                        }
                     }
                     let Some(buffer) = pane_buffers.get_mut(&pane_id) else {
                         continue;
@@ -3605,9 +3621,8 @@ mod tests {
         DamageCoalescingPolicy, DamageRect, FrameDamage, GridRowRenderContext, TerminalCommand,
         append_pane_output, coalesce_render_damage, frame_damage_overlay_render_ops,
         opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
-        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_items,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
-        render_grid_row_segment,
+        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -3618,15 +3633,22 @@ mod tests {
         AttachSurfaceKind, PaneState, PaneSummary,
     };
     use bmux_plugin::{
-        ExtensionRect, RenderColor, RenderDamage, RenderExtensionLayer, RenderLayerItem,
-        RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell, TerminalGraphicFill,
-        TerminalGraphicOverlay, TerminalRenderCapabilities, TerminalRgba,
+        ExtensionRect, RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp,
+        RenderStyle, RenderUnderCell,
+    };
+    #[cfg(feature = "image-kitty")]
+    use bmux_plugin::{
+        RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRenderCapabilities,
+        TerminalRgba,
     };
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    #[cfg(feature = "image-kitty")]
+    use super::queue_render_items;
 
     fn content_damage(pane_id: Uuid) -> FrameDamage {
         let mut damage = FrameDamage::default();
@@ -4201,7 +4223,7 @@ mod tests {
         assert!(first.contains("\u{1b}_Ga=t,"), "{first:?}");
         assert!(first.contains(",q=2;"), "{first:?}");
         assert!(first.contains("\u{1b}[2;3H\u{1b}_Ga=p,"), "{first:?}");
-        assert!(first.contains(",z=8,q=2"), "{first:?}");
+        assert!(first.contains(",z=8,c=4,r=1,q=2"), "{first:?}");
 
         let mut second = Vec::new();
         assert!(
@@ -4246,6 +4268,7 @@ mod tests {
         );
         let third = String::from_utf8(third).expect("kitty command should be utf8");
         assert!(!third.contains("Ga=t,"), "{third:?}");
+        assert!(third.contains("Ga=d,d=p,"), "{third:?}");
         assert!(third.contains("Ga=p,"), "{third:?}");
         assert!(third.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{third:?}");
 
@@ -4313,6 +4336,7 @@ mod tests {
         );
         let moved = String::from_utf8(moved).expect("kitty command should be utf8");
         assert!(!moved.contains("Ga=t,"), "{moved:?}");
+        assert!(moved.contains("Ga=d,d=p,"), "{moved:?}");
         assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
     }
 

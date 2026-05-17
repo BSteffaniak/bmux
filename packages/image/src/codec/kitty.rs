@@ -116,6 +116,10 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
                             let id = parse_u32(&params, "i").unwrap_or(0);
                             KittyDeleteSpecifier::ByImageId(id)
                         }
+                        b'p' | b'P' => KittyDeleteSpecifier::ByPlacementId {
+                            image_id: parse_u32(&params, "i").unwrap_or(0),
+                            placement_id: parse_u32(&params, "p").unwrap_or(0),
+                        },
                         _ => KittyDeleteSpecifier::All,
                     }
                 } else {
@@ -168,16 +172,42 @@ pub fn encode_place(image_id: u32, placement_id: u32, _row: u16, _col: u16) -> V
 
 /// Encode a kitty graphics placement command for the current cursor cell with a z-index.
 pub fn encode_place_with_z(image_id: u32, placement_id: u32, z_index: i16) -> Vec<u8> {
+    encode_place_with_z_and_cells(image_id, placement_id, z_index, 0, 0)
+}
+
+/// Encode a kitty graphics placement command for the current cursor cell with
+/// z-index and optional cell extents.
+pub fn encode_place_with_z_and_cells(
+    image_id: u32,
+    placement_id: u32,
+    z_index: i16,
+    columns: u16,
+    rows: u16,
+) -> Vec<u8> {
     // q=2 suppresses terminal replies for the same reason as transmit. BMUX
-    // positions Kitty graphics by moving the cursor before placement; embedding
-    // non-standard row/column parameters makes placement terminal-dependent.
-    format!("Ga=p,i={image_id},p={placement_id},z={z_index},q=2").into_bytes()
+    // positions Kitty graphics by moving the cursor before placement; c/r only
+    // describe the placement size in cells and avoid geometry-sized payloads.
+    let mut command = format!("Ga=p,i={image_id},p={placement_id},z={z_index}");
+    if columns > 0 {
+        command.push_str(&format!(",c={columns}"));
+    }
+    if rows > 0 {
+        command.push_str(&format!(",r={rows}"));
+    }
+    command.push_str(",q=2");
+    command.into_bytes()
 }
 
 /// Encode a kitty graphics delete-by-image-id command.
 pub fn encode_delete_image(image_id: u32) -> Vec<u8> {
     // q=2 suppresses delete acknowledgements too.
     format!("Ga=d,d=i,i={image_id},q=2").into_bytes()
+}
+
+/// Encode a kitty graphics delete-by-placement-id command.
+pub fn encode_delete_placement(image_id: u32, placement_id: u32) -> Vec<u8> {
+    // q=2 suppresses delete acknowledgements too.
+    format!("Ga=d,d=p,i={image_id},p={placement_id},q=2").into_bytes()
 }
 
 fn parse_u32(params: &std::collections::HashMap<&str, &str>, key: &str) -> Option<u32> {
@@ -239,9 +269,37 @@ mod tests {
         assert_eq!(place, "Ga=p,i=42,p=42,z=0,q=2");
         assert!(place.ends_with(",q=2"), "{place}");
 
+        let sized_place = String::from_utf8(encode_place_with_z_and_cells(42, 43, 7, 12, 3))
+            .expect("kitty sized place command should be utf8");
+        assert_eq!(sized_place, "Ga=p,i=42,p=43,z=7,c=12,r=3,q=2");
+
         let delete = String::from_utf8(encode_delete_image(42))
             .expect("kitty delete command should be utf8");
         assert_eq!(delete, "Ga=d,d=i,i=42,q=2");
+
+        let delete_placement = String::from_utf8(encode_delete_placement(42, 43))
+            .expect("kitty delete placement command should be utf8");
+        assert_eq!(delete_placement, "Ga=d,d=p,i=42,p=43,q=2");
+    }
+
+    #[test]
+    fn parse_delete_placement() {
+        let body = b"Ga=d,d=p,i=42,p=43";
+        let pos = ImagePosition { row: 0, col: 0 };
+        let cmd = parse_command(body, pos).unwrap();
+        match cmd {
+            KittyCommand::Delete {
+                specifier:
+                    KittyDeleteSpecifier::ByPlacementId {
+                        image_id,
+                        placement_id,
+                    },
+            } => {
+                assert_eq!(image_id, 42);
+                assert_eq!(placement_id, 43);
+            }
+            _ => panic!("expected Delete ByPlacementId"),
+        }
     }
 
     #[test]

@@ -20,8 +20,10 @@ use uuid::Uuid;
 struct RasterSegment {
     col: u16,
     row: u16,
-    width_px: u32,
-    height_px: u32,
+    cell_width: u16,
+    cell_height: u16,
+    pixel_width: u32,
+    pixel_height: u32,
     fill: TerminalGraphicFill,
 }
 
@@ -66,11 +68,11 @@ pub fn semantic_border_graphic_items(
                     cell_rect: bmux_plugin::ExtensionRect::new(
                         segment.col,
                         segment.row,
-                        segment_cell_width(segment, capabilities),
-                        segment_cell_height(segment, capabilities),
+                        segment.cell_width,
+                        segment.cell_height,
                     ),
-                    pixel_width: segment.width_px,
-                    pixel_height: segment.height_px,
+                    pixel_width: segment.pixel_width,
+                    pixel_height: segment.pixel_height,
                     color,
                     fill: segment.fill,
                     z_index: z.saturating_add(1),
@@ -97,16 +99,6 @@ fn is_graphics_capable_semantic_border(
         && capabilities.has_cell_pixels()
 }
 
-fn segment_cell_width(segment: RasterSegment, capabilities: TerminalRenderCapabilities) -> u16 {
-    let cell_w = u32::from(capabilities.cell_pixel_width.max(1));
-    u16::try_from(segment.width_px.div_ceil(cell_w)).unwrap_or(u16::MAX)
-}
-
-fn segment_cell_height(segment: RasterSegment, capabilities: TerminalRenderCapabilities) -> u16 {
-    let cell_h = u32::from(capabilities.cell_pixel_height.max(1));
-    u16::try_from(segment.height_px.div_ceil(cell_h)).unwrap_or(u16::MAX)
-}
-
 fn raster_border_segments(
     rect: &SceneRect,
     thickness_px: u16,
@@ -123,8 +115,10 @@ fn raster_border_segments(
         RasterSegment {
             col: rect.x,
             row: rect.y,
-            width_px: u32::from(rect.w) * u32::from(cell_w),
-            height_px: u32::from(cell_h),
+            cell_width: rect.w,
+            cell_height: 1,
+            pixel_width: u32::from(cell_w),
+            pixel_height: u32::from(cell_h),
             fill: TerminalGraphicFill::Top {
                 thickness_px: thickness,
             },
@@ -132,8 +126,10 @@ fn raster_border_segments(
         RasterSegment {
             col: rect.x,
             row: rect.y.saturating_add(rect.h.saturating_sub(1)),
-            width_px: u32::from(rect.w) * u32::from(cell_w),
-            height_px: u32::from(cell_h),
+            cell_width: rect.w,
+            cell_height: 1,
+            pixel_width: u32::from(cell_w),
+            pixel_height: u32::from(cell_h),
             fill: TerminalGraphicFill::Bottom {
                 thickness_px: thickness,
             },
@@ -141,8 +137,10 @@ fn raster_border_segments(
         RasterSegment {
             col: rect.x,
             row: rect.y,
-            width_px: u32::from(cell_w),
-            height_px: u32::from(rect.h) * u32::from(cell_h),
+            cell_width: 1,
+            cell_height: rect.h,
+            pixel_width: u32::from(cell_w),
+            pixel_height: u32::from(cell_h),
             fill: TerminalGraphicFill::Left {
                 thickness_px: thickness,
             },
@@ -150,8 +148,10 @@ fn raster_border_segments(
         RasterSegment {
             col: rect.x.saturating_add(rect.w.saturating_sub(1)),
             row: rect.y,
-            width_px: u32::from(cell_w),
-            height_px: u32::from(rect.h) * u32::from(cell_h),
+            cell_width: 1,
+            cell_height: rect.h,
+            pixel_width: u32::from(cell_w),
+            pixel_height: u32::from(cell_h),
             fill: TerminalGraphicFill::Right {
                 thickness_px: thickness,
             },
@@ -300,5 +300,64 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn semantic_border_graphics_use_cell_sized_sources_and_large_placements() {
+        let command = PaintCommand::SemanticBorder {
+            rect: SceneRect {
+                x: 10,
+                y: 20,
+                w: 30,
+                h: 12,
+            },
+            z: 7,
+            style: SceneStyle {
+                fg: None,
+                bg: None,
+                bold: false,
+                underline: false,
+                italic: false,
+                reverse: false,
+                dim: false,
+                blink: false,
+                strikethrough: false,
+            },
+            fallback_glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::Rounded,
+            thickness_px: 3,
+            radius_px: 0,
+            when: None,
+        };
+        let items = semantic_border_graphic_items(
+            Uuid::from_u128(1),
+            0,
+            &command,
+            TerminalRenderCapabilities {
+                kitty_graphics: true,
+                graphics_alpha: true,
+                cell_pixel_width: 8,
+                cell_pixel_height: 16,
+                ..TerminalRenderCapabilities::default()
+            },
+            SceneRenderCapabilities::default(),
+        )
+        .expect("semantic border should lower to graphics");
+
+        assert_eq!(items.len(), 4);
+        let RenderLayerItem::Graphic(top) = &items[0] else {
+            panic!("expected graphic item");
+        };
+        assert_eq!(top.cell_rect.w, 30);
+        assert_eq!(top.cell_rect.h, 1);
+        assert_eq!(top.pixel_width, 8);
+        assert_eq!(top.pixel_height, 16);
+
+        let RenderLayerItem::Graphic(left) = &items[2] else {
+            panic!("expected graphic item");
+        };
+        assert_eq!(left.cell_rect.w, 1);
+        assert_eq!(left.cell_rect.h, 12);
+        assert_eq!(left.pixel_width, 8);
+        assert_eq!(left.pixel_height, 16);
     }
 }
