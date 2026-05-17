@@ -215,6 +215,11 @@ fn retarget_attach_stream(
             publish_pane_event(PaneEvent::ClientAttached {
                 session_id: next_session_id.0,
             });
+            // Retargeting changes which session's focused pane is relevant to
+            // attach-local consumers (decoration, status bars). Republish the
+            // full focus snapshot even when the pane focus itself did not
+            // mutate so subscribers can reconcile after tab/window switches.
+            super::publish_focus_state_snapshot();
             Ok(viewport)
         }
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
