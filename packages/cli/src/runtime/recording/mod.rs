@@ -1596,6 +1596,7 @@ struct PerfRenderOutlierSample {
     full_frame_fallback: bool,
     full_surface_fallbacks: u64,
     dirty_reasons: Vec<String>,
+    dirty_events: Vec<serde_json::Value>,
     extension_stats: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
@@ -1777,6 +1778,11 @@ fn render_outlier_from_frame_trace(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
         dirty_reasons: string_array_field(object, "dirty_reasons"),
+        dirty_events: object
+            .get("dirty_events")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         extension_stats: parse_extension_stats(object.get("extension_stats")),
     })
 }

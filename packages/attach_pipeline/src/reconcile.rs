@@ -1,6 +1,8 @@
 use crate::render::{DamageCoalescingPolicy, DamageRect, FrameDamage, visible_scene_pane_ids};
 use crate::types::{PaneRect, PaneRenderBuffer};
-use bmux_attach_layout_protocol::{AttachScene, AttachSurface, AttachSurfaceKind};
+use bmux_attach_layout_protocol::{
+    AttachFocusTarget, AttachScene, AttachSurface, AttachSurfaceKind,
+};
 use bmux_attach_pipeline_models::{AttachChunkApplyOutcome, AttachOutputChunkMeta};
 use bmux_client::AttachLayoutState;
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,13 +103,18 @@ pub fn attach_scene_damage_between(
         .map(|surface| (surface.id, surface))
         .collect::<BTreeMap<_, _>>();
 
+    let mut damage = FrameDamage::default();
     for (surface_id, previous_surface) in &previous_surfaces {
         match next_surfaces.get(surface_id) {
             Some(next_surface) if *previous_surface == *next_surface => {}
-            Some(next_surface) => {
+            Some(next_surface) if surface_requires_outer_damage(previous_surface, next_surface) => {
                 absolute_damage.push(surface_outer_rect(previous_surface));
                 absolute_damage.push(surface_outer_rect(next_surface));
             }
+            Some(next_surface) if surface_is_pane(next_surface) => {
+                damage.mark_extension_surface(next_surface.id);
+            }
+            Some(_) => {}
             None => absolute_damage.push(surface_outer_rect(previous_surface)),
         }
     }
@@ -117,7 +124,16 @@ pub fn attach_scene_damage_between(
         }
     }
 
-    attach_scene_damage_for_absolute_rects(next, &absolute_damage, policy)
+    damage.merge_from(&attach_scene_damage_for_absolute_rects(
+        next,
+        &absolute_damage,
+        policy,
+    ));
+    if previous.focus != next.focus {
+        mark_focus_target_surface_damage(&mut damage, next, &previous.focus);
+        mark_focus_target_surface_damage(&mut damage, next, &next.focus);
+    }
+    damage
 }
 
 #[must_use]
@@ -157,6 +173,45 @@ pub fn attach_scene_damage_for_absolute_rects(
         }
     }
     damage
+}
+
+fn surface_requires_outer_damage(previous: &AttachSurface, next: &AttachSurface) -> bool {
+    previous.kind != next.kind
+        || previous.layer != next.layer
+        || previous.z != next.z
+        || previous.rect != next.rect
+        || previous.content_rect != next.content_rect
+        || previous.opaque != next.opaque
+        || previous.visible != next.visible
+        || previous.pane_id != next.pane_id
+}
+
+fn mark_focus_target_surface_damage(
+    damage: &mut FrameDamage,
+    scene: &AttachScene,
+    focus: &AttachFocusTarget,
+) {
+    match focus {
+        AttachFocusTarget::None => {}
+        AttachFocusTarget::Pane { pane_id } => {
+            for surface in scene
+                .surfaces
+                .iter()
+                .filter(|surface| surface.visible && surface.pane_id == Some(*pane_id))
+            {
+                damage.mark_extension_surface(surface.id);
+            }
+        }
+        AttachFocusTarget::Surface { surface_id } => {
+            if scene
+                .surfaces
+                .iter()
+                .any(|surface| surface.visible && surface.id == *surface_id)
+            {
+                damage.mark_extension_surface(*surface_id);
+            }
+        }
+    }
 }
 
 const fn surface_is_pane(surface: &AttachSurface) -> bool {
@@ -315,6 +370,14 @@ mod tests {
         }
     }
 
+    fn focused_scene(surfaces: Vec<AttachSurface>, pane_id: Uuid) -> AttachScene {
+        AttachScene {
+            session_id: Uuid::from_u128(100),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces,
+        }
+    }
+
     #[test]
     fn resize_attach_grids_clears_row_cache_on_dimension_change() {
         let pane_id = Uuid::from_u128(1);
@@ -359,5 +422,45 @@ mod tests {
             &[DamageRect::new(2, 2, 4, 3), DamageRect::new(8, 2, 4, 3)]
         );
         assert!(damage.extension_surface_damaged(floating_surface, floating));
+    }
+
+    #[test]
+    fn attach_scene_damage_between_marks_metadata_changes_as_extension_damage() {
+        let pane_id = Uuid::from_u128(1);
+        let surface_id = Uuid::from_u128(10);
+        let previous = scene(vec![pane_surface(surface_id, pane_id, 0, 0, 20, 10, 0)]);
+        let mut next_surface = previous.surfaces[0].clone();
+        next_surface.accepts_input = false;
+        let next = scene(vec![next_surface]);
+
+        let damage =
+            attach_scene_damage_between(&previous, &next, DamageCoalescingPolicy::default());
+
+        assert!(!damage.is_full_frame());
+        assert!(!damage.content_surface_damaged(pane_id));
+        assert!(damage.extension_surface_damaged(surface_id, pane_id));
+    }
+
+    #[test]
+    fn attach_scene_damage_between_marks_focus_changes_as_extension_damage() {
+        let first_pane = Uuid::from_u128(1);
+        let second_pane = Uuid::from_u128(2);
+        let first_surface = Uuid::from_u128(10);
+        let second_surface = Uuid::from_u128(20);
+        let surfaces = vec![
+            pane_surface(first_surface, first_pane, 0, 0, 20, 10, 0),
+            pane_surface(second_surface, second_pane, 20, 0, 20, 10, 0),
+        ];
+        let previous = focused_scene(surfaces.clone(), first_pane);
+        let next = focused_scene(surfaces, second_pane);
+
+        let damage =
+            attach_scene_damage_between(&previous, &next, DamageCoalescingPolicy::default());
+
+        assert!(!damage.is_full_frame());
+        assert!(!damage.content_surface_damaged(first_pane));
+        assert!(!damage.content_surface_damaged(second_pane));
+        assert!(damage.extension_surface_damaged(first_surface, first_pane));
+        assert!(damage.extension_surface_damaged(second_surface, second_pane));
     }
 }

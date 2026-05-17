@@ -95,6 +95,36 @@ fn coalesce_render_damage(
     }
 }
 
+fn extension_render_damage_for_frame(
+    ext: &dyn AttachRenderExtension,
+    surface_id: Uuid,
+    pane_id: Uuid,
+    surface_rect: ExtensionRect,
+    layer: RenderExtensionLayer,
+    frame_damage: &FrameDamage,
+    policy: DamageCoalescingPolicy,
+) -> RenderDamage {
+    let extension_rect_damage = frame_damage.extension_surface_rects(surface_id);
+    if frame_damage.is_full_frame() {
+        return RenderDamage::FullSurface;
+    }
+    if !extension_rect_damage.is_empty() {
+        return coalesce_render_damage(
+            frame_rects_to_render_damage(extension_rect_damage, surface_rect),
+            surface_rect,
+            policy,
+        );
+    }
+    if frame_damage.content_surface_damaged(pane_id) && ext.redraws_on_content_damage(layer) {
+        return RenderDamage::FullSurface;
+    }
+    coalesce_render_damage(
+        ext.surface_layer_damage(surface_id, &surface_rect, layer),
+        surface_rect,
+        policy,
+    )
+}
+
 fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<ExtensionRect> {
     let x1 = rect.x.max(bounds.x);
     let y1 = rect.y.max(bounds.y);
@@ -3004,26 +3034,15 @@ fn before_content_cells_for_surface(
     let mut cells = BTreeMap::new();
     let mut damage_rects = Vec::new();
     for ext in render_extensions {
-        let extension_rect_damage = frame_damage.extension_surface_rects(surface.id);
-        let damage = if frame_damage.content_surface_damaged(pane_id) {
-            RenderDamage::FullSurface
-        } else if extension_rect_damage.is_empty() {
-            coalesce_render_damage(
-                ext.surface_layer_damage(
-                    surface.id,
-                    &ext_rect,
-                    RenderExtensionLayer::BeforePaneContent,
-                ),
-                ext_rect,
-                damage_policy,
-            )
-        } else {
-            coalesce_render_damage(
-                frame_rects_to_render_damage(extension_rect_damage, ext_rect),
-                ext_rect,
-                damage_policy,
-            )
-        };
+        let damage = extension_render_damage_for_frame(
+            ext.as_ref(),
+            surface.id,
+            pane_id,
+            ext_rect,
+            RenderExtensionLayer::BeforePaneContent,
+            frame_damage,
+            damage_policy,
+        );
         if damage.is_none() {
             continue;
         }
@@ -3316,26 +3335,15 @@ fn render_attach_scene_inner<W: io::Write>(
                 h: rect.h,
             };
             for ext in render_extensions {
-                let extension_rect_damage = frame_damage.extension_surface_rects(surface.id);
-                let damage = if frame_damage.content_surface_damaged(pane_id) {
-                    RenderDamage::FullSurface
-                } else if extension_rect_damage.is_empty() {
-                    coalesce_render_damage(
-                        ext.surface_layer_damage(
-                            surface.id,
-                            &ext_rect,
-                            RenderExtensionLayer::AfterPaneContent,
-                        ),
-                        ext_rect,
-                        damage_policy,
-                    )
-                } else {
-                    coalesce_render_damage(
-                        frame_rects_to_render_damage(extension_rect_damage, ext_rect),
-                        ext_rect,
-                        damage_policy,
-                    )
-                };
+                let damage = extension_render_damage_for_frame(
+                    ext.as_ref(),
+                    surface.id,
+                    pane_id,
+                    ext_rect,
+                    RenderExtensionLayer::AfterPaneContent,
+                    frame_damage,
+                    damage_policy,
+                );
                 if damage.is_none() {
                     continue;
                 }

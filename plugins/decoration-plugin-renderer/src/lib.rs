@@ -318,6 +318,10 @@ impl AttachRenderExtension for DecorationRenderExtension {
         Some(cache.revision)
     }
 
+    fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
+        false
+    }
+
     fn render_surface(
         &self,
         stdout: &mut dyn io::Write,

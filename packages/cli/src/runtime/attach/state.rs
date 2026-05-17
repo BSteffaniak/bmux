@@ -164,6 +164,11 @@ impl AttachDirtyFlags {
         self.push_event(source, AttachDirtyKind::Extension, None);
     }
 
+    pub fn mark_surface_dirty(&mut self, surface_id: Uuid, source: AttachDirtySource) {
+        self.precise_frame_damage.mark_extension_surface(surface_id);
+        self.push_event(source, AttachDirtyKind::PreciseDamage, None);
+    }
+
     pub fn mark_layout_refresh(&mut self, source: AttachDirtySource) {
         self.layout_needs_refresh = true;
         self.push_event(source, AttachDirtyKind::LayoutRefresh, None);
@@ -176,6 +181,11 @@ impl AttachDirtyFlags {
 
     pub fn mark_layout_frame_and_status_dirty(&mut self, source: AttachDirtySource) {
         self.mark_layout_frame_dirty(source);
+        self.mark_status_dirty(source);
+    }
+
+    pub fn mark_layout_refresh_and_status_dirty(&mut self, source: AttachDirtySource) {
+        self.mark_layout_refresh(source);
         self.mark_status_dirty(source);
     }
 

@@ -307,11 +307,11 @@ use super::render::{
     visible_scene_pane_ids,
 };
 use super::state::{
-    AttachDirtySource, AttachEventAction, AttachExitReason, AttachInputHookCapture,
-    AttachMouseFloatingDrag, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
-    AttachMouseSelectionDrag, AttachMouseTabDrag, AttachScrollbackCursor, AttachScrollbackPosition,
-    AttachTabDropPlacement, AttachTabDropTarget, AttachUiEffect, AttachUiMode, AttachUiReduction,
-    AttachViewState, PaneRenderBuffer,
+    AttachDirtyFlags, AttachDirtySource, AttachEventAction, AttachExitReason,
+    AttachInputHookCapture, AttachMouseFloatingDrag, AttachMouseResizeAxisDrag,
+    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachScrollbackCursor,
+    AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget, AttachUiEffect,
+    AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
@@ -1043,6 +1043,7 @@ impl AttachDirtyReasons {
     const LAYOUT: u8 = 1 << 4;
     const SCENE_HYDRATED: u8 = 1 << 5;
     const EXTENSION: u8 = 1 << 6;
+    const PRECISE_DAMAGE: u8 = 1 << 7;
 
     fn from_view_state(view_state: &AttachViewState, layout: bool, scene_hydrated: bool) -> Self {
         let mut bits = 0;
@@ -1066,6 +1067,9 @@ impl AttachDirtyReasons {
         }
         if view_state.dirty.extension_needs_redraw {
             bits |= Self::EXTENSION;
+        }
+        if !view_state.dirty.precise_frame_damage.is_empty() {
+            bits |= Self::PRECISE_DAMAGE;
         }
         Self { bits }
     }
@@ -1096,6 +1100,9 @@ impl AttachDirtyReasons {
         }
         if self.contains(Self::EXTENSION) {
             labels.push("extension");
+        }
+        if self.contains(Self::PRECISE_DAMAGE) {
+            labels.push("precise_damage");
         }
         labels
     }
@@ -1529,6 +1536,23 @@ async fn notify_extensions_of_layout(
 /// that live in the server process (e.g. the decoration plugin)
 /// subscribe to the server-side channel and see the snapshot
 /// alongside client-side subscribers.
+fn mark_pane_surface_dirty(
+    dirty: &mut AttachDirtyFlags,
+    layout_state: &AttachLayoutState,
+    pane_id: Uuid,
+    source: AttachDirtySource,
+) -> bool {
+    let mut marked = false;
+    for surface in &layout_state.scene.surfaces {
+        if !surface.visible || surface.pane_id != Some(pane_id) {
+            continue;
+        }
+        dirty.mark_surface_dirty(surface.id, source);
+        marked = true;
+    }
+    marked
+}
+
 async fn publish_attach_layout_snapshot(
     client: &mut bmux_client::StreamingBmuxClient,
     surfaces: &[AttachSurfaceSummary],
@@ -1956,6 +1980,7 @@ fn attach_frame_trace_payload(
     frame_render_ms: u64,
     scene_hydrated: bool,
     dirty_reasons: AttachDirtyReasons,
+    dirty_events: &[super::state::AttachDirtyEvent],
     frame_stats: &AttachFrameRenderStats,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -1974,6 +1999,11 @@ fn attach_frame_trace_payload(
         "synchronized_update": frame_stats.synchronized_update,
         "dirty_event_count": frame_stats.dirty_event_count,
         "dirty_reasons": dirty_reasons.labels(),
+        "dirty_events": dirty_events.iter().map(|event| serde_json::json!({
+            "source": format!("{:?}", event.source),
+            "kind": format!("{:?}", event.kind),
+            "pane_id": event.pane_id,
+        })).collect::<Vec<_>>(),
         "pane_rows_examined": frame_stats.scene_render.pane_rows_examined,
         "pane_rows_emitted": frame_stats.scene_render.pane_rows_emitted,
         "pane_row_segments_emitted": frame_stats.scene_render.pane_row_segments_emitted,
@@ -2003,6 +2033,7 @@ async fn maybe_emit_attach_frame_perf(
     frame_render_ms: u64,
     scene_hydrated: bool,
     dirty_reasons: AttachDirtyReasons,
+    dirty_events: &[super::state::AttachDirtyEvent],
     frame_stats: &AttachFrameRenderStats,
     first_frame_emitted: &mut bool,
     interactive_ready_emitted: &mut bool,
@@ -2063,6 +2094,7 @@ async fn maybe_emit_attach_frame_perf(
                     frame_render_ms,
                     scene_hydrated,
                     dirty_reasons,
+                    dirty_events,
                     frame_stats,
                 ),
             )
@@ -2877,11 +2909,15 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                                 }
                             }
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
-                            view_state.dirty.mark_pane_dirty(
+                            mark_pane_surface_dirty(
+                                &mut view_state.dirty,
+                                &layout_state,
                                 previous.focused_pane_id,
                                 AttachDirtySource::FocusChanged,
                             );
-                            view_state.dirty.mark_pane_dirty(
+                            mark_pane_surface_dirty(
+                                &mut view_state.dirty,
+                                &layout_state,
                                 layout_state.focused_pane_id,
                                 AttachDirtySource::FocusChanged,
                             );
@@ -2929,6 +2965,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             let dirty_reasons =
                 AttachDirtyReasons::from_view_state(&view_state, dirty_layout_frame, true);
             perf_window.record_dirty_reasons(dirty_reasons);
+            let dirty_events = view_state.dirty.dirty_events().to_vec();
             let help_scroll = view_state.help_overlay_scroll;
             let render_started_at = SystemAttachClock.now();
             let render_geometry = terminal.geometry();
@@ -2972,6 +3009,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 render_ms,
                 true,
                 dirty_reasons,
+                &dirty_events,
                 &frame_stats,
                 &mut first_frame_emitted,
                 &mut interactive_ready_emitted,
@@ -3216,6 +3254,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         let dirty_reasons =
             AttachDirtyReasons::from_view_state(&view_state, dirty_layout_frame, false);
         perf_window.record_dirty_reasons(dirty_reasons);
+        let dirty_events = view_state.dirty.dirty_events().to_vec();
         let help_scroll = view_state.help_overlay_scroll;
         let render_started_at = SystemAttachClock.now();
         let render_geometry = terminal.geometry();
@@ -3259,6 +3298,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             render_ms,
             false,
             dirty_reasons,
+            &dirty_events,
             &frame_stats,
             &mut first_frame_emitted,
             &mut interactive_ready_emitted,
@@ -4698,7 +4738,7 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 view_state
                     .dirty
-                    .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
+                    .mark_layout_refresh_and_status_dirty(AttachDirtySource::PluginCommand);
                 emit_attach_plugin_command_timing(
                     plugin_id,
                     command_name,
@@ -4777,7 +4817,7 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 view_state
                     .dirty
-                    .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
+                    .mark_layout_refresh_and_status_dirty(AttachDirtySource::PluginCommand);
                 emit_attach_plugin_command_timing(
                     plugin_id,
                     command_name,
@@ -4805,7 +4845,7 @@ pub async fn handle_attach_plugin_command_action(
             );
             view_state
                 .dirty
-                .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
+                .mark_layout_refresh_and_status_dirty(AttachDirtySource::PluginCommand);
             emit_attach_plugin_command_timing(
                 plugin_id,
                 command_name,
@@ -6350,28 +6390,32 @@ fn frame_uses_synchronized_update(frame_damage: &bmux_attach_pipeline::FrameDama
 fn terminal_render_capabilities(
     view_state: &AttachViewState,
 ) -> bmux_plugin::TerminalRenderCapabilities {
-    let mut capabilities = bmux_plugin::TerminalRenderCapabilities::default();
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
     {
-        capabilities.kitty_graphics = view_state.host_image_caps.kitty_graphics;
-        capabilities.sixel = view_state.host_image_caps.sixel;
-        capabilities.iterm2_inline_images = view_state.host_image_caps.iterm2_inline;
-        capabilities.graphics_alpha =
-            view_state.host_image_caps.kitty_graphics || view_state.host_image_caps.iterm2_inline;
-        capabilities.cell_pixel_width = view_state.host_image_caps.cell_pixel_width;
-        capabilities.cell_pixel_height = view_state.host_image_caps.cell_pixel_height;
+        bmux_plugin::TerminalRenderCapabilities {
+            kitty_graphics: view_state.host_image_caps.kitty_graphics,
+            sixel: view_state.host_image_caps.sixel,
+            iterm2_inline_images: view_state.host_image_caps.iterm2_inline,
+            graphics_alpha: view_state.host_image_caps.kitty_graphics
+                || view_state.host_image_caps.iterm2_inline,
+            cell_pixel_width: view_state.host_image_caps.cell_pixel_width,
+            cell_pixel_height: view_state.host_image_caps.cell_pixel_height,
+            ..bmux_plugin::TerminalRenderCapabilities::default()
+        }
     }
     #[cfg(not(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     )))]
-    let _ = view_state;
-    capabilities
+    {
+        let _ = view_state;
+        bmux_plugin::TerminalRenderCapabilities::default()
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -8349,14 +8393,17 @@ pub fn apply_attach_view_change_components(
     for component in components {
         match component {
             AttachViewComponent::Scene | AttachViewComponent::Layout => {
+                // Server view-change events are invalidation hints. Reconcile
+                // against the next layout snapshot before deciding whether the
+                // frame needs content, surface, or full-frame damage.
                 view_state
                     .dirty
-                    .mark_layout_frame_and_status_dirty(AttachDirtySource::SceneChanged);
+                    .mark_layout_refresh_and_status_dirty(AttachDirtySource::SceneChanged);
             }
             AttachViewComponent::SurfaceContent => {
                 view_state
                     .dirty
-                    .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
+                    .mark_layout_refresh(AttachDirtySource::SceneChanged);
             }
             AttachViewComponent::Status => {
                 view_state
@@ -11092,10 +11139,27 @@ pub async fn focus_attach_pane(
         .await?;
     }
 
+    let previous_focus = focused_attach_pane_id(view_state);
     view_state.mouse.last_focused_pane_id = Some(pane_id);
+    if let Some(layout_state) = view_state.cached_layout_state.clone() {
+        if let Some(previous_pane_id) = previous_focus {
+            mark_pane_surface_dirty(
+                &mut view_state.dirty,
+                &layout_state,
+                previous_pane_id,
+                AttachDirtySource::FocusChanged,
+            );
+        }
+        mark_pane_surface_dirty(
+            &mut view_state.dirty,
+            &layout_state,
+            pane_id,
+            AttachDirtySource::FocusChanged,
+        );
+    }
     view_state
         .dirty
-        .mark_layout_frame_and_status_dirty(AttachDirtySource::FocusChanged);
+        .mark_layout_refresh_and_status_dirty(AttachDirtySource::FocusChanged);
 
     Ok(())
 }
@@ -12292,6 +12356,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn view_change_components_request_reconcile_without_full_frame_damage() {
+        let session_id = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.dirty.clear_frame_damage();
+
+        apply_attach_view_change_components(&[AttachViewComponent::Layout], &mut view_state);
+
+        let damage = view_state.dirty.frame_damage(&AttachScene {
+            session_id,
+            focus: AttachFocusTarget::None,
+            surfaces: Vec::new(),
+        });
+        assert!(view_state.dirty.layout_needs_refresh);
+        assert!(!damage.is_full_frame());
+    }
+
+    #[test]
+    fn pane_surface_dirty_marks_extension_damage_without_content_damage() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let surface = test_pane_surface(
+            pane_id,
+            AttachRect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 10,
+            },
+        );
+        let surface_id = surface.id;
+        let layout_state = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![surface],
+            },
+            zoomed: false,
+        };
+        let mut dirty = AttachDirtyFlags::default();
+        dirty.clear_frame_damage();
+
+        assert!(mark_pane_surface_dirty(
+            &mut dirty,
+            &layout_state,
+            pane_id,
+            AttachDirtySource::FocusChanged,
+        ));
+        let damage = dirty.frame_damage(&layout_state.scene);
+
+        assert!(!damage.is_full_frame());
+        assert!(!damage.content_surface_damaged(pane_id));
+        assert!(damage.extension_surface_damaged(surface_id, pane_id));
+    }
+
     fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
@@ -12834,7 +12962,7 @@ mod tests {
         apply_attach_view_change_components(&[AttachViewComponent::Layout], &mut view_state);
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
-        assert!(view_state.dirty.full_pane_redraw);
+        assert!(!view_state.dirty.full_pane_redraw);
 
         view_state.dirty.status_needs_redraw = false;
         view_state.dirty.layout_needs_refresh = false;
@@ -12844,7 +12972,7 @@ mod tests {
         );
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
-        assert!(view_state.dirty.full_pane_redraw);
+        assert!(!view_state.dirty.full_pane_redraw);
     }
 
     #[test]

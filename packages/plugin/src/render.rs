@@ -1021,6 +1021,15 @@ pub trait AttachRenderExtension: Send + Sync {
         self.surface_damage(surface_id, surface_rect)
     }
 
+    /// Return whether this layer must be repainted after pane content is
+    /// emitted for the same surface. Extensions that only draw outside the
+    /// content rect can opt out so ordinary pane output does not promote their
+    /// damage to a full-surface repaint. The default is conservative for
+    /// overlay-style extensions and existing implementations.
+    fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
+        true
+    }
+
     /// Return an optional revision token for render output on this
     /// surface. Declarative render ops are cached only when this
     /// returns `Some`; increment or otherwise change the token whenever
