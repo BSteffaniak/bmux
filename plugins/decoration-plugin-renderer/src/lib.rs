@@ -69,7 +69,7 @@ const VISUAL_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 struct DecorationRendererCache {
     revision: u64,
     surfaces: BTreeMap<Uuid, SurfaceDecoration>,
-    rendered_surfaces: BTreeMap<Uuid, SurfaceDecoration>,
+    rendered_surfaces: BTreeMap<(Uuid, RenderExtensionLayer), SurfaceDecoration>,
     scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
     visual_last_at: BTreeMap<String, Instant>,
     visual_last_revision: BTreeMap<String, u64>,
@@ -141,19 +141,34 @@ impl DecorationRendererCache {
     }
 
     fn rendered_surface(&self, surface_id: &Uuid) -> Option<&SurfaceDecoration> {
-        self.rendered_surfaces.get(surface_id)
+        self.rendered_surface_layer(surface_id, RenderExtensionLayer::AfterPaneContent)
     }
 
-    fn mark_rendered(&mut self, surface_id: Uuid) {
+    fn rendered_surface_layer(
+        &self,
+        surface_id: &Uuid,
+        layer: RenderExtensionLayer,
+    ) -> Option<&SurfaceDecoration> {
+        self.rendered_surfaces.get(&(*surface_id, layer))
+    }
+
+    fn mark_layer_rendered(&mut self, surface_id: Uuid, layer: RenderExtensionLayer) {
         if let Some(surface) = self.surfaces.get(&surface_id) {
-            self.rendered_surfaces.insert(surface_id, surface.clone());
+            self.rendered_surfaces
+                .insert((surface_id, layer), surface.clone());
         } else {
-            self.rendered_surfaces.remove(&surface_id);
+            self.rendered_surfaces
+                .retain(|(rendered_id, _), _| rendered_id != &surface_id);
         }
     }
 
+    fn mark_rendered(&mut self, surface_id: Uuid) {
+        self.mark_layer_rendered(surface_id, RenderExtensionLayer::AfterPaneContent);
+    }
+
     fn forget_surface(&mut self, surface_id: &Uuid) {
-        self.rendered_surfaces.remove(surface_id);
+        self.rendered_surfaces
+            .retain(|(rendered_id, _), _| rendered_id != surface_id);
         self.surfaces.remove(surface_id);
         let suffix = format!(":{surface_id}");
         self.visual_last_revision
@@ -185,22 +200,22 @@ impl DecorationRenderExtension {
             return Some(Vec::new());
         };
         let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         };
         if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         }
         let surface = filter_surface_layer_for_damage(surface, damage, layer);
         if layer_paint_commands(&surface, layer).is_empty() {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         }
         let scene_capabilities = scene_capabilities_from_terminal(capabilities);
         let ops =
             render_ops_for_surface_layer_with_capabilities(&surface, layer, scene_capabilities)?;
-        cache.mark_rendered(surface_id);
+        cache.mark_layer_rendered(surface_id, layer);
         Some(ops)
     }
 
@@ -214,11 +229,11 @@ impl DecorationRenderExtension {
             return Some(Vec::new());
         };
         let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
             return Some(Vec::new());
         };
         if surface.before_content_paint_commands.is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
             return Some(Vec::new());
         }
         let surface = filter_surface_layer_for_damage(
@@ -231,7 +246,7 @@ impl DecorationRenderExtension {
             RenderExtensionLayer::BeforePaneContent,
             capabilities,
         )?;
-        cache.mark_rendered(surface_id);
+        cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
         Some(render_ops_to_under_cells(&ops))
     }
 
@@ -247,11 +262,11 @@ impl DecorationRenderExtension {
             return Ok(false);
         };
         let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Ok(false);
         };
         if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Ok(false);
         }
         let surface = filter_surface_layer_for_damage(surface, damage, layer);
@@ -274,7 +289,7 @@ impl DecorationRenderExtension {
         if emitted_text_style {
             stdout.write_all(b"\x1b[0m")?;
         }
-        cache.mark_rendered(surface_id);
+        cache.mark_layer_rendered(surface_id, layer);
         Ok(rendered)
     }
 }
@@ -300,7 +315,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             return RenderDamage::None;
         };
         let current = cache.surface(&surface_id);
-        let previous = cache.rendered_surface(&surface_id);
+        let previous = cache.rendered_surface_layer(&surface_id, layer);
         decoration_surface_layer_damage(previous, current, layer)
     }
 
@@ -393,14 +408,14 @@ impl AttachRenderExtension for DecorationRenderExtension {
             return Some(Vec::new());
         };
         let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         };
-        let previous_surface = cache.rendered_surface(&surface_id).cloned();
+        let previous_surface = cache.rendered_surface_layer(&surface_id, layer).cloned();
         if layer_paint_commands(surface, layer).is_empty() && previous_surface.is_none()
             || damage.is_none()
         {
-            cache.mark_rendered(surface_id);
+            cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         }
 
@@ -453,7 +468,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
         if !used_graphics {
             return None;
         }
-        cache.mark_rendered(surface_id);
+        cache.mark_layer_rendered(surface_id, layer);
         Some(items)
     }
 
@@ -1912,6 +1927,60 @@ mod tests {
         );
 
         assert!(matches!(damage, RenderDamage::Regions(_)));
+    }
+
+    #[test]
+    fn rendering_before_layer_does_not_suppress_after_layer_damage() {
+        let surface_id = Uuid::from_u128(102);
+        let mut decoration = surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 1,
+                row: 1,
+                z: 0,
+                text: "after".to_string(),
+                style: scene_style(),
+            }],
+        );
+        decoration.before_content_paint_commands = vec![PaintCommand::Text {
+            col: 1,
+            row: 0,
+            z: 0,
+            text: "before".to_string(),
+            style: scene_style(),
+        }];
+        let cache = Arc::new(Mutex::new(DecorationRendererCache {
+            revision: 1,
+            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            rendered_surfaces: BTreeMap::new(),
+            scene_rx: None,
+            visual_last_at: BTreeMap::new(),
+            visual_last_revision: BTreeMap::new(),
+            visual_last_payload_hash: BTreeMap::new(),
+            visual_adapter_cache: BTreeMap::new(),
+            visual_stats: BTreeMap::new(),
+        }));
+        let extension = DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache,
+        };
+
+        assert!(
+            extension
+                .render_before_content_cells(
+                    surface_id,
+                    &ExtensionRect::new(0, 0, 10, 5),
+                    &RenderDamage::FullSurface,
+                )
+                .is_some()
+        );
+        let after_damage = extension.surface_layer_damage(
+            surface_id,
+            &ExtensionRect::new(0, 0, 10, 5),
+            RenderExtensionLayer::AfterPaneContent,
+        );
+
+        assert!(!after_damage.is_none());
     }
 
     #[test]

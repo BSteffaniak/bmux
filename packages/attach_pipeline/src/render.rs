@@ -3330,16 +3330,15 @@ fn render_attach_scene_inner<W: io::Write>(
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
-        if !focus && !retained_repaint_ids.contains(&surface.id) {
+        if !focus
+            && !retained_repaint_ids.contains(&surface.id)
+            && !should_draw_content
+            && !should_draw_extensions
+        {
             continue;
         }
         if should_draw_extensions {
-            discard_active_terminal_graphics_for_surface(
-                pane_id,
-                surface.id,
-                terminal_graphics_cache,
-                &mut active_terminal_graphics,
-            );
+            let mut discarded_terminal_graphics = false;
             // Consult every registered render extension for this
             // surface. Extensions report generic surface damage;
             // unknown damage safely falls back to full-surface
@@ -3362,6 +3361,15 @@ fn render_attach_scene_inner<W: io::Write>(
                 );
                 if damage.is_none() {
                     continue;
+                }
+                if !discarded_terminal_graphics {
+                    discard_active_terminal_graphics_for_surface(
+                        pane_id,
+                        surface.id,
+                        terminal_graphics_cache,
+                        &mut active_terminal_graphics,
+                    );
+                    discarded_terminal_graphics = true;
                 }
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.record_extension_render_call(ext.name(), &damage);
@@ -5859,6 +5867,163 @@ mod tests {
         let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert_eq!(stats.pane_rows_emitted, 3);
         assert!(rendered.contains("x       \x1b[0m"), "{rendered:?}");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Regression fixture needs two panes and a render extension.
+    fn render_attach_scene_queries_unfocused_extension_surfaces() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::sync::Arc;
+
+        struct QueryExtension;
+
+        impl AttachRenderExtension for QueryExtension {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.query"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => {
+                        RenderDamage::Regions(vec![ExtensionRect::new(
+                            surface_rect.x,
+                            surface_rect.y,
+                            5,
+                            1,
+                        )])
+                    }
+                }
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn std::io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> std::io::Result<bool> {
+                Ok(false)
+            }
+
+            fn render_ops(
+                &self,
+                surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> Option<Vec<RenderOp>> {
+                let focused = surface_id == Uuid::from_u128(1701);
+                Some(vec![RenderOp::TextRun {
+                    x: if focused { 0 } else { 12 },
+                    y: 0,
+                    text: if focused {
+                        "FOCUS".to_string()
+                    } else {
+                        "OTHER".to_string()
+                    },
+                    style: RenderStyle::default(),
+                }])
+            }
+        }
+
+        let focused_pane_id = Uuid::from_u128(1701);
+        let other_pane_id = Uuid::from_u128(1702);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(1700),
+            focus: AttachFocusTarget::Pane {
+                pane_id: focused_pane_id,
+            },
+            surfaces: vec![
+                AttachSurface {
+                    id: focused_pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 10,
+                        h: 4,
+                    },
+                    content_rect: AttachRect {
+                        x: 1,
+                        y: 1,
+                        w: 8,
+                        h: 2,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(focused_pane_id),
+                },
+                AttachSurface {
+                    id: other_pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 12,
+                        y: 0,
+                        w: 10,
+                        h: 4,
+                    },
+                    content_rect: AttachRect {
+                        x: 13,
+                        y: 1,
+                        w: 8,
+                        h: 2,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: false,
+                    pane_id: Some(other_pane_id),
+                },
+            ],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(focused_pane_id, PaneRenderBuffer::default());
+        pane_buffers.insert(other_pane_id, PaneRenderBuffer::default());
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(QueryExtension) as Arc<dyn AttachRenderExtension>];
+        let mut damage = FrameDamage::default();
+        damage.mark_extension_query();
+
+        let mut output = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            None,
+        )
+        .expect("query render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(rendered.contains("FOCUS"), "{rendered:?}");
+        assert!(rendered.contains("OTHER"), "{rendered:?}");
+        assert_eq!(stats.damaged_extension_surfaces, 2);
     }
 
     #[test]
