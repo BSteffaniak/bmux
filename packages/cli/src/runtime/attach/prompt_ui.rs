@@ -86,7 +86,7 @@ enum PromptWidgetState {
         scroll: usize,
     },
     SearchSelect {
-        query: String,
+        query: TextEditBuffer,
         selected: usize,
         scroll: usize,
     },
@@ -99,6 +99,7 @@ enum PromptWidgetState {
         cursor: usize,
         scroll: usize,
         values: BTreeMap<String, PromptFormValue>,
+        editors: BTreeMap<String, TextEditBuffer>,
         errors: BTreeMap<String, String>,
     },
 }
@@ -147,7 +148,7 @@ impl ActivePrompt {
                     (*default_index).min(options.len().saturating_sub(1))
                 };
                 PromptWidgetState::SearchSelect {
-                    query: String::new(),
+                    query: TextEditBuffer::new(),
                     selected,
                     scroll: 0,
                 }
@@ -172,6 +173,7 @@ impl ActivePrompt {
                 cursor: 0,
                 scroll: 0,
                 values: initial_form_values(sections),
+                editors: initial_form_editors(sections),
                 errors: BTreeMap::new(),
             },
         };
@@ -308,6 +310,26 @@ impl AttachPromptState {
                     },
                     PromptWidgetState::TextInput { buffer, error },
                 ) => match key.code {
+                    KeyCode::Left
+                        if key
+                            .modifiers
+                            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                    {
+                        buffer.move_cursor(TextMotion::WordLeft);
+                    }
+                    KeyCode::Right
+                        if key
+                            .modifiers
+                            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                    {
+                        buffer.move_cursor(TextMotion::WordRight);
+                    }
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        buffer.move_cursor(TextMotion::Start);
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        buffer.move_cursor(TextMotion::End);
+                    }
                     KeyCode::Char(ch)
                         if !key
                             .modifiers
@@ -412,7 +434,7 @@ impl AttachPromptState {
                         scroll,
                     },
                 ) => {
-                    let previous_selected_value = filtered_option_indices(options, query)
+                    let previous_selected_value = filtered_option_indices(options, query.text())
                         .get(*selected)
                         .and_then(|index| options.get(*index))
                         .map(|option| option.value.clone());
@@ -422,12 +444,12 @@ impl AttachPromptState {
                                 .modifiers
                                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                         {
-                            query.push(ch);
+                            query.insert_char(ch);
                             *selected = 0;
                             *scroll = 0;
                         }
                         KeyCode::Backspace => {
-                            query.pop();
+                            query.delete_backward();
                             *selected = 0;
                             *scroll = 0;
                         }
@@ -435,6 +457,37 @@ impl AttachPromptState {
                             query.clear();
                             *selected = 0;
                             *scroll = 0;
+                        }
+                        KeyCode::Left
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                        {
+                            query.move_cursor(TextMotion::WordLeft);
+                        }
+                        KeyCode::Right
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                        {
+                            query.move_cursor(TextMotion::WordRight);
+                        }
+                        KeyCode::Left => {
+                            query.move_cursor(TextMotion::Left);
+                        }
+                        KeyCode::Right => {
+                            query.move_cursor(TextMotion::Right);
+                        }
+                        KeyCode::Delete => {
+                            query.delete_forward();
+                            *selected = 0;
+                            *scroll = 0;
+                        }
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.move_cursor(TextMotion::Start);
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.move_cursor(TextMotion::End);
                         }
                         KeyCode::Up | KeyCode::Char('p')
                             if matches!(key.code, KeyCode::Up)
@@ -446,18 +499,18 @@ impl AttachPromptState {
                             if matches!(key.code, KeyCode::Down)
                                 || key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            let len = filtered_option_indices(options, query).len();
+                            let len = filtered_option_indices(options, query.text()).len();
                             *selected = selected.saturating_add(1).min(len.saturating_sub(1));
                         }
                         KeyCode::Home => {
                             *selected = 0;
                         }
                         KeyCode::End => {
-                            let len = filtered_option_indices(options, query).len();
+                            let len = filtered_option_indices(options, query.text()).len();
                             *selected = len.saturating_sub(1);
                         }
                         KeyCode::Enter => {
-                            let filtered = filtered_option_indices(options, query);
+                            let filtered = filtered_option_indices(options, query.text());
                             if let Some(option) = filtered
                                 .get(*selected)
                                 .and_then(|index| options.get(*index))
@@ -469,7 +522,7 @@ impl AttachPromptState {
                         }
                         _ => {}
                     }
-                    let filtered = filtered_option_indices(options, query);
+                    let filtered = filtered_option_indices(options, query.text());
                     *selected = (*selected).min(filtered.len().saturating_sub(1));
                     *scroll = (*scroll).min(*selected);
                     if *live_preview {
@@ -551,6 +604,7 @@ impl AttachPromptState {
                         cursor,
                         scroll,
                         values,
+                        editors,
                         errors,
                     },
                 ) => {
@@ -606,7 +660,12 @@ impl AttachPromptState {
                             {
                                 if let Some(field) = fields.get(*cursor)
                                     && !field.disabled
-                                    && append_form_text_char(field, values, ch)
+                                    && edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::Insert(ch),
+                                    )
                                 {
                                     errors.remove(&field.id);
                                     if *live_preview {
@@ -617,12 +676,89 @@ impl AttachPromptState {
                             KeyCode::Backspace => {
                                 if let Some(field) = fields.get(*cursor)
                                     && !field.disabled
-                                    && pop_form_text_char(field, values)
+                                    && edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::DeleteBackward,
+                                    )
                                 {
                                     errors.remove(&field.id);
                                     if *live_preview {
                                         emit_form_changed(&active.envelope, field, values);
                                     }
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                    && edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::DeleteForward,
+                                    )
+                                {
+                                    errors.remove(&field.id);
+                                    if *live_preview {
+                                        emit_form_changed(&active.envelope, field, values);
+                                    }
+                                }
+                            }
+                            KeyCode::Left
+                                if key
+                                    .modifiers
+                                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                            {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                {
+                                    edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::Move(TextMotion::WordLeft),
+                                    );
+                                }
+                            }
+                            KeyCode::Right
+                                if key
+                                    .modifiers
+                                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                            {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                {
+                                    edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::Move(TextMotion::WordRight),
+                                    );
+                                }
+                            }
+                            KeyCode::Left => {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                {
+                                    edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::Move(TextMotion::Left),
+                                    );
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                {
+                                    edit_form_text(
+                                        field,
+                                        values,
+                                        editors,
+                                        FormEditAction::Move(TextMotion::Right),
+                                    );
                                 }
                             }
                             _ => {}
@@ -927,6 +1063,21 @@ fn initial_form_values(
         .collect()
 }
 
+fn initial_form_editors(
+    sections: &[crate::runtime::prompt::PromptFormSection],
+) -> BTreeMap<String, TextEditBuffer> {
+    flatten_form_fields(sections)
+        .into_iter()
+        .filter_map(|field| match &field.kind {
+            PromptFormFieldKind::Text { .. } | PromptFormFieldKind::Number { .. } => {
+                values_text(&default_form_value(field))
+                    .map(|value| (field.id.clone(), TextEditBuffer::from_text(value)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn default_form_value(field: &PromptFormField) -> PromptFormValue {
     match &field.kind {
         PromptFormFieldKind::Bool { default } => PromptFormValue::Bool(*default),
@@ -1005,35 +1156,58 @@ fn cycle_form_value(field: &PromptFormField, values: &mut BTreeMap<String, Promp
     }
 }
 
-fn append_form_text_char(
+#[derive(Debug, Clone, Copy)]
+enum FormEditAction {
+    Insert(char),
+    DeleteBackward,
+    DeleteForward,
+    Move(TextMotion),
+}
+
+fn edit_form_text(
     field: &PromptFormField,
     values: &mut BTreeMap<String, PromptFormValue>,
-    ch: char,
+    editors: &mut BTreeMap<String, TextEditBuffer>,
+    action: FormEditAction,
 ) -> bool {
     match (&field.kind, values.get_mut(&field.id)) {
         (PromptFormFieldKind::Text { .. }, Some(PromptFormValue::Text(value)))
         | (PromptFormFieldKind::Number { .. }, Some(PromptFormValue::Number(value))) => {
-            value.push(ch);
+            let editor = editors
+                .entry(field.id.clone())
+                .or_insert_with(|| TextEditBuffer::from_text(value.clone()));
+            apply_form_edit_action(editor, action);
+            value.clear();
+            value.push_str(editor.text());
             true
         }
         (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
-            append_form_integer_char(value, ch)
+            edit_form_integer(value, action)
         }
         _ => false,
     }
 }
 
-fn append_form_integer_char(value: &mut i64, ch: char) -> bool {
+fn apply_form_edit_action(editor: &mut TextEditBuffer, action: FormEditAction) {
+    match action {
+        FormEditAction::Insert(ch) => editor.insert_char(ch),
+        FormEditAction::DeleteBackward => editor.delete_backward(),
+        FormEditAction::DeleteForward => editor.delete_forward(),
+        FormEditAction::Move(motion) => editor.move_cursor(motion),
+    }
+}
+
+fn edit_form_integer(value: &mut i64, action: FormEditAction) -> bool {
     let mut text = value.to_string();
-    match ch {
-        '-' => {
+    match action {
+        FormEditAction::Insert('-') => {
             if text.starts_with('-') {
                 text.remove(0);
             } else {
                 text.insert(0, '-');
             }
         }
-        ch if ch.is_ascii_digit() => {
+        FormEditAction::Insert(ch) if ch.is_ascii_digit() => {
             if text == "0" {
                 text.clear();
             } else if text == "-0" {
@@ -1041,38 +1215,14 @@ fn append_form_integer_char(value: &mut i64, ch: char) -> bool {
             }
             text.push(ch);
         }
-        _ => return false,
-    }
-    *value = if text.is_empty() || text == "-" {
-        0
-    } else if let Ok(parsed) = text.parse::<i64>() {
-        parsed
-    } else {
-        return false;
-    };
-    true
-}
-
-fn pop_form_text_char(
-    field: &PromptFormField,
-    values: &mut BTreeMap<String, PromptFormValue>,
-) -> bool {
-    match (&field.kind, values.get_mut(&field.id)) {
-        (PromptFormFieldKind::Text { .. }, Some(PromptFormValue::Text(value)))
-        | (PromptFormFieldKind::Number { .. }, Some(PromptFormValue::Number(value))) => {
-            value.pop();
-            true
+        FormEditAction::DeleteBackward => {
+            text.pop();
         }
-        (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
-            pop_form_integer_char(value)
+        FormEditAction::DeleteForward | FormEditAction::Move(_) | FormEditAction::Insert(_) => {
+            return false;
         }
-        _ => false,
     }
-}
 
-fn pop_form_integer_char(value: &mut i64) -> bool {
-    let mut text = value.to_string();
-    text.pop();
     *value = if text.is_empty() || text == "-" {
         0
     } else if let Ok(parsed) = text.parse::<i64>() {
@@ -1144,14 +1294,13 @@ struct FormRenderRow {
 fn form_render_rows(
     sections: &[crate::runtime::prompt::PromptFormSection],
     values: &BTreeMap<String, PromptFormValue>,
+    editors: &BTreeMap<String, TextEditBuffer>,
     errors: &BTreeMap<String, String>,
 ) -> Vec<FormRenderRow> {
     let mut rows = Vec::new();
     for section in sections {
         for field in &section.fields {
-            let value = values
-                .get(&field.id)
-                .map_or_else(String::new, form_value_display);
+            let value = form_field_display(field, values, editors);
             let suffix = if field.disabled {
                 field.disabled_reason.as_ref().map_or_else(
                     || " disabled".to_string(),
@@ -1169,6 +1318,35 @@ fn form_render_rows(
         }
     }
     rows
+}
+
+fn form_field_display(
+    field: &PromptFormField,
+    values: &BTreeMap<String, PromptFormValue>,
+    editors: &BTreeMap<String, TextEditBuffer>,
+) -> String {
+    match &field.kind {
+        PromptFormFieldKind::Text { .. } | PromptFormFieldKind::Number { .. } => {
+            editors.get(&field.id).map_or_else(
+                || {
+                    values
+                        .get(&field.id)
+                        .map_or_else(String::new, form_value_display)
+                },
+                |editor| editor.text().to_string(),
+            )
+        }
+        _ => values
+            .get(&field.id)
+            .map_or_else(String::new, form_value_display),
+    }
+}
+
+fn values_text(value: &PromptFormValue) -> Option<String> {
+    match value {
+        PromptFormValue::Text(value) | PromptFormValue::Number(value) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 fn form_value_display(value: &PromptFormValue) -> String {
@@ -1426,17 +1604,20 @@ fn render_prompt_body(
                 scroll,
             },
         ) => {
-            let query_hint = if query.is_empty() {
-                placeholder.as_deref().unwrap_or("Type to search")
+            let visible_width = text_width.saturating_sub(2).max(1);
+            let viewport = query.line_viewport(visible_width);
+            let rendered = if viewport.text.is_empty() {
+                placeholder.as_deref().map_or_else(
+                    || "Type to search".to_string(),
+                    |hint| truncate_chars(hint, visible_width),
+                )
             } else {
-                query.as_str()
+                viewport.text
             };
-            let query_row = format!(
-                "> {}",
-                truncate_chars(query_hint, text_width.saturating_sub(2))
-            );
-            field_lines.push(opaque_row_text(&query_row, text_width));
-            let filtered = filtered_option_indices(options, query);
+            let query_row = format!("> {}", opaque_row_text(&rendered, visible_width));
+            cursor = Some((lines.len() + field_lines.len(), 2 + viewport.cursor_col));
+            field_lines.push(query_row);
+            let filtered = filtered_option_indices(options, query.text());
             if filtered.is_empty() {
                 field_lines.push(opaque_row_text("(no matches)", text_width));
             } else {
@@ -1502,10 +1683,11 @@ fn render_prompt_body(
                 cursor: index,
                 scroll,
                 values,
+                editors,
                 errors,
             },
         ) => {
-            let rows = form_render_rows(sections, values, errors);
+            let rows = form_render_rows(sections, values, editors, errors);
             if rows.is_empty() {
                 field_lines.push(opaque_row_text("(no fields)", text_width));
             } else {
