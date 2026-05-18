@@ -4,6 +4,9 @@
 
 //! Unicode-aware terminal text editing primitives.
 
+#[cfg(feature = "keyboard")]
+pub mod keyboard;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 

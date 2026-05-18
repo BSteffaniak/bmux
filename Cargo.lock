@@ -2116,6 +2116,7 @@ dependencies = [
 name = "bmux_text_edit"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_keyboard",
  "serde",
  "unicode-segmentation",
  "unicode-width",
