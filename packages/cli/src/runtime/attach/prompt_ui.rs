@@ -1927,9 +1927,13 @@ mod tests {
     use uuid::Uuid;
 
     fn key_event(code: KeyCode) -> KeyEvent {
+        modified_key_event(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
@@ -2039,6 +2043,79 @@ mod tests {
         assert!(
             switched_row.contains("> Stop"),
             "switched row: {switched_row:?}"
+        );
+    }
+
+    #[test]
+    fn search_select_query_supports_cursor_editing() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Command",
+                vec![
+                    PromptOption::new("commit", "Commit"),
+                    PromptOption::new("compact", "Compact"),
+                    PromptOption::new("connect", "Connect"),
+                ],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        for ch in "cmmit".chars() {
+            let _ = state.handle_key_event(&key_event(KeyCode::Char(ch)));
+        }
+        let _ = state.handle_key_event(&modified_key_event(KeyCode::Left, KeyModifiers::ALT));
+        let _ = state.handle_key_event(&key_event(KeyCode::Right));
+        let _ = state.handle_key_event(&key_event(KeyCode::Char('o')));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Single("commit".to_string()))
+        );
+    }
+
+    #[test]
+    fn form_text_field_supports_cursor_editing() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Settings",
+                vec![PromptFormSection::new(
+                    "general",
+                    "General",
+                    vec![PromptFormField::new(
+                        "name",
+                        "Name",
+                        PromptFormFieldKind::Text {
+                            initial_value: "helo".to_string(),
+                            placeholder: None,
+                            validation: None,
+                        },
+                    )],
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let _ = state.handle_key_event(&modified_key_event(KeyCode::Left, KeyModifiers::ALT));
+        let _ = state.handle_key_event(&key_event(KeyCode::Right));
+        let _ = state.handle_key_event(&key_event(KeyCode::Right));
+        let _ = state.handle_key_event(&key_event(KeyCode::Char('l')));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        let PromptResponse::Submitted(PromptValue::Form(values)) = completion.response else {
+            panic!("expected form response");
+        };
+        assert_eq!(
+            values.get("name"),
+            Some(&PromptFormValue::Text("hello".to_string()))
         );
     }
 
