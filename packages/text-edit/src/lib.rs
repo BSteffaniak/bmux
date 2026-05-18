@@ -105,6 +105,8 @@ pub enum TextEditCommand {
     Insert(char),
     /// Insert a string at the cursor.
     InsertString(String),
+    /// Insert pasted text at the cursor.
+    Paste(String),
     /// Move the cursor.
     Move(TextMotion),
     /// Delete text relative to the cursor.
@@ -193,6 +195,11 @@ impl TextEditBuffer {
     /// Insert a newline at the cursor.
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
+    }
+
+    /// Insert pasted text at the cursor, replacing any active selection.
+    pub fn paste(&mut self, value: &str) {
+        self.insert_str(value);
     }
 
     /// Delete the grapheme before the cursor.
@@ -303,6 +310,7 @@ impl TextEditBuffer {
         match command {
             TextEditCommand::Insert(ch) => self.insert_char(ch),
             TextEditCommand::InsertString(value) => self.insert_str(&value),
+            TextEditCommand::Paste(value) => self.paste(&value),
             TextEditCommand::Move(motion) => self.move_cursor(motion),
             TextEditCommand::Delete(delete) => self.delete(delete),
             TextEditCommand::Clear => self.clear(),
@@ -590,6 +598,30 @@ mod tests {
         assert_eq!(buffer.text(), "hello ");
         buffer.apply_command(TextEditCommand::Clear);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn paste_replaces_selection() {
+        let mut buffer = TextEditBuffer::from_text("hello world");
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor_with_selection(TextMotion::WordRight, SelectionMode::Extend);
+
+        buffer.paste("goodbye");
+
+        assert_eq!(buffer.text(), "goodbye world");
+        assert_eq!(buffer.selection(), None);
+        assert_eq!(buffer.cursor_byte_index(), "goodbye".len());
+    }
+
+    #[test]
+    fn paste_command_replaces_selection() {
+        let mut buffer = TextEditBuffer::from_text("hello world");
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor_with_selection(TextMotion::WordRight, SelectionMode::Extend);
+
+        buffer.apply_command(TextEditCommand::Paste("goodbye".to_string()));
+
+        assert_eq!(buffer.text(), "goodbye world");
     }
 
     #[test]
