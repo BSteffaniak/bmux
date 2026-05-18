@@ -40,6 +40,28 @@ pub struct LineViewport {
     pub cursor_col: usize,
 }
 
+/// Policy for classifying word boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordBoundaryPolicy {
+    /// Treat whitespace and punctuation as separators.
+    #[default]
+    Punctuation,
+    /// Treat only whitespace as separators.
+    Whitespace,
+}
+
+impl WordBoundaryPolicy {
+    fn is_separator(self, grapheme: &str) -> bool {
+        match self {
+            Self::Punctuation => {
+                grapheme.chars().all(char::is_whitespace)
+                    || grapheme.chars().all(|ch| ch.is_ascii_punctuation())
+            }
+            Self::Whitespace => grapheme.chars().all(char::is_whitespace),
+        }
+    }
+}
+
 /// A selected byte range in a [`TextEditBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -172,6 +194,7 @@ pub struct TextEditBuffer {
     cursor: usize,
     selection_anchor: Option<usize>,
     desired_visual_col: Option<usize>,
+    word_boundary_policy: WordBoundaryPolicy,
 }
 
 impl TextEditBuffer {
@@ -183,6 +206,7 @@ impl TextEditBuffer {
             cursor: 0,
             selection_anchor: None,
             desired_visual_col: None,
+            word_boundary_policy: WordBoundaryPolicy::Punctuation,
         }
     }
 
@@ -196,6 +220,7 @@ impl TextEditBuffer {
             cursor,
             selection_anchor: None,
             desired_visual_col: None,
+            word_boundary_policy: WordBoundaryPolicy::Punctuation,
         }
     }
 
@@ -221,6 +246,17 @@ impl TextEditBuffer {
     #[must_use]
     pub fn cursor_grapheme_index(&self) -> usize {
         self.text[..self.cursor].graphemes(true).count()
+    }
+
+    /// Return the current word-boundary policy.
+    #[must_use]
+    pub const fn word_boundary_policy(&self) -> WordBoundaryPolicy {
+        self.word_boundary_policy
+    }
+
+    /// Set the word-boundary policy used by word movement and deletion.
+    pub const fn set_word_boundary_policy(&mut self, policy: WordBoundaryPolicy) {
+        self.word_boundary_policy = policy;
     }
 
     /// Clear all text and reset the cursor.
@@ -339,10 +375,16 @@ impl TextEditBuffer {
             TextDelete::Backward => self.delete_backward(),
             TextDelete::Forward => self.delete_forward(),
             TextDelete::WordBackward => {
-                self.delete_range(previous_word_boundary(&self.text, self.cursor), self.cursor);
+                self.delete_range(
+                    previous_word_boundary(&self.text, self.cursor, self.word_boundary_policy),
+                    self.cursor,
+                );
             }
             TextDelete::WordForward => {
-                self.delete_range(self.cursor, next_word_boundary(&self.text, self.cursor));
+                self.delete_range(
+                    self.cursor,
+                    next_word_boundary(&self.text, self.cursor, self.word_boundary_policy),
+                );
             }
             TextDelete::ToLineStart => {
                 let start = self.text[..self.cursor]
@@ -429,8 +471,12 @@ impl TextEditBuffer {
             TextMotion::Right => {
                 next_grapheme_boundary(&self.text, self.cursor).unwrap_or(self.text.len())
             }
-            TextMotion::WordLeft => previous_word_boundary(&self.text, self.cursor),
-            TextMotion::WordRight => next_word_boundary(&self.text, self.cursor),
+            TextMotion::WordLeft => {
+                previous_word_boundary(&self.text, self.cursor, self.word_boundary_policy)
+            }
+            TextMotion::WordRight => {
+                next_word_boundary(&self.text, self.cursor, self.word_boundary_policy)
+            }
             TextMotion::Start => 0,
             TextMotion::End => self.text.len(),
             TextMotion::LineStart => self.text[..self.cursor]
@@ -595,39 +641,34 @@ fn next_grapheme_boundary(text: &str, cursor: usize) -> Option<usize> {
         })
 }
 
-fn previous_word_boundary(text: &str, cursor: usize) -> usize {
+fn previous_word_boundary(text: &str, cursor: usize, policy: WordBoundaryPolicy) -> usize {
     let spans = grapheme_spans(text);
     let mut index = spans
         .iter()
         .position(|span| span.start == cursor)
         .unwrap_or(spans.len());
-    while index > 0 && is_word_separator(&text[spans[index - 1].start..spans[index - 1].end]) {
+    while index > 0 && policy.is_separator(&text[spans[index - 1].start..spans[index - 1].end]) {
         index -= 1;
     }
-    while index > 0 && !is_word_separator(&text[spans[index - 1].start..spans[index - 1].end]) {
+    while index > 0 && !policy.is_separator(&text[spans[index - 1].start..spans[index - 1].end]) {
         index -= 1;
     }
     spans.get(index).map_or(0, |span| span.start)
 }
 
-fn next_word_boundary(text: &str, cursor: usize) -> usize {
+fn next_word_boundary(text: &str, cursor: usize, policy: WordBoundaryPolicy) -> usize {
     let spans = grapheme_spans(text);
     let mut index = spans
         .iter()
         .position(|span| span.start == cursor)
         .unwrap_or(spans.len());
-    while index < spans.len() && is_word_separator(&text[spans[index].start..spans[index].end]) {
+    while index < spans.len() && policy.is_separator(&text[spans[index].start..spans[index].end]) {
         index += 1;
     }
-    while index < spans.len() && !is_word_separator(&text[spans[index].start..spans[index].end]) {
+    while index < spans.len() && !policy.is_separator(&text[spans[index].start..spans[index].end]) {
         index += 1;
     }
     spans.get(index).map_or(text.len(), |span| span.start)
-}
-
-fn is_word_separator(grapheme: &str) -> bool {
-    grapheme.chars().all(char::is_whitespace)
-        || grapheme.chars().all(|ch| ch.is_ascii_punctuation())
 }
 
 fn byte_index_for_visual_col(line: &str, target_col: usize) -> usize {
@@ -719,6 +760,27 @@ mod tests {
         assert_eq!(buffer.text(), "hello ");
         buffer.apply_command(TextEditCommand::Clear);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn word_boundary_policy_can_treat_punctuation_as_word_content() {
+        let mut buffer = TextEditBuffer::from_text("hello-world again");
+
+        buffer.move_cursor(TextMotion::WordLeft);
+        assert_eq!(buffer.cursor_byte_index(), "hello-world ".len());
+
+        buffer.move_cursor(TextMotion::End);
+        buffer.set_word_boundary_policy(WordBoundaryPolicy::Whitespace);
+        buffer.move_cursor(TextMotion::WordLeft);
+        assert_eq!(buffer.cursor_byte_index(), "hello-world ".len());
+    }
+
+    #[test]
+    fn word_boundary_policy_affects_word_deletion() {
+        let mut buffer = TextEditBuffer::from_text("hello-world again");
+        buffer.set_word_boundary_policy(WordBoundaryPolicy::Whitespace);
+        buffer.delete(TextDelete::WordBackward);
+        assert_eq!(buffer.text(), "hello-world ");
     }
 
     #[test]
