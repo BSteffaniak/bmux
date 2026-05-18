@@ -58,6 +58,42 @@ pub enum TextMotion {
     LineEnd,
 }
 
+/// Text deletion commands for [`TextEditBuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDelete {
+    /// Delete one grapheme before the cursor.
+    Backward,
+    /// Delete one grapheme at the cursor.
+    Forward,
+    /// Delete from the cursor to the previous word boundary.
+    WordBackward,
+    /// Delete from the cursor to the next word boundary.
+    WordForward,
+    /// Delete from the cursor to the start of the current hard line.
+    ToLineStart,
+    /// Delete from the cursor to the end of the current hard line.
+    ToLineEnd,
+    /// Delete from the cursor to the start of the buffer.
+    ToStart,
+    /// Delete from the cursor to the end of the buffer.
+    ToEnd,
+}
+
+/// Editor commands that can be produced by key binding layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextEditCommand {
+    /// Insert one character at the cursor.
+    Insert(char),
+    /// Insert a string at the cursor.
+    InsertString(String),
+    /// Move the cursor.
+    Move(TextMotion),
+    /// Delete text relative to the cursor.
+    Delete(TextDelete),
+    /// Clear the whole buffer.
+    Clear,
+}
+
 /// Editable UTF-8 text plus cursor state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -144,6 +180,53 @@ impl TextEditBuffer {
         if let Some(end) = next_grapheme_boundary(&self.text, self.cursor) {
             self.text.drain(self.cursor..end);
         }
+    }
+
+    /// Delete text according to `delete`.
+    pub fn delete(&mut self, delete: TextDelete) {
+        match delete {
+            TextDelete::Backward => self.delete_backward(),
+            TextDelete::Forward => self.delete_forward(),
+            TextDelete::WordBackward => {
+                self.delete_range(previous_word_boundary(&self.text, self.cursor), self.cursor);
+            }
+            TextDelete::WordForward => {
+                self.delete_range(self.cursor, next_word_boundary(&self.text, self.cursor));
+            }
+            TextDelete::ToLineStart => {
+                let start = self.text[..self.cursor]
+                    .rfind('\n')
+                    .map_or(0, |index| index.saturating_add(1));
+                self.delete_range(start, self.cursor);
+            }
+            TextDelete::ToLineEnd => {
+                let end = self.text[self.cursor..]
+                    .find('\n')
+                    .map_or(self.text.len(), |index| self.cursor.saturating_add(index));
+                self.delete_range(self.cursor, end);
+            }
+            TextDelete::ToStart => self.delete_range(0, self.cursor),
+            TextDelete::ToEnd => self.delete_range(self.cursor, self.text.len()),
+        }
+    }
+
+    /// Apply a text edit command.
+    pub fn apply_command(&mut self, command: TextEditCommand) {
+        match command {
+            TextEditCommand::Insert(ch) => self.insert_char(ch),
+            TextEditCommand::InsertString(value) => self.insert_str(&value),
+            TextEditCommand::Move(motion) => self.move_cursor(motion),
+            TextEditCommand::Delete(delete) => self.delete(delete),
+            TextEditCommand::Clear => self.clear(),
+        }
+    }
+
+    fn delete_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        self.text.drain(start..end);
+        self.cursor = start;
     }
 
     /// Move the cursor according to `motion`.
@@ -369,5 +452,32 @@ mod tests {
         let layout = buffer.wrapped_layout(4);
         assert_eq!(layout.lines, vec!["ab界".to_string(), "c".to_string()]);
         assert_eq!(layout.cursor, VisualCursor { row: 0, col: 4 });
+    }
+
+    #[test]
+    fn deletes_words_and_line_ranges() {
+        let mut buffer = TextEditBuffer::from_text("hello brave world");
+        buffer.delete(TextDelete::WordBackward);
+        assert_eq!(buffer.text(), "hello brave ");
+        buffer.move_cursor(TextMotion::Start);
+        buffer.delete(TextDelete::WordForward);
+        assert_eq!(buffer.text(), " brave ");
+
+        let mut buffer = TextEditBuffer::from_text("one two\nthree four");
+        buffer.move_cursor(TextMotion::WordLeft);
+        buffer.delete(TextDelete::ToLineStart);
+        assert_eq!(buffer.text(), "one two\nfour");
+        buffer.delete(TextDelete::ToEnd);
+        assert_eq!(buffer.text(), "one two\n");
+    }
+
+    #[test]
+    fn applies_commands() {
+        let mut buffer = TextEditBuffer::new();
+        buffer.apply_command(TextEditCommand::InsertString("hello world".to_string()));
+        buffer.apply_command(TextEditCommand::Delete(TextDelete::WordBackward));
+        assert_eq!(buffer.text(), "hello ");
+        buffer.apply_command(TextEditCommand::Clear);
+        assert!(buffer.is_empty());
     }
 }

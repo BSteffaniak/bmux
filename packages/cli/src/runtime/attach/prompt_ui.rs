@@ -10,7 +10,7 @@ use bmux_attach_layout_protocol::{
     AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind,
 };
 use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderOp, RenderStyle};
-use bmux_text_edit::{TextEditBuffer, TextMotion};
+use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -680,7 +680,7 @@ impl AttachPromptState {
                                         field,
                                         values,
                                         editors,
-                                        FormEditAction::DeleteBackward,
+                                        FormEditAction::Delete(TextDelete::Backward),
                                     )
                                 {
                                     errors.remove(&field.id);
@@ -696,7 +696,7 @@ impl AttachPromptState {
                                         field,
                                         values,
                                         editors,
-                                        FormEditAction::DeleteForward,
+                                        FormEditAction::Delete(TextDelete::Forward),
                                     )
                                 {
                                     errors.remove(&field.id);
@@ -1159,8 +1159,7 @@ fn cycle_form_value(field: &PromptFormField, values: &mut BTreeMap<String, Promp
 #[derive(Debug, Clone, Copy)]
 enum FormEditAction {
     Insert(char),
-    DeleteBackward,
-    DeleteForward,
+    Delete(TextDelete),
     Move(TextMotion),
 }
 
@@ -1191,8 +1190,7 @@ fn edit_form_text(
 fn apply_form_edit_action(editor: &mut TextEditBuffer, action: FormEditAction) {
     match action {
         FormEditAction::Insert(ch) => editor.insert_char(ch),
-        FormEditAction::DeleteBackward => editor.delete_backward(),
-        FormEditAction::DeleteForward => editor.delete_forward(),
+        FormEditAction::Delete(delete) => editor.delete(delete),
         FormEditAction::Move(motion) => editor.move_cursor(motion),
     }
 }
@@ -1215,10 +1213,10 @@ fn edit_form_integer(value: &mut i64, action: FormEditAction) -> bool {
             }
             text.push(ch);
         }
-        FormEditAction::DeleteBackward => {
+        FormEditAction::Delete(TextDelete::Backward) => {
             text.pop();
         }
-        FormEditAction::DeleteForward | FormEditAction::Move(_) | FormEditAction::Insert(_) => {
+        FormEditAction::Delete(_) | FormEditAction::Move(_) | FormEditAction::Insert(_) => {
             return false;
         }
     }
