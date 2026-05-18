@@ -56,6 +56,48 @@ pub enum SelectionMode {
     Extend,
 }
 
+/// A start/end boundary target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextBoundary {
+    /// Start boundary.
+    Start,
+    /// End boundary.
+    End,
+}
+
+/// Policy for interpreting start/end editor bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextBoundaryPolicy {
+    /// Start/end means the whole buffer.
+    Buffer,
+    /// Start/end means the current hard line.
+    Line,
+}
+
+impl TextBoundaryPolicy {
+    /// Return the motion represented by this policy and boundary.
+    #[must_use]
+    pub const fn motion(self, boundary: TextBoundary) -> TextMotion {
+        match (self, boundary) {
+            (Self::Buffer, TextBoundary::Start) => TextMotion::Start,
+            (Self::Buffer, TextBoundary::End) => TextMotion::End,
+            (Self::Line, TextBoundary::Start) => TextMotion::LineStart,
+            (Self::Line, TextBoundary::End) => TextMotion::LineEnd,
+        }
+    }
+
+    /// Return the deletion represented by this policy and boundary.
+    #[must_use]
+    pub const fn delete(self, boundary: TextBoundary) -> TextDelete {
+        match (self, boundary) {
+            (Self::Buffer, TextBoundary::Start) => TextDelete::ToStart,
+            (Self::Buffer, TextBoundary::End) => TextDelete::ToEnd,
+            (Self::Line, TextBoundary::Start) => TextDelete::ToLineStart,
+            (Self::Line, TextBoundary::End) => TextDelete::ToLineEnd,
+        }
+    }
+}
+
 /// Cursor movement commands for [`TextEditBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextMotion {
@@ -341,6 +383,16 @@ impl TextEditBuffer {
     /// Move the cursor according to `motion`, clearing any active selection.
     pub fn move_cursor(&mut self, motion: TextMotion) {
         self.move_cursor_with_selection(motion, SelectionMode::Move);
+    }
+
+    /// Move to a start/end boundary using `policy`.
+    pub fn move_to_boundary(&mut self, policy: TextBoundaryPolicy, boundary: TextBoundary) {
+        self.move_cursor(policy.motion(boundary));
+    }
+
+    /// Delete to a start/end boundary using `policy`.
+    pub fn delete_to_boundary(&mut self, policy: TextBoundaryPolicy, boundary: TextBoundary) {
+        self.delete(policy.delete(boundary));
     }
 
     /// Move the cursor according to `motion` and the selection mode.
@@ -664,6 +716,39 @@ mod tests {
         assert_eq!(buffer.text(), "hello ");
         buffer.apply_command(TextEditCommand::Clear);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn boundary_policy_maps_start_end_to_line_or_buffer() {
+        assert_eq!(
+            TextBoundaryPolicy::Buffer.motion(TextBoundary::Start),
+            TextMotion::Start
+        );
+        assert_eq!(
+            TextBoundaryPolicy::Line.motion(TextBoundary::End),
+            TextMotion::LineEnd
+        );
+        assert_eq!(
+            TextBoundaryPolicy::Line.delete(TextBoundary::Start),
+            TextDelete::ToLineStart
+        );
+    }
+
+    #[test]
+    fn boundary_policy_helpers_move_and_delete() {
+        let mut buffer = TextEditBuffer::from_text("one two\nthree four");
+        buffer.move_cursor(TextMotion::WordLeft);
+        buffer.move_to_boundary(TextBoundaryPolicy::Line, TextBoundary::Start);
+        assert_eq!(buffer.cursor_byte_index(), "one two\n".len());
+
+        buffer.move_cursor(TextMotion::End);
+        buffer.delete_to_boundary(TextBoundaryPolicy::Line, TextBoundary::Start);
+        assert_eq!(buffer.text(), "one two\n");
+
+        buffer = TextEditBuffer::from_text("one two\nthree four");
+        buffer.move_cursor(TextMotion::LineStart);
+        buffer.delete_to_boundary(TextBoundaryPolicy::Buffer, TextBoundary::Start);
+        assert_eq!(buffer.text(), "three four");
     }
 
     #[test]
