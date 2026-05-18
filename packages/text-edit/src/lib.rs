@@ -37,6 +37,25 @@ pub struct LineViewport {
     pub cursor_col: usize,
 }
 
+/// A selected byte range in a [`TextEditBuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TextSelection {
+    /// Inclusive selection start byte index.
+    pub start: usize,
+    /// Exclusive selection end byte index.
+    pub end: usize,
+}
+
+/// Whether cursor movement should clear or extend the active selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Move the cursor and clear any active selection.
+    Move,
+    /// Move the cursor and extend the selection from its anchor.
+    Extend,
+}
+
 /// Cursor movement commands for [`TextEditBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextMotion {
@@ -100,6 +119,7 @@ pub enum TextEditCommand {
 pub struct TextEditBuffer {
     text: String,
     cursor: usize,
+    selection_anchor: Option<usize>,
 }
 
 impl TextEditBuffer {
@@ -109,6 +129,7 @@ impl TextEditBuffer {
         Self {
             text: String::new(),
             cursor: 0,
+            selection_anchor: None,
         }
     }
 
@@ -117,7 +138,11 @@ impl TextEditBuffer {
     pub fn from_text(text: impl Into<String>) -> Self {
         let text = text.into();
         let cursor = text.len();
-        Self { text, cursor }
+        Self {
+            text,
+            cursor,
+            selection_anchor: None,
+        }
     }
 
     /// Return the full buffer text.
@@ -148,16 +173,19 @@ impl TextEditBuffer {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.selection_anchor = None;
     }
 
     /// Insert one character at the cursor.
     pub fn insert_char(&mut self, ch: char) {
+        let _ = self.delete_selection();
         self.text.insert(self.cursor, ch);
         self.cursor = self.cursor.saturating_add(ch.len_utf8());
     }
 
     /// Insert a string at the cursor.
     pub fn insert_str(&mut self, value: &str) {
+        let _ = self.delete_selection();
         self.text.insert_str(self.cursor, value);
         self.cursor = self.cursor.saturating_add(value.len());
     }
@@ -169,6 +197,9 @@ impl TextEditBuffer {
 
     /// Delete the grapheme before the cursor.
     pub fn delete_backward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if let Some(start) = previous_grapheme_boundary(&self.text, self.cursor) {
             self.text.drain(start..self.cursor);
             self.cursor = start;
@@ -177,13 +208,70 @@ impl TextEditBuffer {
 
     /// Delete the grapheme at the cursor.
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if let Some(end) = next_grapheme_boundary(&self.text, self.cursor) {
             self.text.drain(self.cursor..end);
         }
     }
 
+    /// Return the active selected byte range, if any.
+    #[must_use]
+    pub fn selection(&self) -> Option<TextSelection> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            return None;
+        }
+        Some(TextSelection {
+            start: anchor.min(self.cursor),
+            end: anchor.max(self.cursor),
+        })
+    }
+
+    /// Return the active selected text, if any.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|selection| self.text[selection.start..selection.end].to_string())
+    }
+
+    /// Select the whole buffer.
+    pub const fn select_all(&mut self) {
+        self.selection_anchor = Some(0);
+        self.cursor = self.text.len();
+    }
+
+    /// Clear the active selection without moving the cursor.
+    pub const fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Delete the active selection.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(selection) = self.selection() else {
+            self.selection_anchor = None;
+            return false;
+        };
+        self.text.drain(selection.start..selection.end);
+        self.cursor = selection.start;
+        self.selection_anchor = None;
+        true
+    }
+
+    /// Cut and return the active selection.
+    pub fn cut_selection(&mut self) -> Option<String> {
+        let selected = self.selected_text()?;
+        let deleted = self.delete_selection();
+        debug_assert!(deleted);
+        Some(selected)
+    }
+
     /// Delete text according to `delete`.
     pub fn delete(&mut self, delete: TextDelete) {
+        if self.delete_selection() {
+            return;
+        }
         match delete {
             TextDelete::Backward => self.delete_backward(),
             TextDelete::Forward => self.delete_forward(),
@@ -227,11 +315,34 @@ impl TextEditBuffer {
         }
         self.text.drain(start..end);
         self.cursor = start;
+        self.selection_anchor = None;
     }
 
-    /// Move the cursor according to `motion`.
+    /// Move the cursor according to `motion`, clearing any active selection.
     pub fn move_cursor(&mut self, motion: TextMotion) {
-        self.cursor = match motion {
+        self.move_cursor_with_selection(motion, SelectionMode::Move);
+    }
+
+    /// Move the cursor according to `motion` and the selection mode.
+    pub fn move_cursor_with_selection(&mut self, motion: TextMotion, mode: SelectionMode) {
+        let old_cursor = self.cursor;
+        let new_cursor = self.motion_position(motion);
+        match mode {
+            SelectionMode::Move => self.selection_anchor = None,
+            SelectionMode::Extend => {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(old_cursor);
+                }
+            }
+        }
+        self.cursor = new_cursor;
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
+    }
+
+    fn motion_position(&self, motion: TextMotion) -> usize {
+        match motion {
             TextMotion::Left => previous_grapheme_boundary(&self.text, self.cursor).unwrap_or(0),
             TextMotion::Right => {
                 next_grapheme_boundary(&self.text, self.cursor).unwrap_or(self.text.len())
@@ -246,7 +357,7 @@ impl TextEditBuffer {
             TextMotion::LineEnd => self.text[self.cursor..]
                 .find('\n')
                 .map_or(self.text.len(), |index| self.cursor.saturating_add(index)),
-        };
+        }
     }
 
     /// Return a terminal-width single-line viewport ending near the cursor.
@@ -478,6 +589,32 @@ mod tests {
         buffer.apply_command(TextEditCommand::Delete(TextDelete::WordBackward));
         assert_eq!(buffer.text(), "hello ");
         buffer.apply_command(TextEditCommand::Clear);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn selection_can_be_extended_deleted_and_replaced() {
+        let mut buffer = TextEditBuffer::from_text("hello world");
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor_with_selection(TextMotion::WordRight, SelectionMode::Extend);
+        assert_eq!(buffer.selected_text(), Some("hello".to_string()));
+
+        buffer.insert_str("goodbye");
+        assert_eq!(buffer.text(), "goodbye world");
+        assert_eq!(buffer.selection(), None);
+
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor_with_selection(TextMotion::WordRight, SelectionMode::Extend);
+        assert_eq!(buffer.cut_selection(), Some("goodbye".to_string()));
+        assert_eq!(buffer.text(), " world");
+    }
+
+    #[test]
+    fn select_all_selects_whole_buffer() {
+        let mut buffer = TextEditBuffer::from_text("all text");
+        buffer.select_all();
+        assert_eq!(buffer.selected_text(), Some("all text".to_string()));
+        assert!(buffer.delete_selection());
         assert!(buffer.is_empty());
     }
 }
