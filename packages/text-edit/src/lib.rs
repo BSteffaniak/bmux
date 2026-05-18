@@ -73,6 +73,10 @@ pub enum TextMotion {
     End,
     /// Move to the start of the current hard line.
     LineStart,
+    /// Move one visual line up using soft wrapping.
+    VisualUp,
+    /// Move one visual line down using soft wrapping.
+    VisualDown,
     /// Move to the end of the current hard line.
     LineEnd,
 }
@@ -122,6 +126,7 @@ pub struct TextEditBuffer {
     text: String,
     cursor: usize,
     selection_anchor: Option<usize>,
+    desired_visual_col: Option<usize>,
 }
 
 impl TextEditBuffer {
@@ -132,6 +137,7 @@ impl TextEditBuffer {
             text: String::new(),
             cursor: 0,
             selection_anchor: None,
+            desired_visual_col: None,
         }
     }
 
@@ -144,6 +150,7 @@ impl TextEditBuffer {
             text,
             cursor,
             selection_anchor: None,
+            desired_visual_col: None,
         }
     }
 
@@ -176,6 +183,7 @@ impl TextEditBuffer {
         self.text.clear();
         self.cursor = 0;
         self.selection_anchor = None;
+        self.desired_visual_col = None;
     }
 
     /// Insert one character at the cursor.
@@ -183,6 +191,7 @@ impl TextEditBuffer {
         let _ = self.delete_selection();
         self.text.insert(self.cursor, ch);
         self.cursor = self.cursor.saturating_add(ch.len_utf8());
+        self.desired_visual_col = None;
     }
 
     /// Insert a string at the cursor.
@@ -190,6 +199,7 @@ impl TextEditBuffer {
         let _ = self.delete_selection();
         self.text.insert_str(self.cursor, value);
         self.cursor = self.cursor.saturating_add(value.len());
+        self.desired_visual_col = None;
     }
 
     /// Insert a newline at the cursor.
@@ -263,6 +273,7 @@ impl TextEditBuffer {
         self.text.drain(selection.start..selection.end);
         self.cursor = selection.start;
         self.selection_anchor = None;
+        self.desired_visual_col = None;
         true
     }
 
@@ -324,6 +335,7 @@ impl TextEditBuffer {
         self.text.drain(start..end);
         self.cursor = start;
         self.selection_anchor = None;
+        self.desired_visual_col = None;
     }
 
     /// Move the cursor according to `motion`, clearing any active selection.
@@ -334,7 +346,14 @@ impl TextEditBuffer {
     /// Move the cursor according to `motion` and the selection mode.
     pub fn move_cursor_with_selection(&mut self, motion: TextMotion, mode: SelectionMode) {
         let old_cursor = self.cursor;
+        let vertical = matches!(motion, TextMotion::VisualUp | TextMotion::VisualDown);
+        if !vertical {
+            self.desired_visual_col = None;
+        }
         let new_cursor = self.motion_position(motion);
+        if vertical && self.desired_visual_col.is_none() {
+            self.desired_visual_col = Some(self.cursor_visual_col());
+        }
         match mode {
             SelectionMode::Move => self.selection_anchor = None,
             SelectionMode::Extend => {
@@ -362,10 +381,45 @@ impl TextEditBuffer {
             TextMotion::LineStart => self.text[..self.cursor]
                 .rfind('\n')
                 .map_or(0, |index| index.saturating_add(1)),
+            TextMotion::VisualUp => self.visual_vertical_position(-1),
+            TextMotion::VisualDown => self.visual_vertical_position(1),
             TextMotion::LineEnd => self.text[self.cursor..]
                 .find('\n')
                 .map_or(self.text.len(), |index| self.cursor.saturating_add(index)),
         }
+    }
+
+    fn cursor_visual_col(&self) -> usize {
+        self.wrapped_layout(usize::MAX / 4).cursor.col
+    }
+
+    fn visual_vertical_position(&self, delta: isize) -> usize {
+        let layout = self.wrapped_layout(usize::MAX / 4);
+        let current_row = layout.cursor.row;
+        let target_row = if delta.is_negative() {
+            current_row.saturating_sub(delta.unsigned_abs())
+        } else {
+            current_row.saturating_add(delta.unsigned_abs())
+        };
+        let Some(target_line) = layout.lines.get(target_row) else {
+            return self.cursor;
+        };
+        let target_col = self.desired_visual_col.unwrap_or(layout.cursor.col);
+        let line_start = self.hard_line_start_for_visual_row(target_row);
+        line_start.saturating_add(byte_index_for_visual_col(target_line, target_col))
+    }
+
+    fn hard_line_start_for_visual_row(&self, target_row: usize) -> usize {
+        let mut row = 0usize;
+        for span in grapheme_spans(&self.text) {
+            if row == target_row {
+                return span.start;
+            }
+            if &self.text[span.start..span.end] == "\n" {
+                row = row.saturating_add(1);
+            }
+        }
+        self.text.len()
     }
 
     /// Return a terminal-width single-line viewport ending near the cursor.
@@ -521,6 +575,18 @@ fn is_word_separator(grapheme: &str) -> bool {
         || grapheme.chars().all(|ch| ch.is_ascii_punctuation())
 }
 
+fn byte_index_for_visual_col(line: &str, target_col: usize) -> usize {
+    let mut col = 0usize;
+    for (start, grapheme) in line.grapheme_indices(true) {
+        let width = UnicodeWidthStr::width(grapheme).max(1);
+        if col.saturating_add(width) > target_col {
+            return start;
+        }
+        col = col.saturating_add(width);
+    }
+    line.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +664,31 @@ mod tests {
         assert_eq!(buffer.text(), "hello ");
         buffer.apply_command(TextEditCommand::Clear);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn visual_up_down_moves_between_hard_lines() {
+        let mut buffer = TextEditBuffer::from_text("one\nthree\nfive");
+
+        buffer.move_cursor(TextMotion::VisualUp);
+        assert_eq!(buffer.cursor_byte_index(), "one\nthre".len());
+        buffer.move_cursor(TextMotion::VisualUp);
+        assert_eq!(buffer.cursor_byte_index(), "one".len());
+        buffer.move_cursor(TextMotion::VisualDown);
+        assert_eq!(buffer.cursor_byte_index(), "one\nthre".len());
+    }
+
+    #[test]
+    fn visual_up_down_preserves_desired_column_across_short_lines() {
+        let mut buffer = TextEditBuffer::from_text("abcde\nx\n12345");
+
+        buffer.move_cursor(TextMotion::VisualUp);
+        assert_eq!(buffer.cursor_byte_index(), "abcde\nx".len());
+        buffer.move_cursor(TextMotion::VisualUp);
+        assert_eq!(buffer.cursor_byte_index(), "abcde".len());
+        buffer.move_cursor(TextMotion::VisualDown);
+        buffer.move_cursor(TextMotion::VisualDown);
+        assert_eq!(buffer.cursor_byte_index(), buffer.text().len());
     }
 
     #[test]
