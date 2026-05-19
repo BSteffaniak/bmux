@@ -1,5 +1,7 @@
 //! Built-in neutral widgets.
 
+use bmux_text_edit::{TextEditBuffer, VisualCursor};
+
 use crate::frame::Frame;
 use crate::geometry::{Insets, Rect};
 use crate::style::Style;
@@ -288,6 +290,141 @@ fn line_with_fallback_style(line: &Line, style: Style) -> Line {
     )
 }
 
+/// A rendered text input projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextInputProjection {
+    /// Soft-wrapped visible lines.
+    pub lines: Vec<String>,
+    /// Cursor location in widget-local coordinates.
+    pub cursor: VisualCursor,
+}
+
+/// A multiline text input widget backed by [`TextEditBuffer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextInput<'buffer> {
+    buffer: &'buffer TextEditBuffer,
+    style: Style,
+    placeholder: Option<Line>,
+    placeholder_style: Style,
+    cursor_visible: bool,
+    vertical_scroll: usize,
+}
+
+impl<'buffer> TextInput<'buffer> {
+    /// Create a text input from an edit buffer.
+    #[must_use]
+    pub const fn new(buffer: &'buffer TextEditBuffer) -> Self {
+        Self {
+            buffer,
+            style: Style::new(),
+            placeholder: None,
+            placeholder_style: Style::new(),
+            cursor_visible: true,
+            vertical_scroll: 0,
+        }
+    }
+
+    /// Set rendered text style.
+    #[must_use]
+    pub const fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Set placeholder text.
+    #[must_use]
+    pub fn placeholder(mut self, placeholder: impl Into<Line>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+
+    /// Set placeholder style.
+    #[must_use]
+    pub const fn placeholder_style(mut self, style: Style) -> Self {
+        self.placeholder_style = style;
+        self
+    }
+
+    /// Set cursor visibility.
+    #[must_use]
+    pub const fn cursor_visible(mut self, visible: bool) -> Self {
+        self.cursor_visible = visible;
+        self
+    }
+
+    /// Set vertical scroll offset in wrapped rows.
+    #[must_use]
+    pub const fn vertical_scroll(mut self, rows: usize) -> Self {
+        self.vertical_scroll = rows;
+        self
+    }
+
+    /// Project the buffer into visible wrapped lines for an area.
+    #[must_use]
+    pub fn project(&self, area: Rect) -> TextInputProjection {
+        let width = usize::from(area.width.max(1));
+        let layout = self.buffer.wrapped_layout(width);
+        let lines = layout
+            .lines
+            .iter()
+            .skip(self.vertical_scroll)
+            .take(usize::from(area.height))
+            .cloned()
+            .collect();
+        TextInputProjection {
+            lines,
+            cursor: VisualCursor {
+                row: layout.cursor.row.saturating_sub(self.vertical_scroll),
+                col: layout.cursor.col,
+            },
+        }
+    }
+}
+
+impl Widget for TextInput<'_> {
+    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        if area.is_empty() {
+            return;
+        }
+
+        if self.buffer.is_empty() {
+            if let Some(placeholder) = &self.placeholder {
+                let styled = line_with_fallback_style(placeholder, self.placeholder_style);
+                frame.write_line(Rect::new(area.x, area.y, area.width, 1), &styled);
+            }
+            if self.cursor_visible {
+                frame.set_cursor(crate::frame::Cursor::visible(crate::geometry::Point::new(
+                    area.x, area.y,
+                )));
+            }
+            return;
+        }
+
+        let projection = self.project(area);
+        for (row, line) in projection.lines.iter().enumerate() {
+            let Ok(row) = u16::try_from(row) else {
+                return;
+            };
+            let line = Line::from_spans(vec![crate::text::Span::styled(line.clone(), self.style)]);
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                &line,
+            );
+        }
+
+        if self.cursor_visible && projection.cursor.row < usize::from(area.height) {
+            let cursor_col = u16::try_from(projection.cursor.col)
+                .unwrap_or(u16::MAX)
+                .min(area.width);
+            let cursor_row = u16::try_from(projection.cursor.row).unwrap_or(u16::MAX);
+            frame.set_cursor(crate::frame::Cursor::visible(crate::geometry::Point::new(
+                area.x.saturating_add(cursor_col),
+                area.y.saturating_add(cursor_row),
+            )));
+        }
+    }
+}
+
 /// A simple styled text block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextBlock {
@@ -372,13 +509,65 @@ fn line_width(line: &Line) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Alignment, Border, Panel, TextBlock};
+    use super::{Alignment, Border, Panel, TextBlock, TextInput};
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect};
     use crate::style::{Color, Style};
     use crate::text::{Line, Text};
     use crate::widget::Widget;
+    use bmux_text_edit::TextEditBuffer;
+
+    #[test]
+    fn text_input_renders_placeholder_and_cursor_for_empty_buffer() {
+        let edit = TextEditBuffer::new();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInput::new(&edit)
+            .placeholder("Ask")
+            .render(Rect::new(0, 0, 8, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Ask     "));
+        assert_eq!(
+            frame.cursor(),
+            Some(crate::frame::Cursor::visible(crate::geometry::Point::new(
+                0, 0
+            )))
+        );
+    }
+
+    #[test]
+    fn text_input_renders_wrapped_text_and_cursor() {
+        let edit = TextEditBuffer::from_text("hello world");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInput::new(&edit).render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hello"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some(" worl"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("d    "));
+        assert_eq!(
+            frame.cursor(),
+            Some(crate::frame::Cursor::visible(crate::geometry::Point::new(
+                1, 2
+            )))
+        );
+    }
+
+    #[test]
+    fn text_input_supports_vertical_scroll() {
+        let edit = TextEditBuffer::from_text("abcdef");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInput::new(&edit)
+            .vertical_scroll(1)
+            .render(Rect::new(0, 0, 3, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("def"));
+    }
 
     #[test]
     fn panel_reports_inner_area() {

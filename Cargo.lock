@@ -2141,6 +2141,7 @@ dependencies = [
 name = "bmux_tui"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_text_edit",
  "unicode-width",
 ]
 
