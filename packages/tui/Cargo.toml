@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "gui"]
+description = "Native terminal UI primitives for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "tui", "ui"]
+license     = { workspace = true }
+name        = "bmux_tui"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+unicode-width = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

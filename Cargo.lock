@@ -2138,6 +2138,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_tui"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "unicode-width",
+]
+
+[[package]]
 name = "bmux_visual_adapters_plugin_renderer"
 version = "0.0.1-alpha.0"
 dependencies = [

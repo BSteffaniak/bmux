@@ -1,0 +1,21 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! Native terminal UI primitives for BMUX.
+//!
+//! This crate is intentionally domain-agnostic. It owns reusable terminal UI
+//! foundations such as geometry, style, styled text, render buffers, and layout
+//! helpers. Product behavior belongs in application crates and plugins.
+
+pub mod buffer;
+pub mod geometry;
+pub mod layout;
+pub mod style;
+pub mod text;
+
+pub use buffer::{Buffer, Cell};
+pub use geometry::{Insets, Point, Rect, Size};
+pub use layout::{Constraint, Direction, Layout, split};
+pub use style::{Color, Modifier, Style};
+pub use text::{Line, Span, Text};
