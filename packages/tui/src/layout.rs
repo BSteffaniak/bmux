@@ -1,6 +1,6 @@
 //! Deterministic terminal layout helpers.
 
-use crate::geometry::Rect;
+use crate::geometry::{Insets, Rect, Size};
 
 /// Layout direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,6 +25,130 @@ pub enum Constraint {
     Min(u16),
     /// Fill remaining space with equal weight.
     Fill,
+}
+
+/// Responsive terminal width class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Breakpoint {
+    /// Narrow/compact terminal width.
+    Compact,
+    /// Medium terminal width.
+    Medium,
+    /// Wide terminal width.
+    Wide,
+}
+
+impl Breakpoint {
+    /// Classify a terminal size by width.
+    #[must_use]
+    pub const fn for_size(size: Size) -> Self {
+        if size.width < 80 {
+            Self::Compact
+        } else if size.width < 120 {
+            Self::Medium
+        } else {
+            Self::Wide
+        }
+    }
+}
+
+/// Common split result for two-region layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Split {
+    /// First region.
+    pub first: Rect,
+    /// Second region.
+    pub second: Rect,
+}
+
+/// Return an area inset by margins.
+#[must_use]
+pub const fn margin(area: Rect, insets: Insets) -> Rect {
+    area.inset(insets)
+}
+
+/// Return a centered rectangle constrained by `size`.
+#[must_use]
+pub const fn centered(area: Rect, size: Size) -> Rect {
+    let width = min_u16(area.width, size.width);
+    let height = min_u16(area.height, size.height);
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    Rect::new(x, y, width, height)
+}
+
+/// Split off a leading region by fixed length.
+#[must_use]
+pub const fn split_leading(area: Rect, direction: Direction, length: u16) -> Split {
+    match direction {
+        Direction::Horizontal => {
+            let first_width = min_u16(area.width, length);
+            Split {
+                first: Rect::new(area.x, area.y, first_width, area.height),
+                second: Rect::new(
+                    area.x.saturating_add(first_width),
+                    area.y,
+                    area.width.saturating_sub(first_width),
+                    area.height,
+                ),
+            }
+        }
+        Direction::Vertical => {
+            let first_height = min_u16(area.height, length);
+            Split {
+                first: Rect::new(area.x, area.y, area.width, first_height),
+                second: Rect::new(
+                    area.x,
+                    area.y.saturating_add(first_height),
+                    area.width,
+                    area.height.saturating_sub(first_height),
+                ),
+            }
+        }
+    }
+}
+
+/// Split off a trailing region by fixed length.
+#[must_use]
+pub const fn split_trailing(area: Rect, direction: Direction, length: u16) -> Split {
+    match direction {
+        Direction::Horizontal => {
+            let second_width = min_u16(area.width, length);
+            Split {
+                first: Rect::new(
+                    area.x,
+                    area.y,
+                    area.width.saturating_sub(second_width),
+                    area.height,
+                ),
+                second: Rect::new(
+                    area.right().saturating_sub(second_width),
+                    area.y,
+                    second_width,
+                    area.height,
+                ),
+            }
+        }
+        Direction::Vertical => {
+            let second_height = min_u16(area.height, length);
+            Split {
+                first: Rect::new(
+                    area.x,
+                    area.y,
+                    area.width,
+                    area.height.saturating_sub(second_height),
+                ),
+                second: Rect::new(
+                    area.x,
+                    area.bottom().saturating_sub(second_height),
+                    area.width,
+                    second_height,
+                ),
+            }
+        }
+    }
 }
 
 /// A simple directional layout.
@@ -172,6 +296,10 @@ const fn constraint_weight(constraint: Constraint) -> u16 {
     }
 }
 
+const fn min_u16(a: u16, b: u16) -> u16 {
+    if a < b { a } else { b }
+}
+
 fn rects_for_lengths(area: Rect, direction: Direction, lengths: &[u16]) -> Vec<Rect> {
     let mut rects = Vec::with_capacity(lengths.len());
     let mut offset = 0_u16;
@@ -192,8 +320,59 @@ fn rects_for_lengths(area: Rect, direction: Direction, lengths: &[u16]) -> Vec<R
 
 #[cfg(test)]
 mod tests {
-    use super::{Constraint, Direction, Layout, split};
+    use super::{
+        Breakpoint, Constraint, Direction, Layout, Split, centered, split, split_leading,
+        split_trailing,
+    };
     use crate::geometry::Rect;
+
+    #[test]
+    fn breakpoint_classifies_widths() {
+        assert_eq!(
+            Breakpoint::for_size(crate::geometry::Size::new(79, 24)),
+            Breakpoint::Compact
+        );
+        assert_eq!(
+            Breakpoint::for_size(crate::geometry::Size::new(80, 24)),
+            Breakpoint::Medium
+        );
+        assert_eq!(
+            Breakpoint::for_size(crate::geometry::Size::new(120, 24)),
+            Breakpoint::Wide
+        );
+    }
+
+    #[test]
+    fn centered_clamps_to_area() {
+        assert_eq!(
+            centered(Rect::new(0, 0, 10, 6), crate::geometry::Size::new(4, 2)),
+            Rect::new(3, 2, 4, 2)
+        );
+        assert_eq!(
+            centered(Rect::new(0, 0, 3, 2), crate::geometry::Size::new(8, 8)),
+            Rect::new(0, 0, 3, 2)
+        );
+    }
+
+    #[test]
+    fn leading_and_trailing_splits_saturate() {
+        let area = Rect::new(0, 0, 5, 3);
+
+        assert_eq!(
+            split_leading(area, Direction::Horizontal, 2),
+            Split {
+                first: Rect::new(0, 0, 2, 3),
+                second: Rect::new(2, 0, 3, 3)
+            }
+        );
+        assert_eq!(
+            split_trailing(area, Direction::Vertical, 9),
+            Split {
+                first: Rect::new(0, 0, 5, 0),
+                second: Rect::new(0, 0, 5, 3)
+            }
+        );
+    }
 
     #[test]
     fn horizontal_split_respects_length_and_fill() {

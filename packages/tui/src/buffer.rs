@@ -96,6 +96,19 @@ impl Buffer {
         }
     }
 
+    /// Fill a rectangular area, clipped to this buffer.
+    pub fn fill(&mut self, area: Rect, symbol: &str, style: Style) {
+        let clip = self.area.intersection(area);
+        if clip.is_empty() {
+            return;
+        }
+        for y in clip.y..clip.bottom() {
+            for x in clip.x..clip.right() {
+                self.set_cell(Point::new(x, y), symbol, style);
+            }
+        }
+    }
+
     /// Write styled text clipped to the supplied absolute area.
     pub fn write_line(&mut self, area: Rect, line: &Line) {
         let clip = self.area.intersection(area);
@@ -172,6 +185,16 @@ mod tests {
         buffer.set_cell(Point::new(2, 3), "y", Style::new());
 
         assert_eq!(buffer.row_symbols(3).as_deref(), Some("y   "));
+    }
+
+    #[test]
+    fn fill_clips_to_area_and_buffer() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+
+        buffer.fill(Rect::new(1, 0, 4, 1), "x", Style::new());
+
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some(" xxx"));
+        assert_eq!(buffer.row_symbols(1).as_deref(), Some("    "));
     }
 
     #[test]

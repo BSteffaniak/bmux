@@ -9,13 +9,19 @@
 //! helpers. Product behavior belongs in application crates and plugins.
 
 pub mod buffer;
+pub mod frame;
 pub mod geometry;
 pub mod layout;
 pub mod style;
 pub mod text;
+pub mod widget;
+pub mod widgets;
 
 pub use buffer::{Buffer, Cell};
+pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
-pub use layout::{Constraint, Direction, Layout, split};
+pub use layout::{Breakpoint, Constraint, Direction, Layout, Split, split};
 pub use style::{Color, Modifier, Style};
 pub use text::{Line, Span, Text};
+pub use widget::{StatefulWidget, Widget};
+pub use widgets::{Alignment, TextBlock};
