@@ -1,5 +1,7 @@
 //! Built-in neutral widgets.
 
+use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::keyboard::TextKeymap;
 use bmux_text_edit::{TextEditBuffer, TextSelection, VisualCursor};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -362,6 +364,66 @@ fn line_with_fallback_style(line: &Line, style: Style) -> Line {
             .map(|span| crate::text::Span::styled(span.content.clone(), style.patch(span.style)))
             .collect::<Vec<_>>(),
     )
+}
+
+/// Enter-key behavior for text input key handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextInputEnterBehavior {
+    /// Enter inserts a newline into the edit buffer.
+    #[default]
+    InsertNewline,
+    /// Enter reports submission and leaves the edit buffer unchanged.
+    Submit,
+}
+
+/// Result of handling a key stroke for a text input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextInputKeyOutcome {
+    /// The key was not recognized as text input.
+    Ignored,
+    /// The edit buffer changed or cursor moved.
+    Edited,
+    /// The key requested submission.
+    Submitted,
+}
+
+/// Key handling policy for [`TextInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextInputKeyHandler {
+    /// Standard editor keymap.
+    pub keymap: TextKeymap,
+    /// Enter-key behavior.
+    pub enter_behavior: TextInputEnterBehavior,
+}
+
+impl TextInputKeyHandler {
+    /// Create a key handler from a keymap and enter behavior.
+    #[must_use]
+    pub const fn new(keymap: TextKeymap, enter_behavior: TextInputEnterBehavior) -> Self {
+        Self {
+            keymap,
+            enter_behavior,
+        }
+    }
+
+    /// Apply a key stroke to an edit buffer.
+    pub fn handle_key(self, buffer: &mut TextEditBuffer, stroke: KeyStroke) -> TextInputKeyOutcome {
+        if stroke.key == KeyCode::Enter && stroke.modifiers.is_empty() {
+            return match self.enter_behavior {
+                TextInputEnterBehavior::InsertNewline => {
+                    buffer.insert_newline();
+                    TextInputKeyOutcome::Edited
+                }
+                TextInputEnterBehavior::Submit => TextInputKeyOutcome::Submitted,
+            };
+        }
+
+        let Some(command) = self.keymap.command_for_key(stroke) else {
+            return TextInputKeyOutcome::Ignored;
+        };
+        buffer.apply_command(command);
+        TextInputKeyOutcome::Edited
+    }
 }
 
 /// A rendered text input projection.
@@ -742,14 +804,86 @@ fn line_width(line: &Line) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Alignment, Border, Modal, Panel, TextBlock, TextInput, TextWrap};
+    use super::{
+        Alignment, Border, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
+        TextInputKeyHandler, TextInputKeyOutcome, TextWrap,
+    };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect, Size};
     use crate::style::{Color, Modifier, Style};
     use crate::text::{Line, Text};
     use crate::widget::Widget;
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
     use bmux_text_edit::TextEditBuffer;
+
+    #[test]
+    fn text_input_key_handler_inserts_characters_and_deletes() {
+        let mut edit = TextEditBuffer::new();
+        let handler = TextInputKeyHandler::default();
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Char('a'))),
+            TextInputKeyOutcome::Edited
+        );
+        assert_eq!(edit.text(), "a");
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Backspace)),
+            TextInputKeyOutcome::Edited
+        );
+        assert_eq!(edit.text(), "");
+    }
+
+    #[test]
+    fn text_input_key_handler_supports_submit_enter_behavior() {
+        let mut edit = TextEditBuffer::from_text("run");
+        let handler = TextInputKeyHandler::new(
+            bmux_text_edit::keyboard::TextKeymap::default(),
+            TextInputEnterBehavior::Submit,
+        );
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Enter)),
+            TextInputKeyOutcome::Submitted
+        );
+        assert_eq!(edit.text(), "run");
+    }
+
+    #[test]
+    fn text_input_key_handler_inserts_newline_by_default() {
+        let mut edit = TextEditBuffer::from_text("a");
+        let handler = TextInputKeyHandler::default();
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Enter)),
+            TextInputKeyOutcome::Edited
+        );
+        assert_eq!(edit.text(), "a\n");
+    }
+
+    #[test]
+    fn text_input_key_handler_ignores_unknown_keys() {
+        let mut edit = TextEditBuffer::new();
+        let handler = TextInputKeyHandler::default();
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Escape)),
+            TextInputKeyOutcome::Ignored
+        );
+        assert_eq!(
+            handler.handle_key(
+                &mut edit,
+                KeyStroke::with_modifiers(
+                    KeyCode::Char('x'),
+                    Modifiers {
+                        super_key: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+            ),
+            TextInputKeyOutcome::Ignored
+        );
+    }
 
     #[test]
     fn text_block_wraps_at_grapheme_boundaries() {
