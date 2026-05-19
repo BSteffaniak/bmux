@@ -617,7 +617,7 @@ fn grapheme_spans(text: &str) -> Vec<GraphemeSpan> {
         .map(|(start, grapheme)| GraphemeSpan {
             start,
             end: start.saturating_add(grapheme.len()),
-            width: UnicodeWidthStr::width(grapheme).max(1),
+            width: UnicodeWidthStr::width(grapheme),
         })
         .collect()
 }
@@ -839,6 +839,93 @@ mod tests {
         buffer.move_cursor(TextMotion::VisualDown);
         buffer.move_cursor(TextMotion::VisualDown);
         assert_eq!(buffer.cursor_byte_index(), buffer.text().len());
+    }
+
+    #[test]
+    fn combining_marks_have_zero_width_inside_graphemes() {
+        let combined = "e\u{301}";
+        let mut buffer = TextEditBuffer::from_text(format!("a{combined}b"));
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor(TextMotion::Right);
+        buffer.move_cursor(TextMotion::Right);
+
+        assert_eq!(buffer.cursor_byte_index(), "a".len() + combined.len());
+        assert_eq!(buffer.cursor_grapheme_index(), 2);
+        let layout = buffer.wrapped_layout(10);
+        assert_eq!(layout.lines, vec![format!("a{combined}b")]);
+        assert_eq!(layout.cursor, VisualCursor { row: 0, col: 2 });
+    }
+
+    #[test]
+    fn zero_width_marks_do_not_advance_layout_columns() {
+        let text = "a\u{200d}b";
+        let mut buffer = TextEditBuffer::from_text(text);
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor(TextMotion::Right);
+        buffer.move_cursor(TextMotion::Right);
+
+        assert_eq!(buffer.cursor_byte_index(), "a\u{200d}b".len());
+        assert_eq!(
+            buffer.wrapped_layout(10).cursor,
+            VisualCursor { row: 0, col: 2 }
+        );
+    }
+
+    #[test]
+    fn cjk_wide_chars_wrap_at_column_boundaries() {
+        let buffer = TextEditBuffer::from_text("a界b");
+        let layout = buffer.wrapped_layout(3);
+
+        assert_eq!(layout.lines, vec!["a界".to_string(), "b".to_string()]);
+        assert_eq!(layout.cursor, VisualCursor { row: 1, col: 1 });
+    }
+
+    #[test]
+    fn emoji_zwj_sequence_moves_and_wraps_as_one_grapheme() {
+        let family = "👨‍👩‍👧‍👦";
+        let mut buffer = TextEditBuffer::from_text(format!("a{family}b"));
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor(TextMotion::Right);
+        buffer.move_cursor(TextMotion::Right);
+
+        assert_eq!(buffer.cursor_byte_index(), "a".len() + family.len());
+        assert_eq!(buffer.cursor_grapheme_index(), 2);
+        let layout = buffer.wrapped_layout(2);
+        assert_eq!(
+            layout.lines,
+            vec!["a".to_string(), family.to_string(), "b".to_string()]
+        );
+        assert_eq!(layout.cursor, VisualCursor { row: 1, col: 2 });
+    }
+
+    #[test]
+    fn regional_indicator_flags_and_skin_tone_modifiers_are_single_graphemes() {
+        let flag = "🇺🇸";
+        let wave = "👋🏽";
+        let mut buffer = TextEditBuffer::from_text(format!("{flag}{wave}x"));
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor(TextMotion::Right);
+        assert_eq!(buffer.cursor_byte_index(), flag.len());
+        buffer.move_cursor(TextMotion::Right);
+        assert_eq!(buffer.cursor_byte_index(), flag.len() + wave.len());
+        assert_eq!(buffer.cursor_grapheme_index(), 2);
+    }
+
+    #[test]
+    fn mixed_unicode_wrapping_projects_cursor_by_display_width() {
+        let text = "a界👋🏽e\u{301}b";
+        let mut buffer = TextEditBuffer::from_text(text);
+        buffer.move_cursor(TextMotion::Start);
+        for _ in 0..4 {
+            buffer.move_cursor(TextMotion::Right);
+        }
+
+        let layout = buffer.wrapped_layout(4);
+        assert_eq!(
+            layout.lines,
+            vec!["a界".to_string(), "👋🏽e\u{301}b".to_string()]
+        );
+        assert_eq!(layout.cursor, VisualCursor { row: 1, col: 3 });
     }
 
     #[test]
