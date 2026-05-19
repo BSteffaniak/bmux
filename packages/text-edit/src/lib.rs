@@ -140,6 +140,8 @@ pub enum TextMotion {
     End,
     /// Move to the start of the current hard line.
     LineStart,
+    /// Move to an absolute byte index, snapping to a valid grapheme boundary.
+    Absolute(usize),
     /// Move one visual line up using soft wrapping.
     VisualUp,
     /// Move one visual line down using soft wrapping.
@@ -482,6 +484,7 @@ impl TextEditBuffer {
             TextMotion::LineStart => self.text[..self.cursor]
                 .rfind('\n')
                 .map_or(0, |index| index.saturating_add(1)),
+            TextMotion::Absolute(index) => snap_to_grapheme_boundary(&self.text, index),
             TextMotion::VisualUp => self.visual_vertical_position(-1),
             TextMotion::VisualDown => self.visual_vertical_position(1),
             TextMotion::LineEnd => self.text[self.cursor..]
@@ -511,14 +514,31 @@ impl TextEditBuffer {
     }
 
     fn hard_line_start_for_visual_row(&self, target_row: usize) -> usize {
+        self.wrapped_row_start_byte_index(usize::MAX / 4, target_row)
+    }
+
+    fn wrapped_row_start_byte_index(&self, width: usize, target_row: usize) -> usize {
+        let width = width.max(1);
         let mut row = 0usize;
+        let mut col = 0usize;
         for span in grapheme_spans(&self.text) {
             if row == target_row {
                 return span.start;
             }
-            if &self.text[span.start..span.end] == "\n" {
+            let grapheme = &self.text[span.start..span.end];
+            if grapheme == "\n" {
                 row = row.saturating_add(1);
+                col = 0;
+                continue;
             }
+            if col > 0 && col.saturating_add(span.width) > width {
+                row = row.saturating_add(1);
+                col = 0;
+                if row == target_row {
+                    return span.start;
+                }
+            }
+            col = col.saturating_add(span.width);
         }
         self.text.len()
     }
@@ -567,6 +587,61 @@ impl TextEditBuffer {
         }
 
         LineViewport { text, cursor_col }
+    }
+
+    /// Return the byte index nearest to a single-line viewport column.
+    #[must_use]
+    pub fn byte_index_for_line_viewport_col(&self, width: usize, col: usize) -> usize {
+        let viewport = self.line_viewport(width);
+        let visible_start = self
+            .text
+            .find(&viewport.text)
+            .unwrap_or_else(|| self.cursor.min(self.text.len()));
+        visible_start.saturating_add(byte_index_for_visual_col(&viewport.text, col))
+    }
+
+    /// Move the cursor to a single-line viewport column.
+    pub fn move_cursor_to_line_viewport_col(&mut self, width: usize, col: usize) {
+        self.move_cursor(TextMotion::Absolute(
+            self.byte_index_for_line_viewport_col(width, col),
+        ));
+    }
+
+    /// Extend selection to a single-line viewport column.
+    pub fn select_to_line_viewport_col(&mut self, width: usize, col: usize) {
+        self.move_cursor_with_selection(
+            TextMotion::Absolute(self.byte_index_for_line_viewport_col(width, col)),
+            SelectionMode::Extend,
+        );
+    }
+
+    /// Return the byte index nearest to a soft-wrapped row and column.
+    #[must_use]
+    pub fn byte_index_for_wrapped_position(&self, width: usize, row: usize, col: usize) -> usize {
+        let layout = self.wrapped_layout(width);
+        let Some(line) = layout.lines.get(row) else {
+            return self.text.len();
+        };
+        let line_start = self.wrapped_row_start_byte_index(width, row);
+        snap_to_grapheme_boundary(
+            &self.text,
+            line_start.saturating_add(byte_index_for_visual_col(line, col)),
+        )
+    }
+
+    /// Move the cursor to a soft-wrapped row and column.
+    pub fn move_cursor_to_wrapped_position(&mut self, width: usize, row: usize, col: usize) {
+        self.move_cursor(TextMotion::Absolute(
+            self.byte_index_for_wrapped_position(width, row, col),
+        ));
+    }
+
+    /// Extend selection to a soft-wrapped row and column.
+    pub fn select_to_wrapped_position(&mut self, width: usize, row: usize, col: usize) {
+        self.move_cursor_with_selection(
+            TextMotion::Absolute(self.byte_index_for_wrapped_position(width, row, col)),
+            SelectionMode::Extend,
+        );
     }
 
     /// Return a soft-wrapped projection for `width` terminal columns.
@@ -620,6 +695,20 @@ fn grapheme_spans(text: &str) -> Vec<GraphemeSpan> {
             width: UnicodeWidthStr::width(grapheme),
         })
         .collect()
+}
+
+fn snap_to_grapheme_boundary(text: &str, index: usize) -> usize {
+    let index = index.min(text.len());
+    if text.is_char_boundary(index)
+        && (index == text.len() || text[index..].graphemes(true).next().is_some())
+    {
+        return index;
+    }
+    text.grapheme_indices(true)
+        .map(|(start, _)| start)
+        .take_while(|start| *start <= index)
+        .last()
+        .unwrap_or(0)
 }
 
 fn previous_grapheme_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -926,6 +1015,39 @@ mod tests {
             vec!["a界".to_string(), "👋🏽e\u{301}b".to_string()]
         );
         assert_eq!(layout.cursor, VisualCursor { row: 1, col: 3 });
+    }
+
+    #[test]
+    fn wrapped_position_hit_testing_moves_cursor() {
+        let mut buffer = TextEditBuffer::from_text("ab界cd");
+
+        assert_eq!(buffer.byte_index_for_wrapped_position(4, 0, 3), "ab".len());
+        assert_eq!(
+            buffer.byte_index_for_wrapped_position(4, 1, 1),
+            "ab界c".len()
+        );
+
+        buffer.move_cursor_to_wrapped_position(4, 0, 3);
+        assert_eq!(buffer.cursor_byte_index(), "ab".len());
+    }
+
+    #[test]
+    fn wrapped_position_hit_testing_extends_selection() {
+        let mut buffer = TextEditBuffer::from_text("hello world");
+        buffer.move_cursor(TextMotion::Start);
+
+        buffer.select_to_wrapped_position(20, 0, 5);
+
+        assert_eq!(buffer.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn line_viewport_hit_testing_moves_cursor_with_unicode() {
+        let mut buffer = TextEditBuffer::from_text("a界👋🏽e\u{301}");
+
+        buffer.move_cursor_to_line_viewport_col(20, 3);
+
+        assert_eq!(buffer.cursor_byte_index(), "a界".len());
     }
 
     #[test]
