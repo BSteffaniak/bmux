@@ -11,8 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_text_edit = { workspace = true }
-unicode-width  = { workspace = true }
+bmux_text_edit       = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width        = { workspace = true }
 
 [features]
 default          = []

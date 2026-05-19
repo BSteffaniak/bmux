@@ -1,6 +1,8 @@
 //! Built-in neutral widgets.
 
-use bmux_text_edit::{TextEditBuffer, VisualCursor};
+use bmux_text_edit::{TextEditBuffer, TextSelection, VisualCursor};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::frame::Frame;
 use crate::geometry::{Insets, Rect};
@@ -304,6 +306,7 @@ pub struct TextInputProjection {
 pub struct TextInput<'buffer> {
     buffer: &'buffer TextEditBuffer,
     style: Style,
+    selection_style: Style,
     placeholder: Option<Line>,
     placeholder_style: Style,
     cursor_visible: bool,
@@ -317,6 +320,7 @@ impl<'buffer> TextInput<'buffer> {
         Self {
             buffer,
             style: Style::new(),
+            selection_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
             placeholder: None,
             placeholder_style: Style::new(),
             cursor_visible: true,
@@ -328,6 +332,13 @@ impl<'buffer> TextInput<'buffer> {
     #[must_use]
     pub const fn style(mut self, style: Style) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Set selected text style. This style patches over the base text style.
+    #[must_use]
+    pub const fn selection_style(mut self, style: Style) -> Self {
+        self.selection_style = style;
         self
     }
 
@@ -401,11 +412,22 @@ impl Widget for TextInput<'_> {
         }
 
         let projection = self.project(area);
-        for (row, line) in projection.lines.iter().enumerate() {
+        let rendered_lines = selected_wrapped_lines(
+            self.buffer.text(),
+            usize::from(area.width.max(1)),
+            self.buffer.selection(),
+            self.style,
+            self.selection_style,
+        );
+        for (row, line) in rendered_lines
+            .into_iter()
+            .skip(self.vertical_scroll)
+            .take(usize::from(area.height))
+            .enumerate()
+        {
             let Ok(row) = u16::try_from(row) else {
                 return;
             };
-            let line = Line::from_spans(vec![crate::text::Span::styled(line.clone(), self.style)]);
             frame.write_line(
                 Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
                 &line,
@@ -423,6 +445,59 @@ impl Widget for TextInput<'_> {
             )));
         }
     }
+}
+
+fn selected_wrapped_lines(
+    text: &str,
+    width: usize,
+    selection: Option<TextSelection>,
+    base_style: Style,
+    selection_style: Style,
+) -> Vec<Line> {
+    let width = width.max(1);
+    let mut lines = vec![Line::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if grapheme == "\n" {
+            lines.push(Line::new());
+            row = row.saturating_add(1);
+            col = 0;
+            continue;
+        }
+
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if col > 0 && col.saturating_add(grapheme_width) > width {
+            lines.push(Line::new());
+            row = row.saturating_add(1);
+            col = 0;
+        }
+
+        let style = if selection_contains(selection, start) {
+            base_style.patch(selection_style)
+        } else {
+            base_style
+        };
+        push_styled_grapheme(&mut lines[row], grapheme, style);
+        col = col.saturating_add(grapheme_width);
+    }
+
+    lines
+}
+
+fn selection_contains(selection: Option<TextSelection>, byte_index: usize) -> bool {
+    selection.is_some_and(|selection| byte_index >= selection.start && byte_index < selection.end)
+}
+
+fn push_styled_grapheme(line: &mut Line, grapheme: &str, style: Style) {
+    if let Some(last) = line.spans.last_mut()
+        && last.style == style
+    {
+        last.content.push_str(grapheme);
+        return;
+    }
+    line.push_span(crate::text::Span::styled(grapheme.to_owned(), style));
 }
 
 /// A simple styled text block.
@@ -513,7 +588,7 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect};
-    use crate::style::{Color, Style};
+    use crate::style::{Color, Modifier, Style};
     use crate::text::{Line, Text};
     use crate::widget::Widget;
     use bmux_text_edit::TextEditBuffer;
@@ -625,6 +700,77 @@ mod tests {
                 .get(crate::geometry::Point::new(0, 0))
                 .map(|cell| cell.style),
             Some(style)
+        );
+    }
+
+    #[test]
+    fn text_input_styles_selection() {
+        let mut edit = TextEditBuffer::from_text("hello");
+        edit.move_cursor(bmux_text_edit::TextMotion::Start);
+        edit.move_cursor_with_selection(
+            bmux_text_edit::TextMotion::Right,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        edit.move_cursor_with_selection(
+            bmux_text_edit::TextMotion::Right,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let selection_style = Style::new().add_modifier(Modifier::REVERSED);
+
+        TextInput::new(&edit)
+            .selection_style(selection_style)
+            .render(Rect::new(0, 0, 5, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hello"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(selection_style)
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(1, 0))
+                .map(|cell| cell.style),
+            Some(selection_style)
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(2, 0))
+                .map(|cell| cell.style),
+            Some(Style::new())
+        );
+    }
+
+    #[test]
+    fn text_input_selection_can_span_wrapped_lines() {
+        let mut edit = TextEditBuffer::from_text("abcd");
+        edit.move_cursor(bmux_text_edit::TextMotion::Start);
+        edit.move_cursor_with_selection(
+            bmux_text_edit::TextMotion::End,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let selection_style = Style::new().add_modifier(Modifier::REVERSED);
+
+        TextInput::new(&edit)
+            .selection_style(selection_style)
+            .render(Rect::new(0, 0, 2, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("ab"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("cd"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 1))
+                .map(|cell| cell.style),
+            Some(selection_style)
         );
     }
 
