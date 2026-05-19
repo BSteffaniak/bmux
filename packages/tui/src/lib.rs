@@ -25,5 +25,5 @@ pub use style::{Color, Modifier, Style};
 pub use text::{Line, Span, Text};
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
-    Alignment, Border, BorderSet, Panel, TextBlock, TextInput, TextInputProjection, TextWrap,
+    Alignment, Border, BorderSet, Modal, Panel, TextBlock, TextInput, TextInputProjection, TextWrap,
 };

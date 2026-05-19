@@ -5,7 +5,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::frame::Frame;
-use crate::geometry::{Insets, Rect};
+use crate::geometry::{Insets, Rect, Size};
+use crate::layout::centered;
 use crate::style::Style;
 use crate::text::{Line, Text};
 use crate::widget::Widget;
@@ -187,6 +188,77 @@ impl Widget for Panel {
             if let Some(title) = &self.title {
                 render_title(area, title, border.style, frame);
             }
+        }
+    }
+}
+
+/// A centered modal surface with optional scrim and child content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Modal<'widget, W> {
+    panel: Panel,
+    size: Size,
+    scrim: Option<Style>,
+    child: Option<&'widget W>,
+}
+
+impl<'widget, W> Modal<'widget, W> {
+    /// Create a modal with the requested maximum size.
+    #[must_use]
+    pub const fn new(size: Size) -> Self {
+        Self {
+            panel: Panel::new().border(Border::single()),
+            size,
+            scrim: None,
+            child: None,
+        }
+    }
+
+    /// Set the panel used for modal chrome.
+    #[must_use]
+    pub fn panel(mut self, panel: Panel) -> Self {
+        self.panel = panel;
+        self
+    }
+
+    /// Set an optional full-area scrim style.
+    #[must_use]
+    pub const fn scrim(mut self, style: Style) -> Self {
+        self.scrim = Some(style);
+        self
+    }
+
+    /// Set modal child content.
+    #[must_use]
+    pub const fn child(mut self, child: &'widget W) -> Self {
+        self.child = Some(child);
+        self
+    }
+
+    /// Return the modal panel area for a parent area.
+    #[must_use]
+    pub const fn panel_area(&self, area: Rect) -> Rect {
+        centered(area, self.size)
+    }
+
+    /// Return the modal content area for a parent area.
+    #[must_use]
+    pub const fn content_area(&self, area: Rect) -> Rect {
+        self.panel.inner_area(self.panel_area(area))
+    }
+}
+
+impl<W: Widget> Widget for Modal<'_, W> {
+    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        if area.is_empty() {
+            return;
+        }
+        if let Some(style) = self.scrim {
+            frame.fill(area, " ", style);
+        }
+        let panel_area = self.panel_area(area);
+        self.panel.render(panel_area, frame);
+        if let Some(child) = self.child {
+            child.render(self.panel.inner_area(panel_area), frame);
         }
     }
 }
@@ -670,10 +742,10 @@ fn line_width(line: &Line) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Alignment, Border, Panel, TextBlock, TextInput, TextWrap};
+    use super::{Alignment, Border, Modal, Panel, TextBlock, TextInput, TextWrap};
     use crate::buffer::Buffer;
     use crate::frame::Frame;
-    use crate::geometry::{Insets, Rect};
+    use crate::geometry::{Insets, Rect, Size};
     use crate::style::{Color, Modifier, Style};
     use crate::text::{Line, Text};
     use crate::widget::Widget;
@@ -778,6 +850,44 @@ mod tests {
             .render(Rect::new(0, 0, 3, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn modal_centers_panel_and_renders_child_in_inner_area() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 5));
+        let mut frame = Frame::new(&mut buffer);
+        let child = TextBlock::new("Hi");
+        let modal = Modal::new(Size::new(6, 3)).child(&child);
+
+        modal.render(Rect::new(0, 0, 10, 5), &mut frame);
+
+        assert_eq!(
+            modal.panel_area(Rect::new(0, 0, 10, 5)),
+            Rect::new(2, 1, 6, 3)
+        );
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  ┌────┐  "));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("  │Hi  │  "));
+        assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("  └────┘  "));
+    }
+
+    #[test]
+    fn modal_scrim_fills_parent_area_before_panel() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+        let scrim = Style::new().bg(Color::BrightBlack);
+        let panel = Panel::new().border(Border::ascii());
+        let modal: Modal<'_, TextBlock> = Modal::new(Size::new(3, 3)).panel(panel).scrim(scrim);
+
+        modal.render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" +-+ "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(scrim)
+        );
     }
 
     #[test]
