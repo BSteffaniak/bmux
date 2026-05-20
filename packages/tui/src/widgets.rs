@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::frame::Frame;
 use crate::geometry::{Insets, Rect, Size};
-use crate::layout::centered;
+use crate::layout::{Direction, centered, split_leading};
 use crate::style::Style;
 use crate::text::{Line, Text};
 use crate::widget::Widget;
@@ -650,6 +650,110 @@ impl List<'_> {
     }
 }
 
+/// A command-palette-style list picker composed from a panel, text input, and list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPicker<'a> {
+    input: TextInput<'a>,
+    items: &'a [ListItem],
+    panel: Panel,
+    input_height: u16,
+    gap: u16,
+    list: List<'a>,
+}
+
+impl<'a> ListPicker<'a> {
+    /// Create a list picker from an input buffer and list items.
+    #[must_use]
+    pub const fn new(input: &'a TextEditBuffer, items: &'a [ListItem]) -> Self {
+        Self {
+            input: TextInput::new(input),
+            items,
+            panel: Panel::new().border(Border::single()),
+            input_height: 1,
+            gap: 1,
+            list: List::new(items),
+        }
+    }
+
+    /// Set the panel chrome.
+    #[must_use]
+    pub fn panel(mut self, panel: Panel) -> Self {
+        self.panel = panel;
+        self
+    }
+
+    /// Set the text input widget.
+    #[must_use]
+    pub fn input(mut self, input: TextInput<'a>) -> Self {
+        self.input = input;
+        self
+    }
+
+    /// Set the list widget.
+    #[must_use]
+    pub fn list(mut self, list: List<'a>) -> Self {
+        self.list = list;
+        self
+    }
+
+    /// Set the input area height.
+    #[must_use]
+    pub const fn input_height(mut self, height: u16) -> Self {
+        self.input_height = height;
+        self
+    }
+
+    /// Set the gap between input and list.
+    #[must_use]
+    pub const fn gap(mut self, rows: u16) -> Self {
+        self.gap = rows;
+        self
+    }
+
+    /// Return the input and list areas inside the picker.
+    #[must_use]
+    pub const fn content_areas(&self, area: Rect) -> ListPickerAreas {
+        let inner = self.panel.inner_area(area);
+        let input_split = split_leading(inner, Direction::Vertical, self.input_height);
+        let list_split = split_leading(input_split.second, Direction::Vertical, self.gap);
+        ListPickerAreas {
+            input: input_split.first,
+            list: list_split.second,
+        }
+    }
+}
+
+impl crate::widget::StatefulWidget for ListPicker<'_> {
+    type State = ListState;
+
+    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+        if area.is_empty() {
+            return;
+        }
+        self.panel.render(area, frame);
+        let areas = self.content_areas(area);
+        self.input.render(areas.input, frame);
+        self.list.render(areas.list, frame, state);
+    }
+}
+
+/// Content areas computed by [`ListPicker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListPickerAreas {
+    /// Text input area.
+    pub input: Rect,
+    /// List area.
+    pub list: Rect,
+}
+
+impl ListPicker<'_> {
+    /// Return picker item count.
+    #[must_use]
+    pub const fn item_count(&self) -> usize {
+        self.items.len()
+    }
+}
+
 /// Enter-key behavior for text input key handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextInputEnterBehavior {
@@ -1089,9 +1193,9 @@ fn line_width(line: &Line) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, Border, List, ListItem, ListKeyHandler, ListKeyOutcome, ListState, Modal, Panel,
-        TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
-        TextWrap,
+        Alignment, Border, List, ListItem, ListKeyHandler, ListKeyOutcome, ListPicker, ListState,
+        Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler,
+        TextInputKeyOutcome, TextWrap,
     };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
@@ -1416,6 +1520,43 @@ mod tests {
             handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Char('x'))),
             ListKeyOutcome::Ignored
         );
+    }
+
+    #[test]
+    fn list_picker_computes_content_areas() {
+        let input = TextEditBuffer::new();
+        let items = vec![ListItem::new("one")];
+        let picker = ListPicker::new(&input, &items)
+            .panel(Panel::new().border(Border::ascii()))
+            .input_height(2)
+            .gap(1);
+
+        assert_eq!(picker.item_count(), 1);
+        assert_eq!(
+            picker.content_areas(Rect::new(0, 0, 10, 6)),
+            super::ListPickerAreas {
+                input: Rect::new(1, 1, 8, 2),
+                list: Rect::new(1, 4, 8, 1),
+            }
+        );
+    }
+
+    #[test]
+    fn list_picker_renders_panel_input_and_list() {
+        let input = TextEditBuffer::from_text("f");
+        let items = vec![ListItem::new("foo"), ListItem::new("bar")];
+        let mut state = ListState {
+            selected: Some(1),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        ListPicker::new(&input, &items).render(Rect::new(0, 0, 8, 5), &mut frame, &mut state);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("┌──────┐"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("│f     │"));
+        assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("│bar   │"));
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub use style::{Color, Modifier, Style};
 pub use text::{Line, Span, Text};
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
-    Alignment, Border, BorderSet, List, ListItem, ListKeyHandler, ListKeyOutcome, ListState, Modal,
-    Panel, TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
-    TextInputProjection, TextWrap,
+    Alignment, Border, BorderSet, List, ListItem, ListKeyHandler, ListKeyOutcome, ListPicker,
+    ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
+    TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
 };
