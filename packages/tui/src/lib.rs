@@ -30,6 +30,7 @@ pub mod palette;
 pub mod style;
 pub mod terminal;
 pub mod text;
+pub mod text_block;
 pub mod viewport;
 pub mod widget;
 pub mod widgets;
@@ -67,11 +68,11 @@ pub use palette::{CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState,
 pub use style::{Color, Modifier, Style};
 pub use terminal::{DrawStats, Terminal};
 pub use text::{Line, Span, Text};
+pub use text_block::{TextBlock, TextWrap};
 pub use viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
     Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker, ListPickerAreas,
-    TextBlock, TextWrap,
 };
 
 /// Common imports for building BMUX TUI surfaces.
@@ -113,10 +114,10 @@ pub mod prelude {
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{Line, Span, Text};
+    pub use crate::text_block::{TextBlock, TextWrap};
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
     pub use crate::widget::{StatefulWidget, Widget};
     pub use crate::widgets::{
-        Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker,
-        ListPickerAreas, TextBlock, TextWrap,
+        Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker, ListPickerAreas,
     };
 }

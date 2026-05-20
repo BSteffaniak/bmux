@@ -92,8 +92,8 @@ mod tests {
     use crate::frame::Frame;
     use crate::geometry::Rect;
     use crate::style::{Color, Style};
+    use crate::text_block::TextBlock;
     use crate::widget::Widget;
-    use crate::widgets::TextBlock;
 
     #[test]
     fn overlay_stack_renders_layers_in_order() {
