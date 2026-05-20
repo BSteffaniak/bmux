@@ -9,7 +9,8 @@ The framework is not a product-specific UI layer. It owns terminal UI primitives
 - Provide a BMUX-native replacement for the terminal UI library currently used by Bcode.
 - Make terminal UI construction more ergonomic than direct cell painting or ad hoc crossterm rendering.
 - Support deterministic responsive layout across terminal sizes and resize events.
-- Support reusable widgets for text input, lists, overlays, modals, command palettes, transcripts, and diff/file views.
+- Support reusable widgets for text input, lists, overlays, modals, command palettes, and transcripts.
+- Support opt-in developer-tool widgets such as diff/file views without making them part of the default TUI core.
 - Preserve BMUX's existing strengths in terminal protocol correctness, rendering performance, and plugin-oriented architecture.
 - Make rendering testable without a real terminal.
 
@@ -45,6 +46,34 @@ Later modules should be added only when needed:
 - test support
 
 If the crate becomes too broad, split only by real capability pressure, for example `tui-render` or `tui-testing`. Avoid vague shared/common crates.
+
+## Feature boundaries and dependency direction
+
+`bmux_tui` has a small default feature set. The default build is the general-purpose terminal UI toolkit and must stay useful for applications that have no developer-tool or coding-agent needs.
+
+Default `bmux_tui` may contain:
+
+- geometry, layout, style, text, buffer, frame, and backend primitives
+- general widgets such as text blocks, panels, modals, text inputs, lists, and pickers
+- generic event/focus/viewport primitives when they are added
+- adapters to neutral BMUX primitives when those adapters do not pull in product behavior
+
+Default `bmux_tui` must not contain hard dependencies on:
+
+- BMUX sessions, windows, panes, clients, contexts, permissions, or plugin runtime behavior
+- Bcode chat/model/tool concepts
+- coding-agent-only visualizations
+- file-edit or VCS-specific models
+
+Feature-gated modules may provide more specialized UI surfaces. These features must depend inward on the neutral TUI primitives; neutral primitives must never depend outward on feature-gated modules.
+
+Current specialized features:
+
+| Feature | Purpose                                                   | Boundary rule                                                     |
+| ------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
+| `diff`  | Developer-tool/coding-agent diff and file view primitives | Opt-in only; no default exports; no core dependency on diff types |
+
+If a feature begins to need substantial domain models or behavior, prefer a separate domain crate or plugin-owned UI module instead of expanding default `bmux_tui`.
 
 ## Relationship to existing BMUX crates
 
@@ -142,9 +171,17 @@ Required performance direction:
 
 ## Diff and file views
 
-Diff/file views are first-class product targets, especially for coding-agent file edit tools.
+Diff/file views are important for developer-tool and coding-agent consumers, especially for file edit tools, but they are not part of the general-purpose TUI core. They live behind the `diff` feature and should remain optional.
 
-The framework should eventually provide reusable primitives for:
+Boundary requirements for diff/file view work:
+
+- The default `bmux_tui` build must not export diff types.
+- Core modules such as geometry, layout, style, text, buffer, frame, widgets, and ANSI backends must not depend on diff modules.
+- Diff modules may depend on neutral TUI primitives.
+- Diff modules must avoid Bcode-specific model/tool/session types.
+- If diff support grows into a substantial developer-tool UI domain, consider extracting it into a dedicated crate such as `packages/tui-diff` instead of expanding default `bmux_tui`.
+
+The optional diff feature can eventually provide reusable primitives for:
 
 - unified diffs
 - side-by-side diffs
@@ -185,10 +222,11 @@ The framework should eventually provide reusable primitives for:
 - Add crossterm/ANSI backend adapter.
 - Add cursor positioning and incremental flush support.
 
-### Phase 6: rich views
+### Phase 6: optional developer-tool views
 
-- Add transcript/list virtualization depth.
-- Add diff/file view primitives.
+- Keep diff/file view primitives behind the `diff` feature.
+- Add transcript/list virtualization depth to the default core only when the primitives remain general.
+- Add optional diff/file view primitives without introducing default dependencies on coding-agent or VCS concepts.
 
 ### Phase 7: adoption
 
