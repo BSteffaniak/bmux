@@ -44,9 +44,10 @@ pub use terminal::{DrawStats, Terminal};
 pub use text::{Line, Span, Text};
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
-    Alignment, Border, BorderSet, List, ListItem, ListKeyHandler, ListKeyOutcome, ListPicker,
-    ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
-    TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
+    Alignment, Border, BorderSet, Dropdown, List, ListItem, ListKeyHandler, ListKeyOutcome,
+    ListPicker, ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput,
+    TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection,
+    TextWrap,
 };
 
 /// Common imports for building BMUX TUI surfaces.
@@ -72,8 +73,9 @@ pub mod prelude {
     pub use crate::text::{Line, Span, Text};
     pub use crate::widget::{StatefulWidget, Widget};
     pub use crate::widgets::{
-        Alignment, Border, BorderSet, List, ListItem, ListKeyHandler, ListKeyOutcome, ListPicker,
-        ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
-        TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
+        Alignment, Border, BorderSet, Dropdown, List, ListItem, ListKeyHandler, ListKeyOutcome,
+        ListPicker, ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput,
+        TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection,
+        TextWrap,
     };
 }
