@@ -88,6 +88,7 @@ impl<W: Write> Terminal<W> {
             write_ansi_frame(&mut self.writer, &buffer, cursor)?;
             DrawStats::full(buffer.cells().len())
         };
+        self.writer.flush()?;
         self.previous = Some(buffer);
         Ok(stats)
     }
