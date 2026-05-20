@@ -8,6 +8,7 @@
 //! foundations such as geometry, style, styled text, render buffers, and layout
 //! helpers. Product behavior belongs in application crates and plugins.
 
+pub mod ansi;
 pub mod buffer;
 pub mod frame;
 pub mod geometry;
@@ -17,6 +18,7 @@ pub mod text;
 pub mod widget;
 pub mod widgets;
 
+pub use ansi::write_ansi_frame;
 pub use buffer::{Buffer, Cell};
 pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
