@@ -1,7 +1,10 @@
 //! Diff/file view primitives.
 
+use bmux_keyboard::{KeyCode, KeyStroke};
+
 use crate::frame::Frame;
 use crate::geometry::Rect;
+use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::style::{Color, Modifier, Style};
 use crate::text::{Line, Span};
 use crate::widget::StatefulWidget;
@@ -78,6 +81,37 @@ impl DiffFileListState {
         }
     }
 
+    /// Select an item by index.
+    pub const fn select(&mut self, index: Option<usize>) {
+        self.selected = index;
+    }
+
+    /// Move selection down by one file.
+    pub fn select_next(&mut self, file_count: usize) {
+        if file_count == 0 {
+            self.selected = None;
+            self.offset = 0;
+            return;
+        }
+        self.selected = Some(
+            self.selected
+                .map_or(0, |selected| selected.saturating_add(1).min(file_count - 1)),
+        );
+    }
+
+    /// Move selection up by one file.
+    pub fn select_previous(&mut self, file_count: usize) {
+        if file_count == 0 {
+            self.selected = None;
+            self.offset = 0;
+            return;
+        }
+        self.selected = Some(
+            self.selected
+                .map_or(0, |selected| selected.saturating_sub(1)),
+        );
+    }
+
     /// Ensure selected item remains visible.
     pub fn ensure_selected_visible(&mut self, height: u16, file_count: usize) {
         if file_count == 0 {
@@ -95,6 +129,119 @@ impl DiffFileListState {
         }
         self.offset = self.offset.min(file_count.saturating_sub(1));
     }
+}
+
+/// Result of handling a key stroke for a changed-file list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffFileListKeyOutcome {
+    /// The key was not recognized as file-list input.
+    Ignored,
+    /// Selection or scroll position changed.
+    Moved,
+    /// The selected file was activated.
+    Activated(usize),
+    /// The file-list interaction was canceled.
+    Canceled,
+}
+
+/// Key handling policy for changed-file lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffFileListKeyHandler;
+
+impl DiffFileListKeyHandler {
+    /// Apply a key stroke to changed-file list state.
+    pub fn handle_key(
+        self,
+        state: &mut DiffFileListState,
+        file_count: usize,
+        viewport_height: u16,
+        stroke: KeyStroke,
+    ) -> DiffFileListKeyOutcome {
+        if !stroke.modifiers.is_empty() {
+            return DiffFileListKeyOutcome::Ignored;
+        }
+        match stroke.key {
+            KeyCode::Up => {
+                state.select_previous(file_count);
+                state.ensure_selected_visible(viewport_height, file_count);
+                DiffFileListKeyOutcome::Moved
+            }
+            KeyCode::Down => {
+                state.select_next(file_count);
+                state.ensure_selected_visible(viewport_height, file_count);
+                DiffFileListKeyOutcome::Moved
+            }
+            KeyCode::Home => {
+                state.select(if file_count == 0 { None } else { Some(0) });
+                state.ensure_selected_visible(viewport_height, file_count);
+                DiffFileListKeyOutcome::Moved
+            }
+            KeyCode::End => {
+                state.select(file_count.checked_sub(1));
+                state.ensure_selected_visible(viewport_height, file_count);
+                DiffFileListKeyOutcome::Moved
+            }
+            KeyCode::PageUp => {
+                move_file_selection_by_page(
+                    state,
+                    file_count,
+                    viewport_height,
+                    FilePageDirection::Up,
+                );
+                DiffFileListKeyOutcome::Moved
+            }
+            KeyCode::PageDown => {
+                move_file_selection_by_page(
+                    state,
+                    file_count,
+                    viewport_height,
+                    FilePageDirection::Down,
+                );
+                DiffFileListKeyOutcome::Moved
+            }
+            KeyCode::Enter => state.selected.map_or(
+                DiffFileListKeyOutcome::Ignored,
+                DiffFileListKeyOutcome::Activated,
+            ),
+            KeyCode::Escape => DiffFileListKeyOutcome::Canceled,
+            KeyCode::Char(_)
+            | KeyCode::Tab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Space
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Insert
+            | KeyCode::F(_) => DiffFileListKeyOutcome::Ignored,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilePageDirection {
+    Up,
+    Down,
+}
+
+fn move_file_selection_by_page(
+    state: &mut DiffFileListState,
+    file_count: usize,
+    viewport_height: u16,
+    direction: FilePageDirection,
+) {
+    if file_count == 0 {
+        state.selected = None;
+        state.offset = 0;
+        return;
+    }
+    let page = usize::from(viewport_height.max(1));
+    let selected = state.selected.unwrap_or(0).min(file_count - 1);
+    let next = match direction {
+        FilePageDirection::Up => selected.saturating_sub(page),
+        FilePageDirection::Down => selected.saturating_add(page).min(file_count - 1),
+    };
+    state.select(Some(next));
+    state.ensure_selected_visible(viewport_height, file_count);
 }
 
 /// Changed-file list widget.
@@ -134,6 +281,43 @@ impl<'files> DiffFileList<'files> {
     #[must_use]
     pub const fn file_count(&self) -> usize {
         self.files.len()
+    }
+    /// Register visible file-row hit regions.
+    pub fn register_hits(
+        &self,
+        area: Rect,
+        state: &DiffFileListState,
+        hits: &mut HitMap,
+        id_prefix: &str,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        for (row, index) in (state.offset..self.files.len())
+            .take(usize::from(area.height))
+            .enumerate()
+        {
+            let Ok(row) = u16::try_from(row) else {
+                return;
+            };
+            hits.push(
+                HitRegion::new(
+                    HitId::new(format!("{id_prefix}:{index}")),
+                    Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                )
+                .role(HitRole::ListItem),
+            );
+        }
+    }
+
+    /// Resolve a hit id generated by [`Self::register_hits`] into a file index.
+    #[must_use]
+    pub fn hit_file_index(id: &HitId, id_prefix: &str) -> Option<usize> {
+        id.as_str()
+            .strip_prefix(id_prefix)?
+            .strip_prefix(':')?
+            .parse()
+            .ok()
     }
 }
 
@@ -658,14 +842,17 @@ fn truncate_to_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffFileList, DiffFileListState, DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind,
-        DiffView, DiffViewMode, DiffViewState,
+        DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome, DiffFileListState,
+        DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind, DiffView, DiffViewMode,
+        DiffViewState,
     };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Point, Rect};
+    use crate::hit::HitMap;
     use crate::style::{Color, Modifier, Style};
     use crate::widget::StatefulWidget;
+    use bmux_keyboard::{KeyCode, KeyStroke};
 
     #[test]
     fn diff_file_summary_displays_paths() {
@@ -704,6 +891,51 @@ mod tests {
             frame.buffer().row_symbols(1).as_deref(),
             Some("c.rs +0 -4      ")
         );
+    }
+
+    #[test]
+    fn diff_file_list_key_handler_moves_and_activates() {
+        let mut state = DiffFileListState::new();
+        let handler = DiffFileListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(&mut state, 5, 2, KeyStroke::simple(KeyCode::Down)),
+            DiffFileListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(
+            handler.handle_key(&mut state, 5, 2, KeyStroke::simple(KeyCode::PageDown)),
+            DiffFileListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(2));
+        assert_eq!(state.offset, 1);
+        assert_eq!(
+            handler.handle_key(&mut state, 5, 2, KeyStroke::simple(KeyCode::Enter)),
+            DiffFileListKeyOutcome::Activated(2)
+        );
+    }
+
+    #[test]
+    fn diff_file_list_registers_visible_row_hits() {
+        let files = vec![
+            DiffFileSummary::new("a.rs", 1, 0),
+            DiffFileSummary::new("b.rs", 2, 3),
+            DiffFileSummary::new("c.rs", 0, 4),
+        ];
+        let list = DiffFileList::new(&files);
+        let state = DiffFileListState {
+            selected: Some(2),
+            offset: 1,
+        };
+        let mut hits = HitMap::new();
+
+        list.register_hits(Rect::new(2, 3, 20, 2), &state, &mut hits, "files");
+
+        let hit = hits
+            .hit_test(Point::new(3, 4))
+            .expect("second visible file row should be hittable");
+        assert_eq!(hit.id().as_str(), "files:2");
+        assert_eq!(DiffFileList::hit_file_index(hit.id(), "files"), Some(2));
     }
 
     #[test]
