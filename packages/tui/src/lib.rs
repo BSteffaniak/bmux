@@ -14,6 +14,7 @@ pub mod buffer;
 pub mod chrome;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
+pub mod dialog;
 #[cfg(feature = "diff")]
 pub mod diff;
 pub mod event;
@@ -43,6 +44,7 @@ pub use chrome::{Border, BorderSet, Modal, Panel};
 pub use crossterm::{
     CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
 };
+pub use dialog::{Button, Dialog, DialogAction, DialogState};
 #[cfg(feature = "diff")]
 pub use diff::{DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, DiffViewStyles};
 pub use event::{
@@ -71,9 +73,7 @@ pub use text::{Line, Span, Text};
 pub use text_block::{TextBlock, TextWrap};
 pub use viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
 pub use widget::{StatefulWidget, Widget};
-pub use widgets::{
-    Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker, ListPickerAreas,
-};
+pub use widgets::{Alignment, Dropdown, ListPicker, ListPickerAreas};
 
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
@@ -85,6 +85,7 @@ pub mod prelude {
     pub use crate::crossterm::{
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
     };
+    pub use crate::dialog::{Button, Dialog, DialogAction, DialogState};
     #[cfg(feature = "diff")]
     pub use crate::diff::{
         DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, DiffViewStyles,
@@ -117,7 +118,5 @@ pub mod prelude {
     pub use crate::text_block::{TextBlock, TextWrap};
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
     pub use crate::widget::{StatefulWidget, Widget};
-    pub use crate::widgets::{
-        Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker, ListPickerAreas,
-    };
+    pub use crate::widgets::{Alignment, Dropdown, ListPicker, ListPickerAreas};
 }
