@@ -3,6 +3,7 @@
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 
+use crate::chrome::{Border, Panel};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::{HitId, HitMap, HitRegion, HitRole};
@@ -11,7 +12,6 @@ use crate::layout::{Direction, split_leading};
 use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
 use crate::text::Line;
 use crate::widget::{StatefulWidget, Widget};
-use crate::widgets::{Border, Panel};
 
 /// One command palette item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,10 +288,10 @@ mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
 
     use crate::buffer::Buffer;
+    use crate::chrome::{Border, Panel};
     use crate::frame::Frame;
     use crate::geometry::Rect;
     use crate::widget::StatefulWidget;
-    use crate::widgets::{Border, Panel};
 
     fn items() -> Vec<PaletteItem> {
         vec![

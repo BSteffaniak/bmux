@@ -1,11 +1,12 @@
 //! Transcript/status block primitives.
 
+use crate::chrome::{Border, Panel};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::style::{Color, Modifier, Style};
 use crate::text::{Line, Span, Text};
 use crate::widget::Widget;
-use crate::widgets::{Border, Panel, TextBlock, TextWrap};
+use crate::widgets::{TextBlock, TextWrap};
 
 /// Semantic status level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

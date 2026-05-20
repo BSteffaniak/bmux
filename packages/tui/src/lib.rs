@@ -11,6 +11,7 @@
 pub mod ansi;
 pub mod blocks;
 pub mod buffer;
+pub mod chrome;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
 #[cfg(feature = "diff")]
@@ -36,6 +37,7 @@ pub mod widgets;
 pub use ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 pub use blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
 pub use buffer::{Buffer, Cell};
+pub use chrome::{Border, BorderSet, Modal, Panel};
 #[cfg(feature = "crossterm")]
 pub use crossterm::{
     CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
@@ -68,8 +70,8 @@ pub use text::{Line, Span, Text};
 pub use viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
-    Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker,
-    ListPickerAreas, Modal, Panel, TextBlock, TextWrap,
+    Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker, ListPickerAreas,
+    TextBlock, TextWrap,
 };
 
 /// Common imports for building BMUX TUI surfaces.
@@ -77,6 +79,7 @@ pub mod prelude {
     pub use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
     pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
+    pub use crate::chrome::{Border, BorderSet, Modal, Panel};
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
@@ -113,7 +116,7 @@ pub mod prelude {
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
     pub use crate::widget::{StatefulWidget, Widget};
     pub use crate::widgets::{
-        Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown,
-        ListPicker, ListPickerAreas, Modal, Panel, TextBlock, TextWrap,
+        Alignment, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker,
+        ListPickerAreas, TextBlock, TextWrap,
     };
 }

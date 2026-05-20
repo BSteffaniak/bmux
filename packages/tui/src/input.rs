@@ -5,12 +5,12 @@ use bmux_text_edit::keyboard::TextKeymap;
 use bmux_text_edit::{TextEditBuffer, TextSelection, VisualCursor};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::chrome::line_with_fallback_style;
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::style::Style;
 use crate::text::Line;
 use crate::widget::Widget;
-use crate::widgets::line_with_fallback_style;
 
 /// Enter-key behavior for text input key handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
