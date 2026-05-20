@@ -27,6 +27,77 @@ pub enum Constraint {
     Fill,
 }
 
+/// Width thresholds for responsive terminal layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Breakpoints {
+    /// Width below this value is compact.
+    pub compact_max_exclusive: u16,
+    /// Width below this value is medium; wider is wide.
+    pub wide_min: u16,
+}
+
+impl Default for Breakpoints {
+    fn default() -> Self {
+        Self {
+            compact_max_exclusive: 80,
+            wide_min: 120,
+        }
+    }
+}
+
+impl Breakpoints {
+    /// Classify a terminal size by configured width thresholds.
+    #[must_use]
+    pub const fn classify(self, size: Size) -> Breakpoint {
+        if size.width < self.compact_max_exclusive {
+            Breakpoint::Compact
+        } else if size.width < self.wide_min {
+            Breakpoint::Medium
+        } else {
+            Breakpoint::Wide
+        }
+    }
+}
+
+/// Values selected by responsive breakpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Responsive<T> {
+    /// Compact value.
+    pub compact: T,
+    /// Medium value.
+    pub medium: T,
+    /// Wide value.
+    pub wide: T,
+}
+
+impl<T: Copy> Responsive<T> {
+    /// Create responsive values.
+    #[must_use]
+    pub const fn new(compact: T, medium: T, wide: T) -> Self {
+        Self {
+            compact,
+            medium,
+            wide,
+        }
+    }
+
+    /// Return the value for a breakpoint.
+    #[must_use]
+    pub const fn for_breakpoint(self, breakpoint: Breakpoint) -> T {
+        match breakpoint {
+            Breakpoint::Compact => self.compact,
+            Breakpoint::Medium => self.medium,
+            Breakpoint::Wide => self.wide,
+        }
+    }
+
+    /// Return the value for a terminal size using default breakpoints.
+    #[must_use]
+    pub const fn for_size(self, size: Size) -> T {
+        self.for_breakpoint(Breakpoint::for_size(size))
+    }
+}
+
 /// Responsive terminal width class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Breakpoint {
@@ -427,10 +498,40 @@ fn rects_for_lengths(area: Rect, direction: Direction, lengths: &[u16]) -> Vec<R
 #[cfg(test)]
 mod tests {
     use super::{
-        Breakpoint, Constraint, Direction, DockLayout, Layout, Split, centered, split,
-        split_leading, split_trailing,
+        Breakpoint, Breakpoints, Constraint, Direction, DockLayout, Layout, Responsive, Split,
+        centered, split, split_leading, split_trailing,
     };
     use crate::geometry::Rect;
+
+    #[test]
+    fn custom_breakpoints_classify_widths() {
+        let breakpoints = Breakpoints {
+            compact_max_exclusive: 50,
+            wide_min: 100,
+        };
+
+        assert_eq!(
+            breakpoints.classify(crate::geometry::Size::new(49, 20)),
+            Breakpoint::Compact
+        );
+        assert_eq!(
+            breakpoints.classify(crate::geometry::Size::new(50, 20)),
+            Breakpoint::Medium
+        );
+        assert_eq!(
+            breakpoints.classify(crate::geometry::Size::new(100, 20)),
+            Breakpoint::Wide
+        );
+    }
+
+    #[test]
+    fn responsive_values_select_by_size() {
+        let columns = Responsive::new(1, 2, 3);
+
+        assert_eq!(columns.for_size(crate::geometry::Size::new(40, 20)), 1);
+        assert_eq!(columns.for_size(crate::geometry::Size::new(100, 20)), 2);
+        assert_eq!(columns.for_size(crate::geometry::Size::new(140, 20)), 3);
+    }
 
     #[test]
     fn breakpoint_classifies_widths() {
@@ -477,6 +578,35 @@ mod tests {
                 first: Rect::new(0, 0, 5, 0),
                 second: Rect::new(0, 0, 5, 3)
             }
+        );
+    }
+
+    #[test]
+    fn tiny_terminal_layouts_remain_deterministic() {
+        let area = Rect::new(0, 0, 1, 1);
+        let dock = DockLayout::new()
+            .top(1)
+            .bottom(1)
+            .left(1)
+            .right(1)
+            .split(area);
+        let splits = Layout::horizontal()
+            .constraints(vec![
+                Constraint::Length(1),
+                Constraint::Fill,
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        assert_eq!(dock.top, Some(Rect::new(0, 0, 1, 1)));
+        assert_eq!(dock.center, Rect::new(1, 1, 0, 0));
+        assert_eq!(
+            splits,
+            vec![
+                Rect::new(0, 0, 1, 1),
+                Rect::new(1, 0, 0, 1),
+                Rect::new(1, 0, 0, 1)
+            ]
         );
     }
 

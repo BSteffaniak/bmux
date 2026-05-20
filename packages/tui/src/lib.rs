@@ -34,7 +34,10 @@ pub use diff::{DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, Di
 pub use focus::{FocusId, FocusKeyOutcome, FocusTrap};
 pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
-pub use layout::{Breakpoint, Constraint, Direction, DockAreas, DockLayout, Layout, Split, split};
+pub use layout::{
+    Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
+    Split, split,
+};
 pub use overlay::{OverlayLayer, OverlayStack};
 pub use style::{Color, Modifier, Style};
 pub use terminal::{DrawStats, Terminal};
@@ -60,7 +63,8 @@ pub mod prelude {
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};
     pub use crate::layout::{
-        Breakpoint, Constraint, Direction, DockAreas, DockLayout, Layout, Split, split,
+        Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
+        Split, split,
     };
     pub use crate::overlay::{OverlayLayer, OverlayStack};
     pub use crate::style::{Color, Modifier, Style};
