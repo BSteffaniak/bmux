@@ -266,3 +266,205 @@ fn push_styled_grapheme(line: &mut Line, grapheme: &str, style: Style) {
     }
     line.push_span(crate::text::Span::styled(grapheme.to_owned(), style));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
+    use crate::buffer::Buffer;
+    use crate::frame::Frame;
+    use crate::geometry::Rect;
+    use crate::style::{Modifier, Style};
+    use crate::widget::Widget;
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+    use bmux_text_edit::TextEditBuffer;
+
+    #[test]
+    fn text_input_key_handler_inserts_characters_and_deletes() {
+        let mut edit = TextEditBuffer::new();
+        let handler = TextInputKeyHandler::default();
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Char('a'))),
+            TextInputKeyOutcome::Edited
+        );
+        assert_eq!(edit.text(), "a");
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Backspace)),
+            TextInputKeyOutcome::Edited
+        );
+        assert_eq!(edit.text(), "");
+    }
+
+    #[test]
+    fn text_input_key_handler_supports_submit_enter_behavior() {
+        let mut edit = TextEditBuffer::from_text("run");
+        let handler = TextInputKeyHandler::new(
+            bmux_text_edit::keyboard::TextKeymap::default(),
+            TextInputEnterBehavior::Submit,
+        );
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Enter)),
+            TextInputKeyOutcome::Submitted
+        );
+        assert_eq!(edit.text(), "run");
+    }
+
+    #[test]
+    fn text_input_key_handler_inserts_newline_by_default() {
+        let mut edit = TextEditBuffer::from_text("a");
+        let handler = TextInputKeyHandler::default();
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Enter)),
+            TextInputKeyOutcome::Edited
+        );
+        assert_eq!(edit.text(), "a\n");
+    }
+
+    #[test]
+    fn text_input_key_handler_ignores_unknown_keys() {
+        let mut edit = TextEditBuffer::new();
+        let handler = TextInputKeyHandler::default();
+
+        assert_eq!(
+            handler.handle_key(&mut edit, KeyStroke::simple(KeyCode::Escape)),
+            TextInputKeyOutcome::Ignored
+        );
+        assert_eq!(
+            handler.handle_key(
+                &mut edit,
+                KeyStroke::with_modifiers(
+                    KeyCode::Char('x'),
+                    Modifiers {
+                        super_key: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+            ),
+            TextInputKeyOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn text_input_renders_placeholder_and_cursor_for_empty_buffer() {
+        let edit = TextEditBuffer::new();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInput::new(&edit)
+            .placeholder("Ask")
+            .render(Rect::new(0, 0, 8, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Ask     "));
+        assert_eq!(
+            frame.cursor(),
+            Some(crate::frame::Cursor::visible(crate::geometry::Point::new(
+                0, 0
+            )))
+        );
+    }
+
+    #[test]
+    fn text_input_renders_wrapped_text_and_cursor() {
+        let edit = TextEditBuffer::from_text("hello world");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInput::new(&edit).render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hello"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("world"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("     "));
+        assert_eq!(
+            frame.cursor(),
+            Some(crate::frame::Cursor::visible(crate::geometry::Point::new(
+                5, 1
+            )))
+        );
+    }
+
+    #[test]
+    fn text_input_supports_vertical_scroll() {
+        let edit = TextEditBuffer::from_text("abcdef");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInput::new(&edit)
+            .vertical_scroll(1)
+            .render(Rect::new(0, 0, 3, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn text_input_styles_selection() {
+        let mut edit = TextEditBuffer::from_text("hello");
+        edit.move_cursor(bmux_text_edit::TextMotion::Start);
+        edit.move_cursor_with_selection(
+            bmux_text_edit::TextMotion::Right,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        edit.move_cursor_with_selection(
+            bmux_text_edit::TextMotion::Right,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let selection_style = Style::new().add_modifier(Modifier::REVERSED);
+
+        TextInput::new(&edit)
+            .selection_style(selection_style)
+            .render(Rect::new(0, 0, 5, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hello"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(selection_style)
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(1, 0))
+                .map(|cell| cell.style),
+            Some(selection_style)
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(2, 0))
+                .map(|cell| cell.style),
+            Some(Style::new())
+        );
+    }
+
+    #[test]
+    fn text_input_selection_can_span_wrapped_lines() {
+        let mut edit = TextEditBuffer::from_text("abcd");
+        edit.move_cursor(bmux_text_edit::TextMotion::Start);
+        edit.move_cursor_with_selection(
+            bmux_text_edit::TextMotion::End,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let selection_style = Style::new().add_modifier(Modifier::REVERSED);
+
+        TextInput::new(&edit)
+            .selection_style(selection_style)
+            .render(Rect::new(0, 0, 2, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("ab"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("cd"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 1))
+                .map(|cell| cell.style),
+            Some(selection_style)
+        );
+    }
+}

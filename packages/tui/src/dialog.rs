@@ -230,3 +230,76 @@ fn render_dialog_actions(
         x = x.saturating_add(width).saturating_add(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Button, Dialog, DialogAction, DialogState};
+    use crate::buffer::Buffer;
+    use crate::chrome::{Border, Panel};
+    use crate::frame::Frame;
+    use crate::geometry::Rect;
+    use crate::style::{Color, Style};
+    use crate::widget::{StatefulWidget, Widget};
+
+    #[test]
+    fn button_renders_focus_style() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let focus = Style::new().bg(Color::Blue);
+
+        Button::new("Run")
+            .focused_style(focus)
+            .focused(true)
+            .render(Rect::new(0, 0, 8, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ Run ] "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(focus)
+        );
+    }
+
+    #[test]
+    fn dialog_renders_body_and_actions() {
+        let actions = vec![
+            DialogAction::new("allow", "Allow"),
+            DialogAction::new("deny", "Deny"),
+        ];
+        let mut state = DialogState { focused_action: 1 };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        Dialog::new("Permit action?", &actions)
+            .panel(Panel::new().border(Border::ascii()).title("Permission"))
+            .render(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("+Permission--------+")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("|Permit action?    |")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(3).as_deref(),
+            Some("|[ Allow ] [ Deny ]|")
+        );
+        assert_eq!(state.focused_action, 1);
+    }
+
+    #[test]
+    fn dialog_state_cycles_actions() {
+        let mut state = DialogState::default();
+
+        state.focus_next(2);
+        assert_eq!(state.focused_action, 1);
+        state.focus_next(2);
+        assert_eq!(state.focused_action, 0);
+        state.focus_previous(2);
+        assert_eq!(state.focused_action, 1);
+    }
+}

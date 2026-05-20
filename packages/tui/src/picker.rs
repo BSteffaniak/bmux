@@ -186,3 +186,90 @@ impl ListPicker<'_> {
         self.items.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Dropdown, ListPicker, ListPickerAreas};
+    use crate::buffer::Buffer;
+    use crate::chrome::{Border, Panel};
+    use crate::frame::Frame;
+    use crate::geometry::Rect;
+    use crate::list::{ListItem, ListState};
+    use crate::widget::StatefulWidget;
+    use bmux_text_edit::TextEditBuffer;
+
+    #[test]
+    fn dropdown_renders_list_with_panel_and_height_limit() {
+        let items = vec![
+            ListItem::new("one"),
+            ListItem::new("two"),
+            ListItem::new("three"),
+        ];
+        let mut state = ListState {
+            selected: Some(1),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Dropdown::new(&items)
+            .panel(Panel::new().border(Border::ascii()))
+            .max_height(3)
+            .render(Rect::new(0, 0, 8, 4), &mut frame, &mut state);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("+------+"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("|two   |"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("+------+"));
+        assert_eq!(state.offset, 1);
+    }
+
+    #[test]
+    fn dropdown_content_area_accounts_for_panel_and_limit() {
+        let items = vec![ListItem::new("one")];
+        let dropdown = Dropdown::new(&items)
+            .panel(Panel::new().border(Border::single()))
+            .max_height(5);
+
+        assert_eq!(
+            dropdown.content_area(Rect::new(2, 3, 10, 8)),
+            Rect::new(3, 4, 8, 3)
+        );
+    }
+
+    #[test]
+    fn list_picker_computes_content_areas() {
+        let input = TextEditBuffer::new();
+        let items = vec![ListItem::new("one")];
+        let picker = ListPicker::new(&input, &items)
+            .panel(Panel::new().border(Border::ascii()))
+            .input_height(2)
+            .gap(1);
+
+        assert_eq!(picker.item_count(), 1);
+        assert_eq!(
+            picker.content_areas(Rect::new(0, 0, 10, 6)),
+            ListPickerAreas {
+                input: Rect::new(1, 1, 8, 2),
+                list: Rect::new(1, 4, 8, 1),
+            }
+        );
+    }
+
+    #[test]
+    fn list_picker_renders_panel_input_and_list() {
+        let input = TextEditBuffer::from_text("f");
+        let items = vec![ListItem::new("foo"), ListItem::new("bar")];
+        let mut state = ListState {
+            selected: Some(1),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        ListPicker::new(&input, &items).render(Rect::new(0, 0, 8, 5), &mut frame, &mut state);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("┌──────┐"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("│f     │"));
+        assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("│bar   │"));
+    }
+}

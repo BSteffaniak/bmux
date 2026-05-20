@@ -347,3 +347,111 @@ pub(crate) fn line_with_fallback_style(line: &Line, style: Style) -> Line {
             .collect::<Vec<_>>(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Border, Modal, Panel};
+    use crate::buffer::Buffer;
+    use crate::frame::Frame;
+    use crate::geometry::{Insets, Rect, Size};
+    use crate::style::{Color, Style};
+    use crate::text_block::TextBlock;
+    use crate::widget::Widget;
+
+    #[test]
+    fn modal_centers_panel_and_renders_child_in_inner_area() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 5));
+        let mut frame = Frame::new(&mut buffer);
+        let child = TextBlock::new("Hi");
+        let modal = Modal::new(Size::new(6, 3)).child(&child);
+
+        modal.render(Rect::new(0, 0, 10, 5), &mut frame);
+
+        assert_eq!(
+            modal.panel_area(Rect::new(0, 0, 10, 5)),
+            Rect::new(2, 1, 6, 3)
+        );
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  ┌────┐  "));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("  │Hi  │  "));
+        assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("  └────┘  "));
+    }
+
+    #[test]
+    fn modal_scrim_fills_parent_area_before_panel() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+        let scrim = Style::new().bg(Color::BrightBlack);
+        let panel = Panel::new().border(Border::ascii());
+        let modal: Modal<'_, TextBlock> = Modal::new(Size::new(3, 3)).panel(panel).scrim(scrim);
+
+        modal.render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" +-+ "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(scrim)
+        );
+    }
+
+    #[test]
+    fn panel_reports_inner_area() {
+        let panel = Panel::new()
+            .border(Border::single())
+            .padding(Insets::new(1, 2, 3, 4));
+
+        assert_eq!(
+            panel.inner_area(Rect::new(0, 0, 20, 10)),
+            Rect::new(5, 2, 12, 4)
+        );
+    }
+
+    #[test]
+    fn panel_renders_single_border() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Panel::new()
+            .border(Border::single())
+            .render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("┌───┐"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("│   │"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("└───┘"));
+    }
+
+    #[test]
+    fn panel_renders_title_over_top_border() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Panel::new()
+            .border(Border::ascii())
+            .title("Title")
+            .render(Rect::new(0, 0, 8, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("+Title-+"));
+    }
+
+    #[test]
+    fn panel_background_fills_area() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let style = Style::new().bg(Color::Blue);
+
+        Panel::new()
+            .background(style)
+            .render(Rect::new(0, 0, 4, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("    "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(style)
+        );
+    }
+}

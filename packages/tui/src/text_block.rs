@@ -8,7 +8,18 @@ use crate::geometry::Rect;
 use crate::style::Style;
 use crate::text::{Line, Text};
 use crate::widget::Widget;
-use crate::widgets::Alignment;
+
+/// Horizontal text alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Alignment {
+    /// Align to the left edge.
+    #[default]
+    Left,
+    /// Center within the available width.
+    Center,
+    /// Align to the right edge.
+    Right,
+}
 
 /// Text wrapping policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,4 +197,89 @@ fn line_width(line: &Line) -> u16 {
         .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_str()))
         .sum();
     u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Alignment, TextBlock, TextWrap};
+    use crate::buffer::Buffer;
+    use crate::frame::Frame;
+    use crate::geometry::Rect;
+    use crate::style::{Color, Style};
+    use crate::text::{Line, Text};
+    use crate::widget::Widget;
+
+    #[test]
+    fn text_block_wraps_at_grapheme_boundaries() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextBlock::new("abcdef")
+            .wrap(TextWrap::Character)
+            .render(Rect::new(0, 0, 4, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("abcd"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("ef  "));
+    }
+
+    #[test]
+    fn text_block_wrap_preserves_styles() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let style = Style::new().fg(Color::Red);
+        let text = Text::from_lines(vec![Line::from_spans(vec![crate::text::Span::styled(
+            "abcd", style,
+        )])]);
+
+        TextBlock::new(text)
+            .wrap(TextWrap::Character)
+            .render(Rect::new(0, 0, 2, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("cd"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 1))
+                .map(|cell| cell.style),
+            Some(style)
+        );
+    }
+
+    #[test]
+    fn text_block_supports_trim_and_vertical_scroll() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let text = Text::from_lines(vec![Line::raw("ab  "), Line::raw("cd")]);
+
+        TextBlock::new(text)
+            .trim(true)
+            .vertical_scroll(1)
+            .render(Rect::new(0, 0, 4, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cd  "));
+    }
+
+    #[test]
+    fn text_block_renders_lines() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let text = Text::from_lines(vec![Line::raw("hi"), Line::raw("yo")]);
+
+        TextBlock::new(text).render(Rect::new(0, 0, 5, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hi   "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("yo   "));
+    }
+
+    #[test]
+    fn text_block_honors_center_alignment() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextBlock::new("hi")
+            .alignment(Alignment::Center)
+            .render(Rect::new(0, 0, 6, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  hi  "));
+    }
 }

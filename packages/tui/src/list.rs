@@ -326,3 +326,199 @@ impl List<'_> {
         line
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
+    use crate::buffer::Buffer;
+    use crate::frame::Frame;
+    use crate::geometry::Rect;
+    use crate::style::{Modifier, Style};
+    use crate::widget::StatefulWidget;
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+
+    #[test]
+    fn list_renders_visible_window_and_selection() {
+        let items = vec![
+            ListItem::new("one"),
+            ListItem::new("two"),
+            ListItem::new("three"),
+            ListItem::new("four"),
+        ];
+        let mut state = ListState {
+            selected: Some(2),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 7, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let selected_style = Style::new().add_modifier(Modifier::REVERSED);
+
+        List::new(&items).selected_style(selected_style).render(
+            Rect::new(0, 0, 7, 2),
+            &mut frame,
+            &mut state,
+        );
+
+        assert_eq!(state.offset, 1);
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("two    "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("three  "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 1))
+                .map(|cell| cell.style),
+            Some(selected_style)
+        );
+    }
+
+    #[test]
+    fn list_state_moves_selection_with_bounds() {
+        let mut state = ListState::new();
+
+        state.select_next(3);
+        assert_eq!(state.selected, Some(0));
+        state.select_next(3);
+        state.select_next(3);
+        state.select_next(3);
+        assert_eq!(state.selected, Some(2));
+        state.select_previous(3);
+        assert_eq!(state.selected, Some(1));
+        state.select_previous(0);
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn list_renders_highlight_symbol_for_selected_item() {
+        let items = vec![ListItem::new("one"), ListItem::new("two")];
+        let mut state = ListState {
+            selected: Some(0),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        List::new(&items).highlight_symbol("> ").render(
+            Rect::new(0, 0, 6, 1),
+            &mut frame,
+            &mut state,
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("> one "));
+    }
+
+    #[test]
+    fn list_registers_visible_row_hit_regions() {
+        let items = vec![
+            ListItem::new("one"),
+            ListItem::new("two"),
+            ListItem::new("three"),
+            ListItem::new("four"),
+        ];
+        let list = List::new(&items);
+        let state = ListState {
+            selected: Some(2),
+            offset: 1,
+        };
+        let mut hits = crate::hit::HitMap::new();
+
+        list.register_hits(Rect::new(5, 2, 10, 2), &state, &mut hits, "files");
+
+        assert_eq!(hits.regions().len(), 2);
+        let hit = hits
+            .hit_test(crate::geometry::Point::new(6, 3))
+            .expect("second visible row should be hittable");
+        assert_eq!(hit.id().as_str(), "files:2");
+        assert_eq!(hit.role(), crate::hit::HitRole::ListItem);
+        assert_eq!(List::hit_item_index(hit.id(), "files"), Some(2));
+    }
+
+    #[test]
+    fn list_hit_item_index_rejects_other_prefixes() {
+        assert_eq!(
+            List::hit_item_index(&crate::hit::HitId::new("other:7"), "files"),
+            None
+        );
+        assert_eq!(
+            List::hit_item_index(&crate::hit::HitId::new("files:not-number"), "files"),
+            None
+        );
+    }
+
+    #[test]
+    fn list_key_handler_moves_and_pages_selection() {
+        let mut state = ListState::new();
+        let handler = ListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(&mut state, 10, 3, KeyStroke::simple(KeyCode::Down)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(
+            handler.handle_key(&mut state, 10, 3, KeyStroke::simple(KeyCode::PageDown)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(3));
+        assert_eq!(state.offset, 1);
+        assert_eq!(
+            handler.handle_key(&mut state, 10, 3, KeyStroke::simple(KeyCode::PageUp)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn list_key_handler_supports_home_end_activate_and_cancel() {
+        let mut state = ListState {
+            selected: Some(1),
+            offset: 0,
+        };
+        let handler = ListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::End)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(3));
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Home)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Enter)),
+            ListKeyOutcome::Activated
+        );
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Escape)),
+            ListKeyOutcome::Canceled
+        );
+    }
+
+    #[test]
+    fn list_key_handler_ignores_modified_and_unmapped_keys() {
+        let mut state = ListState::new();
+        let handler = ListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(
+                &mut state,
+                4,
+                2,
+                KeyStroke::with_modifiers(
+                    KeyCode::Down,
+                    Modifiers {
+                        shift: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+            ),
+            ListKeyOutcome::Ignored
+        );
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Char('x'))),
+            ListKeyOutcome::Ignored
+        );
+    }
+}
