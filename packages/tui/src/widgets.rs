@@ -455,6 +455,112 @@ impl ListState {
     }
 }
 
+/// Result of handling a key stroke for a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKeyOutcome {
+    /// The key was not recognized as list input.
+    Ignored,
+    /// Selection or scroll position changed.
+    Moved,
+    /// The selected item was activated.
+    Activated,
+    /// The list interaction was canceled.
+    Canceled,
+}
+
+/// Key handling policy for selectable lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListKeyHandler;
+
+impl ListKeyHandler {
+    /// Apply a key stroke to list state.
+    pub fn handle_key(
+        self,
+        state: &mut ListState,
+        item_count: usize,
+        viewport_height: u16,
+        stroke: KeyStroke,
+    ) -> ListKeyOutcome {
+        if !stroke.modifiers.is_empty() {
+            return ListKeyOutcome::Ignored;
+        }
+        match stroke.key {
+            KeyCode::Up => {
+                state.select_previous(item_count);
+                state.ensure_selected_visible(viewport_height, item_count);
+                ListKeyOutcome::Moved
+            }
+            KeyCode::Down => {
+                state.select_next(item_count);
+                state.ensure_selected_visible(viewport_height, item_count);
+                ListKeyOutcome::Moved
+            }
+            KeyCode::Home => {
+                state.select(if item_count == 0 { None } else { Some(0) });
+                state.ensure_selected_visible(viewport_height, item_count);
+                ListKeyOutcome::Moved
+            }
+            KeyCode::End => {
+                state.select(item_count.checked_sub(1));
+                state.ensure_selected_visible(viewport_height, item_count);
+                ListKeyOutcome::Moved
+            }
+            KeyCode::PageUp => {
+                move_selection_by_page(state, item_count, viewport_height, PageDirection::Up);
+                ListKeyOutcome::Moved
+            }
+            KeyCode::PageDown => {
+                move_selection_by_page(state, item_count, viewport_height, PageDirection::Down);
+                ListKeyOutcome::Moved
+            }
+            KeyCode::Enter => {
+                if state.selected.is_some() {
+                    ListKeyOutcome::Activated
+                } else {
+                    ListKeyOutcome::Ignored
+                }
+            }
+            KeyCode::Escape => ListKeyOutcome::Canceled,
+            KeyCode::Char(_)
+            | KeyCode::Tab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Space
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Insert
+            | KeyCode::F(_) => ListKeyOutcome::Ignored,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageDirection {
+    Up,
+    Down,
+}
+
+fn move_selection_by_page(
+    state: &mut ListState,
+    item_count: usize,
+    viewport_height: u16,
+    direction: PageDirection,
+) {
+    if item_count == 0 {
+        state.selected = None;
+        state.offset = 0;
+        return;
+    }
+    let page = usize::from(viewport_height.max(1));
+    let selected = state.selected.unwrap_or(0).min(item_count - 1);
+    let next = match direction {
+        PageDirection::Up => selected.saturating_sub(page),
+        PageDirection::Down => selected.saturating_add(page).min(item_count - 1),
+    };
+    state.select(Some(next));
+    state.ensure_selected_visible(viewport_height, item_count);
+}
+
 /// A virtualized single-line list widget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct List<'items> {
@@ -983,8 +1089,9 @@ fn line_width(line: &Line) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, Border, List, ListItem, ListState, Modal, Panel, TextBlock, TextInput,
-        TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome, TextWrap,
+        Alignment, Border, List, ListItem, ListKeyHandler, ListKeyOutcome, ListState, Modal, Panel,
+        TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
+        TextWrap,
     };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
@@ -1231,6 +1338,84 @@ mod tests {
         );
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("> one "));
+    }
+
+    #[test]
+    fn list_key_handler_moves_and_pages_selection() {
+        let mut state = ListState::new();
+        let handler = ListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(&mut state, 10, 3, KeyStroke::simple(KeyCode::Down)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(
+            handler.handle_key(&mut state, 10, 3, KeyStroke::simple(KeyCode::PageDown)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(3));
+        assert_eq!(state.offset, 1);
+        assert_eq!(
+            handler.handle_key(&mut state, 10, 3, KeyStroke::simple(KeyCode::PageUp)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn list_key_handler_supports_home_end_activate_and_cancel() {
+        let mut state = ListState {
+            selected: Some(1),
+            offset: 0,
+        };
+        let handler = ListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::End)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(3));
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Home)),
+            ListKeyOutcome::Moved
+        );
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Enter)),
+            ListKeyOutcome::Activated
+        );
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Escape)),
+            ListKeyOutcome::Canceled
+        );
+    }
+
+    #[test]
+    fn list_key_handler_ignores_modified_and_unmapped_keys() {
+        let mut state = ListState::new();
+        let handler = ListKeyHandler;
+
+        assert_eq!(
+            handler.handle_key(
+                &mut state,
+                4,
+                2,
+                KeyStroke::with_modifiers(
+                    KeyCode::Down,
+                    Modifiers {
+                        shift: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+            ),
+            ListKeyOutcome::Ignored
+        );
+        assert_eq!(
+            handler.handle_key(&mut state, 4, 2, KeyStroke::simple(KeyCode::Char('x'))),
+            ListKeyOutcome::Ignored
+        );
     }
 
     #[test]
