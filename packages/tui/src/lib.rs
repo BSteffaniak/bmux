@@ -20,6 +20,7 @@ pub mod focus;
 pub mod frame;
 pub mod geometry;
 pub mod history;
+pub mod hit;
 pub mod layout;
 pub mod overlay;
 pub mod palette;
@@ -45,6 +46,7 @@ pub use focus::{FocusId, FocusKeyOutcome, FocusTrap};
 pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
 pub use history::{TextInputHistory, TextInputHistoryDirection, TextInputHistoryState};
+pub use hit::{Hit, HitId, HitMap, HitRegion, HitRole};
 pub use layout::{
     Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
     Split, split,
@@ -82,6 +84,7 @@ pub mod prelude {
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};
     pub use crate::history::{TextInputHistory, TextInputHistoryDirection, TextInputHistoryState};
+    pub use crate::hit::{Hit, HitId, HitMap, HitRegion, HitRole};
     pub use crate::layout::{
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
         Split, split,
