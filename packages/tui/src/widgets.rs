@@ -936,7 +936,7 @@ impl Widget for TextInput<'_> {
         let projection = self.project(area);
         let rendered_lines = selected_wrapped_lines(
             self.buffer.text(),
-            usize::from(area.width.max(1)),
+            &self.buffer.wrapped_layout(usize::from(area.width.max(1))),
             self.buffer.selection(),
             self.style,
             self.selection_style,
@@ -971,41 +971,28 @@ impl Widget for TextInput<'_> {
 
 fn selected_wrapped_lines(
     text: &str,
-    width: usize,
+    layout: &bmux_text_edit::WrapLayout,
     selection: Option<TextSelection>,
     base_style: Style,
     selection_style: Style,
 ) -> Vec<Line> {
-    let width = width.max(1);
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-
-    for (start, grapheme) in text.grapheme_indices(true) {
-        if grapheme == "\n" {
-            lines.push(Line::new());
-            row = row.saturating_add(1);
-            col = 0;
-            continue;
-        }
-
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if col > 0 && col.saturating_add(grapheme_width) > width {
-            lines.push(Line::new());
-            row = row.saturating_add(1);
-            col = 0;
-        }
-
-        let style = if selection_contains(selection, start) {
-            base_style.patch(selection_style)
-        } else {
-            base_style
-        };
-        push_styled_grapheme(&mut lines[row], grapheme, style);
-        col = col.saturating_add(grapheme_width);
-    }
-
-    lines
+    layout
+        .line_ranges
+        .iter()
+        .map(|range| {
+            let mut line = Line::new();
+            for (offset, grapheme) in text[range.clone()].grapheme_indices(true) {
+                let start = range.start.saturating_add(offset);
+                let style = if selection_contains(selection, start) {
+                    base_style.patch(selection_style)
+                } else {
+                    base_style
+                };
+                push_styled_grapheme(&mut line, grapheme, style);
+            }
+            line
+        })
+        .collect()
 }
 
 fn selection_contains(selection: Option<TextSelection>, byte_index: usize) -> bool {
@@ -1352,12 +1339,12 @@ mod tests {
         TextInput::new(&edit).render(Rect::new(0, 0, 5, 3), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hello"));
-        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some(" worl"));
-        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("d    "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("world"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("     "));
         assert_eq!(
             frame.cursor(),
             Some(crate::frame::Cursor::visible(crate::geometry::Point::new(
-                1, 2
+                5, 1
             )))
         );
     }

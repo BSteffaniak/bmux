@@ -7,6 +7,7 @@
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
 
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -26,6 +27,8 @@ pub struct VisualCursor {
 pub struct WrapLayout {
     /// Renderable visual lines.
     pub lines: Vec<String>,
+    /// Original buffer byte ranges for each visual line.
+    pub line_ranges: Vec<Range<usize>>,
     /// Cursor position in the visual line grid.
     pub cursor: VisualCursor,
 }
@@ -630,8 +633,15 @@ impl TextEditBuffer {
     #[must_use]
     pub fn wrapped_layout(&self, width: usize) -> WrapLayout {
         let projection = self.wrapped_projection(width);
+        let line_ranges = projection
+            .lines
+            .iter()
+            .zip(projection.line_starts.iter().copied())
+            .map(|(line, start)| start..start.saturating_add(line.len()))
+            .collect();
         WrapLayout {
             lines: projection.lines,
+            line_ranges,
             cursor: projection.cursor,
         }
     }
@@ -656,6 +666,14 @@ impl TextEditBuffer {
             }
 
             if col > 0 && col.saturating_add(span.width) > width {
+                if is_wrapping_whitespace(grapheme) {
+                    lines.push(String::new());
+                    line_starts.push(span.end);
+                    row = row.saturating_add(1);
+                    col = 0;
+                    break_after_whitespace = None;
+                    continue;
+                }
                 if let Some(break_start) = break_after_whitespace
                     && break_start > line_starts[row]
                     && break_start < span.start
