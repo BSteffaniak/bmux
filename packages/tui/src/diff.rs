@@ -135,12 +135,21 @@ impl Default for DiffViewStyles {
     }
 }
 
+/// One rendered diff row after applying view transforms such as folding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffRenderRow {
+    Line(usize),
+    Fold { start: usize, count: usize },
+}
+
 /// Virtualized diff view widget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffView<'lines> {
     lines: &'lines [DiffLine],
     mode: DiffViewMode,
     styles: DiffViewStyles,
+    fold_context_threshold: Option<usize>,
+    fold_context_keep: usize,
 }
 
 impl<'lines> DiffView<'lines> {
@@ -158,6 +167,8 @@ impl<'lines> DiffView<'lines> {
                 removed: Style::new(),
                 gutter: Style::new(),
             },
+            fold_context_threshold: None,
+            fold_context_keep: 3,
         }
     }
 
@@ -172,6 +183,24 @@ impl<'lines> DiffView<'lines> {
     #[must_use]
     pub const fn styles(mut self, styles: DiffViewStyles) -> Self {
         self.styles = styles;
+        self
+    }
+
+    /// Fold long runs of unchanged context lines.
+    ///
+    /// Runs longer than `threshold` keep `keep_edges` lines at each edge and
+    /// render the middle as one folded summary row.
+    #[must_use]
+    pub const fn fold_context(mut self, threshold: usize, keep_edges: usize) -> Self {
+        self.fold_context_threshold = Some(threshold);
+        self.fold_context_keep = keep_edges;
+        self
+    }
+
+    /// Disable context folding.
+    #[must_use]
+    pub const fn without_context_folding(mut self) -> Self {
+        self.fold_context_threshold = None;
         self
     }
 
@@ -217,9 +246,9 @@ impl StatefulWidget for DiffView<'_> {
         if area.is_empty() {
             return;
         }
-        state.offset = state.offset.min(self.lines.len().saturating_sub(1));
-        for (row, line) in self
-            .lines
+        let rows = self.render_rows();
+        state.offset = state.offset.min(rows.len().saturating_sub(1));
+        for (row, render_row) in rows
             .iter()
             .skip(state.offset)
             .take(usize::from(area.height))
@@ -228,9 +257,17 @@ impl StatefulWidget for DiffView<'_> {
             let Ok(row) = u16::try_from(row) else {
                 return;
             };
-            let rendered = match self.resolved_mode(area) {
-                DiffViewMode::Unified | DiffViewMode::Responsive => self.render_unified_line(line),
-                DiffViewMode::SideBySide => self.render_side_by_side_line(line, area.width),
+            let rendered = match *render_row {
+                DiffRenderRow::Line(index) => {
+                    let line = &self.lines[index];
+                    match self.resolved_mode(area) {
+                        DiffViewMode::Unified | DiffViewMode::Responsive => {
+                            self.render_unified_line(line)
+                        }
+                        DiffViewMode::SideBySide => self.render_side_by_side_line(line, area.width),
+                    }
+                }
+                DiffRenderRow::Fold { count, .. } => self.render_fold_line(count),
             };
             frame.write_line(
                 Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
@@ -241,6 +278,42 @@ impl StatefulWidget for DiffView<'_> {
 }
 
 impl DiffView<'_> {
+    fn render_rows(&self) -> Vec<DiffRenderRow> {
+        let Some(threshold) = self.fold_context_threshold else {
+            return (0..self.lines.len()).map(DiffRenderRow::Line).collect();
+        };
+        let mut rows = Vec::new();
+        let mut index = 0usize;
+        while index < self.lines.len() {
+            if self.lines[index].kind != DiffLineKind::Context {
+                rows.push(DiffRenderRow::Line(index));
+                index = index.saturating_add(1);
+                continue;
+            }
+            let start = index;
+            while index < self.lines.len() && self.lines[index].kind == DiffLineKind::Context {
+                index = index.saturating_add(1);
+            }
+            let count = index.saturating_sub(start);
+            if count <= threshold || self.fold_context_keep.saturating_mul(2) >= count {
+                rows.extend((start..index).map(DiffRenderRow::Line));
+                continue;
+            }
+            rows.extend(
+                (start..start.saturating_add(self.fold_context_keep)).map(DiffRenderRow::Line),
+            );
+            let fold_count = count.saturating_sub(self.fold_context_keep.saturating_mul(2));
+            rows.push(DiffRenderRow::Fold {
+                start: start.saturating_add(self.fold_context_keep),
+                count: fold_count,
+            });
+            rows.extend(
+                (index.saturating_sub(self.fold_context_keep)..index).map(DiffRenderRow::Line),
+            );
+        }
+        rows
+    }
+
     fn render_unified_line(&self, line: &DiffLine) -> Line {
         let style = self.style_for(line.kind);
         let prefix = match line.kind {
@@ -253,6 +326,13 @@ impl DiffView<'_> {
             Span::styled(prefix, style),
             Span::styled(line.content.clone(), style),
         ])
+    }
+
+    fn render_fold_line(&self, count: usize) -> Line {
+        Line::from_spans(vec![Span::styled(
+            format!("   ·    ·  ⋯ {count} unchanged lines folded"),
+            self.styles.gutter,
+        )])
     }
 
     fn render_side_by_side_line(&self, line: &DiffLine, width: u16) -> Line {
@@ -394,6 +474,37 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("   2    2  two  ")
+        );
+    }
+
+    #[test]
+    fn diff_view_folds_long_context_ranges() {
+        let lines = vec![
+            DiffLine::new(DiffLineKind::HunkHeader, None, None, "@@"),
+            DiffLine::new(DiffLineKind::Context, Some(1), Some(1), "one"),
+            DiffLine::new(DiffLineKind::Context, Some(2), Some(2), "two"),
+            DiffLine::new(DiffLineKind::Context, Some(3), Some(3), "three"),
+            DiffLine::new(DiffLineKind::Context, Some(4), Some(4), "four"),
+            DiffLine::new(DiffLineKind::Context, Some(5), Some(5), "five"),
+            DiffLine::new(DiffLineKind::Added, None, Some(6), "six"),
+        ];
+        let mut state = DiffViewState::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        DiffView::new(&lines).fold_context(3, 1).render(
+            Rect::new(0, 0, 40, 5),
+            &mut frame,
+            &mut state,
+        );
+
+        assert_eq!(
+            frame.buffer().row_symbols(2).as_deref(),
+            Some("   ·    ·  ⋯ 3 unchanged lines folded   ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(3).as_deref(),
+            Some("   5    5  five                         ")
         );
     }
 
