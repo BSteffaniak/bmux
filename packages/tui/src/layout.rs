@@ -151,6 +151,112 @@ pub const fn split_trailing(area: Rect, direction: Direction, length: u16) -> Sp
     }
 }
 
+/// Rectangles produced by a dock layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DockAreas {
+    /// Top docked area.
+    pub top: Option<Rect>,
+    /// Bottom docked area.
+    pub bottom: Option<Rect>,
+    /// Left docked area.
+    pub left: Option<Rect>,
+    /// Right docked area.
+    pub right: Option<Rect>,
+    /// Remaining center area.
+    pub center: Rect,
+}
+
+/// Fixed-edge dock layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DockLayout {
+    top: Option<u16>,
+    bottom: Option<u16>,
+    left: Option<u16>,
+    right: Option<u16>,
+}
+
+impl DockLayout {
+    /// Create an empty dock layout.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            top: None,
+            bottom: None,
+            left: None,
+            right: None,
+        }
+    }
+
+    /// Dock a fixed-height top area.
+    #[must_use]
+    pub const fn top(mut self, height: u16) -> Self {
+        self.top = Some(height);
+        self
+    }
+
+    /// Dock a fixed-height bottom area.
+    #[must_use]
+    pub const fn bottom(mut self, height: u16) -> Self {
+        self.bottom = Some(height);
+        self
+    }
+
+    /// Dock a fixed-width left area.
+    #[must_use]
+    pub const fn left(mut self, width: u16) -> Self {
+        self.left = Some(width);
+        self
+    }
+
+    /// Dock a fixed-width right area.
+    #[must_use]
+    pub const fn right(mut self, width: u16) -> Self {
+        self.right = Some(width);
+        self
+    }
+
+    /// Resolve docked areas for `area`.
+    #[must_use]
+    pub const fn split(self, area: Rect) -> DockAreas {
+        let mut center = area;
+        let top = if let Some(height) = self.top {
+            let split = split_leading(center, Direction::Vertical, height);
+            center = split.second;
+            Some(split.first)
+        } else {
+            None
+        };
+        let bottom = if let Some(height) = self.bottom {
+            let split = split_trailing(center, Direction::Vertical, height);
+            center = split.first;
+            Some(split.second)
+        } else {
+            None
+        };
+        let left = if let Some(width) = self.left {
+            let split = split_leading(center, Direction::Horizontal, width);
+            center = split.second;
+            Some(split.first)
+        } else {
+            None
+        };
+        let right = if let Some(width) = self.right {
+            let split = split_trailing(center, Direction::Horizontal, width);
+            center = split.first;
+            Some(split.second)
+        } else {
+            None
+        };
+        DockAreas {
+            top,
+            bottom,
+            left,
+            right,
+            center,
+        }
+    }
+}
+
 /// A simple directional layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -321,8 +427,8 @@ fn rects_for_lengths(area: Rect, direction: Direction, lengths: &[u16]) -> Vec<R
 #[cfg(test)]
 mod tests {
     use super::{
-        Breakpoint, Constraint, Direction, Layout, Split, centered, split, split_leading,
-        split_trailing,
+        Breakpoint, Constraint, Direction, DockLayout, Layout, Split, centered, split,
+        split_leading, split_trailing,
     };
     use crate::geometry::Rect;
 
@@ -372,6 +478,36 @@ mod tests {
                 second: Rect::new(0, 0, 5, 3)
             }
         );
+    }
+
+    #[test]
+    fn dock_layout_reserves_edges_and_center() {
+        let areas = DockLayout::new()
+            .top(1)
+            .bottom(2)
+            .left(3)
+            .right(4)
+            .split(Rect::new(0, 0, 20, 10));
+
+        assert_eq!(areas.top, Some(Rect::new(0, 0, 20, 1)));
+        assert_eq!(areas.bottom, Some(Rect::new(0, 8, 20, 2)));
+        assert_eq!(areas.left, Some(Rect::new(0, 1, 3, 7)));
+        assert_eq!(areas.right, Some(Rect::new(16, 1, 4, 7)));
+        assert_eq!(areas.center, Rect::new(3, 1, 13, 7));
+    }
+
+    #[test]
+    fn dock_layout_saturates_when_edges_exceed_area() {
+        let areas = DockLayout::new()
+            .top(9)
+            .bottom(9)
+            .left(9)
+            .split(Rect::new(0, 0, 4, 4));
+
+        assert_eq!(areas.top, Some(Rect::new(0, 0, 4, 4)));
+        assert_eq!(areas.bottom, Some(Rect::new(0, 4, 4, 0)));
+        assert_eq!(areas.left, Some(Rect::new(0, 4, 4, 0)));
+        assert_eq!(areas.center, Rect::new(4, 4, 0, 0));
     }
 
     #[test]
