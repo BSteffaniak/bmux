@@ -18,4 +18,5 @@ unicode-width        = { workspace = true }
 
 [features]
 default          = []
+diff             = []
 fail-on-warnings = []

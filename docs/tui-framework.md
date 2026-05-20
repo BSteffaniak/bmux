@@ -32,6 +32,8 @@ The first crate owns neutral primitives:
 - buffer: `Cell`, `Buffer`
 - layout: constraints and deterministic split helpers
 
+Bespoke product-adjacent functionality should be opt-in. Diff/file views are useful for coding-agent and developer-tool surfaces, but they are not required by general terminal UI consumers, so they live behind the `diff` crate feature and must not be required by the core primitives.
+
 Later modules should be added only when needed:
 
 - widgets
