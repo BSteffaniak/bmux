@@ -18,7 +18,7 @@ pub mod text;
 pub mod widget;
 pub mod widgets;
 
-pub use ansi::write_ansi_frame;
+pub use ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 pub use buffer::{Buffer, Cell};
 pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
@@ -34,7 +34,7 @@ pub use widgets::{
 
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
-    pub use crate::ansi::write_ansi_frame;
+    pub use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};

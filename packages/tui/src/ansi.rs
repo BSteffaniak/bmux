@@ -51,6 +51,81 @@ pub fn write_ansi_frame(
     Ok(())
 }
 
+/// Statistics from a damage-aware ANSI frame write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnsiFrameDiffStats {
+    /// Number of changed cells written.
+    pub changed_cells: usize,
+    /// Whether the renderer fell back to a full frame repaint.
+    pub full_repaint: bool,
+}
+
+/// Write only changed cells between two buffers using ANSI escape sequences.
+///
+/// If buffer areas differ, this falls back to [`write_ansi_frame`] and reports
+/// `full_repaint = true`.
+///
+/// # Errors
+///
+/// Returns any I/O error reported by `writer`.
+pub fn write_ansi_frame_diff(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+    cursor: Option<Cursor>,
+) -> io::Result<AnsiFrameDiffStats> {
+    if previous.area() != current.area() {
+        write_ansi_frame(writer, current, cursor)?;
+        return Ok(AnsiFrameDiffStats {
+            changed_cells: current.cells().len(),
+            full_repaint: true,
+        });
+    }
+
+    let area = current.area();
+    let mut active_style = Style::new();
+    let mut changed_cells = 0usize;
+    write!(writer, "\x1b[?25l")?;
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let point = Point::new(x, y);
+            let Some(previous_cell) = previous.get(point) else {
+                continue;
+            };
+            let Some(current_cell) = current.get(point) else {
+                continue;
+            };
+            if previous_cell == current_cell {
+                continue;
+            }
+            write_ansi_move_to(writer, point)?;
+            if current_cell.style != active_style {
+                write_ansi_style(writer, current_cell.style)?;
+                active_style = current_cell.style;
+            }
+            if current_cell.symbol.is_empty() {
+                writer.write_all(b" ")?;
+            } else {
+                writer.write_all(current_cell.symbol.as_bytes())?;
+            }
+            changed_cells = changed_cells.saturating_add(1);
+        }
+    }
+    write_ansi_style(writer, Style::new())?;
+    if let Some(cursor) = cursor {
+        write_ansi_move_to(writer, cursor.position)?;
+        if cursor.visible {
+            write!(writer, "\x1b[?25h")?;
+        } else {
+            write!(writer, "\x1b[?25l")?;
+        }
+    }
+    Ok(AnsiFrameDiffStats {
+        changed_cells,
+        full_repaint: false,
+    })
+}
+
 fn write_ansi_move_to(writer: &mut impl Write, point: Point) -> io::Result<()> {
     write!(
         writer,
@@ -152,11 +227,46 @@ const fn bright_color_base(role: ColorRole) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::write_ansi_frame;
+    use super::{write_ansi_frame, write_ansi_frame_diff};
     use crate::buffer::Buffer;
     use crate::frame::Cursor;
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
+
+    #[test]
+    fn ansi_frame_diff_writes_only_changed_cells() {
+        let mut previous = Buffer::empty(Rect::new(0, 0, 3, 1));
+        previous.set_cell(Point::new(0, 0), "A", Style::new());
+        previous.set_cell(Point::new(1, 0), "B", Style::new());
+        previous.set_cell(Point::new(2, 0), "C", Style::new());
+        let mut current = previous.clone();
+        current.set_cell(Point::new(1, 0), "X", Style::new().fg(Color::Red));
+        let mut out = Vec::new();
+
+        let stats = write_ansi_frame_diff(&mut out, &previous, &current, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        assert_eq!(stats.changed_cells, 1);
+        assert!(!stats.full_repaint);
+        assert!(output.contains("\x1b[1;2H\x1b[0;31mX"));
+        assert!(!output.contains('A'));
+        assert!(!output.contains('C'));
+    }
+
+    #[test]
+    fn ansi_frame_diff_falls_back_when_areas_differ() {
+        let previous = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut current = Buffer::empty(Rect::new(0, 0, 2, 1));
+        current.set_cell(Point::new(0, 0), "A", Style::new());
+        current.set_cell(Point::new(1, 0), "B", Style::new());
+        let mut out = Vec::new();
+
+        let stats = write_ansi_frame_diff(&mut out, &previous, &current, None).unwrap();
+
+        assert_eq!(stats.changed_cells, 2);
+        assert!(stats.full_repaint);
+        assert!(String::from_utf8(out).unwrap().contains("AB"));
+    }
 
     #[test]
     fn ansi_frame_writes_rows_and_cursor() {
