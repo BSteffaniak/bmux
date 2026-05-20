@@ -28,6 +28,7 @@ pub mod layout;
 pub mod list;
 pub mod overlay;
 pub mod palette;
+pub mod picker;
 pub mod style;
 pub mod terminal;
 pub mod text;
@@ -67,13 +68,14 @@ pub use layout::{
 pub use list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
 pub use overlay::{OverlayLayer, OverlayStack};
 pub use palette::{CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem};
+pub use picker::{Dropdown, ListPicker, ListPickerAreas};
 pub use style::{Color, Modifier, Style};
 pub use terminal::{DrawStats, Terminal};
 pub use text::{Line, Span, Text};
 pub use text_block::{TextBlock, TextWrap};
 pub use viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
 pub use widget::{StatefulWidget, Widget};
-pub use widgets::{Alignment, Dropdown, ListPicker, ListPickerAreas};
+pub use widgets::Alignment;
 
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
@@ -112,11 +114,12 @@ pub mod prelude {
     pub use crate::palette::{
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
     };
+    pub use crate::picker::{Dropdown, ListPicker, ListPickerAreas};
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{Line, Span, Text};
     pub use crate::text_block::{TextBlock, TextWrap};
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
     pub use crate::widget::{StatefulWidget, Widget};
-    pub use crate::widgets::{Alignment, Dropdown, ListPicker, ListPickerAreas};
+    pub use crate::widgets::Alignment;
 }
