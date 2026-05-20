@@ -9,6 +9,7 @@
 //! helpers. Product behavior belongs in application crates and plugins.
 
 pub mod ansi;
+pub mod blocks;
 pub mod buffer;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
@@ -28,6 +29,7 @@ pub mod widget;
 pub mod widgets;
 
 pub use ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
+pub use blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
 pub use buffer::{Buffer, Cell};
 #[cfg(feature = "crossterm")]
 pub use crossterm::CrosstermTerminalGuard;
@@ -57,6 +59,7 @@ pub use widgets::{
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
     pub use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
+    pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::CrosstermTerminalGuard;
