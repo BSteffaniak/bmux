@@ -6,6 +6,7 @@ use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 use crate::buffer::Buffer;
 use crate::frame::Frame;
 use crate::geometry::Rect;
+use crate::hit::HitMap;
 
 /// Statistics from one terminal draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ pub struct Terminal<W> {
     writer: W,
     area: Rect,
     previous: Option<Buffer>,
+    hits: HitMap,
 }
 
 impl<W: Write> Terminal<W> {
@@ -52,6 +54,7 @@ impl<W: Write> Terminal<W> {
             writer,
             area,
             previous: None,
+            hits: HitMap::new(),
         }
     }
 
@@ -59,6 +62,12 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn area(&self) -> Rect {
         self.area
+    }
+
+    /// Return the hit map registered by the last draw.
+    #[must_use]
+    pub const fn hits(&self) -> &HitMap {
+        &self.hits
     }
 
     /// Resize the terminal area and force the next draw to repaint fully.
@@ -76,10 +85,10 @@ impl<W: Write> Terminal<W> {
     /// Returns any I/O error reported by the backend writer.
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawStats> {
         let mut buffer = Buffer::empty(self.area);
-        let cursor = {
+        let (cursor, hits) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
-            frame.cursor()
+            (frame.cursor(), frame.hits().clone())
         };
 
         let stats = if let Some(previous) = &self.previous {
@@ -89,6 +98,7 @@ impl<W: Write> Terminal<W> {
             DrawStats::full(buffer.cells().len())
         };
         self.writer.flush()?;
+        self.hits = hits;
         self.previous = Some(buffer);
         Ok(stats)
     }

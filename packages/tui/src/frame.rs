@@ -2,6 +2,7 @@
 
 use crate::buffer::Buffer;
 use crate::geometry::{Point, Rect};
+use crate::hit::{HitMap, HitRegion};
 use crate::style::Style;
 use crate::text::Line;
 
@@ -38,6 +39,7 @@ impl Cursor {
 pub struct Frame<'buffer> {
     buffer: &'buffer mut Buffer,
     cursor: Option<Cursor>,
+    hits: HitMap,
 }
 
 impl<'buffer> Frame<'buffer> {
@@ -46,6 +48,7 @@ impl<'buffer> Frame<'buffer> {
         Self {
             buffer,
             cursor: None,
+            hits: HitMap::new(),
         }
     }
 
@@ -75,6 +78,17 @@ impl<'buffer> Frame<'buffer> {
     /// Return a mutable view of the backing buffer.
     pub const fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
+    }
+
+    /// Return registered hit regions.
+    #[must_use]
+    pub const fn hits(&self) -> &HitMap {
+        &self.hits
+    }
+
+    /// Add a hit-test region for this frame.
+    pub fn push_hit(&mut self, region: HitRegion) {
+        self.hits.push(region);
     }
 
     /// Fill a rectangular area with a symbol and style.
