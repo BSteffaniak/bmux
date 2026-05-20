@@ -13,10 +13,12 @@ version     = { workspace = true }
 [dependencies]
 bmux_keyboard        = { workspace = true }
 bmux_text_edit       = { workspace = true, features = ["keyboard"] }
+crossterm            = { workspace = true, optional = true }
 unicode-segmentation = { workspace = true }
 unicode-width        = { workspace = true }
 
 [features]
+crossterm        = ["dep:crossterm"]
 default          = []
 diff             = []
 fail-on-warnings = []
