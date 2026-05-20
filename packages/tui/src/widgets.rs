@@ -366,6 +366,184 @@ fn line_with_fallback_style(line: &Line, style: Style) -> Line {
     )
 }
 
+/// A list item rendered as one styled line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    line: Line,
+}
+
+impl ListItem {
+    /// Create a list item from a line.
+    #[must_use]
+    pub fn new(line: impl Into<Line>) -> Self {
+        Self { line: line.into() }
+    }
+
+    /// Return the rendered line.
+    #[must_use]
+    pub const fn line(&self) -> &Line {
+        &self.line
+    }
+}
+
+/// Scroll and selection state for [`List`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListState {
+    /// Selected item index, if any.
+    pub selected: Option<usize>,
+    /// First visible item index.
+    pub offset: usize,
+}
+
+impl ListState {
+    /// Create empty list state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            selected: None,
+            offset: 0,
+        }
+    }
+
+    /// Select an item by index.
+    pub const fn select(&mut self, index: Option<usize>) {
+        self.selected = index;
+    }
+
+    /// Move selection down by one item.
+    pub fn select_next(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = None;
+            self.offset = 0;
+            return;
+        }
+        self.selected = Some(
+            self.selected
+                .map_or(0, |selected| selected.saturating_add(1).min(item_count - 1)),
+        );
+    }
+
+    /// Move selection up by one item.
+    pub fn select_previous(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = None;
+            self.offset = 0;
+            return;
+        }
+        self.selected = Some(
+            self.selected
+                .map_or(0, |selected| selected.saturating_sub(1)),
+        );
+    }
+
+    /// Adjust offset so the selection is visible in a viewport of `height` rows.
+    pub fn ensure_selected_visible(&mut self, height: u16, item_count: usize) {
+        if item_count == 0 {
+            self.selected = None;
+            self.offset = 0;
+            return;
+        }
+        let height = usize::from(height.max(1));
+        let selected = self.selected.unwrap_or(0).min(item_count - 1);
+        self.selected = Some(selected);
+        if selected < self.offset {
+            self.offset = selected;
+        } else if selected >= self.offset.saturating_add(height) {
+            self.offset = selected.saturating_add(1).saturating_sub(height);
+        }
+        self.offset = self.offset.min(item_count.saturating_sub(1));
+    }
+}
+
+/// A virtualized single-line list widget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct List<'items> {
+    items: &'items [ListItem],
+    selected_style: Style,
+    highlight_symbol: Option<String>,
+}
+
+impl<'items> List<'items> {
+    /// Create a list from items.
+    #[must_use]
+    pub const fn new(items: &'items [ListItem]) -> Self {
+        Self {
+            items,
+            selected_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
+            highlight_symbol: None,
+        }
+    }
+
+    /// Set selected item style. This style patches over item span styles.
+    #[must_use]
+    pub const fn selected_style(mut self, style: Style) -> Self {
+        self.selected_style = style;
+        self
+    }
+
+    /// Set an optional highlight symbol rendered before the selected item.
+    #[must_use]
+    pub fn highlight_symbol(mut self, symbol: impl Into<String>) -> Self {
+        self.highlight_symbol = Some(symbol.into());
+        self
+    }
+
+    /// Return this list's items.
+    #[must_use]
+    pub const fn items(&self) -> &[ListItem] {
+        self.items
+    }
+}
+
+impl crate::widget::StatefulWidget for List<'_> {
+    type State = ListState;
+
+    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+        if area.is_empty() {
+            return;
+        }
+        state.ensure_selected_visible(area.height, self.items.len());
+        let visible_count = usize::from(area.height);
+        for (row, (index, item)) in self
+            .items
+            .iter()
+            .enumerate()
+            .skip(state.offset)
+            .take(visible_count)
+            .enumerate()
+        {
+            let Ok(row) = u16::try_from(row) else {
+                return;
+            };
+            let selected = state.selected == Some(index);
+            let line = self.render_item_line(item, selected);
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                &line,
+            );
+        }
+    }
+}
+
+impl List<'_> {
+    fn render_item_line(&self, item: &ListItem, selected: bool) -> Line {
+        let line = if selected {
+            line_with_fallback_style(item.line(), self.selected_style)
+        } else {
+            item.line().clone()
+        };
+        if selected && let Some(symbol) = &self.highlight_symbol {
+            let mut spans = vec![crate::text::Span::styled(
+                symbol.clone(),
+                self.selected_style,
+            )];
+            spans.extend(line.spans);
+            return Line::from_spans(spans);
+        }
+        line
+    }
+}
+
 /// Enter-key behavior for text input key handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextInputEnterBehavior {
@@ -805,15 +983,15 @@ fn line_width(line: &Line) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, Border, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
-        TextInputKeyHandler, TextInputKeyOutcome, TextWrap,
+        Alignment, Border, List, ListItem, ListState, Modal, Panel, TextBlock, TextInput,
+        TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome, TextWrap,
     };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect, Size};
     use crate::style::{Color, Modifier, Style};
     use crate::text::{Line, Text};
-    use crate::widget::Widget;
+    use crate::widget::{StatefulWidget, Widget};
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
     use bmux_text_edit::TextEditBuffer;
 
@@ -984,6 +1162,75 @@ mod tests {
             .render(Rect::new(0, 0, 3, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn list_renders_visible_window_and_selection() {
+        let items = vec![
+            ListItem::new("one"),
+            ListItem::new("two"),
+            ListItem::new("three"),
+            ListItem::new("four"),
+        ];
+        let mut state = ListState {
+            selected: Some(2),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 7, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let selected_style = Style::new().add_modifier(Modifier::REVERSED);
+
+        List::new(&items).selected_style(selected_style).render(
+            Rect::new(0, 0, 7, 2),
+            &mut frame,
+            &mut state,
+        );
+
+        assert_eq!(state.offset, 1);
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("two    "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("three  "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 1))
+                .map(|cell| cell.style),
+            Some(selected_style)
+        );
+    }
+
+    #[test]
+    fn list_state_moves_selection_with_bounds() {
+        let mut state = ListState::new();
+
+        state.select_next(3);
+        assert_eq!(state.selected, Some(0));
+        state.select_next(3);
+        state.select_next(3);
+        state.select_next(3);
+        assert_eq!(state.selected, Some(2));
+        state.select_previous(3);
+        assert_eq!(state.selected, Some(1));
+        state.select_previous(0);
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn list_renders_highlight_symbol_for_selected_item() {
+        let items = vec![ListItem::new("one"), ListItem::new("two")];
+        let mut state = ListState {
+            selected: Some(0),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        List::new(&items).highlight_symbol("> ").render(
+            Rect::new(0, 0, 6, 1),
+            &mut frame,
+            &mut state,
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("> one "));
     }
 
     #[test]
