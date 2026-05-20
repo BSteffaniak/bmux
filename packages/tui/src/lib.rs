@@ -21,6 +21,7 @@ pub mod frame;
 pub mod geometry;
 pub mod history;
 pub mod hit;
+pub mod input;
 pub mod layout;
 pub mod list;
 pub mod overlay;
@@ -50,6 +51,10 @@ pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
 pub use history::{TextInputHistory, TextInputHistoryDirection, TextInputHistoryState};
 pub use hit::{Hit, HitId, HitMap, HitRegion, HitRole};
+pub use input::{
+    TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
+    TextInputProjection,
+};
 pub use layout::{
     Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
     Split, split,
@@ -64,8 +69,7 @@ pub use viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportSta
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
     Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker,
-    ListPickerAreas, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
-    TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
+    ListPickerAreas, Modal, Panel, TextBlock, TextWrap,
 };
 
 /// Common imports for building BMUX TUI surfaces.
@@ -90,6 +94,10 @@ pub mod prelude {
     pub use crate::geometry::{Insets, Point, Rect, Size};
     pub use crate::history::{TextInputHistory, TextInputHistoryDirection, TextInputHistoryState};
     pub use crate::hit::{Hit, HitId, HitMap, HitRegion, HitRole};
+    pub use crate::input::{
+        TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
+        TextInputProjection,
+    };
     pub use crate::layout::{
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
         Split, split,
@@ -106,7 +114,6 @@ pub mod prelude {
     pub use crate::widget::{StatefulWidget, Widget};
     pub use crate::widgets::{
         Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown,
-        ListPicker, ListPickerAreas, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
-        TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
+        ListPicker, ListPickerAreas, Modal, Panel, TextBlock, TextWrap,
     };
 }

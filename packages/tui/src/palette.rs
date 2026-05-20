@@ -6,13 +6,12 @@ use bmux_text_edit::TextEditBuffer;
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::{HitId, HitMap, HitRegion, HitRole};
+use crate::input::{TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use crate::layout::{Direction, split_leading};
 use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
 use crate::text::Line;
 use crate::widget::{StatefulWidget, Widget};
-use crate::widgets::{
-    Border, Panel, TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
-};
+use crate::widgets::{Border, Panel};
 
 /// One command palette item.
 #[derive(Debug, Clone, PartialEq, Eq)]
