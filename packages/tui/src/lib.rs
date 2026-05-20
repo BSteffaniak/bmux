@@ -10,6 +10,7 @@
 
 pub mod ansi;
 pub mod buffer;
+pub mod diff;
 pub mod frame;
 pub mod geometry;
 pub mod layout;
@@ -20,6 +21,7 @@ pub mod widgets;
 
 pub use ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 pub use buffer::{Buffer, Cell};
+pub use diff::{DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, DiffViewStyles};
 pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
 pub use layout::{Breakpoint, Constraint, Direction, Layout, Split, split};
@@ -36,6 +38,9 @@ pub use widgets::{
 pub mod prelude {
     pub use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
     pub use crate::buffer::{Buffer, Cell};
+    pub use crate::diff::{
+        DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, DiffViewStyles,
+    };
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};
     pub use crate::layout::{Breakpoint, Constraint, Direction, Layout, Split, split};
