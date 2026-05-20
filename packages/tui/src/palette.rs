@@ -7,11 +7,11 @@ use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::layout::{Direction, split_leading};
+use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
 use crate::text::Line;
 use crate::widget::{StatefulWidget, Widget};
 use crate::widgets::{
-    Border, List, ListItem, ListKeyHandler, ListKeyOutcome, ListState, Panel, TextInput,
-    TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
+    Border, Panel, TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
 };
 
 /// One command palette item.

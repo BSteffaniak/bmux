@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::frame::Frame;
 use crate::geometry::{Insets, Rect, Size};
 use crate::layout::{Direction, centered, split_leading, split_trailing};
+use crate::list::{List, ListItem, ListState};
 use crate::style::Style;
 use crate::text::{Line, Text};
 use crate::widget::Widget;
@@ -365,10 +366,6 @@ pub(crate) fn line_with_fallback_style(line: &Line, style: Style) -> Line {
             .collect::<Vec<_>>(),
     )
 }
-
-#[path = "widgets_list.rs"]
-mod widgets_list;
-pub use widgets_list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
 
 /// A simple button widget.
 
@@ -1195,13 +1192,14 @@ fn line_width(line: &Line) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, Border, Button, Dialog, DialogAction, DialogState, Dropdown, List, ListItem,
-        ListKeyHandler, ListKeyOutcome, ListPicker, ListState, Modal, Panel, TextBlock, TextInput,
-        TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome, TextWrap,
+        Alignment, Border, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker, Modal,
+        Panel, TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler,
+        TextInputKeyOutcome, TextWrap,
     };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect, Size};
+    use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
     use crate::style::{Color, Modifier, Style};
     use crate::text::{Line, Text};
     use crate::widget::{StatefulWidget, Widget};

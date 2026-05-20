@@ -22,6 +22,7 @@ pub mod geometry;
 pub mod history;
 pub mod hit;
 pub mod layout;
+pub mod list;
 pub mod overlay;
 pub mod palette;
 pub mod style;
@@ -53,6 +54,7 @@ pub use layout::{
     Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
     Split, split,
 };
+pub use list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
 pub use overlay::{OverlayLayer, OverlayStack};
 pub use palette::{CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem};
 pub use style::{Color, Modifier, Style};
@@ -61,10 +63,9 @@ pub use text::{Line, Span, Text};
 pub use viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
 pub use widget::{StatefulWidget, Widget};
 pub use widgets::{
-    Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown, List,
-    ListItem, ListKeyHandler, ListKeyOutcome, ListPicker, ListPickerAreas, ListState, Modal, Panel,
-    TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
-    TextInputProjection, TextWrap,
+    Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown, ListPicker,
+    ListPickerAreas, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
+    TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
 };
 
 /// Common imports for building BMUX TUI surfaces.
@@ -93,6 +94,7 @@ pub mod prelude {
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
         Split, split,
     };
+    pub use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
     pub use crate::overlay::{OverlayLayer, OverlayStack};
     pub use crate::palette::{
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
@@ -103,9 +105,8 @@ pub mod prelude {
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
     pub use crate::widget::{StatefulWidget, Widget};
     pub use crate::widgets::{
-        Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown, List,
-        ListItem, ListKeyHandler, ListKeyOutcome, ListPicker, ListPickerAreas, ListState, Modal,
-        Panel, TextBlock, TextInput, TextInputEnterBehavior, TextInputKeyHandler,
-        TextInputKeyOutcome, TextInputProjection, TextWrap,
+        Alignment, Border, BorderSet, Button, Dialog, DialogAction, DialogState, Dropdown,
+        ListPicker, ListPickerAreas, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
+        TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
     };
 }

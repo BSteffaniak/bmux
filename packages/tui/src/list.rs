@@ -8,7 +8,7 @@ use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::style::Style;
 use crate::text::Line;
 
-use super::line_with_fallback_style;
+use crate::widgets::line_with_fallback_style;
 
 /// A list item rendered as one styled line.
 #[derive(Debug, Clone, PartialEq, Eq)]
