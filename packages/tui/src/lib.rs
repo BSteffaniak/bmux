@@ -31,3 +31,20 @@ pub use widgets::{
     ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
     TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
 };
+
+/// Common imports for building BMUX TUI surfaces.
+pub mod prelude {
+    pub use crate::ansi::write_ansi_frame;
+    pub use crate::buffer::{Buffer, Cell};
+    pub use crate::frame::{Cursor, Frame};
+    pub use crate::geometry::{Insets, Point, Rect, Size};
+    pub use crate::layout::{Breakpoint, Constraint, Direction, Layout, Split, split};
+    pub use crate::style::{Color, Modifier, Style};
+    pub use crate::text::{Line, Span, Text};
+    pub use crate::widget::{StatefulWidget, Widget};
+    pub use crate::widgets::{
+        Alignment, Border, BorderSet, List, ListItem, ListKeyHandler, ListKeyOutcome, ListPicker,
+        ListPickerAreas, ListState, Modal, Panel, TextBlock, TextInput, TextInputEnterBehavior,
+        TextInputKeyHandler, TextInputKeyOutcome, TextInputProjection, TextWrap,
+    };
+}
