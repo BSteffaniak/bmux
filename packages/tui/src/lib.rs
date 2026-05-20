@@ -14,6 +14,7 @@ pub mod buffer;
 pub mod crossterm;
 #[cfg(feature = "diff")]
 pub mod diff;
+pub mod focus;
 pub mod frame;
 pub mod geometry;
 pub mod layout;
@@ -30,6 +31,7 @@ pub use buffer::{Buffer, Cell};
 pub use crossterm::CrosstermTerminalGuard;
 #[cfg(feature = "diff")]
 pub use diff::{DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, DiffViewStyles};
+pub use focus::{FocusId, FocusKeyOutcome, FocusTrap};
 pub use frame::{Cursor, Frame};
 pub use geometry::{Insets, Point, Rect, Size};
 pub use layout::{Breakpoint, Constraint, Direction, Layout, Split, split};
@@ -54,6 +56,7 @@ pub mod prelude {
     pub use crate::diff::{
         DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState, DiffViewStyles,
     };
+    pub use crate::focus::{FocusId, FocusKeyOutcome, FocusTrap};
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};
     pub use crate::layout::{Breakpoint, Constraint, Direction, Layout, Split, split};
