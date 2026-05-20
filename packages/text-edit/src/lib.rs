@@ -518,29 +518,11 @@ impl TextEditBuffer {
     }
 
     fn wrapped_row_start_byte_index(&self, width: usize, target_row: usize) -> usize {
-        let width = width.max(1);
-        let mut row = 0usize;
-        let mut col = 0usize;
-        for span in grapheme_spans(&self.text) {
-            if row == target_row {
-                return span.start;
-            }
-            let grapheme = &self.text[span.start..span.end];
-            if grapheme == "\n" {
-                row = row.saturating_add(1);
-                col = 0;
-                continue;
-            }
-            if col > 0 && col.saturating_add(span.width) > width {
-                row = row.saturating_add(1);
-                col = 0;
-                if row == target_row {
-                    return span.start;
-                }
-            }
-            col = col.saturating_add(span.width);
-        }
-        self.text.len()
+        self.wrapped_projection(width)
+            .line_starts
+            .get(target_row)
+            .copied()
+            .unwrap_or(self.text.len())
     }
 
     /// Return a terminal-width single-line viewport ending near the cursor.
@@ -647,37 +629,120 @@ impl TextEditBuffer {
     /// Return a soft-wrapped projection for `width` terminal columns.
     #[must_use]
     pub fn wrapped_layout(&self, width: usize) -> WrapLayout {
+        let projection = self.wrapped_projection(width);
+        WrapLayout {
+            lines: projection.lines,
+            cursor: projection.cursor,
+        }
+    }
+
+    fn wrapped_projection(&self, width: usize) -> WrappedProjection {
         let width = width.max(1);
         let mut lines = vec![String::new()];
+        let mut line_starts = vec![0usize];
         let mut row = 0usize;
         let mut col = 0usize;
-        let mut cursor = VisualCursor::default();
+        let mut break_after_whitespace: Option<usize> = None;
 
         for span in grapheme_spans(&self.text) {
-            if span.start == self.cursor {
-                cursor = VisualCursor { row, col };
-            }
-            let g = &self.text[span.start..span.end];
-            if g == "\n" {
+            let grapheme = &self.text[span.start..span.end];
+            if grapheme == "\n" {
                 lines.push(String::new());
+                line_starts.push(span.end);
                 row = row.saturating_add(1);
                 col = 0;
+                break_after_whitespace = None;
                 continue;
             }
+
             if col > 0 && col.saturating_add(span.width) > width {
-                lines.push(String::new());
-                row = row.saturating_add(1);
-                col = 0;
+                if let Some(break_start) = break_after_whitespace
+                    && break_start > line_starts[row]
+                    && break_start < span.start
+                {
+                    let split_at = break_start.saturating_sub(line_starts[row]);
+                    let moved = lines[row].split_off(split_at);
+                    lines.push(moved);
+                    line_starts.push(break_start);
+                    row = row.saturating_add(1);
+                    col = UnicodeWidthStr::width(lines[row].as_str());
+                    break_after_whitespace = last_whitespace_break(&lines[row], line_starts[row]);
+                } else {
+                    lines.push(String::new());
+                    line_starts.push(span.start);
+                    row = row.saturating_add(1);
+                    col = 0;
+                    break_after_whitespace = None;
+                }
             }
-            lines[row].push_str(g);
+
+            lines[row].push_str(grapheme);
             col = col.saturating_add(span.width);
-        }
-        if self.cursor == self.text.len() {
-            cursor = VisualCursor { row, col };
+            if is_wrapping_whitespace(grapheme) {
+                break_after_whitespace = Some(span.end);
+            }
         }
 
-        WrapLayout { lines, cursor }
+        let cursor = visual_cursor_for_wrapped_lines(&self.text, self.cursor, &lines, &line_starts);
+        WrappedProjection {
+            lines,
+            line_starts,
+            cursor,
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+struct WrappedProjection {
+    lines: Vec<String>,
+    line_starts: Vec<usize>,
+    cursor: VisualCursor,
+}
+
+fn visual_cursor_for_wrapped_lines(
+    text: &str,
+    cursor: usize,
+    lines: &[String],
+    line_starts: &[usize],
+) -> VisualCursor {
+    let row = line_starts
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(row, start)| {
+            let cursor_starts_soft_wrapped_row = row > 0
+                && *start == cursor
+                && !text[..cursor].ends_with('\n')
+                && line_starts
+                    .get(row.saturating_sub(1))
+                    .is_some_and(|previous_start| *previous_start < cursor);
+            (*start <= cursor && !cursor_starts_soft_wrapped_row).then_some(row)
+        })
+        .unwrap_or(0)
+        .min(lines.len().saturating_sub(1));
+    let line_start = line_starts.get(row).copied().unwrap_or(0);
+    let line_end = line_start.saturating_add(lines[row].len()).min(text.len());
+    let cursor = cursor.clamp(line_start, line_end);
+    VisualCursor {
+        row,
+        col: UnicodeWidthStr::width(&text[line_start..cursor]),
+    }
+}
+
+fn is_wrapping_whitespace(grapheme: &str) -> bool {
+    grapheme != "\n" && grapheme.chars().all(char::is_whitespace)
+}
+
+fn last_whitespace_break(line: &str, line_start: usize) -> Option<usize> {
+    line.grapheme_indices(true)
+        .rev()
+        .find_map(|(index, grapheme)| {
+            is_wrapping_whitespace(grapheme).then_some(
+                line_start
+                    .saturating_add(index)
+                    .saturating_add(grapheme.len()),
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -822,6 +887,30 @@ mod tests {
         let layout = buffer.wrapped_layout(4);
         assert_eq!(layout.lines, vec!["ab界".to_string(), "c".to_string()]);
         assert_eq!(layout.cursor, VisualCursor { row: 0, col: 4 });
+    }
+
+    #[test]
+    fn wrapped_layout_prefers_word_boundaries() {
+        let buffer = TextEditBuffer::from_text("hello brave world");
+        let layout = buffer.wrapped_layout(10);
+
+        assert_eq!(
+            layout.lines,
+            vec![
+                "hello ".to_string(),
+                "brave ".to_string(),
+                "world".to_string()
+            ]
+        );
+        assert_eq!(layout.cursor, VisualCursor { row: 2, col: 5 });
+    }
+
+    #[test]
+    fn wrapped_position_hit_testing_uses_word_wrapped_row_starts() {
+        let mut buffer = TextEditBuffer::from_text("hello brave world");
+        buffer.move_cursor_to_wrapped_position(10, 1, 1);
+
+        assert_eq!(buffer.cursor_byte_index(), "hello b".len());
     }
 
     #[test]
