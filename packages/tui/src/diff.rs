@@ -71,6 +71,38 @@ pub struct DiffViewState {
     pub offset: usize,
 }
 
+impl DiffViewState {
+    /// Move to the next hunk header, if one exists.
+    pub fn next_hunk(&mut self, lines: &[DiffLine]) -> bool {
+        let start = self.offset.saturating_add(1);
+        if let Some(index) = lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, line)| (line.kind == DiffLineKind::HunkHeader).then_some(index))
+        {
+            self.offset = index;
+            return true;
+        }
+        false
+    }
+
+    /// Move to the previous hunk header, if one exists.
+    pub fn previous_hunk(&mut self, lines: &[DiffLine]) -> bool {
+        let Some(index) = lines
+            .iter()
+            .enumerate()
+            .take(self.offset)
+            .rev()
+            .find_map(|(index, line)| (line.kind == DiffLineKind::HunkHeader).then_some(index))
+        else {
+            return false;
+        };
+        self.offset = index;
+        true
+    }
+}
+
 /// Styles used by [`DiffView`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffViewStyles {
@@ -147,6 +179,26 @@ impl<'lines> DiffView<'lines> {
     #[must_use]
     pub const fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Return hunk header indices.
+    #[must_use]
+    pub fn hunk_indices(&self) -> Vec<usize> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| (line.kind == DiffLineKind::HunkHeader).then_some(index))
+            .collect()
+    }
+
+    /// Move state to the next hunk header, if one exists.
+    pub fn next_hunk(&self, state: &mut DiffViewState) -> bool {
+        state.next_hunk(self.lines)
+    }
+
+    /// Move state to the previous hunk header, if one exists.
+    pub fn previous_hunk(&self, state: &mut DiffViewState) -> bool {
+        state.previous_hunk(self.lines)
     }
 
     const fn resolved_mode(&self, area: Rect) -> DiffViewMode {
@@ -343,5 +395,27 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("   2    2  two  ")
         );
+    }
+
+    #[test]
+    fn diff_view_navigates_hunks() {
+        let lines = vec![
+            DiffLine::new(DiffLineKind::FileHeader, None, None, "file"),
+            DiffLine::new(DiffLineKind::HunkHeader, None, None, "@@ one @@"),
+            DiffLine::new(DiffLineKind::Context, Some(1), Some(1), "one"),
+            DiffLine::new(DiffLineKind::HunkHeader, None, None, "@@ two @@"),
+            DiffLine::new(DiffLineKind::Added, None, Some(2), "two"),
+        ];
+        let view = DiffView::new(&lines);
+        let mut state = DiffViewState::default();
+
+        assert_eq!(view.hunk_indices(), vec![1, 3]);
+        assert!(view.next_hunk(&mut state));
+        assert_eq!(state.offset, 1);
+        assert!(view.next_hunk(&mut state));
+        assert_eq!(state.offset, 3);
+        assert!(!view.next_hunk(&mut state));
+        assert!(view.previous_hunk(&mut state));
+        assert_eq!(state.offset, 1);
     }
 }
