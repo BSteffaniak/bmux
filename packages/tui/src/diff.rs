@@ -6,6 +6,182 @@ use crate::style::{Color, Modifier, Style};
 use crate::text::{Line, Span};
 use crate::widget::StatefulWidget;
 
+/// Summary for one changed file in a diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFileSummary {
+    /// Old path, when known.
+    pub old_path: Option<String>,
+    /// New path, when known.
+    pub new_path: Option<String>,
+    /// Number of added lines.
+    pub added: u32,
+    /// Number of removed lines.
+    pub removed: u32,
+}
+
+impl DiffFileSummary {
+    /// Create a changed-file summary.
+    #[must_use]
+    pub fn new(path: impl Into<String>, added: u32, removed: u32) -> Self {
+        Self {
+            old_path: None,
+            new_path: Some(path.into()),
+            added,
+            removed,
+        }
+    }
+
+    /// Create a renamed changed-file summary.
+    #[must_use]
+    pub fn renamed(
+        old_path: impl Into<String>,
+        new_path: impl Into<String>,
+        added: u32,
+        removed: u32,
+    ) -> Self {
+        Self {
+            old_path: Some(old_path.into()),
+            new_path: Some(new_path.into()),
+            added,
+            removed,
+        }
+    }
+
+    /// Return the display path.
+    #[must_use]
+    pub fn display_path(&self) -> String {
+        match (&self.old_path, &self.new_path) {
+            (Some(old), Some(new)) if old != new => format!("{old} → {new}"),
+            (_, Some(new)) => new.clone(),
+            (Some(old), None) => old.clone(),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// Selection state for a changed-file list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffFileListState {
+    /// Selected file index, if any.
+    pub selected: Option<usize>,
+    /// First visible file index.
+    pub offset: usize,
+}
+
+impl DiffFileListState {
+    /// Create empty file-list state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            selected: None,
+            offset: 0,
+        }
+    }
+
+    /// Ensure selected item remains visible.
+    pub fn ensure_selected_visible(&mut self, height: u16, file_count: usize) {
+        if file_count == 0 {
+            self.selected = None;
+            self.offset = 0;
+            return;
+        }
+        let height = usize::from(height.max(1));
+        let selected = self.selected.unwrap_or(0).min(file_count - 1);
+        self.selected = Some(selected);
+        if selected < self.offset {
+            self.offset = selected;
+        } else if selected >= self.offset.saturating_add(height) {
+            self.offset = selected.saturating_add(1).saturating_sub(height);
+        }
+        self.offset = self.offset.min(file_count.saturating_sub(1));
+    }
+}
+
+/// Changed-file list widget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFileList<'files> {
+    files: &'files [DiffFileSummary],
+    style: Style,
+    selected_style: Style,
+}
+
+impl<'files> DiffFileList<'files> {
+    /// Create a changed-file list.
+    #[must_use]
+    pub const fn new(files: &'files [DiffFileSummary]) -> Self {
+        Self {
+            files,
+            style: Style::new(),
+            selected_style: Style::new().add_modifier(Modifier::REVERSED),
+        }
+    }
+
+    /// Set base style.
+    #[must_use]
+    pub const fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Set selected row style.
+    #[must_use]
+    pub const fn selected_style(mut self, style: Style) -> Self {
+        self.selected_style = style;
+        self
+    }
+
+    /// Return file count.
+    #[must_use]
+    pub const fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+impl StatefulWidget for DiffFileList<'_> {
+    type State = DiffFileListState;
+
+    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+        if area.is_empty() {
+            return;
+        }
+        state.ensure_selected_visible(area.height, self.files.len());
+        for (row, (index, file)) in self
+            .files
+            .iter()
+            .enumerate()
+            .skip(state.offset)
+            .take(usize::from(area.height))
+            .enumerate()
+        {
+            let Ok(row) = u16::try_from(row) else {
+                return;
+            };
+            let selected = state.selected == Some(index);
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                &render_file_summary(
+                    file,
+                    if selected {
+                        self.style.patch(self.selected_style)
+                    } else {
+                        self.style
+                    },
+                ),
+            );
+        }
+    }
+}
+
+fn render_file_summary(file: &DiffFileSummary, style: Style) -> Line {
+    Line::from_spans(vec![
+        Span::styled(file.display_path(), style),
+        Span::styled(" ", style),
+        Span::styled(format!("+{}", file.added), style.fg(Color::Green)),
+        Span::styled(" ", style),
+        Span::styled(format!("-{}", file.removed), style.fg(Color::Red)),
+    ])
+}
+
 /// Semantic kind for one diff line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
@@ -481,12 +657,54 @@ fn truncate_to_width(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffInlineSpan, DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState};
+    use super::{
+        DiffFileList, DiffFileListState, DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind,
+        DiffView, DiffViewMode, DiffViewState,
+    };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
     use crate::widget::StatefulWidget;
+
+    #[test]
+    fn diff_file_summary_displays_paths() {
+        assert_eq!(
+            DiffFileSummary::new("src/lib.rs", 3, 1).display_path(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            DiffFileSummary::renamed("old.rs", "new.rs", 1, 2).display_path(),
+            "old.rs → new.rs"
+        );
+    }
+
+    #[test]
+    fn diff_file_list_renders_visible_files_and_selection() {
+        let files = vec![
+            DiffFileSummary::new("a.rs", 1, 0),
+            DiffFileSummary::new("b.rs", 2, 3),
+            DiffFileSummary::new("c.rs", 0, 4),
+        ];
+        let mut state = DiffFileListState {
+            selected: Some(2),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        DiffFileList::new(&files).render(Rect::new(0, 0, 16, 2), &mut frame, &mut state);
+
+        assert_eq!(state.offset, 1);
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("b.rs +2 -3      ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("c.rs +0 -4      ")
+        );
+    }
 
     #[test]
     fn diff_view_renders_unified_lines() {
