@@ -21,6 +21,26 @@ pub enum DiffLineKind {
     Removed,
 }
 
+/// One inline span inside a diff line's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffInlineSpan {
+    /// Span content.
+    pub content: String,
+    /// Style patch applied over the line kind style.
+    pub style: Style,
+}
+
+impl DiffInlineSpan {
+    /// Create an inline diff span.
+    #[must_use]
+    pub fn new(content: impl Into<String>, style: Style) -> Self {
+        Self {
+            content: content.into(),
+            style,
+        }
+    }
+}
+
 /// One logical line in a diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
@@ -32,6 +52,8 @@ pub struct DiffLine {
     pub content: String,
     /// Semantic line kind.
     pub kind: DiffLineKind,
+    /// Optional inline content spans for changed-region highlighting.
+    pub inline_spans: Vec<DiffInlineSpan>,
 }
 
 impl DiffLine {
@@ -48,7 +70,21 @@ impl DiffLine {
             new_line,
             content: content.into(),
             kind,
+            inline_spans: Vec::new(),
         }
+    }
+
+    /// Set inline content spans.
+    #[must_use]
+    pub fn inline_spans(mut self, spans: Vec<DiffInlineSpan>) -> Self {
+        self.inline_spans = spans;
+        self
+    }
+
+    /// Return true when the line has inline spans.
+    #[must_use]
+    pub fn has_inline_spans(&self) -> bool {
+        !self.inline_spans.is_empty()
     }
 }
 
@@ -321,11 +357,12 @@ impl DiffView<'_> {
             DiffLineKind::Removed => "-",
             DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => " ",
         };
-        Line::from_spans(vec![
+        let mut spans = vec![
             Span::styled(format_unified_gutter(line), self.styles.gutter),
             Span::styled(prefix, style),
-            Span::styled(line.content.clone(), style),
-        ])
+        ];
+        spans.extend(self.content_spans(line, style));
+        Line::from_spans(spans)
     }
 
     fn render_fold_line(&self, count: usize) -> Line {
@@ -339,18 +376,27 @@ impl DiffView<'_> {
         let style = self.style_for(line.kind);
         let half = usize::from(width.saturating_sub(1) / 2);
         let old = match line.kind {
-            DiffLineKind::Added => String::new(),
-            _ => side_text(line.old_line, &line.content, half),
+            DiffLineKind::Added => empty_side_spans(half, style),
+            _ => side_spans(line.old_line, line, half, style),
         };
         let new = match line.kind {
-            DiffLineKind::Removed => String::new(),
-            _ => side_text(line.new_line, &line.content, half),
+            DiffLineKind::Removed => empty_side_spans(half, style),
+            _ => side_spans(line.new_line, line, half, style),
         };
-        Line::from_spans(vec![
-            Span::styled(pad_to_width(&old, half), style),
-            Span::styled("│", self.styles.gutter),
-            Span::styled(new, style),
-        ])
+        let mut spans = old;
+        spans.push(Span::styled("│", self.styles.gutter));
+        spans.extend(new);
+        Line::from_spans(spans)
+    }
+
+    fn content_spans(&self, line: &DiffLine, base_style: Style) -> Vec<Span> {
+        if line.inline_spans.is_empty() {
+            return vec![Span::styled(line.content.clone(), base_style)];
+        }
+        line.inline_spans
+            .iter()
+            .map(|span| Span::styled(span.content.clone(), base_style.patch(span.style)))
+            .collect()
     }
 
     const fn style_for(&self, kind: DiffLineKind) -> Style {
@@ -374,19 +420,49 @@ fn format_unified_gutter(line: &DiffLine) -> String {
     )
 }
 
-fn side_text(line_number: Option<u32>, content: &str, width: usize) -> String {
-    let text = format!(
-        "{:>4} {}",
-        line_number.map_or_else(|| String::from("-"), |line| line.to_string()),
-        content
-    );
-    truncate_to_width(&text, width)
+fn empty_side_spans(width: usize, style: Style) -> Vec<Span> {
+    vec![Span::styled(" ".repeat(width), style)]
 }
 
-fn pad_to_width(text: &str, width: usize) -> String {
-    let text = truncate_to_width(text, width);
-    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str()));
-    format!("{text}{}", " ".repeat(padding))
+fn side_spans(line_number: Option<u32>, line: &DiffLine, width: usize, style: Style) -> Vec<Span> {
+    let gutter = format!(
+        "{:>4} ",
+        line_number.map_or_else(|| String::from("-"), |line| line.to_string())
+    );
+    let mut spans = vec![Span::styled(gutter.clone(), style)];
+    let content_width =
+        width.saturating_sub(unicode_width::UnicodeWidthStr::width(gutter.as_str()));
+    if line.inline_spans.is_empty() {
+        spans.push(Span::styled(
+            truncate_to_width(&line.content, content_width),
+            style,
+        ));
+        return pad_spans_to_width(spans, width, style);
+    }
+    let mut remaining = content_width;
+    for inline in &line.inline_spans {
+        if remaining == 0 {
+            break;
+        }
+        let text = truncate_to_width(&inline.content, remaining);
+        remaining = remaining.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str()));
+        spans.push(Span::styled(text, style.patch(inline.style)));
+    }
+    pad_spans_to_width(spans, width, style)
+}
+
+fn pad_spans_to_width(mut spans: Vec<Span>, width: usize, style: Style) -> Vec<Span> {
+    let current = spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_str()))
+        .sum::<usize>();
+    if current < width {
+        spans.push(Span::styled(
+            " ".repeat(width.saturating_sub(current)),
+            style,
+        ));
+    }
+    spans
 }
 
 fn truncate_to_width(text: &str, width: usize) -> String {
@@ -405,10 +481,11 @@ fn truncate_to_width(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState};
+    use super::{DiffInlineSpan, DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState};
     use crate::buffer::Buffer;
     use crate::frame::Frame;
-    use crate::geometry::Rect;
+    use crate::geometry::{Point, Rect};
+    use crate::style::{Color, Modifier, Style};
     use crate::widget::StatefulWidget;
 
     #[test]
@@ -474,6 +551,53 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("   2    2  two  ")
+        );
+    }
+
+    #[test]
+    fn diff_view_renders_inline_changed_spans() {
+        let highlight = Style::new().bg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let lines = vec![
+            DiffLine::new(DiffLineKind::Added, None, Some(1), "new value").inline_spans(vec![
+                DiffInlineSpan::new("new ", Style::new()),
+                DiffInlineSpan::new("value", highlight),
+            ]),
+        ];
+        let mut state = DiffViewState::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        DiffView::new(&lines)
+            .styles(super::DiffViewStyles::default())
+            .render(Rect::new(0, 0, 20, 1), &mut frame, &mut state);
+
+        assert_eq!(
+            frame.buffer().get(Point::new(15, 0)).map(|cell| cell.style),
+            Some(Style::new().fg(Color::Green).patch(highlight))
+        );
+    }
+
+    #[test]
+    fn diff_view_renders_side_by_side_inline_spans() {
+        let highlight = Style::new().bg(Color::Yellow);
+        let lines = vec![
+            DiffLine::new(DiffLineKind::Removed, Some(1), None, "old value").inline_spans(vec![
+                DiffInlineSpan::new("old ", Style::new()),
+                DiffInlineSpan::new("value", highlight),
+            ]),
+        ];
+        let mut state = DiffViewState::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        DiffView::new(&lines)
+            .styles(super::DiffViewStyles::default())
+            .mode(DiffViewMode::SideBySide)
+            .render(Rect::new(0, 0, 24, 1), &mut frame, &mut state);
+
+        assert_eq!(
+            frame.buffer().get(Point::new(10, 0)).map(|cell| cell.style),
+            Some(Style::new().fg(Color::Red).patch(highlight))
         );
     }
 
