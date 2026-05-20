@@ -21,6 +21,7 @@ pub mod geometry;
 pub mod history;
 pub mod layout;
 pub mod overlay;
+pub mod palette;
 pub mod style;
 pub mod terminal;
 pub mod text;
@@ -44,6 +45,7 @@ pub use layout::{
     Split, split,
 };
 pub use overlay::{OverlayLayer, OverlayStack};
+pub use palette::{CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem};
 pub use style::{Color, Modifier, Style};
 pub use terminal::{DrawStats, Terminal};
 pub use text::{Line, Span, Text};
@@ -76,6 +78,9 @@ pub mod prelude {
         Split, split,
     };
     pub use crate::overlay::{OverlayLayer, OverlayStack};
+    pub use crate::palette::{
+        CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
+    };
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{Line, Span, Text};
