@@ -1,11 +1,13 @@
 //! Crossterm terminal lifecycle and event adapter.
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
     KeyModifiers as CrosstermKeyModifiers, MouseButton as CrosstermMouseButton,
     MouseEvent as CrosstermMouseEvent, MouseEventKind as CrosstermMouseEventKind,
+    poll as crossterm_poll, read as crossterm_read,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -86,6 +88,30 @@ impl<W: Write> Drop for CrosstermTerminalGuard<W> {
             let _ = disable_raw_mode();
         }
     }
+}
+
+/// Poll for a terminal event and convert it to a BMUX TUI event.
+///
+/// Returns `Ok(None)` when no terminal event is ready before `timeout`, or
+/// when crossterm reports an event kind that has no BMUX TUI representation.
+///
+/// # Errors
+///
+/// Returns any error reported by crossterm while polling or reading events.
+pub fn poll_event(timeout: Duration) -> io::Result<Option<Event>> {
+    if !crossterm_poll(timeout)? {
+        return Ok(None);
+    }
+    read_event()
+}
+
+/// Read one terminal event and convert it to a BMUX TUI event.
+///
+/// # Errors
+///
+/// Returns any error reported by crossterm while reading events.
+pub fn read_event() -> io::Result<Option<Event>> {
+    Ok(event_from_crossterm(crossterm_read()?))
 }
 
 /// Convert a crossterm event into a BMUX TUI event.
@@ -199,12 +225,14 @@ fn mouse_modifiers_from_crossterm(modifiers: CrosstermKeyModifiers) -> MouseModi
 mod tests {
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 
-    use super::{event_from_crossterm, key_from_crossterm};
+    use super::{event_from_crossterm, key_from_crossterm, poll_event, read_event};
     use crate::event::{Event, FocusEvent, MouseButton, MouseEventKind};
 
     #[test]
     fn crossterm_guard_module_compiles() {
         let _ = core::mem::size_of::<Option<super::CrosstermTerminalGuard<Vec<u8>>>>();
+        let _ = poll_event as fn(std::time::Duration) -> std::io::Result<Option<Event>>;
+        let _ = read_event as fn() -> std::io::Result<Option<Event>>;
     }
 
     #[test]
