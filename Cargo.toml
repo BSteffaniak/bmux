@@ -130,7 +130,7 @@ repository = "https://github.com/BSteffaniak/bmux"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
-arc-swap = { version = "1.7", default-features = false }
+arc-swap = { version = "1.9", default-features = false }
 # Internal bmux packages
 bmux                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
 bmux_appearance             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/appearance" }
@@ -219,109 +219,112 @@ bmux_windows_plugin_api              = { version = "0.0.1-alpha.0", default-feat
 # Docs site crates
 bmux_docs_site_ui = { version = "0.0.1-alpha.0", default-features = false, path = "packages/docs-site/ui" }
 
-hyperchad                    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad", default-features = false }
-hyperchad_color              = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_color", default-features = false }
-hyperchad_renderer           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_renderer", default-features = false }
-hyperchad_template           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_template", default-features = false }
-hyperchad_transformer        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_transformer", default-features = false }
-hyperchad_transformer_models = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_transformer_models", default-features = false }
+hyperchad                    = { version = "0.3.0", package = "hyperchad", default-features = false }
+hyperchad_color              = { version = "0.3.0", package = "hyperchad_color", default-features = false }
+hyperchad_renderer           = { version = "0.3.0", package = "hyperchad_renderer", default-features = false }
+hyperchad_template           = { version = "0.3.0", package = "hyperchad_template", default-features = false }
+hyperchad_transformer        = { version = "0.3.0", package = "hyperchad_transformer", default-features = false }
+hyperchad_transformer_models = { version = "0.3.0", package = "hyperchad_transformer_models", default-features = false }
 
-switchy = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "switchy", default-features = false }
+switchy = { version = "0.3.0", package = "switchy", default-features = false }
 
-moosicbox_log_runtime = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_runtime", default-features = false }
-moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_watch", default-features = false }
+moosicbox_log_runtime = { version = "0.3.0", package = "moosicbox_log_runtime", default-features = false }
+moosicbox_log_watch   = { version = "0.3.0", package = "moosicbox_log_watch", default-features = false }
 
-git_sshripped_recipient    = { version = "0.4.1", default-features = false }
-git_sshripped_ssh_agent    = { version = "0.4.1", default-features = false }
-git_sshripped_ssh_identity = { version = "0.4.1", default-features = false }
+git_sshripped_recipient    = { version = "0.9.0", default-features = false }
+git_sshripped_ssh_agent    = { version = "0.9.0", default-features = false }
+git_sshripped_ssh_identity = { version = "0.9.0", default-features = false }
 
 # External dependencies
 ab_glyph = { version = "0.2.32" }
-anyhow = { version = "1.0.98", default-features = false }
-clap = { version = "4.5.40", default-features = false }
+anyhow = { version = "1.0.102", default-features = false }
+clap = { version = "4.6.1", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 dirs = { version = "6.0.0", default-features = false }
 env_logger = { version = "0.11.10", default-features = false }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.23.0" }
-futures = { version = "0.3.31", default-features = false }
-gif = { version = "0.13.3" }
+futures = { version = "0.3.32", default-features = false }
+gif = { version = "0.14.2" }
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
     "gif",
     "bmp",
 ] }
-iroh = { version = "0.97.0", default-features = true }
+iroh = { version = "0.98.2", default-features = true }
 libc = { version = "0.2" }
-libloading = { version = "0.8.9", default-features = false }
+libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 log = { version = "0.4.29", default-features = false }
-lz4_flex = { version = "0.11", default-features = false }
+lz4_flex = { version = "0.13", default-features = false }
 portable-pty = { version = "0.9.0" }
 proc-macro2 = { version = "1.0.106", default-features = false }
 qrcode = { version = "0.14.1", default-features = false }
 quote = { version = "1.0.45", default-features = false }
-rcgen = { version = "0.13.2", default-features = false, features = [
+rcgen = { version = "0.14.8", default-features = false, features = [
     "pem",
     "ring",
 ] }
-regex = { version = "1.12.2", default-features = false, features = ["std"] }
-reqwest = { version = "0.12.28", default-features = false, features = [
+regex = { version = "1.12.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.13.3", default-features = false, features = [
     "json",
-    "rustls-tls",
+    "rustls-no-provider",
 ] }
-resvg = { version = "0.45.1", default-features = true }
-rustls = { version = "0.23.16", default-features = false, features = [
+resvg = { version = "0.47.0", default-features = true }
+rustls = { version = "0.23.40", default-features = false, features = [
     "std",
     "ring",
 ] }
-rustls-native-certs = { version = "0.8.1", default-features = false }
+rustls-native-certs = { version = "0.8.3", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = [
     "std",
 ] }
-semver = { version = "1.0.26", default-features = false, features = ["std"] }
-serde = { version = "1.0.219", default-features = false, features = ["std"] }
-serde_json = { version = "1.0.143", default-features = false, features = [
+semver = { version = "1.0.28", default-features = false, features = ["std"] }
+serde = { version = "1.0.228", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
-sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
-similar = { version = "2.7.0" }
+sha2 = { version = "=0.11.0-rc.5", default-features = false }
+similar = { version = "3.1.0" }
 ssh2 = { version = "0.9.5" }
 syn = { version = "2.0.117", default-features = false }
-sysinfo = { version = "0.37.2" }
+sysinfo = { version = "0.38.1" }
 tempfile = { version = "3.27.0", default-features = false }
-thiserror = { version = "2.0.12", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
 time = { version = "0.3.47", default-features = false }
-tokio = { version = "1.45.1", default-features = false }
-tokio-rustls = { version = "0.26.1", default-features = false }
-toml = { version = "0.8.23", default-features = false, features = ["display"] }
-toml_edit = { version = "0.22.26", default-features = false, features = [
+tokio = { version = "1.52.3", default-features = false }
+tokio-rustls = { version = "0.26.4", default-features = false }
+toml = { version = "1.1.2", default-features = false, features = [
+    "display",
+    "serde",
+] }
+toml_edit = { version = "0.25.11", default-features = false, features = [
     "parse",
     "display",
 ] }
 tracing = { version = "0.1.44", default-features = false }
-tracing-appender = { version = "0.2.3", default-features = false }
+tracing-appender = { version = "0.2.5", default-features = false }
 tracing-log = { version = "0.2.0", default-features = false }
-tracing-subscriber = { version = "0.3.20", default-features = false }
-trybuild = { version = "1.0.101" }
+tracing-subscriber = { version = "0.3.23", default-features = false }
+trybuild = { version = "1.0.116" }
 ttf-parser = { version = "0.25.1", default-features = true }
-unicode-segmentation = { version = "1.12.0", default-features = false }
+unicode-segmentation = { version = "1.13.2", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
-uniffi = { version = "0.31.0" }
-uuid = { version = "1.21.0", default-features = false }
+uniffi = { version = "0.31.1" }
+uuid = { version = "1.23.1", default-features = false }
 vte = { version = "0.15.0", default-features = false }
 windows-sys = { version = "0.61.2" }
 zstd = { version = "0.13", default-features = false }
 
 # File-system watcher for config / theme / decoration-script hot-reload.
-notify = { version = "6", default-features = false, features = [
+notify = { version = "8", default-features = false, features = [
     "macos_fsevent",
 ] }
 
 # Lua scripting runtime for the decoration plugin. Mutually-exclusive
 # features select the Lua ABI; see the decoration plugin's
 # `scripting-*` cargo features for the exposed matrix.
-mlua = { version = "0.10", default-features = false }
+mlua = { version = "0.11", default-features = false }
 
 # Dev/test dependencies
 serial_test = { version = "3.4.0" }

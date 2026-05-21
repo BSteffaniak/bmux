@@ -53,7 +53,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
 
     let auth_ok = auth_token.is_some();
     let control_plane_ok = if let Some(token) = auth_token.as_deref() {
-        let client = reqwest::Client::new();
+        let client = crate::reqwest_client();
         let response = client
             .get(format!("{control_plane_url}/v1/auth/whoami"))
             .bearer_auth(token)

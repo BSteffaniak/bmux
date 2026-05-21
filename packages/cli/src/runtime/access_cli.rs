@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, IrohSshAuthorizedKey};
 use git_sshripped_recipient::fetch_github_user_keys;
-use git_sshripped_ssh_agent::{fingerprint_for_public_key_line, list_agent_ed25519_keys};
+use git_sshripped_ssh_agent::{fingerprint_for_public_key_line, list_agent_keys};
 use git_sshripped_ssh_identity::default_public_key_candidates;
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
@@ -250,7 +250,7 @@ fn collect_key_entries(
     let mut entries = Vec::new();
 
     if agent {
-        for key in list_agent_ed25519_keys()? {
+        for key in list_agent_keys()? {
             let public_key = key
                 .public_key
                 .to_openssh()
@@ -308,7 +308,7 @@ fn collect_key_entries(
 fn discover_local_candidates() -> Result<Vec<KeyEntry>> {
     let mut entries = Vec::new();
 
-    for key in list_agent_ed25519_keys()? {
+    for key in list_agent_keys()? {
         entries.push(KeyEntry {
             fingerprint: key.fingerprint,
             public_key: key

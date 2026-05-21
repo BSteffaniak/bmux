@@ -304,7 +304,7 @@ pub async fn expand_bmux_target_if_needed(config: &BmuxConfig, target: &str) -> 
         return Ok(target.to_string());
     };
     let control_plane = control_plane_url(config);
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .get(format!("{control_plane}/v1/share-links/{name}"))
         .bearer_auth(auth_state.access_token)

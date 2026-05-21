@@ -2333,7 +2333,7 @@ async fn fetch_invite_metadata(config: &BmuxConfig, target: &str) -> Option<Invi
     };
 
     let control_plane = control_plane_url(config);
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let mut request = client.get(format!("{control_plane}/v1/share-links/{name}"));
     if let Ok(Some(state)) = load_auth_state_optional(&ConfigPaths::default()) {
         request = request.bearer_auth(state.access_token);
@@ -3199,7 +3199,7 @@ async fn share_link_matches_target(
     name: &str,
     expected_target: &str,
 ) -> Result<bool> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .get(format!("{control_plane_url}/v1/share-links/{name}"))
         .bearer_auth(token)
@@ -3273,7 +3273,7 @@ async fn register_host_presence(
     name: Option<String>,
     target: &str,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .post(format!("{control_plane_url}/v1/hosts"))
         .bearer_auth(token)
@@ -3386,7 +3386,7 @@ fn open_browser(url: &str) -> bool {
 }
 
 async fn start_device_login(control_plane_url: &str) -> Result<DeviceStartResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .post(format!("{control_plane_url}/v1/auth/device/start"))
         .send()
@@ -3449,7 +3449,7 @@ async fn poll_device_login(
     control_plane_url: &str,
     device_code: &str,
 ) -> Result<DevicePollResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .post(format!("{control_plane_url}/v1/auth/device/poll"))
         .json(&DevicePollRequest {
@@ -3482,7 +3482,7 @@ fn local_ipc_endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
 }
 
 async fn verify_access_token(control_plane_url: &str, token: &str) -> Result<WhoAmIResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .get(format!("{control_plane_url}/v1/auth/whoami"))
         .bearer_auth(token)
@@ -3506,7 +3506,7 @@ async fn create_share_link(
     token: &str,
     request: &CreateShareRequest,
 ) -> Result<ShareLinkResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .post(format!("{control_plane_url}/v1/share-links"))
         .bearer_auth(token)
@@ -3527,7 +3527,7 @@ async fn create_share_link(
 }
 
 async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::reqwest_client();
     let response = client
         .delete(format!("{control_plane_url}/v1/share-links/{name}"))
         .bearer_auth(token)

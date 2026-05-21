@@ -19,6 +19,11 @@ pub mod input;
 /// Playbook system for headless scripted bmux execution.
 pub mod playbook;
 
+pub(crate) fn reqwest_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 /// Run the bmux CLI runtime entrypoint.
 ///
 /// # Errors

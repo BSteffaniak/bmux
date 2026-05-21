@@ -755,7 +755,7 @@ mod lua_backend {
         let mut array = Vec::new();
         let mut object = serde_json::Map::new();
         let mut is_array = true;
-        let mut expected_index = 1_i32;
+        let mut expected_index = 1_i64;
         for pair in table.clone().pairs::<Value, Value>() {
             let (key, value) = pair?;
             match key {

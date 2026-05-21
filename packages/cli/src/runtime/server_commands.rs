@@ -1061,7 +1061,7 @@ fn generate_quick_gateway_cert_pair() -> Result<(String, String)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .context("failed generating quick self-signed gateway certificate")?;
     let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let key_pem = cert.signing_key.serialize_pem();
     std::fs::write(&cert_path, cert_pem)
         .with_context(|| format!("failed writing {}", cert_path.display()))?;
     std::fs::write(&key_path, key_pem)

@@ -211,19 +211,18 @@ mod tests {
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)] // Template placeholders use {key} syntax, not format args.
     fn parse_single_text_action() {
-        let toml_str = r#"
-            [[actions]]
-            name = "test-action"
-            command = "plugin:test:cmd --arg {value}"
+        let toml_str = r#"[[actions]]
+name = "test-action"
+command = "plugin:test:cmd --arg {value}"
 
-            [[actions.prompts]]
-            key = "value"
-            type = "text"
-            title = "Enter Value"
-            placeholder = "type here"
-            validation = "positive_integer"
-        "#;
-        let value: toml::Value = toml_str.parse().unwrap();
+[[actions.prompts]]
+key = "value"
+type = "text"
+title = "Enter Value"
+placeholder = "type here"
+validation = "positive_integer"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
         let config = parse_config(Some(&value)).unwrap();
         assert_eq!(config.actions.len(), 1);
         assert_eq!(config.actions[0].name, "test-action");
@@ -234,23 +233,22 @@ mod tests {
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)] // Template placeholders use {key} syntax, not format args.
     fn parse_multi_prompt_action() {
-        let toml_str = r#"
-            [[actions]]
-            name = "multi"
-            command = "cmd --a {first} --b {second}"
+        let toml_str = r#"[[actions]]
+name = "multi"
+command = "cmd --a {first} --b {second}"
 
-            [[actions.prompts]]
-            key = "first"
-            type = "text"
-            title = "First"
+[[actions.prompts]]
+key = "first"
+type = "text"
+title = "First"
 
-            [[actions.prompts]]
-            key = "second"
-            type = "confirm"
-            title = "Continue?"
-            default = true
-        "#;
-        let value: toml::Value = toml_str.parse().unwrap();
+[[actions.prompts]]
+key = "second"
+type = "confirm"
+title = "Continue?"
+default = true
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
         let config = parse_config(Some(&value)).unwrap();
         assert_eq!(config.actions[0].prompts.len(), 2);
     }
