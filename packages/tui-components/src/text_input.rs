@@ -255,17 +255,23 @@ impl<'policy> TextInputControl<'policy> {
     }
 
     fn handle_mouse_drag(&self, state: &mut TextInputState, mouse: MouseEvent) -> TextInputOutcome {
-        let Some((row, col)) = mouse_wrapped_position(state, mouse) else {
+        let Some(position) = drag_wrapped_position(
+            state,
+            mouse,
+            matches!(self.policy.mouse.edge_scroll, DragEdgeScroll::Enabled),
+        ) else {
             return TextInputOutcome::Ignored;
         };
         extend_selection_to_granularity(
             &mut state.buffer,
             state.content_area,
-            row,
-            col,
+            position.row,
+            position.col,
             state.mouse_selection.active,
         );
-        state.sync_scroll_to_cursor(self.policy);
+        if !position.scrolled {
+            state.sync_scroll_to_cursor(self.policy);
+        }
         TextInputOutcome::Redraw
     }
 }
@@ -387,10 +393,21 @@ pub struct MousePolicy {
     pub click_to_cursor: bool,
     /// Whether dragging extends selection.
     pub drag_selection: bool,
+    /// Whether dragging beyond the visible top/bottom scrolls the input viewport.
+    pub edge_scroll: DragEdgeScroll,
     /// Double-click selection behavior.
     pub double_click: Option<SelectionGranularity>,
     /// Triple-click selection behavior.
     pub triple_click: Option<SelectionGranularity>,
+}
+
+/// Drag behavior when the mouse leaves the visible top or bottom edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragEdgeScroll {
+    /// Ignore drag events outside the text input bounds.
+    Disabled,
+    /// Scroll the viewport and extend selection while dragging beyond edges.
+    Enabled,
 }
 
 impl MousePolicy {
@@ -401,6 +418,7 @@ impl MousePolicy {
             enabled: false,
             click_to_cursor: false,
             drag_selection: false,
+            edge_scroll: DragEdgeScroll::Disabled,
             double_click: None,
             triple_click: None,
         }
@@ -413,6 +431,7 @@ impl MousePolicy {
             enabled: true,
             click_to_cursor: true,
             drag_selection: true,
+            edge_scroll: DragEdgeScroll::Enabled,
             double_click: Some(SelectionGranularity::Word),
             triple_click: Some(SelectionGranularity::All),
         }
@@ -657,6 +676,78 @@ fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DragPosition {
+    row: usize,
+    col: usize,
+    scrolled: bool,
+}
+
+fn drag_wrapped_position(
+    state: &mut TextInputState,
+    mouse: MouseEvent,
+    edge_scroll: bool,
+) -> Option<DragPosition> {
+    let area = state.content_area;
+    if area.is_empty() {
+        return None;
+    }
+    let col = clamped_mouse_col(area, mouse.position.x);
+    if mouse.position.y < area.y {
+        if !edge_scroll {
+            return None;
+        }
+        let previous = state.vertical_scroll;
+        state.vertical_scroll = state.vertical_scroll.saturating_sub(1);
+        return Some(DragPosition {
+            row: state.vertical_scroll,
+            col,
+            scrolled: state.vertical_scroll != previous,
+        });
+    }
+    if mouse.position.y >= area.bottom() {
+        if !edge_scroll {
+            return None;
+        }
+        let previous = state.vertical_scroll;
+        state.vertical_scroll = state
+            .vertical_scroll
+            .saturating_add(1)
+            .min(max_vertical_scroll(&state.buffer, area));
+        return Some(DragPosition {
+            row: state
+                .vertical_scroll
+                .saturating_add(usize::from(area.height).saturating_sub(1)),
+            col,
+            scrolled: state.vertical_scroll != previous,
+        });
+    }
+    Some(DragPosition {
+        row: usize::from(mouse.position.y.saturating_sub(area.y))
+            .saturating_add(state.vertical_scroll),
+        col,
+        scrolled: false,
+    })
+}
+
+fn clamped_mouse_col(area: Rect, x: u16) -> usize {
+    if x < area.x {
+        0
+    } else if x >= area.right() {
+        usize::from(area.width.saturating_sub(1))
+    } else {
+        usize::from(x.saturating_sub(area.x))
+    }
+}
+
+fn max_vertical_scroll(buffer: &TextEditBuffer, area: Rect) -> usize {
+    buffer
+        .wrapped_layout(usize::from(area.width.max(1)))
+        .lines
+        .len()
+        .saturating_sub(usize::from(area.height))
+}
+
 fn apply_selection_granularity(
     buffer: &mut TextEditBuffer,
     area: Rect,
@@ -875,5 +966,53 @@ mod tests {
             mouse(MouseEventKind::Drag(MouseButton::Left), 5, 0),
         );
         assert_eq!(state.buffer().selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn drag_below_input_scrolls_and_extends_selection() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("0\n1\n2\n3\n4"));
+        state.buffer_mut().move_cursor(TextMotion::Start);
+        state.set_content_area(Rect::new(0, 0, 10, 2), &policy);
+
+        let _ = control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+        );
+        assert_eq!(
+            control.handle_mouse(
+                &mut state,
+                mouse(MouseEventKind::Drag(MouseButton::Left), 0, 2),
+            ),
+            TextInputOutcome::Redraw
+        );
+
+        assert_eq!(state.vertical_scroll(), 1);
+        assert_eq!(state.buffer().selected_text(), Some("0\n1\n".to_string()));
+    }
+
+    #[test]
+    fn drag_above_input_scrolls_and_extends_selection() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("0\n1\n2\n3\n4"));
+        state.set_content_area(Rect::new(0, 5, 10, 2), &policy);
+        assert_eq!(state.vertical_scroll(), 3);
+
+        let _ = control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 6),
+        );
+        assert_eq!(
+            control.handle_mouse(
+                &mut state,
+                mouse(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            ),
+            TextInputOutcome::Redraw
+        );
+
+        assert_eq!(state.vertical_scroll(), 2);
+        assert_eq!(state.buffer().selected_text(), Some("2\n3\n".to_string()));
     }
 }
