@@ -38,7 +38,9 @@ pub mod widget;
 
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
-    pub use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
+    pub use crate::ansi::{
+        AnsiFrameDiffStats, ansi_to_lines, write_ansi_frame, write_ansi_frame_diff,
+    };
     pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::chrome::{Border, BorderSet, Modal, Panel};

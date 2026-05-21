@@ -606,6 +606,22 @@ impl<'lines> DiffView<'lines> {
         self.lines.len()
     }
 
+    /// Render diff rows as styled lines for a fixed width.
+    #[must_use]
+    pub fn render_lines(&self, width: u16, max_rows: usize) -> Vec<Line> {
+        self.render_rows()
+            .into_iter()
+            .take(max_rows)
+            .map(|render_row| self.render_row(render_row, width))
+            .collect()
+    }
+
+    /// Return the rendered row count after context folding.
+    #[must_use]
+    pub fn rendered_row_count(&self) -> usize {
+        self.render_rows().len()
+    }
+
     /// Return hunk header indices.
     #[must_use]
     pub fn hunk_indices(&self) -> Vec<usize> {
@@ -653,18 +669,7 @@ impl StatefulWidget for DiffView<'_> {
             let Ok(row) = u16::try_from(row) else {
                 return;
             };
-            let rendered = match *render_row {
-                DiffRenderRow::Line(index) => {
-                    let line = &self.lines[index];
-                    match self.resolved_mode(area) {
-                        DiffViewMode::Unified | DiffViewMode::Responsive => {
-                            self.render_unified_line(line)
-                        }
-                        DiffViewMode::SideBySide => self.render_side_by_side_line(line, area.width),
-                    }
-                }
-                DiffRenderRow::Fold { count, .. } => self.render_fold_line(count),
-            };
+            let rendered = self.render_row(*render_row, area.width);
             frame.write_line(
                 Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
                 &rendered,
@@ -674,6 +679,21 @@ impl StatefulWidget for DiffView<'_> {
 }
 
 impl DiffView<'_> {
+    fn render_row(&self, render_row: DiffRenderRow, width: u16) -> Line {
+        match render_row {
+            DiffRenderRow::Line(index) => {
+                let line = &self.lines[index];
+                match self.resolved_mode(Rect::new(0, 0, width, 1)) {
+                    DiffViewMode::Unified | DiffViewMode::Responsive => {
+                        self.render_unified_line(line)
+                    }
+                    DiffViewMode::SideBySide => self.render_side_by_side_line(line, width),
+                }
+            }
+            DiffRenderRow::Fold { count, .. } => self.render_fold_line(count),
+        }
+    }
+
     fn render_rows(&self) -> Vec<DiffRenderRow> {
         let Some(threshold) = self.fold_context_threshold else {
             return (0..self.lines.len()).map(DiffRenderRow::Line).collect();

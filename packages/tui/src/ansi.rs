@@ -6,6 +6,7 @@ use crate::buffer::Buffer;
 use crate::frame::Cursor;
 use crate::geometry::Point;
 use crate::style::{Color, Modifier, Style};
+use crate::text::{Line, Span};
 
 /// Write a full buffer frame using ANSI escape sequences.
 ///
@@ -126,6 +127,223 @@ pub fn write_ansi_frame_diff(
     })
 }
 
+/// Convert ANSI-styled terminal output into BMUX styled text lines.
+///
+/// Unsupported control sequences are stripped. SGR styling is preserved for the common ANSI
+/// color/modifier forms, including 8-color, bright-color, 256-color, and RGB colors.
+#[must_use]
+pub fn ansi_to_lines(input: &str) -> Vec<Line> {
+    let mut parser = AnsiTextParser::default();
+    parser.push_str(input);
+    parser.finish()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnsiTextParser {
+    lines: Vec<Line>,
+    current: Line,
+    style: Style,
+}
+
+impl Default for AnsiTextParser {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            current: Line::new(),
+            style: Style::new(),
+        }
+    }
+}
+
+impl AnsiTextParser {
+    fn push_str(&mut self, input: &str) {
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\x1b' => self.consume_escape(&mut chars),
+                '\n' => self.push_newline(),
+                '\r' => {}
+                '\t' => self.push_text("    "),
+                ch if ch.is_control() => {}
+                ch => self.push_text(&ch.to_string()),
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<Line> {
+        self.lines.push(self.current);
+        self.lines
+    }
+
+    fn push_newline(&mut self) {
+        self.lines.push(std::mem::take(&mut self.current));
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if let Some(last) = self.current.spans.last_mut()
+            && last.style == self.style
+        {
+            last.content.push_str(text);
+            return;
+        }
+        self.current
+            .push_span(Span::styled(text.to_owned(), self.style));
+    }
+
+    fn consume_escape(&mut self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        match chars.next() {
+            Some('[') => self.consume_csi(chars),
+            Some(']') => consume_until_bel_or_st(chars),
+            Some(_) | None => {}
+        }
+    }
+
+    fn consume_csi(&mut self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        let mut sequence = String::new();
+        for ch in chars.by_ref() {
+            if ('@'..='~').contains(&ch) {
+                if ch == 'm' {
+                    apply_sgr(&mut self.style, &sequence);
+                }
+                return;
+            }
+            sequence.push(ch);
+        }
+    }
+}
+
+fn consume_until_bel_or_st(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let mut previous_was_escape = false;
+    for ch in chars.by_ref() {
+        if ch == '\x07' || previous_was_escape && ch == '\\' {
+            return;
+        }
+        previous_was_escape = ch == '\x1b';
+    }
+}
+
+fn apply_sgr(style: &mut Style, sequence: &str) {
+    let params = sgr_params(sequence);
+    if params.is_empty() {
+        *style = Style::new();
+        return;
+    }
+    let mut index = 0usize;
+    while index < params.len() {
+        match params[index] {
+            0 => *style = Style::new(),
+            1 => style.modifiers |= Modifier::BOLD,
+            2 => style.modifiers |= Modifier::DIM,
+            3 => style.modifiers |= Modifier::ITALIC,
+            4 => style.modifiers |= Modifier::UNDERLINE,
+            5 => style.modifiers |= Modifier::SLOW_BLINK,
+            7 => style.modifiers |= Modifier::REVERSED,
+            8 => style.modifiers |= Modifier::HIDDEN,
+            9 => style.modifiers |= Modifier::CROSSED_OUT,
+            22 => style.modifiers = style.modifiers.difference(Modifier::BOLD | Modifier::DIM),
+            23 => style.modifiers = style.modifiers.difference(Modifier::ITALIC),
+            24 => style.modifiers = style.modifiers.difference(Modifier::UNDERLINE),
+            25 => style.modifiers = style.modifiers.difference(Modifier::SLOW_BLINK),
+            27 => style.modifiers = style.modifiers.difference(Modifier::REVERSED),
+            28 => style.modifiers = style.modifiers.difference(Modifier::HIDDEN),
+            29 => style.modifiers = style.modifiers.difference(Modifier::CROSSED_OUT),
+            30..=37 => style.fg = Some(standard_color(params[index] - 30, false)),
+            39 => style.fg = None,
+            40..=47 => style.bg = Some(standard_color(params[index] - 40, false)),
+            49 => style.bg = None,
+            90..=97 => style.fg = Some(standard_color(params[index] - 90, true)),
+            100..=107 => style.bg = Some(standard_color(params[index] - 100, true)),
+            38 | 48 => {
+                index = apply_extended_color(style, &params, index);
+            }
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+fn sgr_params(sequence: &str) -> Vec<u16> {
+    if sequence.is_empty() {
+        return Vec::new();
+    }
+    sequence
+        .split([';', ':'])
+        .map(|part| part.parse::<u16>().unwrap_or(0))
+        .collect()
+}
+
+fn apply_extended_color(style: &mut Style, params: &[u16], index: usize) -> usize {
+    let Some(mode) = params.get(index.saturating_add(1)).copied() else {
+        return index;
+    };
+    let color_role = if params[index] == 38 {
+        ColorRole::Foreground
+    } else {
+        ColorRole::Background
+    };
+    match mode {
+        5 => {
+            if let Some(color) = params.get(index.saturating_add(2)).copied() {
+                set_style_color(
+                    style,
+                    color_role,
+                    Color::Indexed(u8::try_from(color).unwrap_or(u8::MAX)),
+                );
+                return index.saturating_add(2);
+            }
+        }
+        2 => {
+            if let (Some(red), Some(green), Some(blue)) = (
+                params.get(index.saturating_add(2)).copied(),
+                params.get(index.saturating_add(3)).copied(),
+                params.get(index.saturating_add(4)).copied(),
+            ) {
+                set_style_color(
+                    style,
+                    color_role,
+                    Color::Rgb(
+                        u8::try_from(red).unwrap_or(u8::MAX),
+                        u8::try_from(green).unwrap_or(u8::MAX),
+                        u8::try_from(blue).unwrap_or(u8::MAX),
+                    ),
+                );
+                return index.saturating_add(4);
+            }
+        }
+        _ => {}
+    }
+    index
+}
+
+const fn set_style_color(style: &mut Style, role: ColorRole, color: Color) {
+    match role {
+        ColorRole::Foreground => style.fg = Some(color),
+        ColorRole::Background => style.bg = Some(color),
+    }
+}
+
+const fn standard_color(offset: u16, bright: bool) -> Color {
+    match (offset, bright) {
+        (0, false) => Color::Black,
+        (1, false) => Color::Red,
+        (2, false) => Color::Green,
+        (3, false) => Color::Yellow,
+        (4, false) => Color::Blue,
+        (5, false) => Color::Magenta,
+        (6, false) => Color::Cyan,
+        (7, false) => Color::White,
+        (0, true) => Color::BrightBlack,
+        (1, true) => Color::BrightRed,
+        (2, true) => Color::BrightGreen,
+        (3, true) => Color::BrightYellow,
+        (4, true) => Color::BrightBlue,
+        (5, true) => Color::BrightMagenta,
+        (6, true) => Color::BrightCyan,
+        (7, true) => Color::BrightWhite,
+        (_, _) => Color::Default,
+    }
+}
+
 fn write_ansi_move_to(writer: &mut impl Write, point: Point) -> io::Result<()> {
     write!(
         writer,
@@ -227,11 +445,30 @@ const fn bright_color_base(role: ColorRole) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{write_ansi_frame, write_ansi_frame_diff};
+    use super::{ansi_to_lines, write_ansi_frame, write_ansi_frame_diff};
     use crate::buffer::Buffer;
     use crate::frame::Cursor;
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
+
+    #[test]
+    fn ansi_to_lines_preserves_sgr_styles() {
+        let lines = ansi_to_lines("normal \x1b[31;1mred\x1b[0m\n\x1b[38;5;42midx\x1b[0m");
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].plain_text(), "normal red");
+        assert_eq!(lines[1].plain_text(), "idx");
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Red));
+        assert!(lines[0].spans[1].style.modifiers.contains(Modifier::BOLD));
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Indexed(42)));
+    }
+
+    #[test]
+    fn ansi_to_lines_strips_unsupported_control_sequences() {
+        let lines = ansi_to_lines("before\x1b]0;title\x07after\x1b[2K");
+
+        assert_eq!(lines[0].plain_text(), "beforeafter");
+    }
 
     #[test]
     fn ansi_frame_diff_writes_only_changed_cells() {
