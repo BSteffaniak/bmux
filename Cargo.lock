@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "bmux"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_cli",
  "bmux_client",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_appearance"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin_sdk",
  "serde",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_attach_image_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_attach_layout_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_codec",
  "bmux_plugin_schema_macros",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_attach_pipeline"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_appearance",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_attach_pipeline_models"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "uuid",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_attach_token_state"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_session_models",
  "serde",
@@ -1088,14 +1088,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_attach_view_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bmux_cli"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1202,18 +1202,18 @@ dependencies = [
 
 [[package]]
 name = "bmux_cli_output"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 
 [[package]]
 name = "bmux_cli_schema"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "bmux_client"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_attach_layout_protocol",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_client_state"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_session_models",
  "serde",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_clients_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_client_state",
  "bmux_clients_plugin_api",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_clients_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -1272,14 +1272,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_clipboard"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bmux_clipboard_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_clipboard",
  "bmux_plugin_sdk",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_cluster_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_clients_plugin_api",
  "bmux_config",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_codec"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_command_palette_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_keybind",
  "bmux_plugin",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_config"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_config_doc",
  "bmux_config_doc_derive",
@@ -1340,11 +1340,11 @@ dependencies = [
 
 [[package]]
 name = "bmux_config_doc"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 
 [[package]]
 name = "bmux_config_doc_derive"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_context_state"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_session_models",
  "serde",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_contexts_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_clients_plugin_api",
  "bmux_context_state",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_contexts_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_control_catalog_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_clients_plugin_api",
  "bmux_context_state",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_control_catalog_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_decoration_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arc-swap",
  "bmux_attach_layout_protocol",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_decoration_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_decoration_plugin_renderer"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_scene_protocol",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_diagnostic_log"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_docs_site"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_docs_site_ui",
  "env_logger",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_docs_site_ui"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_cli",
  "bmux_cli_schema",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_env"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_slots",
@@ -1522,14 +1522,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_event_models"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bmux_example_native_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_cli",
  "bmux_cli_output",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_fonts"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -1551,14 +1551,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_hello_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin_sdk",
 ]
 
 [[package]]
 name = "bmux_image"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_ipc"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -1586,14 +1586,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_keybind"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "bmux_keyboard"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "crossterm",
  "serde",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_mobile_core"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_mobile_ffi"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_mobile_core",
  "thiserror 2.0.18",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_pane_runtime_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_attach_image_protocol",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_pane_runtime_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_pane_runtime_state"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_attach_image_protocol",
@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_perf_telemetry"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_perf_tools"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_client",
  "bmux_codec",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_performance_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_pane_runtime_state",
  "bmux_performance_plugin_api",
@@ -1741,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_performance_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_performance_state"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_config",
  "serde",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_permissions_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_clients_plugin_api",
  "bmux_contexts_plugin_api",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_permissions_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_plugin_cli_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_plugin_schema"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_plugin_schema_macros"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_plugin_sdk"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_prompt_plugin_showcase"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_cli",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_prompt_showcase"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_cli",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_prompted_actions_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_recording_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_codec",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_recording_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_codec",
@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_recording_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_recording_runtime"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_recording_protocol",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_sandbox_harness"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_client",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_scene_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_scene_protocol_render"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_scene_protocol",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_server"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_attach_image_protocol",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_session_models"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "uuid",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_session_state"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_session_models",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_sessions_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_pane_runtime_plugin_api",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_sessions_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_slots"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "dirs",
  "serde",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_snapshot_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_snapshot_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_client_state",
@@ -2122,14 +2122,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_snapshot_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bmux_snapshot_runtime"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin_sdk",
  "bmux_snapshot_protocol",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_terminal_grid"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2149,14 +2149,14 @@ dependencies = [
 
 [[package]]
 name = "bmux_terminal_protocol"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bmux_text_edit"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_keyboard",
  "serde",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_theme_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_appearance",
  "bmux_ipc",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_tui"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_tui_components"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_visual_adapters_plugin_renderer"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "tracing",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_windows_plugin"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_clients_plugin_api",
  "bmux_contexts_plugin_api",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "bmux_windows_plugin_api"
-version = "0.0.1-alpha.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin_schema_macros",
