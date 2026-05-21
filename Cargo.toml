@@ -53,6 +53,7 @@ members = [
     "packages/keyboard",
     "packages/text-edit",
     "packages/tui",
+    "packages/tui-components",
     "packages/mobile-core",
     "packages/mobile-ffi",
     "packages/image",
@@ -183,6 +184,7 @@ bmux_terminal_grid          = { version = "0.0.1-alpha.0", default-features = fa
 bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
 bmux_text_edit              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/text-edit" }
 bmux_tui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
+bmux_tui_components         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
 bmux_clients_plugin                  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clients-plugin" }

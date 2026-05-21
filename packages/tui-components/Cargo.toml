@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "gui"]
+description = "Reusable terminal UI components for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "tui", "components"]
+license     = { workspace = true }
+name        = "bmux_tui_components"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_keyboard        = { workspace = true, optional = true }
+bmux_text_edit       = { workspace = true, features = ["keyboard"], optional = true }
+bmux_tui             = { workspace = true, optional = true }
+unicode-segmentation = { workspace = true, optional = true }
+
+[features]
+default = []
+fail-on-warnings = []
+text-input = [
+    "dep:bmux_keyboard",
+    "dep:bmux_text_edit",
+    "dep:bmux_tui",
+    "dep:unicode-segmentation",
+]
