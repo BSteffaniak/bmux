@@ -6,7 +6,6 @@ edition     = { workspace = true }
 keywords    = ["bmux", "command-palette", "plugin"]
 license     = { workspace = true }
 name        = "bmux_command_palette_plugin"
-publish     = false
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }

@@ -6,7 +6,6 @@ edition     = { workspace = true }
 keywords    = ["bmux", "plugin", "cluster"]
 license     = { workspace = true }
 name        = "bmux_cluster_plugin"
-publish     = false
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }

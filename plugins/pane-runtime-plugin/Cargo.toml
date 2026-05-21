@@ -6,7 +6,6 @@ edition     = { workspace = true }
 keywords    = ["bmux", "plugin", "pane", "runtime"]
 license     = { workspace = true }
 name        = "bmux_pane_runtime_plugin"
-publish     = false
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
