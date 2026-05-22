@@ -10,10 +10,10 @@ use crossterm::event::{
     MouseEvent as CrosstermMouseEvent, MouseEventKind as CrosstermMouseEventKind,
     poll as crossterm_poll, read as crossterm_read,
 };
-use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 
 use crate::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use crate::geometry::{Point, Size};
@@ -25,6 +25,7 @@ use crate::geometry::{Point, Size};
 pub struct CrosstermTerminalGuard<W: Write> {
     writer: Option<W>,
     active: bool,
+    keyboard_enhanced: bool,
 }
 
 impl<W: Write> CrosstermTerminalGuard<W> {
@@ -36,18 +37,25 @@ impl<W: Write> CrosstermTerminalGuard<W> {
     /// entering the alternate screen.
     pub fn enter(mut writer: W) -> io::Result<Self> {
         enable_raw_mode()?;
+        let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement()
+            .unwrap_or(false)
+            && push_keyboard_enhancement_flags(&mut writer).is_ok();
         if let Err(error) = execute!(
             writer,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
         ) {
+            if keyboard_enhanced {
+                let _ = pop_keyboard_enhancement_flags(&mut writer);
+            }
             let _ = disable_raw_mode();
             return Err(error);
         }
         Ok(Self {
             writer: Some(writer),
             active: true,
+            keyboard_enhanced,
         })
     }
 
@@ -79,6 +87,10 @@ impl<W: Write> CrosstermTerminalGuard<W> {
 
     fn leave_inner(&mut self) -> io::Result<()> {
         if let Some(writer) = &mut self.writer {
+            if self.keyboard_enhanced {
+                pop_keyboard_enhancement_flags(writer)?;
+                self.keyboard_enhanced = false;
+            }
             execute!(
                 writer,
                 DisableBracketedPaste,
@@ -94,6 +106,10 @@ impl<W: Write> Drop for CrosstermTerminalGuard<W> {
     fn drop(&mut self) {
         if self.active {
             if let Some(writer) = &mut self.writer {
+                if self.keyboard_enhanced {
+                    let _ = pop_keyboard_enhancement_flags(writer);
+                    self.keyboard_enhanced = false;
+                }
                 let _ = execute!(
                     writer,
                     DisableBracketedPaste,
@@ -104,6 +120,24 @@ impl<W: Write> Drop for CrosstermTerminalGuard<W> {
             let _ = disable_raw_mode();
         }
     }
+}
+
+fn push_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
+    use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+
+    queue!(
+        writer,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )?;
+    writer.flush()
+}
+
+fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
+    queue!(writer, crossterm::event::PopKeyboardEnhancementFlags)?;
+    writer.flush()
 }
 
 /// Poll for a terminal event and convert it to a BMUX TUI event.

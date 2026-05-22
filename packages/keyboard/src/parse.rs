@@ -74,8 +74,8 @@ pub fn parse_key_stroke(value: &str) -> Result<KeyStroke, ParseKeyError> {
 
     for modifier in &tokens[..tokens.len() - 1] {
         match *modifier {
-            "ctrl" => ctrl = true,
-            "alt" => alt = true,
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" => alt = true,
             "shift" => shift = true,
             "super" | "cmd" | "command" | "win" | "windows" => super_key = true,
             "hyper" => hyper = true,
@@ -104,12 +104,15 @@ pub fn parse_key_stroke(value: &str) -> Result<KeyStroke, ParseKeyError> {
 fn parse_key_token(value: &str) -> Result<KeyCode, ParseKeyError> {
     let normalized = match value {
         "esc" => "escape",
+        "return" => "enter",
         "up" => "arrow_up",
         "down" => "arrow_down",
         "left" => "arrow_left",
         "right" => "arrow_right",
-        "pgup" => "page_up",
-        "pgdn" => "page_down",
+        "pgup" | "pageup" => "page_up",
+        "pgdn" | "pagedown" => "page_down",
+        "del" => "delete",
+        "ins" => "insert",
         "+" => "plus",
         "-" => "minus",
         _ => value,
@@ -160,5 +163,16 @@ mod tests {
         assert_eq!(chord.len(), 2);
         assert!(chord[0].modifiers.ctrl);
         assert_eq!(chord[1].key, KeyCode::Char('d'));
+    }
+
+    #[test]
+    fn parses_common_aliases() {
+        let stroke = parse_key_stroke("control+return").expect("parse control-return");
+        assert_eq!(stroke.key, KeyCode::Enter);
+        assert!(stroke.modifiers.ctrl);
+
+        let stroke = parse_key_stroke("option+pageup").expect("parse option-pageup");
+        assert_eq!(stroke.key, KeyCode::PageUp);
+        assert!(stroke.modifiers.alt);
     }
 }
