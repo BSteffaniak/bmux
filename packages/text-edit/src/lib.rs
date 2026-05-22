@@ -1171,6 +1171,20 @@ mod tests {
     }
 
     #[test]
+    fn paste_preserves_multiline_text() {
+        let mut buffer = TextEditBuffer::from_text("before after");
+        buffer.move_cursor(TextMotion::WordLeft);
+
+        buffer.paste("one\ntwo\r\nthree\rbracketed");
+
+        assert_eq!(buffer.text(), "before one\ntwo\r\nthree\rbracketedafter");
+        assert_eq!(
+            buffer.cursor_byte_index(),
+            "before one\ntwo\r\nthree\rbracketed".len()
+        );
+    }
+
+    #[test]
     fn paste_command_replaces_selection() {
         let mut buffer = TextEditBuffer::from_text("hello world");
         buffer.move_cursor(TextMotion::Start);

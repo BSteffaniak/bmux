@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
-use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -114,6 +114,25 @@ impl<'policy> TextInputControl<'policy> {
         usize_to_u16_saturating(wrapped_rows)
             .max(self.policy.viewport.min_rows.max(1))
             .min(self.policy.viewport.max_rows.unwrap_or(u16::MAX))
+    }
+
+    /// Handle one input event.
+    pub fn handle_event(&self, state: &mut TextInputState, event: &Event) -> TextInputOutcome {
+        match event {
+            Event::Key(stroke) => self.handle_key(state, *stroke),
+            Event::Mouse(mouse) => self.handle_mouse(state, *mouse),
+            Event::Paste(text) => self.handle_paste(state, text),
+            Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
+                TextInputOutcome::Ignored
+            }
+        }
+    }
+
+    /// Handle bracketed pasted text.
+    pub fn handle_paste(&self, state: &mut TextInputState, text: &str) -> TextInputOutcome {
+        state.buffer.paste(text);
+        state.sync_scroll_to_cursor(self.policy);
+        TextInputOutcome::Edited
     }
 
     /// Handle one keyboard stroke.
@@ -889,6 +908,33 @@ mod tests {
             TextInputOutcome::Ignored
         );
         assert_eq!(state.buffer().cursor_byte_index(), "hello".len());
+    }
+
+    #[test]
+    fn handle_paste_preserves_multiline_text() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("hello"));
+        state.set_content_area(Rect::new(0, 0, 20, 1), &policy);
+
+        assert_eq!(
+            control.handle_paste(&mut state, "\nworld\r\nraw\rtext"),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "hello\nworld\r\nraw\rtext");
+    }
+
+    #[test]
+    fn handle_event_dispatches_paste() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::default();
+
+        assert_eq!(
+            control.handle_event(&mut state, &Event::Paste("one\ntwo".to_owned())),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "one\ntwo");
     }
 
     #[test]
