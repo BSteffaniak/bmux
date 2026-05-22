@@ -1077,6 +1077,27 @@ impl TerminalGrid {
         self.display_rows(0, self.main_row_count())
     }
 
+    /// Materialize retained main-screen content rows without viewport padding.
+    ///
+    /// The returned rows include retained scrollback and the live viewport up to
+    /// the cursor/content extent, but exclude unused terminal rectangle rows.
+    /// This is intended for transcript-style renderers that need terminal
+    /// fidelity without fixed-pane padding.
+    #[must_use]
+    pub fn main_content_rows(&self) -> Vec<PhysicalRow> {
+        let mut rows = self.main_content_rows_unbounded();
+        trim_trailing_unused_rows(&mut rows);
+        rows
+    }
+
+    /// Materialize the tail of retained main-screen content rows.
+    #[must_use]
+    pub fn main_content_tail_rows(&self, max_rows: usize) -> Vec<PhysicalRow> {
+        let rows = self.main_content_rows();
+        let start = rows.len().saturating_sub(max_rows);
+        rows[start..].to_vec()
+    }
+
     #[must_use]
     pub fn snapshot(&self, scrollback_offset: usize, rows: usize) -> GridSnapshot {
         GridSnapshot::from_grid(self, scrollback_offset, rows)
@@ -1216,13 +1237,38 @@ impl TerminalGrid {
     ) -> Vec<PhysicalRow> {
         let mut skipped = 0_usize;
         let mut selected = Vec::with_capacity(requested_rows.min(self.height.saturating_mul(2)));
+        self.collect_main_rows_reversed(
+            scrollback_offset,
+            requested_rows,
+            &mut skipped,
+            &mut selected,
+        );
+        selected.reverse();
+        selected
+    }
+
+    fn main_content_rows_unbounded(&self) -> Vec<PhysicalRow> {
+        let mut skipped = 0_usize;
+        let mut selected = Vec::with_capacity(self.main_row_count());
+        self.collect_main_rows_reversed(0, usize::MAX, &mut skipped, &mut selected);
+        selected.reverse();
+        selected
+    }
+
+    fn collect_main_rows_reversed(
+        &self,
+        scrollback_offset: usize,
+        requested_rows: usize,
+        skipped: &mut usize,
+        selected: &mut Vec<PhysicalRow>,
+    ) {
         for row in self.main_rows.iter().rev() {
             collect_reversed_row(
                 row.clone(),
                 scrollback_offset,
                 requested_rows,
-                &mut skipped,
-                &mut selected,
+                skipped,
+                selected,
             );
             if selected.len() >= requested_rows {
                 break;
@@ -1235,8 +1281,8 @@ impl TerminalGrid {
                 self.width,
                 scrollback_offset,
                 requested_rows,
-                &mut skipped,
-                &mut selected,
+                skipped,
+                selected,
             );
         }
         for line in self.main_history.iter().rev() {
@@ -1249,12 +1295,10 @@ impl TerminalGrid {
                 self.width,
                 scrollback_offset,
                 requested_rows,
-                &mut skipped,
-                &mut selected,
+                skipped,
+                selected,
             );
         }
-        selected.reverse();
-        selected
     }
 
     fn alt_display_rows(
@@ -1534,6 +1578,21 @@ fn projected_row_count(cells: &[Cell], width: usize) -> usize {
     projected_logical_line_row_count(cells, width)
 }
 
+/// Return whether a physical row contains no visible text.
+#[must_use]
+pub fn physical_row_is_blank(row: &PhysicalRow) -> bool {
+    row.cells()
+        .iter()
+        .filter(|cell| !cell.is_wide_continuation())
+        .all(|cell| cell.text().trim().is_empty())
+}
+
+fn trim_trailing_unused_rows(rows: &mut Vec<PhysicalRow>) {
+    while rows.last().is_some_and(physical_row_is_blank) {
+        rows.pop();
+    }
+}
+
 fn projected_pending_row_count(cells: &[Cell], width: usize) -> usize {
     if cells.is_empty() {
         0
@@ -1637,6 +1696,40 @@ mod tests {
 
         grid.process(b"\x1b[K");
         assert!(grid.content_revision() > printed_content_revision);
+    }
+
+    #[test]
+    fn main_content_rows_excludes_unused_viewport_padding() {
+        let mut grid = TerminalGrid::new(10, 5, GridLimits::default()).unwrap();
+
+        grid.process(b"hello\r\nworld");
+
+        let rows = grid.main_content_rows();
+        let text = rows.iter().map(row_text).collect::<Vec<_>>();
+        assert_eq!(text, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn main_content_rows_preserves_intentional_blank_output_lines() {
+        let mut grid = TerminalGrid::new(10, 5, GridLimits::default()).unwrap();
+
+        grid.process(b"before\r\n\r\nafter");
+
+        let rows = grid.main_content_rows();
+        let text = rows.iter().map(row_text).collect::<Vec<_>>();
+        assert_eq!(text, vec!["before", "", "after"]);
+    }
+
+    #[test]
+    fn main_content_rows_reflows_on_resize() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
+        grid.process(b"abcdefghij");
+
+        grid.resize(10, 5).unwrap();
+
+        let rows = grid.main_content_rows();
+        let text = rows.iter().map(row_text).collect::<Vec<_>>();
+        assert_eq!(text, vec!["abcdefghij"]);
     }
 
     #[test]

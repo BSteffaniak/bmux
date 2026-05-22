@@ -21,6 +21,7 @@ pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{
     Cell, Cursor, GridLimits, GridMode, GridRowWindow, MouseProtocolEncoding, MouseProtocolMode,
     PhysicalRow, ProjectedRows, ProtocolState, TerminalGrid, TerminalGridError,
+    physical_row_is_blank,
 };
 pub use parser::{
     ProtocolProcessOutcome, TerminalGridStream, TerminalGridStreamDeltaError,
