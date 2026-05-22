@@ -70,10 +70,25 @@ impl TextInputState {
 
     /// Synchronize vertical scroll so the cursor is visible if policy allows.
     pub fn sync_scroll_to_cursor(&mut self, policy: &TextInputPolicy) {
-        if !policy.viewport.auto_scroll_to_cursor || self.content_area.height == 0 {
+        let Some(offset) = self.cursor_scroll_offset(policy) else {
             return;
+        };
+        self.vertical_scroll = offset;
+    }
+
+    /// Return the scroll offset that keeps the cursor visible.
+    #[must_use]
+    pub fn cursor_scroll_offset(&self, policy: &TextInputPolicy) -> Option<usize> {
+        if !policy.viewport.auto_scroll_to_cursor || self.content_area.height == 0 {
+            return None;
         }
-        self.vertical_scroll = cursor_scroll_offset(&self.buffer, self.content_area);
+        let layout = self
+            .buffer
+            .wrapped_layout(usize::from(self.content_area.width.max(1)));
+        Some(scroll_offset_for_cursor_row(
+            layout.cursor.row,
+            self.content_area.height,
+        ))
     }
 
     /// Return whether a mouse selection drag is active.
@@ -131,7 +146,9 @@ impl<'policy> TextInputControl<'policy> {
     /// Handle bracketed pasted text.
     pub fn handle_paste(&self, state: &mut TextInputState, text: &str) -> TextInputOutcome {
         state.buffer.paste(text);
-        state.sync_scroll_to_cursor(self.policy);
+        if self.policy.viewport.auto_scroll_to_cursor {
+            state.vertical_scroll = usize::MAX;
+        }
         TextInputOutcome::Edited
     }
 
@@ -669,16 +686,10 @@ fn extend_visual_selection(buffer: &mut TextEditBuffer, area: Rect, delta: isize
     buffer.select_to_wrapped_position(width, target_row, layout.cursor.col);
 }
 
-fn cursor_scroll_offset(buffer: &TextEditBuffer, area: Rect) -> usize {
-    if area.height == 0 {
-        return 0;
-    }
-    let layout = buffer.wrapped_layout(usize::from(area.width.max(1)));
-    layout
-        .cursor
-        .row
+fn scroll_offset_for_cursor_row(cursor_row: usize, height: u16) -> usize {
+    cursor_row
         .saturating_add(1)
-        .saturating_sub(usize::from(area.height))
+        .saturating_sub(usize::from(height))
 }
 
 fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(usize, usize)> {
@@ -921,7 +932,7 @@ mod tests {
             control.handle_paste(&mut state, "\nworld\r\nraw\rtext"),
             TextInputOutcome::Edited
         );
-        assert_eq!(state.buffer().text(), "hello\nworld\r\nraw\rtext");
+        assert_eq!(state.buffer().text(), "hello\nworld\nraw\ntext");
     }
 
     #[test]

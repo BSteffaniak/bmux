@@ -155,17 +155,25 @@ impl<'buffer> TextInput<'buffer> {
     pub fn project(&self, area: Rect) -> TextInputProjection {
         let width = usize::from(area.width.max(1));
         let layout = self.buffer.wrapped_layout(width);
+        Self::project_with_layout(&layout, self.vertical_scroll, area.height)
+    }
+
+    fn project_with_layout(
+        layout: &bmux_text_edit::WrapLayout,
+        vertical_scroll: usize,
+        height: u16,
+    ) -> TextInputProjection {
         let lines = layout
             .lines
             .iter()
-            .skip(self.vertical_scroll)
-            .take(usize::from(area.height))
+            .skip(vertical_scroll)
+            .take(usize::from(height))
             .cloned()
             .collect();
         TextInputProjection {
             lines,
             cursor: VisualCursor {
-                row: layout.cursor.row.saturating_sub(self.vertical_scroll),
+                row: layout.cursor.row.saturating_sub(vertical_scroll),
                 col: layout.cursor.col,
             },
         }
@@ -191,17 +199,23 @@ impl Widget for TextInput<'_> {
             return;
         }
 
-        let projection = self.project(area);
+        let layout = self.buffer.wrapped_layout(usize::from(area.width.max(1)));
+        let vertical_scroll = if self.vertical_scroll == usize::MAX {
+            scroll_offset_for_cursor_row(layout.cursor.row, area.height)
+        } else {
+            self.vertical_scroll
+        };
+        let projection = Self::project_with_layout(&layout, vertical_scroll, area.height);
         let rendered_lines = selected_wrapped_lines(
             self.buffer.text(),
-            &self.buffer.wrapped_layout(usize::from(area.width.max(1))),
+            &layout,
             self.buffer.selection(),
             self.style,
             self.selection_style,
         );
         for (row, line) in rendered_lines
             .into_iter()
-            .skip(self.vertical_scroll)
+            .skip(vertical_scroll)
             .take(usize::from(area.height))
             .enumerate()
         {
@@ -225,6 +239,12 @@ impl Widget for TextInput<'_> {
             )));
         }
     }
+}
+
+fn scroll_offset_for_cursor_row(cursor_row: usize, height: u16) -> usize {
+    cursor_row
+        .saturating_add(1)
+        .saturating_sub(usize::from(height))
 }
 
 fn selected_wrapped_lines(

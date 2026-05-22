@@ -294,8 +294,26 @@ impl TextEditBuffer {
     }
 
     /// Insert pasted text at the cursor, replacing any active selection.
+    ///
+    /// Carriage-return line endings are canonicalized to line-feed hard line
+    /// breaks because this editor stores hard line breaks as `\n` internally.
     pub fn paste(&mut self, value: &str) {
-        self.insert_str(value);
+        let _ = self.delete_selection();
+        let mut normalized = String::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\r' {
+                if chars.peek() == Some(&'\n') {
+                    let _ = chars.next();
+                }
+                normalized.push('\n');
+            } else {
+                normalized.push(ch);
+            }
+        }
+        self.text.insert_str(self.cursor, &normalized);
+        self.cursor = self.cursor.saturating_add(normalized.len());
+        self.desired_visual_col = None;
     }
 
     /// Delete the grapheme before the cursor.
@@ -1177,10 +1195,10 @@ mod tests {
 
         buffer.paste("one\ntwo\r\nthree\rbracketed");
 
-        assert_eq!(buffer.text(), "before one\ntwo\r\nthree\rbracketedafter");
+        assert_eq!(buffer.text(), "before one\ntwo\nthree\nbracketedafter");
         assert_eq!(
             buffer.cursor_byte_index(),
-            "before one\ntwo\r\nthree\rbracketed".len()
+            "before one\ntwo\nthree\nbracketed".len()
         );
     }
 
