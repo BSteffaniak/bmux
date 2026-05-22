@@ -37,21 +37,16 @@ impl<W: Write> CrosstermTerminalGuard<W> {
     /// entering the alternate screen.
     pub fn enter(mut writer: W) -> io::Result<Self> {
         enable_raw_mode()?;
-        let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement()
-            .unwrap_or(false)
-            && push_keyboard_enhancement_flags(&mut writer).is_ok();
         if let Err(error) = execute!(
             writer,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
         ) {
-            if keyboard_enhanced {
-                let _ = pop_keyboard_enhancement_flags(&mut writer);
-            }
             let _ = disable_raw_mode();
             return Err(error);
         }
+        let keyboard_enhanced = push_keyboard_enhancement_flags(&mut writer).is_ok();
         Ok(Self {
             writer: Some(writer),
             active: true,
@@ -129,6 +124,8 @@ fn push_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
         writer,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
     )?;
