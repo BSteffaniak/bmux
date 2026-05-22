@@ -4,10 +4,11 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode as CrosstermKeyCode,
-    KeyEvent as CrosstermKeyEvent, KeyModifiers as CrosstermKeyModifiers,
-    MouseButton as CrosstermMouseButton, MouseEvent as CrosstermMouseEvent,
-    MouseEventKind as CrosstermMouseEventKind, poll as crossterm_poll, read as crossterm_read,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+    KeyModifiers as CrosstermKeyModifiers, MouseButton as CrosstermMouseButton,
+    MouseEvent as CrosstermMouseEvent, MouseEventKind as CrosstermMouseEventKind,
+    poll as crossterm_poll, read as crossterm_read,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -35,7 +36,12 @@ impl<W: Write> CrosstermTerminalGuard<W> {
     /// entering the alternate screen.
     pub fn enter(mut writer: W) -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(writer, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            writer,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -73,7 +79,12 @@ impl<W: Write> CrosstermTerminalGuard<W> {
 
     fn leave_inner(&mut self) -> io::Result<()> {
         if let Some(writer) = &mut self.writer {
-            execute!(writer, DisableMouseCapture, LeaveAlternateScreen)?;
+            execute!(
+                writer,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )?;
         }
         disable_raw_mode()
     }
@@ -83,7 +94,12 @@ impl<W: Write> Drop for CrosstermTerminalGuard<W> {
     fn drop(&mut self) {
         if self.active {
             if let Some(writer) = &mut self.writer {
-                let _ = execute!(writer, DisableMouseCapture, LeaveAlternateScreen);
+                let _ = execute!(
+                    writer,
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
             }
             let _ = disable_raw_mode();
         }
