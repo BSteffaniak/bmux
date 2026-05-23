@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard        = { workspace = true }
+bmux_keyboard        = { workspace = true, features = ["crossterm"] }
 bmux_text_edit       = { workspace = true, features = ["keyboard"] }
 crossterm            = { workspace = true, optional = true }
 unicode-segmentation = { workspace = true }

@@ -87,6 +87,13 @@ mod tests {
     }
 
     #[test]
+    fn maps_space_to_char_space() {
+        let event = CrosstermKeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
+        let stroke = crossterm_key_event_to_stroke(&event).expect("stroke");
+        assert_eq!(stroke.key, KeyCode::Char(' '));
+    }
+
+    #[test]
     fn keeps_alt_arrow_modifier() {
         let event = CrosstermKeyEvent::new(CrosstermKeyCode::Left, KeyModifiers::ALT);
         let stroke = crossterm_key_event_to_stroke(&event).expect("stroke");

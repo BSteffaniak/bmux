@@ -5,10 +5,9 @@ use std::time::Duration;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
-    KeyModifiers as CrosstermKeyModifiers, MouseButton as CrosstermMouseButton,
-    MouseEvent as CrosstermMouseEvent, MouseEventKind as CrosstermMouseEventKind,
-    poll as crossterm_poll, read as crossterm_read,
+    Event as CrosstermEvent, KeyEvent as CrosstermKeyEvent, KeyModifiers as CrosstermKeyModifiers,
+    MouseButton as CrosstermMouseButton, MouseEvent as CrosstermMouseEvent,
+    MouseEventKind as CrosstermMouseEventKind, poll as crossterm_poll, read as crossterm_read,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -17,6 +16,7 @@ use crossterm::{execute, queue};
 
 use crate::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use crate::geometry::{Point, Size};
+use bmux_keyboard::crossterm::{crossterm_key_event_is_release, crossterm_key_event_to_stroke};
 
 /// RAII guard for crossterm raw mode and alternate-screen lifecycle.
 ///
@@ -124,7 +124,6 @@ fn push_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
         writer,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
@@ -177,39 +176,11 @@ pub fn event_from_crossterm(event: CrosstermEvent) -> Option<Event> {
 /// Convert a crossterm key event into a BMUX keyboard stroke.
 #[must_use]
 pub fn key_from_crossterm(key: CrosstermKeyEvent) -> Option<bmux_keyboard::KeyStroke> {
-    let code = match key.code {
-        CrosstermKeyCode::Backspace => bmux_keyboard::KeyCode::Backspace,
-        CrosstermKeyCode::Enter => bmux_keyboard::KeyCode::Enter,
-        CrosstermKeyCode::Left => bmux_keyboard::KeyCode::Left,
-        CrosstermKeyCode::Right => bmux_keyboard::KeyCode::Right,
-        CrosstermKeyCode::Up => bmux_keyboard::KeyCode::Up,
-        CrosstermKeyCode::Down => bmux_keyboard::KeyCode::Down,
-        CrosstermKeyCode::Home => bmux_keyboard::KeyCode::Home,
-        CrosstermKeyCode::End => bmux_keyboard::KeyCode::End,
-        CrosstermKeyCode::PageUp => bmux_keyboard::KeyCode::PageUp,
-        CrosstermKeyCode::PageDown => bmux_keyboard::KeyCode::PageDown,
-        CrosstermKeyCode::Tab | CrosstermKeyCode::BackTab => bmux_keyboard::KeyCode::Tab,
-        CrosstermKeyCode::Delete => bmux_keyboard::KeyCode::Delete,
-        CrosstermKeyCode::Insert => bmux_keyboard::KeyCode::Insert,
-        CrosstermKeyCode::F(number) => bmux_keyboard::KeyCode::F(number),
-        CrosstermKeyCode::Char(' ') => bmux_keyboard::KeyCode::Space,
-        CrosstermKeyCode::Char(value) => bmux_keyboard::KeyCode::Char(value),
-        CrosstermKeyCode::Esc => bmux_keyboard::KeyCode::Escape,
-        CrosstermKeyCode::Null
-        | CrosstermKeyCode::CapsLock
-        | CrosstermKeyCode::ScrollLock
-        | CrosstermKeyCode::NumLock
-        | CrosstermKeyCode::PrintScreen
-        | CrosstermKeyCode::Pause
-        | CrosstermKeyCode::Menu
-        | CrosstermKeyCode::KeypadBegin
-        | CrosstermKeyCode::Media(_)
-        | CrosstermKeyCode::Modifier(_) => return None,
-    };
-    Some(bmux_keyboard::KeyStroke::with_modifiers(
-        code,
-        modifiers_from_crossterm(key.modifiers),
-    ))
+    if crossterm_key_event_is_release(&key) {
+        return None;
+    }
+
+    crossterm_key_event_to_stroke(&key)
 }
 
 /// Convert crossterm mouse event data.
@@ -220,17 +191,6 @@ pub fn mouse_from_crossterm(mouse: CrosstermMouseEvent) -> MouseEvent {
         Point::new(mouse.column, mouse.row),
     )
     .with_modifiers(mouse_modifiers_from_crossterm(mouse.modifiers))
-}
-
-fn modifiers_from_crossterm(modifiers: CrosstermKeyModifiers) -> bmux_keyboard::Modifiers {
-    bmux_keyboard::Modifiers {
-        ctrl: modifiers.contains(CrosstermKeyModifiers::CONTROL),
-        alt: modifiers.contains(CrosstermKeyModifiers::ALT),
-        shift: modifiers.contains(CrosstermKeyModifiers::SHIFT),
-        super_key: modifiers.contains(CrosstermKeyModifiers::SUPER),
-        hyper: modifiers.contains(CrosstermKeyModifiers::HYPER),
-        meta: modifiers.contains(CrosstermKeyModifiers::META),
-    }
 }
 
 const fn mouse_button_from_crossterm(button: CrosstermMouseButton) -> MouseButton {
@@ -295,6 +255,34 @@ mod tests {
 
         assert_eq!(stroke.key, bmux_keyboard::KeyCode::Char('x'));
         assert!(stroke.modifiers.ctrl);
+    }
+
+    #[test]
+    fn ignores_key_release_events() {
+        let key = KeyEvent {
+            code: crossterm::event::KeyCode::Char('x'),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(key_from_crossterm(key), None);
+    }
+
+    #[test]
+    fn preserves_super_and_meta_char_modifiers() {
+        let key = KeyEvent {
+            code: crossterm::event::KeyCode::Char('c'),
+            modifiers: crossterm::event::KeyModifiers::SUPER | crossterm::event::KeyModifiers::META,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        let stroke = key_from_crossterm(key).expect("key should convert");
+
+        assert_eq!(stroke.key, bmux_keyboard::KeyCode::Char('c'));
+        assert!(stroke.modifiers.super_key);
+        assert!(stroke.modifiers.meta);
     }
 
     #[test]
