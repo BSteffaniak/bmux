@@ -7,6 +7,7 @@ use crate::geometry::Rect;
 use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::style::{Color, Modifier, Style};
 use crate::text::{Line, Span};
+use crate::text_width::{display_width, truncate_to_display_width};
 use crate::widget::StatefulWidget;
 
 /// Summary for one changed file in a diff.
@@ -401,6 +402,29 @@ impl DiffInlineSpan {
     }
 }
 
+/// One emphasized range inside a diff line's content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffChangedRange {
+    /// Start byte offset in [`DiffLine::content`].
+    pub start: usize,
+    /// End byte offset in [`DiffLine::content`].
+    pub end: usize,
+}
+
+impl DiffChangedRange {
+    /// Create a changed range.
+    #[must_use]
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    /// Return true when this range is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+}
+
 /// One logical line in a diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
@@ -412,8 +436,10 @@ pub struct DiffLine {
     pub content: String,
     /// Semantic line kind.
     pub kind: DiffLineKind,
-    /// Optional inline content spans for changed-region highlighting.
+    /// Optional inline content spans for syntax highlighting.
     pub inline_spans: Vec<DiffInlineSpan>,
+    /// Changed byte ranges inside this line's content.
+    pub changed_ranges: Vec<DiffChangedRange>,
 }
 
 impl DiffLine {
@@ -431,6 +457,7 @@ impl DiffLine {
             content: content.into(),
             kind,
             inline_spans: Vec::new(),
+            changed_ranges: Vec::new(),
         }
     }
 
@@ -438,6 +465,13 @@ impl DiffLine {
     #[must_use]
     pub fn inline_spans(mut self, spans: Vec<DiffInlineSpan>) -> Self {
         self.inline_spans = spans;
+        self
+    }
+
+    /// Set changed content ranges.
+    #[must_use]
+    pub fn changed_ranges(mut self, ranges: Vec<DiffChangedRange>) -> Self {
+        self.changed_ranges = ranges;
         self
     }
 
@@ -508,10 +542,18 @@ pub struct DiffViewStyles {
     pub hunk_header: Style,
     /// Context line style.
     pub context: Style,
-    /// Added line style.
+    /// Added line fallback text style.
     pub added: Style,
-    /// Removed line style.
+    /// Removed line fallback text style.
     pub removed: Style,
+    /// Added line full-row background style.
+    pub added_row: Style,
+    /// Removed line full-row background style.
+    pub removed_row: Style,
+    /// Added changed-range emphasis style.
+    pub added_emphasis: Style,
+    /// Removed changed-range emphasis style.
+    pub removed_emphasis: Style,
     /// Gutter style.
     pub gutter: Style,
 }
@@ -526,6 +568,10 @@ impl Default for DiffViewStyles {
             context: Style::new(),
             added: Style::new().fg(Color::Green),
             removed: Style::new().fg(Color::Red),
+            added_row: Style::new().bg(Color::Indexed(22)),
+            removed_row: Style::new().bg(Color::Indexed(52)),
+            added_emphasis: Style::new().bg(Color::Indexed(28)),
+            removed_emphasis: Style::new().bg(Color::Indexed(88)),
             gutter: Style::new().fg(Color::BrightBlack),
         }
     }
@@ -561,6 +607,10 @@ impl<'lines> DiffView<'lines> {
                 context: Style::new(),
                 added: Style::new(),
                 removed: Style::new(),
+                added_row: Style::new(),
+                removed_row: Style::new(),
+                added_emphasis: Style::new(),
+                removed_emphasis: Style::new(),
                 gutter: Style::new(),
             },
             fold_context_threshold: None,
@@ -670,15 +720,31 @@ impl StatefulWidget for DiffView<'_> {
                 return;
             };
             let rendered = self.render_row(*render_row, area.width);
-            frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
-                &rendered,
-            );
+            let row_area = Rect::new(area.x, area.y.saturating_add(row), area.width, 1);
+            if let Some(style) = self.render_row_background(*render_row) {
+                frame.fill(row_area, " ", style);
+            }
+            frame.write_line(row_area, &rendered);
         }
     }
 }
 
 impl DiffView<'_> {
+    fn render_row_background(&self, render_row: DiffRenderRow) -> Option<Style> {
+        match render_row {
+            DiffRenderRow::Line(index) => self.line_row_style(&self.lines[index]),
+            DiffRenderRow::Fold { .. } => None,
+        }
+    }
+
+    const fn line_row_style(&self, line: &DiffLine) -> Option<Style> {
+        match line.kind {
+            DiffLineKind::Added => Some(self.styles.added_row),
+            DiffLineKind::Removed => Some(self.styles.removed_row),
+            DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::Context => None,
+        }
+    }
+
     fn render_row(&self, render_row: DiffRenderRow, width: u16) -> Line {
         match render_row {
             DiffRenderRow::Line(index) => {
@@ -731,14 +797,15 @@ impl DiffView<'_> {
     }
 
     fn render_unified_line(&self, line: &DiffLine) -> Line {
-        let style = self.style_for(line.kind);
+        let style = self.content_base_style(line);
+        let gutter_style = self.gutter_style(line);
         let prefix = match line.kind {
             DiffLineKind::Added => "+",
             DiffLineKind::Removed => "-",
             DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => " ",
         };
         let mut spans = vec![
-            Span::styled(format_unified_gutter(line), self.styles.gutter),
+            Span::styled(format_unified_gutter(line), gutter_style),
             Span::styled(prefix, style),
         ];
         spans.extend(self.content_spans(line, style));
@@ -753,15 +820,27 @@ impl DiffView<'_> {
     }
 
     fn render_side_by_side_line(&self, line: &DiffLine, width: u16) -> Line {
-        let style = self.style_for(line.kind);
+        let style = self.content_base_style(line);
         let half = usize::from(width.saturating_sub(1) / 2);
         let old = match line.kind {
             DiffLineKind::Added => empty_side_spans(half, style),
-            _ => side_spans(line.old_line, line, half, style),
+            _ => side_spans(
+                line.old_line,
+                line,
+                half,
+                style,
+                self.emphasis_style(line.kind),
+            ),
         };
         let new = match line.kind {
             DiffLineKind::Removed => empty_side_spans(half, style),
-            _ => side_spans(line.new_line, line, half, style),
+            _ => side_spans(
+                line.new_line,
+                line,
+                half,
+                style,
+                self.emphasis_style(line.kind),
+            ),
         };
         let mut spans = old;
         spans.push(Span::styled("│", self.styles.gutter));
@@ -770,13 +849,34 @@ impl DiffView<'_> {
     }
 
     fn content_spans(&self, line: &DiffLine, base_style: Style) -> Vec<Span> {
-        if line.inline_spans.is_empty() {
-            return vec![Span::styled(line.content.clone(), base_style)];
+        layered_content_spans(
+            &line.content,
+            &line.inline_spans,
+            &line.changed_ranges,
+            base_style,
+            self.emphasis_style(line.kind),
+        )
+    }
+
+    fn content_base_style(&self, line: &DiffLine) -> Style {
+        let style = self.style_for(line.kind);
+        self.line_row_style(line)
+            .map_or(style, |row| row.patch(style))
+    }
+
+    fn gutter_style(&self, line: &DiffLine) -> Style {
+        self.line_row_style(line)
+            .map_or(self.styles.gutter, |row| row.patch(self.styles.gutter))
+    }
+
+    const fn emphasis_style(&self, kind: DiffLineKind) -> Style {
+        match kind {
+            DiffLineKind::Added => self.styles.added_emphasis,
+            DiffLineKind::Removed => self.styles.removed_emphasis,
+            DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::Context => {
+                Style::new()
+            }
         }
-        line.inline_spans
-            .iter()
-            .map(|span| Span::styled(span.content.clone(), base_style.patch(span.style)))
-            .collect()
     }
 
     const fn style_for(&self, kind: DiffLineKind) -> Style {
@@ -804,29 +904,33 @@ fn empty_side_spans(width: usize, style: Style) -> Vec<Span> {
     vec![Span::styled(" ".repeat(width), style)]
 }
 
-fn side_spans(line_number: Option<u32>, line: &DiffLine, width: usize, style: Style) -> Vec<Span> {
+fn side_spans(
+    line_number: Option<u32>,
+    line: &DiffLine,
+    width: usize,
+    style: Style,
+    emphasis_style: Style,
+) -> Vec<Span> {
     let gutter = format!(
         "{:>4} ",
         line_number.map_or_else(|| String::from("-"), |line| line.to_string())
     );
     let mut spans = vec![Span::styled(gutter.clone(), style)];
-    let content_width =
-        width.saturating_sub(unicode_width::UnicodeWidthStr::width(gutter.as_str()));
-    if line.inline_spans.is_empty() {
-        spans.push(Span::styled(
-            truncate_to_width(&line.content, content_width),
-            style,
-        ));
-        return pad_spans_to_width(spans, width, style);
-    }
+    let content_width = width.saturating_sub(display_width(&gutter));
     let mut remaining = content_width;
-    for inline in &line.inline_spans {
+    for span in layered_content_spans(
+        &line.content,
+        &line.inline_spans,
+        &line.changed_ranges,
+        style,
+        emphasis_style,
+    ) {
         if remaining == 0 {
             break;
         }
-        let text = truncate_to_width(&inline.content, remaining);
-        remaining = remaining.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str()));
-        spans.push(Span::styled(text, style.patch(inline.style)));
+        let text = truncate_to_display_width(&span.content, remaining);
+        remaining = remaining.saturating_sub(display_width(&text));
+        spans.push(Span::styled(text, span.style));
     }
     pad_spans_to_width(spans, width, style)
 }
@@ -834,7 +938,7 @@ fn side_spans(line_number: Option<u32>, line: &DiffLine, width: usize, style: St
 fn pad_spans_to_width(mut spans: Vec<Span>, width: usize, style: Style) -> Vec<Span> {
     let current = spans
         .iter()
-        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_str()))
+        .map(|span| display_width(span.content.as_str()))
         .sum::<usize>();
     if current < width {
         spans.push(Span::styled(
@@ -845,26 +949,105 @@ fn pad_spans_to_width(mut spans: Vec<Span>, width: usize, style: Style) -> Vec<S
     spans
 }
 
-fn truncate_to_width(text: &str, width: usize) -> String {
-    let mut result = String::new();
-    let mut used = 0usize;
-    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text, true) {
-        let grapheme_width = unicode_width::UnicodeWidthStr::width(grapheme);
-        if used.saturating_add(grapheme_width) > width {
-            break;
+fn layered_content_spans(
+    content: &str,
+    inline_spans: &[DiffInlineSpan],
+    changed_ranges: &[DiffChangedRange],
+    base_style: Style,
+    emphasis_style: Style,
+) -> Vec<Span> {
+    let source_spans = if inline_spans.is_empty() {
+        vec![DiffInlineSpan::new(content, Style::new())]
+    } else {
+        inline_spans.to_vec()
+    };
+    let ranges = normalized_changed_ranges(content, changed_ranges);
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for inline in source_spans {
+        let mut local_start = 0usize;
+        let span_start = offset;
+        let span_end = span_start.saturating_add(inline.content.len());
+        for range in ranges
+            .iter()
+            .copied()
+            .filter(|range| range.start < span_end && range.end > span_start)
+        {
+            let overlap_start = range.start.max(span_start).saturating_sub(span_start);
+            let overlap_end = range.end.min(span_end).saturating_sub(span_start);
+            if local_start < overlap_start {
+                push_content_slice(
+                    &mut spans,
+                    &inline.content[local_start..overlap_start],
+                    base_style.patch(inline.style),
+                );
+            }
+            push_content_slice(
+                &mut spans,
+                &inline.content[overlap_start..overlap_end],
+                base_style.patch(inline.style).patch(emphasis_style),
+            );
+            local_start = overlap_end;
         }
-        result.push_str(grapheme);
-        used = used.saturating_add(grapheme_width);
+        if local_start < inline.content.len() {
+            push_content_slice(
+                &mut spans,
+                &inline.content[local_start..],
+                base_style.patch(inline.style),
+            );
+        }
+        offset = span_end;
     }
-    result
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+    spans
+}
+
+fn push_content_slice(spans: &mut Vec<Span>, content: &str, style: Style) {
+    if !content.is_empty() {
+        spans.push(Span::styled(content.to_owned(), style));
+    }
+}
+
+fn normalized_changed_ranges(
+    content: &str,
+    changed_ranges: &[DiffChangedRange],
+) -> Vec<DiffChangedRange> {
+    let mut ranges = changed_ranges
+        .iter()
+        .copied()
+        .filter_map(|range| normalize_changed_range(content, range))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<DiffChangedRange> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn normalize_changed_range(content: &str, range: DiffChangedRange) -> Option<DiffChangedRange> {
+    let start = range.start.min(content.len());
+    let end = range.end.min(content.len());
+    if start >= end || !content.is_char_boundary(start) || !content.is_char_boundary(end) {
+        return None;
+    }
+    Some(DiffChangedRange::new(start, end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome, DiffFileListState,
-        DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind, DiffView, DiffViewMode,
-        DiffViewState,
+        DiffChangedRange, DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome,
+        DiffFileListState, DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind, DiffView,
+        DiffViewMode, DiffViewState,
     };
     use crate::buffer::Buffer;
     use crate::frame::Frame;
@@ -1025,6 +1208,62 @@ mod tests {
     }
 
     #[test]
+    fn diff_view_fills_changed_row_backgrounds() {
+        let lines = vec![DiffLine::new(DiffLineKind::Added, None, Some(1), "new")];
+        let mut state = DiffViewState::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        DiffView::new(&lines)
+            .styles(super::DiffViewStyles::default())
+            .render(Rect::new(0, 0, 20, 1), &mut frame, &mut state);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(0, 0))
+                .map(|cell| cell.style.bg),
+            Some(Some(Color::Indexed(22)))
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(19, 0))
+                .map(|cell| cell.style.bg),
+            Some(Some(Color::Indexed(22)))
+        );
+    }
+
+    #[test]
+    fn diff_view_layers_changed_ranges_over_syntax_spans() {
+        let syntax = Style::new().fg(Color::Cyan);
+        let lines = vec![
+            DiffLine::new(DiffLineKind::Added, None, Some(1), "new value")
+                .inline_spans(vec![
+                    DiffInlineSpan::new("new ", syntax),
+                    DiffInlineSpan::new("value", syntax),
+                ])
+                .changed_ranges(vec![DiffChangedRange::new(4, 9)]),
+        ];
+        let mut state = DiffViewState::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        DiffView::new(&lines)
+            .styles(super::DiffViewStyles::default())
+            .render(Rect::new(0, 0, 24, 1), &mut frame, &mut state);
+
+        assert_eq!(
+            frame.buffer().get(Point::new(11, 0)).map(|cell| cell.style),
+            Some(Style::new().bg(Color::Indexed(22)).patch(syntax))
+        );
+        assert_eq!(
+            frame.buffer().get(Point::new(15, 0)).map(|cell| cell.style),
+            Some(Style::new().bg(Color::Indexed(28)).patch(syntax))
+        );
+    }
+
+    #[test]
     fn diff_view_renders_inline_changed_spans() {
         let highlight = Style::new().bg(Color::Yellow).add_modifier(Modifier::BOLD);
         let lines = vec![
@@ -1043,7 +1282,12 @@ mod tests {
 
         assert_eq!(
             frame.buffer().get(Point::new(15, 0)).map(|cell| cell.style),
-            Some(Style::new().fg(Color::Green).patch(highlight))
+            Some(
+                Style::new()
+                    .bg(Color::Indexed(22))
+                    .fg(Color::Green)
+                    .patch(highlight)
+            )
         );
     }
 
@@ -1067,7 +1311,12 @@ mod tests {
 
         assert_eq!(
             frame.buffer().get(Point::new(10, 0)).map(|cell| cell.style),
-            Some(Style::new().fg(Color::Red).patch(highlight))
+            Some(
+                Style::new()
+                    .bg(Color::Indexed(52))
+                    .fg(Color::Red)
+                    .patch(highlight)
+            )
         );
     }
 

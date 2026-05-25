@@ -11,5 +11,6 @@
 
 pub mod action_row;
 pub mod labeled_details;
+pub mod modal_frame;
 #[cfg(feature = "text-input")]
 pub mod text_input;

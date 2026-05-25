@@ -53,9 +53,9 @@ pub mod prelude {
     pub use crate::dialog::{Button, Dialog, DialogAction, DialogState};
     #[cfg(feature = "diff")]
     pub use crate::diff::{
-        DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome, DiffFileListState,
-        DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind, DiffView, DiffViewMode,
-        DiffViewState, DiffViewStyles,
+        DiffChangedRange, DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome,
+        DiffFileListState, DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind, DiffView,
+        DiffViewMode, DiffViewState, DiffViewStyles,
     };
     pub use crate::event::{
         Event, EventHandler, EventOutcome, FocusEvent, MouseButton, MouseEvent, MouseEventKind,
