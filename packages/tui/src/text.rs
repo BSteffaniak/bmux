@@ -61,6 +61,22 @@ impl Line {
         }
     }
 
+    /// Return a copy of this line with `style` applied behind each span's
+    /// explicit style.
+    ///
+    /// This is useful when rendering text on an opaque surface: callers can
+    /// supply the surface style as a fallback while preserving span-specific
+    /// foreground colors and modifiers.
+    #[must_use]
+    pub fn with_fallback_style(&self, style: Style) -> Self {
+        Self::from_spans(
+            self.spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone(), style.patch(span.style)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     /// Append a span to the line.
     pub fn push_span(&mut self, span: Span) {
         self.spans.push(span);
@@ -161,5 +177,16 @@ mod tests {
         ]);
 
         assert_eq!(line.plain_text(), "hello world");
+    }
+
+    #[test]
+    fn line_with_fallback_style_preserves_explicit_fields() {
+        let fallback = Style::new().fg(Color::White).bg(Color::Black);
+        let explicit = Style::new().fg(Color::Red);
+        let line = Line::from_spans(vec![Span::styled("hello", explicit)]);
+
+        let styled = line.with_fallback_style(fallback);
+
+        assert_eq!(styled.spans[0].style, fallback.patch(explicit));
     }
 }

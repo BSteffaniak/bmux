@@ -179,6 +179,18 @@ impl ModalFrame {
         self.panel().render(self.panel_area(parent), frame);
     }
 
+    /// Render one line inside this modal using the theme text style as an
+    /// opaque fallback.
+    pub fn render_line(&self, area: Rect, line: &Line, frame: &mut Frame<'_>) {
+        frame.write_line_with_fallback_style(area, line, self.theme.text);
+    }
+
+    /// Return this modal's visual theme.
+    #[must_use]
+    pub const fn theme(&self) -> ModalTheme {
+        self.theme
+    }
+
     fn panel(&self) -> Panel {
         let mut panel = Panel::new()
             .border(self.border.clone())

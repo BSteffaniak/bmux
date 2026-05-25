@@ -103,6 +103,15 @@ impl<'a> ActionRow<'a> {
 
     /// Render the action row.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        self.render_actions(area, frame, None);
+    }
+
+    /// Render the action row with a fallback style filling each button area.
+    pub fn render_with_fallback_style(&self, area: Rect, frame: &mut Frame<'_>, style: Style) {
+        self.render_actions(area, frame, Some(style));
+    }
+
+    fn render_actions(&self, area: Rect, frame: &mut Frame<'_>, fallback: Option<Style>) {
         for (index, action_area) in self.action_areas(area).into_iter().enumerate() {
             let Some(action) = self.actions.get(index) else {
                 return;
@@ -112,10 +121,12 @@ impl<'a> ActionRow<'a> {
             } else {
                 self.styles.button
             };
-            frame.write_line(
-                action_area,
-                &Line::from_spans(vec![Span::styled(format!("[ {} ]", action.label), style)]),
-            );
+            let line = Line::from_spans(vec![Span::styled(format!("[ {} ]", action.label), style)]);
+            if let Some(fallback) = fallback {
+                frame.write_line_with_fallback_style(action_area, &line, fallback);
+            } else {
+                frame.write_line(action_area, &line);
+            }
         }
     }
 }

@@ -138,6 +138,13 @@ impl Buffer {
         }
     }
 
+    /// Fill `area` with `style`, then write `line` with that style applied as
+    /// a fallback behind every span.
+    pub fn write_line_with_fallback_style(&mut self, area: Rect, line: &Line, style: Style) {
+        self.fill(area, " ", style);
+        self.write_line(area, &line.with_fallback_style(style));
+    }
+
     /// Return plain symbols for one absolute row in this buffer.
     #[must_use]
     pub fn row_symbols(&self, y: u16) -> Option<String> {
@@ -223,6 +230,26 @@ mod tests {
         assert_eq!(
             buffer.get(Point::new(1, 0)).map(|cell| cell.style),
             Some(Style::new())
+        );
+    }
+
+    #[test]
+    fn write_line_with_fallback_style_fills_row_and_patches_spans() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let fallback = Style::new().fg(Color::White).bg(Color::Black);
+        let explicit = Style::new().fg(Color::Red);
+        let line = Line::from_spans(vec![Span::styled("a", explicit)]);
+
+        buffer.write_line_with_fallback_style(Rect::new(0, 0, 4, 1), &line, fallback);
+
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("a   "));
+        assert_eq!(
+            buffer.get(Point::new(0, 0)).map(|cell| cell.style),
+            Some(fallback.patch(explicit))
+        );
+        assert_eq!(
+            buffer.get(Point::new(1, 0)).map(|cell| cell.style),
+            Some(fallback)
         );
     }
 

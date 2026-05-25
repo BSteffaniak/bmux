@@ -5,7 +5,6 @@ use bmux_text_edit::keyboard::TextKeymap;
 use bmux_text_edit::{TextEditBuffer, TextSelection, VisualCursor};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::chrome::line_with_fallback_style;
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::style::Style;
@@ -188,8 +187,12 @@ impl Widget for TextInput<'_> {
 
         if self.buffer.is_empty() {
             if let Some(placeholder) = &self.placeholder {
-                let styled = line_with_fallback_style(placeholder, self.placeholder_style);
-                frame.write_line(Rect::new(area.x, area.y, area.width, 1), &styled);
+                let styled = placeholder.with_fallback_style(self.placeholder_style);
+                frame.write_line_with_fallback_style(
+                    Rect::new(area.x, area.y, area.width, 1),
+                    &styled,
+                    self.placeholder_style,
+                );
             }
             if self.cursor_visible {
                 frame.set_cursor(crate::frame::Cursor::visible(crate::geometry::Point::new(
@@ -222,9 +225,10 @@ impl Widget for TextInput<'_> {
             let Ok(row) = u16::try_from(row) else {
                 return;
             };
-            frame.write_line(
+            frame.write_line_with_fallback_style(
                 Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
                 &line,
+                self.style,
             );
         }
 

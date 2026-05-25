@@ -1,6 +1,6 @@
 //! Button and dialog widgets.
 
-use crate::chrome::{Border, Panel, line_with_fallback_style};
+use crate::chrome::{Border, Panel};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::layout::{Direction, split_trailing};
@@ -65,7 +65,8 @@ impl Widget for Button {
         };
         let line = Line::from_spans(vec![
             crate::text::Span::styled("[ ", style),
-            line_with_fallback_style(&self.label, style)
+            self.label
+                .with_fallback_style(style)
                 .spans
                 .into_iter()
                 .next()

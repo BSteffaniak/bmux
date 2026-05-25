@@ -100,6 +100,13 @@ impl<'buffer> Frame<'buffer> {
     pub fn write_line(&mut self, area: Rect, line: &Line) {
         self.buffer.write_line(area, line);
     }
+
+    /// Fill a rectangular area with `style`, then write a line whose spans
+    /// inherit that fallback style.
+    pub fn write_line_with_fallback_style(&mut self, area: Rect, line: &Line, style: Style) {
+        self.buffer
+            .write_line_with_fallback_style(area, line, style);
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::style::Style;
-use crate::text::{Line, Text};
+use crate::text::{Line, Span, Text};
 use crate::widget::Widget;
 
 /// Horizontal text alignment.
@@ -35,6 +35,7 @@ pub enum TextWrap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextBlock {
     text: Text,
+    style: Style,
     alignment: Alignment,
     wrap: TextWrap,
     trim: bool,
@@ -47,11 +48,20 @@ impl TextBlock {
     pub fn new(text: impl Into<Text>) -> Self {
         Self {
             text: text.into(),
+            style: Style::new(),
             alignment: Alignment::Left,
             wrap: TextWrap::None,
             trim: false,
             vertical_scroll: 0,
         }
+    }
+
+    /// Set base style used to fill rendered rows and as a fallback behind text
+    /// spans.
+    #[must_use]
+    pub const fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
     }
 
     /// Set horizontal alignment.
@@ -108,7 +118,11 @@ impl Widget for TextBlock {
             let line_y = area.y.saturating_add(line_offset);
             let line_area = aligned_line_area(area, line, self.alignment)
                 .unwrap_or_else(|| Rect::new(area.x, line_y, 0, 1));
-            frame.write_line(Rect::new(line_area.x, line_y, line_area.width, 1), line);
+            frame.fill(Rect::new(area.x, line_y, area.width, 1), " ", self.style);
+            frame.write_line(
+                Rect::new(line_area.x, line_y, line_area.width, 1),
+                &line.with_fallback_style(self.style),
+            );
         }
     }
 }
@@ -157,7 +171,7 @@ fn push_styled_grapheme(line: &mut Line, grapheme: &str, style: Style) {
         last.content.push_str(grapheme);
         return;
     }
-    line.push_span(crate::text::Span::styled(grapheme.to_owned(), style));
+    line.push_span(Span::styled(grapheme.to_owned(), style));
 }
 
 fn trim_line_end(line: &Line) -> Line {
@@ -269,6 +283,26 @@ mod tests {
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hi   "));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("yo   "));
+    }
+
+    #[test]
+    fn text_block_style_fills_rendered_rows() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let style = Style::new().fg(Color::White).bg(Color::Black);
+
+        TextBlock::new("hi")
+            .style(style)
+            .render(Rect::new(0, 0, 5, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hi   "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(4, 0))
+                .map(|cell| cell.style),
+            Some(style)
+        );
     }
 
     #[test]

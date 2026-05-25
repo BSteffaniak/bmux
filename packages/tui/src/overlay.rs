@@ -114,8 +114,8 @@ mod tests {
 
     #[test]
     fn overlay_layer_can_clear_before_rendering() {
-        let text = TextBlock::new("x");
         let clear = Style::new().bg(Color::Blue);
+        let text = TextBlock::new("x").style(clear);
         let mut stack = OverlayStack::new();
         stack.push(OverlayLayer::new(Rect::new(0, 0, 3, 1), &text).clear_style(clear));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));

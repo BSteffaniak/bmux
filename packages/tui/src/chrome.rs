@@ -335,17 +335,8 @@ fn render_title(area: Rect, title: &Line, style: Style, frame: &mut Frame<'_>) {
         area.width.saturating_sub(2),
         1,
     );
-    let styled_title = line_with_fallback_style(title, style);
+    let styled_title = title.with_fallback_style(style);
     frame.write_line(title_area, &styled_title);
-}
-
-pub(crate) fn line_with_fallback_style(line: &Line, style: Style) -> Line {
-    Line::from_spans(
-        line.spans
-            .iter()
-            .map(|span| crate::text::Span::styled(span.content.clone(), style.patch(span.style)))
-            .collect::<Vec<_>>(),
-    )
 }
 
 #[cfg(test)]

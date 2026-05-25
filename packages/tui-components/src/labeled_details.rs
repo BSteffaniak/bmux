@@ -103,6 +103,15 @@ impl<'a> LabeledDetails<'a> {
 
     /// Render this detail list directly.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        self.render_lines(area, frame, None);
+    }
+
+    /// Render this detail list directly with a fallback style for each row.
+    pub fn render_with_fallback_style(&self, area: Rect, frame: &mut Frame<'_>, style: Style) {
+        self.render_lines(area, frame, Some(style));
+    }
+
+    fn render_lines(&self, area: Rect, frame: &mut Frame<'_>, fallback: Option<Style>) {
         if area.is_empty() {
             return;
         }
@@ -115,10 +124,12 @@ impl<'a> LabeledDetails<'a> {
             let Ok(offset) = u16::try_from(index) else {
                 return;
             };
-            frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(offset), area.width, 1),
-                line,
-            );
+            let line_area = Rect::new(area.x, area.y.saturating_add(offset), area.width, 1);
+            if let Some(fallback) = fallback {
+                frame.write_line_with_fallback_style(line_area, line, fallback);
+            } else {
+                frame.write_line(line_area, line);
+            }
         }
     }
 }

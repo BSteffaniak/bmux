@@ -8,8 +8,6 @@ use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::style::Style;
 use crate::text::Line;
 
-use crate::chrome::line_with_fallback_style;
-
 /// A list item rendered as one styled line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListItem {
@@ -209,6 +207,7 @@ fn move_selection_by_page(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct List<'items> {
     items: &'items [ListItem],
+    style: Style,
     selected_style: Style,
     highlight_symbol: Option<String>,
 }
@@ -219,9 +218,18 @@ impl<'items> List<'items> {
     pub const fn new(items: &'items [ListItem]) -> Self {
         Self {
             items,
+            style: Style::new(),
             selected_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
             highlight_symbol: None,
         }
+    }
+
+    /// Set base row style. This style is used to fill each rendered row and as
+    /// a fallback behind item span styles.
+    #[must_use]
+    pub const fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
     }
 
     /// Set selected item style. This style patches over item span styles.
@@ -300,9 +308,14 @@ impl crate::widget::StatefulWidget for List<'_> {
             };
             let selected = state.selected == Some(index);
             let line = self.render_item_line(item, selected);
-            frame.write_line(
+            frame.write_line_with_fallback_style(
                 Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
                 &line,
+                if selected {
+                    self.selected_style
+                } else {
+                    self.style
+                },
             );
         }
     }
@@ -310,11 +323,12 @@ impl crate::widget::StatefulWidget for List<'_> {
 
 impl List<'_> {
     fn render_item_line(&self, item: &ListItem, selected: bool) -> Line {
-        let line = if selected {
-            line_with_fallback_style(item.line(), self.selected_style)
+        let style = if selected {
+            self.selected_style
         } else {
-            item.line().clone()
+            self.style
         };
+        let line = item.line().with_fallback_style(style);
         if selected && let Some(symbol) = &self.highlight_symbol {
             let mut spans = vec![crate::text::Span::styled(
                 symbol.clone(),
@@ -333,7 +347,7 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::Rect;
-    use crate::style::{Modifier, Style};
+    use crate::style::{Color, Modifier, Style};
     use crate::widget::StatefulWidget;
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 
@@ -368,6 +382,31 @@ mod tests {
                 .get(crate::geometry::Point::new(0, 1))
                 .map(|cell| cell.style),
             Some(selected_style)
+        );
+    }
+
+    #[test]
+    fn list_base_style_fills_unselected_rows() {
+        let items = vec![ListItem::new("one"), ListItem::new("two")];
+        let mut state = ListState {
+            selected: Some(1),
+            offset: 0,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let style = Style::new().fg(Color::White).bg(Color::Black);
+
+        List::new(&items)
+            .style(style)
+            .render(Rect::new(0, 0, 5, 2), &mut frame, &mut state);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("one  "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(4, 0))
+                .map(|cell| cell.style),
+            Some(style)
         );
     }
 
