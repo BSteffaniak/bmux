@@ -9,5 +9,7 @@
 //! separate from component policy so applications can opt into behavior one
 //! feature at a time.
 
+pub mod action_row;
+pub mod labeled_details;
 #[cfg(feature = "text-input")]
 pub mod text_input;

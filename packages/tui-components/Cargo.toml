@@ -13,7 +13,7 @@ version     = { workspace = true }
 [dependencies]
 bmux_keyboard        = { workspace = true, optional = true }
 bmux_text_edit       = { workspace = true, features = ["keyboard"], optional = true }
-bmux_tui             = { workspace = true, optional = true }
+bmux_tui             = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
 
 [features]
@@ -22,6 +22,5 @@ fail-on-warnings = []
 text-input = [
     "dep:bmux_keyboard",
     "dep:bmux_text_edit",
-    "dep:bmux_tui",
     "dep:unicode-segmentation",
 ]

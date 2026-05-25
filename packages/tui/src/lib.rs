@@ -33,6 +33,7 @@ pub mod style;
 pub mod terminal;
 pub mod text;
 pub mod text_block;
+pub mod text_width;
 pub mod viewport;
 pub mod widget;
 
@@ -83,6 +84,9 @@ pub mod prelude {
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{Line, Span, Text};
     pub use crate::text_block::{Alignment, TextBlock, TextWrap};
+    pub use crate::text_width::{
+        display_width, truncate_to_display_width, wrap_text_with_continuation,
+    };
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
     pub use crate::widget::{StatefulWidget, Widget};
 }
