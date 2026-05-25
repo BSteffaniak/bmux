@@ -1,6 +1,7 @@
 //! Render buffer primitives.
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::geometry::{Point, Rect, Size};
 use crate::style::Style;
@@ -118,8 +119,8 @@ impl Buffer {
 
         let mut x = area.x;
         for span in &line.spans {
-            for ch in span.content.chars() {
-                let width = char_width(ch);
+            for grapheme in span.content.graphemes(true) {
+                let width = grapheme_width(grapheme);
                 if width == 0 {
                     continue;
                 }
@@ -127,7 +128,7 @@ impl Buffer {
                     return;
                 }
                 if x >= clip.x && x < clip.right() {
-                    self.set_cell(Point::new(x, area.y), ch.to_string(), span.style);
+                    self.set_cell(Point::new(x, area.y), grapheme.to_owned(), span.style);
                     if width == 2 && x.saturating_add(1) < clip.right() {
                         self.set_cell(Point::new(x.saturating_add(1), area.y), "", span.style);
                     }
@@ -162,11 +163,11 @@ impl Buffer {
     }
 }
 
-fn char_width(ch: char) -> u16 {
-    match UnicodeWidthChar::width(ch) {
-        Some(0) | None => 0,
-        Some(1) => 1,
-        Some(_) => 2,
+fn grapheme_width(grapheme: &str) -> u16 {
+    match UnicodeWidthStr::width(grapheme) {
+        0 => 0,
+        1 => 1,
+        _ => 2,
     }
 }
 
@@ -222,6 +223,32 @@ mod tests {
         assert_eq!(
             buffer.get(Point::new(1, 0)).map(|cell| cell.style),
             Some(Style::new())
+        );
+    }
+
+    #[test]
+    fn write_line_preserves_combining_graphemes() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let line = Line::raw("e\u{301}x");
+
+        buffer.write_line(Rect::new(0, 0, 2, 1), &line);
+
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("e\u{301}x"));
+    }
+
+    #[test]
+    fn write_line_preserves_emoji_zwj_sequence() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let line = Line::raw("👨‍👩‍👧‍👦x");
+
+        buffer.write_line(Rect::new(0, 0, 3, 1), &line);
+
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("👨‍👩‍👧‍👦x"));
+        assert_eq!(
+            buffer
+                .get(Point::new(1, 0))
+                .map(|cell| cell.symbol.as_str()),
+            Some("")
         );
     }
 }
