@@ -3130,6 +3130,39 @@ fn queue_after_content_cleanup_for_damage<W: io::Write>(
     queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &clear_ops)
 }
 
+struct AfterContentCleanupPlan {
+    surface_damage: RenderDamage,
+    content_damage: Vec<DamageRect>,
+}
+
+impl AfterContentCleanupPlan {
+    const fn is_damaged(&self) -> bool {
+        !self.surface_damage.is_none()
+    }
+}
+
+fn after_content_cleanup_plan_for_surface(
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    content_rect: PaneRect,
+    frame_damage: &FrameDamage,
+    policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+) -> AfterContentCleanupPlan {
+    let surface_damage = after_content_own_damage_for_surface(
+        surface_id,
+        surface_rect,
+        frame_damage,
+        policy,
+        render_extensions,
+    );
+    let content_damage = render_damage_content_rects(&surface_damage, content_rect);
+    AfterContentCleanupPlan {
+        surface_damage,
+        content_damage,
+    }
+}
+
 fn after_content_own_damage_for_surface(
     surface_id: Uuid,
     surface_rect: ExtensionRect,
@@ -3346,6 +3379,203 @@ fn queue_before_content_render_items<W: io::Write>(
     Ok(ops)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines // Keep after-content branch ordering together while this stage is extracted behavior-preservingly.
+)]
+fn queue_after_content_extensions_for_surface<W: io::Write>(
+    stdout: &mut W,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    surface_index: usize,
+    surface_rect: ExtensionRect,
+    frame_damage: &FrameDamage,
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    render_context: &RenderExtensionContext,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    active_terminal_graphics: &mut BTreeSet<u64>,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) -> Result<()> {
+    // Consult every registered render extension for this surface. Extensions
+    // report generic surface damage; unknown damage safely falls back to
+    // full-surface extension repaint without forcing pane content redraw.
+    for ext in render_extensions {
+        let damage = extension_render_damage_for_frame(
+            ext.as_ref(),
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            frame_damage,
+            damage_policy,
+        );
+        if damage.is_none() {
+            continue;
+        }
+        if let Some(stats) = render_stats.as_deref_mut() {
+            stats.record_extension_render_call(ext.name(), &damage);
+        }
+
+        let revision =
+            ext.render_layer_revision(surface_id, RenderExtensionLayer::AfterPaneContent);
+        let cache_key = (
+            format!(
+                "{}::{:?}::caps={}",
+                ext.name(),
+                RenderExtensionLayer::AfterPaneContent,
+                render_context.capabilities.cache_key()
+            ),
+            surface_id,
+        );
+        if let Some(revision) = revision
+            && let Some(entry) = pane_buffers
+                .get(&pane_id)
+                .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
+            && entry.surface_rect == surface_rect
+            && entry.damage == damage
+            && entry.revision == revision
+        {
+            stdout
+                .write_all(&entry.bytes)
+                .context("failed replaying cached declarative render ops")?;
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.record_extension_cache_hit(ext.name());
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
+            }
+            continue;
+        }
+
+        if let Some(items) = ext.render_layer_items_with_context(
+            surface_id,
+            &surface_rect,
+            &damage,
+            RenderExtensionLayer::AfterPaneContent,
+            render_context,
+        ) {
+            if !items.is_empty() {
+                if let Some(stats) = render_stats.as_deref_mut() {
+                    stats.record_extension_render_op_call(ext.name());
+                }
+                if let Some(trace) = render_trace.as_deref_mut() {
+                    let (regions, full_surface) = render_damage_trace_shape(&damage);
+                    trace.push(AttachRenderTraceOp::ExtensionOps {
+                        surface_index,
+                        regions,
+                        full_surface,
+                    });
+                }
+            }
+            if let Err(err) = queue_render_items_for_frame(
+                stdout,
+                pane_id,
+                surface_id,
+                surface_rect,
+                &damage,
+                &items,
+                terminal_graphics_cache,
+                active_terminal_graphics,
+                render_context.capabilities,
+                render_stats.as_deref_mut(),
+            ) {
+                tracing::warn!(
+                    extension = ext.name(),
+                    surface_id = %surface_id,
+                    error = %err,
+                    "render extension render_items failed",
+                );
+            }
+        } else if let Some(ops) = ext.render_layer_ops_with_context(
+            surface_id,
+            &surface_rect,
+            &damage,
+            RenderExtensionLayer::AfterPaneContent,
+            render_context,
+        ) {
+            if ops.is_empty() {
+                continue;
+            }
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.record_extension_render_op_call(ext.name());
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                let (regions, full_surface) = render_damage_trace_shape(&damage);
+                trace.push(AttachRenderTraceOp::ExtensionOps {
+                    surface_index,
+                    regions,
+                    full_surface,
+                });
+            }
+            let mut bytes = Vec::new();
+            match queue_render_ops(&mut bytes, surface_rect, &damage, &ops) {
+                Ok(_) => {
+                    stdout
+                        .write_all(&bytes)
+                        .context("failed writing declarative render op bytes")?;
+                    if let Some(revision) = revision
+                        && let Some(buffer) = pane_buffers.get_mut(&pane_id)
+                    {
+                        buffer.extension_render_cache.insert(
+                            cache_key,
+                            ExtensionRenderCacheEntry {
+                                surface_id,
+                                surface_rect,
+                                damage,
+                                revision,
+                                bytes,
+                            },
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        extension = ext.name(),
+                        surface_id = %surface_id,
+                        error = %err,
+                        "render extension render_ops failed",
+                    );
+                }
+            }
+        } else {
+            // Re-bind through `&mut dyn io::Write` so the extension trait's
+            // object-safe signature sees a dyn writer regardless of the
+            // concrete `W` the caller passed.
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.record_extension_imperative_call(ext.name());
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                let (regions, full_surface) = render_damage_trace_shape(&damage);
+                trace.push(AttachRenderTraceOp::ExtensionImperative {
+                    surface_index,
+                    regions,
+                    full_surface,
+                });
+            }
+            let dyn_writer: &mut dyn io::Write = stdout;
+            if let Err(err) = ext.render_layer_surface_with_context(
+                dyn_writer,
+                surface_id,
+                &surface_rect,
+                &damage,
+                RenderExtensionLayer::AfterPaneContent,
+                render_context,
+            ) {
+                tracing::warn!(
+                    extension = ext.name(),
+                    surface_id = %surface_id,
+                    error = %err,
+                    "render extension render_surface failed",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn retain_cached_terminal_graphics_for_visible_surfaces(
     scene: &AttachScene,
     graphics_cache: &TerminalGraphicsCache,
@@ -3418,6 +3648,363 @@ fn finish_terminal_graphics_frame<W: io::Write>(
     Ok(())
 }
 
+fn queue_full_frame_content_clear<W: io::Write>(
+    stdout: &mut W,
+    terminal_size: (u16, u16),
+    status_insets: (u16, u16),
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) -> Result<()> {
+    let (cols, rows) = terminal_size;
+    let (status_top_inset, status_bottom_inset) = status_insets;
+    let clear_start = status_top_inset.min(rows);
+    let clear_end = rows.saturating_sub(status_bottom_inset).max(clear_start);
+    for y in clear_start..clear_end {
+        queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
+            .context("failed clearing attach pane row")?;
+        if let Some(stats) = render_stats.as_deref_mut() {
+            stats.clear_rows = stats.clear_rows.saturating_add(1);
+            stats.clear_cells = stats.clear_cells.saturating_add(u64::from(cols));
+        }
+        if let Some(trace) = render_trace.as_deref_mut() {
+            trace.push(AttachRenderTraceOp::ClearRow {
+                row: y,
+                cells: cols,
+            });
+        }
+    }
+    // Invalidate all row caches so every row is re-emitted.
+    for buffer in pane_buffers.values_mut() {
+        buffer.prev_rows.clear();
+    }
+    Ok(())
+}
+
+#[allow(clippy::struct_excessive_bools)] // Explicit booleans mirror existing frame-stage gates during behavior-preserving extraction.
+struct PaneContentRenderStage<'a> {
+    pane_id: Uuid,
+    surface_index: usize,
+    content: PaneRect,
+    focus: bool,
+    should_draw_content: bool,
+    sync_deferred: bool,
+    scrollback_active: bool,
+    scrollback_offset: usize,
+    scrollback_cursor: Option<AttachScrollbackCursor>,
+    selection_anchor: Option<AttachScrollbackPosition>,
+    runtime_appearance: &'a RuntimeAppearance,
+    before_content_cells: &'a BeforeContentCells,
+    before_content_damage: &'a [DamageRect],
+    after_content_damage: &'a [DamageRect],
+    frame_damage: &'a FrameDamage,
+}
+
+#[allow(clippy::too_many_lines)] // Preserve pane-row byte emission order while extracting the content stage.
+fn queue_pane_content_for_surface<W: io::Write>(
+    stdout: &mut W,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    stage: &PaneContentRenderStage<'_>,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) -> Result<Option<AttachCursorState>> {
+    let inner_width = stage.content.w;
+    let inner_height = stage.content.h;
+    let inner_w = usize::from(inner_width);
+    let inner_h = usize::from(inner_height);
+    let mut cursor_state = None;
+    if let Some(entry) = pane_buffers.get_mut(&stage.pane_id) {
+        let previous_grid_size = (
+            entry.terminal_grid.grid().width(),
+            entry.terminal_grid.grid().height(),
+        );
+        let _ = entry
+            .terminal_grid
+            .resize(inner_width.max(1), inner_height.max(1));
+        // Invalidate the row cache when the pane dimensions change, since
+        // the row strings are no longer comparable at a different size.
+        let next_grid_size = (
+            entry.terminal_grid.grid().width(),
+            entry.terminal_grid.grid().height(),
+        );
+        if next_grid_size != previous_grid_size {
+            entry.prev_rows.clear();
+            entry.scrollback_window = None;
+        }
+        let use_scrollback = stage.scrollback_active && stage.focus;
+        let grid_rows = if use_scrollback {
+            entry
+                .scrollback_window
+                .as_ref()
+                .filter(|window| window.scrollback_offset == stage.scrollback_offset)
+                .map_or_else(
+                    || vec![PhysicalRow::new(); inner_h],
+                    |window| window.rows.clone(),
+                )
+        } else {
+            entry.terminal_grid.grid().display_rows(0, inner_h)
+        };
+        let selection = if use_scrollback {
+            selection_bounds(
+                stage.selection_anchor,
+                stage.scrollback_cursor,
+                stage.scrollback_offset,
+            )
+        } else {
+            None
+        };
+        if stage.focus {
+            let (cursor_row, cursor_col) = if use_scrollback {
+                let cursor = stage
+                    .scrollback_cursor
+                    .unwrap_or(AttachScrollbackCursor { row: 0, col: 0 });
+                (
+                    u16::try_from(cursor.row.min(inner_h.saturating_sub(1))).unwrap_or(u16::MAX),
+                    u16::try_from(cursor.col.min(inner_w.saturating_sub(1))).unwrap_or(u16::MAX),
+                )
+            } else {
+                let cursor = entry.terminal_grid.grid().cursor();
+                (
+                    u16::try_from(cursor.row.min(inner_h.saturating_sub(1))).unwrap_or(u16::MAX),
+                    u16::try_from(cursor.col.min(inner_w.saturating_sub(1))).unwrap_or(u16::MAX),
+                )
+            };
+            let cursor_visible = if use_scrollback {
+                true
+            } else {
+                entry.terminal_grid.grid().cursor().visible
+            };
+            cursor_state = Some(AttachCursorState {
+                x: stage.content.x.saturating_add(cursor_col),
+                y: stage.content.y.saturating_add(cursor_row),
+                visible: cursor_visible,
+            });
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::Cursor {
+                    surface_index: stage.surface_index,
+                    visible: cursor_visible,
+                });
+            }
+        }
+        if !stage.should_draw_content || stage.sync_deferred {
+            if stage.sync_deferred
+                && let Some(stats) = render_stats.as_deref_mut()
+            {
+                stats.pane_rows_sync_deferred = stats
+                    .pane_rows_sync_deferred
+                    .saturating_add(u64::try_from(inner_h).unwrap_or(u64::MAX));
+            }
+            if stage.sync_deferred
+                && let Some(trace) = render_trace.as_deref_mut()
+            {
+                trace.push(AttachRenderTraceOp::PaneRowsSyncDeferred {
+                    surface_index: stage.surface_index,
+                    rows: u16::try_from(inner_h).unwrap_or(u16::MAX),
+                });
+            }
+        } else {
+            let damaged_content_rows = stage.frame_damage.content_surface_rects(stage.pane_id);
+            let mut effective_content_damage = damaged_content_rows.to_vec();
+            effective_content_damage.extend(stage.before_content_damage.iter().copied());
+            effective_content_damage.extend(stage.after_content_damage.iter().copied());
+            for row in 0..inner_h {
+                if let Some(stats) = render_stats.as_deref_mut() {
+                    stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
+                }
+                let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
+                let y = stage.content.y.saturating_add(row_u16);
+                let before_cells = before_content_row_cells(stage.before_content_cells, y);
+                let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
+                    damaged_grid_row_ranges(
+                        grid_row,
+                        row_u16,
+                        inner_width,
+                        &effective_content_damage,
+                    )
+                });
+                let force_row_damage = !damaged_ranges.is_empty();
+                let line = grid_rows.get(row).map_or_else(
+                    || {
+                        let blank_row = PhysicalRow::new();
+                        render_grid_row_segment(
+                            GridRowRenderContext {
+                                row: &blank_row,
+                                selection,
+                                absolute_row: if use_scrollback {
+                                    stage.scrollback_offset.saturating_add(row)
+                                } else {
+                                    row
+                                },
+                                runtime_appearance: stage.runtime_appearance,
+                                palette: entry.terminal_grid.grid().palette(),
+                                before_content_cells: &before_cells,
+                            },
+                            0,
+                            inner_width,
+                        )
+                    },
+                    |grid_row| {
+                        render_grid_row_segment(
+                            GridRowRenderContext {
+                                row: grid_row,
+                                selection,
+                                absolute_row: if use_scrollback {
+                                    stage.scrollback_offset.saturating_add(row)
+                                } else {
+                                    row
+                                },
+                                runtime_appearance: stage.runtime_appearance,
+                                palette: entry.terminal_grid.grid().palette(),
+                                before_content_cells: &before_cells,
+                            },
+                            0,
+                            inner_width,
+                        )
+                    },
+                );
+
+                // Row-level diff: skip emitting if the rendered string matches
+                // the previous frame's cached version for this row.
+                let cached = entry.prev_rows.get(row);
+                if cached.is_none_or(|c| *c != line) {
+                    queue!(stdout, MoveTo(stage.content.x, y), Print(&line))
+                        .context("failed drawing pane content")?;
+                    if let Some(stats) = render_stats.as_deref_mut() {
+                        stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
+                        stats.pane_cells_emitted = stats
+                            .pane_cells_emitted
+                            .saturating_add(u64::from(inner_width));
+                    }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        trace.push(AttachRenderTraceOp::PaneRowFull {
+                            surface_index: stage.surface_index,
+                            row: row_u16,
+                            cells: inner_width,
+                        });
+                    }
+                } else if force_row_damage {
+                    for (start_col, end_col) in damaged_ranges {
+                        let segment = grid_rows.get(row).map_or_else(
+                            || {
+                                let blank_row = PhysicalRow::new();
+                                render_grid_row_segment(
+                                    GridRowRenderContext {
+                                        row: &blank_row,
+                                        selection,
+                                        absolute_row: if use_scrollback {
+                                            stage.scrollback_offset.saturating_add(row)
+                                        } else {
+                                            row
+                                        },
+                                        runtime_appearance: stage.runtime_appearance,
+                                        palette: entry.terminal_grid.grid().palette(),
+                                        before_content_cells: &before_cells,
+                                    },
+                                    start_col,
+                                    end_col,
+                                )
+                            },
+                            |grid_row| {
+                                render_grid_row_segment(
+                                    GridRowRenderContext {
+                                        row: grid_row,
+                                        selection,
+                                        absolute_row: if use_scrollback {
+                                            stage.scrollback_offset.saturating_add(row)
+                                        } else {
+                                            row
+                                        },
+                                        runtime_appearance: stage.runtime_appearance,
+                                        palette: entry.terminal_grid.grid().palette(),
+                                        before_content_cells: &before_cells,
+                                    },
+                                    start_col,
+                                    end_col,
+                                )
+                            },
+                        );
+                        queue!(
+                            stdout,
+                            MoveTo(stage.content.x.saturating_add(start_col), y),
+                            Print(segment)
+                        )
+                        .context("failed drawing damaged pane content segment")?;
+                        if let Some(stats) = render_stats.as_deref_mut() {
+                            stats.pane_row_segments_emitted =
+                                stats.pane_row_segments_emitted.saturating_add(1);
+                            stats.pane_cells_emitted = stats
+                                .pane_cells_emitted
+                                .saturating_add(u64::from(end_col.saturating_sub(start_col)));
+                        }
+                        if let Some(trace) = render_trace.as_deref_mut() {
+                            trace.push(AttachRenderTraceOp::PaneRowSegment {
+                                surface_index: stage.surface_index,
+                                row: row_u16,
+                                start_col,
+                                cells: end_col.saturating_sub(start_col),
+                            });
+                        }
+                    }
+                } else {
+                    if let Some(stats) = render_stats.as_deref_mut() {
+                        stats.pane_rows_cached_skipped =
+                            stats.pane_rows_cached_skipped.saturating_add(1);
+                    }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
+                            surface_index: stage.surface_index,
+                            row: row_u16,
+                        });
+                    }
+                }
+                if row < entry.prev_rows.len() {
+                    entry.prev_rows[row] = line;
+                } else {
+                    entry.prev_rows.push(line);
+                }
+            }
+            // Trim stale cache entries if the visible row count shrank.
+            entry.prev_rows.truncate(inner_h);
+        }
+    } else if stage.should_draw_content || !stage.before_content_damage.is_empty() {
+        let palette = bmux_terminal_grid::StylePalette::default();
+        for row in 0..inner_h {
+            let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
+            let y = stage.content.y.saturating_add(row_u16);
+            let before_cells = before_content_row_cells(stage.before_content_cells, y);
+            let blank_row = PhysicalRow::new();
+            let line = render_grid_row_segment(
+                GridRowRenderContext {
+                    row: &blank_row,
+                    selection: None,
+                    absolute_row: row,
+                    runtime_appearance: stage.runtime_appearance,
+                    palette: &palette,
+                    before_content_cells: &before_cells,
+                },
+                0,
+                inner_width,
+            );
+            queue!(stdout, MoveTo(stage.content.x, y), Print(line))
+                .context("failed clearing pane content")?;
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
+                stats.pane_cells_emitted = stats
+                    .pane_cells_emitted
+                    .saturating_add(u64::from(inner_width));
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::PaneRowFull {
+                    surface_index: stage.surface_index,
+                    row: row_u16,
+                    cells: inner_width,
+                });
+            }
+        }
+    }
+    Ok(cursor_state)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -3479,26 +4066,14 @@ fn render_attach_scene_inner<W: io::Write>(
 
     let mut cursor_state = None;
     if frame_damage.is_full_frame() {
-        let clear_start = status_top_inset.min(rows);
-        let clear_end = rows.saturating_sub(status_bottom_inset).max(clear_start);
-        for y in clear_start..clear_end {
-            queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
-                .context("failed clearing attach pane row")?;
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.clear_rows = stats.clear_rows.saturating_add(1);
-                stats.clear_cells = stats.clear_cells.saturating_add(u64::from(cols));
-            }
-            if let Some(trace) = render_trace.as_deref_mut() {
-                trace.push(AttachRenderTraceOp::ClearRow {
-                    row: y,
-                    cells: cols,
-                });
-            }
-        }
-        // Invalidate all row caches so every row is re-emitted.
-        for buffer in pane_buffers.values_mut() {
-            buffer.prev_rows.clear();
-        }
+        queue_full_frame_content_clear(
+            stdout,
+            terminal_size,
+            (status_top_inset, status_bottom_inset),
+            pane_buffers,
+            &mut render_stats,
+            &mut render_trace,
+        )?;
     }
 
     let focused_surface_id = match scene.focus {
@@ -3569,19 +4144,17 @@ fn render_attach_scene_inner<W: io::Write>(
         let before_content_damage = before_content.1;
         let before_content_damaged = !before_content_damage.is_empty();
         let ext_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
-        let after_content_cleanup_damage = after_content_own_damage_for_surface(
+        let after_content_cleanup = after_content_cleanup_plan_for_surface(
             surface.id,
             ext_rect,
+            content,
             frame_damage,
             damage_policy,
             render_extensions,
         );
-        let after_content_cleanup_content_damage =
-            render_damage_content_rects(&after_content_cleanup_damage, content);
-        let after_content_cleanup_damaged = !after_content_cleanup_damage.is_none();
         let should_draw_content = frame_damage.content_surface_damaged(pane_id)
             || before_content_damaged
-            || !after_content_cleanup_content_damage.is_empty();
+            || !after_content_cleanup.content_damage.is_empty();
         let should_draw_extensions = frame_damage.extension_surface_damaged(surface.id, pane_id);
         if let Some(stats) = render_stats.as_deref_mut() {
             stats.visible_pane_surfaces = stats.visible_pane_surfaces.saturating_add(1);
@@ -3615,479 +4188,57 @@ fn render_attach_scene_inner<W: io::Write>(
         {
             continue;
         }
-        if after_content_cleanup_damaged {
-            queue_after_content_cleanup_for_damage(stdout, ext_rect, &after_content_cleanup_damage)
-                .context("failed clearing stale after-content decoration cells")?;
+        if after_content_cleanup.is_damaged() {
+            queue_after_content_cleanup_for_damage(
+                stdout,
+                ext_rect,
+                &after_content_cleanup.surface_damage,
+            )
+            .context("failed clearing stale after-content decoration cells")?;
         }
-        let inner_width = content.w;
-        let inner_height = content.h;
-        let inner_w = usize::from(inner_width);
-        let inner_h = usize::from(inner_height);
-        if let Some(entry) = pane_buffers.get_mut(&pane_id) {
-            let previous_grid_size = (
-                entry.terminal_grid.grid().width(),
-                entry.terminal_grid.grid().height(),
-            );
-            let _ = entry
-                .terminal_grid
-                .resize(inner_width.max(1), inner_height.max(1));
-            // Invalidate the row cache when the pane dimensions change, since
-            // the row strings are no longer comparable at a different size.
-            let next_grid_size = (
-                entry.terminal_grid.grid().width(),
-                entry.terminal_grid.grid().height(),
-            );
-            if next_grid_size != previous_grid_size {
-                entry.prev_rows.clear();
-                entry.scrollback_window = None;
-            }
-            let use_scrollback = scrollback_active && focus;
-            let grid_rows = if use_scrollback {
-                entry
-                    .scrollback_window
-                    .as_ref()
-                    .filter(|window| window.scrollback_offset == scrollback_offset)
-                    .map_or_else(
-                        || vec![PhysicalRow::new(); inner_h],
-                        |window| window.rows.clone(),
-                    )
-            } else {
-                entry.terminal_grid.grid().display_rows(0, inner_h)
-            };
-            let selection = if use_scrollback {
-                selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
-            } else {
-                None
-            };
-            if focus {
-                let (cursor_row, cursor_col) = if use_scrollback {
-                    let cursor =
-                        scrollback_cursor.unwrap_or(AttachScrollbackCursor { row: 0, col: 0 });
-                    (
-                        cursor.row.min(inner_h.saturating_sub(1)) as u16,
-                        cursor.col.min(inner_w.saturating_sub(1)) as u16,
-                    )
-                } else {
-                    let cursor = entry.terminal_grid.grid().cursor();
-                    (
-                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                    )
-                };
-                let cursor_visible = if use_scrollback {
-                    true
-                } else {
-                    entry.terminal_grid.grid().cursor().visible
-                };
-                cursor_state = Some(AttachCursorState {
-                    x: content.x.saturating_add(cursor_col),
-                    y: content.y.saturating_add(cursor_row),
-                    visible: cursor_visible,
-                });
-                if let Some(trace) = render_trace.as_deref_mut() {
-                    trace.push(AttachRenderTraceOp::Cursor {
-                        surface_index,
-                        visible: cursor_visible,
-                    });
-                }
-            }
-            if !should_draw_content || sync_deferred {
-                if sync_deferred && let Some(stats) = render_stats.as_deref_mut() {
-                    stats.pane_rows_sync_deferred = stats
-                        .pane_rows_sync_deferred
-                        .saturating_add(u64::try_from(inner_h).unwrap_or(u64::MAX));
-                }
-                if sync_deferred && let Some(trace) = render_trace.as_deref_mut() {
-                    trace.push(AttachRenderTraceOp::PaneRowsSyncDeferred {
-                        surface_index,
-                        rows: u16::try_from(inner_h).unwrap_or(u16::MAX),
-                    });
-                }
-            } else {
-                let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
-                let mut effective_content_damage = damaged_content_rows.to_vec();
-                effective_content_damage.extend(before_content_damage.iter().copied());
-                effective_content_damage
-                    .extend(after_content_cleanup_content_damage.iter().copied());
-                for row in 0..inner_h {
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
-                    }
-                    let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
-                    let y = content.y.saturating_add(row_u16);
-                    let before_cells = before_content_row_cells(&before_content_cells, y);
-                    let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
-                        damaged_grid_row_ranges(
-                            grid_row,
-                            row_u16,
-                            inner_width,
-                            &effective_content_damage,
-                        )
-                    });
-                    let force_row_damage = !damaged_ranges.is_empty();
-                    let line = grid_rows.get(row).map_or_else(
-                        || {
-                            let blank_row = PhysicalRow::new();
-                            render_grid_row_segment(
-                                GridRowRenderContext {
-                                    row: &blank_row,
-                                    selection,
-                                    absolute_row: if use_scrollback {
-                                        scrollback_offset.saturating_add(row)
-                                    } else {
-                                        row
-                                    },
-                                    runtime_appearance,
-                                    palette: entry.terminal_grid.grid().palette(),
-                                    before_content_cells: &before_cells,
-                                },
-                                0,
-                                inner_width,
-                            )
-                        },
-                        |grid_row| {
-                            render_grid_row_segment(
-                                GridRowRenderContext {
-                                    row: grid_row,
-                                    selection,
-                                    absolute_row: if use_scrollback {
-                                        scrollback_offset.saturating_add(row)
-                                    } else {
-                                        row
-                                    },
-                                    runtime_appearance,
-                                    palette: entry.terminal_grid.grid().palette(),
-                                    before_content_cells: &before_cells,
-                                },
-                                0,
-                                inner_width,
-                            )
-                        },
-                    );
-
-                    // Row-level diff: skip emitting if the rendered string
-                    // matches the previous frame's cached version for this row.
-                    let cached = entry.prev_rows.get(row);
-                    if cached.is_none_or(|c| *c != line) {
-                        queue!(stdout, MoveTo(content.x, y), Print(&line))
-                            .context("failed drawing pane content")?;
-                        if let Some(stats) = render_stats.as_deref_mut() {
-                            stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
-                            stats.pane_cells_emitted = stats
-                                .pane_cells_emitted
-                                .saturating_add(u64::from(inner_width));
-                        }
-                        if let Some(trace) = render_trace.as_deref_mut() {
-                            trace.push(AttachRenderTraceOp::PaneRowFull {
-                                surface_index,
-                                row: row_u16,
-                                cells: inner_width,
-                            });
-                        }
-                    } else if force_row_damage {
-                        for (start_col, end_col) in damaged_ranges {
-                            let segment = grid_rows.get(row).map_or_else(
-                                || {
-                                    let blank_row = PhysicalRow::new();
-                                    render_grid_row_segment(
-                                        GridRowRenderContext {
-                                            row: &blank_row,
-                                            selection,
-                                            absolute_row: if use_scrollback {
-                                                scrollback_offset.saturating_add(row)
-                                            } else {
-                                                row
-                                            },
-                                            runtime_appearance,
-                                            palette: entry.terminal_grid.grid().palette(),
-                                            before_content_cells: &before_cells,
-                                        },
-                                        start_col,
-                                        end_col,
-                                    )
-                                },
-                                |grid_row| {
-                                    render_grid_row_segment(
-                                        GridRowRenderContext {
-                                            row: grid_row,
-                                            selection,
-                                            absolute_row: if use_scrollback {
-                                                scrollback_offset.saturating_add(row)
-                                            } else {
-                                                row
-                                            },
-                                            runtime_appearance,
-                                            palette: entry.terminal_grid.grid().palette(),
-                                            before_content_cells: &before_cells,
-                                        },
-                                        start_col,
-                                        end_col,
-                                    )
-                                },
-                            );
-                            queue!(
-                                stdout,
-                                MoveTo(content.x.saturating_add(start_col), y),
-                                Print(segment)
-                            )
-                            .context("failed drawing damaged pane content segment")?;
-                            if let Some(stats) = render_stats.as_deref_mut() {
-                                stats.pane_row_segments_emitted =
-                                    stats.pane_row_segments_emitted.saturating_add(1);
-                                stats.pane_cells_emitted = stats
-                                    .pane_cells_emitted
-                                    .saturating_add(u64::from(end_col.saturating_sub(start_col)));
-                            }
-                            if let Some(trace) = render_trace.as_deref_mut() {
-                                trace.push(AttachRenderTraceOp::PaneRowSegment {
-                                    surface_index,
-                                    row: row_u16,
-                                    start_col,
-                                    cells: end_col.saturating_sub(start_col),
-                                });
-                            }
-                        }
-                    } else {
-                        if let Some(stats) = render_stats.as_deref_mut() {
-                            stats.pane_rows_cached_skipped =
-                                stats.pane_rows_cached_skipped.saturating_add(1);
-                        }
-                        if let Some(trace) = render_trace.as_deref_mut() {
-                            trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
-                                surface_index,
-                                row: row_u16,
-                            });
-                        }
-                    }
-                    if row < entry.prev_rows.len() {
-                        entry.prev_rows[row] = line;
-                    } else {
-                        entry.prev_rows.push(line);
-                    }
-                }
-                // Trim stale cache entries if the visible row count shrank.
-                entry.prev_rows.truncate(inner_h);
-            }
-        } else if should_draw_content || !before_content_damage.is_empty() {
-            let palette = bmux_terminal_grid::StylePalette::default();
-            for row in 0..inner_h {
-                let y = content.y.saturating_add(row as u16);
-                let before_cells = before_content_row_cells(&before_content_cells, y);
-                let blank_row = PhysicalRow::new();
-                let line = render_grid_row_segment(
-                    GridRowRenderContext {
-                        row: &blank_row,
-                        selection: None,
-                        absolute_row: row,
-                        runtime_appearance,
-                        palette: &palette,
-                        before_content_cells: &before_cells,
-                    },
-                    0,
-                    inner_width,
-                );
-                queue!(stdout, MoveTo(content.x, y), Print(line))
-                    .context("failed clearing pane content")?;
-                if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
-                    stats.pane_cells_emitted = stats
-                        .pane_cells_emitted
-                        .saturating_add(u64::from(inner_width));
-                }
-                if let Some(trace) = render_trace.as_deref_mut() {
-                    trace.push(AttachRenderTraceOp::PaneRowFull {
-                        surface_index,
-                        row: u16::try_from(row).unwrap_or(u16::MAX),
-                        cells: inner_width,
-                    });
-                }
-            }
+        if let Some(content_cursor_state) = queue_pane_content_for_surface(
+            stdout,
+            pane_buffers,
+            &PaneContentRenderStage {
+                pane_id,
+                surface_index,
+                content,
+                focus,
+                should_draw_content,
+                sync_deferred,
+                scrollback_active,
+                scrollback_offset,
+                scrollback_cursor,
+                selection_anchor,
+                runtime_appearance,
+                before_content_cells: &before_content_cells,
+                before_content_damage: &before_content_damage,
+                after_content_damage: &after_content_cleanup.content_damage,
+                frame_damage,
+            },
+            &mut render_stats,
+            &mut render_trace,
+        )? {
+            cursor_state = Some(content_cursor_state);
         }
 
         if should_draw_extensions {
-            // Consult every registered render extension for this
-            // surface. Extensions report generic surface damage;
-            // unknown damage safely falls back to full-surface
-            // extension repaint without forcing pane content redraw.
-            let ext_rect = bmux_plugin::ExtensionRect {
-                x: rect.x,
-                y: rect.y,
-                w: rect.w,
-                h: rect.h,
-            };
-            for ext in render_extensions {
-                let damage = extension_render_damage_for_frame(
-                    ext.as_ref(),
-                    surface.id,
-                    pane_id,
-                    ext_rect,
-                    RenderExtensionLayer::AfterPaneContent,
-                    frame_damage,
-                    damage_policy,
-                );
-                if damage.is_none() {
-                    continue;
-                }
-                if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.record_extension_render_call(ext.name(), &damage);
-                }
-
-                let revision =
-                    ext.render_layer_revision(surface.id, RenderExtensionLayer::AfterPaneContent);
-                let cache_key = (
-                    format!(
-                        "{}::{:?}::caps={}",
-                        ext.name(),
-                        RenderExtensionLayer::AfterPaneContent,
-                        render_context.capabilities.cache_key()
-                    ),
-                    surface.id,
-                );
-                if let Some(revision) = revision
-                    && let Some(entry) = pane_buffers
-                        .get(&pane_id)
-                        .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
-                    && entry.surface_rect == ext_rect
-                    && entry.damage == damage
-                    && entry.revision == revision
-                {
-                    stdout
-                        .write_all(&entry.bytes)
-                        .context("failed replaying cached declarative render ops")?;
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.record_extension_cache_hit(ext.name());
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
-                    }
-                    continue;
-                }
-
-                if let Some(items) = ext.render_layer_items_with_context(
-                    surface.id,
-                    &ext_rect,
-                    &damage,
-                    RenderExtensionLayer::AfterPaneContent,
-                    render_context,
-                ) {
-                    if !items.is_empty() {
-                        if let Some(stats) = render_stats.as_deref_mut() {
-                            stats.record_extension_render_op_call(ext.name());
-                        }
-                        if let Some(trace) = render_trace.as_deref_mut() {
-                            let (regions, full_surface) = render_damage_trace_shape(&damage);
-                            trace.push(AttachRenderTraceOp::ExtensionOps {
-                                surface_index,
-                                regions,
-                                full_surface,
-                            });
-                        }
-                    }
-                    if let Err(err) = queue_render_items_for_frame(
-                        stdout,
-                        pane_id,
-                        surface.id,
-                        ext_rect,
-                        &damage,
-                        &items,
-                        terminal_graphics_cache,
-                        &mut active_terminal_graphics,
-                        render_context.capabilities,
-                        render_stats.as_deref_mut(),
-                    ) {
-                        tracing::warn!(
-                            extension = ext.name(),
-                            surface_id = %surface.id,
-                            error = %err,
-                            "render extension render_items failed",
-                        );
-                    }
-                } else if let Some(ops) = ext.render_layer_ops_with_context(
-                    surface.id,
-                    &ext_rect,
-                    &damage,
-                    RenderExtensionLayer::AfterPaneContent,
-                    render_context,
-                ) {
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.record_extension_render_op_call(ext.name());
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        let (regions, full_surface) = render_damage_trace_shape(&damage);
-                        trace.push(AttachRenderTraceOp::ExtensionOps {
-                            surface_index,
-                            regions,
-                            full_surface,
-                        });
-                    }
-                    let mut bytes = Vec::new();
-                    match queue_render_ops(&mut bytes, ext_rect, &damage, &ops) {
-                        Ok(_) => {
-                            stdout
-                                .write_all(&bytes)
-                                .context("failed writing declarative render op bytes")?;
-                            if let Some(revision) = revision
-                                && let Some(buffer) = pane_buffers.get_mut(&pane_id)
-                            {
-                                buffer.extension_render_cache.insert(
-                                    cache_key,
-                                    ExtensionRenderCacheEntry {
-                                        surface_id: surface.id,
-                                        surface_rect: ext_rect,
-                                        damage,
-                                        revision,
-                                        bytes,
-                                    },
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                extension = ext.name(),
-                                surface_id = %surface.id,
-                                error = %err,
-                                "render extension render_ops failed",
-                            );
-                        }
-                    }
-                } else {
-                    // Re-bind through `&mut dyn io::Write` so the extension
-                    // trait's object-safe signature sees a dyn writer
-                    // regardless of the concrete `W` the caller passed.
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.record_extension_imperative_call(ext.name());
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        let (regions, full_surface) = render_damage_trace_shape(&damage);
-                        trace.push(AttachRenderTraceOp::ExtensionImperative {
-                            surface_index,
-                            regions,
-                            full_surface,
-                        });
-                    }
-                    let dyn_writer: &mut dyn io::Write = stdout;
-                    if let Err(err) = ext.render_layer_surface_with_context(
-                        dyn_writer,
-                        surface.id,
-                        &ext_rect,
-                        &damage,
-                        RenderExtensionLayer::AfterPaneContent,
-                        render_context,
-                    ) {
-                        tracing::warn!(
-                            extension = ext.name(),
-                            surface_id = %surface.id,
-                            error = %err,
-                            "render extension render_surface failed",
-                        );
-                    }
-                }
-            }
+            queue_after_content_extensions_for_surface(
+                stdout,
+                pane_id,
+                surface.id,
+                surface_index,
+                ext_rect,
+                frame_damage,
+                damage_policy,
+                render_extensions,
+                render_context,
+                pane_buffers,
+                terminal_graphics_cache,
+                &mut active_terminal_graphics,
+                &mut render_stats,
+                &mut render_trace,
+            )?;
         }
     }
 
