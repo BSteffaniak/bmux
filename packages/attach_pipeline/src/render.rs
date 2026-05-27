@@ -3377,6 +3377,47 @@ fn retain_cached_terminal_graphics_for_visible_surfaces(
     }));
 }
 
+fn begin_terminal_graphics_frame<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    graphics_cache: &mut TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+    render_stats: Option<&mut AttachSceneRenderStats>,
+) -> Result<BTreeSet<u64>> {
+    let mut active_terminal_graphics = BTreeSet::new();
+    retain_cached_terminal_graphics_for_visible_surfaces(
+        scene,
+        graphics_cache,
+        capabilities,
+        &mut active_terminal_graphics,
+    );
+    cleanup_stale_terminal_graphics(
+        stdout,
+        &active_terminal_graphics,
+        graphics_cache,
+        capabilities,
+        render_stats,
+    )?;
+    Ok(active_terminal_graphics)
+}
+
+fn finish_terminal_graphics_frame<W: io::Write>(
+    stdout: &mut W,
+    active_terminal_graphics: &BTreeSet<u64>,
+    graphics_cache: &mut TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+    render_stats: Option<&mut AttachSceneRenderStats>,
+) -> Result<()> {
+    cleanup_stale_terminal_graphics(
+        stdout,
+        active_terminal_graphics,
+        graphics_cache,
+        capabilities,
+        render_stats,
+    )?;
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -3413,21 +3454,24 @@ fn render_attach_scene_inner<W: io::Write>(
         stats.full_frame = frame_damage.is_full_frame();
         stats.viewport_cells = u64::from(cols).saturating_mul(u64::from(rows));
     }
-    let mut active_terminal_graphics = BTreeSet::new();
 
+    // Frame stage order is intentional and mirrors the user-visible terminal
+    // layering contract:
+    // 1. refresh extension state from retained plugin channels;
+    // 2. reconcile already-cached terminal graphics against currently visible surfaces;
+    // 3. clear full-frame cell content when requested;
+    // 4. render before-content extension cells/graphics;
+    // 5. render pane content rows/segments;
+    // 6. clear stale after-content decoration cells and redraw intersecting content;
+    // 7. render after-content extension cells/graphics;
+    // 8. delete terminal graphics that are no longer active after all surfaces rendered.
     for ext in render_extensions {
         ext.refresh_state();
     }
 
-    retain_cached_terminal_graphics_for_visible_surfaces(
-        scene,
-        terminal_graphics_cache,
-        render_context.capabilities,
-        &mut active_terminal_graphics,
-    );
-    cleanup_stale_terminal_graphics(
+    let mut active_terminal_graphics = begin_terminal_graphics_frame(
         stdout,
-        &active_terminal_graphics,
+        scene,
         terminal_graphics_cache,
         render_context.capabilities,
         render_stats.as_deref_mut(),
@@ -4047,7 +4091,7 @@ fn render_attach_scene_inner<W: io::Write>(
         }
     }
 
-    cleanup_stale_terminal_graphics(
+    finish_terminal_graphics_frame(
         stdout,
         &active_terminal_graphics,
         terminal_graphics_cache,
