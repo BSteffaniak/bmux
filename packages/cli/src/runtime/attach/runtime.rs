@@ -6518,6 +6518,100 @@ fn terminal_render_capabilities(
     }
 }
 
+struct RetainedFramePlan {
+    status_surface: Option<RetainedSurface>,
+    help_surface: Option<RetainedSurface>,
+    prompt_overlay_render: Option<AttachPromptOverlayRender>,
+    prompt_surface: Option<RetainedSurface>,
+    graph_damage: RetainedDamage,
+    repaint_plan: Vec<RetainedRepaintSurface>,
+}
+
+impl RetainedFramePlan {
+    const fn graph_damaged(&self) -> bool {
+        !matches!(self.graph_damage, RetainedDamage::None)
+    }
+
+    fn repaint_by_id(&self) -> BTreeMap<Uuid, &RetainedRepaintSurface> {
+        self.repaint_plan
+            .iter()
+            .map(|surface| (surface.surface_id, surface))
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Retained planning bridges frame damage, UI surfaces, and compositor state.
+fn build_retained_frame_plan(
+    view_state: &mut AttachViewState,
+    layout_state: &AttachLayoutState,
+    frame_damage: &mut bmux_attach_pipeline::FrameDamage,
+    status_surface: Option<RetainedSurface>,
+    help_surface: Option<RetainedSurface>,
+    prompt_overlay_render: Option<AttachPromptOverlayRender>,
+    viewport: DamageRect,
+    damage_policy: DamageCoalescingPolicy,
+) -> RetainedFramePlan {
+    let prompt_surface = prompt_overlay_render
+        .as_ref()
+        .map(retained_prompt_overlay_surface);
+    let retained_frame_damage = retained_frame_damage_from_frame_damage(
+        &layout_state.scene,
+        frame_damage,
+        viewport,
+        damage_policy,
+    );
+    let mut explicit_ui_damage_rects = Vec::new();
+    if frame_damage.status_damaged()
+        && let Some(surface) = status_surface.as_ref()
+    {
+        explicit_ui_damage_rects.push(surface.rect);
+    }
+    if frame_damage.overlay_damaged() {
+        if let Some(surface) = help_surface.as_ref() {
+            explicit_ui_damage_rects.push(surface.rect);
+        }
+        if let Some(surface) = prompt_surface.as_ref() {
+            explicit_ui_damage_rects.push(surface.rect);
+        }
+    }
+    let explicit_ui_damage =
+        retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
+    let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
+    retained_surfaces.extend(status_surface.iter().cloned());
+    retained_surfaces.extend(help_surface.iter().cloned());
+    retained_surfaces.extend(prompt_surface.iter().cloned());
+    let graph_damage = view_state.retained_compositor.replace_surfaces(
+        retained_surfaces.clone(),
+        viewport,
+        damage_policy,
+    );
+    let retained_damage = merge_retained_damages(
+        [
+            retained_frame_damage,
+            explicit_ui_damage,
+            graph_damage.clone(),
+        ],
+        viewport,
+        damage_policy,
+    );
+    let repaint_plan = view_state
+        .retained_compositor
+        .repaint_plan(&retained_damage);
+    frame_damage.merge_from(&frame_damage_from_retained_repaint_plan(
+        &layout_state.scene,
+        &repaint_plan,
+        damage_policy,
+    ));
+    RetainedFramePlan {
+        status_surface,
+        help_surface,
+        prompt_overlay_render,
+        prompt_surface,
+        graph_damage,
+        repaint_plan,
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     terminal_writer: &mut W,
@@ -6592,68 +6686,22 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     } else {
         None
     };
-    let prompt_retained_surface = prompt_overlay_render
-        .as_ref()
-        .map(retained_prompt_overlay_surface);
-
-    let retained_frame_damage = retained_frame_damage_from_frame_damage(
-        &layout_state.scene,
-        &frame_damage,
+    let retained_plan = build_retained_frame_plan(
+        view_state,
+        layout_state,
+        &mut frame_damage,
+        status_surface,
+        help_retained_surface,
+        prompt_overlay_render,
         viewport,
         damage_policy,
     );
-    let mut explicit_ui_damage_rects = Vec::new();
-    if frame_damage.status_damaged()
-        && let Some(surface) = status_surface.as_ref()
-    {
-        explicit_ui_damage_rects.push(surface.rect);
-    }
-    if frame_damage.overlay_damaged() {
-        if let Some(surface) = help_retained_surface.as_ref() {
-            explicit_ui_damage_rects.push(surface.rect);
-        }
-        if let Some(surface) = prompt_retained_surface.as_ref() {
-            explicit_ui_damage_rects.push(surface.rect);
-        }
-    }
-    let explicit_ui_damage =
-        retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
-    let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
-    retained_surfaces.extend(status_surface.iter().cloned());
-    retained_surfaces.extend(help_retained_surface.iter().cloned());
-    retained_surfaces.extend(prompt_retained_surface.iter().cloned());
-    let retained_graph_damage = view_state.retained_compositor.replace_surfaces(
-        retained_surfaces.clone(),
-        viewport,
-        damage_policy,
-    );
-    let retained_damage = merge_retained_damages(
-        [
-            retained_frame_damage,
-            explicit_ui_damage,
-            retained_graph_damage.clone(),
-        ],
-        viewport,
-        damage_policy,
-    );
-    let retained_repaint_plan = view_state
-        .retained_compositor
-        .repaint_plan(&retained_damage);
-    frame_damage.merge_from(&frame_damage_from_retained_repaint_plan(
-        &layout_state.scene,
-        &retained_repaint_plan,
-        damage_policy,
-    ));
     let damage_stats = frame_damage.stats();
-    let retained_graph_damaged = !matches!(retained_graph_damage, RetainedDamage::None);
-    let render_scene = frame_damage.scene_damaged() || retained_graph_damaged;
-    let retained_repaint_by_id = retained_repaint_plan
-        .iter()
-        .map(|surface| (surface.surface_id, surface))
-        .collect::<BTreeMap<_, _>>();
+    let render_scene = frame_damage.scene_damaged() || retained_plan.graph_damaged();
+    let retained_repaint_by_id = retained_plan.repaint_by_id();
 
     let use_synchronized_update = frame_uses_synchronized_update(&frame_damage)
-        || retained_graph_damaged
+        || retained_plan.graph_damaged()
         || damage_config.visualize;
 
     let mut frame_bytes = Vec::new();
@@ -6675,8 +6723,9 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
-    queue_retained_background_clear(&mut frame_bytes, &retained_graph_damage)?;
-    let status_rendered = if let Some((surface, repaint)) = status_surface
+    queue_retained_background_clear(&mut frame_bytes, &retained_plan.graph_damage)?;
+    let status_rendered = if let Some((surface, repaint)) = retained_plan
+        .status_surface
         .as_ref()
         .zip(retained_repaint_by_id.get(&STATUS_SURFACE_ID))
     {
@@ -6786,7 +6835,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let previous_cursor_state = view_state.last_cursor_state;
     let mut overlay_rendered = false;
     let mut overlay_cursor_state = None;
-    if let Some(help_surface) = help_retained_surface.as_ref()
+    if let Some(help_surface) = retained_plan.help_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
         && queue_retained_render_ops(&mut frame_bytes, help_surface, repaint)?
     {
@@ -6799,11 +6848,12 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         }
         overlay_rendered = true;
     }
-    if let Some(prompt_surface) = prompt_retained_surface.as_ref()
+    if let Some(prompt_surface) = retained_plan.prompt_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
         && queue_retained_render_ops(&mut frame_bytes, prompt_surface, repaint)?
     {
-        overlay_cursor_state = prompt_overlay_render
+        overlay_cursor_state = retained_plan
+            .prompt_overlay_render
             .as_ref()
             .and_then(|render| render.cursor_state);
         if let Some(trace) = render_trace.as_deref_mut() {
