@@ -154,16 +154,32 @@ impl DecorationRendererCache {
 
     fn mark_layer_rendered(&mut self, surface_id: Uuid, layer: RenderExtensionLayer) {
         if let Some(surface) = self.surfaces.get(&surface_id) {
-            self.rendered_surfaces
-                .insert((surface_id, layer), surface.clone());
+            self.mark_layer_rendered_snapshot(surface_id, layer, surface.clone());
         } else {
             self.rendered_surfaces
                 .retain(|(rendered_id, _), _| rendered_id != &surface_id);
         }
     }
 
+    fn mark_layer_rendered_snapshot(
+        &mut self,
+        surface_id: Uuid,
+        layer: RenderExtensionLayer,
+        surface: SurfaceDecoration,
+    ) {
+        self.rendered_surfaces.insert((surface_id, layer), surface);
+    }
+
     fn mark_rendered(&mut self, surface_id: Uuid) {
         self.mark_layer_rendered(surface_id, RenderExtensionLayer::AfterPaneContent);
+    }
+
+    fn mark_rendered_snapshot(&mut self, surface_id: Uuid, surface: SurfaceDecoration) {
+        self.mark_layer_rendered_snapshot(
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            surface,
+        );
     }
 
     fn forget_surface(&mut self, surface_id: &Uuid) {
@@ -207,15 +223,43 @@ impl DecorationRenderExtension {
             cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         }
-        let surface = filter_surface_layer_for_damage(surface, damage, layer);
-        if layer_paint_commands(&surface, layer).is_empty() {
-            cache.mark_layer_rendered(surface_id, layer);
+        let rendered_surface = surface.clone();
+        let damaged_surface = filter_surface_layer_for_damage(surface, damage, layer);
+        if layer_paint_commands(&damaged_surface, layer).is_empty() {
+            cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
             return Some(Vec::new());
         }
         let scene_capabilities = scene_capabilities_from_terminal(capabilities);
-        let ops =
-            render_ops_for_surface_layer_with_capabilities(&surface, layer, scene_capabilities)?;
-        cache.mark_layer_rendered(surface_id, layer);
+        let graphics_semantic_border_active = surface_has_graphics_semantic_border(
+            surface_id,
+            surface,
+            capabilities,
+            scene_capabilities,
+        );
+        let mut render_surface;
+        let surface_for_ops =
+            if layer == RenderExtensionLayer::AfterPaneContent && graphics_semantic_border_active {
+                render_surface = surface.clone();
+                render_surface
+                    .paint_commands
+                    .retain(|command| !matches!(command, PaintCommand::BoxBorder { .. }));
+                &render_surface
+            } else {
+                surface
+            };
+        // If terminal graphics are unavailable, semantic borders fall back to
+        // terminal-cell drawing. Render the full layer, not only the damaged
+        // subset, so higher-z text decorations are replayed after lower-z
+        // border/paddle clears in the same synchronized frame. Filtering the
+        // command list here was the real-terminal flicker path: a dirty border
+        // could be emitted without the header/score command that normally
+        // occludes it.
+        let ops = render_ops_for_surface_layer_with_capabilities(
+            surface_for_ops,
+            layer,
+            scene_capabilities,
+        )?;
+        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
         Some(ops)
     }
 
@@ -236,6 +280,7 @@ impl DecorationRenderExtension {
             cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
             return Some(Vec::new());
         }
+        let rendered_surface = surface.clone();
         let surface = filter_surface_layer_for_damage(
             surface,
             damage,
@@ -246,7 +291,11 @@ impl DecorationRenderExtension {
             RenderExtensionLayer::BeforePaneContent,
             capabilities,
         )?;
-        cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
+        cache.mark_layer_rendered_snapshot(
+            surface_id,
+            RenderExtensionLayer::BeforePaneContent,
+            rendered_surface,
+        );
         Some(render_ops_to_under_cells(&ops))
     }
 
@@ -269,13 +318,14 @@ impl DecorationRenderExtension {
             cache.mark_layer_rendered(surface_id, layer);
             return Ok(false);
         }
+        let rendered_surface = surface.clone();
         let surface = filter_surface_layer_for_damage(surface, damage, layer);
         let scene_capabilities = scene_capabilities_from_terminal(capabilities);
         let mut ordered: Vec<(usize, &PaintCommand)> = layer_paint_commands(&surface, layer)
             .iter()
             .enumerate()
             .collect();
-        ordered.sort_by_key(|(index, command)| (paint_command_z(command), *index));
+        ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
         let mut rendered = false;
         let mut emitted_text_style = false;
         for (_, command) in ordered {
@@ -289,7 +339,7 @@ impl DecorationRenderExtension {
         if emitted_text_style {
             stdout.write_all(b"\x1b[0m")?;
         }
-        cache.mark_layer_rendered(surface_id, layer);
+        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
         Ok(rendered)
     }
 }
@@ -340,8 +390,13 @@ impl AttachRenderExtension for DecorationRenderExtension {
             .map(|surface| surface_layer_revision(surface, layer))
     }
 
-    fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
-        false
+    fn redraws_on_content_damage(&self, layer: RenderExtensionLayer) -> bool {
+        // Decoration commands frequently occupy border/title cells that real
+        // pane output can still clear during full-row/full-screen terminal
+        // repaints. Replaying the after-content layer on pane content damage is
+        // required to keep headers, scores, paddles, and fallback borders from
+        // disappearing until the next decoration tick.
+        layer == RenderExtensionLayer::AfterPaneContent
     }
 
     fn render_surface(
@@ -362,9 +417,10 @@ impl AttachRenderExtension for DecorationRenderExtension {
             cache.mark_rendered(surface_id);
             return Ok(false);
         }
+        let rendered_surface = surface.clone();
         let surface = filter_surface_for_damage(surface, damage);
         if surface.paint_commands.is_empty() {
-            cache.mark_rendered(surface_id);
+            cache.mark_rendered_snapshot(surface_id, rendered_surface);
             return Ok(false);
         }
         // `apply_paint_commands` is generic over `W: io::Write` and
@@ -377,7 +433,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
         let rendered = apply_paint_commands(&mut writer, &surface)
             .map(|()| true)
             .map_err(|err| io::Error::other(err.to_string()))?;
-        cache.mark_rendered(surface_id);
+        cache.mark_rendered_snapshot(surface_id, rendered_surface);
         Ok(rendered)
     }
 
@@ -411,6 +467,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             cache.mark_layer_rendered(surface_id, layer);
             return Some(Vec::new());
         };
+        let rendered_surface = surface.clone();
         let previous_surface = cache.rendered_surface_layer(&surface_id, layer).cloned();
         if layer_paint_commands(surface, layer).is_empty() && previous_surface.is_none()
             || damage.is_none()
@@ -436,11 +493,9 @@ impl AttachRenderExtension for DecorationRenderExtension {
                 })
         });
 
-        let mut ordered: Vec<(usize, &PaintCommand)> = layer_paint_commands(surface, layer)
-            .iter()
-            .enumerate()
-            .collect();
-        ordered.sort_by_key(|(index, command)| (paint_command_z(command), *index));
+        let layer_commands = layer_paint_commands(surface, layer);
+        let mut ordered: Vec<(usize, &PaintCommand)> = layer_commands.iter().enumerate().collect();
+        ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
 
         let mut used_graphics = previous_used_graphics;
         let mut items = Vec::new();
@@ -468,7 +523,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
         if !used_graphics {
             return None;
         }
-        cache.mark_layer_rendered(surface_id, layer);
+        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
         Some(items)
     }
 
@@ -550,13 +605,14 @@ impl AttachRenderExtension for DecorationRenderExtension {
             cache.mark_rendered(surface_id);
             return Some(Vec::new());
         }
+        let rendered_surface = surface.clone();
         let surface = filter_surface_for_damage(surface, damage);
         if surface.paint_commands.is_empty() {
-            cache.mark_rendered(surface_id);
+            cache.mark_rendered_snapshot(surface_id, rendered_surface);
             return Some(Vec::new());
         }
         let ops = render_ops_for_surface(&surface)?;
-        cache.mark_rendered(surface_id);
+        cache.mark_rendered_snapshot(surface_id, rendered_surface);
         Some(ops)
     }
 
@@ -630,6 +686,29 @@ impl AttachRenderExtension for DecorationRenderExtension {
             cache.forget_surface(&surface_id);
         }
     }
+}
+
+fn surface_has_graphics_semantic_border(
+    surface_id: Uuid,
+    surface: &SurfaceDecoration,
+    capabilities: TerminalRenderCapabilities,
+    scene_capabilities: SceneRenderCapabilities,
+) -> bool {
+    surface
+        .before_content_paint_commands
+        .iter()
+        .chain(surface.paint_commands.iter())
+        .enumerate()
+        .any(|(index, command)| {
+            raster_border::semantic_border_graphic_items(
+                surface_id,
+                u64::try_from(index).unwrap_or(u64::MAX),
+                command,
+                capabilities,
+                scene_capabilities,
+            )
+            .is_some()
+        })
 }
 
 fn layer_paint_commands(
@@ -1137,6 +1216,51 @@ fn hash_revision_part(hasher: &mut impl Hasher, value: &impl serde::Serialize) {
     }
 }
 
+fn paint_command_sort_key(index: usize, command: &PaintCommand) -> (i16, usize) {
+    (paint_command_z(command), index)
+}
+
+fn terminal_cell_occluders_after(
+    commands: &[PaintCommand],
+    command_index: usize,
+    command: &PaintCommand,
+) -> Vec<ExtensionRect> {
+    let command_key = paint_command_sort_key(command_index, command);
+    commands
+        .iter()
+        .enumerate()
+        .filter(|(index, candidate)| {
+            *index != command_index
+                && paint_command_sort_key(*index, candidate) > command_key
+                && paint_command_paints_terminal_cells(candidate)
+        })
+        .flat_map(|(_, candidate)| paint_command_damage(candidate))
+        .collect()
+}
+
+fn paint_command_paints_terminal_cells(command: &PaintCommand) -> bool {
+    match command {
+        PaintCommand::Text { text, .. } | PaintCommand::GradientRun { text, .. } => {
+            !text.is_empty()
+        }
+        PaintCommand::FilledRect { rect, glyph, .. } => {
+            rect.w > 0 && rect.h > 0 && !glyph.is_empty()
+        }
+        PaintCommand::CellGrid { cols, cells, .. } => {
+            *cols > 0 && cells.iter().any(|cell| !cell.glyph.is_empty())
+        }
+        PaintCommand::BoxBorder { rect, glyphs, .. } => {
+            rect.w >= 2 && rect.h >= 2 && !matches!(glyphs, SceneBorderGlyphs::None)
+        }
+        PaintCommand::SemanticBorder { .. } => false,
+    }
+}
+
+fn cell_occluded(col: u16, row: u16, occluders: &[ExtensionRect]) -> bool {
+    let cell = ExtensionRect::new(col, row, 1, 1);
+    occluders.iter().any(|occluder| occluder.intersects(cell))
+}
+
 fn paint_command_intersects_render_damage(command: &PaintCommand, damage: &RenderDamage) -> bool {
     match damage {
         RenderDamage::None => false,
@@ -1238,11 +1362,12 @@ pub fn render_ops_for_paint_commands_with_capabilities(
     capabilities: SceneRenderCapabilities,
 ) -> Option<Vec<RenderOp>> {
     let mut ordered: Vec<(usize, &PaintCommand)> = paint_commands.iter().enumerate().collect();
-    ordered.sort_by_key(|(index, command)| (paint_command_z(command), *index));
+    ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
 
     let mut ops = Vec::new();
-    for (_, command) in ordered {
-        push_render_ops_for_command(&mut ops, command, capabilities)?;
+    for (command_index, command) in ordered {
+        let occluders = terminal_cell_occluders_after(paint_commands, command_index, command);
+        push_render_ops_for_command_with_occluders(&mut ops, command, capabilities, &occluders)?;
     }
     Some(ops)
 }
@@ -1299,10 +1424,11 @@ fn render_ops_to_under_cells(ops: &[RenderOp]) -> Vec<(u16, u16, RenderUnderCell
     cells
 }
 
-fn push_render_ops_for_command(
+fn push_render_ops_for_command_with_occluders(
     ops: &mut Vec<RenderOp>,
     command: &PaintCommand,
     capabilities: SceneRenderCapabilities,
+    occluders: &[ExtensionRect],
 ) -> Option<()> {
     match command {
         PaintCommand::Text {
@@ -1315,31 +1441,18 @@ fn push_render_ops_for_command(
             if text.is_empty() {
                 return Some(());
             }
-            ops.push(RenderOp::TextRun {
-                x: *col,
-                y: *row,
-                text: text.clone(),
-                style: render_style_from_scene(style),
-            });
+            push_text_run_render_ops(
+                ops,
+                *col,
+                *row,
+                text,
+                render_style_from_scene(style),
+                occluders,
+            );
         }
         PaintCommand::FilledRect {
             rect, glyph, style, ..
-        } => {
-            if rect.w == 0 || rect.h == 0 || glyph.is_empty() {
-                return Some(());
-            }
-            let style = render_style_from_scene(style);
-            let rect = extension_rect_from_scene(rect);
-            if glyph == " " {
-                ops.push(RenderOp::ClearRect { rect, style });
-            } else {
-                ops.push(RenderOp::FillRect {
-                    rect,
-                    ch: render_single_display_cell_char(glyph)?,
-                    style,
-                });
-            }
-        }
+        } => push_filled_rect_command_ops(ops, rect, glyph, style, occluders)?,
         PaintCommand::GradientRun {
             col,
             row,
@@ -1349,7 +1462,17 @@ fn push_render_ops_for_command(
             to_style,
             ..
         } => {
-            push_gradient_run_ops(ops, *col, *row, text, *axis, from_style, to_style);
+            let mut gradient_ops = Vec::new();
+            push_gradient_run_ops(
+                &mut gradient_ops,
+                *col,
+                *row,
+                text,
+                *axis,
+                from_style,
+                to_style,
+            );
+            push_clipped_render_ops(ops, gradient_ops, occluders);
         }
         PaintCommand::CellGrid {
             origin_col,
@@ -1357,23 +1480,14 @@ fn push_render_ops_for_command(
             cols,
             cells,
             ..
-        } => {
-            if *cols == 0 || cells.is_empty() {
-                return Some(());
-            }
-            ops.push(RenderOp::CellGrid {
-                x: *origin_col,
-                y: *origin_row,
-                rows: render_cell_grid_rows(*cols, cells)?,
-            });
-        }
+        } => push_cell_grid_command_ops(ops, *origin_col, *origin_row, *cols, cells, occluders)?,
         PaintCommand::BoxBorder {
             rect,
             glyphs,
             style,
             ..
         } => {
-            push_border_render_op(ops, rect, glyphs, style)?;
+            push_border_render_op(ops, rect, glyphs, style, occluders)?;
         }
         PaintCommand::SemanticBorder {
             rect,
@@ -1385,10 +1499,191 @@ fn push_render_ops_for_command(
             if !capability_query_matches(when.as_ref(), capabilities) {
                 return Some(());
             }
-            push_border_render_op(ops, rect, fallback_glyphs, style)?;
+            push_border_render_op(ops, rect, fallback_glyphs, style, occluders)?;
         }
     }
     Some(())
+}
+
+fn push_filled_rect_command_ops(
+    ops: &mut Vec<RenderOp>,
+    rect: &SceneRect,
+    glyph: &str,
+    style: &SceneStyle,
+    occluders: &[ExtensionRect],
+) -> Option<()> {
+    if rect.w == 0 || rect.h == 0 || glyph.is_empty() {
+        return Some(());
+    }
+    let style = render_style_from_scene(style);
+    let rect = extension_rect_from_scene(rect);
+    if occluders.is_empty() {
+        if glyph == " " {
+            ops.push(RenderOp::ClearRect { rect, style });
+        } else {
+            ops.push(RenderOp::FillRect {
+                rect,
+                ch: render_single_display_cell_char(glyph)?,
+                style,
+            });
+        }
+    } else {
+        let ch = if glyph == " " {
+            ' '
+        } else {
+            render_single_display_cell_char(glyph)?
+        };
+        push_fill_rect_render_ops(ops, rect, ch, style, occluders);
+    }
+    Some(())
+}
+
+fn push_cell_grid_command_ops(
+    ops: &mut Vec<RenderOp>,
+    origin_col: u16,
+    origin_row: u16,
+    cols: u16,
+    cells: &[SceneCell],
+    occluders: &[ExtensionRect],
+) -> Option<()> {
+    if cols == 0 || cells.is_empty() {
+        return Some(());
+    }
+    let mut rows = render_cell_grid_rows(cols, cells)?;
+    if !occluders.is_empty() {
+        clip_cell_grid_rows_to_occluders(&mut rows, origin_col, origin_row, occluders);
+    }
+    ops.push(RenderOp::CellGrid {
+        x: origin_col,
+        y: origin_row,
+        rows,
+    });
+    Some(())
+}
+
+fn clip_cell_grid_rows_to_occluders(
+    rows: &mut [Vec<RenderCell>],
+    origin_col: u16,
+    origin_row: u16,
+    occluders: &[ExtensionRect],
+) {
+    for (row_offset, row) in rows.iter_mut().enumerate() {
+        let Ok(row_offset) = u16::try_from(row_offset) else {
+            break;
+        };
+        for (col_offset, cell) in row.iter_mut().enumerate() {
+            let Ok(col_offset) = u16::try_from(col_offset) else {
+                break;
+            };
+            let col = origin_col.saturating_add(col_offset);
+            let row = origin_row.saturating_add(row_offset);
+            if cell_occluded(col, row, occluders) {
+                cell.ch = None;
+            }
+        }
+    }
+}
+
+fn push_text_run_render_ops(
+    ops: &mut Vec<RenderOp>,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: RenderStyle,
+    occluders: &[ExtensionRect],
+) {
+    if occluders.is_empty() {
+        ops.push(RenderOp::TextRun {
+            x,
+            y,
+            text: text.to_string(),
+            style,
+        });
+        return;
+    }
+    let mut run = String::new();
+    let mut run_x = x;
+    let mut col = x;
+    for ch in text.chars() {
+        let width = render_text_width_u16(ch.encode_utf8(&mut [0; 4])).max(1);
+        let occluded =
+            (0..width).any(|offset| cell_occluded(col.saturating_add(offset), y, occluders));
+        if occluded {
+            flush_border_text_run(ops, &mut run, run_x, y, style);
+            col = col.saturating_add(width);
+            run_x = col;
+        } else {
+            if run.is_empty() {
+                run_x = col;
+            }
+            run.push(ch);
+            col = col.saturating_add(width);
+        }
+    }
+    flush_border_text_run(ops, &mut run, run_x, y, style);
+}
+
+fn push_fill_rect_render_ops(
+    ops: &mut Vec<RenderOp>,
+    rect: ExtensionRect,
+    ch: char,
+    style: RenderStyle,
+    occluders: &[ExtensionRect],
+) {
+    for row in rect.y..rect.bottom() {
+        let mut run = String::new();
+        let mut run_x = rect.x;
+        for col in rect.x..rect.right() {
+            if cell_occluded(col, row, occluders) {
+                flush_border_text_run(ops, &mut run, run_x, row, style);
+                run_x = col.saturating_add(1);
+            } else {
+                if run.is_empty() {
+                    run_x = col;
+                }
+                run.push(ch);
+            }
+        }
+        flush_border_text_run(ops, &mut run, run_x, row, style);
+    }
+}
+
+fn push_clipped_render_ops(
+    ops: &mut Vec<RenderOp>,
+    source_ops: Vec<RenderOp>,
+    occluders: &[ExtensionRect],
+) {
+    if occluders.is_empty() {
+        ops.extend(source_ops);
+        return;
+    }
+    for op in source_ops {
+        match op {
+            RenderOp::TextRun { x, y, text, style } => {
+                push_text_run_render_ops(ops, x, y, &text, style, occluders);
+            }
+            RenderOp::FillRect { rect, ch, style } => {
+                push_fill_rect_render_ops(ops, rect, ch, style, occluders);
+            }
+            RenderOp::ClearRect { rect, style } => {
+                push_fill_rect_render_ops(ops, rect, ' ', style, occluders);
+            }
+            RenderOp::EraseRowSegment { x, y, width, style } => {
+                push_fill_rect_render_ops(
+                    ops,
+                    ExtensionRect::new(x, y, width, 1),
+                    ' ',
+                    style,
+                    occluders,
+                );
+            }
+            RenderOp::CellGrid { x, y, mut rows } => {
+                clip_cell_grid_rows_to_occluders(&mut rows, x, y, occluders);
+                ops.push(RenderOp::CellGrid { x, y, rows });
+            }
+            RenderOp::StyledText { .. } | RenderOp::Border { .. } => ops.push(op),
+        }
+    }
 }
 
 fn push_border_render_op(
@@ -1396,16 +1691,141 @@ fn push_border_render_op(
     rect: &SceneRect,
     glyphs: &SceneBorderGlyphs,
     style: &SceneStyle,
+    occluders: &[ExtensionRect],
 ) -> Option<()> {
     if rect.w < 2 || rect.h < 2 || matches!(glyphs, SceneBorderGlyphs::None) {
         return Some(());
     }
-    ops.push(RenderOp::Border {
-        rect: extension_rect_from_scene(rect),
-        glyphs: render_border_glyphs(glyphs)?,
-        style: render_style_from_scene(style),
-    });
+    let rect = extension_rect_from_scene(rect);
+    let glyphs = render_border_glyphs(glyphs)?;
+    let style = render_style_from_scene(style);
+    if occluders.is_empty() {
+        ops.push(RenderOp::Border {
+            rect,
+            glyphs,
+            style,
+        });
+        return Some(());
+    }
+    push_occluded_border_render_ops(ops, rect, glyphs, style, occluders);
     Some(())
+}
+
+fn push_occluded_border_render_ops(
+    ops: &mut Vec<RenderOp>,
+    rect: ExtensionRect,
+    glyphs: RenderBorderGlyphs,
+    style: RenderStyle,
+    occluders: &[ExtensionRect],
+) {
+    push_occluded_border_row(
+        ops,
+        rect.x,
+        rect.y,
+        rect.w,
+        glyphs.top_left,
+        glyphs.horizontal,
+        glyphs.top_right,
+        style,
+        occluders,
+    );
+    push_occluded_border_row(
+        ops,
+        rect.x,
+        rect.y.saturating_add(rect.h.saturating_sub(1)),
+        rect.w,
+        glyphs.bottom_left,
+        glyphs.horizontal,
+        glyphs.bottom_right,
+        style,
+        occluders,
+    );
+    if rect.h <= 2 {
+        return;
+    }
+    for row in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
+        push_border_cell_if_visible(ops, rect.x, row, glyphs.vertical, style, occluders);
+        push_border_cell_if_visible(
+            ops,
+            rect.x.saturating_add(rect.w.saturating_sub(1)),
+            row,
+            glyphs.vertical,
+            style,
+            occluders,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Border row lowering keeps glyph roles explicit.
+fn push_occluded_border_row(
+    ops: &mut Vec<RenderOp>,
+    x: u16,
+    y: u16,
+    width: u16,
+    left: char,
+    horizontal: char,
+    right: char,
+    style: RenderStyle,
+    occluders: &[ExtensionRect],
+) {
+    let mut run = String::new();
+    let mut run_x = x;
+    for offset in 0..width {
+        let col = x.saturating_add(offset);
+        let ch = if offset == 0 {
+            left
+        } else if offset == width.saturating_sub(1) {
+            right
+        } else {
+            horizontal
+        };
+        if cell_occluded(col, y, occluders) {
+            flush_border_text_run(ops, &mut run, run_x, y, style);
+            run_x = col.saturating_add(1);
+        } else {
+            if run.is_empty() {
+                run_x = col;
+            }
+            run.push(ch);
+        }
+    }
+    flush_border_text_run(ops, &mut run, run_x, y, style);
+}
+
+fn push_border_cell_if_visible(
+    ops: &mut Vec<RenderOp>,
+    x: u16,
+    y: u16,
+    ch: char,
+    style: RenderStyle,
+    occluders: &[ExtensionRect],
+) {
+    if !cell_occluded(x, y, occluders) {
+        ops.push(RenderOp::TextRun {
+            x,
+            y,
+            text: ch.to_string(),
+            style,
+        });
+    }
+}
+
+fn flush_border_text_run(
+    ops: &mut Vec<RenderOp>,
+    run: &mut String,
+    x: u16,
+    y: u16,
+    style: RenderStyle,
+) {
+    if run.is_empty() {
+        return;
+    }
+    ops.push(RenderOp::TextRun {
+        x,
+        y,
+        text: std::mem::take(run),
+        style,
+    });
 }
 
 const fn paint_command_z(command: &PaintCommand) -> i16 {
@@ -2052,6 +2472,58 @@ mod tests {
     }
 
     #[test]
+    fn partial_render_snapshot_preserves_full_surface_after_successful_emit() {
+        let surface_id = Uuid::from_u128(103);
+        let (extension, cache) = extension_with_surface(
+            surface_id,
+            vec![
+                PaintCommand::Text {
+                    col: 1,
+                    row: 1,
+                    z: 0,
+                    text: "dirty".to_string(),
+                    style: scene_style(),
+                },
+                PaintCommand::Text {
+                    col: 1,
+                    row: 3,
+                    z: 0,
+                    text: "later".to_string(),
+                    style: scene_style(),
+                },
+            ],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 10),
+                &RenderDamage::Regions(vec![ExtensionRect::new(1, 1, 5, 1)]),
+            )
+            .expect("partial render should use declarative ops");
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], RenderOp::TextRun { text, .. } if text == "dirty"));
+
+        let rendered = cache
+            .lock()
+            .expect("cache should lock")
+            .rendered_surface(&surface_id)
+            .expect("partial snapshot recorded")
+            .clone();
+        assert_eq!(rendered.paint_commands.len(), 2);
+        assert!(
+            matches!(&rendered.paint_commands[0], PaintCommand::Text { text, .. } if text == "dirty")
+        );
+        assert!(
+            matches!(&rendered.paint_commands[1], PaintCommand::Text { text, .. } if text == "later")
+        );
+
+        let followup_damage =
+            extension.surface_damage(surface_id, &ExtensionRect::new(0, 0, 20, 10));
+        assert_eq!(followup_damage, RenderDamage::None);
+    }
+
+    #[test]
     fn visual_adapter_dirty_only_uses_content_revision_and_suppresses_unchanged_payload() {
         install_test_visual_adapter();
         let (extension, cache) = extension_with_visual_request();
@@ -2387,6 +2859,353 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, RenderLayerItem::Graphic(_)))
         );
+    }
+
+    #[test]
+    fn lower_text_skips_cells_covered_by_higher_text() {
+        let ops = render_ops_for_paint_commands_with_capabilities(
+            &[
+                PaintCommand::Text {
+                    col: 3,
+                    row: 0,
+                    z: 5,
+                    text: "◆".to_string(),
+                    style: scene_style(),
+                },
+                PaintCommand::Text {
+                    col: 2,
+                    row: 0,
+                    z: 10,
+                    text: "HEADER".to_string(),
+                    style: scene_style(),
+                },
+            ],
+            SceneRenderCapabilities::default(),
+        )
+        .expect("text commands should lower to render ops");
+
+        assert!(ops.iter().any(|op| {
+            matches!(op, RenderOp::TextRun { x: 2, y: 0, text, .. } if text == "HEADER")
+        }));
+        assert!(!ops.iter().any(|op| {
+            matches!(op, RenderOp::TextRun { x: 3, y: 0, text, .. } if text == "◆")
+        }));
+    }
+
+    #[test]
+    fn text_border_fallback_skips_cells_covered_by_higher_text() {
+        let ops = render_ops_for_paint_commands_with_capabilities(
+            &[
+                PaintCommand::SemanticBorder {
+                    rect: SceneRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 5,
+                    },
+                    z: 0,
+                    style: scene_style(),
+                    fallback_glyphs: SceneBorderGlyphs::Rounded,
+                    thickness_px: 3,
+                    radius_px: 0,
+                    when: None,
+                },
+                PaintCommand::Text {
+                    col: 2,
+                    row: 0,
+                    z: 10,
+                    text: "HEADER".to_string(),
+                    style: scene_style(),
+                },
+            ],
+            SceneRenderCapabilities::default(),
+        )
+        .expect("semantic border should fall back to text ops");
+
+        assert!(ops.iter().any(|op| {
+            matches!(op, RenderOp::TextRun { x: 2, y: 0, text, .. } if text == "HEADER")
+        }));
+        assert!(!ops.iter().any(|op| match op {
+            RenderOp::Border { .. } => true,
+            RenderOp::TextRun { x, y: 0, text, .. } => {
+                let end = x.saturating_add(u16::try_from(text.chars().count()).unwrap_or(u16::MAX));
+                *x < 8 && end > 2 && text != "HEADER"
+            }
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn graphics_semantic_border_suppresses_static_text_border() {
+        let surface_id = Uuid::from_u128(107);
+        let mut decoration = surface(
+            surface_id,
+            vec![
+                PaintCommand::BoxBorder {
+                    rect: SceneRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 8,
+                    },
+                    z: 0,
+                    glyphs: SceneBorderGlyphs::SingleLine,
+                    style: scene_style(),
+                },
+                PaintCommand::Text {
+                    col: 2,
+                    row: 0,
+                    z: 10,
+                    text: "HEADER".to_string(),
+                    style: scene_style(),
+                },
+            ],
+        );
+        decoration.before_content_paint_commands = vec![PaintCommand::SemanticBorder {
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 8,
+            },
+            z: 10,
+            style: scene_style(),
+            fallback_glyphs: SceneBorderGlyphs::SingleLine,
+            thickness_px: 3,
+            radius_px: 0,
+            when: None,
+        }];
+        let cache = Arc::new(Mutex::new(DecorationRendererCache {
+            revision: 7,
+            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            rendered_surfaces: BTreeMap::new(),
+            scene_rx: None,
+            visual_last_at: BTreeMap::new(),
+            visual_last_revision: BTreeMap::new(),
+            visual_last_payload_hash: BTreeMap::new(),
+            visual_adapter_cache: BTreeMap::new(),
+            visual_stats: BTreeMap::new(),
+        }));
+        let extension = DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache,
+        };
+
+        let ops = extension
+            .render_layer_ops_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 8),
+                &RenderDamage::FullSurface,
+                RenderExtensionLayer::AfterPaneContent,
+                &kitty_alpha_context(),
+            )
+            .expect("after layer should render header ops");
+
+        assert!(
+            ops.iter()
+                .any(|op| { matches!(op, RenderOp::TextRun { text, .. } if text == "HEADER") })
+        );
+        assert!(ops.iter().all(|op| !matches!(op, RenderOp::Border { .. })));
+    }
+
+    #[test]
+    fn before_content_semantic_border_uses_graphics_items() {
+        let surface_id = Uuid::from_u128(106);
+        let mut decoration = surface(surface_id, Vec::new());
+        decoration.before_content_paint_commands = vec![PaintCommand::SemanticBorder {
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 8,
+            },
+            z: 10,
+            style: scene_style(),
+            fallback_glyphs: SceneBorderGlyphs::SingleLine,
+            thickness_px: 3,
+            radius_px: 0,
+            when: None,
+        }];
+        let cache = Arc::new(Mutex::new(DecorationRendererCache {
+            revision: 7,
+            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            rendered_surfaces: BTreeMap::new(),
+            scene_rx: None,
+            visual_last_at: BTreeMap::new(),
+            visual_last_revision: BTreeMap::new(),
+            visual_last_payload_hash: BTreeMap::new(),
+            visual_adapter_cache: BTreeMap::new(),
+            visual_stats: BTreeMap::new(),
+        }));
+        let extension = DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache,
+        };
+
+        let items = extension
+            .render_layer_items_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 8),
+                &RenderDamage::FullSurface,
+                RenderExtensionLayer::BeforePaneContent,
+                &kitty_alpha_context(),
+            )
+            .expect("before-content semantic border should use graphics items");
+
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, RenderLayerItem::Graphic(_)))
+        );
+    }
+
+    #[test]
+    fn semantic_border_graphics_use_under_text_placements_for_later_text_decorations() {
+        let surface_id = Uuid::from_u128(104);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![
+                PaintCommand::SemanticBorder {
+                    rect: SceneRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 5,
+                    },
+                    z: 0,
+                    style: scene_style(),
+                    fallback_glyphs: SceneBorderGlyphs::Rounded,
+                    thickness_px: 3,
+                    radius_px: 0,
+                    when: None,
+                },
+                PaintCommand::Text {
+                    col: 2,
+                    row: 0,
+                    z: 10,
+                    text: "HEADER".to_string(),
+                    style: scene_style(),
+                },
+            ],
+        );
+
+        let items = extension
+            .render_layer_items_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 5),
+                &RenderDamage::FullSurface,
+                RenderExtensionLayer::AfterPaneContent,
+                &kitty_alpha_context(),
+            )
+            .expect("semantic border should use graphics items");
+        let header_rect = ExtensionRect::new(2, 0, 6, 1);
+
+        assert!(items.iter().any(|item| {
+            matches!(item, RenderLayerItem::Op(RenderOp::TextRun { text, .. }) if text == "HEADER")
+        }));
+        assert!(items.iter().all(|item| match item {
+            RenderLayerItem::Graphic(graphic) => graphic.z_index == -1,
+            RenderLayerItem::Op(_) => true,
+        }));
+        assert!(items.iter().any(|item| match item {
+            RenderLayerItem::Graphic(graphic) => graphic.cell_rect.intersects(header_rect),
+            RenderLayerItem::Op(_) => false,
+        }));
+    }
+
+    #[test]
+    fn semantic_border_graphics_use_stable_under_text_placements_for_pong_edge_decorations() {
+        let surface_id = Uuid::from_u128(105);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![
+                PaintCommand::SemanticBorder {
+                    rect: SceneRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 8,
+                    },
+                    z: 0,
+                    style: scene_style(),
+                    fallback_glyphs: SceneBorderGlyphs::Rounded,
+                    thickness_px: 3,
+                    radius_px: 0,
+                    when: None,
+                },
+                PaintCommand::Text {
+                    col: 8,
+                    row: 0,
+                    z: 30,
+                    text: "1 : 0".to_string(),
+                    style: scene_style(),
+                },
+                PaintCommand::Text {
+                    col: 0,
+                    row: 2,
+                    z: 20,
+                    text: "▌".to_string(),
+                    style: scene_style(),
+                },
+                PaintCommand::Text {
+                    col: 19,
+                    row: 3,
+                    z: 20,
+                    text: "▐".to_string(),
+                    style: scene_style(),
+                },
+            ],
+        );
+
+        let items = extension
+            .render_layer_items_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 8),
+                &RenderDamage::FullSurface,
+                RenderExtensionLayer::AfterPaneContent,
+                &kitty_alpha_context(),
+            )
+            .expect("semantic border should use graphics items");
+        assert!(items.iter().any(|item| {
+            matches!(item, RenderLayerItem::Op(RenderOp::TextRun { text, .. }) if text == "1 : 0")
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(item, RenderLayerItem::Op(RenderOp::TextRun { text, .. }) if text == "▌")
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(item, RenderLayerItem::Op(RenderOp::TextRun { text, .. }) if text == "▐")
+        }));
+        let graphics = items
+            .iter()
+            .filter_map(|item| match item {
+                RenderLayerItem::Graphic(graphic) => {
+                    assert_eq!(graphic.z_index, -1);
+                    Some(graphic.cell_rect)
+                }
+                RenderLayerItem::Op(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            graphics,
+            vec![
+                ExtensionRect::new(0, 0, 20, 1),
+                ExtensionRect::new(0, 7, 20, 1),
+                ExtensionRect::new(0, 0, 1, 8),
+                ExtensionRect::new(19, 0, 1, 8),
+            ]
+        );
+    }
+
+    fn kitty_alpha_context() -> RenderExtensionContext {
+        RenderExtensionContext {
+            capabilities: TerminalRenderCapabilities {
+                kitty_graphics: true,
+                graphics_alpha: true,
+                cell_pixel_width: 8,
+                cell_pixel_height: 16,
+                ..TerminalRenderCapabilities::default()
+            },
+        }
     }
 
     #[test]

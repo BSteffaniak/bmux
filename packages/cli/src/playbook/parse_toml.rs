@@ -93,6 +93,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         env: raw.env.unwrap_or_default(),
         env_mode,
         binary: None,
+        sandbox_config_file: raw.sandbox_config_file.map(Into::into),
         bundled_plugin_ids: Vec::new(),
         verbose: false,
         render_trace: raw.render_trace.unwrap_or(false),
@@ -379,6 +380,7 @@ struct RawPlaybookConfig {
     vars: Option<BTreeMap<String, String>>,
     env: Option<BTreeMap<String, String>>,
     env_mode: Option<String>,
+    sandbox_config_file: Option<String>,
     include: Option<Vec<String>>,
 }
 

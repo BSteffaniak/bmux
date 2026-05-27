@@ -40,6 +40,10 @@ pub struct PlaybookConfig {
     /// Path to the bmux binary for spawning sandbox servers.
     /// `None` falls back to `std::env::current_exe()`.
     pub binary: Option<std::path::PathBuf>,
+    /// Optional bmux config file to copy into the sandbox config directory.
+    /// When set, sandbox startup preserves the copied config instead of
+    /// generating the deterministic default plugin-disable config.
+    pub sandbox_config_file: Option<std::path::PathBuf>,
     /// Pre-computed bundled plugin IDs for sandbox plugin configuration.
     /// Populated by the CLI runtime; empty when not available.
     pub bundled_plugin_ids: Vec<String>,
@@ -112,6 +116,7 @@ impl Default for PlaybookConfig {
             env: BTreeMap::new(),
             env_mode: None,
             binary: None,
+            sandbox_config_file: None,
             bundled_plugin_ids: Vec::new(),
             verbose: false,
             render_trace: false,

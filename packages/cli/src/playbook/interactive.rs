@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::engine::{drain_output_until_idle, execute_step, start_recording};
 use super::parse_dsl::parse_action_line;
-use super::sandbox::SandboxServer;
+use super::sandbox::{SandboxServer, SandboxStartOptions};
 use super::screen::{ScreenDeltaEvent, ScreenDeltaFormat, ScreenInspector};
 use super::types::{PaneCapture, SnapshotCapture, Step};
 
@@ -691,15 +691,17 @@ pub async fn run_interactive(
         _ => super::types::SandboxEnvMode::Inherit,
     };
 
-    let sandbox = SandboxServer::start(
+    let env = std::collections::BTreeMap::new();
+    let sandbox = SandboxServer::start(SandboxStartOptions {
         shell,
-        &plugins,
-        SERVER_STARTUP_TIMEOUT,
-        &std::collections::BTreeMap::new(),
+        plugin_config: &plugins,
+        startup_timeout: SERVER_STARTUP_TIMEOUT,
+        env: &env,
         env_mode,
-        None,
-        &[],
-    )
+        binary: None,
+        sandbox_config_file: None,
+        bundled_plugin_ids: &[],
+    })
     .await
     .context("failed starting sandbox server")?;
 

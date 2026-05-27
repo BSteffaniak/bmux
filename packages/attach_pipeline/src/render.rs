@@ -96,6 +96,31 @@ fn extension_render_damage_for_frame(
     frame_damage: &FrameDamage,
     policy: DamageCoalescingPolicy,
 ) -> RenderDamage {
+    let own_damage = extension_own_render_damage_for_frame(
+        ext,
+        surface_id,
+        surface_rect,
+        layer,
+        frame_damage,
+        policy,
+    );
+    if !own_damage.is_none() {
+        return own_damage;
+    }
+    if frame_damage.content_surface_damaged(pane_id) && ext.redraws_on_content_damage(layer) {
+        return RenderDamage::FullSurface;
+    }
+    RenderDamage::None
+}
+
+fn extension_own_render_damage_for_frame(
+    ext: &dyn AttachRenderExtension,
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    layer: RenderExtensionLayer,
+    frame_damage: &FrameDamage,
+    policy: DamageCoalescingPolicy,
+) -> RenderDamage {
     let extension_rect_damage = frame_damage.extension_surface_rects(surface_id);
     if frame_damage.is_full_frame() || frame_damage.extension_surfaces.contains(&surface_id) {
         return RenderDamage::FullSurface;
@@ -106,9 +131,6 @@ fn extension_render_damage_for_frame(
             surface_rect,
             policy,
         );
-    }
-    if frame_damage.content_surface_damaged(pane_id) && ext.redraws_on_content_damage(layer) {
-        return RenderDamage::FullSurface;
     }
     coalesce_render_damage(
         ext.surface_layer_damage(surface_id, &surface_rect, layer),
@@ -310,13 +332,17 @@ fn queue_render_items_for_frame<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     mut render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
-    let mut wrote = false;
-    active_graphics.extend(active_terminal_graphic_keys(
+    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
+    let mut wrote = cleanup_stale_terminal_graphics_for_surface(
+        stdout,
         pane_id,
         surface_id,
-        items,
+        &current_graphics,
+        graphics_cache,
         capabilities,
-    ));
+        render_stats.as_deref_mut(),
+    )?;
+    active_graphics.extend(current_graphics);
     let mut pending_ops = Vec::new();
     for item in items {
         match item {
@@ -926,18 +952,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
         .is_some_and(|entry| entry.source != source || entry.host_image_id != host_image_id);
     let previous_placement = previous.as_ref().and_then(|entry| entry.placement);
     let placement_changed = previous_placement.is_some_and(|old| old != placement);
-    let needs_replace = previous.is_some() && (placement_changed || source_changed);
-    if needs_replace {
-        stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_delete_image(
-            host_image_id,
-        ))?;
-        stdout.write_all(b"\x1b\\")?;
-        if let Some(stats) = render_stats.as_mut() {
-            stats.terminal_graphic_deletes = stats.terminal_graphic_deletes.saturating_add(1);
-        }
-    }
-    let needs_transmit = previous.is_none() || needs_replace;
+    let needs_transmit = previous.is_none() || source_changed;
     if needs_transmit {
         let pixels = terminal_graphic_pixels(graphic);
         stdout.write_all(b"\x1b_")?;
@@ -955,7 +970,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
                 pane_id,
                 surface_id,
                 source,
-                placement: None,
+                placement: previous_placement,
                 host_image_id,
             },
         );
@@ -966,10 +981,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
                 .saturating_add(u64::try_from(pixels.len()).unwrap_or(u64::MAX));
         }
     }
-    let needs_place = needs_transmit
-        || previous
-            .as_ref()
-            .is_none_or(|entry| entry.placement != Some(placement));
+    let needs_place = previous_placement != Some(placement);
     if needs_place {
         queue!(stdout, MoveTo(graphic.cell_rect.x, graphic.cell_rect.y))
             .context("failed moving cursor for kitty graphic placement")?;
@@ -989,7 +1001,37 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
             stats.terminal_graphic_places = stats.terminal_graphic_places.saturating_add(1);
         }
     }
-    Ok(placement_changed || needs_transmit || needs_place)
+    Ok(source_changed || placement_changed || needs_transmit || needs_place)
+}
+
+fn cleanup_stale_terminal_graphics_for_surface<W: io::Write>(
+    stdout: &mut W,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    current_graphics: &BTreeSet<u64>,
+    graphics_cache: &mut TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+    render_stats: Option<&mut AttachSceneRenderStats>,
+) -> Result<bool> {
+    let stale = graphics_cache
+        .iter()
+        .filter_map(|(key, entry)| {
+            (entry.pane_id == pane_id
+                && entry.surface_id == surface_id
+                && !current_graphics.contains(key))
+            .then_some((*key, entry.host_image_id))
+        })
+        .collect::<Vec<_>>();
+    if stale.is_empty() {
+        return Ok(false);
+    }
+    cleanup_stale_terminal_graphics_by_key(
+        stdout,
+        &stale,
+        graphics_cache,
+        capabilities,
+        render_stats,
+    )
 }
 
 fn cleanup_stale_terminal_graphics<W: io::Write>(
@@ -1049,6 +1091,17 @@ fn cleanup_stale_kitty_graphics<W: io::Write>(
     let mut wrote = false;
     for (key, host_image_id) in stale {
         graphics_cache.remove(key);
+        stdout.write_all(b"\x1b_")?;
+        stdout.write_all(&bmux_image::codec::kitty::encode_delete_placement(
+            *host_image_id,
+            *host_image_id,
+        ))?;
+        stdout.write_all(b"\x1b\\")?;
+        // Some Kitty-compatible hosts (notably Ghostty in real attach) keep
+        // negative-z placements visible after a placement-scoped delete. Once
+        // a BMUX terminal graphic is stale there are no active placements left
+        // for its host image id, so deleting the image source is safe here and
+        // makes tab/window switches remove semantic-border graphics reliably.
         stdout.write_all(b"\x1b_")?;
         stdout.write_all(&bmux_image::codec::kitty::encode_delete_image(
             *host_image_id,
@@ -3029,18 +3082,94 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
     Ok((cursor_state, stats))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn before_content_cells_for_surface(
+type BeforeContentCells = BTreeMap<(u16, u16), RenderUnderCell>;
+type BeforeContentRender = (BeforeContentCells, Vec<DamageRect>);
+
+fn render_damage_rects(damage: &RenderDamage, surface_rect: ExtensionRect) -> Vec<ExtensionRect> {
+    match damage {
+        RenderDamage::None => Vec::new(),
+        RenderDamage::FullSurface => vec![surface_rect],
+        RenderDamage::Regions(regions) => regions.clone(),
+    }
+}
+
+fn render_damage_content_rects(damage: &RenderDamage, content: PaneRect) -> Vec<DamageRect> {
+    let content_rect = ExtensionRect::new(content.x, content.y, content.w, content.h);
+    render_damage_rects(damage, content_rect)
+        .into_iter()
+        .filter_map(|rect| {
+            let x1 = rect.x.max(content.x);
+            let y1 = rect.y.max(content.y);
+            let x2 = rect.right().min(content.x.saturating_add(content.w));
+            let y2 = rect.bottom().min(content.y.saturating_add(content.h));
+            (x1 < x2 && y1 < y2).then_some(DamageRect::new(
+                x1.saturating_sub(content.x),
+                y1.saturating_sub(content.y),
+                x2.saturating_sub(x1),
+                y2.saturating_sub(y1),
+            ))
+        })
+        .collect()
+}
+
+fn queue_after_content_cleanup_for_damage<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+) -> Result<bool> {
+    if damage.is_none() {
+        return Ok(false);
+    }
+    let clear_ops = render_damage_rects(damage, surface_rect)
+        .into_iter()
+        .map(|rect| RenderOp::ClearRect {
+            rect,
+            style: RenderStyle::default(),
+        })
+        .collect::<Vec<_>>();
+    queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &clear_ops)
+}
+
+fn after_content_own_damage_for_surface(
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    frame_damage: &FrameDamage,
+    policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+) -> RenderDamage {
+    let mut rects = Vec::new();
+    for ext in render_extensions {
+        match extension_own_render_damage_for_frame(
+            ext.as_ref(),
+            surface_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            frame_damage,
+            policy,
+        ) {
+            RenderDamage::None => {}
+            RenderDamage::FullSurface => return RenderDamage::FullSurface,
+            RenderDamage::Regions(regions) => rects.extend(regions),
+        }
+    }
+    coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
+}
+
+#[allow(clippy::too_many_arguments)] // Mirrors the after-content render path state.
+fn before_content_cells_for_surface<W: io::Write>(
+    stdout: &mut W,
     surface: &bmux_attach_layout_protocol::AttachSurface,
     pane_id: Uuid,
     rect: PaneRect,
     content: PaneRect,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    active_terminal_graphics: &mut BTreeSet<u64>,
     frame_damage: &FrameDamage,
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
     render_context: &RenderExtensionContext,
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
-) -> (BTreeMap<(u16, u16), RenderUnderCell>, Vec<DamageRect>) {
+) -> Result<BeforeContentRender> {
     let ext_rect = bmux_plugin::ExtensionRect {
         x: rect.x,
         y: rect.y,
@@ -3085,21 +3214,33 @@ fn before_content_cells_for_surface(
             }
             RenderDamage::None => {}
         }
-        if let Some(layer_cells) = ext.render_before_content_cells_with_context(
+        if let Some(items) = ext.render_layer_items_with_context(
+            surface.id,
+            &ext_rect,
+            &damage,
+            RenderExtensionLayer::BeforePaneContent,
+            render_context,
+        ) {
+            let ops = queue_before_content_render_items(
+                stdout,
+                pane_id,
+                surface.id,
+                ext_rect,
+                &damage,
+                &items,
+                terminal_graphics_cache,
+                active_terminal_graphics,
+                render_context.capabilities,
+                render_stats.as_deref_mut(),
+            )?;
+            insert_before_content_cells(&mut cells, content, render_ops_to_cells(&ops));
+        } else if let Some(layer_cells) = ext.render_before_content_cells_with_context(
             surface.id,
             &ext_rect,
             &damage,
             render_context,
         ) {
-            for (col, row, cell) in layer_cells {
-                if col >= content.x
-                    && col < content.x.saturating_add(content.w)
-                    && row >= content.y
-                    && row < content.y.saturating_add(content.h)
-                {
-                    cells.insert((col.saturating_sub(content.x), row), cell);
-                }
-            }
+            insert_before_content_layer_cells(&mut cells, content, layer_cells);
         } else if let Some(ops) = ext.render_layer_ops_with_context(
             surface.id,
             &ext_rect,
@@ -3107,18 +3248,102 @@ fn before_content_cells_for_surface(
             RenderExtensionLayer::BeforePaneContent,
             render_context,
         ) {
-            for ((col, row), cell) in render_ops_to_cells(&ops) {
-                if col >= content.x
-                    && col < content.x.saturating_add(content.w)
-                    && row >= content.y
-                    && row < content.y.saturating_add(content.h)
-                {
-                    cells.insert((col.saturating_sub(content.x), row), cell);
+            insert_before_content_cells(&mut cells, content, render_ops_to_cells(&ops));
+        }
+    }
+    Ok((cells, damage_rects))
+}
+
+fn insert_before_content_cells(
+    cells: &mut BTreeMap<(u16, u16), RenderUnderCell>,
+    content: PaneRect,
+    layer_cells: BTreeMap<(u16, u16), RenderUnderCell>,
+) {
+    for ((col, row), cell) in layer_cells {
+        insert_before_content_cell(cells, content, col, row, cell);
+    }
+}
+
+fn insert_before_content_layer_cells(
+    cells: &mut BTreeMap<(u16, u16), RenderUnderCell>,
+    content: PaneRect,
+    layer_cells: Vec<(u16, u16, RenderUnderCell)>,
+) {
+    for (col, row, cell) in layer_cells {
+        insert_before_content_cell(cells, content, col, row, cell);
+    }
+}
+
+fn insert_before_content_cell(
+    cells: &mut BTreeMap<(u16, u16), RenderUnderCell>,
+    content: PaneRect,
+    col: u16,
+    row: u16,
+    cell: RenderUnderCell,
+) {
+    if col >= content.x
+        && col < content.x.saturating_add(content.w)
+        && row >= content.y
+        && row < content.y.saturating_add(content.h)
+    {
+        cells.insert((col.saturating_sub(content.x), row), cell);
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Terminal graphic reconciliation needs frame-local cache state.
+fn queue_before_content_render_items<W: io::Write>(
+    stdout: &mut W,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    items: &[RenderLayerItem],
+    graphics_cache: &mut TerminalGraphicsCache,
+    active_graphics: &mut BTreeSet<u64>,
+    capabilities: TerminalRenderCapabilities,
+    mut render_stats: Option<&mut AttachSceneRenderStats>,
+) -> Result<Vec<RenderOp>> {
+    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
+    cleanup_stale_terminal_graphics_for_surface(
+        stdout,
+        pane_id,
+        surface_id,
+        &current_graphics,
+        graphics_cache,
+        capabilities,
+        render_stats.as_deref_mut(),
+    )?;
+    active_graphics.extend(current_graphics);
+
+    let mut ops = Vec::new();
+    for item in items {
+        match item {
+            RenderLayerItem::Op(op) => ops.push(op.clone()),
+            RenderLayerItem::Graphic(graphic) => {
+                let instance_key = terminal_graphic_instance_key(pane_id, surface_id, graphic.key);
+                if terminal_graphic_needs_reconcile(
+                    graphic,
+                    instance_key,
+                    surface_rect,
+                    damage,
+                    graphics_cache,
+                    capabilities,
+                ) {
+                    queue_terminal_graphic_overlay(
+                        stdout,
+                        pane_id,
+                        surface_id,
+                        instance_key,
+                        graphic,
+                        graphics_cache,
+                        capabilities,
+                        render_stats.as_deref_mut(),
+                    )?;
                 }
             }
         }
     }
-    (cells, damage_rects)
+    Ok(ops)
 }
 
 fn retain_cached_terminal_graphics_for_visible_surfaces(
@@ -3150,19 +3375,6 @@ fn retain_cached_terminal_graphics_for_visible_surfaces(
             .contains(&(entry.pane_id, entry.surface_id))
             .then_some(*key)
     }));
-}
-
-fn discard_active_terminal_graphics_for_surface(
-    pane_id: Uuid,
-    surface_id: Uuid,
-    graphics_cache: &TerminalGraphicsCache,
-    active_terminal_graphics: &mut BTreeSet<u64>,
-) {
-    for key in graphics_cache.iter().filter_map(|(key, entry)| {
-        (entry.pane_id == pane_id && entry.surface_id == surface_id).then_some(*key)
-    }) {
-        active_terminal_graphics.remove(&key);
-    }
 }
 
 #[allow(
@@ -3213,6 +3425,13 @@ fn render_attach_scene_inner<W: io::Write>(
         render_context.capabilities,
         &mut active_terminal_graphics,
     );
+    cleanup_stale_terminal_graphics(
+        stdout,
+        &active_terminal_graphics,
+        terminal_graphics_cache,
+        render_context.capabilities,
+        render_stats.as_deref_mut(),
+    )?;
 
     let mut cursor_state = None;
     if frame_damage.is_full_frame() {
@@ -3289,21 +3508,36 @@ fn render_attach_scene_inner<W: io::Write>(
             continue;
         }
         let before_content = before_content_cells_for_surface(
+            stdout,
             surface,
             pane_id,
             rect,
             content,
+            terminal_graphics_cache,
+            &mut active_terminal_graphics,
             frame_damage,
             damage_policy,
             render_extensions,
             render_context,
             &mut render_stats,
-        );
+        )?;
         let before_content_cells = before_content.0;
         let before_content_damage = before_content.1;
         let before_content_damaged = !before_content_damage.is_empty();
-        let should_draw_content =
-            frame_damage.content_surface_damaged(pane_id) || before_content_damaged;
+        let ext_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
+        let after_content_cleanup_damage = after_content_own_damage_for_surface(
+            surface.id,
+            ext_rect,
+            frame_damage,
+            damage_policy,
+            render_extensions,
+        );
+        let after_content_cleanup_content_damage =
+            render_damage_content_rects(&after_content_cleanup_damage, content);
+        let after_content_cleanup_damaged = !after_content_cleanup_damage.is_none();
+        let should_draw_content = frame_damage.content_surface_damaged(pane_id)
+            || before_content_damaged
+            || !after_content_cleanup_content_damage.is_empty();
         let should_draw_extensions = frame_damage.extension_surface_damaged(surface.id, pane_id);
         if let Some(stats) = render_stats.as_deref_mut() {
             stats.visible_pane_surfaces = stats.visible_pane_surfaces.saturating_add(1);
@@ -3337,8 +3571,298 @@ fn render_attach_scene_inner<W: io::Write>(
         {
             continue;
         }
+        if after_content_cleanup_damaged {
+            queue_after_content_cleanup_for_damage(stdout, ext_rect, &after_content_cleanup_damage)
+                .context("failed clearing stale after-content decoration cells")?;
+        }
+        let inner_width = content.w;
+        let inner_height = content.h;
+        let inner_w = usize::from(inner_width);
+        let inner_h = usize::from(inner_height);
+        if let Some(entry) = pane_buffers.get_mut(&pane_id) {
+            let previous_grid_size = (
+                entry.terminal_grid.grid().width(),
+                entry.terminal_grid.grid().height(),
+            );
+            let _ = entry
+                .terminal_grid
+                .resize(inner_width.max(1), inner_height.max(1));
+            // Invalidate the row cache when the pane dimensions change, since
+            // the row strings are no longer comparable at a different size.
+            let next_grid_size = (
+                entry.terminal_grid.grid().width(),
+                entry.terminal_grid.grid().height(),
+            );
+            if next_grid_size != previous_grid_size {
+                entry.prev_rows.clear();
+                entry.scrollback_window = None;
+            }
+            let use_scrollback = scrollback_active && focus;
+            let grid_rows = if use_scrollback {
+                entry
+                    .scrollback_window
+                    .as_ref()
+                    .filter(|window| window.scrollback_offset == scrollback_offset)
+                    .map_or_else(
+                        || vec![PhysicalRow::new(); inner_h],
+                        |window| window.rows.clone(),
+                    )
+            } else {
+                entry.terminal_grid.grid().display_rows(0, inner_h)
+            };
+            let selection = if use_scrollback {
+                selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
+            } else {
+                None
+            };
+            if focus {
+                let (cursor_row, cursor_col) = if use_scrollback {
+                    let cursor =
+                        scrollback_cursor.unwrap_or(AttachScrollbackCursor { row: 0, col: 0 });
+                    (
+                        cursor.row.min(inner_h.saturating_sub(1)) as u16,
+                        cursor.col.min(inner_w.saturating_sub(1)) as u16,
+                    )
+                } else {
+                    let cursor = entry.terminal_grid.grid().cursor();
+                    (
+                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                    )
+                };
+                let cursor_visible = if use_scrollback {
+                    true
+                } else {
+                    entry.terminal_grid.grid().cursor().visible
+                };
+                cursor_state = Some(AttachCursorState {
+                    x: content.x.saturating_add(cursor_col),
+                    y: content.y.saturating_add(cursor_row),
+                    visible: cursor_visible,
+                });
+                if let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::Cursor {
+                        surface_index,
+                        visible: cursor_visible,
+                    });
+                }
+            }
+            if !should_draw_content || sync_deferred {
+                if sync_deferred && let Some(stats) = render_stats.as_deref_mut() {
+                    stats.pane_rows_sync_deferred = stats
+                        .pane_rows_sync_deferred
+                        .saturating_add(u64::try_from(inner_h).unwrap_or(u64::MAX));
+                }
+                if sync_deferred && let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::PaneRowsSyncDeferred {
+                        surface_index,
+                        rows: u16::try_from(inner_h).unwrap_or(u16::MAX),
+                    });
+                }
+            } else {
+                let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
+                let mut effective_content_damage = damaged_content_rows.to_vec();
+                effective_content_damage.extend(before_content_damage.iter().copied());
+                effective_content_damage
+                    .extend(after_content_cleanup_content_damage.iter().copied());
+                for row in 0..inner_h {
+                    if let Some(stats) = render_stats.as_deref_mut() {
+                        stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
+                    }
+                    let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
+                    let y = content.y.saturating_add(row_u16);
+                    let before_cells = before_content_row_cells(&before_content_cells, y);
+                    let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
+                        damaged_grid_row_ranges(
+                            grid_row,
+                            row_u16,
+                            inner_width,
+                            &effective_content_damage,
+                        )
+                    });
+                    let force_row_damage = !damaged_ranges.is_empty();
+                    let line = grid_rows.get(row).map_or_else(
+                        || {
+                            let blank_row = PhysicalRow::new();
+                            render_grid_row_segment(
+                                GridRowRenderContext {
+                                    row: &blank_row,
+                                    selection,
+                                    absolute_row: if use_scrollback {
+                                        scrollback_offset.saturating_add(row)
+                                    } else {
+                                        row
+                                    },
+                                    runtime_appearance,
+                                    palette: entry.terminal_grid.grid().palette(),
+                                    before_content_cells: &before_cells,
+                                },
+                                0,
+                                inner_width,
+                            )
+                        },
+                        |grid_row| {
+                            render_grid_row_segment(
+                                GridRowRenderContext {
+                                    row: grid_row,
+                                    selection,
+                                    absolute_row: if use_scrollback {
+                                        scrollback_offset.saturating_add(row)
+                                    } else {
+                                        row
+                                    },
+                                    runtime_appearance,
+                                    palette: entry.terminal_grid.grid().palette(),
+                                    before_content_cells: &before_cells,
+                                },
+                                0,
+                                inner_width,
+                            )
+                        },
+                    );
+
+                    // Row-level diff: skip emitting if the rendered string
+                    // matches the previous frame's cached version for this row.
+                    let cached = entry.prev_rows.get(row);
+                    if cached.is_none_or(|c| *c != line) {
+                        queue!(stdout, MoveTo(content.x, y), Print(&line))
+                            .context("failed drawing pane content")?;
+                        if let Some(stats) = render_stats.as_deref_mut() {
+                            stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
+                            stats.pane_cells_emitted = stats
+                                .pane_cells_emitted
+                                .saturating_add(u64::from(inner_width));
+                        }
+                        if let Some(trace) = render_trace.as_deref_mut() {
+                            trace.push(AttachRenderTraceOp::PaneRowFull {
+                                surface_index,
+                                row: row_u16,
+                                cells: inner_width,
+                            });
+                        }
+                    } else if force_row_damage {
+                        for (start_col, end_col) in damaged_ranges {
+                            let segment = grid_rows.get(row).map_or_else(
+                                || {
+                                    let blank_row = PhysicalRow::new();
+                                    render_grid_row_segment(
+                                        GridRowRenderContext {
+                                            row: &blank_row,
+                                            selection,
+                                            absolute_row: if use_scrollback {
+                                                scrollback_offset.saturating_add(row)
+                                            } else {
+                                                row
+                                            },
+                                            runtime_appearance,
+                                            palette: entry.terminal_grid.grid().palette(),
+                                            before_content_cells: &before_cells,
+                                        },
+                                        start_col,
+                                        end_col,
+                                    )
+                                },
+                                |grid_row| {
+                                    render_grid_row_segment(
+                                        GridRowRenderContext {
+                                            row: grid_row,
+                                            selection,
+                                            absolute_row: if use_scrollback {
+                                                scrollback_offset.saturating_add(row)
+                                            } else {
+                                                row
+                                            },
+                                            runtime_appearance,
+                                            palette: entry.terminal_grid.grid().palette(),
+                                            before_content_cells: &before_cells,
+                                        },
+                                        start_col,
+                                        end_col,
+                                    )
+                                },
+                            );
+                            queue!(
+                                stdout,
+                                MoveTo(content.x.saturating_add(start_col), y),
+                                Print(segment)
+                            )
+                            .context("failed drawing damaged pane content segment")?;
+                            if let Some(stats) = render_stats.as_deref_mut() {
+                                stats.pane_row_segments_emitted =
+                                    stats.pane_row_segments_emitted.saturating_add(1);
+                                stats.pane_cells_emitted = stats
+                                    .pane_cells_emitted
+                                    .saturating_add(u64::from(end_col.saturating_sub(start_col)));
+                            }
+                            if let Some(trace) = render_trace.as_deref_mut() {
+                                trace.push(AttachRenderTraceOp::PaneRowSegment {
+                                    surface_index,
+                                    row: row_u16,
+                                    start_col,
+                                    cells: end_col.saturating_sub(start_col),
+                                });
+                            }
+                        }
+                    } else {
+                        if let Some(stats) = render_stats.as_deref_mut() {
+                            stats.pane_rows_cached_skipped =
+                                stats.pane_rows_cached_skipped.saturating_add(1);
+                        }
+                        if let Some(trace) = render_trace.as_deref_mut() {
+                            trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
+                                surface_index,
+                                row: row_u16,
+                            });
+                        }
+                    }
+                    if row < entry.prev_rows.len() {
+                        entry.prev_rows[row] = line;
+                    } else {
+                        entry.prev_rows.push(line);
+                    }
+                }
+                // Trim stale cache entries if the visible row count shrank.
+                entry.prev_rows.truncate(inner_h);
+            }
+        } else if should_draw_content || !before_content_damage.is_empty() {
+            let palette = bmux_terminal_grid::StylePalette::default();
+            for row in 0..inner_h {
+                let y = content.y.saturating_add(row as u16);
+                let before_cells = before_content_row_cells(&before_content_cells, y);
+                let blank_row = PhysicalRow::new();
+                let line = render_grid_row_segment(
+                    GridRowRenderContext {
+                        row: &blank_row,
+                        selection: None,
+                        absolute_row: row,
+                        runtime_appearance,
+                        palette: &palette,
+                        before_content_cells: &before_cells,
+                    },
+                    0,
+                    inner_width,
+                );
+                queue!(stdout, MoveTo(content.x, y), Print(line))
+                    .context("failed clearing pane content")?;
+                if let Some(stats) = render_stats.as_deref_mut() {
+                    stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
+                    stats.pane_cells_emitted = stats
+                        .pane_cells_emitted
+                        .saturating_add(u64::from(inner_width));
+                }
+                if let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::PaneRowFull {
+                        surface_index,
+                        row: u16::try_from(row).unwrap_or(u16::MAX),
+                        cells: inner_width,
+                    });
+                }
+            }
+        }
+
         if should_draw_extensions {
-            let mut discarded_terminal_graphics = false;
             // Consult every registered render extension for this
             // surface. Extensions report generic surface damage;
             // unknown damage safely falls back to full-surface
@@ -3361,15 +3885,6 @@ fn render_attach_scene_inner<W: io::Write>(
                 );
                 if damage.is_none() {
                     continue;
-                }
-                if !discarded_terminal_graphics {
-                    discard_active_terminal_graphics_for_surface(
-                        pane_id,
-                        surface.id,
-                        terminal_graphics_cache,
-                        &mut active_terminal_graphics,
-                    );
-                    discarded_terminal_graphics = true;
                 }
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.record_extension_render_call(ext.name(), &damage);
@@ -3530,291 +4045,6 @@ fn render_attach_scene_inner<W: io::Write>(
                 }
             }
         }
-
-        let inner_width = content.w;
-        let inner_height = content.h;
-        let inner_w = usize::from(inner_width);
-        let inner_h = usize::from(inner_height);
-        if let Some(entry) = pane_buffers.get_mut(&pane_id) {
-            let previous_grid_size = (
-                entry.terminal_grid.grid().width(),
-                entry.terminal_grid.grid().height(),
-            );
-            let _ = entry
-                .terminal_grid
-                .resize(inner_width.max(1), inner_height.max(1));
-            // Invalidate the row cache when the pane dimensions change, since
-            // the row strings are no longer comparable at a different size.
-            let next_grid_size = (
-                entry.terminal_grid.grid().width(),
-                entry.terminal_grid.grid().height(),
-            );
-            if next_grid_size != previous_grid_size {
-                entry.prev_rows.clear();
-                entry.scrollback_window = None;
-            }
-            let use_scrollback = scrollback_active && focus;
-            let grid_rows = if use_scrollback {
-                entry
-                    .scrollback_window
-                    .as_ref()
-                    .filter(|window| window.scrollback_offset == scrollback_offset)
-                    .map_or_else(
-                        || vec![PhysicalRow::new(); inner_h],
-                        |window| window.rows.clone(),
-                    )
-            } else {
-                entry.terminal_grid.grid().display_rows(0, inner_h)
-            };
-            let selection = if use_scrollback {
-                selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
-            } else {
-                None
-            };
-            if focus {
-                let (cursor_row, cursor_col) = if use_scrollback {
-                    let cursor =
-                        scrollback_cursor.unwrap_or(AttachScrollbackCursor { row: 0, col: 0 });
-                    (
-                        cursor.row.min(inner_h.saturating_sub(1)) as u16,
-                        cursor.col.min(inner_w.saturating_sub(1)) as u16,
-                    )
-                } else {
-                    let cursor = entry.terminal_grid.grid().cursor();
-                    (
-                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
-                            .unwrap_or(u16::MAX),
-                    )
-                };
-                let cursor_visible = if use_scrollback {
-                    true
-                } else {
-                    entry.terminal_grid.grid().cursor().visible
-                };
-                cursor_state = Some(AttachCursorState {
-                    x: content.x.saturating_add(cursor_col),
-                    y: content.y.saturating_add(cursor_row),
-                    visible: cursor_visible,
-                });
-                if let Some(trace) = render_trace.as_deref_mut() {
-                    trace.push(AttachRenderTraceOp::Cursor {
-                        surface_index,
-                        visible: cursor_visible,
-                    });
-                }
-            }
-            if !should_draw_content || sync_deferred {
-                if sync_deferred && let Some(stats) = render_stats.as_deref_mut() {
-                    stats.pane_rows_sync_deferred = stats
-                        .pane_rows_sync_deferred
-                        .saturating_add(u64::try_from(inner_h).unwrap_or(u64::MAX));
-                }
-                if sync_deferred && let Some(trace) = render_trace.as_deref_mut() {
-                    trace.push(AttachRenderTraceOp::PaneRowsSyncDeferred {
-                        surface_index,
-                        rows: u16::try_from(inner_h).unwrap_or(u16::MAX),
-                    });
-                }
-                continue;
-            }
-            let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
-            let mut effective_content_damage = damaged_content_rows.to_vec();
-            effective_content_damage.extend(before_content_damage.iter().copied());
-            for row in 0..inner_h {
-                if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
-                }
-                let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
-                let y = content.y.saturating_add(row_u16);
-                let before_cells = before_content_row_cells(&before_content_cells, y);
-                let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
-                    damaged_grid_row_ranges(
-                        grid_row,
-                        row_u16,
-                        inner_width,
-                        &effective_content_damage,
-                    )
-                });
-                let force_row_damage = !damaged_ranges.is_empty();
-                let line = grid_rows.get(row).map_or_else(
-                    || {
-                        let blank_row = PhysicalRow::new();
-                        render_grid_row_segment(
-                            GridRowRenderContext {
-                                row: &blank_row,
-                                selection,
-                                absolute_row: if use_scrollback {
-                                    scrollback_offset.saturating_add(row)
-                                } else {
-                                    row
-                                },
-                                runtime_appearance,
-                                palette: entry.terminal_grid.grid().palette(),
-                                before_content_cells: &before_cells,
-                            },
-                            0,
-                            inner_width,
-                        )
-                    },
-                    |grid_row| {
-                        render_grid_row_segment(
-                            GridRowRenderContext {
-                                row: grid_row,
-                                selection,
-                                absolute_row: if use_scrollback {
-                                    scrollback_offset.saturating_add(row)
-                                } else {
-                                    row
-                                },
-                                runtime_appearance,
-                                palette: entry.terminal_grid.grid().palette(),
-                                before_content_cells: &before_cells,
-                            },
-                            0,
-                            inner_width,
-                        )
-                    },
-                );
-
-                // Row-level diff: skip emitting if the rendered string
-                // matches the previous frame's cached version for this row.
-                let cached = entry.prev_rows.get(row);
-                if cached.is_none_or(|c| *c != line) {
-                    queue!(stdout, MoveTo(content.x, y), Print(&line))
-                        .context("failed drawing pane content")?;
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
-                        stats.pane_cells_emitted = stats
-                            .pane_cells_emitted
-                            .saturating_add(u64::from(inner_width));
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        trace.push(AttachRenderTraceOp::PaneRowFull {
-                            surface_index,
-                            row: row_u16,
-                            cells: inner_width,
-                        });
-                    }
-                } else if force_row_damage {
-                    for (start_col, end_col) in damaged_ranges {
-                        let segment = grid_rows.get(row).map_or_else(
-                            || {
-                                let blank_row = PhysicalRow::new();
-                                render_grid_row_segment(
-                                    GridRowRenderContext {
-                                        row: &blank_row,
-                                        selection,
-                                        absolute_row: if use_scrollback {
-                                            scrollback_offset.saturating_add(row)
-                                        } else {
-                                            row
-                                        },
-                                        runtime_appearance,
-                                        palette: entry.terminal_grid.grid().palette(),
-                                        before_content_cells: &before_cells,
-                                    },
-                                    start_col,
-                                    end_col,
-                                )
-                            },
-                            |grid_row| {
-                                render_grid_row_segment(
-                                    GridRowRenderContext {
-                                        row: grid_row,
-                                        selection,
-                                        absolute_row: if use_scrollback {
-                                            scrollback_offset.saturating_add(row)
-                                        } else {
-                                            row
-                                        },
-                                        runtime_appearance,
-                                        palette: entry.terminal_grid.grid().palette(),
-                                        before_content_cells: &before_cells,
-                                    },
-                                    start_col,
-                                    end_col,
-                                )
-                            },
-                        );
-                        queue!(
-                            stdout,
-                            MoveTo(content.x.saturating_add(start_col), y),
-                            Print(segment)
-                        )
-                        .context("failed drawing damaged pane content segment")?;
-                        if let Some(stats) = render_stats.as_deref_mut() {
-                            stats.pane_row_segments_emitted =
-                                stats.pane_row_segments_emitted.saturating_add(1);
-                            stats.pane_cells_emitted = stats
-                                .pane_cells_emitted
-                                .saturating_add(u64::from(end_col.saturating_sub(start_col)));
-                        }
-                        if let Some(trace) = render_trace.as_deref_mut() {
-                            trace.push(AttachRenderTraceOp::PaneRowSegment {
-                                surface_index,
-                                row: row_u16,
-                                start_col,
-                                cells: end_col.saturating_sub(start_col),
-                            });
-                        }
-                    }
-                } else {
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.pane_rows_cached_skipped =
-                            stats.pane_rows_cached_skipped.saturating_add(1);
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
-                            surface_index,
-                            row: row_u16,
-                        });
-                    }
-                }
-                if row < entry.prev_rows.len() {
-                    entry.prev_rows[row] = line;
-                } else {
-                    entry.prev_rows.push(line);
-                }
-            }
-            // Trim stale cache entries if the visible row count shrank.
-            entry.prev_rows.truncate(inner_h);
-        } else if should_draw_content || !before_content_damage.is_empty() {
-            let palette = bmux_terminal_grid::StylePalette::default();
-            for row in 0..inner_h {
-                let y = content.y.saturating_add(row as u16);
-                let before_cells = before_content_row_cells(&before_content_cells, y);
-                let blank_row = PhysicalRow::new();
-                let line = render_grid_row_segment(
-                    GridRowRenderContext {
-                        row: &blank_row,
-                        selection: None,
-                        absolute_row: row,
-                        runtime_appearance,
-                        palette: &palette,
-                        before_content_cells: &before_cells,
-                    },
-                    0,
-                    inner_width,
-                );
-                queue!(stdout, MoveTo(content.x, y), Print(line))
-                    .context("failed clearing pane content")?;
-                if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
-                    stats.pane_cells_emitted = stats
-                        .pane_cells_emitted
-                        .saturating_add(u64::from(inner_width));
-                }
-                if let Some(trace) = render_trace.as_deref_mut() {
-                    trace.push(AttachRenderTraceOp::PaneRowFull {
-                        surface_index,
-                        row: u16::try_from(row).unwrap_or(u16::MAX),
-                        cells: inner_width,
-                    });
-                }
-            }
-        }
     }
 
     cleanup_stale_terminal_graphics(
@@ -3867,6 +4097,7 @@ mod tests {
     use super::{
         cleanup_stale_terminal_graphics, queue_render_items, queue_render_items_for_frame,
         render_attach_scene_with_stats_and_trace_with_capabilities,
+        terminal_graphic_placement_signature,
     };
     #[cfg(feature = "image-kitty")]
     use crate::types::TerminalGraphicsCache;
@@ -4529,8 +4760,8 @@ mod tests {
             .expect("moved cached kitty graphic should place")
         );
         let third = String::from_utf8(third).expect("kitty command should be utf8");
-        assert!(third.contains("Ga=d,d=i,"), "{third:?}");
-        assert!(third.contains("Ga=t,"), "{third:?}");
+        assert!(!third.contains("Ga=d,d=i,"), "{third:?}");
+        assert!(!third.contains("Ga=t,"), "{third:?}");
         assert!(third.contains("Ga=p,"), "{third:?}");
         assert!(third.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{third:?}");
 
@@ -4554,8 +4785,60 @@ mod tests {
             .expect("stale kitty graphic delete should queue")
         );
         let fourth = String::from_utf8(fourth).expect("kitty command should be utf8");
+        assert!(fourth.contains("Ga=d,d=p,"), "{fourth:?}");
         assert!(fourth.contains("Ga=d,d=i,"), "{fourth:?}");
         assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn queue_render_items_updates_kitty_graphic_source_without_delete_or_replacement() {
+        let capabilities = test_kitty_capabilities();
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 4,
+        };
+        let mut cache = BTreeMap::new();
+        queue_render_items(
+            &mut Vec::new(),
+            Uuid::from_u128(7),
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+            &mut cache,
+            capabilities,
+            None,
+        )
+        .expect("initial kitty graphic should queue");
+
+        let mut changed_graphic = test_graphic_overlay(2);
+        changed_graphic.color.r = 9;
+        let mut changed = Vec::new();
+        assert!(
+            queue_render_items(
+                &mut changed,
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(changed_graphic)],
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("changed kitty source should retransmit")
+        );
+        let changed = String::from_utf8(changed).expect("kitty command should be utf8");
+        assert!(changed.contains("Ga=t,"), "{changed:?}");
+        assert!(!changed.contains("Ga=d,"), "{changed:?}");
+        assert!(!changed.contains("Ga=p,"), "{changed:?}");
+        assert_eq!(
+            cache.values().next().expect("cache entry").placement,
+            Some(terminal_graphic_placement_signature(&test_graphic_overlay(
+                2
+            )))
+        );
     }
 
     #[cfg(feature = "image-kitty")]
@@ -4597,8 +4880,8 @@ mod tests {
             .expect("moved graphic should reconcile despite no text damage")
         );
         let moved = String::from_utf8(moved).expect("kitty command should be utf8");
-        assert!(moved.contains("Ga=d,d=i,"), "{moved:?}");
-        assert!(moved.contains("Ga=t,"), "{moved:?}");
+        assert!(!moved.contains("Ga=d,d=i,"), "{moved:?}");
+        assert!(!moved.contains("Ga=t,"), "{moved:?}");
         assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
     }
 
@@ -4654,6 +4937,7 @@ mod tests {
             .expect("old pane graphic should be deleted");
         let second = String::from_utf8(second).expect("kitty command should be utf8");
         assert!(second.contains("Ga=t,"), "{second:?}");
+        assert!(second.contains("Ga=d,d=p,"), "{second:?}");
         assert!(second.contains("Ga=d,d=i,"), "{second:?}");
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_b);
@@ -4691,8 +4975,197 @@ mod tests {
         cleanup_stale_terminal_graphics(&mut deleted, &active, &mut cache, capabilities, None)
             .expect("terminal-scoped cleanup should delete stale image");
         let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
+        assert!(deleted.contains("Ga=d,d=p,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn same_surface_stale_graphics_cleanup_runs_before_replacement_text() {
+        let capabilities = test_kitty_capabilities();
+        let pane_id = Uuid::from_u128(101);
+        let surface_id = Uuid::from_u128(7);
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 4,
+        };
+        let mut cache = BTreeMap::new();
+        let mut active = BTreeSet::new();
+        queue_render_items_for_frame(
+            &mut Vec::new(),
+            pane_id,
+            surface_id,
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &[RenderLayerItem::Graphic(test_graphic_overlay(2))],
+            &mut cache,
+            &mut active,
+            capabilities,
+            None,
+        )
+        .expect("initial pane graphic should queue");
+        assert_eq!(cache.len(), 1);
+
+        active.clear();
+        let mut replacement = Vec::new();
+        queue_render_items_for_frame(
+            &mut replacement,
+            pane_id,
+            surface_id,
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &[RenderLayerItem::Op(RenderOp::TextRun {
+                x: 2,
+                y: 1,
+                text: "HEADER".to_string(),
+                style: RenderStyle::default(),
+            })],
+            &mut cache,
+            &mut active,
+            capabilities,
+            None,
+        )
+        .expect("replacement text should queue after stale graphic cleanup");
+        let replacement = String::from_utf8(replacement).expect("kitty command should be utf8");
+        let delete_at = replacement
+            .find("Ga=d,d=p,")
+            .expect("stale graphic placement should be deleted before text");
+        let image_delete_at = replacement
+            .find("Ga=d,d=i,")
+            .expect("stale graphic image should be deleted before text");
+        let text_at = replacement
+            .find("HEADER")
+            .expect("replacement text should be written");
+        assert!(delete_at < text_at, "{replacement:?}");
+        assert!(image_delete_at < text_at, "{replacement:?}");
+        assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Fixture builds a complete frame to verify before-content graphics ordering.
+    fn before_content_graphics_are_queued_before_pane_rows() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::{io, sync::Arc};
+
+        struct BeforeGraphicsExtension;
+
+        impl AttachRenderExtension for BeforeGraphicsExtension {
+            fn name(&self) -> &'static str {
+                "test.before.graphics"
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn render_layer_items_with_context(
+                &self,
+                _surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                damage: &RenderDamage,
+                layer: RenderExtensionLayer,
+                _context: &bmux_plugin::RenderExtensionContext,
+            ) -> Option<Vec<RenderLayerItem>> {
+                if damage.is_none() || layer != RenderExtensionLayer::BeforePaneContent {
+                    return None;
+                }
+                Some(vec![RenderLayerItem::Graphic(TerminalGraphicOverlay {
+                    key: 1,
+                    cell_rect: *surface_rect,
+                    pixel_width: 8,
+                    pixel_height: 16,
+                    color: TerminalRgba {
+                        r: 1,
+                        g: 2,
+                        b: 3,
+                        a: 255,
+                    },
+                    fill: TerminalGraphicFill::Top { thickness_px: 3 },
+                    z_index: -1,
+                })])
+            }
+        }
+
+        let pane_id = Uuid::from_u128(901);
+        let surface_id = Uuid::from_u128(902);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(900),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: surface_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 4,
+                },
+                content_rect: AttachRect {
+                    x: 1,
+                    y: 1,
+                    w: 8,
+                    h: 2,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let panes = vec![PaneSummary {
+            id: pane_id,
+            index: 1,
+            name: None,
+            focused: true,
+            state: PaneState::Running,
+            state_reason: None,
+        }];
+        let mut pane_buffers = BTreeMap::new();
+        let mut cache = TerminalGraphicsCache::new();
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(BeforeGraphicsExtension)];
+        let mut bytes = Vec::new();
+
+        render_attach_scene_with_stats_and_trace_with_capabilities(
+            &mut bytes,
+            &scene,
+            &panes,
+            &mut pane_buffers,
+            &mut cache,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (10, 4),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            test_kitty_capabilities(),
+            None,
+        )
+        .expect("before-content graphic should render");
+
+        let output = String::from_utf8(bytes).expect("kitty output should be utf8");
+        assert!(output.contains("Ga=t,"), "{output:?}");
+        assert!(output.contains("z=-1"), "{output:?}");
     }
 
     #[cfg(feature = "image-kitty")]
@@ -4865,6 +5338,7 @@ mod tests {
         .expect("partial render should keep undamaged graphics active");
         let partial = String::from_utf8(partial).expect("kitty command should be utf8");
         assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
+        assert!(!partial.contains("Ga=d,d=p,"), "{partial:?}");
         assert_eq!(graphics_cache.len(), 2);
     }
 
@@ -4908,6 +5382,7 @@ mod tests {
             .expect("lost graphics capability should delete cached image")
         );
         let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
+        assert!(deleted.contains("Ga=d,d=p,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
     }
@@ -6159,7 +6634,9 @@ mod tests {
             }],
         };
         let mut pane_buffers = BTreeMap::new();
-        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 3, 18, b"PANE");
+        pane_buffers.insert(pane_id, pane_buffer);
         let calls = Arc::new(AtomicUsize::new(0));
         let refreshes = Arc::new(AtomicUsize::new(0));
         let extensions: Vec<Arc<dyn AttachRenderExtension>> = vec![Arc::new(DeclarativeExtension {
@@ -6193,6 +6670,14 @@ mod tests {
 
         let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(rendered.contains("OPS"));
+        assert!(rendered.contains("PANE"));
+        assert!(
+            rendered.find("PANE").expect("pane content should render")
+                < rendered
+                    .find("OPS")
+                    .expect("after-pane extension should render"),
+            "after-pane extension must be emitted after pane content: {rendered:?}"
+        );
         assert!(rendered.contains("\x1b[38;2;1;2;3m"));
         assert!(rendered.contains("\x1b[1m"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);

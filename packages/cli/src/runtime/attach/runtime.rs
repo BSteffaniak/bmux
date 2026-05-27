@@ -13,7 +13,7 @@ use bmux_attach_pipeline::reconcile::{
 };
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
-    PaneScrollbackWindow, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
+    PaneScrollbackWindow, RetainedDamage, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
     RetainedSurfacePayload, frame_damage_from_retained_repaint_plan, merge_retained_damages,
     retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
     retained_layer_order, retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
@@ -124,6 +124,7 @@ pub struct HeadlessAttachTerminalHandle {
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     geometry: Arc<Mutex<TerminalGeometry>>,
     output: Arc<Mutex<Vec<u8>>>,
+    pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl HeadlessAttachTerminalHandle {
@@ -148,12 +149,20 @@ impl HeadlessAttachTerminalHandle {
             .lock()
             .map_or_else(|_| Vec::new(), |out| out.clone())
     }
+
+    #[must_use]
+    pub fn drain_output_chunks(&self) -> Vec<Vec<u8>> {
+        self.pending_output_chunks
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut chunks| chunks.drain(..).collect())
+    }
 }
 
 pub struct HeadlessAttachTerminal {
     geometry: Arc<Mutex<TerminalGeometry>>,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     output: Arc<Mutex<Vec<u8>>>,
+    pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl HeadlessAttachTerminal {
@@ -162,16 +171,19 @@ impl HeadlessAttachTerminal {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let geometry = Arc::new(Mutex::new(TerminalGeometry { cols, rows }));
         let output = Arc::new(Mutex::new(Vec::new()));
+        let pending_output_chunks = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 geometry: Arc::clone(&geometry),
                 event_rx,
                 output: Arc::clone(&output),
+                pending_output_chunks: Arc::clone(&pending_output_chunks),
             },
             HeadlessAttachTerminalHandle {
                 event_tx,
                 geometry,
                 output,
+                pending_output_chunks,
             },
         )
     }
@@ -183,6 +195,10 @@ impl Write for HeadlessAttachTerminal {
             .lock()
             .map_err(|_| io::Error::other("headless attach terminal output lock poisoned"))?
             .extend_from_slice(buf);
+        self.pending_output_chunks
+            .lock()
+            .map_err(|_| io::Error::other("headless attach terminal output lock poisoned"))?
+            .push(buf.to_vec());
         Ok(buf.len())
     }
 
@@ -222,8 +238,40 @@ impl AttachTerminal for HeadlessAttachTerminal {
         feature = "image-iterm2"
     ))]
     fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
-        bmux_image::host_caps::HostImageCapabilities::default()
+        headless_image_capabilities_from_env()
     }
+}
+
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
+fn headless_image_capabilities_from_env() -> bmux_image::host_caps::HostImageCapabilities {
+    let mut caps = bmux_image::host_caps::HostImageCapabilities {
+        cell_pixel_width: 8,
+        cell_pixel_height: 16,
+        ..bmux_image::host_caps::HostImageCapabilities::default()
+    };
+    match std::env::var("BMUX_PLAYBOOK_HEADLESS_IMAGE_PROTOCOL")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "kitty" => caps.kitty_graphics = true,
+        "sixel" => caps.sixel = true,
+        "iterm2" => caps.iterm2_inline = true,
+        "env" => {
+            caps = bmux_image::host_caps::detect_from_env();
+            if caps.cell_pixel_width == 0 {
+                caps.cell_pixel_width = 8;
+            }
+            if caps.cell_pixel_height == 0 {
+                caps.cell_pixel_height = 16;
+            }
+        }
+        _ => {}
+    }
+    caps
 }
 
 impl AttachTerminal for RealAttachTerminal {
@@ -272,7 +320,30 @@ impl AttachTerminal for RealAttachTerminal {
         let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
         caps.cell_pixel_width = cpw;
         caps.cell_pixel_height = cph;
+        fill_missing_image_cell_pixels(&mut caps);
         caps
+    }
+}
+
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
+fn fill_missing_image_cell_pixels(caps: &mut bmux_image::host_caps::HostImageCapabilities) {
+    if !caps.any_supported() || (caps.cell_pixel_width > 0 && caps.cell_pixel_height > 0) {
+        return;
+    }
+    // Many real terminals, including macOS-hosted Kitty-compatible terminals,
+    // report zero pixel dimensions through TIOCGWINSZ even though the image
+    // protocol itself is available. Kitty placement commands need non-zero
+    // cell dimensions for BMUX's generated semantic-border sources, so use a
+    // conservative fallback instead of silently disabling graphics.
+    if caps.cell_pixel_width == 0 {
+        caps.cell_pixel_width = 8;
+    }
+    if caps.cell_pixel_height == 0 {
+        caps.cell_pixel_height = 16;
     }
 }
 
@@ -2460,6 +2531,15 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     ))]
     {
         view_state.host_image_caps = terminal.detect_image_capabilities();
+        tracing::info!(
+            target: "attach.image",
+            kitty_graphics = view_state.host_image_caps.kitty_graphics,
+            sixel = view_state.host_image_caps.sixel,
+            iterm2_inline = view_state.host_image_caps.iterm2_inline,
+            cell_pixel_width = view_state.host_image_caps.cell_pixel_width,
+            cell_pixel_height = view_state.host_image_caps.cell_pixel_height,
+            "detected host image capabilities"
+        );
         // Cache the decode mode from config so we don't read config per-frame.
         let img_cfg = attach_config.behavior.images.decode_mode;
         view_state.image_decode_mode = match img_cfg {
@@ -6364,6 +6444,26 @@ fn render_damage_from_retained_damage_rects(rects: &[DamageRect]) -> RenderDamag
     )
 }
 
+fn queue_retained_background_clear(
+    stdout: &mut impl Write,
+    damage: &RetainedDamage,
+) -> Result<bool> {
+    let rects = match damage {
+        RetainedDamage::None | RetainedDamage::Full { .. } => return Ok(false),
+        RetainedDamage::Regions(rects) => rects,
+    };
+    let mut wrote = false;
+    for rect in rects {
+        let blank = " ".repeat(usize::from(rect.w));
+        for row in rect.y..rect.y.saturating_add(rect.h) {
+            queue!(stdout, MoveTo(rect.x, row), Print(&blank))
+                .context("failed clearing retained background damage")?;
+            wrote = true;
+        }
+    }
+    Ok(wrote)
+}
+
 fn queue_retained_render_ops(
     stdout: &mut impl Write,
     surface: &RetainedSurface,
@@ -6531,7 +6631,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         [
             retained_frame_damage,
             explicit_ui_damage,
-            retained_graph_damage,
+            retained_graph_damage.clone(),
         ],
         viewport,
         damage_policy,
@@ -6545,14 +6645,16 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         damage_policy,
     ));
     let damage_stats = frame_damage.stats();
-    let render_scene = frame_damage.scene_damaged();
+    let retained_graph_damaged = !matches!(retained_graph_damage, RetainedDamage::None);
+    let render_scene = frame_damage.scene_damaged() || retained_graph_damaged;
     let retained_repaint_by_id = retained_repaint_plan
         .iter()
         .map(|surface| (surface.surface_id, surface))
         .collect::<BTreeMap<_, _>>();
 
-    let use_synchronized_update =
-        frame_uses_synchronized_update(&frame_damage) || damage_config.visualize;
+    let use_synchronized_update = frame_uses_synchronized_update(&frame_damage)
+        || retained_graph_damaged
+        || damage_config.visualize;
 
     let mut frame_bytes = Vec::new();
     // Wrap multi-region scene/overlay frames in a synchronized update so the
@@ -6573,6 +6675,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
+    queue_retained_background_clear(&mut frame_bytes, &retained_graph_damage)?;
     let status_rendered = if let Some((surface, repaint)) = status_surface
         .as_ref()
         .zip(retained_repaint_by_id.get(&STATUS_SURFACE_ID))
@@ -11717,6 +11820,26 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    #[test]
+    fn image_capability_detection_fills_missing_cell_pixels() {
+        let mut caps = bmux_image::host_caps::HostImageCapabilities {
+            kitty_graphics: true,
+            cell_pixel_width: 0,
+            cell_pixel_height: 0,
+            ..bmux_image::host_caps::HostImageCapabilities::default()
+        };
+
+        fill_missing_image_cell_pixels(&mut caps);
+
+        assert_eq!(caps.cell_pixel_width, 8);
+        assert_eq!(caps.cell_pixel_height, 16);
+    }
 
     #[test]
     fn pane_runtime_status_four_is_treated_as_closed_attach_stream() {

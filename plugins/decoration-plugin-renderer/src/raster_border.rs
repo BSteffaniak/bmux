@@ -7,8 +7,8 @@
 use std::hash::{Hash, Hasher};
 
 use bmux_plugin::{
-    RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRenderCapabilities,
-    TerminalRgba,
+    ExtensionRect, RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay,
+    TerminalRenderCapabilities, TerminalRgba,
 };
 use bmux_scene_protocol::scene_protocol::{
     Color as SceneColor, NamedColor, PaintCommand, Rect as SceneRect, Style as SceneStyle,
@@ -16,8 +16,16 @@ use bmux_scene_protocol::scene_protocol::{
 use bmux_scene_protocol_render::capabilities::{SceneRenderCapabilities, capability_query_matches};
 use uuid::Uuid;
 
+const SEMANTIC_BORDER_GRAPHIC_Z: i16 = -1;
+const SEGMENT_KEY_STRIDE: u64 = 1_024;
+const TOP_SEGMENT_KEY_BASE: u64 = 0;
+const BOTTOM_SEGMENT_KEY_BASE: u64 = SEGMENT_KEY_STRIDE;
+const LEFT_SEGMENT_KEY_BASE: u64 = SEGMENT_KEY_STRIDE * 2;
+const RIGHT_SEGMENT_KEY_BASE: u64 = SEGMENT_KEY_STRIDE * 3;
+
 #[derive(Clone, Copy, Debug)]
 struct RasterSegment {
+    key_slot: u64,
     col: u16,
     row: u16,
     cell_width: u16,
@@ -28,12 +36,39 @@ struct RasterSegment {
 }
 
 #[must_use]
+pub fn semantic_border_terminal_graphic_z(_scene_z: i16) -> i16 {
+    // Kitty z=-1 keeps semantic borders below terminal-cell text while still
+    // above the terminal background. This avoids both header overwrites and
+    // header-row placement churn/deletes.
+    SEMANTIC_BORDER_GRAPHIC_Z
+}
+
+#[must_use]
 pub fn semantic_border_graphic_items(
     surface_id: Uuid,
     semantic_key: u64,
     command: &PaintCommand,
     capabilities: TerminalRenderCapabilities,
     scene_capabilities: SceneRenderCapabilities,
+) -> Option<Vec<RenderLayerItem>> {
+    semantic_border_graphic_items_with_occlusion(
+        surface_id,
+        semantic_key,
+        command,
+        capabilities,
+        scene_capabilities,
+        &[],
+    )
+}
+
+#[must_use]
+pub fn semantic_border_graphic_items_with_occlusion(
+    surface_id: Uuid,
+    semantic_key: u64,
+    command: &PaintCommand,
+    capabilities: TerminalRenderCapabilities,
+    scene_capabilities: SceneRenderCapabilities,
+    occluders: &[ExtensionRect],
 ) -> Option<Vec<RenderLayerItem>> {
     let PaintCommand::SemanticBorder {
         rect,
@@ -54,17 +89,16 @@ pub fn semantic_border_graphic_items(
     }
 
     let color = raster_color_from_style(style);
-    let segments = raster_border_segments(rect, *thickness_px, *radius_px, capabilities);
+    let segments = raster_border_segments(rect, *thickness_px, *radius_px, capabilities, occluders);
     if segments.is_empty() {
-        return None;
+        return Some(Vec::new());
     }
     Some(
         segments
             .into_iter()
-            .enumerate()
-            .map(|(index, segment)| {
+            .map(|segment| {
                 RenderLayerItem::Graphic(TerminalGraphicOverlay {
-                    key: raster_image_key(surface_id, semantic_key, index),
+                    key: raster_image_key(surface_id, semantic_key, segment.key_slot),
                     cell_rect: bmux_plugin::ExtensionRect::new(
                         segment.col,
                         segment.row,
@@ -75,7 +109,7 @@ pub fn semantic_border_graphic_items(
                     pixel_height: segment.pixel_height,
                     color,
                     fill: segment.fill,
-                    z_index: z.saturating_add(1),
+                    z_index: semantic_border_terminal_graphic_z(*z),
                 })
             })
             .collect(),
@@ -104,6 +138,7 @@ fn raster_border_segments(
     thickness_px: u16,
     _radius_px: u16,
     capabilities: TerminalRenderCapabilities,
+    _occluders: &[ExtensionRect],
 ) -> Vec<RasterSegment> {
     let cell_w = capabilities.cell_pixel_width;
     let cell_h = capabilities.cell_pixel_height;
@@ -111,47 +146,53 @@ fn raster_border_segments(
         return Vec::new();
     }
     let thickness = thickness_px.clamp(1, cell_w.min(cell_h));
+    let pixel_width = u32::from(cell_w);
+    let pixel_height = u32::from(cell_h);
     vec![
         RasterSegment {
+            key_slot: TOP_SEGMENT_KEY_BASE,
             col: rect.x,
             row: rect.y,
             cell_width: rect.w,
             cell_height: 1,
-            pixel_width: u32::from(cell_w),
-            pixel_height: u32::from(cell_h),
+            pixel_width,
+            pixel_height,
             fill: TerminalGraphicFill::Top {
                 thickness_px: thickness,
             },
         },
         RasterSegment {
+            key_slot: BOTTOM_SEGMENT_KEY_BASE,
             col: rect.x,
             row: rect.y.saturating_add(rect.h.saturating_sub(1)),
             cell_width: rect.w,
             cell_height: 1,
-            pixel_width: u32::from(cell_w),
-            pixel_height: u32::from(cell_h),
+            pixel_width,
+            pixel_height,
             fill: TerminalGraphicFill::Bottom {
                 thickness_px: thickness,
             },
         },
         RasterSegment {
+            key_slot: LEFT_SEGMENT_KEY_BASE,
             col: rect.x,
             row: rect.y,
             cell_width: 1,
             cell_height: rect.h,
-            pixel_width: u32::from(cell_w),
-            pixel_height: u32::from(cell_h),
+            pixel_width,
+            pixel_height,
             fill: TerminalGraphicFill::Left {
                 thickness_px: thickness,
             },
         },
         RasterSegment {
+            key_slot: RIGHT_SEGMENT_KEY_BASE,
             col: rect.x.saturating_add(rect.w.saturating_sub(1)),
             row: rect.y,
             cell_width: 1,
             cell_height: rect.h,
-            pixel_width: u32::from(cell_w),
-            pixel_height: u32::from(cell_h),
+            pixel_width,
+            pixel_height,
             fill: TerminalGraphicFill::Right {
                 thickness_px: thickness,
             },
@@ -231,7 +272,7 @@ const fn color_cube_channel(value: u8) -> u8 {
     if value == 0 { 0 } else { 55 + value * 40 }
 }
 
-fn raster_image_key(surface_id: Uuid, semantic_key: u64, segment_index: usize) -> u64 {
+fn raster_image_key(surface_id: Uuid, semantic_key: u64, segment_index: u64) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     surface_id.hash(&mut hash);
     semantic_key.hash(&mut hash);
@@ -303,6 +344,13 @@ mod tests {
     }
 
     #[test]
+    fn semantic_border_graphics_use_stable_under_text_z() {
+        assert_eq!(semantic_border_terminal_graphic_z(0), -1);
+        assert_eq!(semantic_border_terminal_graphic_z(500), -1);
+        assert_eq!(semantic_border_terminal_graphic_z(-500), -1);
+    }
+
+    #[test]
     fn semantic_border_graphics_use_cell_sized_sources_and_large_placements() {
         let command = PaintCommand::SemanticBorder {
             rect: SceneRect {
@@ -359,5 +407,88 @@ mod tests {
         assert_eq!(left.cell_rect.h, 12);
         assert_eq!(left.pixel_width, 8);
         assert_eq!(left.pixel_height, 16);
+        assert_eq!(left.z_index, -1);
+    }
+
+    #[test]
+    fn semantic_border_graphics_keep_stable_under_text_placements_with_occluders() {
+        let command = PaintCommand::SemanticBorder {
+            rect: SceneRect {
+                x: 10,
+                y: 20,
+                w: 10,
+                h: 6,
+            },
+            z: 7,
+            style: SceneStyle {
+                fg: None,
+                bg: None,
+                bold: false,
+                underline: false,
+                italic: false,
+                reverse: false,
+                dim: false,
+                blink: false,
+                strikethrough: false,
+            },
+            fallback_glyphs: bmux_scene_protocol::scene_protocol::BorderGlyphs::Rounded,
+            thickness_px: 3,
+            radius_px: 0,
+            when: None,
+        };
+        let capabilities = TerminalRenderCapabilities {
+            kitty_graphics: true,
+            graphics_alpha: true,
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
+            ..TerminalRenderCapabilities::default()
+        };
+        let with_header = semantic_border_graphic_items_with_occlusion(
+            Uuid::from_u128(1),
+            0,
+            &command,
+            capabilities,
+            SceneRenderCapabilities::default(),
+            &[ExtensionRect::new(12, 20, 4, 1)],
+        )
+        .expect("semantic border should lower to graphics");
+        let with_paddle = semantic_border_graphic_items_with_occlusion(
+            Uuid::from_u128(1),
+            0,
+            &command,
+            capabilities,
+            SceneRenderCapabilities::default(),
+            &[ExtensionRect::new(10, 22, 1, 2)],
+        )
+        .expect("semantic border should lower to graphics");
+
+        let graphic_signature = |items: Vec<RenderLayerItem>| {
+            items
+                .into_iter()
+                .map(|item| match item {
+                    RenderLayerItem::Graphic(graphic) => {
+                        assert_eq!(graphic.z_index, -1);
+                        (graphic.key, graphic.cell_rect)
+                    }
+                    RenderLayerItem::Op(_) => panic!("semantic border should emit graphics only"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let header_signature = graphic_signature(with_header);
+        let paddle_signature = graphic_signature(with_paddle);
+        assert_eq!(header_signature, paddle_signature);
+        assert_eq!(
+            header_signature
+                .iter()
+                .map(|(_, rect)| *rect)
+                .collect::<Vec<_>>(),
+            vec![
+                ExtensionRect::new(10, 20, 10, 1),
+                ExtensionRect::new(10, 25, 10, 1),
+                ExtensionRect::new(10, 20, 1, 6),
+                ExtensionRect::new(19, 20, 1, 6),
+            ]
+        );
     }
 }

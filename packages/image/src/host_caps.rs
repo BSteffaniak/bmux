@@ -62,15 +62,16 @@ pub fn detect_from_env() -> HostImageCapabilities {
     // -- Environment variable heuristics ----------------------------------
 
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let term_program_normalized = term_program.to_ascii_lowercase();
     let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
 
-    match term_program.as_str() {
-        "iTerm.app" => {
+    match term_program_normalized.as_str() {
+        "iterm.app" => {
             caps.iterm2_inline = true;
             // iTerm2 also supports sixel since v3.3.0
             caps.sixel = true;
         }
-        "WezTerm" => {
+        "wezterm" => {
             caps.sixel = true;
             caps.kitty_graphics = true;
             caps.iterm2_inline = true;
@@ -86,9 +87,9 @@ pub fn detect_from_env() -> HostImageCapabilities {
         caps.sixel = true;
     }
 
-    // Kitty sets TERM=xterm-kitty
     let term = std::env::var("TERM").unwrap_or_default();
-    if term.contains("kitty") {
+    let term_normalized = term.to_ascii_lowercase();
+    if term_normalized.contains("kitty") || term_normalized.contains("ghostty") {
         caps.kitty_graphics = true;
     }
 

@@ -50,6 +50,17 @@ enum ServerHandle {
     },
 }
 
+pub(super) struct SandboxStartOptions<'a> {
+    pub(super) shell: Option<&'a str>,
+    pub(super) plugin_config: &'a PluginConfig,
+    pub(super) startup_timeout: Duration,
+    pub(super) env: &'a std::collections::BTreeMap<String, String>,
+    pub(super) env_mode: super::types::SandboxEnvMode,
+    pub(super) binary: Option<&'a Path>,
+    pub(super) sandbox_config_file: Option<&'a Path>,
+    pub(super) bundled_plugin_ids: &'a [String],
+}
+
 impl SandboxServer {
     /// Create and start a new ephemeral sandbox server.
     ///
@@ -60,20 +71,18 @@ impl SandboxServer {
     /// # Errors
     ///
     /// Returns an error if the sandbox server fails to start.
-    pub async fn start(
-        shell: Option<&str>,
-        plugin_config: &PluginConfig,
-        startup_timeout: Duration,
-        env: &std::collections::BTreeMap<String, String>,
-        env_mode: super::types::SandboxEnvMode,
-        binary: Option<&Path>,
-        bundled_plugin_ids: &[String],
-    ) -> Result<Self> {
+    pub(super) async fn start(options: SandboxStartOptions<'_>) -> Result<Self> {
         let (paths, root_dir) = create_temp_paths();
-        write_sandbox_config(&paths, shell, plugin_config, bundled_plugin_ids)
-            .context("failed writing sandbox config")?;
+        write_sandbox_config(
+            &paths,
+            options.shell,
+            options.plugin_config,
+            options.sandbox_config_file,
+            options.bundled_plugin_ids,
+        )
+        .context("failed writing sandbox config")?;
 
-        let bmux_binary = match binary {
+        let bmux_binary = match options.binary {
             Some(p) => p.to_path_buf(),
             None => std::env::current_exe().context("failed resolving bmux binary path")?,
         };
@@ -83,7 +92,7 @@ impl SandboxServer {
             &paths,
             &bmux_binary,
             &["server".to_string(), "start".to_string()],
-            env_mode,
+            options.env_mode,
             "running",
             None,
             true,
@@ -94,9 +103,9 @@ impl SandboxServer {
             &bmux_binary,
             &paths,
             &root_dir,
-            startup_timeout,
-            env,
-            env_mode,
+            options.startup_timeout,
+            options.env,
+            options.env_mode,
         )
         .await
         .context("failed starting sandbox server")?;
@@ -360,6 +369,7 @@ fn write_sandbox_config(
     paths: &ConfigPaths,
     shell: Option<&str>,
     plugin_config: &PluginConfig,
+    sandbox_config_file: Option<&Path>,
     bundled_plugin_ids: &[String],
 ) -> Result<()> {
     let config_path = paths.config_file();
@@ -368,31 +378,71 @@ fn write_sandbox_config(
             .with_context(|| format!("failed creating config dir {}", parent.display()))?;
     }
 
-    let mut toml = String::new();
+    let mut toml = if let Some(source) = sandbox_config_file {
+        let source_toml = std::fs::read_to_string(source).with_context(|| {
+            format!("failed reading sandbox config source {}", source.display())
+        })?;
+        let mut copied = source_toml;
+        if !copied.ends_with('\n') {
+            copied.push('\n');
+        }
+        copied
+    } else {
+        String::new()
+    };
 
-    // Shell override
-    if let Some(shell) = shell {
-        write!(toml, "[general]\ndefault_shell = '{shell}'\n\n").unwrap();
+    let explicit_plugin_directives =
+        !plugin_config.enable.is_empty() || !plugin_config.disable.is_empty();
+    let should_write_generated_plugin_config =
+        sandbox_config_file.is_none() || explicit_plugin_directives;
+    if sandbox_config_file.is_some()
+        && explicit_plugin_directives
+        && toml_contains_table(&toml, "plugins")
+    {
+        anyhow::bail!(
+            "@sandbox-config cannot be combined with @plugin directives when the copied config already contains a [plugins] table"
+        );
     }
 
-    // Plugin configuration — build disabled list
-    let disabled = build_plugin_disabled_list(plugin_config, bundled_plugin_ids);
-    let enabled = build_plugin_enabled_list(plugin_config);
+    // Shell override. Avoid appending a duplicate [general] table when a copied
+    // config already contains one; the copied config is authoritative in that
+    // case.
+    if let Some(shell) = shell
+        && (sandbox_config_file.is_none() || !toml_contains_table(&toml, "general"))
+    {
+        write!(toml, "\n[general]\ndefault_shell = '{shell}'\n").unwrap();
+    }
 
-    if !disabled.is_empty() || !enabled.is_empty() {
-        toml.push_str("[plugins]\n");
-        if !disabled.is_empty() {
-            let quoted: Vec<String> = disabled.iter().map(|id| format!("'{id}'")).collect();
-            let _ = writeln!(toml, "disabled = [{}]", quoted.join(", "));
-        }
-        if !enabled.is_empty() {
-            let quoted: Vec<String> = enabled.iter().map(|id| format!("'{id}'")).collect();
-            let _ = writeln!(toml, "enabled = [{}]", quoted.join(", "));
+    // Plugin configuration — build disabled list. When an explicit sandbox
+    // config is supplied, preserve its plugin/theme settings unless the
+    // playbook also supplies explicit @plugin directives.
+    if should_write_generated_plugin_config {
+        let disabled = build_plugin_disabled_list(plugin_config, bundled_plugin_ids);
+        let enabled = build_plugin_enabled_list(plugin_config);
+
+        if !disabled.is_empty() || !enabled.is_empty() {
+            toml.push_str("\n[plugins]\n");
+            if !disabled.is_empty() {
+                let quoted: Vec<String> = disabled.iter().map(|id| format!("'{id}'")).collect();
+                let _ = writeln!(toml, "disabled = [{}]", quoted.join(", "));
+            }
+            if !enabled.is_empty() {
+                let quoted: Vec<String> = enabled.iter().map(|id| format!("'{id}'")).collect();
+                let _ = writeln!(toml, "enabled = [{}]", quoted.join(", "));
+            }
         }
     }
 
     std::fs::write(&config_path, toml)
         .with_context(|| format!("failed writing sandbox config {}", config_path.display()))
+}
+
+fn toml_contains_table(toml: &str, table: &str) -> bool {
+    let expected = format!("[{table}]");
+    let nested_prefix = format!("[{table}.");
+    toml.lines()
+        .map(str::trim)
+        .any(|line| line == expected || line.starts_with(&nested_prefix))
 }
 
 fn build_plugin_disabled_list(plugin_config: &PluginConfig, bundled_ids: &[String]) -> Vec<String> {
@@ -677,6 +727,80 @@ mod tests {
                 None
             }
         })
+    }
+
+    #[test]
+    fn copied_sandbox_config_preserves_theme_settings_without_default_plugin_disable() {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-playbook-config-preserve-test-{}-{}",
+            std::process::id(),
+            unix_millis_now_meta()
+        ));
+        let paths = ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        );
+        let source = root.join("source.toml");
+        std::fs::create_dir_all(&root).expect("test root should be created");
+        std::fs::write(
+            &source,
+            "[plugins.settings.\"bmux.theme\"]\ncomponent_themes = [\"performance\", \"pong\"]\n",
+        )
+        .expect("source config should be written");
+
+        write_sandbox_config(
+            &paths,
+            None,
+            &PluginConfig::default(),
+            Some(&source),
+            &["bmux.theme".to_string()],
+        )
+        .expect("sandbox config should be written");
+
+        let written = std::fs::read_to_string(paths.config_file()).expect("config should read");
+        assert!(written.contains("component_themes"));
+        assert!(!written.contains("disabled"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copied_sandbox_config_rejects_duplicate_plugin_table_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-playbook-config-duplicate-test-{}-{}",
+            std::process::id(),
+            unix_millis_now_meta()
+        ));
+        let paths = ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        );
+        let source = root.join("source.toml");
+        std::fs::create_dir_all(&root).expect("test root should be created");
+        std::fs::write(&source, "[plugins]\nenabled = [\"bmux.theme\"]\n")
+            .expect("source config should be written");
+
+        let error = write_sandbox_config(
+            &paths,
+            None,
+            &PluginConfig {
+                enable: vec!["bmux.theme".to_string()],
+                disable: Vec::new(),
+            },
+            Some(&source),
+            &["bmux.theme".to_string()],
+        )
+        .expect_err("duplicate [plugins] generation should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("@sandbox-config cannot be combined")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -51,7 +51,7 @@ use crate::runtime::attach::runtime::{
 
 use super::RunOptions;
 use super::parse_dsl::parse_action_line;
-use super::sandbox::SandboxServer;
+use super::sandbox::{SandboxServer, SandboxStartOptions};
 use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
@@ -655,6 +655,20 @@ impl RealAttachPlaybookRuntime {
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.terminal.resize(cols, rows)
+    }
+
+    fn record_pending_output(
+        &self,
+        display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    ) {
+        let Some(dt) = display_track.as_mut() else {
+            return;
+        };
+        for chunk in self.terminal.drain_output_chunks() {
+            if let Err(error) = dt.record_frame_bytes(&chunk) {
+                warn!(%error, "failed recording real-attach terminal output chunk");
+            }
+        }
     }
 
     async fn detach(self) {
@@ -2296,15 +2310,16 @@ async fn run_playbook_inner(
             .await
             .map_err(|e| anyhow::anyhow!("failed connecting to live server: {e}"))?;
     } else {
-        let sb = SandboxServer::start(
-            playbook.config.shell.as_deref(),
-            &playbook.config.plugins,
-            SERVER_STARTUP_TIMEOUT,
-            &playbook.config.env,
-            playbook.config.effective_env_mode(),
-            playbook.config.binary.as_deref(),
-            &playbook.config.bundled_plugin_ids,
-        )
+        let sb = SandboxServer::start(SandboxStartOptions {
+            shell: playbook.config.shell.as_deref(),
+            plugin_config: &playbook.config.plugins,
+            startup_timeout: SERVER_STARTUP_TIMEOUT,
+            env: &playbook.config.env,
+            env_mode: playbook.config.effective_env_mode(),
+            binary: playbook.config.binary.as_deref(),
+            sandbox_config_file: playbook.config.sandbox_config_file.as_deref(),
+            bundled_plugin_ids: &playbook.config.bundled_plugin_ids,
+        })
         .await
         .context("failed starting sandbox server")?;
         client = sb.connect("bmux-playbook-runner").await?;
@@ -2581,6 +2596,9 @@ async fn run_playbook_inner(
                         Err(error) => warn!(%error, "failed starting real-attach playbook runtime"),
                     }
                 }
+                if let Some(runtime) = real_attach_runtime.as_ref() {
+                    runtime.record_pending_output(&mut display_track);
+                }
                 let detail_for_visual = detail.clone();
                 let render_after = inspector.capture_all_safe();
                 let render_summary = render_trace_state
@@ -2739,6 +2757,7 @@ async fn run_playbook_inner(
     }
 
     if let Some(runtime) = real_attach_runtime.take() {
+        runtime.record_pending_output(&mut display_track);
         runtime.detach().await;
     }
 
@@ -3696,6 +3715,9 @@ pub(super) async fn execute_step(
                     break;
                 }
                 tokio::time::sleep(chunk).await;
+                if let Some(real_attach) = real_attach_runtime {
+                    real_attach.record_pending_output(display_track);
+                }
             }
             Ok(None)
         }

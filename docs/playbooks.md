@@ -51,6 +51,20 @@ bmux playbook run <source> [flags]
 
 Note: global recording auto-export settings (`recording.auto_export` or `--recording-auto-export`) do not auto-export playbook recordings. Use `--export-gif <path>` for playbook runs.
 
+For production attach rendering bugs, a DSL playbook can opt into the real attach
+runtime and copy a specific bmux config into the sandbox:
+
+```dsl
+@driver real-attach
+@sandbox-config /path/to/bmux.toml
+@record true
+@render-trace true
+```
+
+This keeps server/runtime directories isolated while loading the provided config
+and exercising the production attach renderer. `scripts/repro-decoration-flicker.sh`
+wraps this flow for decoration flicker investigations.
+
 **Exit codes:** `0` = all steps passed, `1` = one or more steps failed or error.
 
 **Stdin example:**
@@ -272,21 +286,22 @@ Directives set playbook-wide configuration. They must appear before any action
 lines (or be interspersed; order relative to actions does not matter since
 directives are processed in a first pass).
 
-| Directive       | Syntax                                          | Default        | Description                                                                                                                                                                        |
-| --------------- | ----------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@viewport`     | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                                                                                                                                                       |
-| `@driver`       | `@driver sandbox\|real-attach\|attach-sim`      | `sandbox`      | Execution backend; `real-attach` runs the production attach runtime against a headless terminal adapter; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
-| `@shell`        | `@shell <path>`                                 | system default | Shell binary for the sandbox                                                                                                                                                       |
-| `@timeout`      | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds                                                                                                                                        |
-| `@record`       | `@record true\|false`                           | `false`        | Enable recording of the execution                                                                                                                                                  |
-| `@render-trace` | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries                                                                                                                                        |
-| `@name`         | `@name <string>`                                | none           | Playbook name (included in JSON output)                                                                                                                                            |
-| `@description`  | `@description <string>`                         | none           | Playbook description                                                                                                                                                               |
-| `@plugin`       | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                                                                                                                                                    |
-| `@var`          | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution                                                                                                                                |
-| `@env`          | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process                                                                                                                                 |
-| `@env-mode`     | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                                                                                                                                                 |
-| `@include`      | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10)                                                                                                                            |
+| Directive         | Syntax                                          | Default        | Description                                                                                                                                                                        |
+| ----------------- | ----------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@viewport`       | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                                                                                                                                                       |
+| `@driver`         | `@driver sandbox\|real-attach\|attach-sim`      | `sandbox`      | Execution backend; `real-attach` runs the production attach runtime against a headless terminal adapter; `attach-sim` runs deterministic attach UI simulation without a server/PTY |
+| `@shell`          | `@shell <path>`                                 | system default | Shell binary for the sandbox                                                                                                                                                       |
+| `@timeout`        | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds                                                                                                                                        |
+| `@record`         | `@record true\|false`                           | `false`        | Enable recording of the execution                                                                                                                                                  |
+| `@render-trace`   | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries                                                                                                                                        |
+| `@sandbox-config` | `@sandbox-config <path>`                        | generated      | Copy this bmux config file into the sandbox config dir instead of generating the deterministic default plugin-disabled config                                                      |
+| `@name`           | `@name <string>`                                | none           | Playbook name (included in JSON output)                                                                                                                                            |
+| `@description`    | `@description <string>`                         | none           | Playbook description                                                                                                                                                               |
+| `@plugin`         | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                                                                                                                                                    |
+| `@var`            | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution                                                                                                                                |
+| `@env`            | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process                                                                                                                                 |
+| `@env-mode`       | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                                                                                                                                                 |
+| `@include`        | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10)                                                                                                                            |
 
 ### Environment Modes
 

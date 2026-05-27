@@ -104,6 +104,7 @@ fn parse_config_directive(
                 ),
             };
         }
+        "sandbox-config" => parse_sandbox_config_directive(rest, config)?,
         "name" => {
             config.name = Some(rest.trim().to_string());
         }
@@ -170,6 +171,15 @@ fn parse_config_directive(
         }
         _ => bail!("unknown config directive: @{name}"),
     }
+    Ok(())
+}
+
+fn parse_sandbox_config_directive(rest: &str, config: &mut PlaybookConfig) -> Result<()> {
+    let path = rest.trim();
+    if path.is_empty() {
+        bail!("@sandbox-config requires a config file path");
+    }
+    config.sandbox_config_file = Some(std::path::PathBuf::from(path));
     Ok(())
 }
 
@@ -877,6 +887,16 @@ snapshot id=final
             Action::SendAttach { key } => assert_eq!(key, "ctrl+a ["),
             _ => panic!("expected send-attach"),
         }
+    }
+
+    #[test]
+    fn parse_sandbox_config() {
+        let input = "@sandbox-config /tmp/bmux.toml\nnew-session\n";
+        let (playbook, _includes) = parse_dsl(input).unwrap();
+        assert_eq!(
+            playbook.config.sandbox_config_file.as_deref(),
+            Some(std::path::Path::new("/tmp/bmux.toml"))
+        );
     }
 
     #[test]

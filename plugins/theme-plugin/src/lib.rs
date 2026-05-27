@@ -1528,6 +1528,10 @@ fn component_only_plugin_extension(plugin_id: &str, extension: &toml::Value) -> 
     let Some(table) = extension.as_table() else {
         return extension.clone();
     };
+    let has_components = table
+        .get("components")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|components| !components.is_empty());
     let mut filtered = toml::map::Map::new();
     for key in [
         "components",
@@ -1536,6 +1540,9 @@ fn component_only_plugin_extension(plugin_id: &str, extension: &toml::Value) -> 
         "animation",
         "input",
     ] {
+        if has_components && key == "script" {
+            continue;
+        }
         if let Some(value) = table.get(key) {
             filtered.insert(key.to_string(), value.clone());
         }
@@ -2399,6 +2406,12 @@ mod tests {
             gradient_to = ""
             style = "double"
 
+            [plugins."bmux.decoration"]
+            script = "performance_header"
+
+            [plugins."bmux.decoration".script_access]
+            state_channels = ["bmux.performance/metrics-state"]
+
             [plugins."bmux.decoration".badges]
             exited = "x"
             running = ">"
@@ -2484,6 +2497,16 @@ mod tests {
             Some("thick")
         );
         assert!(components.contains_key("performance.border"));
+        assert_eq!(decoration.get("script"), None);
+        assert_eq!(
+            decoration
+                .get("script_access")
+                .and_then(toml::Value::as_table)
+                .and_then(|access| access.get("state_channels"))
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
         assert_eq!(
             components
                 .get("pong.ball")
