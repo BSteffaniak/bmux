@@ -45,8 +45,9 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::engine::{AnimationDriverPolicy, run_animation_tick_if_current, with_engine_state};
 use crate::engine::{
-    DecorationEngineCommand, ensure_decoration_engine, send_engine_command,
-    send_engine_command_blocking, send_engine_fire_and_forget,
+    DecorationEngineCommand, INPUT_HOOK_SOFT_WAIT, SoftInputReply, ensure_decoration_engine,
+    send_attach_input_soft, send_engine_command, send_engine_command_blocking,
+    send_engine_fire_and_forget,
 };
 use crate::scripting::{
     PerfTracker, ScriptBackend, ScriptComponentMessage, ScriptEventDelivery, ScriptEventMessage,
@@ -59,6 +60,10 @@ use crate::scripting::{
 /// components ordered above it render after the PTY content.
 const PANE_CONTENT_COMPONENT_ID: &str = "pane.content";
 const MAX_ANIMATION_HZ: u16 = 60;
+const SCRIPT_INVOKE_TRACE_THRESHOLD: Duration = Duration::from_millis(100);
+const SCRIPT_INVOKE_WARN_THRESHOLD: Duration = Duration::from_millis(500);
+const SCRIPT_INVOKE_VISIBLE_THRESHOLD: Duration = Duration::from_secs(1);
+const SCRIPT_INVOKE_PROMINENT_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// Runtime state for one user-composable decoration component.
 struct ScriptComponentRuntime {
@@ -573,6 +578,7 @@ fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> Atta
     let mut result = AttachInputResult::default();
     let message = ScriptMessage::Input(event);
     let mut invoked_instances = BTreeSet::<String>::new();
+    let frame_budget = animation_frame_budget(state.animation_hz);
     if state
         .current_theme
         .as_ref()
@@ -583,7 +589,7 @@ fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> Atta
         match backend.invoke(&message) {
             Ok(outcome) => {
                 merge_attach_input_result(&mut result, outcome.input_result);
-                record_script_perf(state, outcome.duration);
+                record_script_perf(state, "input", outcome.duration);
             }
             Err(error) => {
                 tracing::warn!(target: "decoration.script", error = %error, "decoration script input invocation failed");
@@ -604,7 +610,7 @@ fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> Atta
         match backend.invoke(&message) {
             Ok(outcome) => {
                 merge_attach_input_result(&mut result, outcome.input_result);
-                record_component_script_perf(component, outcome.duration);
+                record_component_script_perf(component, "input", outcome.duration, frame_budget);
             }
             Err(error) => {
                 tracing::warn!(
@@ -617,9 +623,6 @@ fn handle_attach_input_event(state: &mut State, event: AttachInputEvent) -> Atta
         }
     }
 
-    if result.dirty {
-        publish_scene_if_changed(state);
-    }
     result
 }
 
@@ -631,6 +634,9 @@ fn merge_attach_input_result(result: &mut AttachInputResult, next: Option<Attach
     result.capture_pointer |= next.capture_pointer;
     result.release_capture |= next.release_capture;
     result.dirty |= next.dirty;
+    if result.status_message.is_none() {
+        result.status_message = next.status_message;
+    }
     for key in next.capture_keyboard {
         if !result
             .capture_keyboard
@@ -959,7 +965,7 @@ fn merge_script_paint_commands(
                 continue;
             }
         };
-        record_script_perf(state, outcome.duration);
+        record_script_perf(state, "event", outcome.duration);
     }
 
     let started_at = state.script_started_at;
@@ -987,7 +993,7 @@ fn merge_script_paint_commands(
             return;
         }
     };
-    record_script_perf(state, outcome.duration);
+    record_script_perf(state, "render", outcome.duration);
     for (pane_id, commands) in outcome.surfaces {
         let Ok(pane_id) = pane_id.parse::<Uuid>() else {
             tracing::warn!(target: "decoration.script", pane_id, "script returned unknown pane id");
@@ -1075,6 +1081,7 @@ fn merge_component_paint_commands_for_id(
         .get(component_id)
         .and_then(|component| component.spec.target.clone());
     let panes = script_panes_payload_for_component(state, target.as_ref());
+    let frame_budget = animation_frame_budget(state.animation_hz);
     let Some(component) = state.script_components.get_mut(component_id) else {
         return;
     };
@@ -1096,7 +1103,7 @@ fn merge_component_paint_commands_for_id(
                     continue;
                 }
             };
-            record_component_script_perf(component, outcome.duration);
+            record_component_script_perf(component, "event", outcome.duration, frame_budget);
         }
     } else {
         component.script_events.clear();
@@ -1140,7 +1147,7 @@ fn merge_component_paint_commands_for_id(
             return;
         }
     };
-    record_component_script_perf(component, outcome.duration);
+    record_component_script_perf(component, "render", outcome.duration, frame_budget);
     for (pane_id, mut commands) in outcome.surfaces {
         let Ok(pane_id) = pane_id.parse::<Uuid>() else {
             tracing::warn!(target: "decoration.script", pane_id, component_id, "component returned unknown pane id");
@@ -1172,7 +1179,19 @@ fn component_settings_json(spec: &DecorationComponentSpec) -> serde_json::Value 
     )
 }
 
-fn record_component_script_perf(component: &ScriptComponentRuntime, duration: Duration) {
+fn record_component_script_perf(
+    component: &ScriptComponentRuntime,
+    invoke_kind: &str,
+    duration: Duration,
+    frame_budget: Option<Duration>,
+) {
+    record_script_invoke_health(
+        invoke_kind,
+        Some(component.id.as_str()),
+        component.script_path.as_ref(),
+        duration,
+        frame_budget,
+    );
     if let Some(tracker) = component.script_perf.as_ref()
         && let Some(msg) = tracker.record(duration)
     {
@@ -1356,11 +1375,70 @@ fn ordered_surface_ids(state: &State) -> Vec<Uuid> {
     ids
 }
 
-fn record_script_perf(state: &State, duration: Duration) {
+fn record_script_perf(state: &State, invoke_kind: &str, duration: Duration) {
+    record_script_invoke_health(
+        invoke_kind,
+        None,
+        state.script_path.as_ref(),
+        duration,
+        animation_frame_budget(state.animation_hz),
+    );
     if let Some(tracker) = state.script_perf.as_ref()
         && let Some(msg) = tracker.record(duration)
     {
         tracing::warn!(target: "decoration.script", "{msg}");
+    }
+}
+
+fn animation_frame_budget(animation_hz: Option<u16>) -> Option<Duration> {
+    let hz = animation_hz.filter(|hz| *hz > 0)?;
+    Some(Duration::from_micros(1_000_000_u64 / u64::from(hz)))
+}
+
+fn record_script_invoke_health(
+    invoke_kind: &str,
+    component_id: Option<&str>,
+    script_path: Option<&PathBuf>,
+    duration: Duration,
+    frame_budget: Option<Duration>,
+) {
+    let duration_ms = duration.as_millis();
+    if let Some(frame_budget) = frame_budget
+        && duration > frame_budget
+    {
+        tracing::warn!(
+            target: "decoration.script",
+            invoke_kind,
+            component_id = component_id.unwrap_or("<top-level>"),
+            script_path = %script_path.map_or_else(|| "<unknown>".to_string(), |path| path.display().to_string()),
+            duration_ms,
+            frame_budget_ms = frame_budget.as_millis(),
+            overrun_ms = duration.saturating_sub(frame_budget).as_millis(),
+            "decoration script frame overran animation budget"
+        );
+    }
+
+    let level = if duration >= SCRIPT_INVOKE_PROMINENT_THRESHOLD {
+        Some("prominent")
+    } else if duration >= SCRIPT_INVOKE_VISIBLE_THRESHOLD {
+        Some("visible")
+    } else if duration >= SCRIPT_INVOKE_WARN_THRESHOLD {
+        Some("warn")
+    } else if duration >= SCRIPT_INVOKE_TRACE_THRESHOLD {
+        Some("trace")
+    } else {
+        None
+    };
+    if let Some(level) = level {
+        tracing::warn!(
+            target: "decoration.script",
+            invoke_kind,
+            component_id = component_id.unwrap_or("<top-level>"),
+            script_path = %script_path.map_or_else(|| "<unknown>".to_string(), |path| path.display().to_string()),
+            duration_ms,
+            level,
+            "decoration script invocation exceeded soft latency threshold"
+        );
     }
 }
 
@@ -2824,13 +2902,35 @@ impl RustPlugin for DecorationPlugin {
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
             "decoration-input-hooks", "handle-input" => |req: AttachInputEvent, _ctx| {
-                let result = send_engine_command_blocking(&state, |reply| {
-                    DecorationEngineCommand::AttachInput {
-                        event: req.clone(),
-                        reply,
+                let result = match send_attach_input_soft(&state, req.clone(), INPUT_HOOK_SOFT_WAIT) {
+                    SoftInputReply::Replied(result) => result,
+                    SoftInputReply::Deferred => {
+                        tracing::warn!(
+                            hook_id = %req.hook_id,
+                            event_kind = %req.event_kind,
+                            phase = %req.phase,
+                            soft_wait_ms = INPUT_HOOK_SOFT_WAIT.as_millis(),
+                            "decoration input deferred behind decoration engine work"
+                        );
+                        AttachInputResult {
+                            status_message: Some("decoration is busy; input was not blocked".to_string()),
+                            ..AttachInputResult::default()
+                        }
                     }
-                })
-                .unwrap_or_default();
+                    SoftInputReply::QueueFull => {
+                        tracing::warn!(
+                            hook_id = %req.hook_id,
+                            event_kind = %req.event_kind,
+                            phase = %req.phase,
+                            "decoration input dropped because decoration engine queue is full"
+                        );
+                        AttachInputResult {
+                            status_message: Some("decoration queue is full; input was not blocked".to_string()),
+                            ..AttachInputResult::default()
+                        }
+                    }
+                    SoftInputReply::Unavailable => AttachInputResult::default(),
+                };
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
             },
         })

@@ -847,6 +847,7 @@ mod lua_backend {
             capture_keyboard,
             release_capture,
             dirty,
+            status_message: None,
         }))
     }
 

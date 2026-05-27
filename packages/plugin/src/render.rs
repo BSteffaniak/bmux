@@ -169,6 +169,12 @@ pub struct AttachInputResult {
     pub capture_keyboard: Vec<String>,
     pub release_capture: bool,
     pub dirty: bool,
+    /// Optional user-facing status emitted by best-effort input hooks.
+    ///
+    /// This keeps input-hook health reporting generic: overloaded hooks can
+    /// explain that they deferred work without failing the input path.
+    #[serde(default)]
+    pub status_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

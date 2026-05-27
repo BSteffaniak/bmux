@@ -26,6 +26,10 @@ use crate::{
 
 const ANIMATION_TIMER_FLOOR: Duration = Duration::from_millis(1);
 const ENGINE_COMMAND_BUFFER: usize = 1024;
+const INPUT_QUEUE_WAIT_WARN: Duration = Duration::from_millis(100);
+const INPUT_EXECUTION_WARN: Duration = Duration::from_millis(500);
+
+pub(crate) const INPUT_HOOK_SOFT_WAIT: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AnimationDriverPolicy {
@@ -55,7 +59,8 @@ pub(crate) enum DecorationEngineCommand {
     },
     AttachInput {
         event: AttachInputEvent,
-        reply: tokio::sync::oneshot::Sender<AttachInputResult>,
+        enqueued_at: Instant,
+        reply: std::sync::mpsc::Sender<AttachInputResult>,
     },
     PaneEvent(PaneEvent),
     FocusSnapshot(bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap),
@@ -235,11 +240,11 @@ impl DecorationEngine {
                 self.publish_read_model_if(changed);
                 let _ = reply.send(Ok(()));
             }
-            DecorationEngineCommand::AttachInput { event, reply } => {
-                let result = handle_attach_input_event(&mut self.state, event);
-                self.publish_read_model_if(result.dirty);
-                let _ = reply.send(result);
-            }
+            DecorationEngineCommand::AttachInput {
+                event,
+                enqueued_at,
+                reply,
+            } => self.handle_attach_input_command(event, enqueued_at, &reply),
             DecorationEngineCommand::PaneEvent(event) => {
                 let changed = notify_pane_event_direct(&mut self.state, &event);
                 self.publish_read_model_if(changed);
@@ -284,6 +289,36 @@ impl DecorationEngine {
         }
     }
 
+    fn handle_attach_input_command(
+        &mut self,
+        event: AttachInputEvent,
+        enqueued_at: Instant,
+        reply: &std::sync::mpsc::Sender<AttachInputResult>,
+    ) {
+        let queue_wait = enqueued_at.elapsed();
+        if queue_wait >= INPUT_QUEUE_WAIT_WARN {
+            tracing::warn!(
+                hook_id = %event.hook_id,
+                event_kind = %event.event_kind,
+                phase = %event.phase,
+                queue_wait_ms = queue_wait.as_millis(),
+                "decoration input waited behind decoration engine work"
+            );
+        }
+        let started_at = Instant::now();
+        let result = handle_attach_input_event(&mut self.state, event);
+        let execution = started_at.elapsed();
+        if execution >= INPUT_EXECUTION_WARN {
+            tracing::warn!(
+                execution_ms = execution.as_millis(),
+                "decoration input script handling exceeded latency budget"
+            );
+        }
+        let dirty = result.dirty;
+        let _ = reply.send(result);
+        self.publish_read_model_if(dirty);
+    }
+
     fn publish_read_model_if(&mut self, changed: bool) {
         if changed {
             self.publish_read_model();
@@ -323,6 +358,40 @@ pub(crate) fn send_engine_command_blocking<T: Send + 'static>(
     let (reply, rx) = tokio::sync::oneshot::channel();
     tx.send(build(reply)).ok()?;
     recv_engine_reply_blocking(rx)
+}
+
+pub(crate) enum SoftInputReply {
+    Replied(AttachInputResult),
+    Deferred,
+    QueueFull,
+    Unavailable,
+}
+
+pub(crate) fn send_attach_input_soft(
+    state: &SharedState,
+    event: AttachInputEvent,
+    timeout: Duration,
+) -> SoftInputReply {
+    ensure_decoration_engine(state);
+    let Some(tx) = state.command_tx() else {
+        return SoftInputReply::Unavailable;
+    };
+    let (reply, rx) = std::sync::mpsc::channel();
+    let command = DecorationEngineCommand::AttachInput {
+        event,
+        enqueued_at: Instant::now(),
+        reply,
+    };
+    match tx.try_send(command) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_)) => return SoftInputReply::QueueFull,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return SoftInputReply::Unavailable,
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => SoftInputReply::Replied(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => SoftInputReply::Deferred,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => SoftInputReply::Unavailable,
+    }
 }
 
 fn recv_engine_reply_blocking<T: Send + 'static>(

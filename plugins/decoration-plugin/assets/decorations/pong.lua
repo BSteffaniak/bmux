@@ -10,6 +10,10 @@ local PADDLE_HIT_PADDING = 1.0
 -- Options: "alternate", "scorer", "scored_on", "random".
 local SERVE_DIRECTION_MODE = "alternate"
 local STEP_MS = 40
+-- Bound catch-up after bmux/server has been idle or detached. Old animation
+-- frames are obsolete once a newer frame is ready, so keep the game live by
+-- simulating only the most recent window instead of replaying days of ticks.
+local MAX_STEPS_PER_RENDER = 12
 local SPEEDUP_PER_HIT = 1.09
 local MAX_SPEED_MULT = 3.05
 local COLLISION_EPS = 0.001
@@ -778,6 +782,12 @@ local function simulate(pane, active_ms, rally_ms, win_hold_ms, content_bounce, 
     local game = state.game
     apply_collision_inputs(game, content_bounce, visual)
     local simulated_ms = state.game_active_ms or 0
+    local max_catchup_ms = STEP_MS * MAX_STEPS_PER_RENDER
+    if active_ms - simulated_ms > max_catchup_ms then
+        simulated_ms = active_ms - max_catchup_ms
+        game.now_ms = simulated_ms
+        reset_stuck_tracker(game)
+    end
     while simulated_ms + STEP_MS <= active_ms do
         simulated_ms = simulated_ms + STEP_MS
         game.now_ms = simulated_ms

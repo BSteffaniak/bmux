@@ -9258,6 +9258,16 @@ fn apply_attach_input_result(
     hook: AttachInputHook,
     result: &AttachInputResult,
 ) {
+    if let Some(message) = result.status_message.as_deref() {
+        view_state.set_transient_status(
+            truncate_attach_status_message(message),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        view_state
+            .dirty
+            .mark_status_dirty(AttachDirtySource::UserAction);
+    }
     if result.release_capture {
         view_state.mouse.input_capture = None;
         return;
