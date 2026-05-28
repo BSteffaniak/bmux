@@ -13,8 +13,9 @@ use bmux_attach_pipeline::reconcile::{
 };
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
-    PaneScrollbackWindow, RetainedDamage, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
-    RetainedSurfacePayload, frame_damage_from_retained_repaint_plan, merge_retained_damages,
+    FrameDamageStats, PaneScrollbackWindow, RetainedDamage, RetainedOpacity,
+    RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload,
+    frame_damage_from_retained_repaint_plan, merge_retained_damages,
     retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
     retained_layer_order, retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
 };
@@ -6518,18 +6519,76 @@ fn terminal_render_capabilities(
     }
 }
 
+struct RetainedDamagePlan {
+    frame: RetainedDamage,
+    explicit_ui: RetainedDamage,
+    graph: RetainedDamage,
+    merged: RetainedDamage,
+}
+
+impl RetainedDamagePlan {
+    const fn is_damaged(damage: &RetainedDamage) -> bool {
+        !matches!(damage, RetainedDamage::None)
+    }
+
+    const fn graph_damaged(&self) -> bool {
+        Self::is_damaged(&self.graph)
+    }
+
+    const fn merged_damaged(&self) -> bool {
+        Self::is_damaged(&self.merged)
+    }
+
+    const fn any_source_damaged(&self) -> bool {
+        Self::is_damaged(&self.frame)
+            || Self::is_damaged(&self.explicit_ui)
+            || Self::is_damaged(&self.graph)
+    }
+}
+
+struct RenderFramePlan {
+    retained: RetainedFramePlan,
+    damage_stats: FrameDamageStats,
+    render_scene: bool,
+    use_synchronized_update: bool,
+}
+
+impl RenderFramePlan {
+    fn from_damage(
+        retained: RetainedFramePlan,
+        frame_damage: &bmux_attach_pipeline::FrameDamage,
+        visualize_damage: bool,
+    ) -> Self {
+        debug_assert!(
+            !retained.damage.merged_damaged() || retained.damage.any_source_damaged(),
+            "merged retained damage should preserve at least one damage source"
+        );
+        let damage_stats = frame_damage.stats();
+        let render_scene = frame_damage.scene_damaged() || retained.graph_damaged();
+        let use_synchronized_update = frame_uses_synchronized_update(frame_damage)
+            || retained.graph_damaged()
+            || visualize_damage;
+        Self {
+            retained,
+            damage_stats,
+            render_scene,
+            use_synchronized_update,
+        }
+    }
+}
+
 struct RetainedFramePlan {
     status_surface: Option<RetainedSurface>,
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
     prompt_surface: Option<RetainedSurface>,
-    graph_damage: RetainedDamage,
+    damage: RetainedDamagePlan,
     repaint_plan: Vec<RetainedRepaintSurface>,
 }
 
 impl RetainedFramePlan {
     const fn graph_damaged(&self) -> bool {
-        !matches!(self.graph_damage, RetainedDamage::None)
+        self.damage.graph_damaged()
     }
 
     fn repaint_by_id(&self) -> BTreeMap<Uuid, &RetainedRepaintSurface> {
@@ -6554,7 +6613,7 @@ fn build_retained_frame_plan(
     let prompt_surface = prompt_overlay_render
         .as_ref()
         .map(retained_prompt_overlay_surface);
-    let retained_frame_damage = retained_frame_damage_from_frame_damage(
+    let frame_retained_damage = retained_frame_damage_from_frame_damage(
         &layout_state.scene,
         frame_damage,
         viewport,
@@ -6585,18 +6644,16 @@ fn build_retained_frame_plan(
         viewport,
         damage_policy,
     );
-    let retained_damage = merge_retained_damages(
+    let merged_damage = merge_retained_damages(
         [
-            retained_frame_damage,
-            explicit_ui_damage,
+            frame_retained_damage.clone(),
+            explicit_ui_damage.clone(),
             graph_damage.clone(),
         ],
         viewport,
         damage_policy,
     );
-    let repaint_plan = view_state
-        .retained_compositor
-        .repaint_plan(&retained_damage);
+    let repaint_plan = view_state.retained_compositor.repaint_plan(&merged_damage);
     frame_damage.merge_from(&frame_damage_from_retained_repaint_plan(
         &layout_state.scene,
         &repaint_plan,
@@ -6607,7 +6664,12 @@ fn build_retained_frame_plan(
         help_surface,
         prompt_overlay_render,
         prompt_surface,
-        graph_damage,
+        damage: RetainedDamagePlan {
+            frame: frame_retained_damage,
+            explicit_ui: explicit_ui_damage,
+            graph: graph_damage,
+            merged: merged_damage,
+        },
         repaint_plan,
     }
 }
@@ -6696,20 +6758,16 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         viewport,
         damage_policy,
     );
-    let damage_stats = frame_damage.stats();
-    let render_scene = frame_damage.scene_damaged() || retained_plan.graph_damaged();
-    let retained_repaint_by_id = retained_plan.repaint_by_id();
-
-    let use_synchronized_update = frame_uses_synchronized_update(&frame_damage)
-        || retained_plan.graph_damaged()
-        || damage_config.visualize;
+    let frame_plan =
+        RenderFramePlan::from_damage(retained_plan, &frame_damage, damage_config.visualize);
+    let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
     let mut frame_bytes = Vec::new();
     // Wrap multi-region scene/overlay frames in a synchronized update so the
     // terminal buffers output and displays it atomically (Mode 2026). Status-only
     // frames are tiny and safe to write directly, avoiding two extra control
     // sequences on the common low-damage path.
-    if use_synchronized_update {
+    if frame_plan.use_synchronized_update {
         queue!(frame_bytes, BeginSynchronizedUpdate)
             .context("failed queuing begin synchronized update")?;
     }
@@ -6723,8 +6781,9 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
-    queue_retained_background_clear(&mut frame_bytes, &retained_plan.graph_damage)?;
-    let status_rendered = if let Some((surface, repaint)) = retained_plan
+    queue_retained_background_clear(&mut frame_bytes, &frame_plan.retained.damage.graph)?;
+    let status_rendered = if let Some((surface, repaint)) = frame_plan
+        .retained
         .status_surface
         .as_ref()
         .zip(retained_repaint_by_id.get(&STATUS_SURFACE_ID))
@@ -6755,7 +6814,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     };
     let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
     let mut scene_render_stats = AttachSceneRenderStats::default();
-    let cursor_state = if render_scene {
+    let cursor_state = if frame_plan.render_scene {
         // Snapshot the current set of registered render extensions
         // once per frame. The snapshot is cheap (Arc-clones) and
         // keeps the per-surface loop inside `render_attach_scene`
@@ -6803,7 +6862,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if render_scene && view_state.host_image_caps.any_supported() {
+    if frame_plan.render_scene && view_state.host_image_caps.any_supported() {
         for surface in &layout_state.scene.surfaces {
             let Some(pane_id) = surface.pane_id else {
                 continue;
@@ -6835,7 +6894,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let previous_cursor_state = view_state.last_cursor_state;
     let mut overlay_rendered = false;
     let mut overlay_cursor_state = None;
-    if let Some(help_surface) = retained_plan.help_surface.as_ref()
+    if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
         && queue_retained_render_ops(&mut frame_bytes, help_surface, repaint)?
     {
@@ -6848,11 +6907,12 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         }
         overlay_rendered = true;
     }
-    if let Some(prompt_surface) = retained_plan.prompt_surface.as_ref()
+    if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
         && queue_retained_render_ops(&mut frame_bytes, prompt_surface, repaint)?
     {
-        overlay_cursor_state = retained_plan
+        overlay_cursor_state = frame_plan
+            .retained
             .prompt_overlay_render
             .as_ref()
             .and_then(|render| render.cursor_state);
@@ -6953,7 +7013,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         display_capture.record_images(&all_images);
     }
 
-    if use_synchronized_update {
+    if frame_plan.use_synchronized_update {
         queue!(frame_bytes, EndSynchronizedUpdate)
             .context("failed queuing end synchronized update")?;
     }
@@ -6977,14 +7037,14 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let stats = AttachFrameRenderStats {
         frame_bytes: frame_bytes.len(),
         terminal_write_ms,
-        damage_rects: damage_stats.rect_count,
-        damage_area_cells: damage_stats.rect_area_cells,
-        full_surface_fallbacks: damage_stats.full_surface_count,
-        full_frame_fallback: damage_stats.full_frame,
+        damage_rects: frame_plan.damage_stats.rect_count,
+        damage_area_cells: frame_plan.damage_stats.rect_area_cells,
+        full_surface_fallbacks: frame_plan.damage_stats.full_surface_count,
+        full_frame_fallback: frame_plan.damage_stats.full_frame,
         scene_render: scene_render_stats,
         status_rendered,
         overlay_rendered,
-        synchronized_update: use_synchronized_update,
+        synchronized_update: frame_plan.use_synchronized_update,
         dirty_event_count: view_state.dirty.dirty_events().len(),
     };
     view_state.last_help_overlay_surface = current_help_overlay_surface;
