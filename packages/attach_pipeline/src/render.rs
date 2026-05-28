@@ -3607,45 +3607,76 @@ fn retain_cached_terminal_graphics_for_visible_surfaces(
     }));
 }
 
+#[derive(Default)]
+struct TerminalGraphicsFrameResources {
+    active_graphics: BTreeSet<u64>,
+}
+
+impl TerminalGraphicsFrameResources {
+    fn begin<W: io::Write>(
+        stdout: &mut W,
+        scene: &AttachScene,
+        graphics_cache: &mut TerminalGraphicsCache,
+        capabilities: TerminalRenderCapabilities,
+        render_stats: Option<&mut AttachSceneRenderStats>,
+    ) -> Result<Self> {
+        let mut resources = Self::default();
+        retain_cached_terminal_graphics_for_visible_surfaces(
+            scene,
+            graphics_cache,
+            capabilities,
+            &mut resources.active_graphics,
+        );
+        cleanup_stale_terminal_graphics(
+            stdout,
+            &resources.active_graphics,
+            graphics_cache,
+            capabilities,
+            render_stats,
+        )?;
+        Ok(resources)
+    }
+
+    const fn active_graphics_mut(&mut self) -> &mut BTreeSet<u64> {
+        &mut self.active_graphics
+    }
+
+    fn finish<W: io::Write>(
+        &self,
+        stdout: &mut W,
+        graphics_cache: &mut TerminalGraphicsCache,
+        capabilities: TerminalRenderCapabilities,
+        render_stats: Option<&mut AttachSceneRenderStats>,
+    ) -> Result<()> {
+        cleanup_stale_terminal_graphics(
+            stdout,
+            &self.active_graphics,
+            graphics_cache,
+            capabilities,
+            render_stats,
+        )?;
+        Ok(())
+    }
+}
+
 fn begin_terminal_graphics_frame<W: io::Write>(
     stdout: &mut W,
     scene: &AttachScene,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
-) -> Result<BTreeSet<u64>> {
-    let mut active_terminal_graphics = BTreeSet::new();
-    retain_cached_terminal_graphics_for_visible_surfaces(
-        scene,
-        graphics_cache,
-        capabilities,
-        &mut active_terminal_graphics,
-    );
-    cleanup_stale_terminal_graphics(
-        stdout,
-        &active_terminal_graphics,
-        graphics_cache,
-        capabilities,
-        render_stats,
-    )?;
-    Ok(active_terminal_graphics)
+) -> Result<TerminalGraphicsFrameResources> {
+    TerminalGraphicsFrameResources::begin(stdout, scene, graphics_cache, capabilities, render_stats)
 }
 
 fn finish_terminal_graphics_frame<W: io::Write>(
     stdout: &mut W,
-    active_terminal_graphics: &BTreeSet<u64>,
+    terminal_graphics: &TerminalGraphicsFrameResources,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<()> {
-    cleanup_stale_terminal_graphics(
-        stdout,
-        active_terminal_graphics,
-        graphics_cache,
-        capabilities,
-        render_stats,
-    )?;
-    Ok(())
+    terminal_graphics.finish(stdout, graphics_cache, capabilities, render_stats)
 }
 
 fn queue_full_frame_content_clear<W: io::Write>(
@@ -4114,7 +4145,7 @@ fn render_attach_scene_inner<W: io::Write>(
         ext.refresh_state();
     }
 
-    let mut active_terminal_graphics = begin_terminal_graphics_frame(
+    let mut terminal_graphics_frame = begin_terminal_graphics_frame(
         stdout,
         scene,
         terminal_graphics_cache,
@@ -4191,7 +4222,7 @@ fn render_attach_scene_inner<W: io::Write>(
             rect,
             content,
             terminal_graphics_cache,
-            &mut active_terminal_graphics,
+            terminal_graphics_frame.active_graphics_mut(),
             frame_damage,
             damage_policy,
             render_extensions,
@@ -4295,7 +4326,7 @@ fn render_attach_scene_inner<W: io::Write>(
                 render_context,
                 pane_buffers,
                 terminal_graphics_cache,
-                &mut active_terminal_graphics,
+                terminal_graphics_frame.active_graphics_mut(),
                 &mut render_stats,
                 &mut render_trace,
             )?;
@@ -4304,7 +4335,7 @@ fn render_attach_scene_inner<W: io::Write>(
 
     finish_terminal_graphics_frame(
         stdout,
-        &active_terminal_graphics,
+        &terminal_graphics_frame,
         terminal_graphics_cache,
         render_context.capabilities,
         render_stats,
@@ -5595,6 +5626,169 @@ mod tests {
         assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
         assert!(!partial.contains("Ga=d,d=p,"), "{partial:?}");
         assert_eq!(graphics_cache.len(), 2);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Regression fixture models a tab/window switch replacing the visible pane surface.
+    fn tab_switch_deletes_stale_surface_kitty_graphics_before_new_graphics() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::{io, sync::Arc};
+
+        struct GraphicsExtension;
+
+        impl AttachRenderExtension for GraphicsExtension {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.tab_switch_graphics"
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn render_layer_items_with_context(
+                &self,
+                _surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                damage: &RenderDamage,
+                layer: RenderExtensionLayer,
+                _context: &bmux_plugin::RenderExtensionContext,
+            ) -> Option<Vec<RenderLayerItem>> {
+                if damage.is_none() || layer != RenderExtensionLayer::AfterPaneContent {
+                    return None;
+                }
+                Some(vec![RenderLayerItem::Graphic(TerminalGraphicOverlay {
+                    key: 1,
+                    cell_rect: *surface_rect,
+                    pixel_width: 8,
+                    pixel_height: 16,
+                    color: TerminalRgba {
+                        r: 90,
+                        g: 120,
+                        b: 200,
+                        a: 255,
+                    },
+                    fill: TerminalGraphicFill::Top { thickness_px: 3 },
+                    z_index: -1,
+                })])
+            }
+        }
+
+        fn pane_scene(session_id: u128, pane_id: Uuid, surface_id: Uuid) -> AttachScene {
+            AttachScene {
+                session_id: Uuid::from_u128(session_id),
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: surface_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 12,
+                        h: 4,
+                    },
+                    content_rect: AttachRect {
+                        x: 1,
+                        y: 1,
+                        w: 10,
+                        h: 2,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_id),
+                }],
+            }
+        }
+
+        let first_pane = Uuid::from_u128(831);
+        let first_surface = Uuid::from_u128(841);
+        let second_pane = Uuid::from_u128(832);
+        let second_surface = Uuid::from_u128(842);
+        let first_scene = pane_scene(830, first_pane, first_surface);
+        let second_scene = pane_scene(830, second_pane, second_surface);
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(GraphicsExtension) as Arc<dyn AttachRenderExtension>];
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(first_pane, PaneRenderBuffer::default());
+        pane_buffers.insert(second_pane, PaneRenderBuffer::default());
+        let mut graphics_cache = TerminalGraphicsCache::new();
+        let capabilities = test_kitty_capabilities();
+
+        render_attach_scene_with_stats_and_trace_with_capabilities(
+            &mut Vec::new(),
+            &first_scene,
+            &[],
+            &mut pane_buffers,
+            &mut graphics_cache,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (12, 4),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            capabilities,
+            None,
+        )
+        .expect("initial tab render should queue a graphic");
+        assert_eq!(graphics_cache.len(), 1);
+
+        let mut switched = Vec::new();
+        render_attach_scene_with_stats_and_trace_with_capabilities(
+            &mut switched,
+            &second_scene,
+            &[],
+            &mut pane_buffers,
+            &mut graphics_cache,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (12, 4),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            capabilities,
+            None,
+        )
+        .expect("tab switch render should delete stale graphic and queue replacement");
+
+        let switched = String::from_utf8(switched).expect("kitty command should be utf8");
+        let placement_delete_at = switched
+            .find("Ga=d,d=p,")
+            .expect("stale placement should be deleted on tab switch");
+        let image_delete_at = switched
+            .find("Ga=d,d=i,")
+            .expect("stale image source should be deleted on tab switch");
+        let transmit_at = switched
+            .find("Ga=t,")
+            .expect("replacement tab graphic should be transmitted");
+        assert!(
+            placement_delete_at < transmit_at && image_delete_at < transmit_at,
+            "stale deletes should precede replacement graphic: {switched:?}"
+        );
+        assert_eq!(graphics_cache.len(), 1);
     }
 
     #[cfg(feature = "image-kitty")]
