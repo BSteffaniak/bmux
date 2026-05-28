@@ -3681,13 +3681,76 @@ fn queue_full_frame_content_clear<W: io::Write>(
     Ok(())
 }
 
+struct PaneContentDamagePlan {
+    direct_content_damaged: bool,
+    direct_content_rects: Vec<DamageRect>,
+    before_content_rects: Vec<DamageRect>,
+    after_content_cleanup_rects: Vec<DamageRect>,
+}
+
+impl PaneContentDamagePlan {
+    fn from_frame(
+        pane_id: Uuid,
+        frame_damage: &FrameDamage,
+        before_content_rects: Vec<DamageRect>,
+        after_content_cleanup_rects: Vec<DamageRect>,
+    ) -> Self {
+        Self {
+            direct_content_damaged: frame_damage.content_surface_damaged(pane_id),
+            direct_content_rects: frame_damage.content_surface_rects(pane_id).to_vec(),
+            before_content_rects,
+            after_content_cleanup_rects,
+        }
+    }
+
+    const fn requires_redraw(&self) -> bool {
+        self.direct_content_damaged
+            || !self.before_content_rects.is_empty()
+            || !self.after_content_cleanup_rects.is_empty()
+    }
+
+    fn effective_rects(&self) -> Vec<DamageRect> {
+        let mut rects = self.direct_content_rects.clone();
+        rects.extend(self.before_content_rects.iter().copied());
+        rects.extend(self.after_content_cleanup_rects.iter().copied());
+        rects
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)] // Explicit stage gates keep the surface plan readable while preserving existing render decisions.
+struct PaneSurfaceFramePlan {
+    retained_repaint: bool,
+    focused: bool,
+    sync_deferred: bool,
+    after_content_cleanup: AfterContentCleanupPlan,
+    content_damage: PaneContentDamagePlan,
+    draw_extensions: bool,
+}
+
+impl PaneSurfaceFramePlan {
+    const fn should_draw_extensions(&self) -> bool {
+        self.draw_extensions
+    }
+
+    const fn should_draw_content(&self) -> bool {
+        self.content_damage.requires_redraw()
+    }
+
+    const fn should_cleanup_after_content(&self) -> bool {
+        self.after_content_cleanup.is_damaged()
+    }
+
+    const fn should_render_surface(&self) -> bool {
+        self.focused || self.retained_repaint || self.should_draw_content() || self.draw_extensions
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)] // Explicit booleans mirror existing frame-stage gates during behavior-preserving extraction.
 struct PaneContentRenderStage<'a> {
     pane_id: Uuid,
     surface_index: usize,
     content: PaneRect,
     focus: bool,
-    should_draw_content: bool,
     sync_deferred: bool,
     scrollback_active: bool,
     scrollback_offset: usize,
@@ -3695,9 +3758,7 @@ struct PaneContentRenderStage<'a> {
     selection_anchor: Option<AttachScrollbackPosition>,
     runtime_appearance: &'a RuntimeAppearance,
     before_content_cells: &'a BeforeContentCells,
-    before_content_damage: &'a [DamageRect],
-    after_content_damage: &'a [DamageRect],
-    frame_damage: &'a FrameDamage,
+    content_damage: &'a PaneContentDamagePlan,
 }
 
 #[allow(clippy::too_many_lines)] // Preserve pane-row byte emission order while extracting the content stage.
@@ -3786,7 +3847,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 });
             }
         }
-        if !stage.should_draw_content || stage.sync_deferred {
+        if !stage.content_damage.requires_redraw() || stage.sync_deferred {
             if stage.sync_deferred
                 && let Some(stats) = render_stats.as_deref_mut()
             {
@@ -3803,10 +3864,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 });
             }
         } else {
-            let damaged_content_rows = stage.frame_damage.content_surface_rects(stage.pane_id);
-            let mut effective_content_damage = damaged_content_rows.to_vec();
-            effective_content_damage.extend(stage.before_content_damage.iter().copied());
-            effective_content_damage.extend(stage.after_content_damage.iter().copied());
+            let effective_content_damage = stage.content_damage.effective_rects();
             for row in 0..inner_h {
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
@@ -3966,7 +4024,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
             // Trim stale cache entries if the visible row count shrank.
             entry.prev_rows.truncate(inner_h);
         }
-    } else if stage.should_draw_content || !stage.before_content_damage.is_empty() {
+    } else if stage.content_damage.requires_redraw() {
         let palette = bmux_terminal_grid::StylePalette::default();
         for row in 0..inner_h {
             let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
@@ -4142,7 +4200,6 @@ fn render_attach_scene_inner<W: io::Write>(
         )?;
         let before_content_cells = before_content.0;
         let before_content_damage = before_content.1;
-        let before_content_damaged = !before_content_damage.is_empty();
         let ext_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
         let after_content_cleanup = after_content_cleanup_plan_for_surface(
             surface.id,
@@ -4152,20 +4209,6 @@ fn render_attach_scene_inner<W: io::Write>(
             damage_policy,
             render_extensions,
         );
-        let should_draw_content = frame_damage.content_surface_damaged(pane_id)
-            || before_content_damaged
-            || !after_content_cleanup.content_damage.is_empty();
-        let should_draw_extensions = frame_damage.extension_surface_damaged(surface.id, pane_id);
-        if let Some(stats) = render_stats.as_deref_mut() {
-            stats.visible_pane_surfaces = stats.visible_pane_surfaces.saturating_add(1);
-            if should_draw_content {
-                stats.damaged_content_surfaces = stats.damaged_content_surfaces.saturating_add(1);
-            }
-            if should_draw_extensions {
-                stats.damaged_extension_surfaces =
-                    stats.damaged_extension_surfaces.saturating_add(1);
-            }
-        }
 
         // Defer drawing pane content while the inner application is inside a
         // DEC mode 2026 synchronized update.  The server's byte-by-byte CSI
@@ -4181,18 +4224,38 @@ fn render_attach_scene_inner<W: io::Write>(
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
-        if !focus
-            && !retained_repaint_ids.contains(&surface.id)
-            && !should_draw_content
-            && !should_draw_extensions
-        {
+        let surface_plan = PaneSurfaceFramePlan {
+            retained_repaint: retained_repaint_ids.contains(&surface.id),
+            focused: focus,
+            sync_deferred,
+            content_damage: PaneContentDamagePlan::from_frame(
+                pane_id,
+                frame_damage,
+                before_content_damage,
+                after_content_cleanup.content_damage.clone(),
+            ),
+            after_content_cleanup,
+            draw_extensions: frame_damage.extension_surface_damaged(surface.id, pane_id),
+        };
+        if let Some(stats) = render_stats.as_deref_mut() {
+            stats.visible_pane_surfaces = stats.visible_pane_surfaces.saturating_add(1);
+            if surface_plan.should_draw_content() {
+                stats.damaged_content_surfaces = stats.damaged_content_surfaces.saturating_add(1);
+            }
+            if surface_plan.should_draw_extensions() {
+                stats.damaged_extension_surfaces =
+                    stats.damaged_extension_surfaces.saturating_add(1);
+            }
+        }
+
+        if !surface_plan.should_render_surface() {
             continue;
         }
-        if after_content_cleanup.is_damaged() {
+        if surface_plan.should_cleanup_after_content() {
             queue_after_content_cleanup_for_damage(
                 stdout,
                 ext_rect,
-                &after_content_cleanup.surface_damage,
+                &surface_plan.after_content_cleanup.surface_damage,
             )
             .context("failed clearing stale after-content decoration cells")?;
         }
@@ -4203,18 +4266,15 @@ fn render_attach_scene_inner<W: io::Write>(
                 pane_id,
                 surface_index,
                 content,
-                focus,
-                should_draw_content,
-                sync_deferred,
+                focus: surface_plan.focused,
+                sync_deferred: surface_plan.sync_deferred,
                 scrollback_active,
                 scrollback_offset,
                 scrollback_cursor,
                 selection_anchor,
                 runtime_appearance,
                 before_content_cells: &before_content_cells,
-                before_content_damage: &before_content_damage,
-                after_content_damage: &after_content_cleanup.content_damage,
-                frame_damage,
+                content_damage: &surface_plan.content_damage,
             },
             &mut render_stats,
             &mut render_trace,
@@ -4222,7 +4282,7 @@ fn render_attach_scene_inner<W: io::Write>(
             cursor_state = Some(content_cursor_state);
         }
 
-        if should_draw_extensions {
+        if surface_plan.should_draw_extensions() {
             queue_after_content_extensions_for_surface(
                 stdout,
                 pane_id,
