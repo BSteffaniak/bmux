@@ -6757,6 +6757,243 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Regression fixture drives content damage through after-content replay.
+    fn content_damage_replays_after_content_decorations() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::Arc;
+
+        struct AfterContentOverlay;
+
+        impl AttachRenderExtension for AfterContentOverlay {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.after_content_overlay"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                RenderDamage::None
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn render_ops(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> Option<Vec<RenderOp>> {
+                Some(vec![RenderOp::TextRun {
+                    x: 0,
+                    y: 0,
+                    text: "OVR".to_string(),
+                    style: RenderStyle::default(),
+                }])
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1801);
+        let scene = single_pane_scene(pane_id, 10, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 10, b"abc");
+        pane_buffers.insert(pane_id, pane_buffer);
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(AfterContentOverlay) as Arc<dyn AttachRenderExtension>];
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (10, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("initial render should populate row cache");
+
+        append_pane_output(
+            pane_buffers
+                .get_mut(&pane_id)
+                .expect("pane buffer should exist"),
+            b"!",
+        );
+        let mut output = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &content_damage(pane_id),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (10, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            None,
+        )
+        .expect("content-damaged render should replay after-content overlay");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let content_at = rendered
+            .find("abc!")
+            .expect("pane content should be emitted after content damage");
+        let overlay_at = rendered
+            .find("OVR")
+            .expect("after-content overlay should be replayed after content damage");
+        assert!(
+            content_at < overlay_at,
+            "after-content overlay must render after pane content: {rendered:?}"
+        );
+        assert_eq!(stats.damaged_content_surfaces, 1);
+        assert_eq!(stats.damaged_extension_surfaces, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Regression fixture verifies stale after-content cells are cleared before content replay.
+    fn stale_after_content_cells_are_cleared_before_content_repaint() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::Arc;
+
+        struct StaleAfterContentCells;
+
+        impl AttachRenderExtension for StaleAfterContentCells {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.stale_after_content_cells"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => {
+                        RenderDamage::Regions(vec![ExtensionRect::new(1, 0, 3, 1)])
+                    }
+                }
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn render_layer_ops(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+                _layer: RenderExtensionLayer,
+            ) -> Option<Vec<RenderOp>> {
+                Some(Vec::new())
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1802);
+        let scene = single_pane_scene(pane_id, 8, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
+        pane_buffers.insert(pane_id, pane_buffer);
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("initial render should populate row cache");
+
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(StaleAfterContentCells) as Arc<dyn AttachRenderExtension>];
+        let mut output = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::default(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            None,
+        )
+        .expect("stale after-content cleanup should render");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let clear_at = rendered
+            .find("\u{1b}[1;2H   ")
+            .expect("stale after-content cells should be cleared");
+        let repaint_at = rendered
+            .rfind("bcd")
+            .expect("underlying pane content should be replayed after cleanup");
+        assert!(
+            clear_at < repaint_at,
+            "cleanup must precede content repaint: {rendered:?}"
+        );
+        assert_eq!(stats.damaged_content_surfaces, 1);
+        assert_eq!(stats.pane_row_segments_emitted, 1);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Test covers render-op execution and cache replay in one fixture.
     fn render_attach_scene_prefers_declarative_render_extension_ops() {
         use bmux_plugin::AttachRenderExtension;
