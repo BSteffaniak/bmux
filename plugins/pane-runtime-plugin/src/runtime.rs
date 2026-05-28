@@ -1476,6 +1476,153 @@ impl PaneRuntimeHandle {
     }
 }
 
+#[derive(Clone)]
+struct PaneAttachDataRef {
+    pane_id: Uuid,
+    name: Option<String>,
+    exited: Arc<AtomicBool>,
+    exit_reason: Arc<std::sync::Mutex<Option<String>>>,
+    output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
+    terminal_grid_deltas: Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
+    output_dirty: Arc<AtomicBool>,
+    sync_update_in_progress: Arc<AtomicBool>,
+    mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
+    input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
+    #[cfg(feature = "image-registry")]
+    image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
+    #[cfg(feature = "image-registry")]
+    image_dirty: Arc<AtomicBool>,
+}
+
+struct AttachSceneDataSnapshot {
+    focused_pane_id: Uuid,
+    panes: Vec<PaneAttachDataRef>,
+    layout_root: bmux_attach_layout_protocol::PaneLayoutNode,
+    scene: AttachScene,
+    zoomed: bool,
+}
+
+#[derive(Clone)]
+struct PanePersistenceDataRef {
+    meta: PaneRuntimeMeta,
+    exited: Arc<AtomicBool>,
+    process_id: Arc<std::sync::Mutex<Option<u32>>>,
+    process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
+    resurrection_state: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
+}
+
+struct PersistenceSnapshotParts {
+    focused_pane_id: Uuid,
+    layout_root: Option<PaneLayoutNode>,
+    floating_surfaces: Vec<FloatingSurfaceRuntime>,
+    attached_clients: BTreeSet<ClientId>,
+    attach_viewport: Option<AttachViewport>,
+    panes: Vec<PanePersistenceDataRef>,
+}
+
+fn pane_persistence_data_ref(pane: &PaneRuntimeHandle) -> PanePersistenceDataRef {
+    PanePersistenceDataRef {
+        meta: pane.meta.clone(),
+        exited: Arc::clone(&pane.exited),
+        process_id: Arc::clone(&pane.process_id),
+        process_group_id: Arc::clone(&pane.process_group_id),
+        resurrection_state: Arc::clone(&pane.resurrection_state),
+    }
+}
+
+fn pane_attach_data_ref(
+    _owner_session_id: SessionId,
+    pane_id: Uuid,
+    pane: &PaneRuntimeHandle,
+) -> PaneAttachDataRef {
+    PaneAttachDataRef {
+        pane_id,
+        name: pane.meta.name.clone(),
+        exited: Arc::clone(&pane.exited),
+        exit_reason: Arc::clone(&pane.exit_reason),
+        output_buffer: Arc::clone(&pane.output_buffer),
+        terminal_grid: Arc::clone(&pane.terminal_grid),
+        terminal_grid_deltas: Arc::clone(&pane.terminal_grid_deltas),
+        output_dirty: Arc::clone(&pane.output_dirty),
+        sync_update_in_progress: Arc::clone(&pane.sync_update_in_progress),
+        mouse_protocol_state: Arc::clone(&pane.mouse_protocol_state),
+        input_mode_state: Arc::clone(&pane.input_mode_state),
+        #[cfg(feature = "image-registry")]
+        image_registry: Arc::clone(&pane.image_registry),
+        #[cfg(feature = "image-registry")]
+        image_dirty: Arc::clone(&pane.image_dirty),
+    }
+}
+
+fn pane_summary_for_data_ref(
+    index: usize,
+    focused_pane_id: Uuid,
+    pane: &PaneAttachDataRef,
+) -> PaneSummary {
+    PaneSummary {
+        id: pane.pane_id,
+        index: u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX),
+        name: pane.name.clone(),
+        focused: pane.pane_id == focused_pane_id,
+        state: if pane.exited.load(Ordering::SeqCst) {
+            PaneState::Exited
+        } else {
+            PaneState::Running
+        },
+        state_reason: pane
+            .exit_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone()),
+    }
+}
+
+fn attach_pane_chunk_for_client(
+    pane: &PaneAttachDataRef,
+    client_id: ClientId,
+    max_bytes: usize,
+) -> Result<AttachPaneChunk, SessionRuntimeError> {
+    let read = pane
+        .output_buffer
+        .lock()
+        .map_err(|_| SessionRuntimeError::Closed)?
+        .read_for_client(client_id, max_bytes);
+    Ok(AttachPaneChunk {
+        pane_id: pane.pane_id,
+        data: read.bytes,
+        stream_start: read.stream_start,
+        stream_end: read.stream_end,
+        stream_gap: read.stream_gap,
+        sync_update_active: pane.sync_update_in_progress.load(Ordering::SeqCst),
+    })
+}
+
+fn attach_pane_recent_chunk(
+    pane: &PaneAttachDataRef,
+    client_id: ClientId,
+    max_bytes: usize,
+) -> Result<AttachPaneChunk, SessionRuntimeError> {
+    let read = {
+        let mut output = pane
+            .output_buffer
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        let read = output.read_recent_with_offsets(max_bytes);
+        output.advance_client_to_end(client_id);
+        read
+    };
+    pane.output_dirty.store(false, Ordering::SeqCst);
+    Ok(AttachPaneChunk {
+        pane_id: pane.pane_id,
+        data: read.bytes,
+        stream_start: read.stream_start,
+        stream_end: read.stream_end,
+        stream_gap: read.stream_gap,
+        sync_update_active: pane.sync_update_in_progress.load(Ordering::SeqCst),
+    })
+}
+
 impl SessionRuntimeManager {
     fn bump_attach_view_revision(&mut self, session_id: SessionId) -> Option<u64> {
         let runtime = self.runtimes.get_mut(&session_id)?;
@@ -1875,6 +2022,9 @@ struct RemovedRuntime {
     handle: SessionRuntimeHandle,
 }
 
+// Retained as manager-local DTOs for legacy helper methods that are still useful
+// in tests and during the ongoing runtime-store split.
+#[allow(dead_code)]
 struct AttachLayoutState {
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
@@ -1883,6 +2033,9 @@ struct AttachLayoutState {
     zoomed: bool,
 }
 
+// Retained as manager-local DTOs for legacy helper methods that are still useful
+// in tests and during the ongoing runtime-store split.
+#[allow(dead_code)]
 struct AttachSnapshotState {
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
@@ -1894,6 +2047,9 @@ struct AttachSnapshotState {
     zoomed: bool,
 }
 
+// Retained as manager-local DTOs for legacy helper methods that are still useful
+// in tests and during the ongoing runtime-store split.
+#[allow(dead_code)]
 struct AttachPaneSnapshotState {
     chunks: Vec<AttachPaneChunk>,
     pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
@@ -4053,12 +4209,11 @@ impl SessionRuntimeManager {
             .collect()
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    fn attach_layout_state(
+    fn attach_scene_data_snapshot(
         &self,
         session_id: SessionId,
         client_id: ClientId,
-    ) -> Result<AttachLayoutState, SessionRuntimeError> {
+    ) -> Result<AttachSceneDataSnapshot, SessionRuntimeError> {
         let session = self
             .runtimes
             .get(&session_id)
@@ -4070,24 +4225,16 @@ impl SessionRuntimeManager {
         let pane_refs = self.attach_scene_pane_refs(session_id, &scene);
         let focused_pane_id = focused_pane_for_scene(&scene, session.focused_pane_id);
         let panes = pane_refs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (owner_session_id, pane_id))| {
+            .into_iter()
+            .filter_map(|(owner_session_id, pane_id)| {
                 self.runtimes
-                    .get(owner_session_id)?
+                    .get(&owner_session_id)?
                     .panes
-                    .get(pane_id)
-                    .map(|pane| PaneSummary {
-                        id: *pane_id,
-                        index: (index + 1) as u32,
-                        name: pane.meta.name.clone(),
-                        focused: *pane_id == focused_pane_id,
-                        state: pane_state_for_handle(pane),
-                        state_reason: pane_state_reason_for_handle(pane),
-                    })
+                    .get(&pane_id)
+                    .map(|pane| pane_attach_data_ref(owner_session_id, pane_id, pane))
             })
             .collect::<Vec<_>>();
-        Ok(AttachLayoutState {
+        Ok(AttachSceneDataSnapshot {
             focused_pane_id,
             panes,
             layout_root: fallback_ipc_layout(session),
@@ -4096,7 +4243,124 @@ impl SessionRuntimeManager {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    fn attach_pane_data_refs_for_scene_panes(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+    ) -> Result<Vec<PaneAttachDataRef>, SessionRuntimeError> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !session.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+        Ok(pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                let owner_session_id = self.pane_session_for_attach(session_id, *pane_id)?;
+                self.runtimes
+                    .get(&owner_session_id)?
+                    .panes
+                    .get(pane_id)
+                    .map(|pane| pane_attach_data_ref(owner_session_id, *pane_id, pane))
+            })
+            .collect())
+    }
+
+    fn attach_pane_data_refs_for_session_panes(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+    ) -> Result<Vec<PaneAttachDataRef>, SessionRuntimeError> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !session.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+        Ok(pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                session
+                    .panes
+                    .get(pane_id)
+                    .map(|pane| pane_attach_data_ref(session_id, *pane_id, pane))
+            })
+            .collect())
+    }
+
+    fn attach_pane_data_ref_for_push(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        client_id: ClientId,
+    ) -> Option<PaneAttachDataRef> {
+        let session = self.runtimes.get(&session_id)?;
+        if !session.attached_clients.contains(&client_id) {
+            return None;
+        }
+        let pane = session.panes.get(&pane_id)?;
+        Some(pane_attach_data_ref(session_id, pane_id, pane))
+    }
+
+    fn pane_data_refs_for_images(
+        &self,
+        session_id: SessionId,
+        pane_ids: &[Uuid],
+    ) -> Vec<PaneAttachDataRef> {
+        let Some(session) = self.runtimes.get(&session_id) else {
+            return Vec::new();
+        };
+        pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                session
+                    .panes
+                    .get(pane_id)
+                    .map(|pane| pane_attach_data_ref(session_id, *pane_id, pane))
+            })
+            .collect()
+    }
+
+    fn persistence_snapshot_parts(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<PersistenceSnapshotParts>> {
+        let Some(runtime) = self.runtimes.get(&session_id) else {
+            return Ok(None);
+        };
+        validate_runtime_layout_matches_panes(runtime).with_context(|| {
+            format!(
+                "cannot snapshot inconsistent layout for session {}",
+                session_id.0
+            )
+        })?;
+        let pane_ids = ordered_pane_ids(runtime);
+        let mut panes = Vec::with_capacity(pane_ids.len());
+        for pane_id in pane_ids {
+            let Some(pane) = runtime.panes.get(&pane_id) else {
+                anyhow::bail!(
+                    "layout references missing pane {pane_id} in session {}",
+                    session_id.0
+                );
+            };
+            panes.push(pane_persistence_data_ref(pane));
+        }
+        Ok(Some(PersistenceSnapshotParts {
+            focused_pane_id: runtime.focused_pane_id,
+            layout_root: runtime.layout_root.clone(),
+            floating_surfaces: runtime.floating_surfaces.clone(),
+            attached_clients: runtime.attached_clients.clone(),
+            attach_viewport: runtime.attach_viewport,
+            panes,
+        }))
+    }
+
+    #[allow(dead_code, clippy::cast_possible_truncation)]
     fn attach_snapshot_state(
         &mut self,
         session_id: SessionId,
@@ -4203,6 +4467,7 @@ impl SessionRuntimeManager {
         })
     }
 
+    #[allow(dead_code)]
     fn read_pane_output_batch(
         &mut self,
         session_id: SessionId,
@@ -4261,6 +4526,7 @@ impl SessionRuntimeManager {
         Ok(chunks)
     }
 
+    #[allow(dead_code)]
     fn attach_pane_snapshot_state(
         &mut self,
         session_id: SessionId,
@@ -4627,10 +4893,16 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 // pane-runtime plugin crate, this adapter and its registration move
 // with it.
 
+struct ManagerLockHolder {
+    operation: &'static str,
+    started: std::time::Instant,
+}
+
 struct ServerSessionRuntimeAdapter {
     inner: Arc<Mutex<SessionRuntimeManager>>,
     pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
     client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
+    current_holder: Arc<Mutex<Option<ManagerLockHolder>>>,
 }
 
 impl ServerSessionRuntimeAdapter {
@@ -4653,24 +4925,63 @@ impl ServerSessionRuntimeAdapter {
             inner,
             pane_input_index,
             client_write_permissions,
+            current_holder: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn current_holder_snapshot(&self) -> Option<(&'static str, u128)> {
+        self.current_holder.lock().ok().and_then(|holder| {
+            holder
+                .as_ref()
+                .map(|h| (h.operation, h.started.elapsed().as_millis()))
+        })
+    }
+
+    fn mark_holder_start(&self, operation: &'static str) {
+        if let Ok(mut holder) = self.current_holder.lock() {
+            *holder = Some(ManagerLockHolder {
+                operation,
+                started: std::time::Instant::now(),
+            });
+        }
+    }
+
+    fn mark_holder_end(&self) {
+        if let Ok(mut holder) = self.current_holder.lock() {
+            *holder = None;
         }
     }
 
     fn with_lock<R>(&self, f: impl FnOnce(&mut SessionRuntimeManager) -> R) -> Option<R> {
+        self.with_lock_named("unknown", f)
+    }
+
+    fn with_lock_named<R>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut SessionRuntimeManager) -> R,
+    ) -> Option<R> {
         let wait_started = std::time::Instant::now();
         let mut guard = self.inner.lock().ok()?;
         let wait = wait_started.elapsed();
         if wait > Duration::from_millis(10) {
+            let holder = self.current_holder_snapshot();
             warn!(
+                operation,
                 wait_ms = wait.as_millis(),
+                holder_operation = holder.map(|(op, _)| op),
+                holder_ms = holder.map(|(_, ms)| ms),
                 "pane runtime manager lock wait exceeded hot-path budget"
             );
         }
+        self.mark_holder_start(operation);
         let hold_started = std::time::Instant::now();
         let result = f(&mut guard);
         let hold = hold_started.elapsed();
+        self.mark_holder_end();
         if hold > Duration::from_millis(10) {
             warn!(
+                operation,
                 hold_ms = hold.as_millis(),
                 "pane runtime manager lock hold exceeded hot-path budget"
             );
@@ -4679,20 +4990,35 @@ impl ServerSessionRuntimeAdapter {
     }
 
     fn with_lock_read<R>(&self, f: impl FnOnce(&SessionRuntimeManager) -> R) -> Option<R> {
+        self.with_lock_read_named("unknown", f)
+    }
+
+    fn with_lock_read_named<R>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&SessionRuntimeManager) -> R,
+    ) -> Option<R> {
         let wait_started = std::time::Instant::now();
         let guard = self.inner.lock().ok()?;
         let wait = wait_started.elapsed();
         if wait > Duration::from_millis(10) {
+            let holder = self.current_holder_snapshot();
             warn!(
+                operation,
                 wait_ms = wait.as_millis(),
+                holder_operation = holder.map(|(op, _)| op),
+                holder_ms = holder.map(|(_, ms)| ms),
                 "pane runtime manager read lock wait exceeded hot-path budget"
             );
         }
+        self.mark_holder_start(operation);
         let hold_started = std::time::Instant::now();
         let result = f(&guard);
         let hold = hold_started.elapsed();
+        self.mark_holder_end();
         if hold > Duration::from_millis(10) {
             warn!(
+                operation,
                 hold_ms = hold.as_millis(),
                 "pane runtime manager read lock hold exceeded hot-path budget"
             );
@@ -5105,8 +5431,22 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_ids: &[Uuid],
         max_bytes: usize,
     ) -> Result<Vec<AttachPaneChunk>, SessionRuntimeError> {
-        self.with_lock(|m| m.read_pane_output_batch(session_id, client_id, pane_ids, max_bytes))
-            .unwrap_or(Err(SessionRuntimeError::Closed))
+        let panes = self
+            .with_lock_read_named("read_pane_output_batch.resolve", |m| {
+                m.attach_pane_data_refs_for_scene_panes(session_id, client_id, pane_ids)
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let num_panes = pane_ids.len().max(1);
+        let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes);
+        let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
+        let mut chunks = Vec::new();
+        for pane in panes {
+            let allowed = per_pane_budget.min(budget_remaining);
+            let chunk = attach_pane_chunk_for_client(&pane, client_id, allowed)?;
+            budget_remaining = budget_remaining.saturating_sub(chunk.data.len());
+            chunks.push(chunk);
+        }
+        Ok(chunks)
     }
 
     fn attach_pane_output_batch_with_dirty_check(
@@ -5116,25 +5456,36 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_ids: &[Uuid],
         max_bytes: usize,
     ) -> (Result<Vec<AttachPaneChunk>, SessionRuntimeError>, bool) {
-        self.with_lock(|m| {
-            if let Some(runtime) = m.runtimes.get(&session_id) {
-                for pane_id in pane_ids {
-                    if let Some(pane) = runtime.panes.get(pane_id) {
-                        pane.output_dirty.store(false, Ordering::SeqCst);
-                    }
+        let panes = match self
+            .with_lock_read_named("attach_pane_output_batch.resolve", |m| {
+                m.attach_pane_data_refs_for_scene_panes(session_id, client_id, pane_ids)
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))
+        {
+            Ok(panes) => panes,
+            Err(err) => return (Err(err), false),
+        };
+        for pane in &panes {
+            pane.output_dirty.store(false, Ordering::SeqCst);
+        }
+        let num_panes = pane_ids.len().max(1);
+        let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes);
+        let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
+        let mut chunks = Vec::new();
+        for pane in &panes {
+            let allowed = per_pane_budget.min(budget_remaining);
+            match attach_pane_chunk_for_client(pane, client_id, allowed) {
+                Ok(chunk) => {
+                    budget_remaining = budget_remaining.saturating_sub(chunk.data.len());
+                    chunks.push(chunk);
                 }
+                Err(err) => return (Err(err), false),
             }
-            let chunks = m.read_pane_output_batch(session_id, client_id, pane_ids, max_bytes);
-            let still_pending = m.runtimes.get(&session_id).is_some_and(|rt| {
-                pane_ids.iter().any(|pane_id| {
-                    rt.panes
-                        .get(pane_id)
-                        .is_some_and(|p| p.output_dirty.load(Ordering::SeqCst))
-                })
-            });
-            (chunks, still_pending)
-        })
-        .unwrap_or((Err(SessionRuntimeError::Closed), false))
+        }
+        let still_pending = panes
+            .iter()
+            .any(|pane| pane.output_dirty.load(Ordering::SeqCst));
+        (Ok(chunks), still_pending)
     }
 
     fn attach_pane_image_deltas(
@@ -5144,42 +5495,40 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         since_sequences: &[u64],
         payload_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
     ) -> Vec<bmux_attach_image_protocol::AttachPaneImageDelta> {
-        self.with_lock_read(|m| {
-            let mut result = Vec::new();
-            let Some(runtime) = m.runtimes.get(&session_id) else {
-                return result;
+        let panes = self
+            .with_lock_read_named("attach_pane_image_deltas.resolve", |m| {
+                m.pane_data_refs_for_images(session_id, pane_ids)
+            })
+            .unwrap_or_default();
+        let pane_by_id = panes
+            .into_iter()
+            .map(|pane| (pane.pane_id, pane))
+            .collect::<BTreeMap<_, _>>();
+        let mut result = Vec::new();
+        for (i, pane_id) in pane_ids.iter().enumerate() {
+            let Some(pane) = pane_by_id.get(pane_id) else {
+                continue;
             };
-            for pane_id in pane_ids {
-                if let Some(pane) = runtime.panes.get(pane_id) {
-                    #[cfg(feature = "image-registry")]
-                    pane.image_dirty.store(false, Ordering::SeqCst);
-                    #[cfg(not(feature = "image-registry"))]
-                    let _ = pane;
-                }
+            #[cfg(feature = "image-registry")]
+            pane.image_dirty.store(false, Ordering::SeqCst);
+            let since = since_sequences.get(i).copied().unwrap_or(0);
+            #[cfg(feature = "image-registry")]
+            if let Ok(reg) = pane.image_registry.lock() {
+                let delta = reg.delta_since(since);
+                result.push(delta.to_ipc(*pane_id, payload_codec));
             }
-            for (i, pane_id) in pane_ids.iter().enumerate() {
-                let since = since_sequences.get(i).copied().unwrap_or(0);
-                if let Some(pane) = runtime.panes.get(pane_id) {
-                    #[cfg(feature = "image-registry")]
-                    if let Ok(reg) = pane.image_registry.lock() {
-                        let delta = reg.delta_since(since);
-                        result.push(delta.to_ipc(*pane_id, payload_codec));
-                    }
-                    #[cfg(not(feature = "image-registry"))]
-                    {
-                        let _ = (pane, since, payload_codec);
-                        result.push(bmux_attach_image_protocol::AttachPaneImageDelta {
-                            pane_id: *pane_id,
-                            added: Vec::new(),
-                            removed: Vec::new(),
-                            sequence: 0,
-                        });
-                    }
-                }
+            #[cfg(not(feature = "image-registry"))]
+            {
+                let _ = (pane, since, payload_codec);
+                result.push(bmux_attach_image_protocol::AttachPaneImageDelta {
+                    pane_id: *pane_id,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    sequence: 0,
+                });
             }
-            result
-        })
-        .unwrap_or_default()
+        }
+        result
     }
 
     fn begin_attach(
@@ -5267,15 +5616,23 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<bmux_pane_runtime_state::AttachLayoutState, SessionRuntimeError> {
-        let inner = self
-            .with_lock(|m| m.attach_layout_state(session_id, client_id))
+        let snapshot = self
+            .with_lock_read_named("attach_layout_state.snapshot", |m| {
+                m.attach_scene_data_snapshot(session_id, client_id)
+            })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let panes = snapshot
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| pane_summary_for_data_ref(index, snapshot.focused_pane_id, pane))
+            .collect();
         Ok(bmux_pane_runtime_state::AttachLayoutState {
-            focused_pane_id: inner.focused_pane_id,
-            panes: inner.panes,
-            layout_root: inner.layout_root,
-            scene: inner.scene,
-            zoomed: inner.zoomed,
+            focused_pane_id: snapshot.focused_pane_id,
+            panes,
+            layout_root: snapshot.layout_root,
+            scene: snapshot.scene,
+            zoomed: snapshot.zoomed,
         })
     }
 
@@ -5285,18 +5642,56 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         max_bytes_per_pane: usize,
     ) -> Result<bmux_pane_runtime_state::AttachSnapshotState, SessionRuntimeError> {
-        let inner = self
-            .with_lock(|m| m.attach_snapshot_state(session_id, client_id, max_bytes_per_pane))
+        let snapshot = self
+            .with_lock_read_named("attach_snapshot_state.snapshot", |m| {
+                m.attach_scene_data_snapshot(session_id, client_id)
+            })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let panes = snapshot
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| pane_summary_for_data_ref(index, snapshot.focused_pane_id, pane))
+            .collect::<Vec<_>>();
+        let mut chunks = Vec::new();
+        let mut pane_mouse_protocols = Vec::new();
+        let mut pane_input_modes = Vec::new();
+        let num_panes = snapshot.panes.len().max(1);
+        let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
+        let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
+        for pane in &snapshot.panes {
+            let protocol = pane
+                .mouse_protocol_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_mouse_protocols.push(AttachPaneMouseProtocol {
+                pane_id: pane.pane_id,
+                protocol,
+            });
+            let mode = pane
+                .input_mode_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_input_modes.push(AttachPaneInputMode {
+                pane_id: pane.pane_id,
+                mode,
+            });
+            let allowed = per_pane_budget.min(budget_remaining);
+            let chunk = attach_pane_recent_chunk(pane, client_id, allowed)?;
+            budget_remaining = budget_remaining.saturating_sub(chunk.data.len());
+            chunks.push(chunk);
+        }
         Ok(bmux_pane_runtime_state::AttachSnapshotState {
-            focused_pane_id: inner.focused_pane_id,
-            panes: inner.panes,
-            layout_root: inner.layout_root,
-            scene: inner.scene,
-            zoomed: inner.zoomed,
-            chunks: inner.chunks,
-            pane_mouse_protocols: inner.pane_mouse_protocols,
-            pane_input_modes: inner.pane_input_modes,
+            focused_pane_id: snapshot.focused_pane_id,
+            panes,
+            layout_root: snapshot.layout_root,
+            scene: snapshot.scene,
+            zoomed: snapshot.zoomed,
+            chunks,
+            pane_mouse_protocols,
+            pane_input_modes,
         })
     }
 
@@ -5307,15 +5702,49 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_ids: &[Uuid],
         max_bytes_per_pane: usize,
     ) -> Result<bmux_pane_runtime_state::AttachPaneSnapshotState, SessionRuntimeError> {
-        let inner = self
-            .with_lock(|m| {
-                m.attach_pane_snapshot_state(session_id, client_id, pane_ids, max_bytes_per_pane)
+        let panes = self
+            .with_lock_read_named("attach_pane_snapshot_state.resolve", |m| {
+                m.attach_pane_data_refs_for_scene_panes(session_id, client_id, pane_ids)
             })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let num_panes = pane_ids.len().max(1);
+        let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
+        let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
+        let mut chunks = Vec::new();
+        let mut pane_mouse_protocols = Vec::new();
+        let mut pane_input_modes = Vec::new();
+        let mut seen = BTreeSet::new();
+        for pane in panes {
+            if !seen.insert(pane.pane_id) {
+                continue;
+            }
+            let protocol = pane
+                .mouse_protocol_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_mouse_protocols.push(AttachPaneMouseProtocol {
+                pane_id: pane.pane_id,
+                protocol,
+            });
+            let mode = pane
+                .input_mode_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_input_modes.push(AttachPaneInputMode {
+                pane_id: pane.pane_id,
+                mode,
+            });
+            let allowed = per_pane_budget.min(budget_remaining);
+            let chunk = attach_pane_recent_chunk(&pane, client_id, allowed)?;
+            budget_remaining = budget_remaining.saturating_sub(chunk.data.len());
+            chunks.push(chunk);
+        }
         Ok(bmux_pane_runtime_state::AttachPaneSnapshotState {
-            chunks: inner.chunks,
-            pane_mouse_protocols: inner.pane_mouse_protocols,
-            pane_input_modes: inner.pane_input_modes,
+            chunks,
+            pane_mouse_protocols,
+            pane_input_modes,
         })
     }
 
@@ -5326,50 +5755,39 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_ids: &[Uuid],
         max_rows_per_pane: usize,
     ) -> Result<bmux_pane_runtime_state::AttachGridSnapshotState, SessionRuntimeError> {
-        self.with_lock(|m| {
-            let session = m
-                .runtimes
-                .get(&session_id)
-                .ok_or(SessionRuntimeError::NotFound)?;
-            if !session.attached_clients.contains(&client_id) {
-                return Err(SessionRuntimeError::NotAttached);
+        let panes = self
+            .with_lock_read_named("attach_grid_snapshot_state.resolve", |m| {
+                m.attach_pane_data_refs_for_session_panes(session_id, client_id, pane_ids)
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let mut snapshots = Vec::new();
+        let mut seen = BTreeSet::new();
+        for pane in panes {
+            if !seen.insert(pane.pane_id) {
+                continue;
             }
-            let mut snapshots = Vec::new();
-            let mut seen = BTreeSet::new();
-            for pane_id in pane_ids {
-                if !seen.insert(*pane_id) {
-                    continue;
-                }
-                let Some(pane) = session.panes.get(pane_id) else {
-                    continue;
-                };
-                let snapshot = {
-                    let grid = pane
-                        .terminal_grid
-                        .lock()
-                        .map_err(|_| SessionRuntimeError::Closed)?;
-                    grid.snapshot(0, max_rows_per_pane)
-                };
-                let stream_end = {
-                    let mut output = pane
-                        .output_buffer
-                        .lock()
-                        .map_err(|_| SessionRuntimeError::Closed)?;
-                    let stream_end = output.end_offset();
-                    output.set_client_cursor(client_id, stream_end);
-                    stream_end
-                };
-                let encoded =
-                    serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
-                snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
-                    pane_id: *pane_id,
-                    stream_end,
-                    encoded,
-                });
-            }
-            Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
-        })
-        .unwrap_or(Err(SessionRuntimeError::Closed))
+            let snapshot = pane
+                .terminal_grid
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .snapshot(0, max_rows_per_pane);
+            let stream_end = {
+                let mut output = pane
+                    .output_buffer
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)?;
+                let stream_end = output.end_offset();
+                output.set_client_cursor(client_id, stream_end);
+                stream_end
+            };
+            let encoded = serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+            snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
+                pane_id: pane.pane_id,
+                stream_end,
+                encoded,
+            });
+        }
+        Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
     }
 
     fn attach_grid_window_state(
@@ -5378,78 +5796,70 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         windows: &[bmux_pane_runtime_state::AttachPaneGridWindowRequest],
     ) -> Result<bmux_pane_runtime_state::AttachGridWindowState, SessionRuntimeError> {
-        self.with_lock(|m| {
-            let session = m
-                .runtimes
-                .get(&session_id)
-                .ok_or(SessionRuntimeError::NotFound)?;
-            if !session.attached_clients.contains(&client_id) {
-                return Err(SessionRuntimeError::NotAttached);
-            }
-            let mut snapshots = Vec::new();
-            for window in windows {
-                let Some(owner_session_id) = m.pane_session_for_attach(session_id, window.pane_id)
-                else {
-                    continue;
-                };
-                let Some(pane) = m
-                    .runtimes
-                    .get(&owner_session_id)
-                    .and_then(|runtime| runtime.panes.get(&window.pane_id))
-                else {
-                    continue;
-                };
-                let (
-                    snapshot,
+        let pane_ids = windows
+            .iter()
+            .map(|window| window.pane_id)
+            .collect::<Vec<_>>();
+        let panes = self
+            .with_lock_read_named("attach_grid_window_state.resolve", |m| {
+                m.attach_pane_data_refs_for_scene_panes(session_id, client_id, &pane_ids)
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let pane_by_id = panes
+            .into_iter()
+            .map(|pane| (pane.pane_id, pane))
+            .collect::<BTreeMap<_, _>>();
+        let mut snapshots = Vec::new();
+        for window in windows {
+            let Some(pane) = pane_by_id.get(&window.pane_id) else {
+                continue;
+            };
+            let (
+                snapshot,
+                max_scrollback_offset,
+                total_scrolled_rows,
+                adjusted_offset,
+                desired_offset,
+            ) = {
+                let grid = pane
+                    .terminal_grid
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)?;
+                let total_scrolled_rows = grid.grid().total_scrolled_rows();
+                let max_scrollback_offset = grid.grid().max_scrollback_offset();
+                let anchor_growth = window
+                    .anchor_total_scrolled_rows
+                    .map_or(0, |anchor| total_scrolled_rows.saturating_sub(anchor));
+                let desired_offset = window
+                    .scrollback_offset
+                    .saturating_add(usize::try_from(anchor_growth).unwrap_or(usize::MAX));
+                let adjusted_offset = desired_offset.min(max_scrollback_offset);
+                (
+                    grid.snapshot(adjusted_offset, window.rows),
                     max_scrollback_offset,
                     total_scrolled_rows,
                     adjusted_offset,
                     desired_offset,
-                ) = {
-                    let grid = pane
-                        .terminal_grid
-                        .lock()
-                        .map_err(|_| SessionRuntimeError::Closed)?;
-                    let total_scrolled_rows = grid.grid().total_scrolled_rows();
-                    let max_scrollback_offset = grid.grid().max_scrollback_offset();
-                    let anchor_growth = window
-                        .anchor_total_scrolled_rows
-                        .map_or(0, |anchor| total_scrolled_rows.saturating_sub(anchor));
-                    let desired_offset = window
-                        .scrollback_offset
-                        .saturating_add(usize::try_from(anchor_growth).unwrap_or(usize::MAX));
-                    let adjusted_offset = desired_offset.min(max_scrollback_offset);
-                    (
-                        grid.snapshot(adjusted_offset, window.rows),
-                        max_scrollback_offset,
-                        total_scrolled_rows,
-                        adjusted_offset,
-                        desired_offset,
-                    )
-                };
-                let stream_end = {
-                    let output = pane
-                        .output_buffer
-                        .lock()
-                        .map_err(|_| SessionRuntimeError::Closed)?;
-                    output.end_offset()
-                };
-                let encoded =
-                    serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
-                snapshots.push(bmux_pane_runtime_state::AttachPaneGridWindow {
-                    pane_id: window.pane_id,
-                    scrollback_offset: adjusted_offset,
-                    max_scrollback_offset,
-                    total_scrolled_rows,
-                    anchor_delta_rows: adjusted_offset.saturating_sub(window.scrollback_offset),
-                    anchor_clamped: adjusted_offset < desired_offset,
-                    stream_end,
-                    encoded,
-                });
-            }
-            Ok(bmux_pane_runtime_state::AttachGridWindowState { windows: snapshots })
-        })
-        .unwrap_or(Err(SessionRuntimeError::Closed))
+                )
+            };
+            let stream_end = pane
+                .output_buffer
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .end_offset();
+            let encoded = serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+            snapshots.push(bmux_pane_runtime_state::AttachPaneGridWindow {
+                pane_id: window.pane_id,
+                scrollback_offset: adjusted_offset,
+                max_scrollback_offset,
+                total_scrolled_rows,
+                anchor_delta_rows: adjusted_offset.saturating_sub(window.scrollback_offset),
+                anchor_clamped: adjusted_offset < desired_offset,
+                stream_end,
+                encoded,
+            });
+        }
+        Ok(bmux_pane_runtime_state::AttachGridWindowState { windows: snapshots })
     }
 
     fn attach_grid_delta_state(
@@ -5460,85 +5870,84 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         base_revisions: &[u64],
         max_batches_per_pane: usize,
     ) -> Result<bmux_pane_runtime_state::AttachGridDeltaState, SessionRuntimeError> {
-        self.with_lock(|m| {
-            let session = m
-                .runtimes
-                .get(&session_id)
-                .ok_or(SessionRuntimeError::NotFound)?;
-            if !session.attached_clients.contains(&client_id) {
-                return Err(SessionRuntimeError::NotAttached);
+        let panes = self
+            .with_lock_read_named("attach_grid_delta_state.resolve", |m| {
+                m.attach_pane_data_refs_for_session_panes(session_id, client_id, pane_ids)
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let pane_by_id = panes
+            .into_iter()
+            .map(|pane| (pane.pane_id, pane))
+            .collect::<BTreeMap<_, _>>();
+        let mut deltas = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (index, pane_id) in pane_ids.iter().enumerate() {
+            if !seen.insert(*pane_id) {
+                continue;
             }
-            let mut deltas = Vec::new();
-            let mut seen = BTreeSet::new();
-            for (index, pane_id) in pane_ids.iter().enumerate() {
-                if !seen.insert(*pane_id) {
+            let Some(pane) = pane_by_id.get(pane_id) else {
+                continue;
+            };
+            let base_revision = base_revisions.get(index).copied().unwrap_or_default();
+            let current_revision = pane
+                .terminal_grid
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .grid()
+                .revision();
+            let (encoded, revision, desynced) = if base_revision == current_revision {
+                (Vec::new(), current_revision, false)
+            } else {
+                let log = pane
+                    .terminal_grid_deltas
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)?;
+                let Some(start) = log
+                    .iter()
+                    .position(|delta| delta.base_revision == base_revision)
+                else {
+                    deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
+                        pane_id: *pane_id,
+                        base_revision,
+                        revision: current_revision,
+                        desynced: true,
+                        encoded: Vec::new(),
+                    });
+                    continue;
+                };
+                let selected = select_terminal_grid_deltas(
+                    &log,
+                    start,
+                    max_batches_per_pane,
+                    RESPONSE_OUTPUT_BUDGET,
+                );
+                if selected.is_empty() {
+                    deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
+                        pane_id: *pane_id,
+                        base_revision,
+                        revision: current_revision,
+                        desynced: true,
+                        encoded: Vec::new(),
+                    });
                     continue;
                 }
-                let Some(pane) = session.panes.get(pane_id) else {
-                    continue;
-                };
-                let base_revision = base_revisions.get(index).copied().unwrap_or_default();
-                let current_revision = pane
-                    .terminal_grid
-                    .lock()
-                    .map_err(|_| SessionRuntimeError::Closed)?
-                    .grid()
-                    .revision();
-                let (encoded, revision, desynced) = if base_revision == current_revision {
-                    (Vec::new(), current_revision, false)
-                } else {
-                    let log = pane
-                        .terminal_grid_deltas
-                        .lock()
-                        .map_err(|_| SessionRuntimeError::Closed)?;
-                    let Some(start) = log
-                        .iter()
-                        .position(|delta| delta.base_revision == base_revision)
-                    else {
-                        deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
-                            pane_id: *pane_id,
-                            base_revision,
-                            revision: current_revision,
-                            desynced: true,
-                            encoded: Vec::new(),
-                        });
-                        continue;
-                    };
-                    let selected = select_terminal_grid_deltas(
-                        &log,
-                        start,
-                        max_batches_per_pane,
-                        RESPONSE_OUTPUT_BUDGET,
-                    );
-                    if selected.is_empty() {
-                        deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
-                            pane_id: *pane_id,
-                            base_revision,
-                            revision: current_revision,
-                            desynced: true,
-                            encoded: Vec::new(),
-                        });
-                        continue;
-                    }
-                    let revision = selected
-                        .last()
-                        .map_or(base_revision, |delta| delta.revision);
-                    let desynced = revision != current_revision;
-                    let encoded =
-                        serde_json::to_vec(&selected).map_err(|_| SessionRuntimeError::Closed)?;
-                    (encoded, revision, desynced)
-                };
-                deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
-                    pane_id: *pane_id,
-                    base_revision,
-                    revision,
-                    desynced,
-                    encoded,
-                });
-            }
-            Ok(bmux_pane_runtime_state::AttachGridDeltaState { deltas })
-        })
-        .unwrap_or(Err(SessionRuntimeError::Closed))
+                let revision = selected
+                    .last()
+                    .map_or(base_revision, |delta| delta.revision);
+                let desynced = revision != current_revision;
+                let encoded =
+                    serde_json::to_vec(&selected).map_err(|_| SessionRuntimeError::Closed)?;
+                (encoded, revision, desynced)
+            };
+            deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
+                pane_id: *pane_id,
+                base_revision,
+                revision,
+                desynced,
+                encoded,
+            });
+        }
+        Ok(bmux_pane_runtime_state::AttachGridDeltaState { deltas })
     }
 
     fn pane_state(&self, session_id: SessionId, pane_id: Uuid) -> Option<PaneState> {
@@ -5562,25 +5971,31 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     }
 
     fn clear_output_dirty(&self, session_id: SessionId, pane_id: Uuid) {
-        let _ = self.with_lock_read(|m| {
-            if let Some(r) = m.runtimes.get(&session_id)
-                && let Some(p) = r.panes.get(&pane_id)
-            {
-                p.output_dirty.store(false, Ordering::SeqCst);
-            }
-        });
+        if let Some(pane) = self
+            .with_lock_read_named("clear_output_dirty.resolve", |m| {
+                m.runtimes
+                    .get(&session_id)
+                    .and_then(|r| r.panes.get(&pane_id))
+                    .map(|pane| pane_attach_data_ref(session_id, pane_id, pane))
+            })
+            .flatten()
+        {
+            pane.output_dirty.store(false, Ordering::SeqCst);
+        }
     }
 
     fn clear_image_dirty(&self, session_id: SessionId, pane_id: Uuid) {
         #[cfg(feature = "image-registry")]
+        if let Some(pane) = self
+            .with_lock_read_named("clear_image_dirty.resolve", |m| {
+                m.runtimes
+                    .get(&session_id)
+                    .and_then(|r| r.panes.get(&pane_id))
+                    .map(|pane| pane_attach_data_ref(session_id, pane_id, pane))
+            })
+            .flatten()
         {
-            let _ = self.with_lock_read(|m| {
-                if let Some(r) = m.runtimes.get(&session_id)
-                    && let Some(p) = r.panes.get(&pane_id)
-                {
-                    p.image_dirty.store(false, Ordering::SeqCst);
-                }
-            });
+            pane.image_dirty.store(false, Ordering::SeqCst);
         }
         #[cfg(not(feature = "image-registry"))]
         {
@@ -5603,13 +6018,14 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_id: Uuid,
         _client_id: ClientId,
     ) -> bool {
-        self.with_lock_read(|m| {
+        self.with_lock_read_named("pane_output_has_pending.resolve", |m| {
             m.runtimes
                 .get(&session_id)
                 .and_then(|r| r.panes.get(&pane_id))
-                .is_some_and(|p| p.output_dirty.load(Ordering::SeqCst))
+                .map(|pane| Arc::clone(&pane.output_dirty))
         })
-        .unwrap_or(false)
+        .flatten()
+        .is_some_and(|dirty| dirty.load(Ordering::SeqCst))
     }
 
     fn session_has_stored_viewport(&self, session_id: SessionId) -> bool {
@@ -5645,99 +6061,81 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         .flatten()
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Snapshot persistence must validate and refresh all panes from one consistent runtime-manager view."
-    )]
     fn snapshot_session_runtime_for_persistence(
         &self,
         session_id: SessionId,
     ) -> anyhow::Result<Option<bmux_pane_runtime_state::SessionRuntimeSnapshot>> {
-        self.with_lock(|m| {
-            let Some(runtime) = m.runtimes.get_mut(&session_id) else {
-                return Ok(None);
-            };
+        let Some(parts) = self
+            .with_lock_read_named("snapshot_session_runtime_for_persistence.resolve", |m| {
+                m.persistence_snapshot_parts(session_id)
+            })
+            .unwrap_or_else(|| Err(anyhow::anyhow!("session runtime manager lock poisoned")))?
+        else {
+            return Ok(None);
+        };
 
-            validate_runtime_layout_matches_panes(runtime).with_context(|| {
-                format!(
-                    "cannot snapshot inconsistent layout for session {}",
-                    session_id.0
-                )
-            })?;
+        let mut panes = Vec::with_capacity(parts.panes.len());
+        for pane in parts.panes {
+            let process_id = pane.process_id.lock().ok().and_then(|v| *v);
+            let process_group_id = pane.process_group_id.lock().ok().and_then(|v| *v);
+            let mut resurrection_runtime = pane
+                .resurrection_state
+                .lock()
+                .ok()
+                .map(|s| s.clone())
+                .unwrap_or_default();
 
-            let pane_ids = ordered_pane_ids(runtime);
-            let mut panes = Vec::with_capacity(pane_ids.len());
-            for pane_id in pane_ids {
-                let Some(pane) = runtime.panes.get_mut(&pane_id) else {
-                    anyhow::bail!(
-                        "layout references missing pane {pane_id} in session {}",
-                        session_id.0
-                    );
-                };
-
-                let process_id = pane.process_id.lock().ok().and_then(|v| *v);
-                let process_group_id = pane.process_group_id.lock().ok().and_then(|v| *v);
-                let mut resurrection_runtime = pane
-                    .resurrection_state
-                    .lock()
-                    .ok()
-                    .map(|s| s.clone())
-                    .unwrap_or_default();
-
-                if !pane.exited.load(Ordering::SeqCst)
-                    && resurrection_runtime.active_command_source
-                        != Some(PaneCommandSource::Verbatim)
-                {
-                    match inspect_process_group_command_and_cwd(
-                        process_group_id,
-                        process_id,
-                        &pane.meta.shell,
-                    ) {
-                        Some(inspection) => {
-                            if let Some(command) = inspection.command {
-                                resurrection_runtime.active_command = Some(command);
-                                resurrection_runtime.active_command_source =
-                                    Some(PaneCommandSource::Inspection);
-                            } else if resurrection_runtime.active_command_source
-                                == Some(PaneCommandSource::Inspection)
-                            {
-                                resurrection_runtime.active_command = None;
-                                resurrection_runtime.active_command_source = None;
-                            }
-                            if let Some(cwd) = inspection.cwd {
-                                resurrection_runtime.last_known_cwd = Some(cwd);
-                            }
-                        }
-                        None if resurrection_runtime.active_command_source
-                            == Some(PaneCommandSource::Inspection) =>
+            if !pane.exited.load(Ordering::SeqCst)
+                && resurrection_runtime.active_command_source != Some(PaneCommandSource::Verbatim)
+            {
+                match inspect_process_group_command_and_cwd(
+                    process_group_id,
+                    process_id,
+                    &pane.meta.shell,
+                ) {
+                    Some(inspection) => {
+                        if let Some(command) = inspection.command {
+                            resurrection_runtime.active_command = Some(command);
+                            resurrection_runtime.active_command_source =
+                                Some(PaneCommandSource::Inspection);
+                        } else if resurrection_runtime.active_command_source
+                            == Some(PaneCommandSource::Inspection)
                         {
                             resurrection_runtime.active_command = None;
                             resurrection_runtime.active_command_source = None;
                         }
-                        None => {}
+                        if let Some(cwd) = inspection.cwd {
+                            resurrection_runtime.last_known_cwd = Some(cwd);
+                        }
                     }
+                    None if resurrection_runtime.active_command_source
+                        == Some(PaneCommandSource::Inspection) =>
+                    {
+                        resurrection_runtime.active_command = None;
+                        resurrection_runtime.active_command_source = None;
+                    }
+                    None => {}
                 }
-
-                if let Ok(mut state_guard) = pane.resurrection_state.lock() {
-                    *state_guard = resurrection_runtime.clone();
-                }
-
-                let mut meta = pane.meta.clone();
-                meta.resurrection = resurrection_runtime.to_snapshot();
-                panes.push(meta);
             }
 
-            Ok(Some(bmux_pane_runtime_state::SessionRuntimeSnapshot {
-                session_id,
-                panes,
-                focused_pane_id: runtime.focused_pane_id,
-                layout_root: runtime.layout_root.clone(),
-                floating_surfaces: runtime.floating_surfaces.clone(),
-                attached_clients: runtime.attached_clients.clone(),
-                attach_viewport: runtime.attach_viewport,
-            }))
-        })
-        .unwrap_or_else(|| Err(anyhow::anyhow!("session runtime manager lock poisoned")))
+            if let Ok(mut state_guard) = pane.resurrection_state.lock() {
+                *state_guard = resurrection_runtime.clone();
+            }
+
+            let mut meta = pane.meta;
+            meta.resurrection = resurrection_runtime.to_snapshot();
+            panes.push(meta);
+        }
+
+        Ok(Some(bmux_pane_runtime_state::SessionRuntimeSnapshot {
+            session_id,
+            panes,
+            focused_pane_id: parts.focused_pane_id,
+            layout_root: parts.layout_root,
+            floating_surfaces: parts.floating_surfaces,
+            attached_clients: parts.attached_clients,
+            attach_viewport: parts.attach_viewport,
+        }))
     }
 
     fn list_session_ids(&self) -> Vec<SessionId> {
@@ -5761,10 +6159,6 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         }
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Guard must live for the duration of the runtime lookup + pane read; tightening would split it into two locks."
-    )]
     fn read_pane_output_for_push(
         &self,
         session_id: SessionId,
@@ -5772,20 +6166,18 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         budget: usize,
     ) -> Option<(bmux_pane_runtime_state::OutputRead, bool)> {
-        let (inner_read, sync_update_active) = {
-            let guard = self.inner.lock().ok()?;
-            let runtime = guard.runtimes.get(&session_id)?;
-            if !runtime.attached_clients.contains(&client_id) {
-                return None;
-            }
-            let pane = runtime.panes.get(&pane_id)?;
-            pane.output_dirty.store(false, Ordering::SeqCst);
-            let mut buf = pane.output_buffer.lock().ok()?;
-            let inner_read = buf.read_for_client(client_id, budget);
-            let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
-            drop(buf);
-            (inner_read, sync_update_active)
-        };
+        let pane = self
+            .with_lock_read_named("read_pane_output_for_push.resolve", |m| {
+                m.attach_pane_data_ref_for_push(session_id, pane_id, client_id)
+            })
+            .flatten()?;
+        pane.output_dirty.store(false, Ordering::SeqCst);
+        let inner_read = pane
+            .output_buffer
+            .lock()
+            .ok()?
+            .read_for_client(client_id, budget);
+        let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
         Some((
             bmux_pane_runtime_state::OutputRead {
                 bytes: inner_read.bytes,
