@@ -4736,6 +4736,128 @@ struct PaneContentRenderStage<'a> {
     content_damage: &'a PaneContentDamagePlan,
 }
 
+struct PaneContentRowOutputPlan {
+    row: u16,
+    y: u16,
+    line: String,
+    action: PaneContentRowOutputAction,
+}
+
+enum PaneContentRowOutputAction {
+    Full {
+        width: u16,
+    },
+    Segments {
+        segments: Vec<PaneContentRowSegmentOutput>,
+    },
+    CacheSkip,
+}
+
+struct PaneContentRowSegmentOutput {
+    start_col: u16,
+    width: u16,
+    text: String,
+}
+
+impl PaneContentRowOutputPlan {
+    const fn full(row: u16, y: u16, width: u16, line: String) -> Self {
+        Self {
+            row,
+            y,
+            line,
+            action: PaneContentRowOutputAction::Full { width },
+        }
+    }
+
+    const fn segments(
+        row: u16,
+        y: u16,
+        line: String,
+        segments: Vec<PaneContentRowSegmentOutput>,
+    ) -> Self {
+        Self {
+            row,
+            y,
+            line,
+            action: PaneContentRowOutputAction::Segments { segments },
+        }
+    }
+
+    const fn cache_skip(row: u16, line: String) -> Self {
+        Self {
+            row,
+            y: 0,
+            line,
+            action: PaneContentRowOutputAction::CacheSkip,
+        }
+    }
+}
+
+fn execute_pane_content_row_output_plan<W: io::Write>(
+    stdout: &mut W,
+    content_x: u16,
+    surface_index: usize,
+    plan: &PaneContentRowOutputPlan,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) -> Result<()> {
+    match &plan.action {
+        PaneContentRowOutputAction::Full { width } => {
+            queue!(stdout, MoveTo(content_x, plan.y), Print(&plan.line))
+                .context("failed drawing pane content")?;
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
+                stats.pane_cells_emitted =
+                    stats.pane_cells_emitted.saturating_add(u64::from(*width));
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::PaneRowFull {
+                    surface_index,
+                    row: plan.row,
+                    cells: *width,
+                });
+            }
+        }
+        PaneContentRowOutputAction::Segments { segments } => {
+            for segment in segments {
+                queue!(
+                    stdout,
+                    MoveTo(content_x.saturating_add(segment.start_col), plan.y),
+                    Print(&segment.text)
+                )
+                .context("failed drawing damaged pane content segment")?;
+                if let Some(stats) = render_stats.as_deref_mut() {
+                    stats.pane_row_segments_emitted =
+                        stats.pane_row_segments_emitted.saturating_add(1);
+                    stats.pane_cells_emitted = stats
+                        .pane_cells_emitted
+                        .saturating_add(u64::from(segment.width));
+                }
+                if let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::PaneRowSegment {
+                        surface_index,
+                        row: plan.row,
+                        start_col: segment.start_col,
+                        cells: segment.width,
+                    });
+                }
+            }
+        }
+        PaneContentRowOutputAction::CacheSkip => {
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.pane_rows_cached_skipped = stats.pane_rows_cached_skipped.saturating_add(1);
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
+                    surface_index,
+                    row: plan.row,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // Preserve pane-row byte emission order while extracting the content stage.
 fn queue_pane_content_for_surface<W: io::Write>(
     stdout: &mut W,
@@ -4899,101 +5021,74 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 // Row-level diff: skip emitting if the rendered string matches
                 // the previous frame's cached version for this row.
                 let cached = entry.prev_rows.get(row);
-                if cached.is_none_or(|c| *c != line) {
-                    queue!(stdout, MoveTo(stage.content.x, y), Print(&line))
-                        .context("failed drawing pane content")?;
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
-                        stats.pane_cells_emitted = stats
-                            .pane_cells_emitted
-                            .saturating_add(u64::from(inner_width));
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        trace.push(AttachRenderTraceOp::PaneRowFull {
-                            surface_index: stage.surface_index,
-                            row: row_u16,
-                            cells: inner_width,
-                        });
-                    }
+                let row_plan = if cached.is_none_or(|c| *c != line) {
+                    PaneContentRowOutputPlan::full(row_u16, y, inner_width, line)
                 } else if force_row_damage {
-                    for (start_col, end_col) in damaged_ranges {
-                        let segment = grid_rows.get(row).map_or_else(
-                            || {
-                                let blank_row = PhysicalRow::new();
-                                render_grid_row_segment(
-                                    GridRowRenderContext {
-                                        row: &blank_row,
-                                        selection,
-                                        absolute_row: if use_scrollback {
-                                            stage.scrollback_offset.saturating_add(row)
-                                        } else {
-                                            row
+                    let segments = damaged_ranges
+                        .into_iter()
+                        .map(|(start_col, end_col)| {
+                            let text = grid_rows.get(row).map_or_else(
+                                || {
+                                    let blank_row = PhysicalRow::new();
+                                    render_grid_row_segment(
+                                        GridRowRenderContext {
+                                            row: &blank_row,
+                                            selection,
+                                            absolute_row: if use_scrollback {
+                                                stage.scrollback_offset.saturating_add(row)
+                                            } else {
+                                                row
+                                            },
+                                            runtime_appearance: stage.runtime_appearance,
+                                            palette: entry.terminal_grid.grid().palette(),
+                                            before_content_cells: &before_cells,
                                         },
-                                        runtime_appearance: stage.runtime_appearance,
-                                        palette: entry.terminal_grid.grid().palette(),
-                                        before_content_cells: &before_cells,
-                                    },
-                                    start_col,
-                                    end_col,
-                                )
-                            },
-                            |grid_row| {
-                                render_grid_row_segment(
-                                    GridRowRenderContext {
-                                        row: grid_row,
-                                        selection,
-                                        absolute_row: if use_scrollback {
-                                            stage.scrollback_offset.saturating_add(row)
-                                        } else {
-                                            row
+                                        start_col,
+                                        end_col,
+                                    )
+                                },
+                                |grid_row| {
+                                    render_grid_row_segment(
+                                        GridRowRenderContext {
+                                            row: grid_row,
+                                            selection,
+                                            absolute_row: if use_scrollback {
+                                                stage.scrollback_offset.saturating_add(row)
+                                            } else {
+                                                row
+                                            },
+                                            runtime_appearance: stage.runtime_appearance,
+                                            palette: entry.terminal_grid.grid().palette(),
+                                            before_content_cells: &before_cells,
                                         },
-                                        runtime_appearance: stage.runtime_appearance,
-                                        palette: entry.terminal_grid.grid().palette(),
-                                        before_content_cells: &before_cells,
-                                    },
-                                    start_col,
-                                    end_col,
-                                )
-                            },
-                        );
-                        queue!(
-                            stdout,
-                            MoveTo(stage.content.x.saturating_add(start_col), y),
-                            Print(segment)
-                        )
-                        .context("failed drawing damaged pane content segment")?;
-                        if let Some(stats) = render_stats.as_deref_mut() {
-                            stats.pane_row_segments_emitted =
-                                stats.pane_row_segments_emitted.saturating_add(1);
-                            stats.pane_cells_emitted = stats
-                                .pane_cells_emitted
-                                .saturating_add(u64::from(end_col.saturating_sub(start_col)));
-                        }
-                        if let Some(trace) = render_trace.as_deref_mut() {
-                            trace.push(AttachRenderTraceOp::PaneRowSegment {
-                                surface_index: stage.surface_index,
-                                row: row_u16,
+                                        start_col,
+                                        end_col,
+                                    )
+                                },
+                            );
+                            PaneContentRowSegmentOutput {
                                 start_col,
-                                cells: end_col.saturating_sub(start_col),
-                            });
-                        }
-                    }
+                                width: end_col.saturating_sub(start_col),
+                                text,
+                            }
+                        })
+                        .collect();
+                    PaneContentRowOutputPlan::segments(row_u16, y, line, segments)
                 } else {
-                    if let Some(stats) = render_stats.as_deref_mut() {
-                        stats.pane_rows_cached_skipped =
-                            stats.pane_rows_cached_skipped.saturating_add(1);
-                    }
-                    if let Some(trace) = render_trace.as_deref_mut() {
-                        trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
-                            surface_index: stage.surface_index,
-                            row: row_u16,
-                        });
-                    }
-                }
+                    PaneContentRowOutputPlan::cache_skip(row_u16, line)
+                };
+                execute_pane_content_row_output_plan(
+                    stdout,
+                    stage.content.x,
+                    stage.surface_index,
+                    &row_plan,
+                    render_stats,
+                    render_trace,
+                )?;
                 if row < entry.prev_rows.len() {
-                    entry.prev_rows[row] = line;
+                    entry.prev_rows[row] = row_plan.line;
                 } else {
-                    entry.prev_rows.push(line);
+                    entry.prev_rows.push(row_plan.line);
                 }
             }
             // Trim stale cache entries if the visible row count shrank.
@@ -5327,14 +5422,16 @@ mod tests {
     use super::{
         AfterContentExtensionOutputAction, AttachLayer, AttachLayerSurface, AttachRenderTrace,
         AttachRenderTraceOp, BeforeContentExtensionOutputAction, DamageCoalescingPolicy,
-        DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext, RenderVisibleCell,
+        DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext,
+        PaneContentRowOutputPlan, PaneContentRowSegmentOutput, RenderVisibleCell,
         RenderVisibleCellPlan, TerminalCommand, append_pane_output,
         build_after_content_extension_output_plan, build_before_content_extension_output_plan,
         build_render_ops_output_plan, coalesce_render_damage,
-        commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
-        opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
-        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
-        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        commit_extension_layer_snapshots_for_surface, execute_pane_content_row_output_plan,
+        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
+        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
+        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
+        render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -5779,6 +5876,29 @@ mod tests {
             plan.commands.last(),
             Some(TerminalCommand::ResetStyle)
         ));
+    }
+
+    #[test]
+    fn pane_content_row_output_plan_executes_planned_segments() {
+        let plan = PaneContentRowOutputPlan::segments(
+            2,
+            4,
+            "unchanged row".to_string(),
+            vec![PaneContentRowSegmentOutput {
+                start_col: 3,
+                width: 4,
+                text: "diff".to_string(),
+            }],
+        );
+        let mut output = Vec::new();
+        let mut stats = None;
+        let mut trace = None;
+
+        execute_pane_content_row_output_plan(&mut output, 10, 7, &plan, &mut stats, &mut trace)
+            .expect("planned row segment should emit");
+
+        let output = String::from_utf8(output).expect("row output should be utf8");
+        assert!(output.contains("\u{1b}[5;14Hdiff"), "{output:?}");
     }
 
     #[test]
