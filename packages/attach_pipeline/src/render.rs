@@ -3948,81 +3948,176 @@ fn before_content_cells_for_surface<W: io::Write>(
     let mut cells = BTreeMap::new();
     let mut damage_rects = Vec::new();
     for snapshot in layer_snapshots {
-        let ext = snapshot.extension.as_ref();
-        let damage = snapshot.render_damage.clone();
-        if damage.is_none() {
-            continue;
-        }
         debug_assert_eq!(snapshot.surface_id, surface.id);
         debug_assert_eq!(snapshot.pane_id, pane_id);
-        if let Some(stats) = render_stats.as_deref_mut() {
-            stats.record_extension_render_call(ext.name(), &damage);
-        }
-        match &damage {
-            RenderDamage::FullSurface => {
-                damage_rects.push(DamageRect::new(0, 0, content.w, content.h));
-            }
-            RenderDamage::Regions(regions) => {
-                damage_rects.extend(regions.iter().filter_map(|region| {
-                    let x1 = region.x.max(content.x);
-                    let y1 = region.y.max(content.y);
-                    let x2 = region.right().min(content.x.saturating_add(content.w));
-                    let y2 = region.bottom().min(content.y.saturating_add(content.h));
-                    (x1 < x2 && y1 < y2).then_some(DamageRect::new(
-                        x1.saturating_sub(content.x),
-                        y1.saturating_sub(content.y),
-                        x2.saturating_sub(x1),
-                        y2.saturating_sub(y1),
-                    ))
-                }));
-            }
-            RenderDamage::None => {}
-        }
-        if let Some(items) = ext.render_layer_items_with_context(
-            snapshot.surface_id,
-            &snapshot.surface_rect,
-            &damage,
-            snapshot.layer,
+        let Some(plan) =
+            build_before_content_extension_output_plan(snapshot, content, render_context)
+        else {
+            continue;
+        };
+        record_before_content_extension_output_plan(&plan, render_stats);
+        damage_rects.extend(plan.damage_rects.iter().copied());
+        execute_before_content_extension_output_plan(
+            stdout,
+            &mut cells,
+            content,
+            &plan,
             render_context,
-        ) {
+            terminal_graphics_cache,
+            terminal_graphics,
+        )?;
+    }
+    Ok((cells, damage_rects))
+}
+
+#[derive(Clone)]
+struct BeforeContentExtensionOutputPlan {
+    snapshot: ExtensionLayerSnapshot,
+    damage_rects: Vec<DamageRect>,
+    action: BeforeContentExtensionOutputAction,
+}
+
+#[derive(Clone)]
+enum BeforeContentExtensionOutputAction {
+    RenderItems {
+        items: Vec<RenderLayerItem>,
+    },
+    LayerCells {
+        cells: Vec<(u16, u16, RenderUnderCell)>,
+    },
+    RenderOps {
+        ops: Vec<RenderOp>,
+    },
+    NoOutput,
+}
+
+fn build_before_content_extension_output_plan(
+    snapshot: &ExtensionLayerSnapshot,
+    content: PaneRect,
+    render_context: &RenderExtensionContext,
+) -> Option<BeforeContentExtensionOutputPlan> {
+    let damage = snapshot.render_damage.clone();
+    if damage.is_none() {
+        return None;
+    }
+    let action = before_content_extension_output_action(snapshot, &damage, render_context);
+    Some(BeforeContentExtensionOutputPlan {
+        snapshot: snapshot.clone(),
+        damage_rects: before_content_damage_rects(&damage, content),
+        action,
+    })
+}
+
+fn before_content_extension_output_action(
+    snapshot: &ExtensionLayerSnapshot,
+    damage: &RenderDamage,
+    render_context: &RenderExtensionContext,
+) -> BeforeContentExtensionOutputAction {
+    if let Some(items) = snapshot.extension.render_layer_items_with_context(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        damage,
+        snapshot.layer,
+        render_context,
+    ) {
+        return BeforeContentExtensionOutputAction::RenderItems { items };
+    }
+    if let Some(cells) = snapshot.extension.render_before_content_cells_with_context(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        damage,
+        render_context,
+    ) {
+        return BeforeContentExtensionOutputAction::LayerCells { cells };
+    }
+    if let Some(ops) = snapshot.extension.render_layer_ops_with_context(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        damage,
+        snapshot.layer,
+        render_context,
+    ) {
+        return BeforeContentExtensionOutputAction::RenderOps { ops };
+    }
+    BeforeContentExtensionOutputAction::NoOutput
+}
+
+fn before_content_damage_rects(damage: &RenderDamage, content: PaneRect) -> Vec<DamageRect> {
+    match damage {
+        RenderDamage::FullSurface => vec![DamageRect::new(0, 0, content.w, content.h)],
+        RenderDamage::Regions(regions) => regions
+            .iter()
+            .filter_map(|region| {
+                let x1 = region.x.max(content.x);
+                let y1 = region.y.max(content.y);
+                let x2 = region.right().min(content.x.saturating_add(content.w));
+                let y2 = region.bottom().min(content.y.saturating_add(content.h));
+                (x1 < x2 && y1 < y2).then_some(DamageRect::new(
+                    x1.saturating_sub(content.x),
+                    y1.saturating_sub(content.y),
+                    x2.saturating_sub(x1),
+                    y2.saturating_sub(y1),
+                ))
+            })
+            .collect(),
+        RenderDamage::None => Vec::new(),
+    }
+}
+
+fn record_before_content_extension_output_plan(
+    plan: &BeforeContentExtensionOutputPlan,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+) {
+    if let Some(stats) = render_stats.as_deref_mut() {
+        stats.record_extension_render_call(
+            plan.snapshot.extension.name(),
+            &plan.snapshot.render_damage,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Executes one planned before-content action with frame-local mutable resources.
+fn execute_before_content_extension_output_plan<W: io::Write>(
+    stdout: &mut W,
+    cells: &mut BeforeContentCells,
+    content: PaneRect,
+    plan: &BeforeContentExtensionOutputPlan,
+    render_context: &RenderExtensionContext,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+) -> Result<()> {
+    match &plan.action {
+        BeforeContentExtensionOutputAction::RenderItems { items } => {
             let ops = queue_before_content_render_items(
                 stdout,
-                pane_id,
-                snapshot.surface_id,
-                snapshot.surface_rect,
-                &damage,
-                &items,
+                plan.snapshot.pane_id,
+                plan.snapshot.surface_id,
+                plan.snapshot.surface_rect,
+                &plan.snapshot.render_damage,
+                items,
                 terminal_graphics_cache,
                 terminal_graphics,
                 render_context.capabilities,
             )?;
             insert_before_content_cells(
-                &mut cells,
+                cells,
                 content,
-                render_ops_to_cells(snapshot.surface_rect, &ops),
-            );
-        } else if let Some(layer_cells) = ext.render_before_content_cells_with_context(
-            snapshot.surface_id,
-            &snapshot.surface_rect,
-            &damage,
-            render_context,
-        ) {
-            insert_before_content_layer_cells(&mut cells, content, layer_cells);
-        } else if let Some(ops) = ext.render_layer_ops_with_context(
-            snapshot.surface_id,
-            &snapshot.surface_rect,
-            &damage,
-            snapshot.layer,
-            render_context,
-        ) {
-            insert_before_content_cells(
-                &mut cells,
-                content,
-                render_ops_to_cells(snapshot.surface_rect, &ops),
+                render_ops_to_cells(plan.snapshot.surface_rect, &ops),
             );
         }
+        BeforeContentExtensionOutputAction::LayerCells { cells: layer_cells } => {
+            insert_before_content_layer_cells(cells, content, layer_cells.clone());
+        }
+        BeforeContentExtensionOutputAction::RenderOps { ops } => {
+            insert_before_content_cells(
+                cells,
+                content,
+                render_ops_to_cells(plan.snapshot.surface_rect, ops),
+            );
+        }
+        BeforeContentExtensionOutputAction::NoOutput => {}
     }
-    Ok((cells, damage_rects))
+    Ok(())
 }
 
 fn insert_before_content_cells(
@@ -5231,9 +5326,10 @@ fn render_attach_scene_inner<W: io::Write>(
 mod tests {
     use super::{
         AfterContentExtensionOutputAction, AttachLayer, AttachLayerSurface, AttachRenderTrace,
-        AttachRenderTraceOp, DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot,
-        FrameDamage, GridRowRenderContext, RenderVisibleCell, RenderVisibleCellPlan,
-        TerminalCommand, append_pane_output, build_after_content_extension_output_plan,
+        AttachRenderTraceOp, BeforeContentExtensionOutputAction, DamageCoalescingPolicy,
+        DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext, RenderVisibleCell,
+        RenderVisibleCellPlan, TerminalCommand, append_pane_output,
+        build_after_content_extension_output_plan, build_before_content_extension_output_plan,
         build_render_ops_output_plan, coalesce_render_damage,
         commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
         opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
@@ -5683,6 +5779,100 @@ mod tests {
             plan.commands.last(),
             Some(TerminalCommand::ResetStyle)
         ));
+    }
+
+    #[test]
+    fn before_content_extension_output_plan_selects_layer_cells_before_emit() {
+        struct PlannedBeforeCellsExtension;
+
+        impl bmux_plugin::AttachRenderExtension for PlannedBeforeCellsExtension {
+            fn name(&self) -> &'static str {
+                "test.planned_before_cells"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                RenderDamage::Regions(vec![ExtensionRect {
+                    x: surface_rect.x.saturating_add(1),
+                    y: surface_rect.y,
+                    w: 1,
+                    h: 1,
+                }])
+            }
+
+            fn render_before_content_cells_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+                _context: &RenderExtensionContext,
+            ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
+                Some(vec![(
+                    1,
+                    0,
+                    RenderUnderCell {
+                        ch: 'u',
+                        style: RenderStyle::default(),
+                    },
+                )])
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn std::io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let surface_id = Uuid::from_u128(90);
+        let pane_id = Uuid::from_u128(91);
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 1,
+        };
+        let extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(PlannedBeforeCellsExtension);
+        let snapshot = ExtensionLayerSnapshot::build(
+            &extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::BeforePaneContent,
+            &FrameDamage::default(),
+            DamageCoalescingPolicy::default(),
+        );
+        let render_context = RenderExtensionContext {
+            capabilities: bmux_plugin::TerminalRenderCapabilities::default(),
+        };
+
+        let plan = build_before_content_extension_output_plan(
+            &snapshot,
+            PaneRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+            &render_context,
+        )
+        .expect("damaged before-content extension should produce an output plan");
+
+        let BeforeContentExtensionOutputAction::LayerCells { cells } = plan.action else {
+            panic!("expected before-content layer-cell output plan");
+        };
+        assert_eq!(plan.damage_rects, vec![DamageRect::new(1, 0, 1, 1)]);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].2.ch, 'u');
     }
 
     #[test]
