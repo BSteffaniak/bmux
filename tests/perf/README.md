@@ -38,7 +38,11 @@ real attach telemetry for diagnosing runtime performance.
 
 Budgets live in `tests/perf/budgets/*.json` and are matched by scenario name.
 Use `ignore_actions` to exclude warmup/setup steps such as `new-session` from
-render budget aggregation.
+render budget aggregation. Render budgets can cap rows, row segments, cells,
+frame bytes, and terminal graphic transmit/place/delete/byte churn from
+playbook render summaries. Perf budgets can cap real attach counters such as
+render frames, overrender/slow-write frame counts, extension cache misses or
+imperative calls, and terminal graphic churn from `bmux.perf` telemetry.
 
 For local config/plugin validation against an already-running BMUX server, use:
 

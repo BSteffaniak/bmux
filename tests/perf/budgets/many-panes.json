@@ -7,15 +7,31 @@
     "max_full_frame_frames": 0,
     "max_full_surface_fallbacks": 0,
     "max_rows_emitted": 200,
+    "max_row_segments_emitted": 20,
     "max_cells_emitted": 30000,
     "max_frame_bytes": 240000,
-    "max_terminal_graphic_deletes": 0
+    "max_terminal_graphic_transmits": 0,
+    "max_terminal_graphic_places": 0,
+    "max_terminal_graphic_deletes": 0,
+    "max_terminal_graphic_bytes": 0
   },
   "perf": {
     "require_events": false,
     "max_malformed_payloads": 0,
     "max_dropped_events_reported": 0,
     "max_render_p95_ms": 16,
-    "max_drain_ipc_p95_ms": 20
+    "max_drain_ipc_p95_ms": 20,
+    "max_render_frames": 15,
+    "max_overrender_flagged_frames": 12,
+    "max_full_frame_fallback_flagged_frames": 7,
+    "max_large_partial_frame_frames": 3,
+    "max_slow_terminal_write_per_kib_frames": 0,
+    "max_extension_cache_misses": 40,
+    "max_extension_imperative_calls": 0,
+    "max_extension_imperative_or_cache_miss_frames": 7,
+    "max_terminal_graphic_transmits": 0,
+    "max_terminal_graphic_places": 0,
+    "max_terminal_graphic_deletes": 0,
+    "max_terminal_graphic_bytes": 0
   }
 }

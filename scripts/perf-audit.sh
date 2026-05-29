@@ -176,6 +176,23 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
           render_p95_ms: n($p.timings_ms.render_ms_max.p95_ms),
           drain_ipc_p95_ms: n($p.timings_ms.drain_ipc_ms_max.p95_ms),
           attach_window_counters: ($p.attach_window_counters // {}),
+          overrender_counters: ($p.overrender_counters // {}),
+          extension_counters: ($p.extension_counters // {}),
+          render_frames: n($p.attach_window_counters.render_frames),
+          overrender_flagged_frames: n($p.overrender_counters.overrender_flagged_frames // $p.attach_window_counters.overrender_flagged_frames),
+          full_frame_fallback_flagged_frames: n($p.overrender_counters.full_frame_fallback_flagged_frames // $p.attach_window_counters.full_frame_fallback_flagged_frames),
+          large_partial_frame_frames: n($p.overrender_counters.large_partial_frame_frames // $p.attach_window_counters.large_partial_frame_frames),
+          slow_terminal_write_per_kib_frames: n($p.overrender_counters.slow_terminal_write_per_kib_frames // $p.attach_window_counters.slow_terminal_write_per_kib_frames),
+          extension_imperative_or_cache_miss_frames: n($p.overrender_counters.extension_imperative_or_cache_miss_frames // $p.attach_window_counters.extension_imperative_or_cache_miss_frames),
+          extension_render_calls: n($p.attach_window_counters.extension_render_calls),
+          extension_cache_hits: n($p.attach_window_counters.extension_cache_hits),
+          extension_cache_misses: (n($p.attach_window_counters.extension_render_calls) - n($p.attach_window_counters.extension_cache_hits)),
+          extension_cache_hit_percent: (if n($p.attach_window_counters.extension_render_calls) > 0 then ((n($p.attach_window_counters.extension_cache_hits) * 100) / n($p.attach_window_counters.extension_render_calls) | floor) else 100 end),
+          extension_imperative_calls: n($p.attach_window_counters.extension_imperative_calls),
+          terminal_graphic_transmits: n($p.attach_window_counters.terminal_graphic_transmits),
+          terminal_graphic_places: n($p.attach_window_counters.terminal_graphic_places),
+          terminal_graphic_deletes: n($p.attach_window_counters.terminal_graphic_deletes),
+          terminal_graphic_bytes: n($p.attach_window_counters.terminal_graphic_bytes),
           render_outliers: ($p.render_outliers // []),
           full_surface_render_outliers_after_ms: (($p.render_outliers // []) | map(select(
             ((.since_attach_start_ms // 0) >= (($b.perf.full_surface_outlier_after_ms // $b.perf.outlier_after_ms // 0)))
@@ -200,6 +217,11 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
       if $expected == null then empty
       elif $actual == $expected then empty
       else {kind:"bool", name:$name, actual:$actual, expected:$expected}
+      end;
+    def check_min($name; $actual; $min):
+      if $min == null then empty
+      elif $actual >= $min then empty
+      else {kind:"min", name:$name, actual:$actual, expected:$min}
       end;
     ($m[0]) as $m |
     ($b[0]) as $b |
@@ -234,6 +256,20 @@ for playbook in "$PLAYBOOK_DIR"/*.dsl; do
       check_max("perf.reconnect_outage_max_ms"; $m.perf.reconnect_outage_max_ms; $p.max_reconnect_outage_max_ms),
       (if $m.perf.perf_events > 0 then check_max("perf.render_p95_ms"; $m.perf.render_p95_ms; $p.max_render_p95_ms) else empty end),
       (if $m.perf.perf_events > 0 then check_max("perf.drain_ipc_p95_ms"; $m.perf.drain_ipc_p95_ms; $p.max_drain_ipc_p95_ms) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.render_frames"; $m.perf.render_frames; $p.max_render_frames) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.overrender_flagged_frames"; $m.perf.overrender_flagged_frames; $p.max_overrender_flagged_frames) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.full_frame_fallback_flagged_frames"; $m.perf.full_frame_fallback_flagged_frames; $p.max_full_frame_fallback_flagged_frames) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.large_partial_frame_frames"; $m.perf.large_partial_frame_frames; $p.max_large_partial_frame_frames) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.slow_terminal_write_per_kib_frames"; $m.perf.slow_terminal_write_per_kib_frames; $p.max_slow_terminal_write_per_kib_frames) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.extension_render_calls"; $m.perf.extension_render_calls; $p.max_extension_render_calls) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.extension_cache_misses"; $m.perf.extension_cache_misses; $p.max_extension_cache_misses) else empty end),
+      (if $m.perf.perf_events > 0 then check_min("perf.extension_cache_hit_percent"; $m.perf.extension_cache_hit_percent; $p.min_extension_cache_hit_percent) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.extension_imperative_calls"; $m.perf.extension_imperative_calls; $p.max_extension_imperative_calls) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.extension_imperative_or_cache_miss_frames"; $m.perf.extension_imperative_or_cache_miss_frames; $p.max_extension_imperative_or_cache_miss_frames) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.terminal_graphic_transmits"; $m.perf.terminal_graphic_transmits; $p.max_terminal_graphic_transmits) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.terminal_graphic_places"; $m.perf.terminal_graphic_places; $p.max_terminal_graphic_places) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.terminal_graphic_deletes"; $m.perf.terminal_graphic_deletes; $p.max_terminal_graphic_deletes) else empty end),
+      (if $m.perf.perf_events > 0 then check_max("perf.terminal_graphic_bytes"; $m.perf.terminal_graphic_bytes; $p.max_terminal_graphic_bytes) else empty end),
       (if $m.perf.perf_events > 0 then check_max("perf.full_surface_render_outliers_after_ms"; $m.perf.full_surface_render_outliers_after_ms; $p.max_full_surface_render_outliers_after_ms) else empty end),
       (if $m.perf.perf_events > 0 then check_max("perf.extension_full_surface_calls_after_ms"; $m.perf.extension_full_surface_calls_after_ms; $p.max_extension_full_surface_calls_after_ms) else empty end)
     ]
