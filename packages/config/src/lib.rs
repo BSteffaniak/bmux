@@ -17,6 +17,51 @@ use thiserror::Error;
 pub const RECORDINGS_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDINGS_DIR";
 pub const BMUX_CONFIG_ENV: &str = "BMUX_CONFIG";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigScopeTarget {
+    pub name: String,
+    pub cwd: Option<PathBuf>,
+}
+
+impl ConfigScopeTarget {
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            cwd: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cwd(name: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            cwd: Some(cwd.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn global() -> Self {
+        Self::new("global")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedConfigLoadRequest {
+    pub target: ConfigScopeTarget,
+    pub local_config_filename: String,
+}
+
+impl ScopedConfigLoadRequest {
+    #[must_use]
+    pub fn new(target: ConfigScopeTarget) -> Self {
+        Self {
+            target,
+            local_config_filename: "bmux.toml".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOverrides {
     /// Optional base layer merged BELOW the primary config (lowest precedence
@@ -164,6 +209,176 @@ pub struct CompositionLayerChange {
 pub struct CompositionExplain {
     pub resolution: CompositionResolution,
     pub applied_layers: Vec<CompositionLayerChange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ScopeListConfig {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ScopeListConfig {
+    fn into_scopes(self) -> Vec<String> {
+        match self {
+            Self::One(scope) => vec![scope],
+            Self::Many(scopes) => scopes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct BmuxConfigMetadata {
+    default_scope: Option<ScopeListConfig>,
+}
+
+fn normalize_scope_name(scope: &str) -> String {
+    scope.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn default_local_scopes() -> Vec<String> {
+    vec!["pane".to_string(), "new-pane".to_string()]
+}
+
+fn parse_scope_selector(value: Option<ScopeListConfig>, fallback: Vec<String>) -> Vec<String> {
+    value
+        .map_or(fallback, ScopeListConfig::into_scopes)
+        .into_iter()
+        .map(|scope| normalize_scope_name(&scope))
+        .filter(|scope| !scope.is_empty())
+        .collect()
+}
+
+fn scope_matches(scopes: &[String], target: &ConfigScopeTarget) -> bool {
+    let target_name = normalize_scope_name(&target.name);
+    scopes
+        .iter()
+        .any(|scope| scope == "*" || scope == "all" || scope == &target_name)
+}
+
+fn remove_bmux_metadata(root: &mut toml::Table) -> Result<Option<BmuxConfigMetadata>> {
+    let Some(bmux_value) = root.get_mut("bmux") else {
+        return Ok(None);
+    };
+    let Some(bmux_table) = bmux_value.as_table_mut() else {
+        return Err(ConfigError::ParseError {
+            error: "[bmux] must be a table".to_string(),
+        });
+    };
+    let metadata = bmux_table
+        .remove("config")
+        .map(|value| {
+            value
+                .try_into::<BmuxConfigMetadata>()
+                .map_err(|error| ConfigError::ParseError {
+                    error: format!("invalid [bmux.config] metadata: {error}"),
+                })
+        })
+        .transpose()?;
+    if bmux_table.is_empty() {
+        root.remove("bmux");
+    }
+    Ok(metadata)
+}
+
+fn scoped_overlay_for_target(
+    root: &mut toml::Table,
+    target: &ConfigScopeTarget,
+) -> Result<Option<toml::Value>> {
+    let Some(bmux_value) = root.get_mut("bmux") else {
+        return Ok(None);
+    };
+    let Some(bmux_table) = bmux_value.as_table_mut() else {
+        return Err(ConfigError::ParseError {
+            error: "[bmux] must be a table".to_string(),
+        });
+    };
+    let Some(scopes_value) = bmux_table.get_mut("scopes") else {
+        if bmux_table.is_empty() {
+            root.remove("bmux");
+        }
+        return Ok(None);
+    };
+    let Some(scopes_table) = scopes_value.as_table_mut() else {
+        return Err(ConfigError::ParseError {
+            error: "[bmux.scopes] must be a table".to_string(),
+        });
+    };
+
+    let target_scope = normalize_scope_name(&target.name);
+    let mut merged = toml::Value::Table(toml::Table::new());
+    let mut loaded_any = false;
+    for (scope_key, scope_value) in scopes_table.iter_mut() {
+        let overlay_scope = normalize_scope_name(scope_key);
+        if overlay_scope != target_scope && overlay_scope != "all" {
+            continue;
+        }
+        let Some(config_block) = scope_value.as_table_mut() else {
+            return Err(ConfigError::ParseError {
+                error: format!("[bmux.scopes.{scope_key}] must be a table"),
+            });
+        };
+        let Some(config_value) = config_block.get("config") else {
+            continue;
+        };
+        merge_toml_value(&mut merged, config_value.clone());
+        loaded_any = true;
+    }
+
+    bmux_table.remove("scopes");
+    if bmux_table.is_empty() {
+        root.remove("bmux");
+    }
+    Ok(loaded_any.then_some(merged))
+}
+
+fn scoped_local_overlay_for_target(
+    mut value: toml::Value,
+    target: &ConfigScopeTarget,
+) -> Result<Option<toml::Value>> {
+    let Some(root) = value.as_table_mut() else {
+        return Err(ConfigError::ParseError {
+            error: "config root must be a table".to_string(),
+        });
+    };
+
+    let scoped_overlay = scoped_overlay_for_target(root, target)?;
+    let metadata = remove_bmux_metadata(root)?;
+    let default_scopes = parse_scope_selector(
+        metadata.and_then(|metadata| metadata.default_scope),
+        default_local_scopes(),
+    );
+
+    let mut merged = toml::Value::Table(toml::Table::new());
+    let mut loaded_any = scope_matches(&default_scopes, target) && !root.is_empty();
+    if loaded_any {
+        merge_toml_value(&mut merged, value);
+    }
+    if let Some(scoped_overlay) = scoped_overlay {
+        merge_toml_value(&mut merged, scoped_overlay);
+        loaded_any = true;
+    }
+    Ok(loaded_any.then_some(merged))
+}
+
+fn discover_local_config_paths(
+    cwd: &std::path::Path,
+    filename: &str,
+    global_config_path: &std::path::Path,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(filename);
+        if candidate == global_config_path {
+            continue;
+        }
+        if candidate.exists() {
+            paths.push(candidate);
+        }
+    }
+    paths.reverse();
+    paths
 }
 
 fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
@@ -400,6 +615,28 @@ fn merged_raw_config_value_with_overrides(
         let value = load_toml_file(&path)?;
         merge_toml_value(&mut merged, value);
         loaded_any = true;
+    }
+
+    Ok(loaded_any.then_some(merged))
+}
+
+fn merged_raw_config_value_for_scope(
+    base_path: &std::path::Path,
+    explicit_overrides: Option<&ConfigLoadOverrides>,
+    request: &ScopedConfigLoadRequest,
+) -> Result<Option<toml::Value>> {
+    let mut merged = merged_raw_config_value_with_overrides(base_path, explicit_overrides)?
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+    let mut loaded_any = !matches!(&merged, toml::Value::Table(table) if table.is_empty());
+
+    if let Some(cwd) = request.target.cwd.as_deref() {
+        for path in discover_local_config_paths(cwd, &request.local_config_filename, base_path) {
+            let local_value = load_toml_file(&path)?;
+            if let Some(overlay) = scoped_local_overlay_for_target(local_value, &request.target)? {
+                merge_toml_value(&mut merged, overlay);
+                loaded_any = true;
+            }
+        }
     }
 
     Ok(loaded_any.then_some(merged))
@@ -2640,6 +2877,28 @@ impl BmuxConfig {
         Self::load_from_path_with_resolution_and_overrides(&paths.config_file(), None, overrides)
     }
 
+    /// Load configuration for a scoped target using default paths and explicit overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any config file cannot be read or parsed.
+    pub fn load_for_scope_with_overrides(
+        request: &ScopedConfigLoadRequest,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<Self> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_for_scope_with_overrides(&paths.config_file(), overrides, request)
+    }
+
+    /// Load configuration for a scoped target using default paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any config file cannot be read or parsed.
+    pub fn load_for_scope(request: &ScopedConfigLoadRequest) -> Result<Self> {
+        Self::load_for_scope_with_overrides(request, &ConfigLoadOverrides::default())
+    }
+
     /// Load configuration while forcing a specific active composition profile.
     ///
     /// # Errors
@@ -2697,6 +2956,22 @@ impl BmuxConfig {
         Ok(config)
     }
 
+    /// Load configuration for a scoped target from a specific path using explicit overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any config file cannot be read or parsed.
+    pub fn load_from_path_for_scope_with_overrides(
+        path: &std::path::Path,
+        overrides: &ConfigLoadOverrides,
+        request: &ScopedConfigLoadRequest,
+    ) -> Result<Self> {
+        let (config, _resolution) = Self::load_from_path_for_scope_with_resolution_and_overrides(
+            path, None, overrides, request,
+        )?;
+        Ok(config)
+    }
+
     /// Load configuration from a specific path and return composition metadata.
     ///
     /// # Errors
@@ -2723,8 +2998,34 @@ impl BmuxConfig {
         forced_profile: Option<&str>,
         overrides: &ConfigLoadOverrides,
     ) -> Result<(Self, CompositionResolution)> {
-        let Some(mut raw_value) = merged_raw_config_value_with_overrides(path, Some(overrides))?
-        else {
+        Self::load_from_raw_value_with_resolution(
+            merged_raw_config_value_with_overrides(path, Some(overrides))?,
+            forced_profile,
+        )
+    }
+
+    /// Load configuration for a scoped target from a specific path with explicit overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any config file cannot be read or parsed.
+    pub fn load_from_path_for_scope_with_resolution_and_overrides(
+        path: &std::path::Path,
+        forced_profile: Option<&str>,
+        overrides: &ConfigLoadOverrides,
+        request: &ScopedConfigLoadRequest,
+    ) -> Result<(Self, CompositionResolution)> {
+        Self::load_from_raw_value_with_resolution(
+            merged_raw_config_value_for_scope(path, Some(overrides), request)?,
+            forced_profile,
+        )
+    }
+
+    fn load_from_raw_value_with_resolution(
+        raw_value: Option<toml::Value>,
+        forced_profile: Option<&str>,
+    ) -> Result<(Self, CompositionResolution)> {
+        let Some(mut raw_value) = raw_value else {
             return Ok((
                 Self::default(),
                 CompositionResolution {
@@ -3212,8 +3513,9 @@ impl BmuxConfig {
 mod tests {
     use super::{
         AlternateScreenWheelBehavior, BMUX_CONFIG_ENV, BmuxConfig, ConfigLoadOverrides,
-        MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
-        ResolvedTimeout, SandboxCleanupSource, StaleBuildAction, push_process_config_overrides,
+        ConfigScopeTarget, MouseClickPropagation, MouseSelectionReleaseBehavior,
+        MouseWheelPropagation, ResolvedTimeout, SandboxCleanupSource, ScopedConfigLoadRequest,
+        StaleBuildAction, push_process_config_overrides,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4668,5 +4970,160 @@ timeout_profile = "missing"
         assert_ne!(config_no_base.general.server_timeout, 999);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scoped_local_config_merges_for_pane_cwd() {
+        let global_path = temp_config_path();
+        let dir = global_path.parent().expect("temp config parent");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+            .expect("write global config");
+        std::fs::write(
+            project.join("bmux.toml"),
+            "[appearance]\nstatus_position = 'TOP'\n",
+        )
+        .expect("write local config");
+
+        let request = ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("pane", &project));
+        let config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &request,
+        )
+        .expect("load scoped config");
+
+        assert!(matches!(
+            config.appearance.status_position,
+            super::StatusPosition::Top
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn scoped_local_config_defaults_to_pane_and_new_pane_only() {
+        let global_path = temp_config_path();
+        let dir = global_path.parent().expect("temp config parent");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+            .expect("write global config");
+        std::fs::write(
+            project.join("bmux.toml"),
+            "[appearance]\nstatus_position = 'TOP'\n",
+        )
+        .expect("write local config");
+
+        let global_request =
+            ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("global", project.clone()));
+        let global_config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &global_request,
+        )
+        .expect("load global scoped config");
+        assert!(matches!(
+            global_config.appearance.status_position,
+            super::StatusPosition::Bottom
+        ));
+
+        let new_pane_request =
+            ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("new-pane", &project));
+        let new_pane_config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &new_pane_request,
+        )
+        .expect("load new-pane scoped config");
+        assert!(matches!(
+            new_pane_config.appearance.status_position,
+            super::StatusPosition::Top
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn scoped_local_config_metadata_can_override_default_scope() {
+        let global_path = temp_config_path();
+        let dir = global_path.parent().expect("temp config parent");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+            .expect("write global config");
+        std::fs::write(
+            project.join("bmux.toml"),
+            "[bmux.config]\ndefault_scope = ['new-pane']\n\n[appearance]\nstatus_position = 'TOP'\n",
+        )
+        .expect("write local config");
+
+        let pane_request =
+            ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("pane", &project));
+        let pane_config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &pane_request,
+        )
+        .expect("load pane scoped config");
+        assert!(matches!(
+            pane_config.appearance.status_position,
+            super::StatusPosition::Bottom
+        ));
+
+        let new_pane_request =
+            ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("new-pane", &project));
+        let new_pane_config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &new_pane_request,
+        )
+        .expect("load new-pane scoped config");
+        assert!(matches!(
+            new_pane_config.appearance.status_position,
+            super::StatusPosition::Top
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn scoped_overlay_block_applies_only_to_matching_scope() {
+        let global_path = temp_config_path();
+        let dir = global_path.parent().expect("temp config parent");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+            .expect("write global config");
+        std::fs::write(
+            project.join("bmux.toml"),
+            "[bmux.config]\ndefault_scope = []\n\n[bmux.scopes.pane.config.appearance]\nstatus_position = 'TOP'\n",
+        )
+        .expect("write local config");
+
+        let pane_request =
+            ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("pane", &project));
+        let pane_config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &pane_request,
+        )
+        .expect("load pane scoped config");
+        assert!(matches!(
+            pane_config.appearance.status_position,
+            super::StatusPosition::Top
+        ));
+
+        let new_pane_request =
+            ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("new-pane", &project));
+        let new_pane_config = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &global_path,
+            &ConfigLoadOverrides::default(),
+            &new_pane_request,
+        )
+        .expect("load new-pane scoped config");
+        assert!(matches!(
+            new_pane_config.appearance.status_position,
+            super::StatusPosition::Bottom
+        ));
+        std::fs::remove_dir_all(dir).ok();
     }
 }
