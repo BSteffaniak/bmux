@@ -565,6 +565,58 @@ pub fn queue_render_ops<W: io::Write>(
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> Result<bool> {
+    if !render_ops_visible_segment_safe(ops) {
+        return queue_render_ops_direct(stdout, surface_rect, damage, ops);
+    }
+    let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
+    queue_render_ops_direct(
+        stdout,
+        surface_rect,
+        &RenderDamage::FullSurface,
+        &visible_segments,
+    )
+}
+
+fn render_ops_visible_segment_safe(ops: &[RenderOp]) -> bool {
+    ops.iter().all(render_op_visible_segment_safe)
+}
+
+fn render_op_visible_segment_safe(op: &RenderOp) -> bool {
+    match op {
+        RenderOp::TextRun { text, .. } => render_text_visible_segment_safe(text),
+        RenderOp::StyledText { spans, .. } => spans
+            .iter()
+            .all(|span| render_text_visible_segment_safe(&span.text)),
+        RenderOp::ClearRect { .. } | RenderOp::EraseRowSegment { .. } => true,
+        RenderOp::FillRect { ch, .. } => render_char_display_width_u16(*ch) == 1,
+        RenderOp::Border { glyphs, .. } => [
+            glyphs.top_left,
+            glyphs.top_right,
+            glyphs.bottom_left,
+            glyphs.bottom_right,
+            glyphs.horizontal,
+            glyphs.vertical,
+        ]
+        .into_iter()
+        .all(|ch| render_char_display_width_u16(ch) == 1),
+        RenderOp::CellGrid { rows, .. } => rows
+            .iter()
+            .flatten()
+            .filter_map(|cell| cell.ch)
+            .all(|ch| render_char_display_width_u16(ch) == 1),
+    }
+}
+
+fn render_text_visible_segment_safe(text: &str) -> bool {
+    text.chars().all(|ch| render_char_display_width_u16(ch) > 0)
+}
+
+fn queue_render_ops_direct<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> Result<bool> {
     let mut wrote = false;
     let mut commands = Vec::new();
     let mut pending_text_run = None;
@@ -1463,7 +1515,8 @@ struct RenderVisibleLayerKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RenderLayeredVisibleCell {
     layer: RenderVisibleLayerKey,
-    cell: Option<RenderVisibleCell>,
+    origin: (u16, u16),
+    cell: RenderVisibleCell,
 }
 
 #[derive(Default)]
@@ -1487,8 +1540,8 @@ impl RenderVisibleCellPlan {
         self.cells
             .iter()
             .filter_map(|(pos, layered)| {
-                let cell = layered.cell?;
-                render_damage_contains_cell(damage, surface_rect, *pos).then_some((*pos, cell))
+                render_damage_contains_cell(damage, surface_rect, *pos)
+                    .then_some((layered.origin, layered.cell))
             })
             .collect()
     }
@@ -1719,8 +1772,7 @@ impl RenderVisibleCellPlan {
             if !rect_contains_cell(surface_rect, span_pos) {
                 continue;
             }
-            let span_cell = (offset == 0).then_some(cell);
-            self.paint_layered_cell(layer, span_pos, span_cell);
+            self.paint_layered_cell(layer, span_pos, pos, cell);
         }
     }
 
@@ -1728,9 +1780,14 @@ impl RenderVisibleCellPlan {
         &mut self,
         layer: RenderVisibleLayerKey,
         pos: (u16, u16),
-        cell: Option<RenderVisibleCell>,
+        origin: (u16, u16),
+        cell: RenderVisibleCell,
     ) {
-        let candidate = RenderLayeredVisibleCell { layer, cell };
+        let candidate = RenderLayeredVisibleCell {
+            layer,
+            origin,
+            cell,
+        };
         let previous = self.cells.get(&pos);
         if previous.is_none_or(|previous| previous.layer <= layer) {
             self.cells.insert(pos, candidate);
@@ -1766,6 +1823,89 @@ fn render_ops_to_cells(
         .into_iter()
         .map(|(pos, cell)| (pos, cell.into()))
         .collect()
+}
+
+fn render_ops_to_visible_segments(
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> Vec<RenderOp> {
+    let mut plan = RenderVisibleCellPlan::default();
+    plan.paint_ops(surface_rect, 0, ops);
+    visible_cells_to_render_ops(plan.visible_cells_for_damage(damage, surface_rect))
+}
+
+fn visible_cells_to_render_ops(cells: BTreeMap<(u16, u16), RenderVisibleCell>) -> Vec<RenderOp> {
+    let mut ops = Vec::new();
+    let mut pending: Option<VisibleTextRun> = None;
+    let mut cells = cells.into_iter().collect::<Vec<_>>();
+    cells.sort_by_key(|((x, y), _)| (*y, *x));
+    for ((x, y), cell) in cells {
+        if let Some(run) = pending.as_mut()
+            && run.can_push(x, y, cell)
+        {
+            run.push(cell);
+            continue;
+        }
+        flush_visible_text_run(&mut ops, &mut pending);
+        pending = Some(VisibleTextRun::new(x, y, cell));
+    }
+    flush_visible_text_run(&mut ops, &mut pending);
+    ops
+}
+
+struct VisibleTextRun {
+    x: u16,
+    y: u16,
+    next_x: u16,
+    style: RenderStyle,
+    text: String,
+}
+
+impl VisibleTextRun {
+    fn new(x: u16, y: u16, cell: RenderVisibleCell) -> Self {
+        let mut run = Self {
+            x,
+            y,
+            next_x: x,
+            style: cell.style,
+            text: String::new(),
+        };
+        run.push(cell);
+        run
+    }
+
+    fn can_push(&self, x: u16, y: u16, cell: RenderVisibleCell) -> bool {
+        self.y == y && self.next_x == x && self.style == cell.style
+    }
+
+    fn push(&mut self, cell: RenderVisibleCell) {
+        self.text.push(cell.ch);
+        self.next_x = self
+            .next_x
+            .saturating_add(render_char_display_width_u16(cell.ch));
+    }
+}
+
+fn flush_visible_text_run(ops: &mut Vec<RenderOp>, pending: &mut Option<VisibleTextRun>) {
+    let Some(run) = pending.take() else {
+        return;
+    };
+    if run.text.chars().all(|ch| ch == ' ') {
+        ops.push(RenderOp::EraseRowSegment {
+            x: run.x,
+            y: run.y,
+            width: run.next_x.saturating_sub(run.x),
+            style: run.style,
+        });
+    } else {
+        ops.push(RenderOp::TextRun {
+            x: run.x,
+            y: run.y,
+            text: run.text,
+            style: run.style,
+        });
+    }
 }
 
 fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
@@ -5294,6 +5434,78 @@ mod tests {
                 style: upper_style,
             })
         );
+    }
+
+    #[test]
+    fn queue_render_ops_preserves_zero_width_text_with_direct_path() {
+        let ops = [RenderOp::TextRun {
+            x: 0,
+            y: 0,
+            text: "e\u{301}".to_string(),
+            style: RenderStyle::default(),
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("combining text should queue through direct path")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("e\u{301}"), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_emits_only_changed_visible_segments() {
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 1,
+        };
+        let ops = [
+            RenderOp::FillRect {
+                rect: surface_rect,
+                ch: '.',
+                style: RenderStyle::default(),
+            },
+            RenderOp::TextRun {
+                x: 2,
+                y: 0,
+                text: "HEAD".to_string(),
+                style: RenderStyle::default().named_foreground(RenderNamedColor::Cyan),
+            },
+        ];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                surface_rect,
+                &RenderDamage::Regions(vec![ExtensionRect {
+                    x: 2,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                }]),
+                &ops,
+            )
+            .expect("visible damage segment should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[1;3HHEAD"), "{output:?}");
+        assert!(!output.contains('.'), "{output:?}");
     }
 
     #[test]
