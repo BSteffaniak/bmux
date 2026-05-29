@@ -1718,6 +1718,7 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
             include_str!("../assets/themes/performance.toml"),
         ),
         ("pong", include_str!("../assets/themes/pong.toml")),
+        ("tetris", include_str!("../assets/themes/tetris.toml")),
         (
             "mode-aware",
             include_str!("../assets/themes/mode-aware.toml"),

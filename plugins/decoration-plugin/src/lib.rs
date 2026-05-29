@@ -5570,6 +5570,40 @@ exited = ""
     }
 
     #[test]
+    fn tetris_theme_slice_installs_component_and_runs_bundled_script() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xf006);
+        seed_geometry(&plugin, pane, 32, 12);
+        set_activity(&plugin, pane, true, false);
+
+        let theme = include_str!("../../theme-plugin/assets/themes/tetris.toml");
+        let extension = decoration_extension_from_theme(theme);
+        install_extension_with_script(&plugin, extension);
+
+        plugin.state.with_state(|state| {
+            let component = state
+                .script_components
+                .get("tetris.board")
+                .expect("tetris board component installed");
+            assert!(component.backend.is_some(), "tetris backend installed");
+            assert_eq!(
+                component.script_path.as_deref(),
+                Some(Path::new("bundled:tetris")),
+            );
+            assert_eq!(component.instance_id, "tetris");
+        });
+
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        assert!(
+            surface.before_content_paint_commands.iter().any(
+                |cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "█" || text == "·")
+            ),
+            "tetris board emitted behind content"
+        );
+    }
+
+    #[test]
     fn component_layering_uses_relative_above_below_order() {
         let plugin = DecorationPlugin::new();
         let pane = Uuid::from_u128(0xf003);

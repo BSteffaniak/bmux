@@ -1,0 +1,103 @@
+# Tetris theme - focused pane runs an imperfect computer-played Tetris board behind content.
+
+background           = "#050510"
+cursor               = "#ffffff"
+foreground           = "#d8e8ff"
+name                 = "tetris"
+selection_background = "#26324a"
+
+[border]
+active   = "#ffffff"
+inactive = "#384052"
+
+[status]
+active_window  = "#ff5fd7"
+background     = "#090a14"
+foreground     = "#d8e8ff"
+mode_indicator = "#5fffff"
+
+[plugins."bmux.decoration"]
+
+[plugins."bmux.decoration".unfocused]
+bg            = ""
+fg            = "#384052"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "rounded"
+
+[plugins."bmux.decoration".focused]
+bg            = ""
+fg            = "#ffffff"
+glyphs_custom = []
+gradient_from = "#5fffff"
+gradient_to   = "#ffaf5f"
+style         = "thick"
+
+[plugins."bmux.decoration".zoomed]
+bg            = ""
+fg            = "#ffd75f"
+glyphs_custom = []
+gradient_from = "#ffd75f"
+gradient_to   = "#ff5f5f"
+style         = "double"
+
+[plugins."bmux.decoration".badges]
+exited  = "◇"
+running = "◆"
+
+[plugins."bmux.decoration".animation]
+hz   = 16
+kind = "tetris"
+
+[settings.component_settings.tetris]
+components = ["tetris.board"]
+
+[settings.providers.tetris]
+modal_id         = "tetris-advanced-settings"
+prompt_on_select = true
+storage_key      = "theme_settings.tetris"
+
+[settings.forms.tetris]
+section_label = "Tetris"
+title         = "Tetris Settings"
+width_max     = 72
+width_min     = 42
+
+[[settings.forms.tetris.fields]]
+default = 115
+key     = "step_ms"
+label   = "Fall step ms"
+max     = 600
+min     = 35
+type    = "integer"
+
+[[settings.forms.tetris.fields]]
+default = 78
+key     = "skill"
+label   = "Computer skill percent"
+max     = 100
+min     = 0
+type    = "integer"
+
+[[settings.forms.tetris.fields]]
+default = 2200
+key     = "game_over_ms"
+label   = "Game-over flash ms"
+max     = 10000
+min     = 500
+type    = "integer"
+
+[plugins."bmux.decoration".components."tetris.board"]
+below           = ["pane.content"]
+script          = "tetris"
+script_instance = "tetris"
+
+[plugins."bmux.decoration".components."tetris.board".animation]
+hz   = 16
+kind = "tetris"
+
+[plugins."bmux.decoration".components."tetris.board".settings]
+game_over_ms = "2200"
+skill        = "78"
+step_ms      = "115"
