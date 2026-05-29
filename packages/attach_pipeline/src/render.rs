@@ -19,7 +19,8 @@ use bmux_plugin::{
     AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
     RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell, TerminalGraphicOverlay,
-    TerminalRenderCapabilities, clip_render_text_run_to_rect, render_text_width_u16,
+    TerminalRenderCapabilities, clip_render_text_run_to_rect, render_char_display_width_u16,
+    render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -1438,54 +1439,333 @@ fn terminal_graphic_fill_contains(
     }
 }
 
-fn render_ops_to_cells(ops: &[RenderOp]) -> BTreeMap<(u16, u16), RenderUnderCell> {
-    let mut cells = BTreeMap::new();
-    for op in ops {
-        match op {
-            RenderOp::TextRun { x, y, text, style } => {
-                let mut col = *x;
-                for ch in text.chars() {
-                    cells.insert((col, *y), RenderUnderCell { ch, style: *style });
-                    col = col.saturating_add(1);
-                }
-            }
-            RenderOp::FillRect { rect, ch, style } => {
-                for row in rect.y..rect.bottom() {
-                    for col in rect.x..rect.right() {
-                        cells.insert(
-                            (col, row),
-                            RenderUnderCell {
-                                ch: *ch,
-                                style: *style,
-                            },
-                        );
-                    }
-                }
-            }
-            RenderOp::CellGrid { x, y, rows } => {
-                for (row_offset, row) in rows.iter().enumerate() {
-                    let Ok(row_offset) = u16::try_from(row_offset) else {
-                        break;
-                    };
-                    for (col_offset, cell) in row.iter().enumerate() {
-                        let Ok(col_offset) = u16::try_from(col_offset) else {
-                            break;
-                        };
-                        let Some(ch) = cell.ch else { continue };
-                        cells.insert(
-                            (x.saturating_add(col_offset), y.saturating_add(row_offset)),
-                            RenderUnderCell {
-                                ch,
-                                style: cell.style,
-                            },
-                        );
-                    }
-                }
-            }
-            _ => {}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderVisibleCell {
+    ch: char,
+    style: RenderStyle,
+}
+
+impl From<RenderVisibleCell> for RenderUnderCell {
+    fn from(cell: RenderVisibleCell) -> Self {
+        Self {
+            ch: cell.ch,
+            style: cell.style,
         }
     }
-    cells
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RenderVisibleLayerKey {
+    z: i16,
+    order: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderLayeredVisibleCell {
+    layer: RenderVisibleLayerKey,
+    cell: Option<RenderVisibleCell>,
+}
+
+#[derive(Default)]
+struct RenderVisibleCellPlan {
+    cells: BTreeMap<(u16, u16), RenderLayeredVisibleCell>,
+    order: u64,
+}
+
+impl RenderVisibleCellPlan {
+    fn paint_ops(&mut self, surface_rect: ExtensionRect, z: i16, ops: &[RenderOp]) {
+        for op in ops {
+            self.paint_op(surface_rect, z, op);
+        }
+    }
+
+    fn visible_cells_for_damage(
+        &self,
+        damage: &RenderDamage,
+        surface_rect: ExtensionRect,
+    ) -> BTreeMap<(u16, u16), RenderVisibleCell> {
+        self.cells
+            .iter()
+            .filter_map(|(pos, layered)| {
+                let cell = layered.cell?;
+                render_damage_contains_cell(damage, surface_rect, *pos).then_some((*pos, cell))
+            })
+            .collect()
+    }
+
+    fn paint_op(&mut self, surface_rect: ExtensionRect, z: i16, op: &RenderOp) {
+        self.order = self.order.saturating_add(1);
+        let layer = RenderVisibleLayerKey {
+            z,
+            order: self.order,
+        };
+        match op {
+            RenderOp::TextRun { x, y, text, style } => {
+                self.paint_text(surface_rect, layer, *x, *y, text, *style);
+            }
+            RenderOp::StyledText { x, y, spans } => {
+                let mut col = *x;
+                for span in spans {
+                    self.paint_text(surface_rect, layer, col, *y, &span.text, span.style);
+                    col = col.saturating_add(render_text_width_u16(&span.text));
+                }
+            }
+            RenderOp::ClearRect { rect, style } => {
+                self.paint_rect(surface_rect, layer, *rect, ' ', *style);
+            }
+            RenderOp::EraseRowSegment { x, y, width, style } => {
+                self.paint_rect(
+                    surface_rect,
+                    layer,
+                    ExtensionRect {
+                        x: *x,
+                        y: *y,
+                        w: *width,
+                        h: 1,
+                    },
+                    ' ',
+                    *style,
+                );
+            }
+            RenderOp::FillRect { rect, ch, style } => {
+                self.paint_rect(surface_rect, layer, *rect, *ch, *style);
+            }
+            RenderOp::Border {
+                rect,
+                glyphs,
+                style,
+            } => {
+                self.paint_border(surface_rect, layer, *rect, *glyphs, *style);
+            }
+            RenderOp::CellGrid { x, y, rows } => {
+                self.paint_cell_grid(surface_rect, layer, *x, *y, rows);
+            }
+        }
+    }
+
+    fn paint_text(
+        &mut self,
+        surface_rect: ExtensionRect,
+        layer: RenderVisibleLayerKey,
+        x: u16,
+        y: u16,
+        text: &str,
+        style: RenderStyle,
+    ) {
+        if y < surface_rect.y || y >= surface_rect.bottom() {
+            return;
+        }
+        let Some((clipped_x, clipped)) = clip_render_text_run_to_rect(x, text, surface_rect) else {
+            return;
+        };
+        let mut cursor = clipped_x;
+        for ch in clipped.chars() {
+            let width = render_char_display_width_u16(ch);
+            if width == 0 {
+                continue;
+            }
+            self.paint_cell_span(
+                surface_rect,
+                layer,
+                (cursor, y),
+                RenderVisibleCell { ch, style },
+                width,
+            );
+            cursor = cursor.saturating_add(width);
+        }
+    }
+
+    fn paint_rect(
+        &mut self,
+        surface_rect: ExtensionRect,
+        layer: RenderVisibleLayerKey,
+        rect: ExtensionRect,
+        ch: char,
+        style: RenderStyle,
+    ) {
+        let Some(rect) = clip_extension_rect(rect, surface_rect) else {
+            return;
+        };
+        for row in rect.y..rect.bottom() {
+            for col in rect.x..rect.right() {
+                self.paint_cell(surface_rect, layer, col, row, ch, style);
+            }
+        }
+    }
+
+    fn paint_border(
+        &mut self,
+        surface_rect: ExtensionRect,
+        layer: RenderVisibleLayerKey,
+        rect: ExtensionRect,
+        glyphs: BorderGlyphs,
+        style: RenderStyle,
+    ) {
+        let Some(rect) = clip_extension_rect(rect, surface_rect) else {
+            return;
+        };
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        if rect.h == 1 {
+            let row = glyphs.horizontal.to_string().repeat(usize::from(rect.w));
+            self.paint_text(surface_rect, layer, rect.x, rect.y, &row, style);
+            return;
+        }
+        if rect.w == 1 {
+            for y in rect.y..rect.bottom() {
+                self.paint_cell(surface_rect, layer, rect.x, y, glyphs.vertical, style);
+            }
+            return;
+        }
+        let inner_width = usize::from(rect.w.saturating_sub(2));
+        let top = format!(
+            "{}{}{}",
+            glyphs.top_left,
+            glyphs.horizontal.to_string().repeat(inner_width),
+            glyphs.top_right
+        );
+        let bottom = format!(
+            "{}{}{}",
+            glyphs.bottom_left,
+            glyphs.horizontal.to_string().repeat(inner_width),
+            glyphs.bottom_right
+        );
+        self.paint_text(surface_rect, layer, rect.x, rect.y, &top, style);
+        for y in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
+            self.paint_cell(surface_rect, layer, rect.x, y, glyphs.vertical, style);
+            self.paint_cell(
+                surface_rect,
+                layer,
+                rect.right().saturating_sub(1),
+                y,
+                glyphs.vertical,
+                style,
+            );
+        }
+        self.paint_text(
+            surface_rect,
+            layer,
+            rect.x,
+            rect.bottom().saturating_sub(1),
+            &bottom,
+            style,
+        );
+    }
+
+    fn paint_cell_grid(
+        &mut self,
+        surface_rect: ExtensionRect,
+        layer: RenderVisibleLayerKey,
+        x: u16,
+        y: u16,
+        rows: &[Vec<bmux_plugin::RenderCell>],
+    ) {
+        for (row_offset, row) in rows.iter().enumerate() {
+            let Ok(row_offset) = u16::try_from(row_offset) else {
+                break;
+            };
+            let cell_y = y.saturating_add(row_offset);
+            for (col_offset, cell) in row.iter().enumerate() {
+                let Ok(col_offset) = u16::try_from(col_offset) else {
+                    break;
+                };
+                let Some(ch) = cell.ch else {
+                    continue;
+                };
+                self.paint_cell(
+                    surface_rect,
+                    layer,
+                    x.saturating_add(col_offset),
+                    cell_y,
+                    ch,
+                    cell.style,
+                );
+            }
+        }
+    }
+
+    fn paint_cell(
+        &mut self,
+        surface_rect: ExtensionRect,
+        layer: RenderVisibleLayerKey,
+        x: u16,
+        y: u16,
+        ch: char,
+        style: RenderStyle,
+    ) {
+        self.paint_cell_span(
+            surface_rect,
+            layer,
+            (x, y),
+            RenderVisibleCell { ch, style },
+            1,
+        );
+    }
+
+    fn paint_cell_span(
+        &mut self,
+        surface_rect: ExtensionRect,
+        layer: RenderVisibleLayerKey,
+        pos: (u16, u16),
+        cell: RenderVisibleCell,
+        width: u16,
+    ) {
+        if width == 0 {
+            return;
+        }
+        for offset in 0..width {
+            let span_pos = (pos.0.saturating_add(offset), pos.1);
+            if !rect_contains_cell(surface_rect, span_pos) {
+                continue;
+            }
+            let span_cell = (offset == 0).then_some(cell);
+            self.paint_layered_cell(layer, span_pos, span_cell);
+        }
+    }
+
+    fn paint_layered_cell(
+        &mut self,
+        layer: RenderVisibleLayerKey,
+        pos: (u16, u16),
+        cell: Option<RenderVisibleCell>,
+    ) {
+        let candidate = RenderLayeredVisibleCell { layer, cell };
+        let previous = self.cells.get(&pos);
+        if previous.is_none_or(|previous| previous.layer <= layer) {
+            self.cells.insert(pos, candidate);
+        }
+    }
+}
+
+fn render_damage_contains_cell(
+    damage: &RenderDamage,
+    surface_rect: ExtensionRect,
+    pos: (u16, u16),
+) -> bool {
+    match damage {
+        RenderDamage::None => false,
+        RenderDamage::FullSurface => rect_contains_cell(surface_rect, pos),
+        RenderDamage::Regions(regions) => regions.iter().any(|region| {
+            rect_contains_cell(*region, pos) && rect_contains_cell(surface_rect, pos)
+        }),
+    }
+}
+
+const fn rect_contains_cell(rect: ExtensionRect, (x, y): (u16, u16)) -> bool {
+    !rect.is_empty() && x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
+fn render_ops_to_cells(
+    surface_rect: ExtensionRect,
+    ops: &[RenderOp],
+) -> BTreeMap<(u16, u16), RenderUnderCell> {
+    let mut plan = RenderVisibleCellPlan::default();
+    plan.paint_ops(surface_rect, 0, ops);
+    plan.visible_cells_for_damage(&RenderDamage::FullSurface, surface_rect)
+        .into_iter()
+        .map(|(pos, cell)| (pos, cell.into()))
+        .collect()
 }
 
 fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
@@ -3536,7 +3816,11 @@ fn before_content_cells_for_surface<W: io::Write>(
                 terminal_graphics,
                 render_context.capabilities,
             )?;
-            insert_before_content_cells(&mut cells, content, render_ops_to_cells(&ops));
+            insert_before_content_cells(
+                &mut cells,
+                content,
+                render_ops_to_cells(snapshot.surface_rect, &ops),
+            );
         } else if let Some(layer_cells) = ext.render_before_content_cells_with_context(
             snapshot.surface_id,
             &snapshot.surface_rect,
@@ -3551,7 +3835,11 @@ fn before_content_cells_for_surface<W: io::Write>(
             snapshot.layer,
             render_context,
         ) {
-            insert_before_content_cells(&mut cells, content, render_ops_to_cells(&ops));
+            insert_before_content_cells(
+                &mut cells,
+                content,
+                render_ops_to_cells(snapshot.surface_rect, &ops),
+            );
         }
     }
     Ok((cells, damage_rects))
@@ -4675,11 +4963,12 @@ mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
         DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot, FrameDamage,
-        GridRowRenderContext, TerminalCommand, append_pane_output, coalesce_render_damage,
-        commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
-        opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
-        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
-        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        GridRowRenderContext, RenderVisibleCell, RenderVisibleCellPlan, TerminalCommand,
+        append_pane_output, coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
+        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
+        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
+        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
+        render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -4777,228 +5066,6 @@ mod tests {
             },
         );
         appearance
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct VisibleTestCell {
-        ch: char,
-        style: RenderStyle,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct VisibleTestLayerKey {
-        z: i16,
-        order: u64,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct LayeredVisibleTestCell {
-        layer: VisibleTestLayerKey,
-        cell: VisibleTestCell,
-    }
-
-    #[derive(Default)]
-    struct ZAwareVisibleCellTestModel {
-        cells: BTreeMap<(u16, u16), LayeredVisibleTestCell>,
-        order: u64,
-    }
-
-    impl ZAwareVisibleCellTestModel {
-        fn paint_ops(&mut self, surface_rect: ExtensionRect, z: i16, ops: &[RenderOp]) {
-            for op in ops {
-                self.paint_op(surface_rect, z, op);
-            }
-        }
-
-        fn visible_cells_for_damage(
-            &self,
-            damage: &RenderDamage,
-            surface_rect: ExtensionRect,
-        ) -> BTreeMap<(u16, u16), VisibleTestCell> {
-            self.cells
-                .iter()
-                .filter_map(|(pos, layered)| {
-                    render_damage_contains_cell(damage, surface_rect, *pos)
-                        .then_some((*pos, layered.cell))
-                })
-                .collect()
-        }
-
-        fn paint_op(&mut self, surface_rect: ExtensionRect, z: i16, op: &RenderOp) {
-            self.order = self.order.saturating_add(1);
-            let layer = VisibleTestLayerKey {
-                z,
-                order: self.order,
-            };
-            match op {
-                RenderOp::TextRun { x, y, text, style } => {
-                    self.paint_text(surface_rect, layer, *x, *y, text, *style);
-                }
-                RenderOp::StyledText { x, y, spans } => {
-                    let mut col = *x;
-                    for span in spans {
-                        self.paint_text(surface_rect, layer, col, *y, &span.text, span.style);
-                        col =
-                            col.saturating_add(usize_to_u16_saturating(span.text.chars().count()));
-                    }
-                }
-                RenderOp::ClearRect { rect, style } => {
-                    self.paint_rect(surface_rect, layer, *rect, ' ', *style);
-                }
-                RenderOp::EraseRowSegment { x, y, width, style } => {
-                    let rect = ExtensionRect {
-                        x: *x,
-                        y: *y,
-                        w: *width,
-                        h: 1,
-                    };
-                    self.paint_rect(surface_rect, layer, rect, ' ', *style);
-                }
-                RenderOp::FillRect { rect, ch, style } => {
-                    self.paint_rect(surface_rect, layer, *rect, *ch, *style);
-                }
-                RenderOp::Border {
-                    rect,
-                    glyphs,
-                    style,
-                } => {
-                    self.paint_border(surface_rect, layer, *rect, glyphs, *style);
-                }
-                RenderOp::CellGrid { x, y, rows } => {
-                    for (row_offset, row) in rows.iter().enumerate() {
-                        let row_y = y.saturating_add(usize_to_u16_saturating(row_offset));
-                        for (col_offset, cell) in row.iter().enumerate() {
-                            if let Some(ch) = cell.ch {
-                                let col_x = x.saturating_add(usize_to_u16_saturating(col_offset));
-                                self.paint_cell(surface_rect, layer, col_x, row_y, ch, cell.style);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        fn paint_text(
-            &mut self,
-            surface_rect: ExtensionRect,
-            layer: VisibleTestLayerKey,
-            x: u16,
-            y: u16,
-            text: &str,
-            style: RenderStyle,
-        ) {
-            for (offset, ch) in text.chars().enumerate() {
-                self.paint_cell(
-                    surface_rect,
-                    layer,
-                    x.saturating_add(usize_to_u16_saturating(offset)),
-                    y,
-                    ch,
-                    style,
-                );
-            }
-        }
-
-        fn paint_rect(
-            &mut self,
-            surface_rect: ExtensionRect,
-            layer: VisibleTestLayerKey,
-            rect: ExtensionRect,
-            ch: char,
-            style: RenderStyle,
-        ) {
-            for row in rect.y..rect.bottom() {
-                for col in rect.x..rect.right() {
-                    self.paint_cell(surface_rect, layer, col, row, ch, style);
-                }
-            }
-        }
-
-        fn paint_border(
-            &mut self,
-            surface_rect: ExtensionRect,
-            layer: VisibleTestLayerKey,
-            rect: ExtensionRect,
-            glyphs: &bmux_plugin::BorderGlyphs,
-            style: RenderStyle,
-        ) {
-            if rect.is_empty() {
-                return;
-            }
-            let right = rect.right().saturating_sub(1);
-            let bottom = rect.bottom().saturating_sub(1);
-            for col in rect.x..=right {
-                let ch = if col == rect.x {
-                    glyphs.top_left
-                } else if col == right {
-                    glyphs.top_right
-                } else {
-                    glyphs.horizontal
-                };
-                self.paint_cell(surface_rect, layer, col, rect.y, ch, style);
-            }
-            if bottom == rect.y {
-                return;
-            }
-            for col in rect.x..=right {
-                let ch = if col == rect.x {
-                    glyphs.bottom_left
-                } else if col == right {
-                    glyphs.bottom_right
-                } else {
-                    glyphs.horizontal
-                };
-                self.paint_cell(surface_rect, layer, col, bottom, ch, style);
-            }
-            for row in rect.y.saturating_add(1)..bottom {
-                self.paint_cell(surface_rect, layer, rect.x, row, glyphs.vertical, style);
-                self.paint_cell(surface_rect, layer, right, row, glyphs.vertical, style);
-            }
-        }
-
-        fn paint_cell(
-            &mut self,
-            surface_rect: ExtensionRect,
-            layer: VisibleTestLayerKey,
-            x: u16,
-            y: u16,
-            ch: char,
-            style: RenderStyle,
-        ) {
-            if !rect_contains_cell(surface_rect, (x, y)) {
-                return;
-            }
-            let candidate = LayeredVisibleTestCell {
-                layer,
-                cell: VisibleTestCell { ch, style },
-            };
-            let previous = self.cells.get(&(x, y));
-            if previous.is_none_or(|previous| previous.layer <= layer) {
-                self.cells.insert((x, y), candidate);
-            }
-        }
-    }
-
-    fn render_damage_contains_cell(
-        damage: &RenderDamage,
-        surface_rect: ExtensionRect,
-        pos: (u16, u16),
-    ) -> bool {
-        match damage {
-            RenderDamage::None => false,
-            RenderDamage::FullSurface => rect_contains_cell(surface_rect, pos),
-            RenderDamage::Regions(regions) => regions.iter().any(|region| {
-                rect_contains_cell(*region, pos) && rect_contains_cell(surface_rect, pos)
-            }),
-        }
-    }
-
-    fn rect_contains_cell(rect: ExtensionRect, (x, y): (u16, u16)) -> bool {
-        !rect.is_empty() && x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
-    }
-
-    fn usize_to_u16_saturating(value: usize) -> u16 {
-        u16::try_from(value).unwrap_or(u16::MAX)
     }
 
     fn render_row_with_before_content_cell(content_bytes: &[u8]) -> String {
@@ -5188,7 +5255,7 @@ mod tests {
         };
         let lower_style = RenderStyle::default().named_foreground(RenderNamedColor::Red);
         let upper_style = RenderStyle::default().named_foreground(RenderNamedColor::Cyan);
-        let mut model = ZAwareVisibleCellTestModel::default();
+        let mut model = RenderVisibleCellPlan::default();
 
         model.paint_ops(
             surface_rect,
@@ -5215,14 +5282,14 @@ mod tests {
 
         assert_eq!(
             visible.get(&(0, 0)),
-            Some(&VisibleTestCell {
+            Some(&RenderVisibleCell {
                 ch: '.',
                 style: lower_style,
             })
         );
         assert_eq!(
             visible.get(&(1, 0)),
-            Some(&VisibleTestCell {
+            Some(&RenderVisibleCell {
                 ch: 'X',
                 style: upper_style,
             })
