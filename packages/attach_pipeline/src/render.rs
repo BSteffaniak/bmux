@@ -1004,6 +1004,73 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     Ok(source_changed || placement_changed || needs_transmit || needs_place)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalGraphicsStaleCleanupPolicy {
+    #[cfg(feature = "image-kitty")]
+    DeleteKittyPlacementAndImageSource,
+    #[cfg(not(feature = "image-kitty"))]
+    DropCacheOnly,
+}
+
+impl TerminalGraphicsStaleCleanupPolicy {
+    const fn current_terminal() -> Self {
+        #[cfg(feature = "image-kitty")]
+        {
+            Self::DeleteKittyPlacementAndImageSource
+        }
+        #[cfg(not(feature = "image-kitty"))]
+        {
+            Self::DropCacheOnly
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalGraphicsCleanupPlan {
+    stale: Vec<(u64, u32)>,
+    policy: TerminalGraphicsStaleCleanupPolicy,
+}
+
+impl TerminalGraphicsCleanupPlan {
+    fn for_surface(
+        pane_id: Uuid,
+        surface_id: Uuid,
+        current_graphics: &BTreeSet<u64>,
+        graphics_cache: &TerminalGraphicsCache,
+    ) -> Self {
+        let stale = graphics_cache
+            .iter()
+            .filter_map(|(key, entry)| {
+                (entry.pane_id == pane_id
+                    && entry.surface_id == surface_id
+                    && !current_graphics.contains(key))
+                .then_some((*key, entry.host_image_id))
+            })
+            .collect::<Vec<_>>();
+        Self {
+            stale,
+            policy: TerminalGraphicsStaleCleanupPolicy::current_terminal(),
+        }
+    }
+
+    fn for_frame(active_graphics: &BTreeSet<u64>, graphics_cache: &TerminalGraphicsCache) -> Self {
+        let stale = graphics_cache
+            .iter()
+            .filter_map(|(key, entry)| {
+                (!active_graphics.contains(key)).then_some((*key, entry.host_image_id))
+            })
+            .collect::<Vec<_>>();
+        Self {
+            stale,
+            policy: TerminalGraphicsStaleCleanupPolicy::current_terminal(),
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.stale.is_empty()
+    }
+}
+
 fn cleanup_stale_terminal_graphics_for_surface<W: io::Write>(
     stdout: &mut W,
     pane_id: Uuid,
@@ -1013,21 +1080,15 @@ fn cleanup_stale_terminal_graphics_for_surface<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
-    let stale = graphics_cache
-        .iter()
-        .filter_map(|(key, entry)| {
-            (entry.pane_id == pane_id
-                && entry.surface_id == surface_id
-                && !current_graphics.contains(key))
-            .then_some((*key, entry.host_image_id))
-        })
-        .collect::<Vec<_>>();
-    if stale.is_empty() {
-        return Ok(false);
-    }
-    cleanup_stale_terminal_graphics_by_key(
+    let plan = TerminalGraphicsCleanupPlan::for_surface(
+        pane_id,
+        surface_id,
+        current_graphics,
+        graphics_cache,
+    );
+    cleanup_stale_terminal_graphics_by_plan(
         stdout,
-        &stale,
+        &plan,
         graphics_cache,
         capabilities,
         render_stats,
@@ -1041,42 +1102,45 @@ fn cleanup_stale_terminal_graphics<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
-    let stale = graphics_cache
-        .iter()
-        .filter_map(|(key, entry)| {
-            (!active_graphics.contains(key)).then_some((*key, entry.host_image_id))
-        })
-        .collect::<Vec<_>>();
-    if stale.is_empty() {
-        return Ok(false);
-    }
-    cleanup_stale_terminal_graphics_by_key(
+    let plan = TerminalGraphicsCleanupPlan::for_frame(active_graphics, graphics_cache);
+    cleanup_stale_terminal_graphics_by_plan(
         stdout,
-        &stale,
+        &plan,
         graphics_cache,
         capabilities,
         render_stats,
     )
 }
 
-fn cleanup_stale_terminal_graphics_by_key<W: io::Write>(
+fn cleanup_stale_terminal_graphics_by_plan<W: io::Write>(
     stdout: &mut W,
-    stale: &[(u64, u32)],
+    plan: &TerminalGraphicsCleanupPlan,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<bool> {
-    #[cfg(feature = "image-kitty")]
-    {
-        cleanup_stale_kitty_graphics(stdout, stale, graphics_cache, capabilities, render_stats)
+    if plan.is_empty() {
+        return Ok(false);
     }
-    #[cfg(not(feature = "image-kitty"))]
-    {
-        let _ = (stdout, capabilities, render_stats);
-        for (key, _) in stale {
-            graphics_cache.remove(key);
+    match plan.policy {
+        #[cfg(feature = "image-kitty")]
+        TerminalGraphicsStaleCleanupPolicy::DeleteKittyPlacementAndImageSource => {
+            cleanup_stale_kitty_graphics(
+                stdout,
+                &plan.stale,
+                graphics_cache,
+                capabilities,
+                render_stats,
+            )
         }
-        Ok(false)
+        #[cfg(not(feature = "image-kitty"))]
+        TerminalGraphicsStaleCleanupPolicy::DropCacheOnly => {
+            let _ = (stdout, capabilities, render_stats);
+            for (key, _) in &plan.stale {
+                graphics_cache.remove(key);
+            }
+            Ok(false)
+        }
     }
 }
 
@@ -4381,6 +4445,7 @@ mod tests {
 
     #[cfg(feature = "image-kitty")]
     use super::{
+        TerminalGraphicsCleanupPlan, TerminalGraphicsStaleCleanupPolicy,
         cleanup_stale_terminal_graphics, queue_render_items, queue_render_items_for_frame,
         render_attach_scene_with_stats_and_trace_with_capabilities,
         terminal_graphic_placement_signature,
@@ -4971,6 +5036,39 @@ mod tests {
             fill: TerminalGraphicFill::Top { thickness_px: 3 },
             z_index: 8,
         }
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn terminal_graphics_cleanup_plan_records_stale_kitty_policy() {
+        let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
+        let capabilities = test_kitty_capabilities();
+        let mut cache = BTreeMap::new();
+        queue_render_items(
+            &mut Vec::new(),
+            Uuid::from_u128(7),
+            ExtensionRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 4,
+            },
+            &RenderDamage::FullSurface,
+            &items,
+            &mut cache,
+            capabilities,
+            None,
+        )
+        .expect("initial kitty graphic should queue");
+
+        let active = BTreeSet::new();
+        let plan = TerminalGraphicsCleanupPlan::for_frame(&active, &cache);
+
+        assert_eq!(plan.stale.len(), 1);
+        assert_eq!(
+            plan.policy,
+            TerminalGraphicsStaleCleanupPolicy::DeleteKittyPlacementAndImageSource
+        );
     }
 
     #[cfg(feature = "image-kitty")]
