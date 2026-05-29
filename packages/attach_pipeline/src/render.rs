@@ -4779,6 +4779,228 @@ mod tests {
         appearance
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct VisibleTestCell {
+        ch: char,
+        style: RenderStyle,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct VisibleTestLayerKey {
+        z: i16,
+        order: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct LayeredVisibleTestCell {
+        layer: VisibleTestLayerKey,
+        cell: VisibleTestCell,
+    }
+
+    #[derive(Default)]
+    struct ZAwareVisibleCellTestModel {
+        cells: BTreeMap<(u16, u16), LayeredVisibleTestCell>,
+        order: u64,
+    }
+
+    impl ZAwareVisibleCellTestModel {
+        fn paint_ops(&mut self, surface_rect: ExtensionRect, z: i16, ops: &[RenderOp]) {
+            for op in ops {
+                self.paint_op(surface_rect, z, op);
+            }
+        }
+
+        fn visible_cells_for_damage(
+            &self,
+            damage: &RenderDamage,
+            surface_rect: ExtensionRect,
+        ) -> BTreeMap<(u16, u16), VisibleTestCell> {
+            self.cells
+                .iter()
+                .filter_map(|(pos, layered)| {
+                    render_damage_contains_cell(damage, surface_rect, *pos)
+                        .then_some((*pos, layered.cell))
+                })
+                .collect()
+        }
+
+        fn paint_op(&mut self, surface_rect: ExtensionRect, z: i16, op: &RenderOp) {
+            self.order = self.order.saturating_add(1);
+            let layer = VisibleTestLayerKey {
+                z,
+                order: self.order,
+            };
+            match op {
+                RenderOp::TextRun { x, y, text, style } => {
+                    self.paint_text(surface_rect, layer, *x, *y, text, *style);
+                }
+                RenderOp::StyledText { x, y, spans } => {
+                    let mut col = *x;
+                    for span in spans {
+                        self.paint_text(surface_rect, layer, col, *y, &span.text, span.style);
+                        col =
+                            col.saturating_add(usize_to_u16_saturating(span.text.chars().count()));
+                    }
+                }
+                RenderOp::ClearRect { rect, style } => {
+                    self.paint_rect(surface_rect, layer, *rect, ' ', *style);
+                }
+                RenderOp::EraseRowSegment { x, y, width, style } => {
+                    let rect = ExtensionRect {
+                        x: *x,
+                        y: *y,
+                        w: *width,
+                        h: 1,
+                    };
+                    self.paint_rect(surface_rect, layer, rect, ' ', *style);
+                }
+                RenderOp::FillRect { rect, ch, style } => {
+                    self.paint_rect(surface_rect, layer, *rect, *ch, *style);
+                }
+                RenderOp::Border {
+                    rect,
+                    glyphs,
+                    style,
+                } => {
+                    self.paint_border(surface_rect, layer, *rect, glyphs, *style);
+                }
+                RenderOp::CellGrid { x, y, rows } => {
+                    for (row_offset, row) in rows.iter().enumerate() {
+                        let row_y = y.saturating_add(usize_to_u16_saturating(row_offset));
+                        for (col_offset, cell) in row.iter().enumerate() {
+                            if let Some(ch) = cell.ch {
+                                let col_x = x.saturating_add(usize_to_u16_saturating(col_offset));
+                                self.paint_cell(surface_rect, layer, col_x, row_y, ch, cell.style);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn paint_text(
+            &mut self,
+            surface_rect: ExtensionRect,
+            layer: VisibleTestLayerKey,
+            x: u16,
+            y: u16,
+            text: &str,
+            style: RenderStyle,
+        ) {
+            for (offset, ch) in text.chars().enumerate() {
+                self.paint_cell(
+                    surface_rect,
+                    layer,
+                    x.saturating_add(usize_to_u16_saturating(offset)),
+                    y,
+                    ch,
+                    style,
+                );
+            }
+        }
+
+        fn paint_rect(
+            &mut self,
+            surface_rect: ExtensionRect,
+            layer: VisibleTestLayerKey,
+            rect: ExtensionRect,
+            ch: char,
+            style: RenderStyle,
+        ) {
+            for row in rect.y..rect.bottom() {
+                for col in rect.x..rect.right() {
+                    self.paint_cell(surface_rect, layer, col, row, ch, style);
+                }
+            }
+        }
+
+        fn paint_border(
+            &mut self,
+            surface_rect: ExtensionRect,
+            layer: VisibleTestLayerKey,
+            rect: ExtensionRect,
+            glyphs: &bmux_plugin::BorderGlyphs,
+            style: RenderStyle,
+        ) {
+            if rect.is_empty() {
+                return;
+            }
+            let right = rect.right().saturating_sub(1);
+            let bottom = rect.bottom().saturating_sub(1);
+            for col in rect.x..=right {
+                let ch = if col == rect.x {
+                    glyphs.top_left
+                } else if col == right {
+                    glyphs.top_right
+                } else {
+                    glyphs.horizontal
+                };
+                self.paint_cell(surface_rect, layer, col, rect.y, ch, style);
+            }
+            if bottom == rect.y {
+                return;
+            }
+            for col in rect.x..=right {
+                let ch = if col == rect.x {
+                    glyphs.bottom_left
+                } else if col == right {
+                    glyphs.bottom_right
+                } else {
+                    glyphs.horizontal
+                };
+                self.paint_cell(surface_rect, layer, col, bottom, ch, style);
+            }
+            for row in rect.y.saturating_add(1)..bottom {
+                self.paint_cell(surface_rect, layer, rect.x, row, glyphs.vertical, style);
+                self.paint_cell(surface_rect, layer, right, row, glyphs.vertical, style);
+            }
+        }
+
+        fn paint_cell(
+            &mut self,
+            surface_rect: ExtensionRect,
+            layer: VisibleTestLayerKey,
+            x: u16,
+            y: u16,
+            ch: char,
+            style: RenderStyle,
+        ) {
+            if !rect_contains_cell(surface_rect, (x, y)) {
+                return;
+            }
+            let candidate = LayeredVisibleTestCell {
+                layer,
+                cell: VisibleTestCell { ch, style },
+            };
+            let previous = self.cells.get(&(x, y));
+            if previous.is_none_or(|previous| previous.layer <= layer) {
+                self.cells.insert((x, y), candidate);
+            }
+        }
+    }
+
+    fn render_damage_contains_cell(
+        damage: &RenderDamage,
+        surface_rect: ExtensionRect,
+        pos: (u16, u16),
+    ) -> bool {
+        match damage {
+            RenderDamage::None => false,
+            RenderDamage::FullSurface => rect_contains_cell(surface_rect, pos),
+            RenderDamage::Regions(regions) => regions.iter().any(|region| {
+                rect_contains_cell(*region, pos) && rect_contains_cell(surface_rect, pos)
+            }),
+        }
+    }
+
+    fn rect_contains_cell(rect: ExtensionRect, (x, y): (u16, u16)) -> bool {
+        !rect.is_empty() && x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+    }
+
+    fn usize_to_u16_saturating(value: usize) -> u16 {
+        u16::try_from(value).unwrap_or(u16::MAX)
+    }
+
     fn render_row_with_before_content_cell(content_bytes: &[u8]) -> String {
         render_row_with_before_content_cell_and_appearance(
             content_bytes,
@@ -4953,6 +5175,57 @@ mod tests {
                 w: 2,
                 h: 2,
             }])
+        );
+    }
+
+    #[test]
+    fn z_aware_visible_cell_model_keeps_higher_occluders_for_lower_damage() {
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 1,
+        };
+        let lower_style = RenderStyle::default().named_foreground(RenderNamedColor::Red);
+        let upper_style = RenderStyle::default().named_foreground(RenderNamedColor::Cyan);
+        let mut model = ZAwareVisibleCellTestModel::default();
+
+        model.paint_ops(
+            surface_rect,
+            0,
+            &[RenderOp::FillRect {
+                rect: surface_rect,
+                ch: '.',
+                style: lower_style,
+            }],
+        );
+        model.paint_ops(
+            surface_rect,
+            10,
+            &[RenderOp::TextRun {
+                x: 1,
+                y: 0,
+                text: "X".to_string(),
+                style: upper_style,
+            }],
+        );
+
+        let visible = model
+            .visible_cells_for_damage(&RenderDamage::Regions(vec![surface_rect]), surface_rect);
+
+        assert_eq!(
+            visible.get(&(0, 0)),
+            Some(&VisibleTestCell {
+                ch: '.',
+                style: lower_style,
+            })
+        );
+        assert_eq!(
+            visible.get(&(1, 0)),
+            Some(&VisibleTestCell {
+                ch: 'X',
+                style: upper_style,
+            })
         );
     }
 
