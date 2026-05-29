@@ -114,6 +114,7 @@ fn extension_own_render_damage_for_frame(
     )
 }
 
+#[derive(Clone)]
 struct ExtensionLayerSnapshot {
     extension: std::sync::Arc<dyn AttachRenderExtension>,
     surface_id: Uuid,
@@ -565,9 +566,6 @@ pub fn queue_render_ops<W: io::Write>(
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> Result<bool> {
-    if !render_ops_visible_segment_safe(ops) {
-        return queue_render_ops_direct(stdout, surface_rect, damage, ops);
-    }
     let plan = build_render_ops_output_plan(surface_rect, damage, ops);
     emit_render_ops_output_plan(stdout, &plan)
 }
@@ -606,16 +604,6 @@ fn render_text_visible_segment_safe(text: &str) -> bool {
     text.chars().all(|ch| render_char_display_width_u16(ch) > 0)
 }
 
-fn queue_render_ops_direct<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    damage: &RenderDamage,
-    ops: &[RenderOp],
-) -> Result<bool> {
-    let plan = build_direct_render_ops_output_plan(surface_rect, damage, ops);
-    emit_render_ops_output_plan(stdout, &plan)
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RenderOpsOutputPlan {
     commands: Vec<TerminalCommand>,
@@ -634,9 +622,16 @@ fn build_render_ops_output_plan(
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> RenderOpsOutputPlan {
-    debug_assert!(render_ops_visible_segment_safe(ops));
-    let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
-    build_direct_render_ops_output_plan(surface_rect, &RenderDamage::FullSurface, &visible_segments)
+    if render_ops_visible_segment_safe(ops) {
+        let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
+        build_direct_render_ops_output_plan(
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &visible_segments,
+        )
+    } else {
+        build_direct_render_ops_output_plan(surface_rect, damage, ops)
+    }
 }
 
 fn build_direct_render_ops_output_plan(
@@ -4119,10 +4114,7 @@ fn queue_before_content_render_items<W: io::Write>(
     Ok(ops)
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines // Keep after-content branch ordering together while this stage is extracted behavior-preservingly.
-)]
+#[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
 fn queue_after_content_extensions_for_surface<W: io::Write>(
     stdout: &mut W,
     surface_index: usize,
@@ -4138,97 +4130,198 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
     // damage is captured separately from content-redraw replay so cleanup and
     // byte emission can share the same layer view without re-querying damage.
     for snapshot in layer_snapshots {
-        let ext = snapshot.extension.as_ref();
-        let damage = snapshot.render_damage.clone();
-        if damage.is_none() {
+        let Some(plan) = build_after_content_extension_output_plan(
+            surface_index,
+            snapshot,
+            render_context,
+            pane_buffers,
+        ) else {
             continue;
-        }
-        if let Some(stats) = render_stats.as_deref_mut() {
-            stats.record_extension_render_call(ext.name(), &damage);
-        }
+        };
+        record_after_content_extension_output_plan(&plan, render_stats, render_trace);
+        execute_after_content_extension_output_plan(
+            stdout,
+            &plan,
+            render_context,
+            pane_buffers,
+            terminal_graphics_cache,
+            terminal_graphics,
+        )?;
+    }
+    Ok(())
+}
 
-        let cache_key = snapshot.cache_key(render_context.capabilities);
-        if let Some(revision) = snapshot.revision
-            && let Some(entry) = pane_buffers
-                .get(&snapshot.pane_id)
-                .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
-            && entry.surface_rect == snapshot.surface_rect
-            && entry.damage == damage
-            && entry.revision == revision
-        {
-            stdout
-                .write_all(&entry.bytes)
-                .context("failed replaying cached declarative render ops")?;
+#[derive(Clone)]
+struct AfterContentExtensionOutputPlan {
+    surface_index: usize,
+    snapshot: ExtensionLayerSnapshot,
+    cache_key: (String, Uuid),
+    action: AfterContentExtensionOutputAction,
+}
+
+#[derive(Clone)]
+enum AfterContentExtensionOutputAction {
+    CachedReplay { bytes: Vec<u8> },
+    RenderItems { items: Vec<RenderLayerItem> },
+    RenderOps { output_plan: RenderOpsOutputPlan },
+    Imperative,
+}
+
+fn build_after_content_extension_output_plan(
+    surface_index: usize,
+    snapshot: &ExtensionLayerSnapshot,
+    render_context: &RenderExtensionContext,
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+) -> Option<AfterContentExtensionOutputPlan> {
+    let damage = snapshot.render_damage.clone();
+    if damage.is_none() {
+        return None;
+    }
+    let cache_key = snapshot.cache_key(render_context.capabilities);
+    let action = if let Some(revision) = snapshot.revision
+        && let Some(entry) = pane_buffers
+            .get(&snapshot.pane_id)
+            .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
+        && entry.surface_rect == snapshot.surface_rect
+        && entry.damage == damage
+        && entry.revision == revision
+    {
+        AfterContentExtensionOutputAction::CachedReplay {
+            bytes: entry.bytes.clone(),
+        }
+    } else if let Some(items) = snapshot.extension.render_layer_items_with_context(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        &damage,
+        snapshot.layer,
+        render_context,
+    ) {
+        AfterContentExtensionOutputAction::RenderItems { items }
+    } else if let Some(ops) = snapshot.extension.render_layer_ops_with_context(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        &damage,
+        snapshot.layer,
+        render_context,
+    ) {
+        if ops.is_empty() {
+            return None;
+        }
+        AfterContentExtensionOutputAction::RenderOps {
+            output_plan: build_render_ops_output_plan(snapshot.surface_rect, &damage, &ops),
+        }
+    } else {
+        AfterContentExtensionOutputAction::Imperative
+    };
+    Some(AfterContentExtensionOutputPlan {
+        surface_index,
+        snapshot: snapshot.clone(),
+        cache_key,
+        action,
+    })
+}
+
+fn record_after_content_extension_output_plan(
+    plan: &AfterContentExtensionOutputPlan,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) {
+    let ext_name = plan.snapshot.extension.name();
+    let damage = &plan.snapshot.render_damage;
+    if let Some(stats) = render_stats.as_deref_mut() {
+        stats.record_extension_render_call(ext_name, damage);
+    }
+    match &plan.action {
+        AfterContentExtensionOutputAction::CachedReplay { .. } => {
             if let Some(stats) = render_stats.as_deref_mut() {
-                stats.record_extension_cache_hit(ext.name());
+                stats.record_extension_cache_hit(ext_name);
             }
             if let Some(trace) = render_trace.as_deref_mut() {
-                trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
+                trace.push(AttachRenderTraceOp::ExtensionCachedReplay {
+                    surface_index: plan.surface_index,
+                });
             }
-            continue;
         }
-
-        if let Some(items) = ext.render_layer_items_with_context(
-            snapshot.surface_id,
-            &snapshot.surface_rect,
-            &damage,
-            snapshot.layer,
-            render_context,
-        ) {
+        AfterContentExtensionOutputAction::RenderItems { items } => {
             if !items.is_empty() {
-                if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.record_extension_render_op_call(ext.name());
-                }
-                if let Some(trace) = render_trace.as_deref_mut() {
-                    let (regions, full_surface) = render_damage_trace_shape(&damage);
-                    trace.push(AttachRenderTraceOp::ExtensionOps {
-                        surface_index,
-                        regions,
-                        full_surface,
-                    });
-                }
+                record_after_content_extension_ops(plan, render_stats, render_trace);
             }
+        }
+        AfterContentExtensionOutputAction::RenderOps { .. } => {
+            record_after_content_extension_ops(plan, render_stats, render_trace);
+        }
+        AfterContentExtensionOutputAction::Imperative => {
+            if let Some(stats) = render_stats.as_deref_mut() {
+                stats.record_extension_imperative_call(ext_name);
+            }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                let (regions, full_surface) = render_damage_trace_shape(damage);
+                trace.push(AttachRenderTraceOp::ExtensionImperative {
+                    surface_index: plan.surface_index,
+                    regions,
+                    full_surface,
+                });
+            }
+        }
+    }
+}
+
+fn record_after_content_extension_ops(
+    plan: &AfterContentExtensionOutputPlan,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) {
+    if let Some(stats) = render_stats.as_deref_mut() {
+        stats.record_extension_render_op_call(plan.snapshot.extension.name());
+    }
+    if let Some(trace) = render_trace.as_deref_mut() {
+        let (regions, full_surface) = render_damage_trace_shape(&plan.snapshot.render_damage);
+        trace.push(AttachRenderTraceOp::ExtensionOps {
+            surface_index: plan.surface_index,
+            regions,
+            full_surface,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Executes one planned after-content action with frame-local mutable resources.
+fn execute_after_content_extension_output_plan<W: io::Write>(
+    stdout: &mut W,
+    plan: &AfterContentExtensionOutputPlan,
+    render_context: &RenderExtensionContext,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+) -> Result<()> {
+    let snapshot = &plan.snapshot;
+    match &plan.action {
+        AfterContentExtensionOutputAction::CachedReplay { bytes } => stdout
+            .write_all(bytes)
+            .context("failed replaying cached declarative render ops"),
+        AfterContentExtensionOutputAction::RenderItems { items } => {
             if let Err(err) = queue_render_items_for_frame(
                 stdout,
                 snapshot.pane_id,
                 snapshot.surface_id,
                 snapshot.surface_rect,
-                &damage,
-                &items,
+                &snapshot.render_damage,
+                items,
                 terminal_graphics_cache,
                 terminal_graphics,
                 render_context.capabilities,
             ) {
                 tracing::warn!(
-                    extension = ext.name(),
+                    extension = snapshot.extension.name(),
                     surface_id = %snapshot.surface_id,
                     error = %err,
                     "render extension render_items failed",
                 );
             }
-        } else if let Some(ops) = ext.render_layer_ops_with_context(
-            snapshot.surface_id,
-            &snapshot.surface_rect,
-            &damage,
-            snapshot.layer,
-            render_context,
-        ) {
-            if ops.is_empty() {
-                continue;
-            }
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.record_extension_render_op_call(ext.name());
-            }
-            if let Some(trace) = render_trace.as_deref_mut() {
-                let (regions, full_surface) = render_damage_trace_shape(&damage);
-                trace.push(AttachRenderTraceOp::ExtensionOps {
-                    surface_index,
-                    regions,
-                    full_surface,
-                });
-            }
+            Ok(())
+        }
+        AfterContentExtensionOutputAction::RenderOps { output_plan } => {
             let mut bytes = Vec::new();
-            match queue_render_ops(&mut bytes, snapshot.surface_rect, &damage, &ops) {
+            match emit_render_ops_output_plan(&mut bytes, output_plan) {
                 Ok(_) => {
                     stdout
                         .write_all(&bytes)
@@ -4237,11 +4330,11 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
                         && let Some(buffer) = pane_buffers.get_mut(&snapshot.pane_id)
                     {
                         buffer.extension_render_cache.insert(
-                            cache_key,
+                            plan.cache_key.clone(),
                             ExtensionRenderCacheEntry {
                                 surface_id: snapshot.surface_id,
                                 surface_rect: snapshot.surface_rect,
-                                damage,
+                                damage: snapshot.render_damage.clone(),
                                 revision,
                                 bytes,
                             },
@@ -4250,47 +4343,38 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
                 }
                 Err(err) => {
                     tracing::warn!(
-                        extension = ext.name(),
+                        extension = snapshot.extension.name(),
                         surface_id = %snapshot.surface_id,
                         error = %err,
                         "render extension render_ops failed",
                     );
                 }
             }
-        } else {
+            Ok(())
+        }
+        AfterContentExtensionOutputAction::Imperative => {
             // Re-bind through `&mut dyn io::Write` so the extension trait's
             // object-safe signature sees a dyn writer regardless of the
             // concrete `W` the caller passed.
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.record_extension_imperative_call(ext.name());
-            }
-            if let Some(trace) = render_trace.as_deref_mut() {
-                let (regions, full_surface) = render_damage_trace_shape(&damage);
-                trace.push(AttachRenderTraceOp::ExtensionImperative {
-                    surface_index,
-                    regions,
-                    full_surface,
-                });
-            }
             let dyn_writer: &mut dyn io::Write = stdout;
-            if let Err(err) = ext.render_layer_surface_with_context(
+            if let Err(err) = snapshot.extension.render_layer_surface_with_context(
                 dyn_writer,
                 snapshot.surface_id,
                 &snapshot.surface_rect,
-                &damage,
+                &snapshot.render_damage,
                 snapshot.layer,
                 render_context,
             ) {
                 tracing::warn!(
-                    extension = ext.name(),
+                    extension = snapshot.extension.name(),
                     surface_id = %snapshot.surface_id,
                     error = %err,
                     "render extension render_surface failed",
                 );
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn retain_cached_terminal_graphics_for_visible_surfaces(
@@ -5146,10 +5230,11 @@ fn render_attach_scene_inner<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
-        DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot, FrameDamage,
-        GridRowRenderContext, RenderVisibleCell, RenderVisibleCellPlan, TerminalCommand,
-        append_pane_output, build_render_ops_output_plan, coalesce_render_damage,
+        AfterContentExtensionOutputAction, AttachLayer, AttachLayerSurface, AttachRenderTrace,
+        AttachRenderTraceOp, DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot,
+        FrameDamage, GridRowRenderContext, RenderVisibleCell, RenderVisibleCellPlan,
+        TerminalCommand, append_pane_output, build_after_content_extension_output_plan,
+        build_render_ops_output_plan, coalesce_render_damage,
         commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
         opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
         queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
@@ -5164,8 +5249,8 @@ mod tests {
         AttachSurfaceKind, PaneState, PaneSummary,
     };
     use bmux_plugin::{
-        ExtensionRect, RenderColor, RenderDamage, RenderExtensionLayer, RenderNamedColor, RenderOp,
-        RenderStyle, RenderUnderCell,
+        ExtensionRect, RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer,
+        RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
     };
     #[cfg(feature = "image-kitty")]
     use bmux_plugin::{
@@ -5598,6 +5683,91 @@ mod tests {
             plan.commands.last(),
             Some(TerminalCommand::ResetStyle)
         ));
+    }
+
+    #[test]
+    fn after_content_extension_output_plan_contains_render_ops_plan_before_emit() {
+        struct PlannedOpsExtension;
+
+        impl bmux_plugin::AttachRenderExtension for PlannedOpsExtension {
+            fn name(&self) -> &'static str {
+                "test.planned_ops"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                RenderDamage::Regions(vec![*surface_rect])
+            }
+
+            fn render_layer_ops_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+                _layer: RenderExtensionLayer,
+                _context: &RenderExtensionContext,
+            ) -> Option<Vec<RenderOp>> {
+                Some(vec![RenderOp::TextRun {
+                    x: 1,
+                    y: 0,
+                    text: "planned".to_string(),
+                    style: RenderStyle::default(),
+                }])
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn std::io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let surface_id = Uuid::from_u128(100);
+        let pane_id = Uuid::from_u128(101);
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 1,
+        };
+        let extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(PlannedOpsExtension);
+        let snapshot = ExtensionLayerSnapshot::build(
+            &extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &FrameDamage::default(),
+            DamageCoalescingPolicy::default(),
+        );
+        let render_context = RenderExtensionContext {
+            capabilities: bmux_plugin::TerminalRenderCapabilities::default(),
+        };
+
+        let plan = build_after_content_extension_output_plan(
+            0,
+            &snapshot,
+            &render_context,
+            &BTreeMap::new(),
+        )
+        .expect("damaged after-content extension should produce an output plan");
+
+        let AfterContentExtensionOutputAction::RenderOps { output_plan } = plan.action else {
+            panic!("expected declarative render ops output plan");
+        };
+        assert!(output_plan.commands.iter().any(|command| matches!(
+            command,
+            TerminalCommand::Print(text) if text == "planned"
+        )));
     }
 
     #[test]
