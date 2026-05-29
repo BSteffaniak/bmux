@@ -2,9 +2,9 @@ use crate::compositor::retained_repaint_plan_from_frame_damage;
 #[cfg(feature = "image-kitty")]
 use crate::types::TerminalGraphicCacheEntry;
 use crate::types::{
-    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition,
-    ExtensionLayerSnapshotCacheEntry, ExtensionRenderCacheEntry, PaneRect, PaneRenderBuffer,
-    TerminalGraphicPlacementSignature, TerminalGraphicSourceSignature, TerminalGraphicsCache,
+    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, ExtensionRenderCacheEntry,
+    PaneRect, PaneRenderBuffer, TerminalGraphicPlacementSignature, TerminalGraphicSourceSignature,
+    TerminalGraphicsCache,
 };
 use anyhow::{Context, Result};
 use bmux_appearance::{
@@ -35,9 +35,21 @@ use std::io;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+#[path = "render/extension_plans.rs"]
+mod extension_plans;
 #[path = "render/terminal_graphics.rs"]
 mod terminal_graphics;
 
+#[cfg(test)]
+use extension_plans::build_before_content_extension_output_plan;
+use extension_plans::{
+    AfterContentExtensionOutputAction, AfterContentExtensionOutputPlan,
+    BeforeContentExtensionOutputAction, BeforeContentExtensionOutputPlan,
+    BeforeContentSurfaceOutputPlan, ExtensionLayerSnapshot,
+    apply_previous_extension_snapshot_damage, build_after_content_extension_output_plan,
+    build_before_content_surface_output_plan, commit_extension_layer_snapshots_for_surface,
+    extension_layer_snapshots_for_surface, previous_extension_snapshot_cleanup_damage,
+};
 use terminal_graphics::{
     TerminalGraphicsFrameResources, begin_terminal_graphics_frame, finish_terminal_graphics_frame,
 };
@@ -92,229 +104,6 @@ fn coalesce_render_damage(
         RenderDamage::FullSurface
     } else {
         RenderDamage::Regions(merged)
-    }
-}
-
-fn extension_own_render_damage_for_frame(
-    ext: &dyn AttachRenderExtension,
-    surface_id: Uuid,
-    surface_rect: ExtensionRect,
-    layer: RenderExtensionLayer,
-    frame_damage: &FrameDamage,
-    policy: DamageCoalescingPolicy,
-) -> RenderDamage {
-    let extension_rect_damage = frame_damage.extension_surface_rects(surface_id);
-    if frame_damage.is_full_frame() || frame_damage.extension_surfaces.contains(&surface_id) {
-        return RenderDamage::FullSurface;
-    }
-    if !extension_rect_damage.is_empty() {
-        return coalesce_render_damage(
-            frame_rects_to_render_damage(extension_rect_damage, surface_rect),
-            surface_rect,
-            policy,
-        );
-    }
-    coalesce_render_damage(
-        ext.surface_layer_damage(surface_id, &surface_rect, layer),
-        surface_rect,
-        policy,
-    )
-}
-
-#[derive(Clone)]
-struct ExtensionLayerSnapshot {
-    extension: std::sync::Arc<dyn AttachRenderExtension>,
-    surface_id: Uuid,
-    pane_id: Uuid,
-    surface_rect: ExtensionRect,
-    layer: RenderExtensionLayer,
-    own_damage: RenderDamage,
-    render_damage: RenderDamage,
-    revision: Option<u64>,
-}
-
-impl ExtensionLayerSnapshot {
-    fn build(
-        extension: &std::sync::Arc<dyn AttachRenderExtension>,
-        surface_id: Uuid,
-        pane_id: Uuid,
-        surface_rect: ExtensionRect,
-        layer: RenderExtensionLayer,
-        frame_damage: &FrameDamage,
-        policy: DamageCoalescingPolicy,
-    ) -> Self {
-        let ext = extension.as_ref();
-        let own_damage = extension_own_render_damage_for_frame(
-            ext,
-            surface_id,
-            surface_rect,
-            layer,
-            frame_damage,
-            policy,
-        );
-        let render_damage = if !own_damage.is_none() {
-            own_damage.clone()
-        } else if frame_damage.content_surface_damaged(pane_id)
-            && ext.redraws_on_content_damage(layer)
-        {
-            RenderDamage::FullSurface
-        } else {
-            RenderDamage::None
-        };
-        let revision = ext.render_layer_revision(surface_id, layer);
-        Self {
-            extension: extension.clone(),
-            surface_id,
-            pane_id,
-            surface_rect,
-            layer,
-            own_damage,
-            render_damage,
-            revision,
-        }
-    }
-
-    fn cache_key(&self, capabilities: TerminalRenderCapabilities) -> (String, Uuid) {
-        (
-            format!(
-                "{}::{:?}::caps={}",
-                self.extension.name(),
-                self.layer,
-                capabilities.cache_key()
-            ),
-            self.surface_id,
-        )
-    }
-}
-
-fn extension_layer_snapshots_for_surface(
-    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
-    surface_id: Uuid,
-    pane_id: Uuid,
-    surface_rect: ExtensionRect,
-    layer: RenderExtensionLayer,
-    frame_damage: &FrameDamage,
-    policy: DamageCoalescingPolicy,
-) -> Vec<ExtensionLayerSnapshot> {
-    render_extensions
-        .iter()
-        .map(|extension| {
-            ExtensionLayerSnapshot::build(
-                extension,
-                surface_id,
-                pane_id,
-                surface_rect,
-                layer,
-                frame_damage,
-                policy,
-            )
-        })
-        .collect()
-}
-
-fn extension_snapshot_changed(
-    previous: &ExtensionLayerSnapshotCacheEntry,
-    current: &ExtensionLayerSnapshot,
-) -> bool {
-    previous.surface_rect != current.surface_rect || previous.revision != current.revision
-}
-
-fn apply_previous_extension_snapshot_damage(
-    pane_buffer: Option<&PaneRenderBuffer>,
-    capabilities: TerminalRenderCapabilities,
-    layer_snapshots: &mut [ExtensionLayerSnapshot],
-) {
-    let Some(buffer) = pane_buffer else {
-        return;
-    };
-    for snapshot in layer_snapshots {
-        if !snapshot.render_damage.is_none() {
-            continue;
-        }
-        let key = snapshot.cache_key(capabilities);
-        if buffer
-            .extension_layer_snapshot_cache
-            .get(&key)
-            .is_some_and(|previous| extension_snapshot_changed(previous, snapshot))
-        {
-            snapshot.render_damage = RenderDamage::FullSurface;
-        }
-    }
-}
-
-fn previous_extension_snapshot_cleanup_damage(
-    pane_buffer: Option<&PaneRenderBuffer>,
-    surface_id: Uuid,
-    layer: RenderExtensionLayer,
-    surface_rect: ExtensionRect,
-    policy: DamageCoalescingPolicy,
-    capabilities: TerminalRenderCapabilities,
-    layer_snapshots: &[ExtensionLayerSnapshot],
-) -> RenderDamage {
-    let Some(buffer) = pane_buffer else {
-        return RenderDamage::None;
-    };
-    let current_keys = layer_snapshots
-        .iter()
-        .map(|snapshot| snapshot.cache_key(capabilities))
-        .collect::<BTreeSet<_>>();
-    let mut rects = Vec::new();
-    for (key, previous) in &buffer.extension_layer_snapshot_cache {
-        if previous.surface_id != surface_id || previous.layer != layer {
-            continue;
-        }
-        let stale = !current_keys.contains(key)
-            || layer_snapshots
-                .iter()
-                .find(|snapshot| snapshot.cache_key(capabilities) == *key)
-                .is_some_and(|snapshot| extension_snapshot_changed(previous, snapshot));
-        if !stale {
-            continue;
-        }
-        match &previous.full_snapshot_damage {
-            RenderDamage::None => {}
-            RenderDamage::FullSurface => return RenderDamage::FullSurface,
-            RenderDamage::Regions(regions) => rects.extend(regions.iter().copied()),
-        }
-    }
-    coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
-}
-
-fn commit_extension_layer_snapshots_for_surface(
-    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
-    capabilities: TerminalRenderCapabilities,
-    pane_id: Uuid,
-    surface_id: Uuid,
-    layer: RenderExtensionLayer,
-    layer_snapshots: &[ExtensionLayerSnapshot],
-) {
-    let Some(buffer) = pane_buffers.get_mut(&pane_id) else {
-        return;
-    };
-    let current_keys = layer_snapshots
-        .iter()
-        .map(|snapshot| snapshot.cache_key(capabilities))
-        .collect::<BTreeSet<_>>();
-    buffer.extension_layer_snapshot_cache.retain(|key, entry| {
-        entry.surface_id != surface_id || entry.layer != layer || current_keys.contains(key)
-    });
-    for snapshot in layer_snapshots {
-        let key = snapshot.cache_key(capabilities);
-        let had_previous = buffer.extension_layer_snapshot_cache.contains_key(&key);
-        if snapshot.render_damage.is_none() && !had_previous {
-            continue;
-        }
-        buffer.extension_layer_snapshot_cache.insert(
-            key,
-            ExtensionLayerSnapshotCacheEntry {
-                surface_id: snapshot.surface_id,
-                surface_rect: snapshot.surface_rect,
-                layer: snapshot.layer,
-                emitted_damage: snapshot.render_damage.clone(),
-                full_snapshot_damage: RenderDamage::FullSurface,
-                revision: snapshot.revision,
-            },
-        );
     }
 }
 
@@ -3939,33 +3728,6 @@ fn after_content_stale_snapshot_damage_for_surface(
     coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
 }
 
-struct BeforeContentSurfaceOutputPlan {
-    plans: Vec<BeforeContentExtensionOutputPlan>,
-    damage_rects: Vec<DamageRect>,
-}
-
-fn build_before_content_surface_output_plan(
-    layer_snapshots: &[ExtensionLayerSnapshot],
-    content: PaneRect,
-    render_context: &RenderExtensionContext,
-) -> BeforeContentSurfaceOutputPlan {
-    let mut plans = Vec::new();
-    let mut damage_rects = Vec::new();
-    for snapshot in layer_snapshots {
-        let Some(plan) =
-            build_before_content_extension_output_plan(snapshot, content, render_context)
-        else {
-            continue;
-        };
-        damage_rects.extend(plan.damage_rects.iter().copied());
-        plans.push(plan);
-    }
-    BeforeContentSurfaceOutputPlan {
-        plans,
-        damage_rects,
-    }
-}
-
 #[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
 fn execute_before_content_surface_output_plan<W: io::Write>(
     stdout: &mut W,
@@ -3990,100 +3752,6 @@ fn execute_before_content_surface_output_plan<W: io::Write>(
         )?;
     }
     Ok(cells)
-}
-
-#[derive(Clone)]
-struct BeforeContentExtensionOutputPlan {
-    snapshot: ExtensionLayerSnapshot,
-    damage_rects: Vec<DamageRect>,
-    action: BeforeContentExtensionOutputAction,
-}
-
-#[derive(Clone)]
-enum BeforeContentExtensionOutputAction {
-    RenderItems {
-        items: Vec<RenderLayerItem>,
-    },
-    LayerCells {
-        cells: Vec<(u16, u16, RenderUnderCell)>,
-    },
-    RenderOps {
-        ops: Vec<RenderOp>,
-    },
-    NoOutput,
-}
-
-fn build_before_content_extension_output_plan(
-    snapshot: &ExtensionLayerSnapshot,
-    content: PaneRect,
-    render_context: &RenderExtensionContext,
-) -> Option<BeforeContentExtensionOutputPlan> {
-    let damage = snapshot.render_damage.clone();
-    if damage.is_none() {
-        return None;
-    }
-    let action = before_content_extension_output_action(snapshot, &damage, render_context);
-    Some(BeforeContentExtensionOutputPlan {
-        snapshot: snapshot.clone(),
-        damage_rects: before_content_damage_rects(&damage, content),
-        action,
-    })
-}
-
-fn before_content_extension_output_action(
-    snapshot: &ExtensionLayerSnapshot,
-    damage: &RenderDamage,
-    render_context: &RenderExtensionContext,
-) -> BeforeContentExtensionOutputAction {
-    if let Some(items) = snapshot.extension.render_layer_items_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        damage,
-        snapshot.layer,
-        render_context,
-    ) {
-        return BeforeContentExtensionOutputAction::RenderItems { items };
-    }
-    if let Some(cells) = snapshot.extension.render_before_content_cells_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        damage,
-        render_context,
-    ) {
-        return BeforeContentExtensionOutputAction::LayerCells { cells };
-    }
-    if let Some(ops) = snapshot.extension.render_layer_ops_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        damage,
-        snapshot.layer,
-        render_context,
-    ) {
-        return BeforeContentExtensionOutputAction::RenderOps { ops };
-    }
-    BeforeContentExtensionOutputAction::NoOutput
-}
-
-fn before_content_damage_rects(damage: &RenderDamage, content: PaneRect) -> Vec<DamageRect> {
-    match damage {
-        RenderDamage::FullSurface => vec![DamageRect::new(0, 0, content.w, content.h)],
-        RenderDamage::Regions(regions) => regions
-            .iter()
-            .filter_map(|region| {
-                let x1 = region.x.max(content.x);
-                let y1 = region.y.max(content.y);
-                let x2 = region.right().min(content.x.saturating_add(content.w));
-                let y2 = region.bottom().min(content.y.saturating_add(content.h));
-                (x1 < x2 && y1 < y2).then_some(DamageRect::new(
-                    x1.saturating_sub(content.x),
-                    y1.saturating_sub(content.y),
-                    x2.saturating_sub(x1),
-                    y2.saturating_sub(y1),
-                ))
-            })
-            .collect(),
-        RenderDamage::None => Vec::new(),
-    }
 }
 
 fn record_before_content_extension_output_plan(
@@ -4266,76 +3934,6 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
         )?;
     }
     Ok(())
-}
-
-#[derive(Clone)]
-struct AfterContentExtensionOutputPlan {
-    surface_index: usize,
-    snapshot: ExtensionLayerSnapshot,
-    cache_key: (String, Uuid),
-    action: AfterContentExtensionOutputAction,
-}
-
-#[derive(Clone)]
-enum AfterContentExtensionOutputAction {
-    CachedReplay { bytes: Vec<u8> },
-    RenderItems { items: Vec<RenderLayerItem> },
-    RenderOps { output_plan: RenderOpsOutputPlan },
-    Imperative,
-}
-
-fn build_after_content_extension_output_plan(
-    surface_index: usize,
-    snapshot: &ExtensionLayerSnapshot,
-    render_context: &RenderExtensionContext,
-    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
-) -> Option<AfterContentExtensionOutputPlan> {
-    let damage = snapshot.render_damage.clone();
-    if damage.is_none() {
-        return None;
-    }
-    let cache_key = snapshot.cache_key(render_context.capabilities);
-    let action = if let Some(revision) = snapshot.revision
-        && let Some(entry) = pane_buffers
-            .get(&snapshot.pane_id)
-            .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
-        && entry.surface_rect == snapshot.surface_rect
-        && entry.damage == damage
-        && entry.revision == revision
-    {
-        AfterContentExtensionOutputAction::CachedReplay {
-            bytes: entry.bytes.clone(),
-        }
-    } else if let Some(items) = snapshot.extension.render_layer_items_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        &damage,
-        snapshot.layer,
-        render_context,
-    ) {
-        AfterContentExtensionOutputAction::RenderItems { items }
-    } else if let Some(ops) = snapshot.extension.render_layer_ops_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        &damage,
-        snapshot.layer,
-        render_context,
-    ) {
-        if ops.is_empty() {
-            return None;
-        }
-        AfterContentExtensionOutputAction::RenderOps {
-            output_plan: build_render_ops_output_plan(snapshot.surface_rect, &damage, &ops),
-        }
-    } else {
-        AfterContentExtensionOutputAction::Imperative
-    };
-    Some(AfterContentExtensionOutputPlan {
-        surface_index,
-        snapshot: snapshot.clone(),
-        cache_key,
-        action,
-    })
 }
 
 fn record_after_content_extension_output_plan(
