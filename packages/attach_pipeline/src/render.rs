@@ -568,13 +568,8 @@ pub fn queue_render_ops<W: io::Write>(
     if !render_ops_visible_segment_safe(ops) {
         return queue_render_ops_direct(stdout, surface_rect, damage, ops);
     }
-    let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
-    queue_render_ops_direct(
-        stdout,
-        surface_rect,
-        &RenderDamage::FullSurface,
-        &visible_segments,
-    )
+    let plan = build_render_ops_output_plan(surface_rect, damage, ops);
+    emit_render_ops_output_plan(stdout, &plan)
 }
 
 fn render_ops_visible_segment_safe(ops: &[RenderOp]) -> bool {
@@ -617,13 +612,56 @@ fn queue_render_ops_direct<W: io::Write>(
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> Result<bool> {
+    let plan = build_direct_render_ops_output_plan(surface_rect, damage, ops);
+    emit_render_ops_output_plan(stdout, &plan)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RenderOpsOutputPlan {
+    commands: Vec<TerminalCommand>,
+}
+
+impl RenderOpsOutputPlan {
+    fn push_reset_if_needed(&mut self, wrote: bool) {
+        if wrote {
+            self.commands.push(TerminalCommand::ResetStyle);
+        }
+    }
+}
+
+fn build_render_ops_output_plan(
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> RenderOpsOutputPlan {
+    debug_assert!(render_ops_visible_segment_safe(ops));
+    let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
+    build_direct_render_ops_output_plan(surface_rect, &RenderDamage::FullSurface, &visible_segments)
+}
+
+fn build_direct_render_ops_output_plan(
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> RenderOpsOutputPlan {
+    let mut plan = RenderOpsOutputPlan::default();
+    let wrote = append_render_ops_to_output_plan(&mut plan, surface_rect, damage, ops);
+    plan.push_reset_if_needed(wrote);
+    plan
+}
+
+fn append_render_ops_to_output_plan(
+    plan: &mut RenderOpsOutputPlan,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> bool {
     let mut wrote = false;
-    let mut commands = Vec::new();
     let mut pending_text_run = None;
     for op in ops {
         if !render_op_intersects_damage(op, damage) {
             wrote |= flush_pending_text_run_to_commands(
-                &mut commands,
+                &mut plan.commands,
                 surface_rect,
                 &mut pending_text_run,
             );
@@ -633,7 +671,7 @@ fn queue_render_ops_direct<W: io::Write>(
             RenderOp::TextRun { x, y, text, style } => {
                 if !merge_pending_text_run(&mut pending_text_run, *x, *y, text, *style) {
                     wrote |= flush_pending_text_run_to_commands(
-                        &mut commands,
+                        &mut plan.commands,
                         surface_rect,
                         &mut pending_text_run,
                     );
@@ -647,28 +685,29 @@ fn queue_render_ops_direct<W: io::Write>(
             }
             RenderOp::StyledText { x, y, spans } => {
                 wrote |= flush_pending_text_run_to_commands(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     &mut pending_text_run,
                 );
-                wrote |= lower_render_styled_text(&mut commands, surface_rect, *x, *y, spans);
+                wrote |= lower_render_styled_text(&mut plan.commands, surface_rect, *x, *y, spans);
             }
             RenderOp::ClearRect { rect, style } => {
                 wrote |= flush_pending_text_run_to_commands(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     &mut pending_text_run,
                 );
-                wrote |= lower_render_fill_rect(&mut commands, surface_rect, *rect, ' ', *style);
+                wrote |=
+                    lower_render_fill_rect(&mut plan.commands, surface_rect, *rect, ' ', *style);
             }
             RenderOp::EraseRowSegment { x, y, width, style } => {
                 wrote |= flush_pending_text_run_to_commands(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     &mut pending_text_run,
                 );
                 wrote |= lower_render_fill_rect(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     ExtensionRect {
                         x: *x,
@@ -682,11 +721,12 @@ fn queue_render_ops_direct<W: io::Write>(
             }
             RenderOp::FillRect { rect, ch, style } => {
                 wrote |= flush_pending_text_run_to_commands(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     &mut pending_text_run,
                 );
-                wrote |= lower_render_fill_rect(&mut commands, surface_rect, *rect, *ch, *style);
+                wrote |=
+                    lower_render_fill_rect(&mut plan.commands, surface_rect, *rect, *ch, *style);
             }
             RenderOp::Border {
                 rect,
@@ -694,28 +734,33 @@ fn queue_render_ops_direct<W: io::Write>(
                 style,
             } => {
                 wrote |= flush_pending_text_run_to_commands(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     &mut pending_text_run,
                 );
-                wrote |= lower_render_border(&mut commands, surface_rect, *rect, *glyphs, *style);
+                wrote |=
+                    lower_render_border(&mut plan.commands, surface_rect, *rect, *glyphs, *style);
             }
             RenderOp::CellGrid { x, y, rows } => {
                 wrote |= flush_pending_text_run_to_commands(
-                    &mut commands,
+                    &mut plan.commands,
                     surface_rect,
                     &mut pending_text_run,
                 );
-                wrote |= lower_render_cell_grid(&mut commands, surface_rect, *x, *y, rows);
+                wrote |= lower_render_cell_grid(&mut plan.commands, surface_rect, *x, *y, rows);
             }
         }
     }
-    wrote |= flush_pending_text_run_to_commands(&mut commands, surface_rect, &mut pending_text_run);
-    if wrote {
-        commands.push(TerminalCommand::ResetStyle);
-        queue_terminal_commands(stdout, &commands)?;
-    }
-    Ok(wrote)
+    wrote |=
+        flush_pending_text_run_to_commands(&mut plan.commands, surface_rect, &mut pending_text_run);
+    wrote
+}
+
+fn emit_render_ops_output_plan<W: io::Write>(
+    stdout: &mut W,
+    plan: &RenderOpsOutputPlan,
+) -> Result<bool> {
+    queue_terminal_commands(stdout, &plan.commands)
 }
 
 #[derive(Clone, Debug)]
@@ -5104,11 +5149,11 @@ mod tests {
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
         DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot, FrameDamage,
         GridRowRenderContext, RenderVisibleCell, RenderVisibleCellPlan, TerminalCommand,
-        append_pane_output, coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
-        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
-        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
-        render_grid_row_segment,
+        append_pane_output, build_render_ops_output_plan, coalesce_render_damage,
+        commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
+        opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
+        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -5506,6 +5551,53 @@ mod tests {
         let output = String::from_utf8(output).expect("render op bytes should be utf8");
         assert!(output.contains("\u{1b}[1;3HHEAD"), "{output:?}");
         assert!(!output.contains('.'), "{output:?}");
+    }
+
+    #[test]
+    fn render_ops_output_plan_contains_terminal_commands_before_emit() {
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 1,
+        };
+        let ops = [
+            RenderOp::FillRect {
+                rect: surface_rect,
+                ch: '.',
+                style: RenderStyle::default(),
+            },
+            RenderOp::TextRun {
+                x: 2,
+                y: 0,
+                text: "HEAD".to_string(),
+                style: RenderStyle::default().named_foreground(RenderNamedColor::Cyan),
+            },
+        ];
+
+        let plan = build_render_ops_output_plan(
+            surface_rect,
+            &RenderDamage::Regions(vec![ExtensionRect {
+                x: 2,
+                y: 0,
+                w: 4,
+                h: 1,
+            }]),
+            &ops,
+        );
+
+        assert!(plan.commands.iter().any(|command| matches!(
+            command,
+            TerminalCommand::Print(text) if text == "HEAD"
+        )));
+        assert!(!plan.commands.iter().any(|command| matches!(
+            command,
+            TerminalCommand::Print(text) if text.contains('.')
+        )));
+        assert!(matches!(
+            plan.commands.last(),
+            Some(TerminalCommand::ResetStyle)
+        ));
     }
 
     #[test]
