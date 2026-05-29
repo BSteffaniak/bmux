@@ -3819,7 +3819,6 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
 }
 
 type BeforeContentCells = BTreeMap<(u16, u16), RenderUnderCell>;
-type BeforeContentRender = (BeforeContentCells, Vec<DamageRect>);
 
 fn render_damage_rects(damage: &RenderDamage, surface_rect: ExtensionRect) -> Vec<ExtensionRect> {
     match damage {
@@ -3933,41 +3932,57 @@ fn after_content_stale_snapshot_damage_for_surface(
     coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
 }
 
-#[allow(clippy::too_many_arguments)] // Mirrors the after-content render path state.
-fn before_content_cells_for_surface<W: io::Write>(
-    stdout: &mut W,
-    surface: &bmux_attach_layout_protocol::AttachSurface,
-    pane_id: Uuid,
-    content: PaneRect,
-    terminal_graphics_cache: &mut TerminalGraphicsCache,
-    terminal_graphics: &mut TerminalGraphicsFrameResources,
+struct BeforeContentSurfaceOutputPlan {
+    plans: Vec<BeforeContentExtensionOutputPlan>,
+    damage_rects: Vec<DamageRect>,
+}
+
+fn build_before_content_surface_output_plan(
     layer_snapshots: &[ExtensionLayerSnapshot],
+    content: PaneRect,
     render_context: &RenderExtensionContext,
-    render_stats: &mut Option<&mut AttachSceneRenderStats>,
-) -> Result<BeforeContentRender> {
-    let mut cells = BTreeMap::new();
+) -> BeforeContentSurfaceOutputPlan {
+    let mut plans = Vec::new();
     let mut damage_rects = Vec::new();
     for snapshot in layer_snapshots {
-        debug_assert_eq!(snapshot.surface_id, surface.id);
-        debug_assert_eq!(snapshot.pane_id, pane_id);
         let Some(plan) =
             build_before_content_extension_output_plan(snapshot, content, render_context)
         else {
             continue;
         };
-        record_before_content_extension_output_plan(&plan, render_stats);
         damage_rects.extend(plan.damage_rects.iter().copied());
+        plans.push(plan);
+    }
+    BeforeContentSurfaceOutputPlan {
+        plans,
+        damage_rects,
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
+fn execute_before_content_surface_output_plan<W: io::Write>(
+    stdout: &mut W,
+    plan: &BeforeContentSurfaceOutputPlan,
+    content: PaneRect,
+    render_context: &RenderExtensionContext,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+) -> Result<BeforeContentCells> {
+    let mut cells = BTreeMap::new();
+    for extension_plan in &plan.plans {
+        record_before_content_extension_output_plan(extension_plan, render_stats);
         execute_before_content_extension_output_plan(
             stdout,
             &mut cells,
             content,
-            &plan,
+            extension_plan,
             render_context,
             terminal_graphics_cache,
             terminal_graphics,
         )?;
     }
-    Ok((cells, damage_rects))
+    Ok(cells)
 }
 
 #[derive(Clone)]
@@ -4736,6 +4751,111 @@ struct PaneContentRenderStage<'a> {
     content_damage: &'a PaneContentDamagePlan,
 }
 
+struct SurfaceOutputPlan<'a> {
+    pane_id: Uuid,
+    surface_id: Uuid,
+    surface_index: usize,
+    ext_rect: ExtensionRect,
+    content: PaneRect,
+    surface_plan: PaneSurfaceFramePlan,
+    before_content_snapshots: Vec<ExtensionLayerSnapshot>,
+    before_content_output_plan: BeforeContentSurfaceOutputPlan,
+    after_content_snapshots: Vec<ExtensionLayerSnapshot>,
+    scrollback_active: bool,
+    scrollback_offset: usize,
+    scrollback_cursor: Option<AttachScrollbackCursor>,
+    selection_anchor: Option<AttachScrollbackPosition>,
+    runtime_appearance: &'a RuntimeAppearance,
+}
+
+impl SurfaceOutputPlan<'_> {
+    const fn should_execute(&self) -> bool {
+        self.surface_plan.should_render_surface()
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Executes one planned surface with frame-local mutable resources.
+fn execute_surface_output_plan<W: io::Write>(
+    stdout: &mut W,
+    plan: &SurfaceOutputPlan<'_>,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+    render_context: &RenderExtensionContext,
+    render_stats: &mut Option<&mut AttachSceneRenderStats>,
+    render_trace: &mut Option<&mut AttachRenderTrace>,
+) -> Result<Option<AttachCursorState>> {
+    let before_content_cells = execute_before_content_surface_output_plan(
+        stdout,
+        &plan.before_content_output_plan,
+        plan.content,
+        render_context,
+        terminal_graphics_cache,
+        terminal_graphics,
+        render_stats,
+    )?;
+    commit_extension_layer_snapshots_for_surface(
+        pane_buffers,
+        render_context.capabilities,
+        plan.pane_id,
+        plan.surface_id,
+        RenderExtensionLayer::BeforePaneContent,
+        &plan.before_content_snapshots,
+    );
+
+    if plan.surface_plan.should_cleanup_after_content() {
+        queue_after_content_cleanup_for_damage(
+            stdout,
+            plan.ext_rect,
+            &plan.surface_plan.after_content_cleanup.surface_damage,
+        )
+        .context("failed clearing stale after-content decoration cells")?;
+    }
+    let cursor_state = queue_pane_content_for_surface(
+        stdout,
+        pane_buffers,
+        &PaneContentRenderStage {
+            pane_id: plan.pane_id,
+            surface_index: plan.surface_index,
+            content: plan.content,
+            focus: plan.surface_plan.focused,
+            sync_deferred: plan.surface_plan.sync_deferred,
+            scrollback_active: plan.scrollback_active,
+            scrollback_offset: plan.scrollback_offset,
+            scrollback_cursor: plan.scrollback_cursor,
+            selection_anchor: plan.selection_anchor,
+            runtime_appearance: plan.runtime_appearance,
+            before_content_cells: &before_content_cells,
+            content_damage: &plan.surface_plan.content_damage,
+        },
+        render_stats,
+        render_trace,
+    )?;
+
+    if plan.surface_plan.should_draw_extensions() {
+        queue_after_content_extensions_for_surface(
+            stdout,
+            plan.surface_index,
+            &plan.after_content_snapshots,
+            render_context,
+            pane_buffers,
+            terminal_graphics_cache,
+            terminal_graphics,
+            render_stats,
+            render_trace,
+        )?;
+    }
+    commit_extension_layer_snapshots_for_surface(
+        pane_buffers,
+        render_context.capabilities,
+        plan.pane_id,
+        plan.surface_id,
+        RenderExtensionLayer::AfterPaneContent,
+        &plan.after_content_snapshots,
+    );
+    Ok(cursor_state)
+}
+
 struct PaneContentRowOutputPlan {
     row: u16,
     y: u16,
@@ -5277,27 +5397,12 @@ fn render_attach_scene_inner<W: io::Write>(
             render_context.capabilities,
             &mut after_content_snapshots,
         );
-        let before_content = before_content_cells_for_surface(
-            stdout,
-            surface,
-            pane_id,
+        let before_content_output_plan = build_before_content_surface_output_plan(
+            &before_content_snapshots,
             content,
-            terminal_graphics_cache,
-            &mut terminal_graphics_frame,
-            &before_content_snapshots,
             render_context,
-            &mut render_stats,
-        )?;
-        commit_extension_layer_snapshots_for_surface(
-            pane_buffers,
-            render_context.capabilities,
-            pane_id,
-            surface.id,
-            RenderExtensionLayer::BeforePaneContent,
-            &before_content_snapshots,
         );
-        let before_content_cells = before_content.0;
-        let before_content_damage = before_content.1;
+        let before_content_damage = before_content_output_plan.damage_rects.clone();
         let after_content_cleanup = after_content_cleanup_plan_for_surface(
             pane_buffers.get(&pane_id),
             surface.id,
@@ -5349,61 +5454,45 @@ fn render_attach_scene_inner<W: io::Write>(
             }
         }
 
-        if !surface_plan.should_render_surface() {
+        let surface_output_plan = SurfaceOutputPlan {
+            pane_id,
+            surface_id: surface.id,
+            surface_index,
+            ext_rect,
+            content,
+            surface_plan,
+            before_content_snapshots,
+            before_content_output_plan,
+            after_content_snapshots,
+            scrollback_active,
+            scrollback_offset,
+            scrollback_cursor,
+            selection_anchor,
+            runtime_appearance,
+        };
+        if !surface_output_plan.should_execute() {
+            commit_extension_layer_snapshots_for_surface(
+                pane_buffers,
+                render_context.capabilities,
+                surface_output_plan.pane_id,
+                surface_output_plan.surface_id,
+                RenderExtensionLayer::BeforePaneContent,
+                &surface_output_plan.before_content_snapshots,
+            );
             continue;
         }
-        if surface_plan.should_cleanup_after_content() {
-            queue_after_content_cleanup_for_damage(
-                stdout,
-                ext_rect,
-                &surface_plan.after_content_cleanup.surface_damage,
-            )
-            .context("failed clearing stale after-content decoration cells")?;
-        }
-        if let Some(content_cursor_state) = queue_pane_content_for_surface(
+        if let Some(content_cursor_state) = execute_surface_output_plan(
             stdout,
+            &surface_output_plan,
             pane_buffers,
-            &PaneContentRenderStage {
-                pane_id,
-                surface_index,
-                content,
-                focus: surface_plan.focused,
-                sync_deferred: surface_plan.sync_deferred,
-                scrollback_active,
-                scrollback_offset,
-                scrollback_cursor,
-                selection_anchor,
-                runtime_appearance,
-                before_content_cells: &before_content_cells,
-                content_damage: &surface_plan.content_damage,
-            },
+            terminal_graphics_cache,
+            &mut terminal_graphics_frame,
+            render_context,
             &mut render_stats,
             &mut render_trace,
         )? {
             cursor_state = Some(content_cursor_state);
         }
-
-        if surface_plan.should_draw_extensions() {
-            queue_after_content_extensions_for_surface(
-                stdout,
-                surface_index,
-                &after_content_snapshots,
-                render_context,
-                pane_buffers,
-                terminal_graphics_cache,
-                &mut terminal_graphics_frame,
-                &mut render_stats,
-                &mut render_trace,
-            )?;
-        }
-        commit_extension_layer_snapshots_for_surface(
-            pane_buffers,
-            render_context.capabilities,
-            pane_id,
-            surface.id,
-            RenderExtensionLayer::AfterPaneContent,
-            &after_content_snapshots,
-        );
     }
 
     finish_terminal_graphics_frame(
@@ -5420,18 +5509,19 @@ fn render_attach_scene_inner<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AfterContentExtensionOutputAction, AttachLayer, AttachLayerSurface, AttachRenderTrace,
-        AttachRenderTraceOp, BeforeContentExtensionOutputAction, DamageCoalescingPolicy,
+        AfterContentCleanupPlan, AfterContentExtensionOutputAction, AttachLayer,
+        AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
+        BeforeContentExtensionOutputAction, BeforeContentSurfaceOutputPlan, DamageCoalescingPolicy,
         DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext,
-        PaneContentRowOutputPlan, PaneContentRowSegmentOutput, RenderVisibleCell,
-        RenderVisibleCellPlan, TerminalCommand, append_pane_output,
-        build_after_content_extension_output_plan, build_before_content_extension_output_plan,
-        build_render_ops_output_plan, coalesce_render_damage,
-        commit_extension_layer_snapshots_for_surface, execute_pane_content_row_output_plan,
-        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
-        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
-        render_grid_row_segment,
+        PaneContentDamagePlan, PaneContentRowOutputPlan, PaneContentRowSegmentOutput,
+        PaneSurfaceFramePlan, RenderVisibleCell, RenderVisibleCellPlan, SurfaceOutputPlan,
+        TerminalCommand, append_pane_output, build_after_content_extension_output_plan,
+        build_before_content_extension_output_plan, build_render_ops_output_plan,
+        coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
+        execute_pane_content_row_output_plan, frame_damage_overlay_render_ops, opaque_row_text,
+        optimize_terminal_commands, queue_frame_damage_overlay,
+        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -5876,6 +5966,52 @@ mod tests {
             plan.commands.last(),
             Some(TerminalCommand::ResetStyle)
         ));
+    }
+
+    #[test]
+    fn surface_output_plan_executes_when_content_is_damaged() {
+        let runtime_appearance = RuntimeAppearance::default();
+        let plan = SurfaceOutputPlan {
+            pane_id: Uuid::from_u128(200),
+            surface_id: Uuid::from_u128(201),
+            surface_index: 0,
+            ext_rect: ExtensionRect::new(0, 0, 10, 3),
+            content: PaneRect {
+                x: 1,
+                y: 1,
+                w: 8,
+                h: 1,
+            },
+            surface_plan: PaneSurfaceFramePlan {
+                retained_repaint: false,
+                focused: false,
+                sync_deferred: false,
+                after_content_cleanup: AfterContentCleanupPlan {
+                    surface_damage: RenderDamage::None,
+                    content_damage: Vec::new(),
+                },
+                content_damage: PaneContentDamagePlan {
+                    direct_content_damaged: true,
+                    direct_content_rects: vec![DamageRect::new(0, 0, 1, 1)],
+                    before_content_rects: Vec::new(),
+                    after_content_cleanup_rects: Vec::new(),
+                },
+                draw_extensions: false,
+            },
+            before_content_snapshots: Vec::new(),
+            before_content_output_plan: BeforeContentSurfaceOutputPlan {
+                plans: Vec::new(),
+                damage_rects: vec![DamageRect::new(0, 0, 1, 1)],
+            },
+            after_content_snapshots: Vec::new(),
+            scrollback_active: false,
+            scrollback_offset: 0,
+            scrollback_cursor: None,
+            selection_anchor: None,
+            runtime_appearance: &runtime_appearance,
+        };
+
+        assert!(plan.should_execute());
     }
 
     #[test]
