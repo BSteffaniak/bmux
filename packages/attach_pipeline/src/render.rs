@@ -87,32 +87,6 @@ fn coalesce_render_damage(
     }
 }
 
-fn extension_render_damage_for_frame(
-    ext: &dyn AttachRenderExtension,
-    surface_id: Uuid,
-    pane_id: Uuid,
-    surface_rect: ExtensionRect,
-    layer: RenderExtensionLayer,
-    frame_damage: &FrameDamage,
-    policy: DamageCoalescingPolicy,
-) -> RenderDamage {
-    let own_damage = extension_own_render_damage_for_frame(
-        ext,
-        surface_id,
-        surface_rect,
-        layer,
-        frame_damage,
-        policy,
-    );
-    if !own_damage.is_none() {
-        return own_damage;
-    }
-    if frame_damage.content_surface_damaged(pane_id) && ext.redraws_on_content_damage(layer) {
-        return RenderDamage::FullSurface;
-    }
-    RenderDamage::None
-}
-
 fn extension_own_render_damage_for_frame(
     ext: &dyn AttachRenderExtension,
     surface_id: Uuid,
@@ -137,6 +111,96 @@ fn extension_own_render_damage_for_frame(
         surface_rect,
         policy,
     )
+}
+
+struct ExtensionLayerSnapshot {
+    extension: std::sync::Arc<dyn AttachRenderExtension>,
+    surface_id: Uuid,
+    pane_id: Uuid,
+    surface_rect: ExtensionRect,
+    layer: RenderExtensionLayer,
+    own_damage: RenderDamage,
+    render_damage: RenderDamage,
+    revision: Option<u64>,
+}
+
+impl ExtensionLayerSnapshot {
+    fn build(
+        extension: &std::sync::Arc<dyn AttachRenderExtension>,
+        surface_id: Uuid,
+        pane_id: Uuid,
+        surface_rect: ExtensionRect,
+        layer: RenderExtensionLayer,
+        frame_damage: &FrameDamage,
+        policy: DamageCoalescingPolicy,
+    ) -> Self {
+        let ext = extension.as_ref();
+        let own_damage = extension_own_render_damage_for_frame(
+            ext,
+            surface_id,
+            surface_rect,
+            layer,
+            frame_damage,
+            policy,
+        );
+        let render_damage = if !own_damage.is_none() {
+            own_damage.clone()
+        } else if frame_damage.content_surface_damaged(pane_id)
+            && ext.redraws_on_content_damage(layer)
+        {
+            RenderDamage::FullSurface
+        } else {
+            RenderDamage::None
+        };
+        let revision = ext.render_layer_revision(surface_id, layer);
+        Self {
+            extension: extension.clone(),
+            surface_id,
+            pane_id,
+            surface_rect,
+            layer,
+            own_damage,
+            render_damage,
+            revision,
+        }
+    }
+
+    fn cache_key(&self, capabilities: TerminalRenderCapabilities) -> (String, Uuid) {
+        (
+            format!(
+                "{}::{:?}::caps={}",
+                self.extension.name(),
+                self.layer,
+                capabilities.cache_key()
+            ),
+            self.surface_id,
+        )
+    }
+}
+
+fn extension_layer_snapshots_for_surface(
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    surface_id: Uuid,
+    pane_id: Uuid,
+    surface_rect: ExtensionRect,
+    layer: RenderExtensionLayer,
+    frame_damage: &FrameDamage,
+    policy: DamageCoalescingPolicy,
+) -> Vec<ExtensionLayerSnapshot> {
+    render_extensions
+        .iter()
+        .map(|extension| {
+            ExtensionLayerSnapshot::build(
+                extension,
+                surface_id,
+                pane_id,
+                surface_rect,
+                layer,
+                frame_damage,
+                policy,
+            )
+        })
+        .collect()
 }
 
 fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<ExtensionRect> {
@@ -3248,20 +3312,13 @@ impl AfterContentCleanupPlan {
 }
 
 fn after_content_cleanup_plan_for_surface(
-    surface_id: Uuid,
     surface_rect: ExtensionRect,
     content_rect: PaneRect,
-    frame_damage: &FrameDamage,
     policy: DamageCoalescingPolicy,
-    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    layer_snapshots: &[ExtensionLayerSnapshot],
 ) -> AfterContentCleanupPlan {
-    let surface_damage = after_content_own_damage_for_surface(
-        surface_id,
-        surface_rect,
-        frame_damage,
-        policy,
-        render_extensions,
-    );
+    let surface_damage =
+        after_content_own_damage_for_surface(surface_rect, policy, layer_snapshots);
     let content_damage = render_damage_content_rects(&surface_damage, content_rect);
     AfterContentCleanupPlan {
         surface_damage,
@@ -3270,25 +3327,16 @@ fn after_content_cleanup_plan_for_surface(
 }
 
 fn after_content_own_damage_for_surface(
-    surface_id: Uuid,
     surface_rect: ExtensionRect,
-    frame_damage: &FrameDamage,
     policy: DamageCoalescingPolicy,
-    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    layer_snapshots: &[ExtensionLayerSnapshot],
 ) -> RenderDamage {
     let mut rects = Vec::new();
-    for ext in render_extensions {
-        match extension_own_render_damage_for_frame(
-            ext.as_ref(),
-            surface_id,
-            surface_rect,
-            RenderExtensionLayer::AfterPaneContent,
-            frame_damage,
-            policy,
-        ) {
+    for snapshot in layer_snapshots {
+        match &snapshot.own_damage {
             RenderDamage::None => {}
             RenderDamage::FullSurface => return RenderDamage::FullSurface,
-            RenderDamage::Regions(regions) => rects.extend(regions),
+            RenderDamage::Regions(regions) => rects.extend(regions.iter().copied()),
         }
     }
     coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
@@ -3299,37 +3347,23 @@ fn before_content_cells_for_surface<W: io::Write>(
     stdout: &mut W,
     surface: &bmux_attach_layout_protocol::AttachSurface,
     pane_id: Uuid,
-    rect: PaneRect,
     content: PaneRect,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
-    frame_damage: &FrameDamage,
-    damage_policy: DamageCoalescingPolicy,
-    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    layer_snapshots: &[ExtensionLayerSnapshot],
     render_context: &RenderExtensionContext,
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
 ) -> Result<BeforeContentRender> {
-    let ext_rect = bmux_plugin::ExtensionRect {
-        x: rect.x,
-        y: rect.y,
-        w: rect.w,
-        h: rect.h,
-    };
     let mut cells = BTreeMap::new();
     let mut damage_rects = Vec::new();
-    for ext in render_extensions {
-        let damage = extension_render_damage_for_frame(
-            ext.as_ref(),
-            surface.id,
-            pane_id,
-            ext_rect,
-            RenderExtensionLayer::BeforePaneContent,
-            frame_damage,
-            damage_policy,
-        );
+    for snapshot in layer_snapshots {
+        let ext = snapshot.extension.as_ref();
+        let damage = snapshot.render_damage.clone();
         if damage.is_none() {
             continue;
         }
+        debug_assert_eq!(snapshot.surface_id, surface.id);
+        debug_assert_eq!(snapshot.pane_id, pane_id);
         if let Some(stats) = render_stats.as_deref_mut() {
             stats.record_extension_render_call(ext.name(), &damage);
         }
@@ -3354,17 +3388,17 @@ fn before_content_cells_for_surface<W: io::Write>(
             RenderDamage::None => {}
         }
         if let Some(items) = ext.render_layer_items_with_context(
-            surface.id,
-            &ext_rect,
+            snapshot.surface_id,
+            &snapshot.surface_rect,
             &damage,
-            RenderExtensionLayer::BeforePaneContent,
+            snapshot.layer,
             render_context,
         ) {
             let ops = queue_before_content_render_items(
                 stdout,
                 pane_id,
-                surface.id,
-                ext_rect,
+                snapshot.surface_id,
+                snapshot.surface_rect,
                 &damage,
                 &items,
                 terminal_graphics_cache,
@@ -3373,17 +3407,17 @@ fn before_content_cells_for_surface<W: io::Write>(
             )?;
             insert_before_content_cells(&mut cells, content, render_ops_to_cells(&ops));
         } else if let Some(layer_cells) = ext.render_before_content_cells_with_context(
-            surface.id,
-            &ext_rect,
+            snapshot.surface_id,
+            &snapshot.surface_rect,
             &damage,
             render_context,
         ) {
             insert_before_content_layer_cells(&mut cells, content, layer_cells);
         } else if let Some(ops) = ext.render_layer_ops_with_context(
-            surface.id,
-            &ext_rect,
+            snapshot.surface_id,
+            &snapshot.surface_rect,
             &damage,
-            RenderExtensionLayer::BeforePaneContent,
+            snapshot.layer,
             render_context,
         ) {
             insert_before_content_cells(&mut cells, content, render_ops_to_cells(&ops));
@@ -3487,13 +3521,8 @@ fn queue_before_content_render_items<W: io::Write>(
 )]
 fn queue_after_content_extensions_for_surface<W: io::Write>(
     stdout: &mut W,
-    pane_id: Uuid,
-    surface_id: Uuid,
     surface_index: usize,
-    surface_rect: ExtensionRect,
-    frame_damage: &FrameDamage,
-    damage_policy: DamageCoalescingPolicy,
-    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    layer_snapshots: &[ExtensionLayerSnapshot],
     render_context: &RenderExtensionContext,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
@@ -3501,19 +3530,12 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) -> Result<()> {
-    // Consult every registered render extension for this surface. Extensions
-    // report generic surface damage; unknown damage safely falls back to
-    // full-surface extension repaint without forcing pane content redraw.
-    for ext in render_extensions {
-        let damage = extension_render_damage_for_frame(
-            ext.as_ref(),
-            surface_id,
-            pane_id,
-            surface_rect,
-            RenderExtensionLayer::AfterPaneContent,
-            frame_damage,
-            damage_policy,
-        );
+    // Consult the stable per-frame snapshots for this surface. Extension-owned
+    // damage is captured separately from content-redraw replay so cleanup and
+    // byte emission can share the same layer view without re-querying damage.
+    for snapshot in layer_snapshots {
+        let ext = snapshot.extension.as_ref();
+        let damage = snapshot.render_damage.clone();
         if damage.is_none() {
             continue;
         }
@@ -3521,22 +3543,12 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
             stats.record_extension_render_call(ext.name(), &damage);
         }
 
-        let revision =
-            ext.render_layer_revision(surface_id, RenderExtensionLayer::AfterPaneContent);
-        let cache_key = (
-            format!(
-                "{}::{:?}::caps={}",
-                ext.name(),
-                RenderExtensionLayer::AfterPaneContent,
-                render_context.capabilities.cache_key()
-            ),
-            surface_id,
-        );
-        if let Some(revision) = revision
+        let cache_key = snapshot.cache_key(render_context.capabilities);
+        if let Some(revision) = snapshot.revision
             && let Some(entry) = pane_buffers
-                .get(&pane_id)
+                .get(&snapshot.pane_id)
                 .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
-            && entry.surface_rect == surface_rect
+            && entry.surface_rect == snapshot.surface_rect
             && entry.damage == damage
             && entry.revision == revision
         {
@@ -3553,10 +3565,10 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
         }
 
         if let Some(items) = ext.render_layer_items_with_context(
-            surface_id,
-            &surface_rect,
+            snapshot.surface_id,
+            &snapshot.surface_rect,
             &damage,
-            RenderExtensionLayer::AfterPaneContent,
+            snapshot.layer,
             render_context,
         ) {
             if !items.is_empty() {
@@ -3574,9 +3586,9 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
             }
             if let Err(err) = queue_render_items_for_frame(
                 stdout,
-                pane_id,
-                surface_id,
-                surface_rect,
+                snapshot.pane_id,
+                snapshot.surface_id,
+                snapshot.surface_rect,
                 &damage,
                 &items,
                 terminal_graphics_cache,
@@ -3585,16 +3597,16 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
             ) {
                 tracing::warn!(
                     extension = ext.name(),
-                    surface_id = %surface_id,
+                    surface_id = %snapshot.surface_id,
                     error = %err,
                     "render extension render_items failed",
                 );
             }
         } else if let Some(ops) = ext.render_layer_ops_with_context(
-            surface_id,
-            &surface_rect,
+            snapshot.surface_id,
+            &snapshot.surface_rect,
             &damage,
-            RenderExtensionLayer::AfterPaneContent,
+            snapshot.layer,
             render_context,
         ) {
             if ops.is_empty() {
@@ -3612,19 +3624,19 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
                 });
             }
             let mut bytes = Vec::new();
-            match queue_render_ops(&mut bytes, surface_rect, &damage, &ops) {
+            match queue_render_ops(&mut bytes, snapshot.surface_rect, &damage, &ops) {
                 Ok(_) => {
                     stdout
                         .write_all(&bytes)
                         .context("failed writing declarative render op bytes")?;
-                    if let Some(revision) = revision
-                        && let Some(buffer) = pane_buffers.get_mut(&pane_id)
+                    if let Some(revision) = snapshot.revision
+                        && let Some(buffer) = pane_buffers.get_mut(&snapshot.pane_id)
                     {
                         buffer.extension_render_cache.insert(
                             cache_key,
                             ExtensionRenderCacheEntry {
-                                surface_id,
-                                surface_rect,
+                                surface_id: snapshot.surface_id,
+                                surface_rect: snapshot.surface_rect,
                                 damage,
                                 revision,
                                 bytes,
@@ -3635,7 +3647,7 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
                 Err(err) => {
                     tracing::warn!(
                         extension = ext.name(),
-                        surface_id = %surface_id,
+                        surface_id = %snapshot.surface_id,
                         error = %err,
                         "render extension render_ops failed",
                     );
@@ -3659,15 +3671,15 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
             let dyn_writer: &mut dyn io::Write = stdout;
             if let Err(err) = ext.render_layer_surface_with_context(
                 dyn_writer,
-                surface_id,
-                &surface_rect,
+                snapshot.surface_id,
+                &snapshot.surface_rect,
                 &damage,
-                RenderExtensionLayer::AfterPaneContent,
+                snapshot.layer,
                 render_context,
             ) {
                 tracing::warn!(
                     extension = ext.name(),
-                    surface_id = %surface_id,
+                    surface_id = %snapshot.surface_id,
                     error = %err,
                     "render extension render_surface failed",
                 );
@@ -4363,30 +4375,43 @@ fn render_attach_scene_inner<W: io::Write>(
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
+        let ext_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
+        let before_content_snapshots = extension_layer_snapshots_for_surface(
+            render_extensions,
+            surface.id,
+            pane_id,
+            ext_rect,
+            RenderExtensionLayer::BeforePaneContent,
+            frame_damage,
+            damage_policy,
+        );
+        let after_content_snapshots = extension_layer_snapshots_for_surface(
+            render_extensions,
+            surface.id,
+            pane_id,
+            ext_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            frame_damage,
+            damage_policy,
+        );
         let before_content = before_content_cells_for_surface(
             stdout,
             surface,
             pane_id,
-            rect,
             content,
             terminal_graphics_cache,
             &mut terminal_graphics_frame,
-            frame_damage,
-            damage_policy,
-            render_extensions,
+            &before_content_snapshots,
             render_context,
             &mut render_stats,
         )?;
         let before_content_cells = before_content.0;
         let before_content_damage = before_content.1;
-        let ext_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
         let after_content_cleanup = after_content_cleanup_plan_for_surface(
-            surface.id,
             ext_rect,
             content,
-            frame_damage,
             damage_policy,
-            render_extensions,
+            &after_content_snapshots,
         );
 
         // Defer drawing pane content while the inner application is inside a
@@ -4464,13 +4489,8 @@ fn render_attach_scene_inner<W: io::Write>(
         if surface_plan.should_draw_extensions() {
             queue_after_content_extensions_for_surface(
                 stdout,
-                pane_id,
-                surface.id,
                 surface_index,
-                ext_rect,
-                frame_damage,
-                damage_policy,
-                render_extensions,
+                &after_content_snapshots,
                 render_context,
                 pane_buffers,
                 terminal_graphics_cache,
@@ -4496,11 +4516,12 @@ fn render_attach_scene_inner<W: io::Write>(
 mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
-        DamageCoalescingPolicy, DamageRect, FrameDamage, GridRowRenderContext, TerminalCommand,
-        append_pane_output, coalesce_render_damage, frame_damage_overlay_render_ops,
-        opaque_row_text, optimize_terminal_commands, queue_frame_damage_overlay,
-        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
-        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot, FrameDamage,
+        GridRowRenderContext, TerminalCommand, append_pane_output, coalesce_render_damage,
+        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
+        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
+        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
+        render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -4775,6 +4796,104 @@ mod tests {
                 h: 2,
             }])
         );
+    }
+
+    #[test]
+    fn extension_layer_snapshot_separates_own_damage_from_content_replay() {
+        struct SnapshotDamageExtension {
+            damage: RenderDamage,
+            redraw_on_content_damage: bool,
+        }
+
+        impl bmux_plugin::AttachRenderExtension for SnapshotDamageExtension {
+            fn name(&self) -> &'static str {
+                "test.snapshot_damage"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                self.damage.clone()
+            }
+
+            fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
+                self.redraw_on_content_damage
+            }
+
+            fn render_layer_revision(
+                &self,
+                _surface_id: Uuid,
+                _layer: RenderExtensionLayer,
+            ) -> Option<u64> {
+                Some(42)
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn std::io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let surface_id = Uuid::from_u128(10);
+        let pane_id = Uuid::from_u128(11);
+        let surface_rect = ExtensionRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 4,
+        };
+        let extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(SnapshotDamageExtension {
+                damage: RenderDamage::None,
+                redraw_on_content_damage: true,
+            });
+        let mut content_damage = FrameDamage::default();
+        content_damage.mark_content_surface(pane_id);
+
+        let replay_snapshot = ExtensionLayerSnapshot::build(
+            &extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &content_damage,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(replay_snapshot.own_damage, RenderDamage::None);
+        assert_eq!(replay_snapshot.render_damage, RenderDamage::FullSurface);
+        assert_eq!(replay_snapshot.revision, Some(42));
+
+        let extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(SnapshotDamageExtension {
+                damage: RenderDamage::Regions(vec![ExtensionRect {
+                    x: 2,
+                    y: 1,
+                    w: 3,
+                    h: 1,
+                }]),
+                redraw_on_content_damage: false,
+            });
+        let own_snapshot = ExtensionLayerSnapshot::build(
+            &extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &FrameDamage::default(),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(own_snapshot.own_damage, own_snapshot.render_damage);
+        assert!(matches!(own_snapshot.own_damage, RenderDamage::Regions(_)));
     }
 
     #[test]
