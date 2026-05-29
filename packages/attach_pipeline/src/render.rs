@@ -2,9 +2,9 @@ use crate::compositor::retained_repaint_plan_from_frame_damage;
 #[cfg(feature = "image-kitty")]
 use crate::types::TerminalGraphicCacheEntry;
 use crate::types::{
-    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, ExtensionRenderCacheEntry,
-    PaneRect, PaneRenderBuffer, TerminalGraphicPlacementSignature, TerminalGraphicSourceSignature,
-    TerminalGraphicsCache,
+    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition,
+    ExtensionLayerSnapshotCacheEntry, ExtensionRenderCacheEntry, PaneRect, PaneRenderBuffer,
+    TerminalGraphicPlacementSignature, TerminalGraphicSourceSignature, TerminalGraphicsCache,
 };
 use anyhow::{Context, Result};
 use bmux_appearance::{
@@ -201,6 +201,32 @@ fn extension_layer_snapshots_for_surface(
             )
         })
         .collect()
+}
+
+fn commit_extension_layer_snapshots(
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    capabilities: TerminalRenderCapabilities,
+    layer_snapshots: &[ExtensionLayerSnapshot],
+) {
+    for snapshot in layer_snapshots {
+        if snapshot.render_damage.is_none() {
+            continue;
+        }
+        let Some(buffer) = pane_buffers.get_mut(&snapshot.pane_id) else {
+            continue;
+        };
+        buffer.extension_layer_snapshot_cache.insert(
+            snapshot.cache_key(capabilities),
+            ExtensionLayerSnapshotCacheEntry {
+                surface_id: snapshot.surface_id,
+                surface_rect: snapshot.surface_rect,
+                layer: snapshot.layer,
+                emitted_damage: snapshot.render_damage.clone(),
+                full_snapshot_damage: RenderDamage::FullSurface,
+                revision: snapshot.revision,
+            },
+        );
+    }
 }
 
 fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<ExtensionRect> {
@@ -3530,6 +3556,7 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) -> Result<()> {
+    commit_extension_layer_snapshots(pane_buffers, render_context.capabilities, layer_snapshots);
     // Consult the stable per-frame snapshots for this surface. Extension-owned
     // damage is captured separately from content-redraw replay so cleanup and
     // byte emission can share the same layer view without re-querying damage.
@@ -4405,6 +4432,11 @@ fn render_attach_scene_inner<W: io::Write>(
             render_context,
             &mut render_stats,
         )?;
+        commit_extension_layer_snapshots(
+            pane_buffers,
+            render_context.capabilities,
+            &before_content_snapshots,
+        );
         let before_content_cells = before_content.0;
         let before_content_damage = before_content.1;
         let after_content_cleanup = after_content_cleanup_plan_for_surface(
@@ -4518,10 +4550,10 @@ mod tests {
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
         DamageCoalescingPolicy, DamageRect, ExtensionLayerSnapshot, FrameDamage,
         GridRowRenderContext, TerminalCommand, append_pane_output, coalesce_render_damage,
-        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
-        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
-        render_grid_row_segment,
+        commit_extension_layer_snapshots, frame_damage_overlay_render_ops, opaque_row_text,
+        optimize_terminal_commands, queue_frame_damage_overlay,
+        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -4894,6 +4926,23 @@ mod tests {
 
         assert_eq!(own_snapshot.own_damage, own_snapshot.render_damage);
         assert!(matches!(own_snapshot.own_damage, RenderDamage::Regions(_)));
+
+        let key = own_snapshot.cache_key(bmux_plugin::TerminalRenderCapabilities::default());
+        let snapshots = [own_snapshot];
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        commit_extension_layer_snapshots(
+            &mut pane_buffers,
+            bmux_plugin::TerminalRenderCapabilities::default(),
+            &snapshots,
+        );
+
+        let committed = pane_buffers
+            .get(&pane_id)
+            .and_then(|buffer| buffer.extension_layer_snapshot_cache.get(&key))
+            .expect("partial extension damage should commit layer snapshot metadata");
+        assert!(matches!(committed.emitted_damage, RenderDamage::Regions(_)));
+        assert_eq!(committed.full_snapshot_damage, RenderDamage::FullSurface);
+        assert_eq!(committed.revision, Some(42));
     }
 
     #[test]
