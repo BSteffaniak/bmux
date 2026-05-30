@@ -8,6 +8,7 @@ use bmux_appearance::{
     RuntimeBorderAppearancePatch, RuntimeContentBlendPatch, RuntimeContentEffectBgPredicate,
     RuntimeContentEffectPatch, RuntimeContentEffectScope, RuntimeStatusAppearancePatch,
 };
+use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigScopeTarget, ScopedConfigLoadRequest};
 use bmux_ipc::Request as IpcRequest;
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
@@ -72,6 +73,13 @@ impl RustPlugin for ThemePlugin {
                     ServiceResponse::error("theme_not_found", "active theme was not found")
                 })?;
                 info!("active runtime appearance service returned resolved theme appearance");
+                Ok(appearance)
+            },
+            "theme-state", "active-appearance-for-cwd" => |req: ActiveAppearanceForCwdArgs, ctx| {
+                let appearance = active_runtime_appearance_for_cwd(ctx, &req.cwd).ok_or_else(|| {
+                    ServiceResponse::error("theme_not_found", "active theme was not found for cwd")
+                })?;
+                info!(cwd = %req.cwd, "active runtime appearance service returned cwd-scoped theme appearance");
                 Ok(appearance)
             },
         })
@@ -376,6 +384,11 @@ struct ApplyThemeExtensionArgs {
     config_dir_candidates: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ActiveAppearanceForCwdArgs {
+    cwd: String,
+}
+
 trait ThemeHostContext: HostRuntimeApi {
     fn settings_value(&self) -> Option<&toml::Value>;
 
@@ -465,8 +478,23 @@ fn active_runtime_appearance(
     configured_theme(context).map(|active| active.theme.appearance)
 }
 
+fn active_runtime_appearance_for_cwd(
+    context: &(impl ThemeHostContext + ?Sized),
+    cwd: &str,
+) -> Option<RuntimeAppearance> {
+    let scoped_settings = scoped_theme_settings_for_cwd(context, cwd).ok()?;
+    configured_theme_with_settings(context, &scoped_settings).map(|active| active.theme.appearance)
+}
+
 fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<ActiveThemeResolution> {
     let settings = parse_settings(context.settings_value());
+    configured_theme_with_settings(context, &settings)
+}
+
+fn configured_theme_with_settings(
+    context: &(impl ThemeHostContext + ?Sized),
+    settings: &ThemePluginSettings,
+) -> Option<ActiveThemeResolution> {
     let catalog = load_theme_catalog(&context.connection_info().config_dir_candidate_paths());
     info!(
         data_dir = %context.connection_info().data_dir,
@@ -476,8 +504,8 @@ fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<Active
         persistence = ?settings.persistence,
         "theme settings parsed",
     );
-    let active = active_theme_stack(context, &settings, &catalog);
-    let theme = resolve_theme_stack_with_settings(&catalog, &active.stack, &settings)?;
+    let active = active_theme_stack(context, settings, &catalog);
+    let theme = resolve_theme_stack_with_settings(&catalog, &active.stack, settings)?;
     Some(ActiveThemeResolution {
         stack: active.stack,
         source: active.source,
@@ -1118,6 +1146,29 @@ fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
         .cloned()
         .and_then(|value| value.try_into().ok())
         .unwrap_or_default()
+}
+
+fn scoped_theme_settings_for_cwd(
+    context: &(impl ThemeHostContext + ?Sized),
+    cwd: &str,
+) -> bmux_config::Result<ThemePluginSettings> {
+    let paths = config_paths_from_connection(context.connection_info());
+    let request = ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("pane", cwd));
+    let config = BmuxConfig::load_from_path_for_scope_with_overrides(
+        &paths.config_file(),
+        &ConfigLoadOverrides::default(),
+        &request,
+    )?;
+    Ok(parse_settings(config.plugins.settings.get("bmux.theme")))
+}
+
+fn config_paths_from_connection(connection: &HostConnectionInfo) -> bmux_config::ConfigPaths {
+    bmux_config::ConfigPaths::new(
+        Path::new(&connection.config_dir).to_path_buf(),
+        Path::new(&connection.runtime_dir).to_path_buf(),
+        Path::new(&connection.data_dir).to_path_buf(),
+        Path::new(&connection.state_dir).to_path_buf(),
+    )
 }
 
 fn declared_theme_name(settings: &ThemePluginSettings) -> String {
@@ -1866,6 +1917,21 @@ mod tests {
         encode_service_message,
     };
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_theme_dir(label: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "bmux-theme-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("create temp theme dir");
+        dir
+    }
 
     #[test]
     fn active_appearance_service_uses_declared_theme() {
@@ -2748,6 +2814,33 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("snake.body")
         );
+    }
+
+    #[test]
+    fn cwd_scoped_active_appearance_uses_local_theme_setting() {
+        let root = temp_theme_dir("scope");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(root.join("bmux.toml"), "").expect("write global config");
+        std::fs::write(
+            project.join("bmux.toml"),
+            r#"
+            [plugins.settings."bmux.theme"]
+            theme = "tetris"
+            "#,
+        )
+        .expect("write local config");
+
+        let mut context = service_context(None);
+        context.connection.config_dir = root.to_string_lossy().into_owned();
+        context.connection.config_dir_candidates = vec![root.to_string_lossy().into_owned()];
+
+        let appearance =
+            active_runtime_appearance_for_cwd(&context, project.to_string_lossy().as_ref())
+                .expect("cwd-scoped appearance resolves");
+
+        assert_eq!(appearance.foreground, "#d8e8ff");
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn service_context(settings: Option<toml::Value>) -> NativeServiceContext {
