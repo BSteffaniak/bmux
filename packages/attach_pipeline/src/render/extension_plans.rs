@@ -7,6 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::extension_retained::{
+    ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, build_extension_layer_diff_plan,
+    load_retained_layer_snapshot, retained_layer_cache_key, retained_scene_items_to_render_items,
+    retained_snapshot_from_plugin_scene,
+};
 use super::{
     DamageCoalescingPolicy, DamageRect, FrameDamage, RenderOpsOutputPlan,
     build_render_ops_output_plan, coalesce_render_damage, frame_rects_to_render_damage,
@@ -399,6 +404,9 @@ fn before_content_damage_rects(damage: &RenderDamage, content: PaneRect) -> Vec<
 
 pub(super) struct AfterContentSurfaceOutputPlan {
     pub(super) plans: Vec<AfterContentExtensionOutputPlan>,
+    pub(super) retained_snapshot_keys: BTreeSet<(String, Uuid)>,
+    pub(super) retained_extension_names: BTreeSet<String>,
+    pub(super) retained_cleanup_damage: RenderDamage,
 }
 
 #[derive(Clone)]
@@ -411,38 +419,127 @@ pub(super) struct AfterContentExtensionOutputPlan {
 
 #[derive(Clone)]
 pub(super) enum AfterContentExtensionOutputAction {
-    CachedReplay { bytes: Vec<u8> },
-    RenderItems { items: Vec<RenderLayerItem> },
-    RenderOps { output_plan: RenderOpsOutputPlan },
+    RetainedScene {
+        diff_plan: Box<ExtensionLayerDiffPlan>,
+        snapshot: ExtensionRetainedLayerSnapshot,
+        output_items: Vec<RenderLayerItem>,
+    },
+    CachedReplay {
+        bytes: Vec<u8>,
+    },
+    RenderItems {
+        items: Vec<RenderLayerItem>,
+    },
+    RenderOps {
+        output_plan: RenderOpsOutputPlan,
+    },
     Imperative,
 }
 
 pub(super) fn build_after_content_surface_output_plan(
     surface_index: usize,
     layer_snapshots: &[ExtensionLayerSnapshot],
+    content: PaneRect,
+    policy: DamageCoalescingPolicy,
     render_context: &RenderExtensionContext,
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
 ) -> AfterContentSurfaceOutputPlan {
+    let mut retained_snapshot_keys = BTreeSet::new();
+    let mut retained_extension_names = BTreeSet::new();
+    let mut retained_cleanup_regions = Vec::new();
     let plans = layer_snapshots
         .iter()
         .filter_map(|snapshot| {
-            build_after_content_extension_output_plan(
+            let plan = build_after_content_extension_output_plan(
                 surface_index,
                 snapshot,
+                content,
+                policy,
                 render_context,
                 pane_buffers,
-            )
+            )?;
+            if let AfterContentExtensionOutputAction::RetainedScene { diff_plan, .. } = &plan.action
+            {
+                retained_snapshot_keys.insert(snapshot.cache_key(render_context.capabilities));
+                retained_extension_names.insert(snapshot.extension.name().to_string());
+                match &diff_plan.stale_cleanup_damage {
+                    RenderDamage::None => {}
+                    RenderDamage::FullSurface => {
+                        retained_cleanup_regions.clear();
+                        retained_cleanup_regions.push(snapshot.surface_rect);
+                    }
+                    RenderDamage::Regions(regions) => {
+                        retained_cleanup_regions.extend(regions.iter().copied());
+                    }
+                }
+            }
+            Some(plan)
         })
         .collect();
-    AfterContentSurfaceOutputPlan { plans }
+    let retained_cleanup_damage = coalesce_render_damage(
+        RenderDamage::Regions(retained_cleanup_regions),
+        layer_snapshots.first().map_or_else(
+            || ExtensionRect::new(0, 0, 0, 0),
+            |snapshot| snapshot.surface_rect,
+        ),
+        policy,
+    );
+    AfterContentSurfaceOutputPlan {
+        plans,
+        retained_snapshot_keys,
+        retained_extension_names,
+        retained_cleanup_damage,
+    }
 }
 
 pub(super) fn build_after_content_extension_output_plan(
     surface_index: usize,
     snapshot: &ExtensionLayerSnapshot,
+    content: PaneRect,
+    policy: DamageCoalescingPolicy,
     render_context: &RenderExtensionContext,
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
 ) -> Option<AfterContentExtensionOutputPlan> {
+    let retained_cache_key = retained_layer_cache_key(
+        snapshot.extension.name(),
+        snapshot.surface_id,
+        snapshot.layer,
+        render_context.capabilities,
+    );
+    if let Some(scene) = snapshot.extension.render_layer_scene_with_context(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        snapshot.layer,
+        render_context,
+    ) {
+        let retained_snapshot = retained_snapshot_from_plugin_scene(snapshot.surface_rect, &scene);
+        let previous_snapshot =
+            load_retained_layer_snapshot(pane_buffers.get(&snapshot.pane_id), &retained_cache_key);
+        let diff_plan = build_extension_layer_diff_plan(
+            previous_snapshot.as_ref(),
+            Some(&retained_snapshot),
+            content,
+            policy,
+        );
+        let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
+        let should_execute = !diff_plan.update_damage.is_none()
+            || !diff_plan.stale_cleanup_damage.is_none()
+            || previous_snapshot.is_none();
+        if !should_execute {
+            return None;
+        }
+        return Some(AfterContentExtensionOutputPlan {
+            surface_index,
+            snapshot: snapshot.clone(),
+            cache_key: retained_cache_key,
+            action: AfterContentExtensionOutputAction::RetainedScene {
+                diff_plan: Box::new(diff_plan),
+                snapshot: retained_snapshot,
+                output_items,
+            },
+        });
+    }
+
     let damage = snapshot.render_damage.clone();
     if damage.is_none() {
         return None;

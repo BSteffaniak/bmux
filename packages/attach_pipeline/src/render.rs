@@ -56,6 +56,9 @@ use extension_plans::{
 use extension_plans::{
     build_after_content_extension_output_plan, build_before_content_extension_output_plan,
 };
+use extension_retained::{
+    ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, commit_retained_layer_snapshot,
+};
 use terminal_graphics::{
     TerminalGraphicsFrameResources, begin_terminal_graphics_frame, finish_terminal_graphics_frame,
 };
@@ -3232,6 +3235,7 @@ impl AfterContentCleanupPlan {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Cleanup planning combines fallback snapshots and retained-scene diffs at one boundary.
 fn after_content_cleanup_plan_for_surface(
     pane_buffer: Option<&PaneRenderBuffer>,
     surface_id: Uuid,
@@ -3240,14 +3244,24 @@ fn after_content_cleanup_plan_for_surface(
     policy: DamageCoalescingPolicy,
     capabilities: TerminalRenderCapabilities,
     layer_snapshots: &[ExtensionLayerSnapshot],
+    retained_snapshot_keys: &BTreeSet<(String, Uuid)>,
+    retained_extension_names: &BTreeSet<String>,
+    retained_cleanup_damage: &RenderDamage,
 ) -> AfterContentCleanupPlan {
-    let surface_damage = after_content_stale_snapshot_damage_for_surface(
-        pane_buffer,
-        surface_id,
+    let surface_damage = merge_render_damage(
+        after_content_stale_snapshot_damage_for_surface(
+            pane_buffer,
+            surface_id,
+            surface_rect,
+            policy,
+            capabilities,
+            layer_snapshots,
+            retained_snapshot_keys,
+            retained_extension_names,
+        ),
+        retained_cleanup_damage.clone(),
         surface_rect,
         policy,
-        capabilities,
-        layer_snapshots,
     );
     let content_damage = render_damage_content_rects(&surface_damage, content_rect);
     AfterContentCleanupPlan {
@@ -3256,6 +3270,7 @@ fn after_content_cleanup_plan_for_surface(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Stale detection needs current surface identity plus retained fallback filters.
 fn after_content_stale_snapshot_damage_for_surface(
     pane_buffer: Option<&PaneRenderBuffer>,
     surface_id: Uuid,
@@ -3263,9 +3278,19 @@ fn after_content_stale_snapshot_damage_for_surface(
     policy: DamageCoalescingPolicy,
     capabilities: TerminalRenderCapabilities,
     layer_snapshots: &[ExtensionLayerSnapshot],
+    retained_snapshot_keys: &BTreeSet<(String, Uuid)>,
+    retained_extension_names: &BTreeSet<String>,
 ) -> RenderDamage {
+    let fallback_snapshots = layer_snapshots
+        .iter()
+        .filter(|snapshot| {
+            !retained_snapshot_keys.contains(&snapshot.cache_key(capabilities))
+                && !retained_extension_names.contains(snapshot.extension.name())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut rects = Vec::new();
-    for snapshot in layer_snapshots {
+    for snapshot in &fallback_snapshots {
         match &snapshot.own_damage {
             RenderDamage::None => {}
             RenderDamage::FullSurface => return RenderDamage::FullSurface,
@@ -3279,13 +3304,31 @@ fn after_content_stale_snapshot_damage_for_surface(
         surface_rect,
         policy,
         capabilities,
-        layer_snapshots,
+        &fallback_snapshots,
     ) {
         RenderDamage::None => {}
         RenderDamage::FullSurface => return RenderDamage::FullSurface,
         RenderDamage::Regions(regions) => rects.extend(regions),
     }
     coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
+}
+
+fn merge_render_damage(
+    lhs: RenderDamage,
+    rhs: RenderDamage,
+    surface_rect: ExtensionRect,
+    policy: DamageCoalescingPolicy,
+) -> RenderDamage {
+    match (lhs, rhs) {
+        (RenderDamage::FullSurface, _) | (_, RenderDamage::FullSurface) => {
+            RenderDamage::FullSurface
+        }
+        (RenderDamage::None, damage) | (damage, RenderDamage::None) => damage,
+        (RenderDamage::Regions(mut lhs), RenderDamage::Regions(rhs)) => {
+            lhs.extend(rhs);
+            coalesce_render_damage(RenderDamage::Regions(lhs), surface_rect, policy)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
@@ -3490,11 +3533,21 @@ fn record_after_content_extension_output_plan(
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) {
     let ext_name = plan.snapshot.extension.name();
-    let damage = &plan.snapshot.render_damage;
+    let damage = match &plan.action {
+        AfterContentExtensionOutputAction::RetainedScene { diff_plan, .. } => {
+            &diff_plan.update_damage
+        }
+        _ => &plan.snapshot.render_damage,
+    };
     if let Some(stats) = render_stats.as_deref_mut() {
         stats.record_extension_render_call(ext_name, damage);
     }
     match &plan.action {
+        AfterContentExtensionOutputAction::RetainedScene { output_items, .. } => {
+            if !output_items.is_empty() {
+                record_after_content_extension_ops(plan, render_stats, render_trace);
+            }
+        }
         AfterContentExtensionOutputAction::CachedReplay { .. } => {
             if let Some(stats) = render_stats.as_deref_mut() {
                 stats.record_extension_cache_hit(ext_name);
@@ -3538,7 +3591,13 @@ fn record_after_content_extension_ops(
         stats.record_extension_render_op_call(plan.snapshot.extension.name());
     }
     if let Some(trace) = render_trace.as_deref_mut() {
-        let (regions, full_surface) = render_damage_trace_shape(&plan.snapshot.render_damage);
+        let damage = match &plan.action {
+            AfterContentExtensionOutputAction::RetainedScene { diff_plan, .. } => {
+                &diff_plan.update_damage
+            }
+            _ => &plan.snapshot.render_damage,
+        };
+        let (regions, full_surface) = render_damage_trace_shape(damage);
         trace.push(AttachRenderTraceOp::ExtensionOps {
             surface_index: plan.surface_index,
             regions,
@@ -3558,6 +3617,24 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
 ) -> Result<()> {
     let snapshot = &plan.snapshot;
     match &plan.action {
+        AfterContentExtensionOutputAction::RetainedScene {
+            diff_plan,
+            snapshot: retained_snapshot,
+            output_items,
+        } => {
+            execute_retained_after_content_extension_output_plan(
+                stdout,
+                plan,
+                diff_plan,
+                retained_snapshot,
+                output_items,
+                render_context,
+                pane_buffers,
+                terminal_graphics_cache,
+                terminal_graphics,
+            );
+            Ok(())
+        }
         AfterContentExtensionOutputAction::CachedReplay { bytes } => stdout
             .write_all(bytes)
             .context("failed replaying cached declarative render ops"),
@@ -3638,6 +3715,50 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)] // Retained execution needs the same frame-local sinks/resources as legacy render items.
+fn execute_retained_after_content_extension_output_plan<W: io::Write>(
+    stdout: &mut W,
+    plan: &AfterContentExtensionOutputPlan,
+    diff_plan: &ExtensionLayerDiffPlan,
+    retained_snapshot: &ExtensionRetainedLayerSnapshot,
+    output_items: &[RenderLayerItem],
+    render_context: &RenderExtensionContext,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+) {
+    let snapshot = &plan.snapshot;
+    if !diff_plan.update_damage.is_none()
+        && !output_items.is_empty()
+        && let Err(err) = queue_render_items_for_frame(
+            stdout,
+            snapshot.pane_id,
+            snapshot.surface_id,
+            snapshot.surface_rect,
+            &diff_plan.update_damage,
+            output_items,
+            terminal_graphics_cache,
+            terminal_graphics,
+            render_context.capabilities,
+        )
+    {
+        tracing::warn!(
+            extension = snapshot.extension.name(),
+            surface_id = %snapshot.surface_id,
+            error = %err,
+            "retained render extension output failed",
+        );
+    }
+    commit_retained_layer_snapshot(
+        pane_buffers,
+        snapshot.pane_id,
+        plan.cache_key.clone(),
+        snapshot.surface_id,
+        snapshot.layer,
+        retained_snapshot,
+    );
 }
 
 fn queue_full_frame_content_clear<W: io::Write>(
@@ -3977,6 +4098,8 @@ fn build_surface_output_plan<'a>(
     let after_content_output_plan = build_after_content_surface_output_plan(
         surface_index,
         &after_content_snapshots,
+        content,
+        damage_policy,
         render_context,
         pane_buffers,
     );
@@ -3988,6 +4111,9 @@ fn build_surface_output_plan<'a>(
         damage_policy,
         render_context.capabilities,
         &after_content_snapshots,
+        &after_content_output_plan.retained_snapshot_keys,
+        &after_content_output_plan.retained_extension_names,
+        &after_content_output_plan.retained_cleanup_damage,
     );
 
     // Defer drawing pane content while the inner application is inside a DEC
@@ -4013,6 +4139,7 @@ fn build_surface_output_plan<'a>(
         ),
         after_content_cleanup,
         draw_extensions: frame_damage.extension_surface_damaged(surface.id, pane_id)
+            || !after_content_output_plan.plans.is_empty()
             || after_content_snapshots
                 .iter()
                 .any(|snapshot| !snapshot.render_damage.is_none()),
@@ -4204,13 +4331,24 @@ fn execute_surface_output_plan<W: io::Write>(
                 )?;
             }
             SurfaceOutputStage::CommitAfterContentSnapshot => {
+                let fallback_snapshots = plan
+                    .after_content_snapshots
+                    .iter()
+                    .filter(|snapshot| {
+                        !plan
+                            .after_content_output_plan
+                            .retained_extension_names
+                            .contains(snapshot.extension.name())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 commit_extension_layer_snapshots_for_surface(
                     pane_buffers,
                     render_context.capabilities,
                     plan.pane_id,
                     plan.surface_id,
                     RenderExtensionLayer::AfterPaneContent,
-                    &plan.after_content_snapshots,
+                    &fallback_snapshots,
                 );
             }
         }
@@ -5220,7 +5358,12 @@ mod tests {
                 damage_rects: vec![DamageRect::new(0, 0, 1, 1)],
             },
             after_content_snapshots: Vec::new(),
-            after_content_output_plan: AfterContentSurfaceOutputPlan { plans: Vec::new() },
+            after_content_output_plan: AfterContentSurfaceOutputPlan {
+                plans: Vec::new(),
+                retained_snapshot_keys: BTreeSet::new(),
+                retained_extension_names: BTreeSet::new(),
+                retained_cleanup_damage: RenderDamage::None,
+            },
             scrollback_active: false,
             scrollback_offset: 0,
             scrollback_cursor: None,
@@ -5428,6 +5571,13 @@ mod tests {
         let plan = build_after_content_extension_output_plan(
             0,
             &snapshot,
+            PaneRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+            DamageCoalescingPolicy::default(),
             &render_context,
             &BTreeMap::new(),
         )
@@ -8291,6 +8441,270 @@ mod tests {
             "cleanup must precede content repaint: {rendered:?}"
         );
         assert_eq!(stats.damaged_content_surfaces, 1);
+        assert_eq!(stats.pane_row_segments_emitted, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retained scene fixture proves renderer-owned diffing avoids damage API fallbacks.
+    fn retained_after_content_scene_updates_without_full_surface_cleanup() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct RetainedTextExtension {
+            state: Arc<AtomicUsize>,
+        }
+
+        impl AttachRenderExtension for RetainedTextExtension {
+            fn name(&self) -> &'static str {
+                "test.retained_text"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => RenderDamage::FullSurface,
+                }
+            }
+
+            fn render_layer_scene_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+                _context: &RenderExtensionContext,
+            ) -> Option<bmux_plugin::RenderLayerScene> {
+                if layer != RenderExtensionLayer::AfterPaneContent {
+                    return None;
+                }
+                let state = self.state.load(Ordering::Relaxed);
+                let text = if state == 1 { "A" } else { "B" };
+                Some(
+                    bmux_plugin::RenderLayerScene::builder()
+                        .revision(u64::try_from(state).unwrap_or(u64::MAX))
+                        .text("label", 0, 1, 0, text, RenderStyle::default())
+                        .build(),
+                )
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                panic!("retained scene extension should not use imperative fallback")
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1804);
+        let scene = single_pane_scene(pane_id, 8, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
+        pane_buffers.insert(pane_id, pane_buffer);
+        let state = Arc::new(AtomicUsize::new(1));
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(RetainedTextExtension {
+                state: state.clone(),
+            }) as Arc<dyn AttachRenderExtension>];
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("initial retained render should commit previous snapshot");
+
+        state.store(2, Ordering::Relaxed);
+        let mut output = Vec::new();
+        let (_cursor, update_stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::default(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            None,
+        )
+        .expect("retained update should render through retained diff path");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(
+            rendered.contains('B'),
+            "updated retained text should render: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("        "),
+            "retained update should not clear full rows: {rendered:?}"
+        );
+        assert_eq!(update_stats.extension_full_surface_calls, 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retained scene fixture verifies stale cleanup and content replay.
+    fn retained_after_content_scene_removal_cleans_previous_cells_and_replays_content() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct OptionalRetainedTextExtension {
+            visible: Arc<AtomicBool>,
+        }
+
+        impl AttachRenderExtension for OptionalRetainedTextExtension {
+            fn name(&self) -> &'static str {
+                "test.optional_retained_text"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => RenderDamage::FullSurface,
+                }
+            }
+
+            fn render_layer_scene_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+                _context: &RenderExtensionContext,
+            ) -> Option<bmux_plugin::RenderLayerScene> {
+                if layer != RenderExtensionLayer::AfterPaneContent {
+                    return None;
+                }
+                let builder = bmux_plugin::RenderLayerScene::builder()
+                    .revision(u64::from(self.visible.load(Ordering::Relaxed)));
+                if self.visible.load(Ordering::Relaxed) {
+                    Some(
+                        builder
+                            .text("label", 0, 1, 0, "OLD", RenderStyle::default())
+                            .build(),
+                    )
+                } else {
+                    Some(builder.build())
+                }
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                panic!("retained scene extension should not use imperative fallback")
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1805);
+        let scene = single_pane_scene(pane_id, 8, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
+        pane_buffers.insert(pane_id, pane_buffer);
+        let visible = Arc::new(AtomicBool::new(true));
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(OptionalRetainedTextExtension {
+                visible: visible.clone(),
+            }) as Arc<dyn AttachRenderExtension>];
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("initial retained render should commit previous snapshot");
+
+        visible.store(false, Ordering::Relaxed);
+        let mut output = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::default(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            None,
+        )
+        .expect("retained removal should clean stale cells");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let clear_at = rendered
+            .find("\u{1b}[1;2H   ")
+            .expect("retained stale cells should be cleared");
+        let repaint_at = rendered
+            .find("bcd")
+            .expect("pane content under removed retained text should replay");
+        assert!(
+            clear_at < repaint_at,
+            "cleanup should precede replay: {rendered:?}"
+        );
+        assert_eq!(stats.extension_full_surface_calls, 0);
         assert_eq!(stats.pane_row_segments_emitted, 1);
     }
 

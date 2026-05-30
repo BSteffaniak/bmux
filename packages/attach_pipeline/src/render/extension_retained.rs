@@ -2,8 +2,10 @@ use crate::types::{
     ExtensionRetainedItemCacheEntry, ExtensionRetainedLayerCacheEntry, PaneRect, PaneRenderBuffer,
 };
 use bmux_plugin::{
-    BorderGlyphs, ExtensionRect, RenderCell, RenderDamage, RenderStyle, RenderTextSpan,
-    RenderUnderCell, TerminalGraphicOverlay, TerminalRenderCapabilities, render_text_width_u16,
+    BorderGlyphs, ExtensionRect, RenderCell, RenderDamage, RenderLayerItem,
+    RenderLayerScene as PluginRenderLayerScene, RenderOp, RenderSceneItem as PluginRenderSceneItem,
+    RenderSceneItemKind as PluginRenderSceneItemKind, RenderStyle, RenderTextSpan, RenderUnderCell,
+    TerminalGraphicOverlay, TerminalRenderCapabilities, render_text_width_u16,
 };
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -243,6 +245,157 @@ pub(super) struct ExtensionLayerDiffPlan {
     pub(super) added_items: Vec<RenderSceneItemKey>,
     pub(super) removed_items: Vec<RenderSceneItemKey>,
     pub(super) output_items: Vec<RenderSceneItem>,
+}
+
+pub(super) fn retained_snapshot_from_plugin_scene(
+    surface_rect: ExtensionRect,
+    scene: &PluginRenderLayerScene,
+) -> ExtensionRetainedLayerSnapshot {
+    ExtensionRetainedLayerSnapshot::new(
+        surface_rect,
+        scene.revision,
+        scene
+            .items
+            .iter()
+            .map(retained_item_from_plugin_item)
+            .collect(),
+    )
+}
+
+pub(super) fn retained_scene_items_to_render_items(
+    items: &[RenderSceneItem],
+) -> Vec<RenderLayerItem> {
+    items
+        .iter()
+        .filter_map(retained_scene_item_to_render_item)
+        .collect()
+}
+
+fn retained_item_from_plugin_item(item: &PluginRenderSceneItem) -> RenderSceneItem {
+    let bounds = plugin_scene_item_bounds(item);
+    let kind = retained_item_kind_from_plugin_kind(&item.kind);
+    RenderSceneItem::new(item.key.0.clone(), item.z, bounds, kind)
+}
+
+fn plugin_scene_item_bounds(item: &PluginRenderSceneItem) -> ExtensionRect {
+    match &item.kind {
+        PluginRenderSceneItemKind::Text { x, y, text, .. } => ExtensionRect::new(
+            *x,
+            *y,
+            render_text_width_u16(text),
+            u16::from(!text.is_empty()),
+        ),
+        PluginRenderSceneItemKind::StyledText { x, y, spans } => {
+            let width = spans
+                .iter()
+                .map(|span| render_text_width_u16(&span.text))
+                .fold(0_u16, u16::saturating_add);
+            ExtensionRect::new(*x, *y, width, u16::from(width > 0))
+        }
+        PluginRenderSceneItemKind::FillRect { rect, .. }
+        | PluginRenderSceneItemKind::Border { rect, .. } => *rect,
+        PluginRenderSceneItemKind::CellGrid { x, y, rows } => {
+            let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+            let width = rows
+                .iter()
+                .map(|row| u16::try_from(row.len()).unwrap_or(u16::MAX))
+                .max()
+                .unwrap_or(0);
+            ExtensionRect::new(*x, *y, width, height)
+        }
+        PluginRenderSceneItemKind::TerminalGraphic { graphic } => graphic.cell_rect,
+        PluginRenderSceneItemKind::UnderCells { cells } => under_cell_bounds(cells),
+    }
+}
+
+fn retained_item_kind_from_plugin_kind(kind: &PluginRenderSceneItemKind) -> RenderSceneItemKind {
+    match kind {
+        PluginRenderSceneItemKind::Text { x, y, text, style } => RenderSceneItemKind::Text {
+            x: *x,
+            y: *y,
+            text: text.clone(),
+            style: *style,
+        },
+        PluginRenderSceneItemKind::StyledText { x, y, spans } => RenderSceneItemKind::StyledText {
+            x: *x,
+            y: *y,
+            spans: spans.clone(),
+        },
+        PluginRenderSceneItemKind::FillRect { rect, ch, style } => RenderSceneItemKind::FillRect {
+            rect: *rect,
+            ch: *ch,
+            style: *style,
+        },
+        PluginRenderSceneItemKind::Border {
+            rect,
+            glyphs,
+            style,
+        } => RenderSceneItemKind::Border {
+            rect: *rect,
+            glyphs: *glyphs,
+            style: *style,
+        },
+        PluginRenderSceneItemKind::CellGrid { x, y, rows } => RenderSceneItemKind::CellGrid {
+            x: *x,
+            y: *y,
+            rows: rows.clone(),
+        },
+        PluginRenderSceneItemKind::TerminalGraphic { graphic } => {
+            RenderSceneItemKind::TerminalGraphic {
+                graphic: graphic.clone(),
+            }
+        }
+        PluginRenderSceneItemKind::UnderCells { cells } => RenderSceneItemKind::UnderCells {
+            cells: cells.clone(),
+        },
+    }
+}
+
+fn retained_scene_item_to_render_item(item: &RenderSceneItem) -> Option<RenderLayerItem> {
+    match &item.kind {
+        RenderSceneItemKind::Text { x, y, text, style } => {
+            Some(RenderLayerItem::Op(RenderOp::TextRun {
+                x: *x,
+                y: *y,
+                text: text.clone(),
+                style: *style,
+            }))
+        }
+        RenderSceneItemKind::StyledText { x, y, spans } => {
+            Some(RenderLayerItem::Op(RenderOp::StyledText {
+                x: *x,
+                y: *y,
+                spans: spans.clone(),
+            }))
+        }
+        RenderSceneItemKind::FillRect { rect, ch, style } => {
+            Some(RenderLayerItem::Op(RenderOp::FillRect {
+                rect: *rect,
+                ch: *ch,
+                style: *style,
+            }))
+        }
+        RenderSceneItemKind::Border {
+            rect,
+            glyphs,
+            style,
+        } => Some(RenderLayerItem::Op(RenderOp::Border {
+            rect: *rect,
+            glyphs: *glyphs,
+            style: *style,
+        })),
+        RenderSceneItemKind::CellGrid { x, y, rows } => {
+            Some(RenderLayerItem::Op(RenderOp::CellGrid {
+                x: *x,
+                y: *y,
+                rows: rows.clone(),
+            }))
+        }
+        RenderSceneItemKind::TerminalGraphic { graphic } => {
+            Some(RenderLayerItem::Graphic(graphic.clone()))
+        }
+        RenderSceneItemKind::UnderCells { .. } => None,
+    }
 }
 
 pub(super) fn retained_layer_cache_key(
