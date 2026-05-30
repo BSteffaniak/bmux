@@ -2027,6 +2027,27 @@ pub enum ConfigCommand {
         #[command(subcommand)]
         command: ConfigProfilesCommand,
     },
+    /// Inspect scoped configuration resolution
+    Scope {
+        #[command(subcommand)]
+        command: ConfigScopeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigScopeCommand {
+    /// Explain scoped source discovery and effective config
+    Explain {
+        /// Scope name to resolve, e.g. pane, new-pane, or global
+        #[arg(long, default_value = "pane")]
+        scope: String,
+        /// Cwd used for discovering local bmux.toml overlays
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

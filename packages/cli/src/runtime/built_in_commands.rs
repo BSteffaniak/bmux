@@ -82,6 +82,7 @@ pub enum BuiltInHandlerId {
     ConfigProfilesShow,
     ConfigProfilesResolve,
     ConfigProfilesExplain,
+    ConfigScopeExplain,
     ConfigProfilesSwitch,
     ConfigProfilesDiff,
     ConfigProfilesLint,
@@ -601,6 +602,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ConfigProfilesEvaluate,
             &["config", "profiles", "evaluate"],
             "Evaluate auto-select profile rules",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigScopeExplain,
+            &["config", "scope", "explain"],
+            "Explain scoped config source resolution",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Perf,

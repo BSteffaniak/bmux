@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_config::{
+    BmuxConfig, ConfigLoadOverrides, ConfigPaths, ConfigScopeTarget, ScopedConfigLoadRequest,
+};
 use bmux_keybind::{RuntimeAction, parse_action};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -65,6 +67,70 @@ pub(super) fn run_config_show(as_json: bool) -> Result<u8> {
 
     let toml_str = toml::to_string_pretty(&config).context("failed to serialize config to TOML")?;
     print!("{toml_str}");
+    Ok(0)
+}
+
+pub(super) fn run_config_scope_explain(
+    scope: &str,
+    cwd: Option<&std::path::Path>,
+    as_json: bool,
+) -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let cwd = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let target = ConfigScopeTarget {
+        name: scope.to_string(),
+        cwd,
+    };
+    let request = ScopedConfigLoadRequest::new(target);
+    let (config, explain) = BmuxConfig::explain_from_path_for_scope_with_overrides(
+        &paths.config_file(),
+        None,
+        &ConfigLoadOverrides::default(),
+        &request,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "target_scope": explain.target_scope,
+                "cwd": explain.cwd,
+                "global_config_path": explain.global_config_path,
+                "local_config_filename": explain.local_config_filename,
+                "sources": explain.sources,
+                "composition": explain.resolution,
+                "config": toml_value_to_json(
+                    &toml::Value::try_from(&config).context("failed to serialize config")?,
+                ),
+            }))
+            .context("failed to encode scoped config explain json")?
+        );
+        return Ok(0);
+    }
+
+    println!("scope: {}", explain.target_scope);
+    if let Some(cwd) = explain.cwd.as_ref() {
+        println!("cwd: {}", cwd.display());
+    }
+    println!("global config: {}", explain.global_config_path.display());
+    println!("local filename: {}", explain.local_config_filename);
+    println!("sources:");
+    for source in &explain.sources {
+        let status = if source.applied { "applied" } else { "skipped" };
+        let scopes = if source.scopes.is_empty() {
+            "-".to_string()
+        } else {
+            source.scopes.join(",")
+        };
+        println!("  - {status:7} [{}] {}", scopes, source.path.display());
+    }
+    println!(
+        "composition layers: {}",
+        explain.resolution.layer_order.join(" -> ")
+    );
     Ok(0)
 }
 

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use bmux_cli_schema::{
-    AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, KeymapCommand,
-    KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand,
-    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
-    SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
-    SlotCommand, TerminalCommand,
+    AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand,
+    KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand,
+    RecordingCommand, RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
+    SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand,
+    SessionCommand, SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -18,11 +18,11 @@ use super::{
     run_config_get, run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
     run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
     run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
-    run_config_set, run_config_show, run_connect, run_doctor, run_external_plugin_command,
-    run_follow, run_host, run_hosts, run_join, run_keymap_doctor, run_keymap_explain,
-    run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token, run_kiosk_revoke_token,
-    run_kiosk_ssh_print_config, run_kiosk_status, run_logs_level, run_logs_path,
-    run_logs_profiles_delete, run_logs_profiles_list, run_logs_profiles_rename,
+    run_config_scope_explain, run_config_set, run_config_show, run_connect, run_doctor,
+    run_external_plugin_command, run_follow, run_host, run_hosts, run_join, run_keymap_doctor,
+    run_keymap_explain, run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token,
+    run_kiosk_revoke_token, run_kiosk_ssh_print_config, run_kiosk_status, run_logs_level,
+    run_logs_path, run_logs_profiles_delete, run_logs_profiles_list, run_logs_profiles_rename,
     run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off, run_perf_on,
     run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
     run_playbook_from_recording, run_playbook_interactive, run_playbook_run, run_playbook_validate,
@@ -152,6 +152,9 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
                 ConfigProfilesCommand::Diff { .. } => BuiltInHandlerId::ConfigProfilesDiff,
                 ConfigProfilesCommand::Lint { .. } => BuiltInHandlerId::ConfigProfilesLint,
                 ConfigProfilesCommand::Evaluate { .. } => BuiltInHandlerId::ConfigProfilesEvaluate,
+            },
+            ConfigCommand::Scope { command } => match command {
+                ConfigScopeCommand::Explain { .. } => BuiltInHandlerId::ConfigScopeExplain,
             },
         },
         Command::Perf { command } => match command {
@@ -977,6 +980,15 @@ pub(super) async fn dispatch_built_in_command(
                 command: ConfigCommand::Set { key, value },
             },
         ) => run_config_set(key, value),
+        (
+            BuiltInHandlerId::ConfigScopeExplain,
+            Command::Config {
+                command:
+                    ConfigCommand::Scope {
+                        command: ConfigScopeCommand::Explain { scope, cwd, json },
+                    },
+            },
+        ) => run_config_scope_explain(scope, cwd.as_deref(), *json),
         (
             BuiltInHandlerId::ConfigProfilesList,
             Command::Config {

@@ -211,6 +211,23 @@ pub struct CompositionExplain {
     pub applied_layers: Vec<CompositionLayerChange>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedConfigSource {
+    pub path: PathBuf,
+    pub applied: bool,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedConfigExplain {
+    pub target_scope: String,
+    pub cwd: Option<PathBuf>,
+    pub global_config_path: PathBuf,
+    pub local_config_filename: String,
+    pub sources: Vec<ScopedConfigSource>,
+    pub resolution: CompositionResolution,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum ScopeListConfig {
@@ -334,9 +351,17 @@ fn scoped_overlay_for_target(
 }
 
 fn scoped_local_overlay_for_target(
-    mut value: toml::Value,
+    value: toml::Value,
     target: &ConfigScopeTarget,
 ) -> Result<Option<toml::Value>> {
+    let (overlay, _scopes) = scoped_local_overlay_for_target_with_scopes(value, target)?;
+    Ok(overlay)
+}
+
+fn scoped_local_overlay_for_target_with_scopes(
+    mut value: toml::Value,
+    target: &ConfigScopeTarget,
+) -> Result<(Option<toml::Value>, Vec<String>)> {
     let Some(root) = value.as_table_mut() else {
         return Err(ConfigError::ParseError {
             error: "config root must be a table".to_string(),
@@ -349,17 +374,20 @@ fn scoped_local_overlay_for_target(
         metadata.and_then(|metadata| metadata.default_scope),
         default_local_scopes(),
     );
+    let mut matched_scopes = Vec::new();
 
     let mut merged = toml::Value::Table(toml::Table::new());
     let mut loaded_any = scope_matches(&default_scopes, target) && !root.is_empty();
     if loaded_any {
+        matched_scopes.extend(default_scopes);
         merge_toml_value(&mut merged, value);
     }
     if let Some(scoped_overlay) = scoped_overlay {
+        matched_scopes.push(normalize_scope_name(&target.name));
         merge_toml_value(&mut merged, scoped_overlay);
         loaded_any = true;
     }
-    Ok(loaded_any.then_some(merged))
+    Ok((loaded_any.then_some(merged), matched_scopes))
 }
 
 fn discover_local_config_paths(
@@ -2970,6 +2998,54 @@ impl BmuxConfig {
             path, None, overrides, request,
         )?;
         Ok(config)
+    }
+
+    /// Explain scoped config source discovery and composition for a target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any config file cannot be read or parsed.
+    pub fn explain_from_path_for_scope_with_overrides(
+        path: &std::path::Path,
+        forced_profile: Option<&str>,
+        overrides: &ConfigLoadOverrides,
+        request: &ScopedConfigLoadRequest,
+    ) -> Result<(Self, ScopedConfigExplain)> {
+        let raw_value = merged_raw_config_value_for_scope(path, Some(overrides), request)?;
+        let (config, resolution) =
+            Self::load_from_raw_value_with_resolution(raw_value, forced_profile)?;
+        let mut sources = Vec::new();
+        if path.exists() {
+            sources.push(ScopedConfigSource {
+                path: path.to_path_buf(),
+                applied: true,
+                scopes: vec!["global".to_string()],
+            });
+        }
+        if let Some(cwd) = request.target.cwd.as_deref() {
+            for local_path in discover_local_config_paths(cwd, &request.local_config_filename, path)
+            {
+                let local_value = load_toml_file(&local_path)?;
+                let (overlay, scopes) =
+                    scoped_local_overlay_for_target_with_scopes(local_value, &request.target)?;
+                sources.push(ScopedConfigSource {
+                    path: local_path,
+                    applied: overlay.is_some(),
+                    scopes,
+                });
+            }
+        }
+        Ok((
+            config,
+            ScopedConfigExplain {
+                target_scope: normalize_scope_name(&request.target.name),
+                cwd: request.target.cwd.clone(),
+                global_config_path: path.to_path_buf(),
+                local_config_filename: request.local_config_filename.clone(),
+                sources,
+                resolution,
+            },
+        ))
     }
 
     /// Load configuration from a specific path and return composition metadata.
