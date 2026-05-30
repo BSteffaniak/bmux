@@ -265,10 +265,35 @@ pub(super) fn retained_snapshot_from_plugin_scene(
 pub(super) fn retained_scene_items_to_render_items(
     items: &[RenderSceneItem],
 ) -> Vec<RenderLayerItem> {
-    items
-        .iter()
+    let mut sorted_items = items.iter().collect::<Vec<_>>();
+    sorted_items.sort_by_key(|item| (item.z, item.key.clone()));
+    sorted_items
+        .into_iter()
         .filter_map(retained_scene_item_to_render_item)
         .collect()
+}
+
+pub(super) fn retained_scene_item_damage_for_render_damage(
+    items: &[RenderSceneItem],
+    damage: &RenderDamage,
+    surface_rect: ExtensionRect,
+    policy: DamageCoalescingPolicy,
+) -> RenderDamage {
+    let damaged_rects = match damage {
+        RenderDamage::None => return RenderDamage::None,
+        RenderDamage::FullSurface => vec![surface_rect],
+        RenderDamage::Regions(regions) => regions.clone(),
+    };
+    let item_rects = items
+        .iter()
+        .filter(|item| {
+            damaged_rects
+                .iter()
+                .any(|rect| item.bounds.intersects(*rect))
+        })
+        .map(|item| item.bounds)
+        .collect::<Vec<_>>();
+    coalesce_render_damage(RenderDamage::Regions(item_rects), surface_rect, policy)
 }
 
 fn retained_item_from_plugin_item(item: &PluginRenderSceneItem) -> RenderSceneItem {

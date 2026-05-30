@@ -9,13 +9,32 @@ use uuid::Uuid;
 
 use super::extension_retained::{
     ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, build_extension_layer_diff_plan,
-    load_retained_layer_snapshot, retained_layer_cache_key, retained_scene_items_to_render_items,
+    load_retained_layer_snapshot, retained_layer_cache_key,
+    retained_scene_item_damage_for_render_damage, retained_scene_items_to_render_items,
     retained_snapshot_from_plugin_scene,
 };
 use super::{
     DamageCoalescingPolicy, DamageRect, FrameDamage, RenderOpsOutputPlan,
     build_render_ops_output_plan, coalesce_render_damage, frame_rects_to_render_damage,
 };
+
+fn merge_render_damage(
+    lhs: RenderDamage,
+    rhs: RenderDamage,
+    surface_rect: ExtensionRect,
+    policy: DamageCoalescingPolicy,
+) -> RenderDamage {
+    match (lhs, rhs) {
+        (RenderDamage::FullSurface, _) | (_, RenderDamage::FullSurface) => {
+            RenderDamage::FullSurface
+        }
+        (RenderDamage::None, damage) | (damage, RenderDamage::None) => damage,
+        (RenderDamage::Regions(mut lhs), RenderDamage::Regions(rhs)) => {
+            lhs.extend(rhs);
+            coalesce_render_damage(RenderDamage::Regions(lhs), surface_rect, policy)
+        }
+    }
+}
 
 fn extension_own_render_damage_for_frame(
     ext: &dyn AttachRenderExtension,
@@ -422,6 +441,7 @@ pub(super) enum AfterContentExtensionOutputAction {
     RetainedScene {
         diff_plan: Box<ExtensionLayerDiffPlan>,
         snapshot: ExtensionRetainedLayerSnapshot,
+        output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
     },
     CachedReplay {
@@ -492,7 +512,7 @@ pub(super) fn build_after_content_surface_output_plan(
     }
 }
 
-pub(super) fn build_after_content_extension_output_plan(
+fn build_retained_after_content_extension_output_plan(
     surface_index: usize,
     snapshot: &ExtensionLayerSnapshot,
     content: PaneRect,
@@ -506,38 +526,74 @@ pub(super) fn build_after_content_extension_output_plan(
         snapshot.layer,
         render_context.capabilities,
     );
-    if let Some(scene) = snapshot.extension.render_layer_scene_with_context(
+    let scene = snapshot.extension.render_layer_scene_with_context(
         snapshot.surface_id,
         &snapshot.surface_rect,
         snapshot.layer,
         render_context,
-    ) {
-        let retained_snapshot = retained_snapshot_from_plugin_scene(snapshot.surface_rect, &scene);
-        let previous_snapshot =
-            load_retained_layer_snapshot(pane_buffers.get(&snapshot.pane_id), &retained_cache_key);
-        let diff_plan = build_extension_layer_diff_plan(
-            previous_snapshot.as_ref(),
-            Some(&retained_snapshot),
-            content,
+    )?;
+    let retained_snapshot = retained_snapshot_from_plugin_scene(snapshot.surface_rect, &scene);
+    let previous_snapshot =
+        load_retained_layer_snapshot(pane_buffers.get(&snapshot.pane_id), &retained_cache_key);
+    let diff_plan = build_extension_layer_diff_plan(
+        previous_snapshot.as_ref(),
+        Some(&retained_snapshot),
+        content,
+        policy,
+    );
+    let retained_replay_damage = if snapshot.own_damage.is_none() {
+        retained_scene_item_damage_for_render_damage(
+            &retained_snapshot.items,
+            &snapshot.render_damage,
+            snapshot.surface_rect,
             policy,
-        );
-        let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
-        let should_execute = !diff_plan.update_damage.is_none()
-            || !diff_plan.stale_cleanup_damage.is_none()
-            || previous_snapshot.is_none();
-        if !should_execute {
-            return None;
-        }
-        return Some(AfterContentExtensionOutputPlan {
-            surface_index,
-            snapshot: snapshot.clone(),
-            cache_key: retained_cache_key,
-            action: AfterContentExtensionOutputAction::RetainedScene {
-                diff_plan: Box::new(diff_plan),
-                snapshot: retained_snapshot,
-                output_items,
-            },
-        });
+        )
+    } else {
+        RenderDamage::None
+    };
+    let output_damage = merge_render_damage(
+        diff_plan.update_damage.clone(),
+        retained_replay_damage,
+        snapshot.surface_rect,
+        policy,
+    );
+    let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
+    let should_execute = !output_damage.is_none()
+        || !diff_plan.stale_cleanup_damage.is_none()
+        || previous_snapshot.is_none();
+    if !should_execute {
+        return None;
+    }
+    Some(AfterContentExtensionOutputPlan {
+        surface_index,
+        snapshot: snapshot.clone(),
+        cache_key: retained_cache_key,
+        action: AfterContentExtensionOutputAction::RetainedScene {
+            diff_plan: Box::new(diff_plan),
+            snapshot: retained_snapshot,
+            output_damage,
+            output_items,
+        },
+    })
+}
+
+pub(super) fn build_after_content_extension_output_plan(
+    surface_index: usize,
+    snapshot: &ExtensionLayerSnapshot,
+    content: PaneRect,
+    policy: DamageCoalescingPolicy,
+    render_context: &RenderExtensionContext,
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+) -> Option<AfterContentExtensionOutputPlan> {
+    if let Some(plan) = build_retained_after_content_extension_output_plan(
+        surface_index,
+        snapshot,
+        content,
+        policy,
+        render_context,
+        pane_buffers,
+    ) {
+        return Some(plan);
     }
 
     let damage = snapshot.render_damage.clone();

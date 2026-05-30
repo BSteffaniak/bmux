@@ -3534,9 +3534,7 @@ fn record_after_content_extension_output_plan(
 ) {
     let ext_name = plan.snapshot.extension.name();
     let damage = match &plan.action {
-        AfterContentExtensionOutputAction::RetainedScene { diff_plan, .. } => {
-            &diff_plan.update_damage
-        }
+        AfterContentExtensionOutputAction::RetainedScene { output_damage, .. } => output_damage,
         _ => &plan.snapshot.render_damage,
     };
     if let Some(stats) = render_stats.as_deref_mut() {
@@ -3592,9 +3590,7 @@ fn record_after_content_extension_ops(
     }
     if let Some(trace) = render_trace.as_deref_mut() {
         let damage = match &plan.action {
-            AfterContentExtensionOutputAction::RetainedScene { diff_plan, .. } => {
-                &diff_plan.update_damage
-            }
+            AfterContentExtensionOutputAction::RetainedScene { output_damage, .. } => output_damage,
             _ => &plan.snapshot.render_damage,
         };
         let (regions, full_surface) = render_damage_trace_shape(damage);
@@ -3620,6 +3616,7 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
         AfterContentExtensionOutputAction::RetainedScene {
             diff_plan,
             snapshot: retained_snapshot,
+            output_damage,
             output_items,
         } => {
             execute_retained_after_content_extension_output_plan(
@@ -3627,6 +3624,7 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
                 plan,
                 diff_plan,
                 retained_snapshot,
+                output_damage,
                 output_items,
                 render_context,
                 pane_buffers,
@@ -3721,8 +3719,9 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
 fn execute_retained_after_content_extension_output_plan<W: io::Write>(
     stdout: &mut W,
     plan: &AfterContentExtensionOutputPlan,
-    diff_plan: &ExtensionLayerDiffPlan,
+    _diff_plan: &ExtensionLayerDiffPlan,
     retained_snapshot: &ExtensionRetainedLayerSnapshot,
+    output_damage: &RenderDamage,
     output_items: &[RenderLayerItem],
     render_context: &RenderExtensionContext,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3730,14 +3729,14 @@ fn execute_retained_after_content_extension_output_plan<W: io::Write>(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
 ) {
     let snapshot = &plan.snapshot;
-    if !diff_plan.update_damage.is_none()
+    if !output_damage.is_none()
         && !output_items.is_empty()
         && let Err(err) = queue_render_items_for_frame(
             stdout,
             snapshot.pane_id,
             snapshot.surface_id,
             snapshot.surface_rect,
-            &diff_plan.update_damage,
+            output_damage,
             output_items,
             terminal_graphics_cache,
             terminal_graphics,
@@ -8706,6 +8705,389 @@ mod tests {
         );
         assert_eq!(stats.extension_full_surface_calls, 0);
         assert_eq!(stats.pane_row_segments_emitted, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retained scene fixture verifies move cleanup, content replay, and repaint ordering.
+    fn retained_after_content_scene_move_cleans_old_and_paints_new() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct MovingRetainedTextExtension {
+            x: Arc<AtomicUsize>,
+        }
+
+        impl AttachRenderExtension for MovingRetainedTextExtension {
+            fn name(&self) -> &'static str {
+                "test.moving_retained_text"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => RenderDamage::FullSurface,
+                }
+            }
+
+            fn render_layer_scene_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+                _context: &RenderExtensionContext,
+            ) -> Option<bmux_plugin::RenderLayerScene> {
+                if layer != RenderExtensionLayer::AfterPaneContent {
+                    return None;
+                }
+                let x = u16::try_from(self.x.load(Ordering::Relaxed)).unwrap_or(u16::MAX);
+                Some(
+                    bmux_plugin::RenderLayerScene::builder()
+                        .revision(u64::from(x))
+                        .text("paddle", 0, x, 0, "P", RenderStyle::default())
+                        .build(),
+                )
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                panic!("retained scene extension should not use imperative fallback")
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1806);
+        let scene = single_pane_scene(pane_id, 8, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
+        pane_buffers.insert(pane_id, pane_buffer);
+        let x = Arc::new(AtomicUsize::new(0));
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(MovingRetainedTextExtension { x: x.clone() })
+                as Arc<dyn AttachRenderExtension>];
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("initial retained render should commit previous snapshot");
+
+        x.store(3, Ordering::Relaxed);
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::default(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("retained move should clean stale cells and draw new position");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let clear_at = rendered
+            .find(' ')
+            .expect("old retained cell should be cleared");
+        let repaint_at = rendered
+            .find('a')
+            .expect("underlying content under old retained cell should replay");
+        let paint_at = rendered
+            .rfind('P')
+            .expect("new retained cell should render");
+        assert!(
+            clear_at < repaint_at,
+            "cleanup should precede content replay: {rendered:?}"
+        );
+        assert!(
+            repaint_at < paint_at,
+            "new retained output should follow content replay: {rendered:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retained scene fixture proves pane content damage replays unchanged overlays.
+    fn retained_after_content_scene_content_damage_replays_unchanged_item() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::Arc;
+
+        struct ContentReplayRetainedTextExtension;
+
+        impl AttachRenderExtension for ContentReplayRetainedTextExtension {
+            fn name(&self) -> &'static str {
+                "test.content_replay_retained_text"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                RenderDamage::None
+            }
+
+            fn render_layer_scene_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+                _context: &RenderExtensionContext,
+            ) -> Option<bmux_plugin::RenderLayerScene> {
+                if layer != RenderExtensionLayer::AfterPaneContent {
+                    return None;
+                }
+                Some(
+                    bmux_plugin::RenderLayerScene::builder()
+                        .revision(1)
+                        .text("badge", 0, 1, 0, "OV", RenderStyle::default())
+                        .build(),
+                )
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                panic!("retained scene extension should not use imperative fallback")
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1807);
+        let scene = single_pane_scene(pane_id, 8, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
+        pane_buffers.insert(pane_id, pane_buffer);
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(ContentReplayRetainedTextExtension) as Arc<dyn AttachRenderExtension>];
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("initial retained render should commit previous snapshot");
+
+        let mut frame_damage = FrameDamage::default();
+        frame_damage.mark_content_surface(pane_id);
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &frame_damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("content damage should replay retained after-content output");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let content_at = rendered
+            .find("abcdef")
+            .expect("pane content should repaint for content damage");
+        let overlay_at = rendered
+            .rfind("OV")
+            .expect("unchanged retained overlay should replay after content repaint");
+        assert!(
+            content_at < overlay_at,
+            "retained overlay must render after content: {rendered:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retained scene fixture verifies output ordering follows item z, not builder order.
+    fn retained_after_content_scene_preserves_z_order_when_lower_item_changes() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct ZOrderedRetainedTextExtension {
+            lower_changed: Arc<AtomicBool>,
+        }
+
+        impl AttachRenderExtension for ZOrderedRetainedTextExtension {
+            fn name(&self) -> &'static str {
+                "test.z_ordered_retained_text"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => RenderDamage::FullSurface,
+                }
+            }
+
+            fn render_layer_scene_with_context(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                layer: RenderExtensionLayer,
+                _context: &RenderExtensionContext,
+            ) -> Option<bmux_plugin::RenderLayerScene> {
+                if layer != RenderExtensionLayer::AfterPaneContent {
+                    return None;
+                }
+                let lower = if self.lower_changed.load(Ordering::Relaxed) {
+                    "l"
+                } else {
+                    "L"
+                };
+                Some(
+                    bmux_plugin::RenderLayerScene::builder()
+                        .revision(u64::from(self.lower_changed.load(Ordering::Relaxed)))
+                        .text("higher", 10, 0, 1, "H", RenderStyle::default())
+                        .text("lower", 0, 0, 1, lower, RenderStyle::default())
+                        .build(),
+                )
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                panic!("retained scene extension should not use imperative fallback")
+            }
+        }
+
+        let pane_id = Uuid::from_u128(1808);
+        let scene = single_pane_scene(pane_id, 8, 2);
+        let mut pane_buffers = BTreeMap::new();
+        let mut pane_buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
+        pane_buffers.insert(pane_id, pane_buffer);
+        let lower_changed = Arc::new(AtomicBool::new(false));
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(ZOrderedRetainedTextExtension {
+                lower_changed: lower_changed.clone(),
+            }) as Arc<dyn AttachRenderExtension>];
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("initial retained render should commit previous snapshot");
+
+        lower_changed.store(true, Ordering::Relaxed);
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::default(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("lower retained update should preserve higher-z item");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let higher_at = rendered
+            .rfind('H')
+            .expect("higher-z retained item should render");
+        if let Some(lower_at) = rendered.rfind('l') {
+            assert!(
+                lower_at < higher_at,
+                "higher-z item must be emitted after lower-z item: {rendered:?}"
+            );
+        }
     }
 
     #[test]
