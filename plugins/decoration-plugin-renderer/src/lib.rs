@@ -41,8 +41,9 @@ use bmux_plugin::{
     AttachVisualAdapterRequest, AttachVisualFrameView, AttachVisualProjectionResult,
     AttachVisualProjectionUpdate, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
-    RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell, TerminalRenderCapabilities,
-    registered_visual_adapter, render_single_display_cell_char, render_text_width_u16,
+    RenderLayerScene, RenderNamedColor, RenderOp, RenderSceneItem, RenderSceneItemKey, RenderStyle,
+    RenderUnderCell, TerminalRenderCapabilities, registered_visual_adapter,
+    render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -450,6 +451,33 @@ impl AttachRenderExtension for DecorationRenderExtension {
             layer,
             TerminalRenderCapabilities::default(),
         )
+    }
+
+    fn render_layer_scene_with_context(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Option<RenderLayerScene> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Some(RenderLayerScene::new(None, Vec::new()));
+        };
+        let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_layer_rendered(surface_id, layer);
+            return Some(RenderLayerScene::new(None, Vec::new()));
+        };
+        let rendered_surface = surface.clone();
+        let scene_capabilities = scene_capabilities_from_terminal(context.capabilities);
+        let scene = render_scene_for_surface_layer_with_capabilities(
+            surface_id,
+            &rendered_surface,
+            layer,
+            context.capabilities,
+            scene_capabilities,
+        )?;
+        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
+        Some(scene)
     }
 
     fn render_layer_items_with_context(
@@ -1372,6 +1400,106 @@ pub fn render_ops_for_paint_commands_with_capabilities(
     Some(ops)
 }
 
+fn render_scene_for_surface_layer_with_capabilities(
+    surface_id: Uuid,
+    surface: &SurfaceDecoration,
+    layer: RenderExtensionLayer,
+    terminal_capabilities: TerminalRenderCapabilities,
+    scene_capabilities: SceneRenderCapabilities,
+) -> Option<RenderLayerScene> {
+    let commands = layer_paint_commands(surface, layer);
+    let mut ordered: Vec<(usize, &PaintCommand)> = commands.iter().enumerate().collect();
+    ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
+
+    let mut items = Vec::new();
+    for (command_index, command) in ordered {
+        push_render_scene_items_for_command(
+            &mut items,
+            surface_id,
+            commands,
+            command_index,
+            command,
+            terminal_capabilities,
+            scene_capabilities,
+        )?;
+    }
+    Some(RenderLayerScene::new(
+        Some(surface_layer_revision(surface, layer)),
+        items,
+    ))
+}
+
+fn push_render_scene_items_for_command(
+    items: &mut Vec<RenderSceneItem>,
+    surface_id: Uuid,
+    commands: &[PaintCommand],
+    command_index: usize,
+    command: &PaintCommand,
+    terminal_capabilities: TerminalRenderCapabilities,
+    scene_capabilities: SceneRenderCapabilities,
+) -> Option<()> {
+    let z = paint_command_z(command);
+    let key_prefix = format!("cmd-{command_index:06}");
+    let occluders = terminal_cell_occluders_after(commands, command_index, command);
+    if let Some(graphics) = raster_border::semantic_border_graphic_items_with_occlusion(
+        surface_id,
+        u64::try_from(command_index).unwrap_or(u64::MAX),
+        command,
+        terminal_capabilities,
+        scene_capabilities,
+        &occluders,
+    ) {
+        for (graphic_index, item) in graphics.into_iter().enumerate() {
+            let RenderLayerItem::Graphic(graphic) = item else {
+                continue;
+            };
+            items.push(RenderSceneItem::terminal_graphic(
+                RenderSceneItemKey::new(format!("{key_prefix}:graphic-{graphic_index:02}")),
+                raster_border::semantic_border_terminal_graphic_z(z),
+                graphic,
+            ));
+        }
+        return Some(());
+    }
+
+    let mut ops = Vec::new();
+    push_render_ops_for_command_with_occluders(&mut ops, command, scene_capabilities, &occluders)?;
+    for (op_index, op) in ops.into_iter().enumerate() {
+        items.push(render_scene_item_from_op(
+            format!("{key_prefix}:op-{op_index:02}"),
+            z,
+            op,
+        ));
+    }
+    Some(())
+}
+
+fn render_scene_item_from_op(key: String, z: i16, op: RenderOp) -> RenderSceneItem {
+    match op {
+        RenderOp::TextRun { x, y, text, style } => RenderSceneItem::text(key, z, x, y, text, style),
+        RenderOp::StyledText { x, y, spans } => RenderSceneItem::styled_text(key, z, x, y, spans),
+        RenderOp::ClearRect { rect, style } => {
+            RenderSceneItem::fill_rect(RenderSceneItemKey::new(key), z, rect, ' ', style)
+        }
+        RenderOp::EraseRowSegment { x, y, width, style } => RenderSceneItem::fill_rect(
+            RenderSceneItemKey::new(key),
+            z,
+            ExtensionRect::new(x, y, width, 1),
+            ' ',
+            style,
+        ),
+        RenderOp::FillRect { rect, ch, style } => {
+            RenderSceneItem::fill_rect(RenderSceneItemKey::new(key), z, rect, ch, style)
+        }
+        RenderOp::Border {
+            rect,
+            glyphs,
+            style,
+        } => RenderSceneItem::border(RenderSceneItemKey::new(key), z, rect, glyphs, style),
+        RenderOp::CellGrid { x, y, rows } => RenderSceneItem::cell_grid(key, z, x, y, rows),
+    }
+}
+
 fn render_ops_to_under_cells(ops: &[RenderOp]) -> Vec<(u16, u16, RenderUnderCell)> {
     let mut cells = Vec::new();
     for op in ops {
@@ -2273,6 +2401,16 @@ mod tests {
         (extension, cache)
     }
 
+    fn kitty_capabilities() -> TerminalRenderCapabilities {
+        TerminalRenderCapabilities {
+            kitty_graphics: true,
+            graphics_alpha: true,
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
+            ..TerminalRenderCapabilities::default()
+        }
+    }
+
     fn scene_style() -> SceneStyle {
         SceneStyle {
             fg: None,
@@ -2469,6 +2607,156 @@ mod tests {
             cache: cache.clone(),
         };
         (extension, cache)
+    }
+
+    #[test]
+    fn retained_scene_converts_text_commands_and_marks_rendered() {
+        let surface_id = Uuid::from_u128(201);
+        let (extension, cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 2,
+                row: 3,
+                z: 4,
+                text: "perf".to_string(),
+                style: scene_style(),
+            }],
+        );
+        let scene = extension
+            .render_layer_scene_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 10),
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext::default(),
+            )
+            .expect("retained scene should be available");
+
+        assert_eq!(scene.items.len(), 1);
+        assert!(matches!(
+            &scene.items[0].kind,
+            bmux_plugin::RenderSceneItemKind::Text { x: 2, y: 3, text, .. } if text == "perf"
+        ));
+        assert!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .rendered_surface_layer(&surface_id, RenderExtensionLayer::AfterPaneContent)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn retained_scene_converts_before_content_to_underlay_items() {
+        let surface_id = Uuid::from_u128(202);
+        let (extension, cache) = extension_with_surface(surface_id, Vec::new());
+        cache
+            .lock()
+            .expect("cache lock")
+            .surfaces
+            .get_mut(&surface_id)
+            .expect("surface")
+            .before_content_paint_commands = vec![PaintCommand::Text {
+            col: 1,
+            row: 0,
+            z: -1,
+            text: "under".to_string(),
+            style: scene_style(),
+        }];
+        let scene = extension
+            .render_layer_scene_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 10),
+                RenderExtensionLayer::BeforePaneContent,
+                &RenderExtensionContext::default(),
+            )
+            .expect("retained scene should be available");
+
+        assert!(matches!(
+            &scene.items[0].kind,
+            bmux_plugin::RenderSceneItemKind::Text { x: 1, y: 0, text, .. } if text == "under"
+        ));
+        assert!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .rendered_surface_layer(&surface_id, RenderExtensionLayer::BeforePaneContent)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn retained_scene_converts_semantic_border_to_graphic_items_when_capable() {
+        let surface_id = Uuid::from_u128(203);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::SemanticBorder {
+                rect: SceneRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                z: 7,
+                style: scene_style(),
+                fallback_glyphs: SceneBorderGlyphs::Rounded,
+                thickness_px: 2,
+                radius_px: 0,
+                when: None,
+            }],
+        );
+        let scene = extension
+            .render_layer_scene_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 10),
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext {
+                    capabilities: kitty_capabilities(),
+                },
+            )
+            .expect("retained scene should be available");
+
+        assert_eq!(scene.items.len(), 4);
+        assert!(scene.items.iter().all(|item| matches!(
+            item.kind,
+            bmux_plugin::RenderSceneItemKind::TerminalGraphic { .. }
+        )));
+    }
+
+    #[test]
+    fn retained_scene_uses_text_fallback_for_semantic_border_without_graphics() {
+        let surface_id = Uuid::from_u128(204);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::SemanticBorder {
+                rect: SceneRect {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 3,
+                },
+                z: 0,
+                style: scene_style(),
+                fallback_glyphs: SceneBorderGlyphs::Ascii,
+                thickness_px: 2,
+                radius_px: 0,
+                when: None,
+            }],
+        );
+        let scene = extension
+            .render_layer_scene_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 4, 3),
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext::default(),
+            )
+            .expect("retained scene should be available");
+
+        assert!(
+            scene
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, bmux_plugin::RenderSceneItemKind::Border { .. }))
+        );
     }
 
     #[test]
