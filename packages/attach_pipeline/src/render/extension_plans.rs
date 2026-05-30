@@ -133,7 +133,36 @@ fn extension_snapshot_changed(
     previous: &ExtensionLayerSnapshotCacheEntry,
     current: &ExtensionLayerSnapshot,
 ) -> bool {
-    previous.surface_rect != current.surface_rect || previous.revision != current.revision
+    extension_snapshot_geometry_changed(previous, current)
+        || extension_snapshot_revision_changed(previous, current)
+}
+
+fn extension_snapshot_geometry_changed(
+    previous: &ExtensionLayerSnapshotCacheEntry,
+    current: &ExtensionLayerSnapshot,
+) -> bool {
+    previous.surface_rect != current.surface_rect
+}
+
+fn extension_snapshot_revision_changed(
+    previous: &ExtensionLayerSnapshotCacheEntry,
+    current: &ExtensionLayerSnapshot,
+) -> bool {
+    previous.revision != current.revision
+}
+
+fn extension_snapshot_needs_previous_cleanup(
+    previous: &ExtensionLayerSnapshotCacheEntry,
+    current: &ExtensionLayerSnapshot,
+) -> bool {
+    // Same-surface revision changes are normal for animated terminal-cell
+    // decorations. When the extension reports precise old/new own damage,
+    // trust that instead of layering on a previous full-snapshot cleanup that
+    // would clear the whole pane and visibly flicker between animation ticks.
+    if extension_snapshot_geometry_changed(previous, current) {
+        return true;
+    }
+    extension_snapshot_revision_changed(previous, current) && current.own_damage.is_none()
 }
 
 pub(super) fn apply_previous_extension_snapshot_damage(
@@ -184,7 +213,9 @@ pub(super) fn previous_extension_snapshot_cleanup_damage(
             || layer_snapshots
                 .iter()
                 .find(|snapshot| snapshot.cache_key(capabilities) == *key)
-                .is_some_and(|snapshot| extension_snapshot_changed(previous, snapshot));
+                .is_some_and(|snapshot| {
+                    extension_snapshot_needs_previous_cleanup(previous, snapshot)
+                });
         if !stale {
             continue;
         }

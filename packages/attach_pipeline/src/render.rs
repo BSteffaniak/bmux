@@ -4724,9 +4724,9 @@ mod tests {
         build_render_ops_output_plan, coalesce_render_damage,
         commit_extension_layer_snapshots_for_surface, execute_pane_content_row_output_plan,
         frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
-        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
-        render_grid_row_segment,
+        previous_extension_snapshot_cleanup_damage, queue_frame_damage_overlay,
+        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -5556,6 +5556,101 @@ mod tests {
         assert!(matches!(committed.emitted_damage, RenderDamage::Regions(_)));
         assert_eq!(committed.full_snapshot_damage, RenderDamage::FullSurface);
         assert_eq!(committed.revision, Some(42));
+    }
+
+    #[test]
+    fn revision_change_with_own_damage_does_not_force_full_snapshot_cleanup() {
+        struct AnimatedDamageExtension {
+            revision: u64,
+            damage: RenderDamage,
+        }
+
+        impl bmux_plugin::AttachRenderExtension for AnimatedDamageExtension {
+            fn name(&self) -> &'static str {
+                "test.animated_damage"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                self.damage.clone()
+            }
+
+            fn render_layer_revision(
+                &self,
+                _surface_id: Uuid,
+                _layer: RenderExtensionLayer,
+            ) -> Option<u64> {
+                Some(self.revision)
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn std::io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let surface_id = Uuid::from_u128(12);
+        let pane_id = Uuid::from_u128(13);
+        let surface_rect = ExtensionRect::new(0, 0, 20, 5);
+        let previous_extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(AnimatedDamageExtension {
+                revision: 1,
+                damage: RenderDamage::FullSurface,
+            });
+        let previous_snapshot = ExtensionLayerSnapshot::build(
+            &previous_extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &FrameDamage::default(),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        commit_extension_layer_snapshots_for_surface(
+            &mut pane_buffers,
+            bmux_plugin::TerminalRenderCapabilities::default(),
+            pane_id,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &[previous_snapshot],
+        );
+
+        let current_extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(AnimatedDamageExtension {
+                revision: 2,
+                damage: RenderDamage::Regions(vec![ExtensionRect::new(2, 1, 4, 1)]),
+            });
+        let current_snapshot = ExtensionLayerSnapshot::build(
+            &current_extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &FrameDamage::default(),
+            DamageCoalescingPolicy::default(),
+        );
+
+        let cleanup_damage = previous_extension_snapshot_cleanup_damage(
+            pane_buffers.get(&pane_id),
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            surface_rect,
+            DamageCoalescingPolicy::default(),
+            bmux_plugin::TerminalRenderCapabilities::default(),
+            &[current_snapshot],
+        );
+
+        assert_eq!(cleanup_damage, RenderDamage::None);
     }
 
     #[test]
