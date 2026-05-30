@@ -582,6 +582,11 @@ async fn typed_list_windows_attach(
         .map_err(|error| typed_client_error(&error))
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ActiveAppearanceForCwdRequest {
+    cwd: String,
+}
+
 /// Pull the theme plugin's retained runtime appearance on attach startup.
 ///
 /// Server-side state forwarders only propagate future state changes to
@@ -590,22 +595,47 @@ async fn typed_list_windows_attach(
 async fn typed_active_runtime_appearance_attach(
     client: &mut StreamingBmuxClient,
 ) -> std::result::Result<RuntimeAppearance, ClientError> {
-    let payload = bmux_codec::to_positional_vec(&()).map_err(|error| ClientError::ServerError {
+    typed_runtime_appearance_service(client, "active-appearance", &()).await
+}
+
+async fn typed_active_runtime_appearance_for_cwd_attach(
+    client: &mut StreamingBmuxClient,
+    cwd: &str,
+) -> std::result::Result<RuntimeAppearance, ClientError> {
+    typed_runtime_appearance_service(
+        client,
+        "active-appearance-for-cwd",
+        &ActiveAppearanceForCwdRequest {
+            cwd: cwd.to_string(),
+        },
+    )
+    .await
+}
+
+async fn typed_runtime_appearance_service<Request>(
+    client: &mut StreamingBmuxClient,
+    operation: &str,
+    request: &Request,
+) -> std::result::Result<RuntimeAppearance, ClientError>
+where
+    Request: serde::Serialize + Sync,
+{
+    let payload = bmux_codec::to_positional_vec(request).map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding active-appearance args: {error}"),
+        message: format!("encoding {operation} args: {error}"),
     })?;
     let response_bytes = client
         .invoke_service_raw(
             "bmux.theme.read",
             InvokeServiceKind::Query,
             "theme-state",
-            "active-appearance",
+            operation,
             payload,
         )
         .await?;
     bmux_codec::from_positional_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding active runtime appearance response: {error}"),
+        message: format!("decoding {operation} response: {error}"),
     })
 }
 
@@ -2682,7 +2712,23 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
         }
         Err(error) => {
-            tracing::warn!(%error, "attach failed to seed runtime appearance from theme plugin");
+            tracing::debug!(%error, "theme plugin active-appearance query unavailable on attach startup");
+            let _ = bmux_plugin::global_event_bus()
+                .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, runtime_appearance.clone());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(cwd_text) = cwd.to_str()
+    {
+        match typed_active_runtime_appearance_for_cwd_attach(&mut client, cwd_text).await {
+            Ok(appearance) => {
+                runtime_appearance = appearance.clone();
+                let _ = bmux_plugin::global_event_bus()
+                    .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+            }
+            Err(error) => {
+                tracing::debug!(%error, cwd = %cwd.display(), "cwd-scoped runtime appearance unavailable on attach startup");
+            }
         }
     }
 
