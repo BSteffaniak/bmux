@@ -38,6 +38,16 @@ fn extension_own_render_damage_for_frame(
     )
 }
 
+// Compatibility boundary for existing damage-oriented extension APIs.
+//
+// Long-term retained-scene rendering should make plugins publish current visual
+// state and let the attach renderer diff old/new retained items. Until that is
+// wired in, `ExtensionLayerSnapshot` keeps the existing contracts explicit:
+// `own_damage` is extension-reported update damage, `render_damage` adds host
+// replay requirements such as content-damage redraws, and previous-snapshot
+// cleanup is reserved for stale/removal/geometry/no-own-damage fallback cases.
+// A revision change alone must not imply stale cleanup; animated decorations
+// change revisions constantly and should use precise own damage when available.
 #[derive(Clone)]
 pub(super) struct ExtensionLayerSnapshot {
     pub(super) extension: Arc<dyn AttachRenderExtension>,

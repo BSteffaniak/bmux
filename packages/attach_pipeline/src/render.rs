@@ -36,6 +36,9 @@ use uuid::Uuid;
 
 #[path = "render/extension_plans.rs"]
 mod extension_plans;
+#[allow(dead_code)] // Retained scene primitives are staged before renderer integration and covered by pure diff tests.
+#[path = "render/extension_retained.rs"]
+mod extension_retained;
 #[path = "render/terminal_graphics.rs"]
 mod terminal_graphics;
 #[path = "render/visible_segments.rs"]

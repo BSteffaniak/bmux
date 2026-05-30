@@ -967,6 +967,19 @@ pub struct TerminalGraphicOverlay {
     pub z_index: i16,
 }
 
+/// Stable renderer-diff key for one declarative retained scene item.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct RenderSceneItemKey(pub String);
+
+impl RenderSceneItemKey {
+    #[must_use]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+}
+
 /// A z-ordered item emitted by a render extension.
 ///
 /// Text/cell items and terminal graphics share one ordering stream so
@@ -976,6 +989,302 @@ pub struct TerminalGraphicOverlay {
 pub enum RenderLayerItem {
     Op(RenderOp),
     Graphic(TerminalGraphicOverlay),
+}
+
+/// Retained declarative scene item for renderer-owned diffing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSceneItem {
+    pub key: RenderSceneItemKey,
+    pub z: i16,
+    pub kind: RenderSceneItemKind,
+}
+
+impl RenderSceneItem {
+    #[must_use]
+    pub fn text(
+        key: impl Into<String>,
+        z: i16,
+        x: u16,
+        y: u16,
+        text: impl Into<String>,
+        style: RenderStyle,
+    ) -> Self {
+        Self {
+            key: RenderSceneItemKey::new(key),
+            z,
+            kind: RenderSceneItemKind::Text {
+                x,
+                y,
+                text: text.into(),
+                style,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn styled_text(
+        key: impl Into<String>,
+        z: i16,
+        x: u16,
+        y: u16,
+        spans: impl Into<Vec<RenderTextSpan>>,
+    ) -> Self {
+        Self {
+            key: RenderSceneItemKey::new(key),
+            z,
+            kind: RenderSceneItemKind::StyledText {
+                x,
+                y,
+                spans: spans.into(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn fill_rect(
+        key: RenderSceneItemKey,
+        z: i16,
+        rect: ExtensionRect,
+        ch: char,
+        style: RenderStyle,
+    ) -> Self {
+        Self {
+            key,
+            z,
+            kind: RenderSceneItemKind::FillRect { rect, ch, style },
+        }
+    }
+
+    #[must_use]
+    pub const fn border(
+        key: RenderSceneItemKey,
+        z: i16,
+        rect: ExtensionRect,
+        glyphs: BorderGlyphs,
+        style: RenderStyle,
+    ) -> Self {
+        Self {
+            key,
+            z,
+            kind: RenderSceneItemKind::Border {
+                rect,
+                glyphs,
+                style,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn cell_grid(
+        key: impl Into<String>,
+        z: i16,
+        x: u16,
+        y: u16,
+        rows: impl Into<Vec<Vec<RenderCell>>>,
+    ) -> Self {
+        Self {
+            key: RenderSceneItemKey::new(key),
+            z,
+            kind: RenderSceneItemKind::CellGrid {
+                x,
+                y,
+                rows: rows.into(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn terminal_graphic(
+        key: RenderSceneItemKey,
+        z: i16,
+        graphic: TerminalGraphicOverlay,
+    ) -> Self {
+        Self {
+            key,
+            z,
+            kind: RenderSceneItemKind::TerminalGraphic { graphic },
+        }
+    }
+
+    #[must_use]
+    pub fn under_cells(
+        key: impl Into<String>,
+        z: i16,
+        cells: impl Into<Vec<(u16, u16, RenderUnderCell)>>,
+    ) -> Self {
+        Self {
+            key: RenderSceneItemKey::new(key),
+            z,
+            kind: RenderSceneItemKind::UnderCells {
+                cells: cells.into(),
+            },
+        }
+    }
+}
+
+/// Retained scene item payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderSceneItemKind {
+    Text {
+        x: u16,
+        y: u16,
+        text: String,
+        style: RenderStyle,
+    },
+    StyledText {
+        x: u16,
+        y: u16,
+        spans: Vec<RenderTextSpan>,
+    },
+    FillRect {
+        rect: ExtensionRect,
+        ch: char,
+        style: RenderStyle,
+    },
+    Border {
+        rect: ExtensionRect,
+        glyphs: BorderGlyphs,
+        style: RenderStyle,
+    },
+    CellGrid {
+        x: u16,
+        y: u16,
+        rows: Vec<Vec<RenderCell>>,
+    },
+    TerminalGraphic {
+        graphic: TerminalGraphicOverlay,
+    },
+    UnderCells {
+        cells: Vec<(u16, u16, RenderUnderCell)>,
+    },
+}
+
+/// Retained visual intent for one extension layer on one surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderLayerScene {
+    pub revision: Option<u64>,
+    pub items: Vec<RenderSceneItem>,
+}
+
+impl RenderLayerScene {
+    #[must_use]
+    pub const fn new(revision: Option<u64>, items: Vec<RenderSceneItem>) -> Self {
+        Self { revision, items }
+    }
+
+    #[must_use]
+    pub const fn builder() -> RenderLayerSceneBuilder {
+        RenderLayerSceneBuilder::new()
+    }
+}
+
+/// Builder for retained layer scenes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RenderLayerSceneBuilder {
+    revision: Option<u64>,
+    items: Vec<RenderSceneItem>,
+}
+
+impl RenderLayerSceneBuilder {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            revision: None,
+            items: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(mut self, revision: u64) -> Self {
+        self.revision = Some(revision);
+        self
+    }
+
+    #[must_use]
+    pub fn item(mut self, item: RenderSceneItem) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    #[must_use]
+    pub fn text(
+        self,
+        key: impl Into<String>,
+        z: i16,
+        x: u16,
+        y: u16,
+        text: impl Into<String>,
+        style: RenderStyle,
+    ) -> Self {
+        self.item(RenderSceneItem::text(key, z, x, y, text, style))
+    }
+
+    #[must_use]
+    pub fn fill_rect(
+        self,
+        key: impl Into<String>,
+        z: i16,
+        rect: ExtensionRect,
+        ch: char,
+        style: RenderStyle,
+    ) -> Self {
+        self.item(RenderSceneItem::fill_rect(
+            RenderSceneItemKey::new(key),
+            z,
+            rect,
+            ch,
+            style,
+        ))
+    }
+
+    #[must_use]
+    pub fn border(
+        self,
+        key: impl Into<String>,
+        z: i16,
+        rect: ExtensionRect,
+        glyphs: BorderGlyphs,
+        style: RenderStyle,
+    ) -> Self {
+        self.item(RenderSceneItem::border(
+            RenderSceneItemKey::new(key),
+            z,
+            rect,
+            glyphs,
+            style,
+        ))
+    }
+
+    #[must_use]
+    pub fn cell_grid(
+        self,
+        key: impl Into<String>,
+        z: i16,
+        x: u16,
+        y: u16,
+        rows: impl Into<Vec<Vec<RenderCell>>>,
+    ) -> Self {
+        self.item(RenderSceneItem::cell_grid(key, z, x, y, rows))
+    }
+
+    #[must_use]
+    pub fn terminal_graphic(
+        self,
+        key: impl Into<String>,
+        z: i16,
+        graphic: TerminalGraphicOverlay,
+    ) -> Self {
+        self.item(RenderSceneItem::terminal_graphic(
+            RenderSceneItemKey::new(key),
+            z,
+            graphic,
+        ))
+    }
+
+    #[must_use]
+    pub fn build(self) -> RenderLayerScene {
+        RenderLayerScene::new(self.revision, self.items)
+    }
 }
 
 /// Context supplied to render extensions for one render pass.
@@ -1141,6 +1450,23 @@ pub trait AttachRenderExtension: Send + Sync {
         _surface_rect: &ExtensionRect,
         _damage: &RenderDamage,
     ) -> Option<Vec<RenderOp>> {
+        None
+    }
+
+    /// Return retained declarative visual intent for one layer.
+    ///
+    /// Implementations that return a scene let the host renderer own diffing,
+    /// stale cleanup, content replay, z-ordering, terminal graphics lifecycle,
+    /// and byte emission. The default returns `None` so existing damage-oriented
+    /// extension APIs remain the compatibility fallback.
+    fn render_layer_scene_with_context(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Option<RenderLayerScene> {
+        let _ = (surface_id, surface_rect, layer, context);
         None
     }
 
@@ -1520,6 +1846,74 @@ mod tests {
         );
         assert!(matches!(ops[2], RenderOp::StyledText { .. }));
         assert!(matches!(ops[3], RenderOp::CellGrid { .. }));
+    }
+
+    #[test]
+    fn render_layer_scene_builder_creates_keyed_retained_items() {
+        let scene = RenderLayerScene::builder()
+            .revision(7)
+            .text("header", 2, 1, 0, "HEAD", RenderStyle::new().bold())
+            .fill_rect(
+                "background",
+                0,
+                ExtensionRect::new(0, 0, 10, 1),
+                ' ',
+                RenderStyle::new(),
+            )
+            .border(
+                "border",
+                1,
+                ExtensionRect::new(0, 0, 10, 3),
+                BorderGlyphs::rounded(),
+                RenderStyle::new(),
+            )
+            .cell_grid(
+                "grid",
+                3,
+                0,
+                1,
+                vec![vec![RenderCell::new('x', RenderStyle::new())]],
+            )
+            .build();
+
+        assert_eq!(scene.revision, Some(7));
+        assert_eq!(scene.items.len(), 4);
+        assert_eq!(scene.items[0].key, RenderSceneItemKey::new("header"));
+        assert!(matches!(
+            scene.items[0].kind,
+            RenderSceneItemKind::Text { .. }
+        ));
+        assert!(matches!(
+            scene.items[1].kind,
+            RenderSceneItemKind::FillRect { .. }
+        ));
+        assert!(matches!(
+            scene.items[2].kind,
+            RenderSceneItemKind::Border { .. }
+        ));
+        assert!(matches!(
+            scene.items[3].kind,
+            RenderSceneItemKind::CellGrid { .. }
+        ));
+    }
+
+    #[test]
+    fn render_extension_retained_scene_default_uses_fallback_path() {
+        let ext = RecordingExtension {
+            name: "x".to_string(),
+            applied: Mutex::new(Vec::new()),
+            removed: Mutex::new(Vec::new()),
+        };
+
+        assert!(
+            ext.render_layer_scene_with_context(
+                Uuid::nil(),
+                &ExtensionRect::new(0, 0, 10, 3),
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -53,6 +53,23 @@ pub struct ExtensionLayerSnapshotCacheEntry {
     pub revision: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionRetainedItemCacheEntry {
+    pub key: String,
+    pub z: i16,
+    pub bounds: ExtensionRect,
+    pub content_fingerprint: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionRetainedLayerCacheEntry {
+    pub surface_id: Uuid,
+    pub surface_rect: ExtensionRect,
+    pub layer: RenderExtensionLayer,
+    pub revision: Option<u64>,
+    pub items: Vec<ExtensionRetainedItemCacheEntry>,
+}
+
 pub struct PaneRenderBuffer {
     pub terminal_grid: TerminalGridStream,
     pub protocol_tracker: TerminalProtocolTracker,
@@ -62,6 +79,7 @@ pub struct PaneRenderBuffer {
     pub scrollback_window: Option<PaneScrollbackWindow>,
     pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
     pub extension_layer_snapshot_cache: BTreeMap<(String, Uuid), ExtensionLayerSnapshotCacheEntry>,
+    pub extension_retained_layer_cache: BTreeMap<(String, Uuid), ExtensionRetainedLayerCacheEntry>,
     pub visual_row_fingerprints: PaneVisualRowFingerprintCache,
 }
 
@@ -194,6 +212,7 @@ impl Default for PaneRenderBuffer {
             scrollback_window: None,
             extension_render_cache: BTreeMap::new(),
             extension_layer_snapshot_cache: BTreeMap::new(),
+            extension_retained_layer_cache: BTreeMap::new(),
             visual_row_fingerprints: PaneVisualRowFingerprintCache::default(),
         }
     }
