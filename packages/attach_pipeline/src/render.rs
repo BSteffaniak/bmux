@@ -41,15 +41,17 @@ mod terminal_graphics;
 #[path = "render/visible_segments.rs"]
 mod visible_segments;
 
-#[cfg(test)]
-use extension_plans::build_before_content_extension_output_plan;
 use extension_plans::{
     AfterContentExtensionOutputAction, AfterContentExtensionOutputPlan,
-    BeforeContentExtensionOutputAction, BeforeContentExtensionOutputPlan,
-    BeforeContentSurfaceOutputPlan, ExtensionLayerSnapshot,
-    apply_previous_extension_snapshot_damage, build_after_content_extension_output_plan,
+    AfterContentSurfaceOutputPlan, BeforeContentExtensionOutputAction,
+    BeforeContentExtensionOutputPlan, BeforeContentSurfaceOutputPlan, ExtensionLayerSnapshot,
+    apply_previous_extension_snapshot_damage, build_after_content_surface_output_plan,
     build_before_content_surface_output_plan, commit_extension_layer_snapshots_for_surface,
     extension_layer_snapshots_for_surface, previous_extension_snapshot_cleanup_damage,
+};
+#[cfg(test)]
+use extension_plans::{
+    build_after_content_extension_output_plan, build_before_content_extension_output_plan,
 };
 use terminal_graphics::{
     TerminalGraphicsFrameResources, begin_terminal_graphics_frame, finish_terminal_graphics_frame,
@@ -3455,10 +3457,9 @@ fn queue_before_content_render_items<W: io::Write>(
 }
 
 #[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
-fn queue_after_content_extensions_for_surface<W: io::Write>(
+fn execute_after_content_surface_output_plan<W: io::Write>(
     stdout: &mut W,
-    surface_index: usize,
-    layer_snapshots: &[ExtensionLayerSnapshot],
+    plan: &AfterContentSurfaceOutputPlan,
     render_context: &RenderExtensionContext,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
@@ -3466,22 +3467,11 @@ fn queue_after_content_extensions_for_surface<W: io::Write>(
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) -> Result<()> {
-    // Consult the stable per-frame snapshots for this surface. Extension-owned
-    // damage is captured separately from content-redraw replay so cleanup and
-    // byte emission can share the same layer view without re-querying damage.
-    for snapshot in layer_snapshots {
-        let Some(plan) = build_after_content_extension_output_plan(
-            surface_index,
-            snapshot,
-            render_context,
-            pane_buffers,
-        ) else {
-            continue;
-        };
-        record_after_content_extension_output_plan(&plan, render_stats, render_trace);
+    for extension_plan in &plan.plans {
+        record_after_content_extension_output_plan(extension_plan, render_stats, render_trace);
         execute_after_content_extension_output_plan(
             stdout,
-            &plan,
+            extension_plan,
             render_context,
             pane_buffers,
             terminal_graphics_cache,
@@ -3778,6 +3768,7 @@ struct SurfaceOutputPlan<'a> {
     before_content_snapshots: Vec<ExtensionLayerSnapshot>,
     before_content_output_plan: BeforeContentSurfaceOutputPlan,
     after_content_snapshots: Vec<ExtensionLayerSnapshot>,
+    after_content_output_plan: AfterContentSurfaceOutputPlan,
     scrollback_active: bool,
     scrollback_offset: usize,
     scrollback_cursor: Option<AttachScrollbackCursor>,
@@ -3980,6 +3971,12 @@ fn build_surface_output_plan<'a>(
         render_context,
     );
     let before_content_damage = before_content_output_plan.damage_rects.clone();
+    let after_content_output_plan = build_after_content_surface_output_plan(
+        surface_index,
+        &after_content_snapshots,
+        render_context,
+        pane_buffers,
+    );
     let after_content_cleanup = after_content_cleanup_plan_for_surface(
         pane_buffers.get(&pane_id),
         surface.id,
@@ -4030,6 +4027,7 @@ fn build_surface_output_plan<'a>(
         before_content_snapshots,
         before_content_output_plan,
         after_content_snapshots,
+        after_content_output_plan,
         scrollback_active,
         scrollback_offset,
         scrollback_cursor,
@@ -4191,10 +4189,9 @@ fn execute_surface_output_plan<W: io::Write>(
                 )?;
             }
             SurfaceOutputStage::AfterContent => {
-                queue_after_content_extensions_for_surface(
+                execute_after_content_surface_output_plan(
                     stdout,
-                    plan.surface_index,
-                    &plan.after_content_snapshots,
+                    &plan.after_content_output_plan,
                     render_context,
                     pane_buffers,
                     terminal_graphics_cache,
@@ -4716,8 +4713,8 @@ fn render_attach_scene_inner<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AfterContentCleanupPlan, AfterContentExtensionOutputAction, AttachLayer,
-        AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
+        AfterContentCleanupPlan, AfterContentExtensionOutputAction, AfterContentSurfaceOutputPlan,
+        AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
         BeforeContentExtensionOutputAction, BeforeContentSurfaceOutputPlan, DamageCoalescingPolicy,
         DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext,
         PaneContentDamagePlan, PaneContentRowOutputPlan, PaneContentRowSegmentOutput,
@@ -5220,6 +5217,7 @@ mod tests {
                 damage_rects: vec![DamageRect::new(0, 0, 1, 1)],
             },
             after_content_snapshots: Vec::new(),
+            after_content_output_plan: AfterContentSurfaceOutputPlan { plans: Vec::new() },
             scrollback_active: false,
             scrollback_offset: 0,
             scrollback_cursor: None,

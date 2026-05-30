@@ -356,6 +356,10 @@ fn before_content_damage_rects(damage: &RenderDamage, content: PaneRect) -> Vec<
     }
 }
 
+pub(super) struct AfterContentSurfaceOutputPlan {
+    pub(super) plans: Vec<AfterContentExtensionOutputPlan>,
+}
+
 #[derive(Clone)]
 pub(super) struct AfterContentExtensionOutputPlan {
     pub(super) surface_index: usize,
@@ -370,6 +374,26 @@ pub(super) enum AfterContentExtensionOutputAction {
     RenderItems { items: Vec<RenderLayerItem> },
     RenderOps { output_plan: RenderOpsOutputPlan },
     Imperative,
+}
+
+pub(super) fn build_after_content_surface_output_plan(
+    surface_index: usize,
+    layer_snapshots: &[ExtensionLayerSnapshot],
+    render_context: &RenderExtensionContext,
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+) -> AfterContentSurfaceOutputPlan {
+    let plans = layer_snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            build_after_content_extension_output_plan(
+                surface_index,
+                snapshot,
+                render_context,
+                pane_buffers,
+            )
+        })
+        .collect();
+    AfterContentSurfaceOutputPlan { plans }
 }
 
 pub(super) fn build_after_content_extension_output_plan(
