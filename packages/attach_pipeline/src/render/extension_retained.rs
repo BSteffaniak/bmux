@@ -376,6 +376,12 @@ fn retained_item_kind_from_plugin_kind(kind: &PluginRenderSceneItemKind) -> Rend
     }
 }
 
+fn retained_graphic_key_from_item_key(key: &RenderSceneItemKey) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
 fn retained_scene_item_to_render_item(item: &RenderSceneItem) -> Option<RenderLayerItem> {
     match &item.kind {
         RenderSceneItemKind::Text { x, y, text, style } => {
@@ -417,7 +423,9 @@ fn retained_scene_item_to_render_item(item: &RenderSceneItem) -> Option<RenderLa
             }))
         }
         RenderSceneItemKind::TerminalGraphic { graphic } => {
-            Some(RenderLayerItem::Graphic(graphic.clone()))
+            let mut graphic = graphic.clone();
+            graphic.key = retained_graphic_key_from_item_key(&item.key);
+            Some(RenderLayerItem::Graphic(graphic))
         }
         RenderSceneItemKind::UnderCells { .. } => None,
     }
@@ -723,12 +731,23 @@ fn retained_item_content_fingerprint(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     z.hash(&mut hasher);
     hash_rect(&mut hasher, bounds);
-    hash_debug(&mut hasher, kind);
+    hash_retained_item_kind(&mut hasher, kind);
     hasher.finish()
 }
 
-fn hash_debug(hasher: &mut impl Hasher, value: &impl std::fmt::Debug) {
-    format!("{value:?}").hash(hasher);
+fn hash_retained_item_kind(hasher: &mut impl Hasher, kind: &RenderSceneItemKind) {
+    match kind {
+        RenderSceneItemKind::TerminalGraphic { graphic } => {
+            "terminal_graphic".hash(hasher);
+            hash_rect(hasher, graphic.cell_rect);
+            graphic.pixel_width.hash(hasher);
+            graphic.pixel_height.hash(hasher);
+            graphic.color.hash(hasher);
+            graphic.fill.hash(hasher);
+            graphic.z_index.hash(hasher);
+        }
+        _ => format!("{kind:?}").hash(hasher),
+    }
 }
 
 fn hash_rect(hasher: &mut impl Hasher, rect: ExtensionRect) {

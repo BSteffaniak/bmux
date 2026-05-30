@@ -452,10 +452,6 @@ fn build_retained_before_content_extension_output_plan(
         policy,
     );
     let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
-    let should_execute = !output_damage.is_none() || previous_snapshot.is_none();
-    if !should_execute {
-        return None;
-    }
     Some(BeforeContentExtensionOutputPlan {
         snapshot: snapshot.clone(),
         cache_key: Some(retained_cache_key),
@@ -661,12 +657,6 @@ fn build_retained_after_content_extension_output_plan(
         policy,
     );
     let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
-    let should_execute = !output_damage.is_none()
-        || !diff_plan.stale_cleanup_damage.is_none()
-        || previous_snapshot.is_none();
-    if !should_execute {
-        return None;
-    }
     Some(AfterContentExtensionOutputPlan {
         surface_index,
         snapshot: snapshot.clone(),

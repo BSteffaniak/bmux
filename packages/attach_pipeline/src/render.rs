@@ -3583,8 +3583,12 @@ fn record_after_content_extension_output_plan(
         stats.record_extension_render_call(ext_name, damage);
     }
     match &plan.action {
-        AfterContentExtensionOutputAction::RetainedScene { output_items, .. } => {
-            if !output_items.is_empty() {
+        AfterContentExtensionOutputAction::RetainedScene {
+            output_damage,
+            output_items,
+            ..
+        } => {
+            if !output_damage.is_none() && !output_items.is_empty() {
                 record_after_content_extension_ops(plan, render_stats, render_trace);
             }
         }
@@ -3761,7 +3765,7 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
 fn execute_retained_after_content_extension_output_plan<W: io::Write>(
     stdout: &mut W,
     plan: &AfterContentExtensionOutputPlan,
-    _diff_plan: &ExtensionLayerDiffPlan,
+    diff_plan: &ExtensionLayerDiffPlan,
     retained_snapshot: &ExtensionRetainedLayerSnapshot,
     output_damage: &RenderDamage,
     output_items: &[RenderLayerItem],
@@ -3771,8 +3775,7 @@ fn execute_retained_after_content_extension_output_plan<W: io::Write>(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
 ) {
     let snapshot = &plan.snapshot;
-    if !output_damage.is_none()
-        && !output_items.is_empty()
+    if (!output_damage.is_none() || !diff_plan.stale_cleanup_damage.is_none())
         && let Err(err) = queue_render_items_for_frame(
             stdout,
             snapshot.pane_id,
@@ -6548,6 +6551,197 @@ mod tests {
             fill: TerminalGraphicFill::Top { thickness_px: 3 },
             z_index: 8,
         }
+    }
+
+    #[cfg(feature = "image-kitty")]
+    struct RetainedGraphicExtension {
+        state: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "image-kitty")]
+    impl bmux_plugin::AttachRenderExtension for RetainedGraphicExtension {
+        fn name(&self) -> &'static str {
+            "test.retained_graphic"
+        }
+
+        fn surface_layer_damage(
+            &self,
+            _surface_id: Uuid,
+            _surface_rect: &ExtensionRect,
+            layer: RenderExtensionLayer,
+        ) -> RenderDamage {
+            match layer {
+                RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                RenderExtensionLayer::AfterPaneContent => RenderDamage::FullSurface,
+            }
+        }
+
+        fn render_layer_scene_with_context(
+            &self,
+            _surface_id: Uuid,
+            _surface_rect: &ExtensionRect,
+            layer: RenderExtensionLayer,
+            _context: &RenderExtensionContext,
+        ) -> Option<bmux_plugin::RenderLayerScene> {
+            if layer != RenderExtensionLayer::AfterPaneContent {
+                return None;
+            }
+            let state = self.state.load(std::sync::atomic::Ordering::Relaxed);
+            let builder = bmux_plugin::RenderLayerScene::builder()
+                .revision(u64::try_from(state).unwrap_or(u64::MAX));
+            if state == 2 {
+                return Some(builder.build());
+            }
+            let mut graphic = test_graphic_overlay(if state == 3 { 4 } else { 2 });
+            graphic.key = if state == 1 { 999 } else { 42 };
+            Some(
+                builder
+                    .terminal_graphic("semantic-border", -1, graphic)
+                    .build(),
+            )
+        }
+
+        fn render_surface(
+            &self,
+            _stdout: &mut dyn std::io::Write,
+            _surface_id: Uuid,
+            _surface_rect: &ExtensionRect,
+            _damage: &RenderDamage,
+        ) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[cfg(feature = "image-kitty")]
+    fn render_retained_graphic_frame(
+        state: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        cache: &mut TerminalGraphicsCache,
+        pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+        frame_damage: &FrameDamage,
+    ) -> (String, AttachSceneRenderStats) {
+        let pane_id = Uuid::from_u128(7_777);
+        let scene = single_pane_scene(pane_id, 10, 4);
+        let extensions: Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>> =
+            vec![std::sync::Arc::new(RetainedGraphicExtension {
+                state: state.clone(),
+            })
+                as std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>];
+        let mut output = Vec::new();
+        let (_cursor, frame_stats) = render_attach_scene_with_stats_and_trace_with_capabilities(
+            &mut output,
+            &scene,
+            &[],
+            pane_buffers,
+            cache,
+            frame_damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (10, 4),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+            test_kitty_capabilities(),
+            None,
+        )
+        .expect("retained graphic frame should render");
+        (
+            String::from_utf8(output).expect("kitty output should be utf8"),
+            frame_stats,
+        )
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn retained_graphic_uses_scene_key_and_unchanged_graphic_does_not_delete_or_retransmit() {
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TerminalGraphicsCache::new();
+        let pane_id = Uuid::from_u128(7_777);
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        let (initial, initial_stats) = render_retained_graphic_frame(
+            &state,
+            &mut cache,
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+        );
+        assert!(initial.contains("Ga=t,"), "{initial:?}");
+        assert_eq!(initial_stats.terminal_graphic_transmits, 1);
+        assert_eq!(initial_stats.terminal_graphic_places, 1);
+
+        state.store(1, std::sync::atomic::Ordering::Relaxed);
+        let (unchanged, unchanged_stats) = render_retained_graphic_frame(
+            &state,
+            &mut cache,
+            &mut pane_buffers,
+            &FrameDamage::default(),
+        );
+        assert!(!unchanged.contains("Ga=d,"), "{unchanged:?}");
+        assert!(!unchanged.contains("Ga=t,"), "{unchanged:?}");
+        assert!(!unchanged.contains("Ga=p,"), "{unchanged:?}");
+        assert_eq!(unchanged_stats.terminal_graphic_transmits, 0);
+        assert_eq!(unchanged_stats.terminal_graphic_places, 0);
+        assert_eq!(unchanged_stats.terminal_graphic_deletes, 0);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn retained_graphic_removed_deletes_stale_placement_and_source() {
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TerminalGraphicsCache::new();
+        let pane_id = Uuid::from_u128(7_777);
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        let _ = render_retained_graphic_frame(
+            &state,
+            &mut cache,
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+        );
+
+        state.store(2, std::sync::atomic::Ordering::Relaxed);
+        let (removed, removed_stats) = render_retained_graphic_frame(
+            &state,
+            &mut cache,
+            &mut pane_buffers,
+            &FrameDamage::default(),
+        );
+        assert!(removed.contains("Ga=d,d=p,"), "{removed:?}");
+        assert!(removed.contains("Ga=d,d=i,"), "{removed:?}");
+        assert_eq!(removed_stats.terminal_graphic_deletes, 1);
+        assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn retained_graphic_geometry_change_places_without_source_delete() {
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TerminalGraphicsCache::new();
+        let pane_id = Uuid::from_u128(7_777);
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        let _ = render_retained_graphic_frame(
+            &state,
+            &mut cache,
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+        );
+
+        state.store(3, std::sync::atomic::Ordering::Relaxed);
+        let (moved, moved_stats) = render_retained_graphic_frame(
+            &state,
+            &mut cache,
+            &mut pane_buffers,
+            &FrameDamage::default(),
+        );
+        assert!(!moved.contains("Ga=d,"), "{moved:?}");
+        assert!(!moved.contains("Ga=t,"), "{moved:?}");
+        assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
+        assert_eq!(moved_stats.terminal_graphic_transmits, 0);
+        assert_eq!(moved_stats.terminal_graphic_places, 1);
+        assert_eq!(moved_stats.terminal_graphic_deletes, 0);
     }
 
     #[cfg(feature = "image-kitty")]
