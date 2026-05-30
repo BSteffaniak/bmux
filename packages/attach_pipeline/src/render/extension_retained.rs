@@ -376,7 +376,7 @@ fn retained_item_kind_from_plugin_kind(kind: &PluginRenderSceneItemKind) -> Rend
     }
 }
 
-fn retained_graphic_key_from_item_key(key: &RenderSceneItemKey) -> u64 {
+pub(super) fn retained_graphic_key_from_item_key(key: &RenderSceneItemKey) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish().max(1)

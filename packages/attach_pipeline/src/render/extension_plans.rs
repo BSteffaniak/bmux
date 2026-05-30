@@ -356,6 +356,7 @@ pub(super) struct BeforeContentExtensionOutputPlan {
 #[derive(Clone)]
 pub(super) enum BeforeContentExtensionOutputAction {
     RetainedScene {
+        diff_plan: Box<ExtensionLayerDiffPlan>,
         snapshot: ExtensionRetainedLayerSnapshot,
         output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
@@ -457,6 +458,7 @@ fn build_retained_before_content_extension_output_plan(
         cache_key: Some(retained_cache_key),
         damage_rects: before_content_damage_rects(&output_damage, content),
         action: BeforeContentExtensionOutputAction::RetainedScene {
+            diff_plan: Box::new(diff_plan),
             snapshot: retained_snapshot,
             output_damage,
             output_items,

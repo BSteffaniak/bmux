@@ -475,7 +475,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             layer,
             context.capabilities,
             scene_capabilities,
-        )?;
+        );
         cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
         Some(scene)
     }
@@ -1406,47 +1406,53 @@ fn render_scene_for_surface_layer_with_capabilities(
     layer: RenderExtensionLayer,
     terminal_capabilities: TerminalRenderCapabilities,
     scene_capabilities: SceneRenderCapabilities,
-) -> Option<RenderLayerScene> {
+) -> RenderLayerScene {
     let commands = layer_paint_commands(surface, layer);
     let mut ordered: Vec<(usize, &PaintCommand)> = commands.iter().enumerate().collect();
     ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
 
+    let layer_key_prefix = match layer {
+        RenderExtensionLayer::BeforePaneContent => "before",
+        RenderExtensionLayer::AfterPaneContent => "after",
+    };
+    let context = RenderSceneCommandContext {
+        surface_id,
+        commands,
+        layer_key_prefix,
+        terminal_capabilities,
+        scene_capabilities,
+    };
     let mut items = Vec::new();
     for (command_index, command) in ordered {
-        push_render_scene_items_for_command(
-            &mut items,
-            surface_id,
-            commands,
-            command_index,
-            command,
-            terminal_capabilities,
-            scene_capabilities,
-        )?;
+        push_render_scene_items_for_command(&mut items, context, command_index, command);
     }
-    Some(RenderLayerScene::new(
-        Some(surface_layer_revision(surface, layer)),
-        items,
-    ))
+    RenderLayerScene::new(Some(surface_layer_revision(surface, layer)), items)
+}
+
+#[derive(Clone, Copy)]
+struct RenderSceneCommandContext<'a> {
+    surface_id: Uuid,
+    commands: &'a [PaintCommand],
+    layer_key_prefix: &'a str,
+    terminal_capabilities: TerminalRenderCapabilities,
+    scene_capabilities: SceneRenderCapabilities,
 }
 
 fn push_render_scene_items_for_command(
     items: &mut Vec<RenderSceneItem>,
-    surface_id: Uuid,
-    commands: &[PaintCommand],
+    context: RenderSceneCommandContext<'_>,
     command_index: usize,
     command: &PaintCommand,
-    terminal_capabilities: TerminalRenderCapabilities,
-    scene_capabilities: SceneRenderCapabilities,
-) -> Option<()> {
+) {
     let z = paint_command_z(command);
-    let key_prefix = format!("cmd-{command_index:06}");
-    let occluders = terminal_cell_occluders_after(commands, command_index, command);
+    let key_prefix = format!("{}:cmd-{command_index:06}", context.layer_key_prefix);
+    let occluders = terminal_cell_occluders_after(context.commands, command_index, command);
     if let Some(graphics) = raster_border::semantic_border_graphic_items_with_occlusion(
-        surface_id,
+        context.surface_id,
         u64::try_from(command_index).unwrap_or(u64::MAX),
         command,
-        terminal_capabilities,
-        scene_capabilities,
+        context.terminal_capabilities,
+        context.scene_capabilities,
         &occluders,
     ) {
         for (graphic_index, item) in graphics.into_iter().enumerate() {
@@ -1459,11 +1465,18 @@ fn push_render_scene_items_for_command(
                 graphic,
             ));
         }
-        return Some(());
+        return;
     }
 
     let mut ops = Vec::new();
-    push_render_ops_for_command_with_occluders(&mut ops, command, scene_capabilities, &occluders)?;
+    let Some(()) = push_render_ops_for_command_with_occluders(
+        &mut ops,
+        command,
+        context.scene_capabilities,
+        &occluders,
+    ) else {
+        return;
+    };
     for (op_index, op) in ops.into_iter().enumerate() {
         items.push(render_scene_item_from_op(
             format!("{key_prefix}:op-{op_index:02}"),
@@ -1471,7 +1484,6 @@ fn push_render_scene_items_for_command(
             op,
         ));
     }
-    Some(())
 }
 
 fn render_scene_item_from_op(key: String, z: i16, op: RenderOp) -> RenderSceneItem {
@@ -2703,6 +2715,57 @@ mod tests {
                 radius_px: 0,
                 when: None,
             }],
+        );
+        let scene = extension
+            .render_layer_scene_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 10),
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext {
+                    capabilities: kitty_capabilities(),
+                },
+            )
+            .expect("retained scene should be available");
+
+        assert_eq!(scene.items.len(), 4);
+        assert!(scene.items.iter().all(|item| matches!(
+            item.kind,
+            bmux_plugin::RenderSceneItemKind::TerminalGraphic { .. }
+        )));
+    }
+
+    #[test]
+    fn retained_scene_keeps_supported_items_when_one_command_cannot_lower() {
+        let surface_id = Uuid::from_u128(205);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![
+                PaintCommand::FilledRect {
+                    rect: SceneRect {
+                        x: 1,
+                        y: 1,
+                        w: 2,
+                        h: 1,
+                    },
+                    z: 0,
+                    glyph: "表".to_string(),
+                    style: scene_style(),
+                },
+                PaintCommand::SemanticBorder {
+                    rect: SceneRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 10,
+                    },
+                    z: 1,
+                    style: scene_style(),
+                    fallback_glyphs: SceneBorderGlyphs::Rounded,
+                    thickness_px: 2,
+                    radius_px: 0,
+                    when: None,
+                },
+            ],
         );
         let scene = extension
             .render_layer_scene_with_context(

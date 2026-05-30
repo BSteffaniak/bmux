@@ -58,7 +58,8 @@ use extension_plans::{
 };
 use extension_retained::{
     ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, RenderSceneItemKind,
-    commit_retained_layer_snapshot,
+    commit_retained_layer_snapshot, retained_graphic_key_from_item_key,
+    retained_scene_items_to_render_items,
 };
 use terminal_graphics::{
     TerminalGraphicsFrameResources, begin_terminal_graphics_frame, finish_terminal_graphics_frame,
@@ -310,15 +311,46 @@ fn queue_render_items_for_frame<W: io::Write>(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
     capabilities: TerminalRenderCapabilities,
 ) -> Result<bool> {
-    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
-    let mut wrote = terminal_graphics.cleanup_stale_for_surface(
+    queue_render_items_for_frame_with_cleanup(
         stdout,
         pane_id,
         surface_id,
-        &current_graphics,
+        surface_rect,
+        damage,
+        items,
         graphics_cache,
+        terminal_graphics,
         capabilities,
-    )?;
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit hot-path render state keeps call sites allocation-free.
+fn queue_render_items_for_frame_with_cleanup<W: io::Write>(
+    stdout: &mut W,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    items: &[RenderLayerItem],
+    graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+    capabilities: TerminalRenderCapabilities,
+    cleanup_surface_graphics: bool,
+) -> Result<bool> {
+    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
+    let mut wrote = if cleanup_surface_graphics {
+        terminal_graphics.cleanup_stale_for_surface(
+            stdout,
+            pane_id,
+            surface_id,
+            &current_graphics,
+            graphics_cache,
+            capabilities,
+        )?
+    } else {
+        false
+    };
     terminal_graphics.activate_graphics(current_graphics);
     let mut pending_ops = Vec::new();
     for item in items {
@@ -3385,20 +3417,37 @@ fn execute_before_content_extension_output_plan<W: io::Write>(
 ) -> Result<()> {
     match &plan.action {
         BeforeContentExtensionOutputAction::RetainedScene {
+            diff_plan,
             snapshot: retained_snapshot,
             output_damage,
             output_items,
         } => {
-            let ops = queue_before_content_render_items(
+            cleanup_removed_retained_terminal_graphics(
+                stdout,
+                (plan.snapshot.pane_id, plan.snapshot.surface_id),
+                diff_plan,
+                retained_snapshot,
+                terminal_graphics_cache,
+                terminal_graphics,
+                render_context.capabilities,
+            )?;
+            let retained_items = retained_scene_items_to_render_items(&retained_snapshot.items);
+            let render_items = if retained_items.is_empty() {
+                output_items.as_slice()
+            } else {
+                retained_items.as_slice()
+            };
+            let ops = queue_before_content_render_items_with_cleanup(
                 stdout,
                 plan.snapshot.pane_id,
                 plan.snapshot.surface_id,
                 plan.snapshot.surface_rect,
                 output_damage,
-                output_items,
+                render_items,
                 terminal_graphics_cache,
                 terminal_graphics,
                 render_context.capabilities,
+                false,
             )?;
             insert_before_content_cells(
                 cells,
@@ -3503,15 +3552,44 @@ fn queue_before_content_render_items<W: io::Write>(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
     capabilities: TerminalRenderCapabilities,
 ) -> Result<Vec<RenderOp>> {
-    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
-    terminal_graphics.cleanup_stale_for_surface(
+    queue_before_content_render_items_with_cleanup(
         stdout,
         pane_id,
         surface_id,
-        &current_graphics,
+        surface_rect,
+        damage,
+        items,
         graphics_cache,
+        terminal_graphics,
         capabilities,
-    )?;
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Terminal graphic reconciliation needs frame-local cache state.
+fn queue_before_content_render_items_with_cleanup<W: io::Write>(
+    stdout: &mut W,
+    pane_id: Uuid,
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    items: &[RenderLayerItem],
+    graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+    capabilities: TerminalRenderCapabilities,
+    cleanup_surface_graphics: bool,
+) -> Result<Vec<RenderOp>> {
+    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
+    if cleanup_surface_graphics {
+        terminal_graphics.cleanup_stale_for_surface(
+            stdout,
+            pane_id,
+            surface_id,
+            &current_graphics,
+            graphics_cache,
+            capabilities,
+        )?;
+    }
     terminal_graphics.activate_graphics(current_graphics);
 
     let mut ops = Vec::new();
@@ -3775,17 +3853,40 @@ fn execute_retained_after_content_extension_output_plan<W: io::Write>(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
 ) {
     let snapshot = &plan.snapshot;
+    if let Err(err) = cleanup_removed_retained_terminal_graphics(
+        stdout,
+        (snapshot.pane_id, snapshot.surface_id),
+        diff_plan,
+        retained_snapshot,
+        terminal_graphics_cache,
+        terminal_graphics,
+        render_context.capabilities,
+    ) {
+        tracing::warn!(
+            extension = snapshot.extension.name(),
+            surface_id = %snapshot.surface_id,
+            error = %err,
+            "retained render extension stale graphic cleanup failed",
+        );
+    }
+    let retained_items = retained_scene_items_to_render_items(&retained_snapshot.items);
+    let render_items = if retained_items.is_empty() {
+        output_items
+    } else {
+        retained_items.as_slice()
+    };
     if (!output_damage.is_none() || !diff_plan.stale_cleanup_damage.is_none())
-        && let Err(err) = queue_render_items_for_frame(
+        && let Err(err) = queue_render_items_for_frame_with_cleanup(
             stdout,
             snapshot.pane_id,
             snapshot.surface_id,
             snapshot.surface_rect,
             output_damage,
-            output_items,
+            render_items,
             terminal_graphics_cache,
             terminal_graphics,
             render_context.capabilities,
+            false,
         )
     {
         tracing::warn!(
@@ -3803,6 +3904,43 @@ fn execute_retained_after_content_extension_output_plan<W: io::Write>(
         snapshot.layer,
         retained_snapshot,
     );
+}
+
+fn cleanup_removed_retained_terminal_graphics<W: io::Write>(
+    stdout: &mut W,
+    surface_identity: (Uuid, Uuid),
+    diff_plan: &ExtensionLayerDiffPlan,
+    retained_snapshot: &ExtensionRetainedLayerSnapshot,
+    graphics_cache: &mut TerminalGraphicsCache,
+    terminal_graphics: &mut TerminalGraphicsFrameResources,
+    capabilities: TerminalRenderCapabilities,
+) -> Result<bool> {
+    if diff_plan.removed_items.is_empty() || !terminal_graphic_can_render(capabilities) {
+        return Ok(false);
+    }
+    let current_keys = retained_snapshot
+        .items
+        .iter()
+        .map(|item| item.key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut active = graphics_cache.keys().copied().collect::<BTreeSet<_>>();
+    for key in &diff_plan.removed_items {
+        if current_keys.contains(key) {
+            continue;
+        }
+        active.remove(&terminal_graphic_instance_key(
+            surface_identity.0,
+            surface_identity.1,
+            retained_graphic_key_from_item_key(key),
+        ));
+    }
+    cleanup_stale_terminal_graphics(
+        stdout,
+        &active,
+        graphics_cache,
+        capabilities,
+        Some(&mut terminal_graphics.stats),
+    )
 }
 
 fn queue_full_frame_content_clear<W: io::Write>(
