@@ -80,6 +80,7 @@ pub(super) struct ExtensionLayerSnapshot {
     pub(super) surface_rect: ExtensionRect,
     pub(super) layer: RenderExtensionLayer,
     pub(super) own_damage: RenderDamage,
+    pub(super) content_replay_damage: RenderDamage,
     pub(super) render_damage: RenderDamage,
     pub(super) revision: Option<u64>,
 }
@@ -103,14 +104,17 @@ impl ExtensionLayerSnapshot {
             frame_damage,
             policy,
         );
-        let render_damage = if !own_damage.is_none() {
-            own_damage.clone()
-        } else if frame_damage.content_surface_damaged(pane_id)
+        let content_replay_damage = if frame_damage.content_surface_damaged(pane_id)
             && ext.redraws_on_content_damage(layer)
         {
             RenderDamage::FullSurface
         } else {
             RenderDamage::None
+        };
+        let render_damage = if own_damage.is_none() {
+            content_replay_damage.clone()
+        } else {
+            own_damage.clone()
         };
         let revision = ext.render_layer_revision(surface_id, layer);
         Self {
@@ -120,6 +124,7 @@ impl ExtensionLayerSnapshot {
             surface_rect,
             layer,
             own_damage,
+            content_replay_damage,
             render_damage,
             revision,
         }
@@ -358,6 +363,7 @@ pub(super) enum BeforeContentExtensionOutputAction {
     RetainedScene {
         diff_plan: Box<ExtensionLayerDiffPlan>,
         snapshot: ExtensionRetainedLayerSnapshot,
+        content_replay_damage: RenderDamage,
         output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
     },
@@ -431,16 +437,12 @@ fn build_retained_before_content_extension_output_plan(
         content,
         policy,
     );
-    let retained_replay_damage = if snapshot.own_damage.is_none() {
-        retained_scene_item_damage_for_render_damage(
-            &retained_snapshot.items,
-            &snapshot.render_damage,
-            snapshot.surface_rect,
-            policy,
-        )
-    } else {
-        RenderDamage::None
-    };
+    let content_replay_damage = retained_scene_item_damage_for_render_damage(
+        &retained_snapshot.items,
+        &snapshot.content_replay_damage,
+        snapshot.surface_rect,
+        policy,
+    );
     let output_damage = merge_render_damage(
         merge_render_damage(
             diff_plan.update_damage.clone(),
@@ -448,7 +450,7 @@ fn build_retained_before_content_extension_output_plan(
             snapshot.surface_rect,
             policy,
         ),
-        retained_replay_damage,
+        content_replay_damage.clone(),
         snapshot.surface_rect,
         policy,
     );
@@ -460,6 +462,7 @@ fn build_retained_before_content_extension_output_plan(
         action: BeforeContentExtensionOutputAction::RetainedScene {
             diff_plan: Box::new(diff_plan),
             snapshot: retained_snapshot,
+            content_replay_damage,
             output_damage,
             output_items,
         },
@@ -542,6 +545,7 @@ pub(super) enum AfterContentExtensionOutputAction {
     RetainedScene {
         diff_plan: Box<ExtensionLayerDiffPlan>,
         snapshot: ExtensionRetainedLayerSnapshot,
+        content_replay_damage: RenderDamage,
         output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
     },
@@ -642,19 +646,15 @@ fn build_retained_after_content_extension_output_plan(
         content,
         policy,
     );
-    let retained_replay_damage = if snapshot.own_damage.is_none() {
-        retained_scene_item_damage_for_render_damage(
-            &retained_snapshot.items,
-            &snapshot.render_damage,
-            snapshot.surface_rect,
-            policy,
-        )
-    } else {
-        RenderDamage::None
-    };
+    let content_replay_damage = retained_scene_item_damage_for_render_damage(
+        &retained_snapshot.items,
+        &snapshot.content_replay_damage,
+        snapshot.surface_rect,
+        policy,
+    );
     let output_damage = merge_render_damage(
         diff_plan.update_damage.clone(),
-        retained_replay_damage,
+        content_replay_damage.clone(),
         snapshot.surface_rect,
         policy,
     );
@@ -666,6 +666,7 @@ fn build_retained_after_content_extension_output_plan(
         action: AfterContentExtensionOutputAction::RetainedScene {
             diff_plan: Box::new(diff_plan),
             snapshot: retained_snapshot,
+            content_replay_damage,
             output_damage,
             output_items,
         },

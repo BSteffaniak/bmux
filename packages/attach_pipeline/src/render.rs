@@ -1587,6 +1587,7 @@ impl AttachSceneRenderStats {
         extension_name: &str,
         diff_plan: &ExtensionLayerDiffPlan,
         snapshot: &ExtensionRetainedLayerSnapshot,
+        content_replay_damage: &RenderDamage,
         output_damage: &RenderDamage,
         output_items: &[RenderLayerItem],
     ) {
@@ -1608,7 +1609,10 @@ impl AttachSceneRenderStats {
             render_damage_area_cells(&diff_plan.update_damage, snapshot.surface_rect);
         let stale_cleanup_cells =
             render_damage_area_cells(&diff_plan.stale_cleanup_damage, snapshot.surface_rect);
-        let content_replay_cells = damage_rects_area_cells(&diff_plan.content_replay_damage);
+        let content_replay_cells =
+            damage_rects_area_cells(&diff_plan.content_replay_damage).saturating_add(
+                render_damage_area_cells(content_replay_damage, snapshot.surface_rect),
+            );
         let full_surface_fallbacks = u64::from(retained_scene_uses_full_surface_damage(
             diff_plan,
             output_damage,
@@ -3584,6 +3588,7 @@ fn record_before_content_extension_output_plan(
         if let BeforeContentExtensionOutputAction::RetainedScene {
             diff_plan,
             snapshot,
+            content_replay_damage,
             output_damage,
             output_items,
         } = &plan.action
@@ -3592,6 +3597,7 @@ fn record_before_content_extension_output_plan(
                 extension_name,
                 diff_plan,
                 snapshot,
+                content_replay_damage,
                 output_damage,
                 output_items,
             );
@@ -3615,6 +3621,7 @@ fn execute_before_content_extension_output_plan<W: io::Write>(
             snapshot: retained_snapshot,
             output_damage,
             output_items,
+            ..
         } => {
             cleanup_removed_retained_terminal_graphics(
                 stdout,
@@ -3856,6 +3863,7 @@ fn record_after_content_extension_output_plan(
         if let AfterContentExtensionOutputAction::RetainedScene {
             diff_plan,
             snapshot,
+            content_replay_damage,
             output_damage,
             output_items,
         } = &plan.action
@@ -3864,6 +3872,7 @@ fn record_after_content_extension_output_plan(
                 ext_name,
                 diff_plan,
                 snapshot,
+                content_replay_damage,
                 output_damage,
                 output_items,
             );
@@ -3951,6 +3960,7 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
             snapshot: retained_snapshot,
             output_damage,
             output_items,
+            ..
         } => {
             execute_retained_after_content_extension_output_plan(
                 stdout,
@@ -9801,7 +9811,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // Retained scene fixture proves pane content damage replays unchanged overlays.
+    #[allow(clippy::too_many_lines)] // Retained scene fixture proves pane content damage replays unchanged overlays even when legacy damage also reports work.
     fn retained_after_content_scene_content_damage_replays_unchanged_item() {
         use bmux_plugin::AttachRenderExtension;
         use std::io;
@@ -9818,9 +9828,12 @@ mod tests {
                 &self,
                 _surface_id: Uuid,
                 _surface_rect: &ExtensionRect,
-                _layer: RenderExtensionLayer,
+                layer: RenderExtensionLayer,
             ) -> RenderDamage {
-                RenderDamage::None
+                match layer {
+                    RenderExtensionLayer::BeforePaneContent => RenderDamage::None,
+                    RenderExtensionLayer::AfterPaneContent => RenderDamage::FullSurface,
+                }
             }
 
             fn render_layer_scene_with_context(
@@ -9884,7 +9897,7 @@ mod tests {
         let mut frame_damage = FrameDamage::default();
         frame_damage.mark_content_surface(pane_id);
         let mut output = Vec::new();
-        render_attach_scene(
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
             &mut output,
             &scene,
             &[],
@@ -9901,6 +9914,7 @@ mod tests {
             &RuntimeAppearance::default(),
             DamageCoalescingPolicy::default(),
             &extensions,
+            None,
         )
         .expect("content damage should replay retained after-content output");
 
@@ -9915,6 +9929,8 @@ mod tests {
             content_at < overlay_at,
             "retained overlay must render after content: {rendered:?}"
         );
+        assert_eq!(stats.retained_scene_update_cells, 0);
+        assert_eq!(stats.retained_scene_content_replay_cells, 2);
     }
 
     #[test]
