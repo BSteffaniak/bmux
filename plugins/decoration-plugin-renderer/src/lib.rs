@@ -17,9 +17,9 @@
 //!    every subsequent scene replacement is drained by
 //!    [`AttachRenderExtension::refresh_state`] before the next frame renders
 //!    (revision-guarded so stale wire events can't downgrade).
-//! 3. On every attach-render pass, the extension reports generic
-//!    surface damage and `render_surface` hands matching paint
-//!    commands to [`bmux_scene_protocol_render::paint::apply_paint_commands`].
+//! 3. On every attach-render pass, the extension publishes retained scene items
+//!    for the attach renderer to diff and emit. Legacy damage/render callbacks
+//!    remain as fallback paths and keep their own rendered-surface cache.
 //!
 //! The CLI's streaming loop is responsible for decoding the IPC
 //! `PluginBusEvent` payloads and re-emitting them onto the local
@@ -460,24 +460,20 @@ impl AttachRenderExtension for DecorationRenderExtension {
         layer: RenderExtensionLayer,
         context: &RenderExtensionContext,
     ) -> Option<RenderLayerScene> {
-        let Ok(mut cache) = self.cache.lock() else {
+        let Ok(cache) = self.cache.lock() else {
             return Some(RenderLayerScene::new(None, Vec::new()));
         };
         let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_layer_rendered(surface_id, layer);
             return Some(RenderLayerScene::new(None, Vec::new()));
         };
-        let rendered_surface = surface.clone();
         let scene_capabilities = scene_capabilities_from_terminal(context.capabilities);
-        let scene = render_scene_for_surface_layer_with_capabilities(
+        Some(render_scene_for_surface_layer_with_capabilities(
             surface_id,
-            &rendered_surface,
+            surface,
             layer,
             context.capabilities,
             scene_capabilities,
-        );
-        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
-        Some(scene)
+        ))
     }
 
     fn render_layer_items_with_context(
@@ -2622,7 +2618,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_scene_converts_text_commands_and_marks_rendered() {
+    fn retained_scene_converts_text_commands_without_marking_legacy_rendered_cache() {
         let surface_id = Uuid::from_u128(201);
         let (extension, cache) = extension_with_surface(
             surface_id,
@@ -2653,7 +2649,8 @@ mod tests {
                 .lock()
                 .expect("cache lock")
                 .rendered_surface_layer(&surface_id, RenderExtensionLayer::AfterPaneContent)
-                .is_some()
+                .is_none(),
+            "retained scene diffing is renderer-owned; decoration only keeps legacy rendered snapshots for fallback APIs"
         );
     }
 
@@ -2692,7 +2689,8 @@ mod tests {
                 .lock()
                 .expect("cache lock")
                 .rendered_surface_layer(&surface_id, RenderExtensionLayer::BeforePaneContent)
-                .is_some()
+                .is_none(),
+            "retained before-content scenes do not update the legacy fallback rendered-surface cache"
         );
     }
 
