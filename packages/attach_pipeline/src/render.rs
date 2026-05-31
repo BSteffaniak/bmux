@@ -1479,6 +1479,16 @@ pub struct ExtensionRenderStats {
     pub cache_hits: u64,
     pub full_surface_calls: u64,
     pub region_count: u64,
+    pub retained_scene_calls: u64,
+    pub retained_scene_items: u64,
+    pub retained_scene_diff_items: u64,
+    pub retained_scene_output_items: u64,
+    pub retained_scene_graphic_items: u64,
+    pub retained_scene_output_graphic_items: u64,
+    pub retained_scene_added_items: u64,
+    pub retained_scene_changed_items: u64,
+    pub retained_scene_removed_items: u64,
+    pub retained_scene_unchanged_items: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1502,6 +1512,16 @@ pub struct AttachSceneRenderStats {
     pub extension_cache_hits: u64,
     pub extension_full_surface_calls: u64,
     pub extension_region_count: u64,
+    pub retained_scene_calls: u64,
+    pub retained_scene_items: u64,
+    pub retained_scene_diff_items: u64,
+    pub retained_scene_output_items: u64,
+    pub retained_scene_graphic_items: u64,
+    pub retained_scene_output_graphic_items: u64,
+    pub retained_scene_added_items: u64,
+    pub retained_scene_changed_items: u64,
+    pub retained_scene_removed_items: u64,
+    pub retained_scene_unchanged_items: u64,
     pub extension_stats: BTreeMap<String, ExtensionRenderStats>,
     pub terminal_graphic_transmits: u64,
     pub terminal_graphic_places: u64,
@@ -1553,6 +1573,94 @@ impl AttachSceneRenderStats {
         let stats = self.extension_entry(extension_name);
         stats.cache_hits = stats.cache_hits.saturating_add(1);
     }
+
+    fn record_extension_retained_scene_plan(
+        &mut self,
+        extension_name: &str,
+        diff_plan: &ExtensionLayerDiffPlan,
+        snapshot: &ExtensionRetainedLayerSnapshot,
+        output_items: &[RenderLayerItem],
+    ) {
+        let scene_items = u64::try_from(snapshot.items.len()).unwrap_or(u64::MAX);
+        let output_item_count = u64::try_from(output_items.len()).unwrap_or(u64::MAX);
+        let graphic_items =
+            u64::try_from(retained_scene_graphic_item_count(snapshot)).unwrap_or(u64::MAX);
+        let output_graphic_items =
+            u64::try_from(retained_render_item_graphic_count(output_items)).unwrap_or(u64::MAX);
+        let added_items = u64::try_from(diff_plan.added_items.len()).unwrap_or(u64::MAX);
+        let changed_items = u64::try_from(diff_plan.changed_items.len()).unwrap_or(u64::MAX);
+        let removed_items = u64::try_from(diff_plan.removed_items.len()).unwrap_or(u64::MAX);
+        let unchanged_items = u64::try_from(diff_plan.unchanged_items.len()).unwrap_or(u64::MAX);
+        let diff_items = added_items
+            .saturating_add(changed_items)
+            .saturating_add(removed_items)
+            .saturating_add(unchanged_items);
+
+        self.retained_scene_calls = self.retained_scene_calls.saturating_add(1);
+        self.retained_scene_items = self.retained_scene_items.saturating_add(scene_items);
+        self.retained_scene_diff_items = self.retained_scene_diff_items.saturating_add(diff_items);
+        self.retained_scene_output_items = self
+            .retained_scene_output_items
+            .saturating_add(output_item_count);
+        self.retained_scene_graphic_items = self
+            .retained_scene_graphic_items
+            .saturating_add(graphic_items);
+        self.retained_scene_output_graphic_items = self
+            .retained_scene_output_graphic_items
+            .saturating_add(output_graphic_items);
+        self.retained_scene_added_items =
+            self.retained_scene_added_items.saturating_add(added_items);
+        self.retained_scene_changed_items = self
+            .retained_scene_changed_items
+            .saturating_add(changed_items);
+        self.retained_scene_removed_items = self
+            .retained_scene_removed_items
+            .saturating_add(removed_items);
+        self.retained_scene_unchanged_items = self
+            .retained_scene_unchanged_items
+            .saturating_add(unchanged_items);
+
+        let stats = self.extension_entry(extension_name);
+        stats.retained_scene_calls = stats.retained_scene_calls.saturating_add(1);
+        stats.retained_scene_items = stats.retained_scene_items.saturating_add(scene_items);
+        stats.retained_scene_diff_items =
+            stats.retained_scene_diff_items.saturating_add(diff_items);
+        stats.retained_scene_output_items = stats
+            .retained_scene_output_items
+            .saturating_add(output_item_count);
+        stats.retained_scene_graphic_items = stats
+            .retained_scene_graphic_items
+            .saturating_add(graphic_items);
+        stats.retained_scene_output_graphic_items = stats
+            .retained_scene_output_graphic_items
+            .saturating_add(output_graphic_items);
+        stats.retained_scene_added_items =
+            stats.retained_scene_added_items.saturating_add(added_items);
+        stats.retained_scene_changed_items = stats
+            .retained_scene_changed_items
+            .saturating_add(changed_items);
+        stats.retained_scene_removed_items = stats
+            .retained_scene_removed_items
+            .saturating_add(removed_items);
+        stats.retained_scene_unchanged_items = stats
+            .retained_scene_unchanged_items
+            .saturating_add(unchanged_items);
+    }
+}
+
+fn retained_scene_graphic_item_count(snapshot: &ExtensionRetainedLayerSnapshot) -> usize {
+    snapshot
+        .items
+        .iter()
+        .filter(|item| matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. }))
+        .count()
+}
+
+fn retained_render_item_graphic_count(items: &[RenderLayerItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item, RenderLayerItem::Graphic(_)))
+        .count()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3401,7 +3509,22 @@ fn record_before_content_extension_output_plan(
             }
             _ => &plan.snapshot.render_damage,
         };
-        stats.record_extension_render_call(plan.snapshot.extension.name(), damage);
+        let extension_name = plan.snapshot.extension.name();
+        stats.record_extension_render_call(extension_name, damage);
+        if let BeforeContentExtensionOutputAction::RetainedScene {
+            diff_plan,
+            snapshot,
+            output_items,
+            ..
+        } = &plan.action
+        {
+            stats.record_extension_retained_scene_plan(
+                extension_name,
+                diff_plan,
+                snapshot,
+                output_items,
+            );
+        }
     }
 }
 
@@ -3659,6 +3782,15 @@ fn record_after_content_extension_output_plan(
     };
     if let Some(stats) = render_stats.as_deref_mut() {
         stats.record_extension_render_call(ext_name, damage);
+        if let AfterContentExtensionOutputAction::RetainedScene {
+            diff_plan,
+            snapshot,
+            output_items,
+            ..
+        } = &plan.action
+        {
+            stats.record_extension_retained_scene_plan(ext_name, diff_plan, snapshot, output_items);
+        }
     }
     match &plan.action {
         AfterContentExtensionOutputAction::RetainedScene {
@@ -6809,6 +6941,9 @@ mod tests {
         assert!(initial.contains("Ga=t,"), "{initial:?}");
         assert_eq!(initial_stats.terminal_graphic_transmits, 1);
         assert_eq!(initial_stats.terminal_graphic_places, 1);
+        assert_eq!(initial_stats.retained_scene_calls, 1);
+        assert_eq!(initial_stats.retained_scene_graphic_items, 1);
+        assert_eq!(initial_stats.retained_scene_output_graphic_items, 1);
 
         state.store(1, std::sync::atomic::Ordering::Relaxed);
         let (unchanged, unchanged_stats) = render_retained_graphic_frame(
@@ -6823,6 +6958,10 @@ mod tests {
         assert_eq!(unchanged_stats.terminal_graphic_transmits, 0);
         assert_eq!(unchanged_stats.terminal_graphic_places, 0);
         assert_eq!(unchanged_stats.terminal_graphic_deletes, 0);
+        assert_eq!(unchanged_stats.retained_scene_calls, 1);
+        assert_eq!(unchanged_stats.retained_scene_graphic_items, 1);
+        assert_eq!(unchanged_stats.retained_scene_diff_items, 1);
+        assert_eq!(unchanged_stats.retained_scene_unchanged_items, 1);
         assert_eq!(cache.len(), 1);
     }
 
@@ -9302,6 +9441,11 @@ mod tests {
             "retained update should not clear full rows: {rendered:?}"
         );
         assert_eq!(update_stats.extension_full_surface_calls, 0);
+        assert_eq!(update_stats.retained_scene_calls, 1);
+        assert_eq!(update_stats.retained_scene_items, 1);
+        assert_eq!(update_stats.retained_scene_diff_items, 1);
+        assert_eq!(update_stats.retained_scene_changed_items, 1);
+        assert_eq!(update_stats.retained_scene_output_items, 1);
     }
 
     #[test]

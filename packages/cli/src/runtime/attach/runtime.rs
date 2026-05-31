@@ -1211,6 +1211,16 @@ struct AttachPerfWindow {
     extension_imperative_calls: u64,
     extension_cache_hits: u64,
     extension_full_surface_calls: u64,
+    retained_scene_calls: u64,
+    retained_scene_items: u64,
+    retained_scene_diff_items: u64,
+    retained_scene_output_items: u64,
+    retained_scene_graphic_items: u64,
+    retained_scene_output_graphic_items: u64,
+    retained_scene_added_items: u64,
+    retained_scene_changed_items: u64,
+    retained_scene_removed_items: u64,
+    retained_scene_unchanged_items: u64,
     extension_stats: BTreeMap<String, ExtensionRenderStats>,
     terminal_graphic_transmits: u64,
     terminal_graphic_places: u64,
@@ -1279,6 +1289,16 @@ impl AttachPerfWindow {
             extension_imperative_calls: 0,
             extension_cache_hits: 0,
             extension_full_surface_calls: 0,
+            retained_scene_calls: 0,
+            retained_scene_items: 0,
+            retained_scene_diff_items: 0,
+            retained_scene_output_items: 0,
+            retained_scene_graphic_items: 0,
+            retained_scene_output_graphic_items: 0,
+            retained_scene_added_items: 0,
+            retained_scene_changed_items: 0,
+            retained_scene_removed_items: 0,
+            retained_scene_unchanged_items: 0,
             extension_stats: BTreeMap::new(),
             terminal_graphic_transmits: 0,
             terminal_graphic_places: 0,
@@ -1361,55 +1381,7 @@ impl AttachPerfWindow {
         if stats.full_frame_fallback {
             self.full_frame_fallbacks = self.full_frame_fallbacks.saturating_add(1);
         }
-        self.pane_rows_examined = self
-            .pane_rows_examined
-            .saturating_add(stats.scene_render.pane_rows_examined);
-        self.pane_rows_emitted = self
-            .pane_rows_emitted
-            .saturating_add(stats.scene_render.pane_rows_emitted);
-        self.pane_row_segments_emitted = self
-            .pane_row_segments_emitted
-            .saturating_add(stats.scene_render.pane_row_segments_emitted);
-        self.pane_rows_cached_skipped = self
-            .pane_rows_cached_skipped
-            .saturating_add(stats.scene_render.pane_rows_cached_skipped);
-        self.pane_rows_sync_deferred = self
-            .pane_rows_sync_deferred
-            .saturating_add(stats.scene_render.pane_rows_sync_deferred);
-        self.pane_cells_emitted = self
-            .pane_cells_emitted
-            .saturating_add(stats.scene_render.pane_cells_emitted);
-        self.extension_render_calls = self
-            .extension_render_calls
-            .saturating_add(stats.scene_render.extension_render_calls);
-        self.extension_render_op_calls = self
-            .extension_render_op_calls
-            .saturating_add(stats.scene_render.extension_render_op_calls);
-        self.extension_imperative_calls = self
-            .extension_imperative_calls
-            .saturating_add(stats.scene_render.extension_imperative_calls);
-        self.extension_cache_hits = self
-            .extension_cache_hits
-            .saturating_add(stats.scene_render.extension_cache_hits);
-        self.extension_full_surface_calls = self
-            .extension_full_surface_calls
-            .saturating_add(stats.scene_render.extension_full_surface_calls);
-        aggregate_extension_render_stats(
-            &mut self.extension_stats,
-            &stats.scene_render.extension_stats,
-        );
-        self.terminal_graphic_transmits = self
-            .terminal_graphic_transmits
-            .saturating_add(stats.scene_render.terminal_graphic_transmits);
-        self.terminal_graphic_places = self
-            .terminal_graphic_places
-            .saturating_add(stats.scene_render.terminal_graphic_places);
-        self.terminal_graphic_deletes = self
-            .terminal_graphic_deletes
-            .saturating_add(stats.scene_render.terminal_graphic_deletes);
-        self.terminal_graphic_bytes = self
-            .terminal_graphic_bytes
-            .saturating_add(stats.scene_render.terminal_graphic_bytes);
+        self.record_scene_render_stats(&stats.scene_render);
         if stats.status_rendered {
             self.status_rendered_frames = self.status_rendered_frames.saturating_add(1);
         }
@@ -1423,6 +1395,93 @@ impl AttachPerfWindow {
             .dirty_events
             .saturating_add(u64::try_from(stats.dirty_event_count).unwrap_or(u64::MAX));
         self.record_render_inefficiency_flags(inefficiency_flags);
+    }
+
+    fn record_scene_render_stats(&mut self, stats: &AttachSceneRenderStats) {
+        self.pane_rows_examined = self
+            .pane_rows_examined
+            .saturating_add(stats.pane_rows_examined);
+        self.pane_rows_emitted = self
+            .pane_rows_emitted
+            .saturating_add(stats.pane_rows_emitted);
+        self.pane_row_segments_emitted = self
+            .pane_row_segments_emitted
+            .saturating_add(stats.pane_row_segments_emitted);
+        self.pane_rows_cached_skipped = self
+            .pane_rows_cached_skipped
+            .saturating_add(stats.pane_rows_cached_skipped);
+        self.pane_rows_sync_deferred = self
+            .pane_rows_sync_deferred
+            .saturating_add(stats.pane_rows_sync_deferred);
+        self.pane_cells_emitted = self
+            .pane_cells_emitted
+            .saturating_add(stats.pane_cells_emitted);
+        self.record_extension_render_stats(stats);
+        self.record_terminal_graphic_stats(stats);
+    }
+
+    fn record_extension_render_stats(&mut self, stats: &AttachSceneRenderStats) {
+        self.extension_render_calls = self
+            .extension_render_calls
+            .saturating_add(stats.extension_render_calls);
+        self.extension_render_op_calls = self
+            .extension_render_op_calls
+            .saturating_add(stats.extension_render_op_calls);
+        self.extension_imperative_calls = self
+            .extension_imperative_calls
+            .saturating_add(stats.extension_imperative_calls);
+        self.extension_cache_hits = self
+            .extension_cache_hits
+            .saturating_add(stats.extension_cache_hits);
+        self.extension_full_surface_calls = self
+            .extension_full_surface_calls
+            .saturating_add(stats.extension_full_surface_calls);
+        self.retained_scene_calls = self
+            .retained_scene_calls
+            .saturating_add(stats.retained_scene_calls);
+        self.retained_scene_items = self
+            .retained_scene_items
+            .saturating_add(stats.retained_scene_items);
+        self.retained_scene_diff_items = self
+            .retained_scene_diff_items
+            .saturating_add(stats.retained_scene_diff_items);
+        self.retained_scene_output_items = self
+            .retained_scene_output_items
+            .saturating_add(stats.retained_scene_output_items);
+        self.retained_scene_graphic_items = self
+            .retained_scene_graphic_items
+            .saturating_add(stats.retained_scene_graphic_items);
+        self.retained_scene_output_graphic_items = self
+            .retained_scene_output_graphic_items
+            .saturating_add(stats.retained_scene_output_graphic_items);
+        self.retained_scene_added_items = self
+            .retained_scene_added_items
+            .saturating_add(stats.retained_scene_added_items);
+        self.retained_scene_changed_items = self
+            .retained_scene_changed_items
+            .saturating_add(stats.retained_scene_changed_items);
+        self.retained_scene_removed_items = self
+            .retained_scene_removed_items
+            .saturating_add(stats.retained_scene_removed_items);
+        self.retained_scene_unchanged_items = self
+            .retained_scene_unchanged_items
+            .saturating_add(stats.retained_scene_unchanged_items);
+        aggregate_extension_render_stats(&mut self.extension_stats, &stats.extension_stats);
+    }
+
+    const fn record_terminal_graphic_stats(&mut self, stats: &AttachSceneRenderStats) {
+        self.terminal_graphic_transmits = self
+            .terminal_graphic_transmits
+            .saturating_add(stats.terminal_graphic_transmits);
+        self.terminal_graphic_places = self
+            .terminal_graphic_places
+            .saturating_add(stats.terminal_graphic_places);
+        self.terminal_graphic_deletes = self
+            .terminal_graphic_deletes
+            .saturating_add(stats.terminal_graphic_deletes);
+        self.terminal_graphic_bytes = self
+            .terminal_graphic_bytes
+            .saturating_add(stats.terminal_graphic_bytes);
     }
 
     const fn record_render_inefficiency_flags(
@@ -1676,6 +1735,36 @@ fn aggregate_extension_render_stats(
             .full_surface_calls
             .saturating_add(stats.full_surface_calls);
         entry.region_count = entry.region_count.saturating_add(stats.region_count);
+        entry.retained_scene_calls = entry
+            .retained_scene_calls
+            .saturating_add(stats.retained_scene_calls);
+        entry.retained_scene_items = entry
+            .retained_scene_items
+            .saturating_add(stats.retained_scene_items);
+        entry.retained_scene_diff_items = entry
+            .retained_scene_diff_items
+            .saturating_add(stats.retained_scene_diff_items);
+        entry.retained_scene_output_items = entry
+            .retained_scene_output_items
+            .saturating_add(stats.retained_scene_output_items);
+        entry.retained_scene_graphic_items = entry
+            .retained_scene_graphic_items
+            .saturating_add(stats.retained_scene_graphic_items);
+        entry.retained_scene_output_graphic_items = entry
+            .retained_scene_output_graphic_items
+            .saturating_add(stats.retained_scene_output_graphic_items);
+        entry.retained_scene_added_items = entry
+            .retained_scene_added_items
+            .saturating_add(stats.retained_scene_added_items);
+        entry.retained_scene_changed_items = entry
+            .retained_scene_changed_items
+            .saturating_add(stats.retained_scene_changed_items);
+        entry.retained_scene_removed_items = entry
+            .retained_scene_removed_items
+            .saturating_add(stats.retained_scene_removed_items);
+        entry.retained_scene_unchanged_items = entry
+            .retained_scene_unchanged_items
+            .saturating_add(stats.retained_scene_unchanged_items);
     }
 }
 
@@ -1695,11 +1784,113 @@ fn extension_render_stats_payload(
                         "cache_hits": stats.cache_hits,
                         "full_surface_calls": stats.full_surface_calls,
                         "region_count": stats.region_count,
+                        "retained_scene_calls": stats.retained_scene_calls,
+                        "retained_scene_items": stats.retained_scene_items,
+                        "retained_scene_diff_items": stats.retained_scene_diff_items,
+                        "retained_scene_output_items": stats.retained_scene_output_items,
+                        "retained_scene_graphic_items": stats.retained_scene_graphic_items,
+                        "retained_scene_output_graphic_items": stats.retained_scene_output_graphic_items,
+                        "retained_scene_added_items": stats.retained_scene_added_items,
+                        "retained_scene_changed_items": stats.retained_scene_changed_items,
+                        "retained_scene_removed_items": stats.retained_scene_removed_items,
+                        "retained_scene_unchanged_items": stats.retained_scene_unchanged_items,
                     }),
                 )
             })
             .collect(),
     )
+}
+
+fn insert_attach_retained_scene_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    window: &AttachPerfWindow,
+) {
+    object.insert(
+        "retained_scene_calls".to_string(),
+        window.retained_scene_calls.into(),
+    );
+    object.insert(
+        "retained_scene_items".to_string(),
+        window.retained_scene_items.into(),
+    );
+    object.insert(
+        "retained_scene_diff_items".to_string(),
+        window.retained_scene_diff_items.into(),
+    );
+    object.insert(
+        "retained_scene_output_items".to_string(),
+        window.retained_scene_output_items.into(),
+    );
+    object.insert(
+        "retained_scene_graphic_items".to_string(),
+        window.retained_scene_graphic_items.into(),
+    );
+    object.insert(
+        "retained_scene_output_graphic_items".to_string(),
+        window.retained_scene_output_graphic_items.into(),
+    );
+    object.insert(
+        "retained_scene_added_items".to_string(),
+        window.retained_scene_added_items.into(),
+    );
+    object.insert(
+        "retained_scene_changed_items".to_string(),
+        window.retained_scene_changed_items.into(),
+    );
+    object.insert(
+        "retained_scene_removed_items".to_string(),
+        window.retained_scene_removed_items.into(),
+    );
+    object.insert(
+        "retained_scene_unchanged_items".to_string(),
+        window.retained_scene_unchanged_items.into(),
+    );
+}
+
+fn insert_attach_frame_retained_scene_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    stats: &AttachSceneRenderStats,
+) {
+    object.insert(
+        "retained_scene_calls".to_string(),
+        stats.retained_scene_calls.into(),
+    );
+    object.insert(
+        "retained_scene_items".to_string(),
+        stats.retained_scene_items.into(),
+    );
+    object.insert(
+        "retained_scene_diff_items".to_string(),
+        stats.retained_scene_diff_items.into(),
+    );
+    object.insert(
+        "retained_scene_output_items".to_string(),
+        stats.retained_scene_output_items.into(),
+    );
+    object.insert(
+        "retained_scene_graphic_items".to_string(),
+        stats.retained_scene_graphic_items.into(),
+    );
+    object.insert(
+        "retained_scene_output_graphic_items".to_string(),
+        stats.retained_scene_output_graphic_items.into(),
+    );
+    object.insert(
+        "retained_scene_added_items".to_string(),
+        stats.retained_scene_added_items.into(),
+    );
+    object.insert(
+        "retained_scene_changed_items".to_string(),
+        stats.retained_scene_changed_items.into(),
+    );
+    object.insert(
+        "retained_scene_removed_items".to_string(),
+        stats.retained_scene_removed_items.into(),
+    );
+    object.insert(
+        "retained_scene_unchanged_items".to_string(),
+        stats.retained_scene_unchanged_items.into(),
+    );
 }
 
 fn insert_attach_terminal_graphics_payload(
@@ -1722,6 +1913,39 @@ fn insert_attach_terminal_graphics_payload(
         "terminal_graphic_bytes".to_string(),
         window.terminal_graphic_bytes.into(),
     );
+}
+
+fn insert_attach_extension_work_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    window: &AttachPerfWindow,
+) {
+    object.insert(
+        "extension_render_calls".to_string(),
+        window.extension_render_calls.into(),
+    );
+    object.insert(
+        "extension_render_op_calls".to_string(),
+        window.extension_render_op_calls.into(),
+    );
+    object.insert(
+        "extension_imperative_calls".to_string(),
+        window.extension_imperative_calls.into(),
+    );
+    object.insert(
+        "extension_cache_hits".to_string(),
+        window.extension_cache_hits.into(),
+    );
+    object.insert(
+        "extension_full_surface_calls".to_string(),
+        window.extension_full_surface_calls.into(),
+    );
+    insert_attach_retained_scene_payload(object, window);
+    if !window.extension_stats.is_empty() {
+        object.insert(
+            "extension_stats".to_string(),
+            extension_render_stats_payload(&window.extension_stats),
+        );
+    }
 }
 
 fn insert_attach_render_work_payload(
@@ -1752,32 +1976,7 @@ fn insert_attach_render_work_payload(
         "pane_cells_emitted".to_string(),
         window.pane_cells_emitted.into(),
     );
-    object.insert(
-        "extension_render_calls".to_string(),
-        window.extension_render_calls.into(),
-    );
-    object.insert(
-        "extension_render_op_calls".to_string(),
-        window.extension_render_op_calls.into(),
-    );
-    object.insert(
-        "extension_imperative_calls".to_string(),
-        window.extension_imperative_calls.into(),
-    );
-    object.insert(
-        "extension_cache_hits".to_string(),
-        window.extension_cache_hits.into(),
-    );
-    object.insert(
-        "extension_full_surface_calls".to_string(),
-        window.extension_full_surface_calls.into(),
-    );
-    if !window.extension_stats.is_empty() {
-        object.insert(
-            "extension_stats".to_string(),
-            extension_render_stats_payload(&window.extension_stats),
-        );
-    }
+    insert_attach_extension_work_payload(object, window);
     insert_attach_terminal_graphics_payload(object, window);
     object.insert(
         "status_rendered_frames".to_string(),
@@ -2055,7 +2254,7 @@ fn attach_frame_trace_payload(
     dirty_events: &[super::state::AttachDirtyEvent],
     frame_stats: &AttachFrameRenderStats,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "frame_render_ms": frame_render_ms,
         "frame_index": rendered_frame_count,
         "since_attach_start_ms": since_attach_start_ms,
@@ -2092,7 +2291,11 @@ fn attach_frame_trace_payload(
         "terminal_graphic_places": frame_stats.scene_render.terminal_graphic_places,
         "terminal_graphic_deletes": frame_stats.scene_render.terminal_graphic_deletes,
         "terminal_graphic_bytes": frame_stats.scene_render.terminal_graphic_bytes,
-    })
+    });
+    if let serde_json::Value::Object(object) = &mut payload {
+        insert_attach_frame_retained_scene_payload(object, &frame_stats.scene_render);
+    }
+    payload
 }
 
 #[allow(clippy::too_many_arguments)] // keep frame/attach telemetry emit context explicit

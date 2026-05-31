@@ -1065,6 +1065,16 @@ pub fn summarize_attach_render_trace(
         terminal_graphic_places: stats.terminal_graphic_places,
         terminal_graphic_deletes: stats.terminal_graphic_deletes,
         terminal_graphic_bytes: stats.terminal_graphic_bytes,
+        retained_scene_calls: stats.retained_scene_calls,
+        retained_scene_items: stats.retained_scene_items,
+        retained_scene_diff_items: stats.retained_scene_diff_items,
+        retained_scene_output_items: stats.retained_scene_output_items,
+        retained_scene_graphic_items: stats.retained_scene_graphic_items,
+        retained_scene_output_graphic_items: stats.retained_scene_output_graphic_items,
+        retained_scene_added_items: stats.retained_scene_added_items,
+        retained_scene_changed_items: stats.retained_scene_changed_items,
+        retained_scene_removed_items: stats.retained_scene_removed_items,
+        retained_scene_unchanged_items: stats.retained_scene_unchanged_items,
         ..PlaybookRenderSummary::default()
     };
     if facts.full_frame_fallback || stats.full_frame {
@@ -1376,6 +1386,36 @@ fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRe
             acc.terminal_graphic_bytes = acc
                 .terminal_graphic_bytes
                 .saturating_add(summary.terminal_graphic_bytes);
+            acc.retained_scene_calls = acc
+                .retained_scene_calls
+                .saturating_add(summary.retained_scene_calls);
+            acc.retained_scene_items = acc
+                .retained_scene_items
+                .saturating_add(summary.retained_scene_items);
+            acc.retained_scene_diff_items = acc
+                .retained_scene_diff_items
+                .saturating_add(summary.retained_scene_diff_items);
+            acc.retained_scene_output_items = acc
+                .retained_scene_output_items
+                .saturating_add(summary.retained_scene_output_items);
+            acc.retained_scene_graphic_items = acc
+                .retained_scene_graphic_items
+                .saturating_add(summary.retained_scene_graphic_items);
+            acc.retained_scene_output_graphic_items = acc
+                .retained_scene_output_graphic_items
+                .saturating_add(summary.retained_scene_output_graphic_items);
+            acc.retained_scene_added_items = acc
+                .retained_scene_added_items
+                .saturating_add(summary.retained_scene_added_items);
+            acc.retained_scene_changed_items = acc
+                .retained_scene_changed_items
+                .saturating_add(summary.retained_scene_changed_items);
+            acc.retained_scene_removed_items = acc
+                .retained_scene_removed_items
+                .saturating_add(summary.retained_scene_removed_items);
+            acc.retained_scene_unchanged_items = acc
+                .retained_scene_unchanged_items
+                .saturating_add(summary.retained_scene_unchanged_items);
             acc.emitted_rows
                 .extend(summary.emitted_rows.iter().copied());
             acc.emitted_row_segments
