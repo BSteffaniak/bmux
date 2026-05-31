@@ -1225,6 +1225,10 @@ struct AttachPerfWindow {
     retained_scene_changed_items: u64,
     retained_scene_removed_items: u64,
     retained_scene_unchanged_items: u64,
+    retained_scene_update_cells: u64,
+    retained_scene_stale_cleanup_cells: u64,
+    retained_scene_content_replay_cells: u64,
+    retained_scene_full_surface_fallbacks: u64,
     extension_stats: BTreeMap<String, ExtensionRenderStats>,
     terminal_graphic_transmits: u64,
     terminal_graphic_places: u64,
@@ -1303,6 +1307,10 @@ impl AttachPerfWindow {
             retained_scene_changed_items: 0,
             retained_scene_removed_items: 0,
             retained_scene_unchanged_items: 0,
+            retained_scene_update_cells: 0,
+            retained_scene_stale_cleanup_cells: 0,
+            retained_scene_content_replay_cells: 0,
+            retained_scene_full_surface_fallbacks: 0,
             extension_stats: BTreeMap::new(),
             terminal_graphic_transmits: 0,
             terminal_graphic_places: 0,
@@ -1470,6 +1478,18 @@ impl AttachPerfWindow {
         self.retained_scene_unchanged_items = self
             .retained_scene_unchanged_items
             .saturating_add(stats.retained_scene_unchanged_items);
+        self.retained_scene_update_cells = self
+            .retained_scene_update_cells
+            .saturating_add(stats.retained_scene_update_cells);
+        self.retained_scene_stale_cleanup_cells = self
+            .retained_scene_stale_cleanup_cells
+            .saturating_add(stats.retained_scene_stale_cleanup_cells);
+        self.retained_scene_content_replay_cells = self
+            .retained_scene_content_replay_cells
+            .saturating_add(stats.retained_scene_content_replay_cells);
+        self.retained_scene_full_surface_fallbacks = self
+            .retained_scene_full_surface_fallbacks
+            .saturating_add(stats.retained_scene_full_surface_fallbacks);
         aggregate_extension_render_stats(&mut self.extension_stats, &stats.extension_stats);
     }
 
@@ -1769,6 +1789,18 @@ fn aggregate_extension_render_stats(
         entry.retained_scene_unchanged_items = entry
             .retained_scene_unchanged_items
             .saturating_add(stats.retained_scene_unchanged_items);
+        entry.retained_scene_update_cells = entry
+            .retained_scene_update_cells
+            .saturating_add(stats.retained_scene_update_cells);
+        entry.retained_scene_stale_cleanup_cells = entry
+            .retained_scene_stale_cleanup_cells
+            .saturating_add(stats.retained_scene_stale_cleanup_cells);
+        entry.retained_scene_content_replay_cells = entry
+            .retained_scene_content_replay_cells
+            .saturating_add(stats.retained_scene_content_replay_cells);
+        entry.retained_scene_full_surface_fallbacks = entry
+            .retained_scene_full_surface_fallbacks
+            .saturating_add(stats.retained_scene_full_surface_fallbacks);
     }
 }
 
@@ -1798,6 +1830,10 @@ fn extension_render_stats_payload(
                         "retained_scene_changed_items": stats.retained_scene_changed_items,
                         "retained_scene_removed_items": stats.retained_scene_removed_items,
                         "retained_scene_unchanged_items": stats.retained_scene_unchanged_items,
+                        "retained_scene_update_cells": stats.retained_scene_update_cells,
+                        "retained_scene_stale_cleanup_cells": stats.retained_scene_stale_cleanup_cells,
+                        "retained_scene_content_replay_cells": stats.retained_scene_content_replay_cells,
+                        "retained_scene_full_surface_fallbacks": stats.retained_scene_full_surface_fallbacks,
                     }),
                 )
             })
@@ -1849,6 +1885,22 @@ fn insert_attach_retained_scene_payload(
         "retained_scene_unchanged_items".to_string(),
         window.retained_scene_unchanged_items.into(),
     );
+    object.insert(
+        "retained_scene_update_cells".to_string(),
+        window.retained_scene_update_cells.into(),
+    );
+    object.insert(
+        "retained_scene_stale_cleanup_cells".to_string(),
+        window.retained_scene_stale_cleanup_cells.into(),
+    );
+    object.insert(
+        "retained_scene_content_replay_cells".to_string(),
+        window.retained_scene_content_replay_cells.into(),
+    );
+    object.insert(
+        "retained_scene_full_surface_fallbacks".to_string(),
+        window.retained_scene_full_surface_fallbacks.into(),
+    );
 }
 
 fn insert_attach_frame_retained_scene_payload(
@@ -1894,6 +1946,22 @@ fn insert_attach_frame_retained_scene_payload(
     object.insert(
         "retained_scene_unchanged_items".to_string(),
         stats.retained_scene_unchanged_items.into(),
+    );
+    object.insert(
+        "retained_scene_update_cells".to_string(),
+        stats.retained_scene_update_cells.into(),
+    );
+    object.insert(
+        "retained_scene_stale_cleanup_cells".to_string(),
+        stats.retained_scene_stale_cleanup_cells.into(),
+    );
+    object.insert(
+        "retained_scene_content_replay_cells".to_string(),
+        stats.retained_scene_content_replay_cells.into(),
+    );
+    object.insert(
+        "retained_scene_full_surface_fallbacks".to_string(),
+        stats.retained_scene_full_surface_fallbacks.into(),
     );
 }
 

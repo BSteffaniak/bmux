@@ -491,6 +491,10 @@ pub struct PlaybookRenderSummary {
     pub retained_scene_changed_items: u64,
     pub retained_scene_removed_items: u64,
     pub retained_scene_unchanged_items: u64,
+    pub retained_scene_update_cells: u64,
+    pub retained_scene_stale_cleanup_cells: u64,
+    pub retained_scene_content_replay_cells: u64,
+    pub retained_scene_full_surface_fallbacks: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emitted_rows: Vec<PlaybookRenderRowRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

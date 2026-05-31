@@ -85,7 +85,7 @@ Rate-limited streams may also include:
 
   - periodic attach-loop aggregates (drain IPC + render)
   - detailed/trace payloads include per-extension render counters under `extension_stats`
-  - retained-scene counters report layer calls, current/output item counts, item diff counts, and retained terminal-graphic item counts
+  - retained-scene counters report layer calls, current/output item counts, item diff counts, retained terminal-graphic item counts, retained damage cell counts, and retained full-surface fallback counts
   - terminal-graphic counters report transmits, placements, deletes, and encoded bytes
   - trace includes additional drain behavior (`drain_budget_hits`, etc)
 

@@ -1075,6 +1075,10 @@ pub fn summarize_attach_render_trace(
         retained_scene_changed_items: stats.retained_scene_changed_items,
         retained_scene_removed_items: stats.retained_scene_removed_items,
         retained_scene_unchanged_items: stats.retained_scene_unchanged_items,
+        retained_scene_update_cells: stats.retained_scene_update_cells,
+        retained_scene_stale_cleanup_cells: stats.retained_scene_stale_cleanup_cells,
+        retained_scene_content_replay_cells: stats.retained_scene_content_replay_cells,
+        retained_scene_full_surface_fallbacks: stats.retained_scene_full_surface_fallbacks,
         ..PlaybookRenderSummary::default()
     };
     if facts.full_frame_fallback || stats.full_frame {
@@ -1416,6 +1420,18 @@ fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRe
             acc.retained_scene_unchanged_items = acc
                 .retained_scene_unchanged_items
                 .saturating_add(summary.retained_scene_unchanged_items);
+            acc.retained_scene_update_cells = acc
+                .retained_scene_update_cells
+                .saturating_add(summary.retained_scene_update_cells);
+            acc.retained_scene_stale_cleanup_cells = acc
+                .retained_scene_stale_cleanup_cells
+                .saturating_add(summary.retained_scene_stale_cleanup_cells);
+            acc.retained_scene_content_replay_cells = acc
+                .retained_scene_content_replay_cells
+                .saturating_add(summary.retained_scene_content_replay_cells);
+            acc.retained_scene_full_surface_fallbacks = acc
+                .retained_scene_full_surface_fallbacks
+                .saturating_add(summary.retained_scene_full_surface_fallbacks);
             acc.emitted_rows
                 .extend(summary.emitted_rows.iter().copied());
             acc.emitted_row_segments
