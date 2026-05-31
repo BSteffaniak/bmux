@@ -1,19 +1,27 @@
 use crate::error::Error;
+use crate::ser::EncodingMode;
 use crate::varint;
 use serde::de::{self, Deserialize, DeserializeSeed, Visitor};
 
 /// A binary deserializer for the bmux wire protocol.
 ///
-/// Reads data encoded by `Serializer`, using LEB128 varints for integers,
-/// length-prefixed containers, and varint enum discriminants.
+/// By default, structs and struct variants are decoded as field-name maps and
+/// enum variants are decoded by variant name. Use [`from_positional_bytes`] for the
+/// positional representation that reads struct fields positionally and enum
+/// variants by declaration index.
 pub struct Deserializer<'de> {
     input: &'de [u8],
     pos: usize,
+    mode: EncodingMode,
 }
 
 impl<'de> Deserializer<'de> {
-    fn new(input: &'de [u8]) -> Self {
-        Deserializer { input, pos: 0 }
+    fn new(input: &'de [u8], mode: EncodingMode) -> Self {
+        Deserializer {
+            input,
+            pos: 0,
+            mode,
+        }
     }
 
     fn remaining(&self) -> &'de [u8] {
@@ -88,13 +96,29 @@ impl<'de> Deserializer<'de> {
     }
 }
 
-/// Deserialize a value from a byte slice.
+/// Deserialize a value from stable bytes.
 ///
 /// # Errors
 ///
 /// Returns an error if the bytes cannot be deserialized into the target type.
 pub fn from_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
-    let mut deserializer = Deserializer::new(bytes);
+    from_bytes_with_mode(bytes, EncodingMode::Stable)
+}
+
+/// Deserialize a value from positional bytes.
+///
+/// # Errors
+///
+/// Returns an error if the bytes cannot be deserialized into the target type.
+pub fn from_positional_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
+    from_bytes_with_mode(bytes, EncodingMode::Positional)
+}
+
+pub(crate) fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    mode: EncodingMode,
+) -> Result<T, Error> {
+    let mut deserializer = Deserializer::new(bytes, mode);
     let value = T::deserialize(&mut deserializer)?;
     if deserializer.pos != deserializer.input.len() {
         return Err(Error::TrailingBytes);
@@ -106,10 +130,6 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
-        // Non-self-describing format: we cannot deserialize_any in general.
-        // However, serde_json::Value and tagged enums may call this.
-        // We handle tagged enums via the enum methods. For serde_json::Value,
-        // callers should pre-serialize to JSON bytes and store as Vec<u8>.
         Err(Error::UnsupportedType(
             "deserialize_any (non-self-describing format)",
         ))
@@ -169,8 +189,8 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        let code = self.read_varint_u32()?;
-        let c = char::from_u32(code).ok_or(Error::InvalidChar)?;
+        let v = self.read_varint_u32()?;
+        let c = char::from_u32(v).ok_or(Error::InvalidChar)?;
         visitor.visit_char(c)
     }
 
@@ -179,7 +199,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        visitor.visit_borrowed_str(self.read_str()?)
+        visitor.visit_string(self.read_str()?.to_string())
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -259,10 +279,19 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_seq(CountedAccess {
-            de: self,
-            remaining: fields.len(),
-        })
+        match self.mode {
+            EncodingMode::Stable => {
+                let len = self.read_varint_usize()?;
+                visitor.visit_map(CountedAccess {
+                    de: self,
+                    remaining: len,
+                })
+            }
+            EncodingMode::Positional => visitor.visit_seq(CountedAccess {
+                de: self,
+                remaining: fields.len(),
+            }),
+        }
     }
 
     fn deserialize_enum<V: Visitor<'de>>(
@@ -275,19 +304,16 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        // When deserializing enums, identifier is the variant index
-        let variant_index = self.read_varint_u32()?;
-        visitor.visit_u32(variant_index)
+        match self.mode {
+            EncodingMode::Stable => visitor.visit_borrowed_str(self.read_str()?),
+            EncodingMode::Positional => visitor.visit_u32(self.read_varint_u32()?),
+        }
     }
 
-    fn deserialize_ignored_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
-        Err(Error::UnsupportedType(
-            "deserialize_ignored_any (non-self-describing format)",
-        ))
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        visitor.visit_unit()
     }
 }
-
-// ── Enum access ──────────────────────────────────────────────────────────────
 
 impl<'de> de::EnumAccess<'de> for &mut Deserializer<'de> {
     type Error = Error;
@@ -325,14 +351,21 @@ impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_seq(CountedAccess {
-            de: self,
-            remaining: fields.len(),
-        })
+        match self.mode {
+            EncodingMode::Stable => {
+                let len = self.read_varint_usize()?;
+                visitor.visit_map(CountedAccess {
+                    de: self,
+                    remaining: len,
+                })
+            }
+            EncodingMode::Positional => visitor.visit_seq(CountedAccess {
+                de: self,
+                remaining: fields.len(),
+            }),
+        }
     }
 }
-
-// ── Counted access for sequences, tuples, maps, structs ──────────────────────
 
 struct CountedAccess<'a, 'de> {
     de: &'a mut Deserializer<'de>,

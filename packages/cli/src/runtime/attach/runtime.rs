@@ -533,10 +533,11 @@ async fn typed_kill_session_attach(
         selector: ipc_to_session_selector(selector),
         force_local,
     };
-    let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding kill-session args: {error}"),
-    })?;
+    let payload =
+        bmux_codec::to_positional_vec(&args).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding kill-session args: {error}"),
+        })?;
     let response_bytes = client
         .invoke_service_raw(
             sessions_commands::client::KillSessionEndpoint::CAPABILITY.as_str(),
@@ -546,7 +547,7 @@ async fn typed_kill_session_attach(
             payload,
         )
         .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+    bmux_codec::from_positional_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("decoding kill-session response: {error}"),
     })
@@ -589,7 +590,7 @@ async fn typed_list_windows_attach(
 async fn typed_active_runtime_appearance_attach(
     client: &mut StreamingBmuxClient,
 ) -> std::result::Result<RuntimeAppearance, ClientError> {
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+    let payload = bmux_codec::to_positional_vec(&()).map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("encoding active-appearance args: {error}"),
     })?;
@@ -602,7 +603,7 @@ async fn typed_active_runtime_appearance_attach(
             payload,
         )
         .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+    bmux_codec::from_positional_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("decoding active runtime appearance response: {error}"),
     })
@@ -679,10 +680,11 @@ where
     Req: serde::Serialize + Sync,
     Resp: serde::de::DeserializeOwned,
 {
-    let payload = bmux_codec::to_vec(args).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding {operation}: {error}"),
-    })?;
+    let payload =
+        bmux_codec::to_positional_vec(args).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding {operation}: {error}"),
+        })?;
     let response_bytes = client
         .invoke_service_raw(
             windows_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
@@ -692,9 +694,11 @@ where
             payload,
         )
         .await?;
-    bmux_codec::from_bytes::<Resp>(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding {operation} response: {error}"),
+    bmux_codec::from_positional_bytes::<Resp>(&response_bytes).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decoding {operation} response: {error}"),
+        }
     })
 }
 
@@ -9648,10 +9652,11 @@ async fn invoke_attach_input_hook(
     hook: &AttachInputHook,
     event: AttachInputEvent,
 ) -> std::result::Result<AttachInputResult, ClientError> {
-    let payload = bmux_codec::to_vec(&event).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding attach input hook event: {error}"),
-    })?;
+    let payload =
+        bmux_codec::to_positional_vec(&event).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding attach input hook event: {error}"),
+        })?;
     let response = client
         .invoke_service_raw(
             hook.endpoint.capability.clone(),
@@ -9661,7 +9666,7 @@ async fn invoke_attach_input_hook(
             payload,
         )
         .await?;
-    bmux_codec::from_bytes::<AttachInputResult>(&response).map_err(|error| {
+    bmux_codec::from_positional_bytes::<AttachInputResult>(&response).map_err(|error| {
         ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("decoding attach input hook result: {error}"),

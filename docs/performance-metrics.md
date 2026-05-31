@@ -85,12 +85,14 @@ Rate-limited streams may also include:
 
   - periodic attach-loop aggregates (drain IPC + render)
   - detailed/trace payloads include per-extension render counters under `extension_stats`
+  - retained-scene counters report layer calls, current/output item counts, item diff counts, and retained terminal-graphic item counts
+  - terminal-graphic counters report transmits, placements, deletes, and encoded bytes
   - trace includes additional drain behavior (`drain_budget_hits`, etc)
 
 - `attach.frame.trace`
 
   - per-frame render timing and render-work facts (trace level)
-  - includes dirty reasons, full-frame fallback flags, frame byte counts, and per-extension counters for outlier attribution
+  - includes dirty reasons, full-frame fallback flags, frame byte counts, retained-scene counters, terminal-graphic counters, and per-extension counters for outlier attribution
 
 - `attach.exit`
 

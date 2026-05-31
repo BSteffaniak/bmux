@@ -16,7 +16,8 @@ async fn typed_new_session(client: &mut BmuxClient, name: Option<String>) -> Res
     struct Args {
         name: Option<String>,
     }
-    let payload = bmux_codec::to_vec(&Args { name }).context("encoding new-session args")?;
+    let payload =
+        bmux_codec::to_positional_vec(&Args { name }).context("encoding new-session args")?;
     let bytes = client
         .invoke_service_raw(
             "bmux.sessions.write",
@@ -30,7 +31,7 @@ async fn typed_new_session(client: &mut BmuxClient, name: Option<String>) -> Res
     let outcome: std::result::Result<
         bmux_sessions_plugin_api::sessions_commands::SessionAck,
         bmux_sessions_plugin_api::sessions_commands::NewSessionError,
-    > = bmux_codec::from_bytes(&bytes).context("decoding new-session response")?;
+    > = bmux_codec::from_positional_bytes(&bytes).context("decoding new-session response")?;
     outcome
         .map(|ack| ack.id)
         .map_err(|err| anyhow::anyhow!("new-session failed: {err:?}"))

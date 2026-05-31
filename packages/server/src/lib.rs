@@ -324,7 +324,7 @@ fn resolve_pipeline_payload(
                         "pipeline field_order requires a JSON object template"
                     ));
                 };
-                return bmux_codec::to_vec(&PipelineStructTemplate { map, field_order })
+                return bmux_codec::to_positional_vec(&PipelineStructTemplate { map, field_order })
                     .context("failed encoding resolved pipeline struct template");
             }
             bmux_codec::to_vec(&resolved).context("failed encoding resolved pipeline template")
@@ -1510,7 +1510,7 @@ async fn handle_connection(
         let service_metadata = ipc_service_request_metadata(&request);
         let exclusive = request_requires_exclusive(&request);
         let request_record_encode_started = Instant::now();
-        let request_data = bmux_codec::to_vec(&request).unwrap_or_else(|e| {
+        let request_data = bmux_codec::to_positional_vec(&request).unwrap_or_else(|e| {
             tracing::warn!("failed to serialize request for recording: {e}");
             vec![]
         });
@@ -1555,7 +1555,7 @@ async fn handle_connection(
         let (response_record_encode_us, response_record_us) = match &response {
             Response::Ok(payload) => {
                 let response_record_encode_started = Instant::now();
-                let response_data = bmux_codec::to_vec(payload).unwrap_or_else(|e| {
+                let response_data = bmux_codec::to_positional_vec(payload).unwrap_or_else(|e| {
                     tracing::warn!("failed to serialize response for recording: {e}");
                     vec![]
                 });
@@ -2889,8 +2889,8 @@ mod tests {
 
         let encoded = resolve_pipeline_payload(&payload, &inputs, &metadata)
             .expect("pipeline template should encode");
-        let decoded: PipelineTemplateTarget =
-            bmux_codec::from_bytes(&encoded).expect("payload should decode as target struct");
+        let decoded: PipelineTemplateTarget = bmux_codec::from_positional_bytes(&encoded)
+            .expect("payload should decode as target struct");
 
         assert_eq!(
             decoded,

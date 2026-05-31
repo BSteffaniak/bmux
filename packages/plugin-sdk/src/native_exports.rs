@@ -638,5 +638,5 @@ where
         return Err(null_code);
     }
     let payload = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    bmux_codec::from_bytes(payload).map_err(|_| parse_code)
+    bmux_codec::from_positional_bytes(payload).map_err(|_| parse_code)
 }

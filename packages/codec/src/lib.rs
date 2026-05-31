@@ -1,10 +1,14 @@
 //! `bmux_codec` — Custom binary serialization codec for the bmux IPC protocol.
 //!
 //! This crate implements a serde-based binary serializer and deserializer
-//! designed for the bmux wire protocol. It uses LEB128 varints for compact
-//! integer encoding, length-prefixed containers, and varint enum discriminants.
+//! designed for the bmux wire protocol. It uses LEB128 varints for positional
+//! integer encoding and length-prefixed containers. The default representation
+//! is stable: structs are encoded as field-name maps and enum variants are
+//! encoded by variant name. Legacy positional encoding is available through
+//! [`to_positional_vec`] and [`from_positional_bytes`] for transient, space-sensitive
+//! payloads.
 //!
-//! # Wire format
+//! # Stable wire format
 //!
 //! | Element          | Encoding                             |
 //! |-----------------|--------------------------------------|
@@ -20,8 +24,10 @@
 //! | `Vec<T>`        | varint length + elements             |
 //! | `Option<T>`     | 1 byte tag (0=None, 1=Some) + value  |
 //! | `Map<K,V>`      | varint length + key-value pairs      |
-//! | struct          | fields in declaration order, no names |
-//! | enum            | varint variant index + variant data   |
+//! | struct          | varint field count + field-name/value pairs |
+//! | enum            | variant name + variant data            |
+//! | positional struct  | fields in declaration order, no names   |
+//! | positional enum    | varint variant index + variant data     |
 //! | newtype         | transparent (inner value only)        |
 //! | `Box<T>`        | transparent (same as T)              |
 
@@ -30,9 +36,9 @@ mod error;
 mod ser;
 pub mod varint;
 
-pub use de::from_bytes;
+pub use de::{from_bytes, from_positional_bytes};
 pub use error::Error;
-pub use ser::to_vec;
+pub use ser::{to_positional_vec, to_vec};
 
 /// Serde adapter for `Vec<u8>` fields that are semantically raw bytes.
 ///
@@ -377,6 +383,66 @@ mod tests {
         assert_eq!(from_bytes::<TestEnum>(&bytes).unwrap(), v);
     }
 
+    #[test]
+    fn stable_struct_decodes_after_field_reorder() {
+        #[derive(Debug, PartialEq, Serialize)]
+        struct Original {
+            a: u32,
+            b: String,
+        }
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Reordered {
+            b: String,
+            a: u32,
+        }
+
+        let bytes = to_vec(&Original {
+            a: 7,
+            b: "stable".into(),
+        })
+        .unwrap();
+        let decoded = from_bytes::<Reordered>(&bytes).unwrap();
+        assert_eq!(decoded.a, 7);
+        assert_eq!(decoded.b, "stable");
+    }
+
+    #[test]
+    fn stable_enum_decodes_after_variant_reorder() {
+        #[derive(Debug, PartialEq, Serialize)]
+        enum Original {
+            First,
+            Second { value: u32 },
+        }
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum Reordered {
+            Second { value: u32 },
+            First,
+        }
+
+        let first_bytes = to_vec(&Original::First).unwrap();
+        assert_eq!(
+            from_bytes::<Reordered>(&first_bytes).unwrap(),
+            Reordered::First
+        );
+
+        let bytes = to_vec(&Original::Second { value: 42 }).unwrap();
+        let decoded = from_bytes::<Reordered>(&bytes).unwrap();
+        assert_eq!(decoded, Reordered::Second { value: 42 });
+    }
+
+    #[test]
+    fn positional_roundtrip_still_available() {
+        let v = TestEnum::Struct {
+            x: -7,
+            y: "world".into(),
+        };
+        let bytes = to_positional_vec(&v).unwrap();
+        assert_eq!(from_positional_bytes::<TestEnum>(&bytes).unwrap(), v);
+        assert!(from_bytes::<TestEnum>(&bytes).is_err());
+    }
+
     // ── Nested / recursive types ─────────────────────────────────────────────
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -697,9 +763,8 @@ mod tests {
             A,
             B,
         }
-        // Variant index 99 is out of range for a 2-variant enum
-        let mut bytes = Vec::new();
-        varint::encode_u32(&mut bytes, 99);
+        // Variant name is unknown for a 2-variant enum.
+        let bytes = to_vec(&"missing").unwrap();
         let result = from_bytes::<SmallEnum>(&bytes);
         assert!(result.is_err());
     }

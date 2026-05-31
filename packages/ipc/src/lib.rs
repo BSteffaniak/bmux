@@ -552,7 +552,7 @@ pub fn encode<T>(message: &T) -> Result<Vec<u8>, bmux_codec::Error>
 where
     T: Serialize,
 {
-    bmux_codec::to_vec(message)
+    bmux_codec::to_positional_vec(message)
 }
 
 /// Deserialize any protocol message using the bmux binary codec.
@@ -564,7 +564,7 @@ pub fn decode<T>(bytes: &[u8]) -> Result<T, bmux_codec::Error>
 where
     T: DeserializeOwned,
 {
-    bmux_codec::from_bytes(bytes)
+    bmux_codec::from_positional_bytes(bytes)
 }
 
 #[cfg(test)]

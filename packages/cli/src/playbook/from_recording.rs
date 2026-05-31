@@ -469,7 +469,7 @@ fn request_to_dsl(
                 struct NewSessionArgs {
                     name: Option<String>,
                 }
-                if let Ok(args) = bmux_codec::from_bytes::<NewSessionArgs>(payload) {
+                if let Ok(args) = bmux_codec::from_positional_bytes::<NewSessionArgs>(payload) {
                     *has_session = true;
                     return RequestDslResult::Line(args.name.map_or_else(
                         || "new-session".to_string(),
@@ -488,7 +488,7 @@ fn request_to_dsl(
                     #[serde(default)]
                     name: Option<String>,
                 }
-                if let Ok(args) = bmux_codec::from_bytes::<KillSessionArgs>(payload)
+                if let Ok(args) = bmux_codec::from_positional_bytes::<KillSessionArgs>(payload)
                     && let Some(name) = args.selector.name
                 {
                     return RequestDslResult::Line(format!("kill-session name='{name}'"));
@@ -513,7 +513,8 @@ fn request_to_dsl(
                             #[serde(rename = "cell_pixel_h")]
                             _cell_pixel_h: u16,
                         }
-                        if let Ok(args) = bmux_codec::from_bytes::<ViewportArgs>(payload) {
+                        if let Ok(args) = bmux_codec::from_positional_bytes::<ViewportArgs>(payload)
+                        {
                             return RequestDslResult::Line(format!(
                                 "resize-viewport cols={} rows={}",
                                 args.cols, args.rows
@@ -527,7 +528,7 @@ fn request_to_dsl(
                             _session_id: Uuid,
                             data: Vec<u8>,
                         }
-                        if let Ok(args) = bmux_codec::from_bytes::<InputArgs>(payload) {
+                        if let Ok(args) = bmux_codec::from_positional_bytes::<InputArgs>(payload) {
                             if args.data.is_empty() || !*has_session {
                                 return RequestDslResult::Skip;
                             }

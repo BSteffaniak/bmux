@@ -234,9 +234,10 @@ where
 {
     let timing_enabled = PhaseChannel::Service.enabled();
     let started_at = timing_enabled.then(Instant::now);
-    let result = bmux_codec::to_vec(message).map_err(|error| PluginError::ServiceProtocol {
-        details: error.to_string(),
-    });
+    let result =
+        bmux_codec::to_positional_vec(message).map_err(|error| PluginError::ServiceProtocol {
+            details: error.to_string(),
+        });
     if let Some(started_at) = started_at {
         emit_service_codec_timing::<T>("typed_service.message_encode", started_at, &result);
     }
@@ -254,9 +255,10 @@ where
 {
     let timing_enabled = PhaseChannel::Service.enabled();
     let started_at = timing_enabled.then(Instant::now);
-    let result = bmux_codec::from_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
-        details: error.to_string(),
-    });
+    let result =
+        bmux_codec::from_positional_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
+            details: error.to_string(),
+        });
     if let Some(started_at) = started_at {
         let total_us = started_at.elapsed().as_micros();
         let payload = PhasePayload::new("typed_service.message_decode")

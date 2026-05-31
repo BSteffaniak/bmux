@@ -1028,7 +1028,7 @@ pub(super) fn extract_viewport_from_events(
             if interface_id != "attach-runtime-commands" || operation != "attach-set-viewport" {
                 continue;
             }
-            if let Ok(args) = bmux_codec::from_bytes::<ViewportArgs>(&payload) {
+            if let Ok(args) = bmux_codec::from_positional_bytes::<ViewportArgs>(&payload) {
                 return Some((args.cols, args.rows));
             }
         }

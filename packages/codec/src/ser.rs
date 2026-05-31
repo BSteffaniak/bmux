@@ -2,32 +2,68 @@ use crate::error::Error;
 use crate::varint;
 use serde::ser::{self, Serialize};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EncodingMode {
+    Stable,
+    Positional,
+}
+
 /// A binary serializer for the bmux wire protocol.
 ///
-/// Encodes data using LEB128 varints for integers, length-prefixed containers,
-/// and varint enum discriminants. Struct fields are written in declaration order
-/// without field names.
+/// By default, structs and struct variants are encoded as field-name maps and
+/// enum variants are encoded by variant name. Use [`to_positional_vec`] for the
+/// positional representation that writes struct fields positionally and
+/// enum variants by declaration index.
 pub struct Serializer {
     output: Vec<u8>,
+    mode: EncodingMode,
 }
 
 impl Serializer {
-    fn new() -> Self {
-        Serializer { output: Vec::new() }
+    fn new(mode: EncodingMode) -> Self {
+        Serializer {
+            output: Vec::new(),
+            mode,
+        }
     }
 
     fn into_vec(self) -> Vec<u8> {
         self.output
     }
+
+    fn write_str(&mut self, value: &str) {
+        varint::encode_usize(&mut self.output, value.len());
+        self.output.extend_from_slice(value.as_bytes());
+    }
 }
 
-/// Serialize a value to a byte vector.
+/// Serialize a value to a stable byte vector.
 ///
 /// # Errors
 ///
 /// Returns an error if the value fails to serialize.
 pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    let mut serializer = Serializer::new();
+    to_vec_with_mode(value, EncodingMode::Stable)
+}
+
+/// Serialize a value to a positional byte vector.
+///
+/// Positional encoding writes struct fields in declaration order and enum variants
+/// by declaration index. Prefer [`to_vec`] unless the payload is transient and
+/// space/performance sensitive.
+///
+/// # Errors
+///
+/// Returns an error if the value fails to serialize.
+pub fn to_positional_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
+    to_vec_with_mode(value, EncodingMode::Positional)
+}
+
+pub(crate) fn to_vec_with_mode<T: Serialize>(
+    value: &T,
+    mode: EncodingMode,
+) -> Result<Vec<u8>, Error> {
+    let mut serializer = Serializer::new(mode);
     value.serialize(&mut serializer)?;
     Ok(serializer.into_vec())
 }
@@ -50,7 +86,6 @@ impl ser::Serializer for &mut Serializer {
     }
 
     fn serialize_i8(self, v: i8) -> Result<(), Error> {
-        // ZigZag + LEB128 for consistency (though i8 is rare)
         varint::encode_i16(&mut self.output, i16::from(v));
         Ok(())
     }
@@ -101,14 +136,12 @@ impl ser::Serializer for &mut Serializer {
     }
 
     fn serialize_char(self, v: char) -> Result<(), Error> {
-        // Encode as u32 (Unicode scalar value)
         varint::encode_u32(&mut self.output, v as u32);
         Ok(())
     }
 
     fn serialize_str(self, v: &str) -> Result<(), Error> {
-        varint::encode_usize(&mut self.output, v.len());
-        self.output.extend_from_slice(v.as_bytes());
+        self.write_str(v);
         Ok(())
     }
 
@@ -140,10 +173,15 @@ impl ser::Serializer for &mut Serializer {
         self,
         _name: &'static str,
         variant_index: u32,
-        _variant: &'static str,
+        variant: &'static str,
     ) -> Result<(), Error> {
-        varint::encode_u32(&mut self.output, variant_index);
-        Ok(())
+        match self.mode {
+            EncodingMode::Stable => self.serialize_str(variant),
+            EncodingMode::Positional => {
+                varint::encode_u32(&mut self.output, variant_index);
+                Ok(())
+            }
+        }
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
@@ -158,10 +196,13 @@ impl ser::Serializer for &mut Serializer {
         self,
         _name: &'static str,
         variant_index: u32,
-        _variant: &'static str,
+        variant: &'static str,
         value: &T,
     ) -> Result<(), Error> {
-        varint::encode_u32(&mut self.output, variant_index);
+        match self.mode {
+            EncodingMode::Stable => self.serialize_str(variant)?,
+            EncodingMode::Positional => varint::encode_u32(&mut self.output, variant_index),
+        }
         value.serialize(self)
     }
 
@@ -174,7 +215,6 @@ impl ser::Serializer for &mut Serializer {
     }
 
     fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Error> {
-        // Tuple fields are serialized in order, no length prefix needed (known at compile time)
         Ok(self)
     }
 
@@ -190,10 +230,13 @@ impl ser::Serializer for &mut Serializer {
         self,
         _name: &'static str,
         variant_index: u32,
-        _variant: &'static str,
+        variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleVariant, Error> {
-        varint::encode_u32(&mut self.output, variant_index);
+        match self.mode {
+            EncodingMode::Stable => self.serialize_str(variant)?,
+            EncodingMode::Positional => varint::encode_u32(&mut self.output, variant_index),
+        }
         Ok(self)
     }
 
@@ -208,9 +251,11 @@ impl ser::Serializer for &mut Serializer {
     fn serialize_struct(
         self,
         _name: &'static str,
-        _len: usize,
+        len: usize,
     ) -> Result<Self::SerializeStruct, Error> {
-        // Struct fields serialized in order, no names on wire
+        if self.mode == EncodingMode::Stable {
+            varint::encode_usize(&mut self.output, len);
+        }
         Ok(self)
     }
 
@@ -218,15 +263,19 @@ impl ser::Serializer for &mut Serializer {
         self,
         _name: &'static str,
         variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
+        variant: &'static str,
+        len: usize,
     ) -> Result<Self::SerializeStructVariant, Error> {
-        varint::encode_u32(&mut self.output, variant_index);
+        match self.mode {
+            EncodingMode::Stable => {
+                self.serialize_str(variant)?;
+                varint::encode_usize(&mut self.output, len);
+            }
+            EncodingMode::Positional => varint::encode_u32(&mut self.output, variant_index),
+        }
         Ok(self)
     }
 }
-
-// ── Compound type serialization ──────────────────────────────────────────────
 
 impl ser::SerializeSeq for &mut Serializer {
     type Ok = ();
@@ -303,9 +352,12 @@ impl ser::SerializeStruct for &mut Serializer {
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
-        _key: &'static str,
+        key: &'static str,
         value: &T,
     ) -> Result<(), Error> {
+        if self.mode == EncodingMode::Stable {
+            self.write_str(key);
+        }
         value.serialize(&mut **self)
     }
 
@@ -320,9 +372,12 @@ impl ser::SerializeStructVariant for &mut Serializer {
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
-        _key: &'static str,
+        key: &'static str,
         value: &T,
     ) -> Result<(), Error> {
+        if self.mode == EncodingMode::Stable {
+            self.write_str(key);
+        }
         value.serialize(&mut **self)
     }
 

@@ -919,7 +919,7 @@ impl RemoteTerminalBackend {
     async fn attach_auto_session(client: &mut BmuxClient) -> Result<(Uuid, bool)> {
         // Typed dispatch: `sessions-state:list-sessions` then
         // `sessions-commands:new-session` if the list is empty.
-        let list_payload = bmux_codec::to_vec(&())
+        let list_payload = bmux_codec::to_positional_vec(&())
             .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
         let list_bytes = client
             .invoke_service_raw(
@@ -932,7 +932,7 @@ impl RemoteTerminalBackend {
             .await
             .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
         let sessions: Vec<bmux_sessions_plugin_api::sessions_state::SessionSummary> =
-            bmux_codec::from_bytes(&list_bytes)
+            bmux_codec::from_positional_bytes(&list_bytes)
                 .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
 
         let selector =
@@ -943,7 +943,7 @@ impl RemoteTerminalBackend {
                 struct NewArgs {
                     name: Option<String>,
                 }
-                let new_payload = bmux_codec::to_vec(&NewArgs { name: None })
+                let new_payload = bmux_codec::to_positional_vec(&NewArgs { name: None })
                     .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
                 let new_bytes = client
                     .invoke_service_raw(
@@ -958,7 +958,7 @@ impl RemoteTerminalBackend {
                 let outcome: std::result::Result<
                     bmux_sessions_plugin_api::sessions_commands::SessionAck,
                     bmux_sessions_plugin_api::sessions_commands::NewSessionError,
-                > = bmux_codec::from_bytes(&new_bytes)
+                > = bmux_codec::from_positional_bytes(&new_bytes)
                     .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
                 let ack = outcome.map_err(|err| {
                     MobileCoreError::TerminalBackendFailure(format!("new-session failed: {err:?}"))
@@ -1368,7 +1368,7 @@ async fn handle_session_mouse_event(
                 index: None,
             },
         };
-        let encoded = bmux_codec::to_vec(&args).map_err(|error| {
+        let encoded = bmux_codec::to_positional_vec(&args).map_err(|error| {
             MobileCoreError::TerminalBackendFailure(format!(
                 "encoding focus-pane-by-selector args: {error}"
             ))
