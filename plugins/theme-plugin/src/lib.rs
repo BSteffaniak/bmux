@@ -608,7 +608,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
             }
             event = event_rx.recv() => {
                 if let Some(PromptEvent::SelectionChanged { value, .. }) = event
-                    && let Some(theme) = resolve_theme_stack_with_settings(&catalog, &base_theme_stack(&value), &settings)
+                    && let Some(theme) = resolve_theme_picker_selection(&catalog, &value, &settings)
                 {
                     publish_runtime_appearance_to_host(&context, &theme);
                     apply_theme_extensions(
@@ -623,8 +623,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
     };
 
     if let Some(name) = selected_name
-        && let Some(theme) =
-            resolve_theme_stack_with_settings(&catalog, &base_theme_stack(&name), &settings)
+        && let Some(theme) = resolve_theme_picker_selection(&catalog, &name, &settings)
     {
         publish_runtime_appearance_to_host(&context, &theme);
         apply_theme_extensions(
@@ -1297,6 +1296,18 @@ fn resolve_theme_stack_with_settings(
     } else {
         resolve_split_theme_stack(catalog, stack, settings)?
     };
+    apply_theme_settings_component_overrides(&mut theme, &settings.theme_settings);
+    apply_settings_component_overrides(&mut theme, &settings.components);
+    apply_settings_component_target_overrides(&mut theme, &settings.component_targets);
+    Some(theme)
+}
+
+fn resolve_theme_picker_selection(
+    catalog: &[ThemeCatalogEntry],
+    name: &str,
+    settings: &ThemePluginSettings,
+) -> Option<ResolvedTheme> {
+    let mut theme = resolve_theme_stack(catalog, &base_theme_stack(name))?;
     apply_theme_settings_component_overrides(&mut theme, &settings.theme_settings);
     apply_settings_component_overrides(&mut theme, &settings.components);
     apply_settings_component_target_overrides(&mut theme, &settings.component_targets);
@@ -2522,6 +2533,78 @@ mod tests {
                 theme: pong_theme_with_component(),
             },
         ]
+    }
+
+    #[test]
+    fn picker_selection_ignores_configured_split_theme_providers() {
+        let selected_theme: ThemeConfig = toml::from_str(
+            r##"
+            name = "tetris"
+            foreground = "#00ffff"
+
+            [settings.providers.tetris]
+            prompt_on_select = true
+            storage_key = "theme_settings.tetris"
+
+            [settings.component_settings.tetris]
+            components = ["tetris.board"]
+
+            [plugins."bmux.decoration".components."tetris.board"]
+            script = "tetris"
+            "##,
+        )
+        .expect("selected theme parses");
+        let configured_component_theme: ThemeConfig = toml::from_str(
+            r##"
+            name = "performance"
+            foreground = "#ffffff"
+
+            [settings.providers.performance]
+            prompt_on_select = true
+            storage_key = "theme_settings.performance"
+
+            [settings.component_settings.performance]
+            components = ["performance.header"]
+
+            [plugins."bmux.decoration".components."performance.header"]
+            script = "performance_header"
+            "##,
+        )
+        .expect("configured component theme parses");
+        let catalog = vec![
+            ThemeCatalogEntry {
+                name: "mode-aware".to_string(),
+                theme: ThemeConfig::default(),
+            },
+            ThemeCatalogEntry {
+                name: "performance".to_string(),
+                theme: configured_component_theme,
+            },
+            ThemeCatalogEntry {
+                name: "tetris".to_string(),
+                theme: selected_theme,
+            },
+        ];
+        let settings = ThemePluginSettings {
+            appearance_themes: vec!["performance".to_string()],
+            component_themes: vec!["performance".to_string()],
+            ..ThemePluginSettings::default()
+        };
+
+        let resolved = resolve_theme_picker_selection(&catalog, "tetris", &settings)
+            .expect("picker selection resolves");
+
+        assert!(resolved.settings.providers.contains_key("tetris"));
+        assert!(!resolved.settings.providers.contains_key("performance"));
+        let components = resolved
+            .plugins
+            .get("bmux.decoration")
+            .and_then(toml::Value::as_table)
+            .and_then(|decoration| decoration.get("components"))
+            .and_then(toml::Value::as_table)
+            .expect("selected theme components exist");
+        assert!(components.contains_key("tetris.board"));
+        assert!(!components.contains_key("performance.header"));
     }
 
     #[test]
