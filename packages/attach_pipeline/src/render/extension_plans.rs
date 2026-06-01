@@ -227,31 +227,39 @@ pub(super) fn apply_previous_extension_snapshot_damage(
     }
 }
 
+pub(super) struct PreviousExtensionSnapshotCleanupQuery<'a> {
+    pub(super) pane_buffer: Option<&'a PaneRenderBuffer>,
+    pub(super) surface_id: Uuid,
+    pub(super) layer: RenderExtensionLayer,
+    pub(super) surface_rect: ExtensionRect,
+    pub(super) policy: DamageCoalescingPolicy,
+    pub(super) capabilities: TerminalRenderCapabilities,
+    pub(super) retained_snapshot_keys: &'a BTreeSet<(String, Uuid)>,
+}
+
 pub(super) fn previous_extension_snapshot_cleanup_damage(
-    pane_buffer: Option<&PaneRenderBuffer>,
-    surface_id: Uuid,
-    layer: RenderExtensionLayer,
-    surface_rect: ExtensionRect,
-    policy: DamageCoalescingPolicy,
-    capabilities: TerminalRenderCapabilities,
+    query: &PreviousExtensionSnapshotCleanupQuery<'_>,
     layer_snapshots: &[ExtensionLayerSnapshot],
 ) -> RenderDamage {
-    let Some(buffer) = pane_buffer else {
+    let Some(buffer) = query.pane_buffer else {
         return RenderDamage::None;
     };
     let current_keys = layer_snapshots
         .iter()
-        .map(|snapshot| snapshot.cache_key(capabilities))
+        .map(|snapshot| snapshot.cache_key(query.capabilities))
         .collect::<BTreeSet<_>>();
     let mut rects = Vec::new();
     for (key, previous) in &buffer.extension_layer_snapshot_cache {
-        if previous.surface_id != surface_id || previous.layer != layer {
+        if previous.surface_id != query.surface_id || previous.layer != query.layer {
+            continue;
+        }
+        if query.retained_snapshot_keys.contains(key) {
             continue;
         }
         let stale = !current_keys.contains(key)
             || layer_snapshots
                 .iter()
-                .find(|snapshot| snapshot.cache_key(capabilities) == *key)
+                .find(|snapshot| snapshot.cache_key(query.capabilities) == *key)
                 .is_some_and(|snapshot| {
                     extension_snapshot_needs_previous_cleanup(previous, snapshot)
                 });
@@ -264,7 +272,11 @@ pub(super) fn previous_extension_snapshot_cleanup_damage(
             RenderDamage::Regions(regions) => rects.extend(regions.iter().copied()),
         }
     }
-    coalesce_render_damage(RenderDamage::Regions(rects), surface_rect, policy)
+    coalesce_render_damage(
+        RenderDamage::Regions(rects),
+        query.surface_rect,
+        query.policy,
+    )
 }
 
 pub(super) fn commit_extension_layer_snapshots_for_surface(

@@ -48,9 +48,10 @@ use extension_plans::{
     AfterContentExtensionOutputAction, AfterContentExtensionOutputPlan,
     AfterContentSurfaceOutputPlan, BeforeContentExtensionOutputAction,
     BeforeContentExtensionOutputPlan, BeforeContentSurfaceOutputPlan, ExtensionLayerSnapshot,
-    apply_previous_extension_snapshot_damage, build_after_content_surface_output_plan,
-    build_before_content_surface_output_plan, commit_extension_layer_snapshots_for_surface,
-    extension_layer_snapshots_for_surface, previous_extension_snapshot_cleanup_damage,
+    PreviousExtensionSnapshotCleanupQuery, apply_previous_extension_snapshot_damage,
+    build_after_content_surface_output_plan, build_before_content_surface_output_plan,
+    commit_extension_layer_snapshots_for_surface, extension_layer_snapshots_for_surface,
+    previous_extension_snapshot_cleanup_damage,
 };
 #[cfg(test)]
 use extension_plans::{
@@ -3513,12 +3514,15 @@ fn after_content_stale_snapshot_damage_for_surface(
         }
     }
     match previous_extension_snapshot_cleanup_damage(
-        pane_buffer,
-        surface_id,
-        RenderExtensionLayer::AfterPaneContent,
-        surface_rect,
-        policy,
-        capabilities,
+        &PreviousExtensionSnapshotCleanupQuery {
+            pane_buffer,
+            surface_id,
+            layer: RenderExtensionLayer::AfterPaneContent,
+            surface_rect,
+            policy,
+            capabilities,
+            retained_snapshot_keys,
+        },
         &fallback_snapshots,
     ) {
         RenderDamage::None => {}
@@ -5302,15 +5306,16 @@ mod tests {
         BeforeContentExtensionOutputAction, BeforeContentSurfaceOutputPlan, DamageCoalescingPolicy,
         DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext,
         PaneContentDamagePlan, PaneContentRowOutputPlan, PaneContentRowSegmentOutput,
-        PaneSurfaceFramePlan, RenderVisibleCell, RenderVisibleCellPlan, SurfaceOutputPlan,
-        SurfaceOutputStage, SurfaceOutputStages, TerminalCommand, append_pane_output,
-        build_after_content_extension_output_plan, build_before_content_extension_output_plan,
-        build_render_ops_output_plan, coalesce_render_damage,
-        commit_extension_layer_snapshots_for_surface, execute_pane_content_row_output_plan,
-        frame_damage_overlay_render_ops, opaque_row_text, optimize_terminal_commands,
-        previous_extension_snapshot_cleanup_damage, queue_frame_damage_overlay,
-        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
-        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        PaneSurfaceFramePlan, PreviousExtensionSnapshotCleanupQuery, RenderVisibleCell,
+        RenderVisibleCellPlan, SurfaceOutputPlan, SurfaceOutputStage, SurfaceOutputStages,
+        TerminalCommand, append_pane_output, build_after_content_extension_output_plan,
+        build_before_content_extension_output_plan, build_render_ops_output_plan,
+        coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
+        execute_pane_content_row_output_plan, frame_damage_overlay_render_ops, opaque_row_text,
+        optimize_terminal_commands, previous_extension_snapshot_cleanup_damage,
+        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
+        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
+        render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -6553,13 +6558,95 @@ mod tests {
         );
 
         let cleanup_damage = previous_extension_snapshot_cleanup_damage(
-            pane_buffers.get(&pane_id),
+            &PreviousExtensionSnapshotCleanupQuery {
+                pane_buffer: pane_buffers.get(&pane_id),
+                surface_id,
+                layer: RenderExtensionLayer::AfterPaneContent,
+                surface_rect,
+                policy: DamageCoalescingPolicy::default(),
+                capabilities: bmux_plugin::TerminalRenderCapabilities::default(),
+                retained_snapshot_keys: &BTreeSet::new(),
+            },
+            &[current_snapshot],
+        );
+
+        assert_eq!(cleanup_damage, RenderDamage::None);
+    }
+
+    #[test]
+    fn retained_snapshot_key_suppresses_legacy_snapshot_cleanup() {
+        struct RetainedMigratedExtension;
+
+        impl bmux_plugin::AttachRenderExtension for RetainedMigratedExtension {
+            fn name(&self) -> &'static str {
+                "test.retained_migrated"
+            }
+
+            fn surface_layer_damage(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _layer: RenderExtensionLayer,
+            ) -> RenderDamage {
+                RenderDamage::FullSurface
+            }
+
+            fn render_layer_revision(
+                &self,
+                _surface_id: Uuid,
+                _layer: RenderExtensionLayer,
+            ) -> Option<u64> {
+                Some(1)
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn std::io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let surface_id = Uuid::from_u128(14);
+        let pane_id = Uuid::from_u128(15);
+        let surface_rect = ExtensionRect::new(0, 0, 20, 5);
+        let extension: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension> =
+            std::sync::Arc::new(RetainedMigratedExtension);
+        let snapshot = ExtensionLayerSnapshot::build(
+            &extension,
+            surface_id,
+            pane_id,
+            surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &FrameDamage::default(),
+            DamageCoalescingPolicy::default(),
+        );
+        let retained_key = snapshot.cache_key(bmux_plugin::TerminalRenderCapabilities::default());
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        commit_extension_layer_snapshots_for_surface(
+            &mut pane_buffers,
+            bmux_plugin::TerminalRenderCapabilities::default(),
+            pane_id,
             surface_id,
             RenderExtensionLayer::AfterPaneContent,
-            surface_rect,
-            DamageCoalescingPolicy::default(),
-            bmux_plugin::TerminalRenderCapabilities::default(),
-            &[current_snapshot],
+            &[snapshot],
+        );
+
+        let retained_keys = std::collections::BTreeSet::from([retained_key]);
+        let cleanup_damage = previous_extension_snapshot_cleanup_damage(
+            &PreviousExtensionSnapshotCleanupQuery {
+                pane_buffer: pane_buffers.get(&pane_id),
+                surface_id,
+                layer: RenderExtensionLayer::AfterPaneContent,
+                surface_rect,
+                policy: DamageCoalescingPolicy::default(),
+                capabilities: bmux_plugin::TerminalRenderCapabilities::default(),
+                retained_snapshot_keys: &retained_keys,
+            },
+            &[],
         );
 
         assert_eq!(cleanup_damage, RenderDamage::None);
