@@ -79,10 +79,10 @@ pub(super) fn run_config_scope_explain(
     let cwd = cwd
         .map(std::path::Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
-    let target = ConfigScopeTarget {
-        name: scope.to_string(),
-        cwd,
-    };
+    let mut target = ConfigScopeTarget::new(scope.to_string());
+    if let Some(cwd) = cwd {
+        target = target.cwd(cwd);
+    }
     let request = ScopedConfigLoadRequest::new(target);
     let (config, explain) = BmuxConfig::explain_from_path_for_scope_with_overrides(
         &paths.config_file(),

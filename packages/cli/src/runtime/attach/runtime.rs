@@ -620,10 +620,11 @@ async fn typed_runtime_appearance_service<Request>(
 where
     Request: serde::Serialize + Sync,
 {
-    let payload = bmux_codec::to_positional_vec(request).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding {operation} args: {error}"),
-    })?;
+    let payload =
+        bmux_codec::to_positional_vec(request).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding {operation} args: {error}"),
+        })?;
     let response_bytes = client
         .invoke_service_raw(
             "bmux.theme.read",

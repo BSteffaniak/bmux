@@ -20,7 +20,7 @@ pub const BMUX_CONFIG_ENV: &str = "BMUX_CONFIG";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigScopeTarget {
     pub name: String,
-    pub cwd: Option<PathBuf>,
+    pub attributes: BTreeMap<String, String>,
 }
 
 impl ConfigScopeTarget {
@@ -28,16 +28,43 @@ impl ConfigScopeTarget {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            cwd: None,
+            attributes: BTreeMap::new(),
         }
     }
 
     #[must_use]
+    pub fn with_attribute(
+        name: impl Into<String>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self::new(name).attribute(key, value)
+    }
+
+    #[must_use]
     pub fn with_cwd(name: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
-        Self {
-            name: name.into(),
-            cwd: Some(cwd.into()),
-        }
+        Self::new(name).cwd(cwd)
+    }
+
+    #[must_use]
+    pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.attributes.insert(key.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn cwd(self, cwd: impl Into<PathBuf>) -> Self {
+        self.attribute("cwd", cwd.into().to_string_lossy().into_owned())
+    }
+
+    #[must_use]
+    pub fn attribute_value(&self, key: &str) -> Option<&str> {
+        self.attributes.get(key).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn cwd_path(&self) -> Option<PathBuf> {
+        self.attribute_value("cwd").map(PathBuf::from)
     }
 
     #[must_use]
@@ -657,8 +684,8 @@ fn merged_raw_config_value_for_scope(
         .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
     let mut loaded_any = !matches!(&merged, toml::Value::Table(table) if table.is_empty());
 
-    if let Some(cwd) = request.target.cwd.as_deref() {
-        for path in discover_local_config_paths(cwd, &request.local_config_filename, base_path) {
+    if let Some(cwd) = request.target.cwd_path() {
+        for path in discover_local_config_paths(&cwd, &request.local_config_filename, base_path) {
             let local_value = load_toml_file(&path)?;
             if let Some(overlay) = scoped_local_overlay_for_target(local_value, &request.target)? {
                 merge_toml_value(&mut merged, overlay);
@@ -3022,8 +3049,9 @@ impl BmuxConfig {
                 scopes: vec!["global".to_string()],
             });
         }
-        if let Some(cwd) = request.target.cwd.as_deref() {
-            for local_path in discover_local_config_paths(cwd, &request.local_config_filename, path)
+        if let Some(cwd) = request.target.cwd_path() {
+            for local_path in
+                discover_local_config_paths(&cwd, &request.local_config_filename, path)
             {
                 let local_value = load_toml_file(&local_path)?;
                 let (overlay, scopes) =
@@ -3039,7 +3067,7 @@ impl BmuxConfig {
             config,
             ScopedConfigExplain {
                 target_scope: normalize_scope_name(&request.target.name),
-                cwd: request.target.cwd.clone(),
+                cwd: request.target.cwd_path(),
                 global_config_path: path.to_path_buf(),
                 local_config_filename: request.local_config_filename.clone(),
                 sources,
