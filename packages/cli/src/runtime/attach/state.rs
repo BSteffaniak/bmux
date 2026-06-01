@@ -1,5 +1,6 @@
 use crate::input::RuntimeAction;
 use crate::status::AttachStatusLine;
+use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachMouseProtocolState, AttachScene, AttachSurface,
 };
@@ -277,6 +278,7 @@ pub struct AttachViewState {
     pub cached_sessions: Vec<SessionRow>,
     pub cached_context_session_bindings: Vec<ContextSessionBinding>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    pub scoped_pane_appearances: BTreeMap<Uuid, RuntimeAppearance>,
     pub terminal_graphics_cache: TerminalGraphicsCache,
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
@@ -518,6 +520,7 @@ impl AttachViewState {
             cached_sessions: Vec::new(),
             cached_context_session_bindings: Vec::new(),
             pane_buffers: BTreeMap::new(),
+            scoped_pane_appearances: BTreeMap::new(),
             terminal_graphics_cache: TerminalGraphicsCache::new(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
@@ -568,6 +571,17 @@ impl AttachViewState {
         }
     }
 
+    #[must_use]
+    pub fn runtime_appearance_for_pane<'a>(
+        &'a self,
+        pane_id: &Uuid,
+        fallback: &'a RuntimeAppearance,
+    ) -> &'a RuntimeAppearance {
+        self.scoped_pane_appearances
+            .get(pane_id)
+            .unwrap_or(fallback)
+    }
+
     pub fn set_transient_status(
         &mut self,
         message: impl Into<String>,
@@ -613,5 +627,50 @@ impl AttachViewState {
 
     pub const fn selection_active(&self) -> bool {
         self.selection_anchor.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_scoped_appearance_overrides_fallback_deterministically() {
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: Uuid::from_u128(1),
+            context_id: None,
+            can_write: true,
+        });
+        let pane_id = Uuid::from_u128(2);
+        let fallback = RuntimeAppearance::default();
+        let override_appearance = RuntimeAppearance {
+            foreground: "#abcdef".to_string(),
+            ..RuntimeAppearance::default()
+        };
+
+        assert_eq!(
+            state
+                .runtime_appearance_for_pane(&pane_id, &fallback)
+                .foreground,
+            fallback.foreground
+        );
+
+        state
+            .scoped_pane_appearances
+            .insert(pane_id, override_appearance.clone());
+        assert_eq!(
+            state
+                .runtime_appearance_for_pane(&pane_id, &fallback)
+                .foreground,
+            override_appearance.foreground
+        );
+
+        state.scoped_pane_appearances.remove(&pane_id);
+        assert_eq!(
+            state
+                .runtime_appearance_for_pane(&pane_id, &fallback)
+                .foreground,
+            fallback.foreground
+        );
     }
 }

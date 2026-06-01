@@ -82,6 +82,17 @@ impl RustPlugin for ThemePlugin {
                 info!(cwd = %req.cwd, "active runtime appearance service returned cwd-scoped theme appearance");
                 Ok(appearance)
             },
+            "theme-state", "active-appearance-for-scope" => |req: ActiveAppearanceForScopeArgs, ctx| {
+                let target = ConfigScopeTarget {
+                    name: req.scope,
+                    attributes: req.attributes,
+                };
+                let appearance = active_runtime_appearance_for_scope(ctx, target).ok_or_else(|| {
+                    ServiceResponse::error("theme_not_found", "active theme was not found for scope")
+                })?;
+                info!("active runtime appearance service returned scope-scoped theme appearance");
+                Ok(appearance)
+            },
         })
     }
 }
@@ -389,6 +400,12 @@ struct ActiveAppearanceForCwdArgs {
     cwd: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ActiveAppearanceForScopeArgs {
+    scope: String,
+    attributes: BTreeMap<String, String>,
+}
+
 trait ThemeHostContext: HostRuntimeApi {
     fn settings_value(&self) -> Option<&toml::Value>;
 
@@ -482,7 +499,14 @@ fn active_runtime_appearance_for_cwd(
     context: &(impl ThemeHostContext + ?Sized),
     cwd: &str,
 ) -> Option<RuntimeAppearance> {
-    let scoped_settings = scoped_theme_settings_for_cwd(context, cwd).ok()?;
+    active_runtime_appearance_for_scope(context, ConfigScopeTarget::with_cwd("pane", cwd))
+}
+
+fn active_runtime_appearance_for_scope(
+    context: &(impl ThemeHostContext + ?Sized),
+    target: ConfigScopeTarget,
+) -> Option<RuntimeAppearance> {
+    let scoped_settings = scoped_theme_settings_for_target(context, target).ok()?;
     configured_theme_with_settings(context, &scoped_settings).map(|active| active.theme.appearance)
 }
 
@@ -1147,12 +1171,12 @@ fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
         .unwrap_or_default()
 }
 
-fn scoped_theme_settings_for_cwd(
+fn scoped_theme_settings_for_target(
     context: &(impl ThemeHostContext + ?Sized),
-    cwd: &str,
+    target: ConfigScopeTarget,
 ) -> bmux_config::Result<ThemePluginSettings> {
     let paths = config_paths_from_connection(context.connection_info());
-    let request = ScopedConfigLoadRequest::new(ConfigScopeTarget::with_cwd("pane", cwd));
+    let request = ScopedConfigLoadRequest::new(target);
     let config = BmuxConfig::load_from_path_for_scope_with_overrides(
         &paths.config_file(),
         &ConfigLoadOverrides::default(),

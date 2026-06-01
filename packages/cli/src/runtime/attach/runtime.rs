@@ -583,8 +583,9 @@ async fn typed_list_windows_attach(
 }
 
 #[derive(Debug, serde::Serialize)]
-struct ActiveAppearanceForCwdRequest {
-    cwd: String,
+struct ActiveAppearanceForScopeRequest {
+    scope: String,
+    attributes: BTreeMap<String, String>,
 }
 
 /// Pull the theme plugin's retained runtime appearance on attach startup.
@@ -602,11 +603,25 @@ async fn typed_active_runtime_appearance_for_cwd_attach(
     client: &mut StreamingBmuxClient,
     cwd: &str,
 ) -> std::result::Result<RuntimeAppearance, ClientError> {
+    typed_active_runtime_appearance_for_scope_attach(
+        client,
+        "pane",
+        BTreeMap::from([("cwd".to_string(), cwd.to_string())]),
+    )
+    .await
+}
+
+async fn typed_active_runtime_appearance_for_scope_attach(
+    client: &mut StreamingBmuxClient,
+    scope: impl Into<String>,
+    attributes: BTreeMap<String, String>,
+) -> std::result::Result<RuntimeAppearance, ClientError> {
     typed_runtime_appearance_service(
         client,
-        "active-appearance-for-cwd",
-        &ActiveAppearanceForCwdRequest {
-            cwd: cwd.to_string(),
+        "active-appearance-for-scope",
+        &ActiveAppearanceForScopeRequest {
+            scope: scope.into(),
+            attributes,
         },
     )
     .await
@@ -6996,6 +7011,22 @@ fn build_retained_frame_plan(
     }
 }
 
+struct AttachAppearanceResolver<'a> {
+    fallback: &'a RuntimeAppearance,
+    view_state: &'a AttachViewState,
+}
+
+impl<'a> AttachAppearanceResolver<'a> {
+    const fn fallback(&self) -> &'a RuntimeAppearance {
+        self.fallback
+    }
+
+    fn for_pane(&self, pane_id: &Uuid) -> &'a RuntimeAppearance {
+        self.view_state
+            .runtime_appearance_for_pane(pane_id, self.fallback)
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     terminal_writer: &mut W,
@@ -7020,6 +7051,17 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         max_rects: damage_config.max_rects,
         max_area_percent: damage_config.max_area_percent,
     };
+    let appearance_resolver = AttachAppearanceResolver {
+        fallback: runtime_appearance,
+        view_state,
+    };
+    let _ = appearance_resolver.fallback();
+    let _ = layout_state
+        .scene
+        .surfaces
+        .iter()
+        .find_map(|surface| surface.pane_id.as_ref())
+        .map(|pane_id| appearance_resolver.for_pane(pane_id));
     let current_help_overlay_surface = if view_state.help_overlay_open {
         help_overlay_surface(help_lines, geometry)
     } else {
