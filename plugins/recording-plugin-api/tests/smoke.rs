@@ -1,5 +1,5 @@
 use bmux_recording_plugin_api::{
-    capabilities, recording_commands, recording_state, recording_types,
+    capabilities, recording_commands, recording_events, recording_state, recording_types,
 };
 
 #[test]
@@ -8,6 +8,24 @@ fn interface_ids_match_bpdl_source() {
     assert_eq!(recording_commands::INTERFACE_ID, "recording-commands");
     assert_eq!(capabilities::RECORDING_READ, "bmux.recording.read");
     assert_eq!(capabilities::RECORDING_WRITE, "bmux.recording.write");
+}
+
+#[test]
+fn recording_job_event_serializes() {
+    let job = recording_types::RecordingJob {
+        id: uuid::Uuid::nil(),
+        kind: recording_types::RecordingJobKind::Cut,
+        status: recording_types::RecordingJobStatus::Exporting,
+        recording_id: Some(uuid::Uuid::nil()),
+        recording_path: Some("/tmp/raw".to_string()),
+        export_output_path: Some("/tmp/out.gif".to_string()),
+        error: None,
+    };
+    let event = recording_events::RecordingEvent::JobUpdated { job };
+
+    let json = serde_json::to_string(&event).expect("job event should serialize");
+    assert!(json.contains("job_updated"));
+    assert!(json.contains("exporting"));
 }
 
 #[test]

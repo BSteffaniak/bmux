@@ -587,6 +587,7 @@ fn register_recording_plugin_config(
     startup_recording: Option<ManualRecordingStartOptions>,
 ) {
     use bmux_recording_plugin_api::RecordingPluginConfig;
+    let auto_export_dir = config.recording_auto_export_dir(paths);
     let plugin_config = RecordingPluginConfig {
         recordings_dir: config.recordings_dir(paths),
         rolling_recordings_dir: paths.rolling_recordings_dir(),
@@ -594,6 +595,9 @@ fn register_recording_plugin_config(
         retention_days: config.recording.retention_days,
         rolling_defaults: rolling_settings.clone(),
         rolling_auto_start,
+        auto_export: config.recording.auto_export || auto_export_dir.is_some(),
+        auto_export_dir,
+        auto_export_fps: config.recording.export.fps.max(1),
         startup_recording,
     };
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));

@@ -2726,6 +2726,9 @@ const fn recording_plugin_bus_event_name(
         bmux_recording_plugin_api::recording_events::RecordingEvent::ExportFailed { .. } => {
             "recording_export_failed"
         }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::JobUpdated { .. } => {
+            "recording_job_updated"
+        }
     }
 }
 

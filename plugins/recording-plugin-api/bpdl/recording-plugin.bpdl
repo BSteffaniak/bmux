@@ -90,6 +90,31 @@ interface recording-types {
         usage_after: recording-rolling-usage,
     }
 
+    variant recording-job-kind {
+        cut,
+        export,
+        stop-export,
+    }
+
+    variant recording-job-status {
+        queued,
+        cutting,
+        cut-completed,
+        exporting,
+        completed,
+        failed,
+    }
+
+    record recording-job {
+        id: uuid,
+        kind: recording-job-kind,
+        status: recording-job-status,
+        recording_id: uuid?,
+        recording_path: string?,
+        export_output_path: string?,
+        error: string?,
+    }
+
     variant recording-error {
         no-active,
         unavailable,
@@ -107,6 +132,7 @@ interface recording-events {
         export-started { recording_id: uuid, output_path: string },
         export-completed { recording_id: uuid, output_path: string },
         export-failed { recording_id: uuid, output_path: string, reason: string },
+        job-updated { job: recording-types.recording-job },
     }
 
     events recording-event;
@@ -118,6 +144,8 @@ interface recording-state {
     query list-recordings() -> list<recording-types.recording-summary>;
     query rolling-status() -> recording-types.recording-rolling-status;
     query capture-targets() -> list<recording-types.recording-capture-target>;
+    query job-status(job_id: uuid) -> recording-types.recording-job?;
+    query list-jobs() -> list<recording-types.recording-job>;
 }
 
 @capability(RECORDING_WRITE)
@@ -149,8 +177,8 @@ interface recording-commands {
     command cut(last_seconds: u64?, name: string?)
         -> result<recording-types.recording-summary, recording-types.recording-error>;
 
-    command queue-cut(last_seconds: u64?, name: string?)
-        -> uuid;
+    command queue-cut(last_seconds: u64?, name: string?, export_fps: u32?)
+        -> recording-types.recording-job;
 
     command rolling-start(options: recording-types.recording-rolling-start-options)
         -> result<recording-types.recording-summary, recording-types.recording-error>;

@@ -21,9 +21,11 @@ pub use recording_runtime::{
     prune_old_recordings,
 };
 
-use bmux_plugin::global_plugin_state_registry;
+use bmux_plugin::{HostRuntimeApi, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{
+    CoreCliCommandRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
+};
 use bmux_recording_plugin_api::{
     ManualRecordingStartOptions, RecordingPluginConfig, recording_events, recording_types,
 };
@@ -35,7 +37,8 @@ use bmux_recording_protocol::{
 use bmux_recording_runtime::{
     RecordMeta, RecordingSink, RecordingSinkHandle, RollingRecordingSettings,
 };
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
@@ -51,9 +54,15 @@ pub struct ManualRecordingRuntimeHandle(pub Arc<Mutex<RecordingRuntime>>);
 pub struct RollingRecordingRuntimeHandle(pub Arc<Mutex<Option<RecordingRuntime>>>);
 
 static CUT_FILESYSTEM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static RECORDING_JOBS: OnceLock<Mutex<BTreeMap<uuid::Uuid, recording_types::RecordingJob>>> =
+    OnceLock::new();
 
 fn cut_filesystem_lock() -> &'static Mutex<()> {
     CUT_FILESYSTEM_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn recording_jobs() -> &'static Mutex<BTreeMap<uuid::Uuid, recording_types::RecordingJob>> {
+    RECORDING_JOBS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -95,6 +104,12 @@ struct CutRequest {
 struct QueueCutRequest {
     last_seconds: Option<u64>,
     name: Option<String>,
+    export_fps: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct JobStatusRequest {
+    job_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -243,6 +258,12 @@ impl RustPlugin for RecordingPlugin {
             "recording-state", "capture-targets" => |_req: (), _ctx| {
                 Ok::<Vec<recording_types::RecordingCaptureTarget>, ServiceResponse>(recording_capture_targets_generated())
             },
+            "recording-state", "job-status" => |req: JobStatusRequest, _ctx| {
+                Ok::<Option<recording_types::RecordingJob>, ServiceResponse>(recording_job_status_generated(req.job_id))
+            },
+            "recording-state", "list-jobs" => |_req: (), _ctx| {
+                Ok::<Vec<recording_types::RecordingJob>, ServiceResponse>(recording_list_jobs_generated())
+            },
             "recording-commands", "start" => |req: StartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     recording_start_generated(req),
@@ -271,8 +292,8 @@ impl RustPlugin for RecordingPlugin {
                     recording_cut_generated(req),
                 )
             },
-            "recording-commands", "queue-cut" => |req: QueueCutRequest, _ctx| {
-                recording_queue_cut_generated(req).map_err(|error| recording_error_response(&error))
+            "recording-commands", "queue-cut" => |req: QueueCutRequest, ctx| {
+                recording_queue_cut_generated(req, ctx).map_err(|error| recording_error_response(&error))
             },
             "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
@@ -471,11 +492,26 @@ fn recording_cut_generated(
     }
 }
 
+fn recording_job_status_generated(job_id: uuid::Uuid) -> Option<recording_types::RecordingJob> {
+    recording_jobs()
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(&job_id).cloned())
+}
+
+fn recording_list_jobs_generated() -> Vec<recording_types::RecordingJob> {
+    recording_jobs()
+        .lock()
+        .map(|jobs| jobs.values().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn recording_queue_cut_generated(
     req: QueueCutRequest,
-) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    // Validate preconditions synchronously so the caller gets
-    // fast failure when the plugin state is unavailable.
+    ctx: &NativeServiceContext,
+) -> Result<recording_types::RecordingJob, recording_types::RecordingError> {
+    // Validate preconditions synchronously so the caller gets fast failure when
+    // the plugin state is unavailable.
     let config_handle = global_plugin_state_registry()
         .get::<RecordingPluginConfig>()
         .ok_or_else(|| generated_failed("recording plugin config is unavailable"))?;
@@ -495,9 +531,8 @@ fn recording_queue_cut_generated(
     let runtime = rolling.as_ref().ok_or_else(|| {
         generated_failed("recording cut requires rolling recording mode to be enabled")
     })?;
-    // Quick check via the public status API that an active recording exists.
     let has_active = runtime.status().active.is_some();
-    let _ = runtime; // end borrow from rolling before dropping the guard
+    let _ = runtime;
     drop(rolling);
     drop(guard);
     drop(rolling_handle);
@@ -508,22 +543,205 @@ fn recording_queue_cut_generated(
         ));
     }
 
-    let cut_id = uuid::Uuid::new_v4();
-    publish_recording_cut_started(req.last_seconds, req.name.clone());
+    let job = new_recording_job(recording_types::RecordingJobKind::Cut);
+    upsert_recording_job(job.clone());
+    publish_recording_job_updated(&job);
 
+    let worker_context = ctx.clone();
+    let job_id = job.id;
     if let Err(error) = std::thread::Builder::new()
         .name("bmux-recording-cut-worker".to_string())
-        .spawn(move || match handle_cut(req.last_seconds, req.name) {
-            Ok(summary) => publish_recording_cut_completed(&summary),
-            Err(error) => publish_recording_cut_failed(error.to_string()),
-        })
+        .spawn(move || run_queued_cut_job(job_id, req, &worker_context))
     {
         let reason = format!("failed spawning cut worker thread: {error}");
+        let failed = update_recording_job(job_id, |job| {
+            job.status = recording_types::RecordingJobStatus::Failed;
+            job.error = Some(reason.clone());
+        });
+        publish_recording_job_updated(&failed);
         publish_recording_cut_failed(reason.clone());
         return Err(generated_failed(reason));
     }
 
-    Ok(cut_id)
+    Ok(job)
+}
+
+fn new_recording_job(kind: recording_types::RecordingJobKind) -> recording_types::RecordingJob {
+    recording_types::RecordingJob {
+        id: uuid::Uuid::new_v4(),
+        kind,
+        status: recording_types::RecordingJobStatus::Queued,
+        recording_id: None,
+        recording_path: None,
+        export_output_path: None,
+        error: None,
+    }
+}
+
+fn upsert_recording_job(job: recording_types::RecordingJob) {
+    if let Ok(mut jobs) = recording_jobs().lock() {
+        jobs.insert(job.id, job);
+    }
+}
+
+fn update_recording_job(
+    job_id: uuid::Uuid,
+    update: impl FnOnce(&mut recording_types::RecordingJob),
+) -> recording_types::RecordingJob {
+    let mut jobs = recording_jobs()
+        .lock()
+        .expect("recording jobs lock should not be poisoned");
+    let job = jobs.entry(job_id).or_insert_with(|| {
+        let mut job = new_recording_job(recording_types::RecordingJobKind::Cut);
+        job.id = job_id;
+        job
+    });
+    update(job);
+    job.clone()
+}
+
+fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest, ctx: &NativeServiceContext) {
+    let cutting = update_recording_job(job_id, |job| {
+        job.status = recording_types::RecordingJobStatus::Cutting;
+    });
+    publish_recording_job_updated(&cutting);
+    publish_recording_cut_started(req.last_seconds, req.name.clone());
+
+    let summary = match handle_cut(req.last_seconds, req.name) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let reason = error.to_string();
+            let failed = update_recording_job(job_id, |job| {
+                job.status = recording_types::RecordingJobStatus::Failed;
+                job.error = Some(reason.clone());
+            });
+            publish_recording_job_updated(&failed);
+            publish_recording_cut_failed(reason);
+            return;
+        }
+    };
+
+    publish_recording_cut_completed(&summary);
+    let cut_completed = update_recording_job(job_id, |job| {
+        job.status = recording_types::RecordingJobStatus::CutCompleted;
+        job.recording_id = Some(summary.id);
+        job.recording_path = Some(summary.path.clone());
+    });
+    publish_recording_job_updated(&cut_completed);
+
+    let export_settings = current_auto_export_settings(req.export_fps);
+    if !export_settings.enabled {
+        let completed = update_recording_job(job_id, |job| {
+            job.status = recording_types::RecordingJobStatus::Completed;
+        });
+        publish_recording_job_updated(&completed);
+        return;
+    }
+
+    let recording_dir = PathBuf::from(&summary.path);
+    let output_path = auto_export_output_path(
+        &recording_dir,
+        export_settings.output_dir.as_deref(),
+        summary.id,
+    );
+    let output = output_path.to_string_lossy().to_string();
+    publish_recording_export_started(summary.id, output.clone());
+    let exporting = update_recording_job(job_id, |job| {
+        job.status = recording_types::RecordingJobStatus::Exporting;
+        job.export_output_path = Some(output.clone());
+    });
+    publish_recording_job_updated(&exporting);
+
+    match run_core_gif_export(ctx, summary.id, &output, export_settings.fps) {
+        Ok(()) => {
+            publish_recording_export_completed(summary.id, output);
+            let completed = update_recording_job(job_id, |job| {
+                job.status = recording_types::RecordingJobStatus::Completed;
+            });
+            publish_recording_job_updated(&completed);
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            publish_recording_export_failed(summary.id, output, reason.clone());
+            let failed = update_recording_job(job_id, |job| {
+                job.status = recording_types::RecordingJobStatus::Failed;
+                job.error = Some(reason);
+            });
+            publish_recording_job_updated(&failed);
+        }
+    }
+}
+
+struct AutoExportSettings {
+    enabled: bool,
+    output_dir: Option<PathBuf>,
+    fps: u32,
+}
+
+fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExportSettings {
+    let Some(config_handle) = config_handle() else {
+        return AutoExportSettings {
+            enabled: false,
+            output_dir: None,
+            fps: fps_override.unwrap_or(24).max(1),
+        };
+    };
+    let Ok(config) = config_handle.read() else {
+        return AutoExportSettings {
+            enabled: false,
+            output_dir: None,
+            fps: fps_override.unwrap_or(24).max(1),
+        };
+    };
+    AutoExportSettings {
+        enabled: config.auto_export,
+        output_dir: config.auto_export_dir.clone(),
+        fps: fps_override.unwrap_or(config.auto_export_fps).max(1),
+    }
+}
+
+fn auto_export_output_path(
+    recording_dir: &Path,
+    explicit_output_dir: Option<&Path>,
+    recording_id: uuid::Uuid,
+) -> PathBuf {
+    let output_dir = explicit_output_dir.map_or_else(
+        || {
+            recording_dir
+                .parent()
+                .map_or_else(|| recording_dir.to_path_buf(), Path::to_path_buf)
+        },
+        Path::to_path_buf,
+    );
+    output_dir.join(format!("recording-{recording_id}.gif"))
+}
+
+fn run_core_gif_export(
+    ctx: &NativeServiceContext,
+    recording_id: uuid::Uuid,
+    output_path: &str,
+    fps: u32,
+) -> anyhow::Result<()> {
+    let request = CoreCliCommandRequest::new(
+        vec!["recording".to_string(), "export".to_string()],
+        vec![
+            recording_id.to_string(),
+            "--format".to_string(),
+            "gif".to_string(),
+            "--output".to_string(),
+            output_path.to_string(),
+            "--fps".to_string(),
+            fps.to_string(),
+        ],
+    );
+    let response = ctx.core_cli_command_run_path(&request)?;
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
+    if response.exit_code != 0 {
+        anyhow::bail!("recording export exited with status {}", response.exit_code);
+    }
+    Ok(())
 }
 
 fn recording_rolling_start_generated(
@@ -613,6 +831,44 @@ fn publish_recording_cut_failed(reason: String) {
     let _ = bmux_plugin::global_event_bus().emit(
         &recording_events::EVENT_KIND,
         recording_events::RecordingEvent::CutFailed { reason },
+    );
+}
+
+fn publish_recording_export_started(recording_id: uuid::Uuid, output_path: String) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::ExportStarted {
+            recording_id,
+            output_path,
+        },
+    );
+}
+
+fn publish_recording_export_completed(recording_id: uuid::Uuid, output_path: String) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::ExportCompleted {
+            recording_id,
+            output_path,
+        },
+    );
+}
+
+fn publish_recording_export_failed(recording_id: uuid::Uuid, output_path: String, reason: String) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::ExportFailed {
+            recording_id,
+            output_path,
+            reason,
+        },
+    );
+}
+
+fn publish_recording_job_updated(job: &recording_types::RecordingJob) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::JobUpdated { job: job.clone() },
     );
 }
 
@@ -1180,3 +1436,41 @@ fn empty_clear_report() -> RecordingRollingClearReport {
 }
 
 bmux_plugin_sdk::export_plugin!(RecordingPlugin, include_str!("../plugin.toml"));
+
+#[cfg(test)]
+mod tests {
+    use super::auto_export_output_path;
+    use std::path::Path;
+
+    #[test]
+    fn auto_export_output_path_uses_configured_directory() {
+        let recording_id =
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("valid uuid");
+        let output = auto_export_output_path(
+            Path::new("/raw/recordings/22222222-2222-4222-8222-222222222222"),
+            Some(Path::new("/exports")),
+            recording_id,
+        );
+
+        assert_eq!(
+            output,
+            Path::new("/exports/recording-11111111-1111-4111-8111-111111111111.gif")
+        );
+    }
+
+    #[test]
+    fn auto_export_output_path_defaults_next_to_recordings_root() {
+        let recording_id =
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("valid uuid");
+        let output = auto_export_output_path(
+            Path::new("/raw/recordings/22222222-2222-4222-8222-222222222222"),
+            None,
+            recording_id,
+        );
+
+        assert_eq!(
+            output,
+            Path::new("/raw/recordings/recording-11111111-1111-4111-8111-111111111111.gif")
+        );
+    }
+}

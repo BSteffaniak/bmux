@@ -8,12 +8,13 @@ mod rebuild;
 mod run_cmd;
 mod suggest;
 
-use bmux_plugin::HostRuntimeApi;
+use bmux_plugin::{HostRuntimeApi, ServiceCallerDispatchClient, block_on_typed_dispatch};
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext,
     NativeCommandInvocationSource, PluginCommandError, RustPlugin,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
+use bmux_recording_plugin_api::recording_commands;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -82,20 +83,30 @@ fn should_run_core_proxy_in_background(
 
 fn run_core_proxy_command_background(
     context: &NativeCommandContext,
-    command_path: &[&str],
+    _command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
     bmux_plugin_sdk::record_command_outcome_metadata(
         bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
         serde_json::json!("recording cut queued"),
     );
 
+    let last_seconds = parse_last_seconds(&context.arguments);
+    let export_fps = parse_export_fps(&context.arguments);
+    let name = parse_name(&context.arguments);
+
     let context = context.clone();
-    let request = core_cli_command_request(command_path, &context.arguments);
     std::thread::Builder::new()
         .name("bmux-recording-cut-command".to_string())
         .spawn(move || {
-            if let Err(error) = run_core_proxy_request_sync(&context, &request) {
-                tracing::warn!("background recording cut command failed: {error}");
+            let mut client = ServiceCallerDispatchClient::new(&context);
+            let result = block_on_typed_dispatch(recording_commands::client::queue_cut(
+                &mut client,
+                last_seconds,
+                name,
+                export_fps,
+            ));
+            if let Err(error) = result {
+                tracing::warn!("recording cut queue via typed service dispatch failed: {error}");
             }
         })
         .map_err(|error| {
@@ -142,6 +153,42 @@ fn run_core_proxy_request_sync(
 fn has_flag(arguments: &[String], long_name: &str) -> bool {
     let long_flag = format!("--{long_name}");
     arguments.iter().any(|argument| argument == &long_flag)
+}
+
+fn parse_u64_option(arguments: &[String], long_name: &str) -> Option<u64> {
+    let long_flag = format!("--{long_name}");
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == &long_flag
+            && let Some(value) = iter.next()
+            && let Ok(value) = value.parse::<u64>()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_u32_option(arguments: &[String], long_name: &str) -> Option<u32> {
+    parse_u64_option(arguments, long_name).and_then(|value| u32::try_from(value).ok())
+}
+
+fn parse_last_seconds(arguments: &[String]) -> Option<u64> {
+    parse_u64_option(arguments, "last-seconds")
+}
+
+fn parse_export_fps(arguments: &[String]) -> Option<u32> {
+    parse_u32_option(arguments, "export-fps")
+}
+
+fn parse_name(arguments: &[String]) -> Option<String> {
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--name" {
+            return iter.next().cloned();
+        }
+    }
+    None
 }
 
 fn plugin_roots(context: &NativeCommandContext) -> Vec<PathBuf> {
@@ -336,7 +383,9 @@ impl DoctorFinding {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginCliPlugin, core_cli_command_request, core_proxy_command_path};
+    use super::{
+        PluginCliPlugin, core_proxy_command_path, parse_export_fps, parse_last_seconds, parse_name,
+    };
     use bmux_plugin_sdk::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
         NativeCommandContext, RegisteredPluginInfo, RustPlugin,
@@ -406,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn background_recording_cut_request_preserves_export_arguments() {
+    fn background_recording_cut_parses_export_arguments() {
         let arguments = vec![
             "--last-seconds".to_string(),
             "30".to_string(),
@@ -415,10 +464,9 @@ mod tests {
             "--name".to_string(),
             "demo".to_string(),
         ];
-        let request = core_cli_command_request(&["recording", "cut"], &arguments);
-
-        assert_eq!(request.command_path, vec!["recording", "cut"]);
-        assert_eq!(request.arguments, arguments);
+        assert_eq!(parse_last_seconds(&arguments), Some(30));
+        assert_eq!(parse_export_fps(&arguments), Some(12));
+        assert_eq!(parse_name(&arguments).as_deref(), Some("demo"));
     }
 
     #[test]

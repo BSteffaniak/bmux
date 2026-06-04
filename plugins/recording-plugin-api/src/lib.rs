@@ -317,6 +317,12 @@ pub struct RecordingPluginConfig {
     pub rolling_defaults: RollingRecordingSettings,
     /// Whether to auto-start a rolling recording on plugin activation.
     pub rolling_auto_start: bool,
+    /// Whether user-initiated completed recordings/cuts should be auto-exported.
+    pub auto_export: bool,
+    /// Optional directory for auto-exported media files.
+    pub auto_export_dir: Option<std::path::PathBuf>,
+    /// Default GIF frames per second for auto-export jobs.
+    pub auto_export_fps: u32,
     /// Optional one-shot manual recording to start during plugin activation.
     pub startup_recording: Option<ManualRecordingStartOptions>,
 }

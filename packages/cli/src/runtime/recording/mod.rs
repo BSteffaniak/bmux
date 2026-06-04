@@ -662,20 +662,21 @@ fn env_path_override(name: &str) -> Option<PathBuf> {
 fn recording_auto_export_settings() -> RecordingAutoExportSettings {
     let paths = ConfigPaths::default();
     let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
+    let output_dir = env_path_override(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV)
+        .or_else(|| config.recording_auto_export_dir(&paths));
+    let config_enabled = config.recording.auto_export || output_dir.is_some();
     let enabled = std::env::var(RECORDING_AUTO_EXPORT_OVERRIDE_ENV)
         .ok()
-        .map_or(config.recording.auto_export, |raw| {
+        .map_or(config_enabled, |raw| {
             parse_bool_env_flag(&raw).unwrap_or_else(|| {
                 tracing::warn!(
                     "ignoring invalid {} value {:?}",
                     RECORDING_AUTO_EXPORT_OVERRIDE_ENV,
                     raw
                 );
-                config.recording.auto_export
+                config_enabled
             })
         });
-    let output_dir = env_path_override(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV)
-        .or_else(|| config.recording_auto_export_dir(&paths));
     RecordingAutoExportSettings {
         enabled,
         output_dir,
@@ -1464,35 +1465,70 @@ pub(super) async fn run_recording_cut(
         )
     })?;
 
-    let recording: RecordingSummary =
-        recording_commands::client::cut(&mut client, last_seconds, name)
+    let queued_job =
+        recording_commands::client::queue_cut(&mut client, last_seconds, name, export_fps)
+            .await
+            .map_err(recording_service_client_error)?;
+    println!("recording cut queued: {}", queued_job.id);
+
+    let completed_job = wait_for_recording_job(&mut client, queued_job).await?;
+    let recording_path = completed_job.recording_path.as_deref().unwrap_or("-");
+    let export_path = completed_job.export_output_path.as_deref();
+    match completed_job.status {
+        recording_types::RecordingJobStatus::Completed => {
+            let mut status = format!("recording cut created: {recording_path}");
+            if let Some(output) = export_path {
+                let _ = write!(status, "; GIF exported to {output}");
+                println!("recording GIF exported: {output}");
+            }
+            println!("recording cut created: {recording_path}");
+            emit_recording_command_status(status);
+            Ok(0)
+        }
+        recording_types::RecordingJobStatus::Failed if completed_job.recording_id.is_some() => {
+            let reason = completed_job
+                .error
+                .as_deref()
+                .unwrap_or("recording export failed");
+            eprintln!("bmux warning: recording cut created but export failed: {reason}");
+            println!("recording cut created: {recording_path}");
+            emit_recording_command_status(format!(
+                "recording cut created: {recording_path}; GIF export failed: {reason}"
+            ));
+            Ok(0)
+        }
+        recording_types::RecordingJobStatus::Failed => {
+            let reason = completed_job
+                .error
+                .unwrap_or_else(|| "recording cut failed".to_string());
+            emit_recording_command_status(format!("recording cut failed: {reason}"));
+            Err(anyhow::anyhow!(reason))
+        }
+        other => Err(anyhow::anyhow!(
+            "recording cut job ended unexpectedly with status {other:?}"
+        )),
+    }
+}
+
+async fn wait_for_recording_job(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    queued_job: recording_types::RecordingJob,
+) -> Result<recording_types::RecordingJob> {
+    let mut last_job = queued_job;
+    loop {
+        if matches!(
+            last_job.status,
+            recording_types::RecordingJobStatus::Completed
+                | recording_types::RecordingJobStatus::Failed
+        ) {
+            return Ok(last_job);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        last_job = recording_state::client::job_status(client, last_job.id)
             .await
             .map_err(recording_service_client_error)?
-            .map(Into::into)
-            .map_err(recording_plugin_error)?;
-    let name_display = recording.name.as_deref().unwrap_or("-");
-    tracing::info!(
-        id = %recording.id,
-        name = %name_display,
-        events = recording.event_count,
-        bytes = recording.payload_bytes,
-        path = %recording.path,
-        "recording cut created",
-    );
-    println!(
-        "recording cut created: {} name={} events={} bytes={} path={}",
-        recording.id, name_display, recording.event_count, recording.payload_bytes, recording.path
-    );
-    let recording_path = PathBuf::from(&recording.path);
-    let auto_export =
-        maybe_auto_export_recording(recording.id, Some(&recording_path), export_fps).await;
-    print_auto_export_outcome(recording.id, &auto_export);
-    let mut status = format!("recording cut created: {}", recording.path);
-    if let Some(suffix) = auto_export_status_suffix(&auto_export) {
-        status.push_str(&suffix);
+            .ok_or_else(|| anyhow::anyhow!("recording job disappeared: {}", last_job.id))?;
     }
-    emit_recording_command_status(status);
-    Ok(0)
 }
 
 pub(super) async fn run_recording_prune(

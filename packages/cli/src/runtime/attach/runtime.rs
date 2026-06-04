@@ -3917,6 +3917,19 @@ async fn handle_attach_stream_server_event(
                         .dirty
                         .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::JobUpdated {
+                    job,
+                }) => {
+                    let status = format!("recording job {:?}: {:?}", job.kind, job.status);
+                    view_state.set_transient_status(
+                        status,
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
                 Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::ExportFailed {
                     reason,
                     ..
