@@ -10,8 +10,8 @@ mod suggest;
 
 use bmux_plugin::{HostRuntimeApi, ServiceCallerDispatchClient, block_on_typed_dispatch};
 use bmux_plugin_sdk::{
-    CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext,
-    NativeCommandInvocationSource, PluginCommandError, RustPlugin,
+    CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext, PluginCommandError,
+    RustPlugin,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
 use bmux_recording_plugin_api::recording_commands;
@@ -72,13 +72,14 @@ fn run_core_proxy_command(
 }
 
 fn should_run_core_proxy_in_background(
-    context: &NativeCommandContext,
+    _context: &NativeCommandContext,
     command_path: &[&str],
 ) -> bool {
-    matches!(
-        context.invocation_source,
-        NativeCommandInvocationSource::AttachKeybinding | NativeCommandInvocationSource::Internal
-    ) && command_path == ["recording", "cut"]
+    // Keep the legacy bmux.plugin_cli recording-cut command on the plugin-owned
+    // queue-cut service path for every invocation source. Prompted-actions can
+    // invoke nested plugin commands without preserving AttachKeybinding as the
+    // source, so gating this on invocation_source lets auto-export be bypassed.
+    command_path == ["recording", "cut"]
 }
 
 fn run_core_proxy_command_background(
@@ -385,6 +386,7 @@ impl DoctorFinding {
 mod tests {
     use super::{
         PluginCliPlugin, core_proxy_command_path, parse_export_fps, parse_last_seconds, parse_name,
+        should_run_core_proxy_in_background,
     };
     use bmux_plugin_sdk::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
@@ -452,6 +454,19 @@ mod tests {
         assert!(core_proxy_command_path("list").is_none());
         assert!(core_proxy_command_path("doctor").is_none());
         assert!(core_proxy_command_path("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn recording_cut_proxy_always_uses_queue_cut_service_path() {
+        let context = test_context("recording-cut", Vec::new());
+        assert!(should_run_core_proxy_in_background(
+            &context,
+            &["recording", "cut"]
+        ));
+        assert!(!should_run_core_proxy_in_background(
+            &context,
+            &["recording", "path"]
+        ));
     }
 
     #[test]

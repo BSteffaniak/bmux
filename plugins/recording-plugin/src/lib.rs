@@ -355,11 +355,7 @@ fn recording_command_path(command_name: &str) -> Option<&'static [&'static str]>
 
 fn should_queue_recording_cut_in_background(context: &NativeCommandContext) -> bool {
     context.command == "recording-cut"
-        && matches!(
-            context.invocation_source,
-            bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding
-                | bmux_plugin_sdk::NativeCommandInvocationSource::Internal
-        )
+        && context.invocation_source != bmux_plugin_sdk::NativeCommandInvocationSource::Cli
 }
 
 fn run_recording_cut_command_background(
