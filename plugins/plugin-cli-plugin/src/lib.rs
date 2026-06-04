@@ -8,13 +8,12 @@ mod rebuild;
 mod run_cmd;
 mod suggest;
 
-use bmux_plugin::{HostRuntimeApi, ServiceCallerDispatchClient, block_on_typed_dispatch};
+use bmux_plugin::HostRuntimeApi;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext,
     NativeCommandInvocationSource, PluginCommandError, RustPlugin,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
-use bmux_recording_plugin_api::recording_commands;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -83,28 +82,20 @@ fn should_run_core_proxy_in_background(
 
 fn run_core_proxy_command_background(
     context: &NativeCommandContext,
-    _command_path: &[&str],
+    command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
     bmux_plugin_sdk::record_command_outcome_metadata(
         bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
         serde_json::json!("recording cut queued"),
     );
-    // Parse optional flags from the command arguments.
-    let last_seconds = parse_last_seconds(&context.arguments);
-    let name = parse_name(&context.arguments);
 
     let context = context.clone();
+    let request = core_cli_command_request(command_path, &context.arguments);
     std::thread::Builder::new()
         .name("bmux-recording-cut-command".to_string())
         .spawn(move || {
-            let mut client = ServiceCallerDispatchClient::new(&context);
-            let result = block_on_typed_dispatch(recording_commands::client::queue_cut(
-                &mut client,
-                last_seconds,
-                name,
-            ));
-            if let Err(error) = result {
-                tracing::warn!("recording cut queue via typed service dispatch failed: {error}");
+            if let Err(error) = run_core_proxy_request_sync(&context, &request) {
+                tracing::warn!("background recording cut command failed: {error}");
             }
         })
         .map_err(|error| {
@@ -115,17 +106,28 @@ fn run_core_proxy_command_background(
     Ok(0)
 }
 
+fn core_cli_command_request(command_path: &[&str], arguments: &[String]) -> CoreCliCommandRequest {
+    CoreCliCommandRequest::new(
+        command_path.iter().map(ToString::to_string).collect(),
+        arguments.to_vec(),
+    )
+}
+
 fn run_core_proxy_command_sync(
     context: &NativeCommandContext,
     command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
-    let request = CoreCliCommandRequest::new(
-        command_path.iter().map(ToString::to_string).collect(),
-        context.arguments.clone(),
-    );
+    let request = core_cli_command_request(command_path, &context.arguments);
+    run_core_proxy_request_sync(context, &request)
+}
+
+fn run_core_proxy_request_sync(
+    context: &NativeCommandContext,
+    request: &CoreCliCommandRequest,
+) -> Result<i32, PluginCommandError> {
     let response: CoreCliCommandResponse =
         context
-            .core_cli_command_run_path(&request)
+            .core_cli_command_run_path(request)
             .map_err(|error| {
                 PluginCommandError::from(format!(
                     "failed running core command path via host bridge: {error}"
@@ -140,29 +142,6 @@ fn run_core_proxy_command_sync(
 fn has_flag(arguments: &[String], long_name: &str) -> bool {
     let long_flag = format!("--{long_name}");
     arguments.iter().any(|argument| argument == &long_flag)
-}
-
-fn parse_last_seconds(arguments: &[String]) -> Option<u64> {
-    let mut iter = arguments.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--last-seconds"
-            && let Some(value) = iter.next()
-            && let Ok(secs) = value.parse::<u64>()
-        {
-            return Some(secs);
-        }
-    }
-    None
-}
-
-fn parse_name(arguments: &[String]) -> Option<String> {
-    let mut iter = arguments.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--name" {
-            return iter.next().cloned();
-        }
-    }
-    None
 }
 
 fn plugin_roots(context: &NativeCommandContext) -> Vec<PathBuf> {
@@ -357,7 +336,7 @@ impl DoctorFinding {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginCliPlugin, core_proxy_command_path};
+    use super::{PluginCliPlugin, core_cli_command_request, core_proxy_command_path};
     use bmux_plugin_sdk::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
         NativeCommandContext, RegisteredPluginInfo, RustPlugin,
@@ -424,6 +403,22 @@ mod tests {
         assert!(core_proxy_command_path("list").is_none());
         assert!(core_proxy_command_path("doctor").is_none());
         assert!(core_proxy_command_path("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn background_recording_cut_request_preserves_export_arguments() {
+        let arguments = vec![
+            "--last-seconds".to_string(),
+            "30".to_string(),
+            "--export-fps".to_string(),
+            "12".to_string(),
+            "--name".to_string(),
+            "demo".to_string(),
+        ];
+        let request = core_cli_command_request(&["recording", "cut"], &arguments);
+
+        assert_eq!(request.command_path, vec!["recording", "cut"]);
+        assert_eq!(request.arguments, arguments);
     }
 
     #[test]
