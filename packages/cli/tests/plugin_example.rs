@@ -137,7 +137,7 @@ fn bundled_recording_manifest_owns_recording_cli_namespace() {
 }
 
 #[test]
-fn bundled_plugin_cli_manifest_includes_recording_cut_and_path() {
+fn bundled_plugin_cli_manifest_does_not_proxy_recording_commands() {
     let plugin_cli = bundled_manifest("bmux.plugin_cli");
     let commands = plugin_cli
         .commands
@@ -145,8 +145,17 @@ fn bundled_plugin_cli_manifest_includes_recording_cut_and_path() {
         .map(|command| command.name.as_str())
         .collect::<Vec<_>>();
 
-    assert!(commands.contains(&"recording-cut"));
-    assert!(commands.contains(&"recording-path"));
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.starts_with("recording-"))
+    );
+    assert!(
+        !plugin_cli
+            .owns_paths
+            .iter()
+            .any(|path| path.0.first().is_some_and(|segment| segment == "recording"))
+    );
 }
 
 #[test]

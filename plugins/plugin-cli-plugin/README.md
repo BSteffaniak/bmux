@@ -6,9 +6,9 @@ Bundled plugin CLI plugin for bmux.
 
 Provides the `bmux plugin` command namespace. Implements plugin discovery and
 listing, command dispatch to other plugins, and bundled plugin rebuilding from
-source. Also proxies several core CLI commands (logs, diagnostics, recording,
-playbook, config, server) under the plugin namespace for a consistent user
-experience.
+source. Also proxies several core CLI commands (logs, diagnostics, playbook,
+config, server) under the plugin namespace for a consistent user experience.
+Recording commands are owned exclusively by `bmux.recording`.
 
 ## Commands
 
@@ -20,7 +20,6 @@ experience.
 
 - `logs-path`, `logs-level`, `logs-tail`, `logs-watch` -- log management
 - `keymap-doctor`, `terminal-doctor` -- diagnostic tools
-- `recording-*` -- recording management and export
 - `playbook-*` -- headless scripted execution
 - `config-*` -- configuration inspection
 - `server-*` -- server lifecycle management
