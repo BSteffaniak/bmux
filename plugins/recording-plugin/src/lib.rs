@@ -17,7 +17,8 @@
 
 pub mod recording_runtime;
 pub use recording_runtime::{
-    RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, prune_old_recordings,
+    RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, execute_recording_cut,
+    prune_old_recordings,
 };
 
 use bmux_plugin::global_plugin_state_registry;
@@ -35,7 +36,7 @@ use bmux_recording_runtime::{
     RecordMeta, RecordingSink, RecordingSinkHandle, RollingRecordingSettings,
 };
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
@@ -48,6 +49,12 @@ pub struct ManualRecordingRuntimeHandle(pub Arc<Mutex<RecordingRuntime>>);
 /// handle in [`bmux_plugin::PluginStateRegistry`]. The inner option
 /// is `None` when rolling recording is disabled in config.
 pub struct RollingRecordingRuntimeHandle(pub Arc<Mutex<Option<RecordingRuntime>>>);
+
+static CUT_FILESYSTEM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn cut_filesystem_lock() -> &'static Mutex<()> {
+    CUT_FILESYSTEM_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct StartRequest {
@@ -265,9 +272,7 @@ impl RustPlugin for RecordingPlugin {
                 )
             },
             "recording-commands", "queue-cut" => |req: QueueCutRequest, _ctx| {
-                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
-                    recording_queue_cut_generated(req),
-                )
+                recording_queue_cut_generated(req).map_err(|error| recording_error_response(&error))
             },
             "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
@@ -364,6 +369,18 @@ fn auto_start_rolling(
 fn generated_failed(reason: impl Into<String>) -> recording_types::RecordingError {
     recording_types::RecordingError::Failed {
         reason: reason.into(),
+    }
+}
+
+fn recording_error_response(error: &recording_types::RecordingError) -> ServiceResponse {
+    ServiceResponse::error("recording_error", recording_error_message(error))
+}
+
+fn recording_error_message(error: &recording_types::RecordingError) -> String {
+    match error {
+        recording_types::RecordingError::NoActive => "no active recording".to_string(),
+        recording_types::RecordingError::Unavailable => "recording unavailable".to_string(),
+        recording_types::RecordingError::Failed { reason } => reason.clone(),
     }
 }
 
@@ -900,20 +917,26 @@ fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> anyhow::Result
     let output_root = cfg.recordings_dir.clone();
     drop(cfg);
 
-    let handle = rolling_handle()
-        .ok_or_else(|| anyhow::anyhow!("recording rolling runtime handle is unavailable"))?;
-    let guard = handle
-        .read()
-        .map_err(|_| anyhow::anyhow!("recording rolling runtime handle lock is poisoned"))?;
-    let mut rolling = guard
-        .0
-        .lock()
-        .map_err(|_| anyhow::anyhow!("recording rolling runtime lock is poisoned"))?;
-    let runtime = rolling.as_mut().ok_or_else(|| {
-        anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
-    })?;
+    let plan = {
+        let handle = rolling_handle()
+            .ok_or_else(|| anyhow::anyhow!("recording rolling runtime handle is unavailable"))?;
+        let guard = handle
+            .read()
+            .map_err(|_| anyhow::anyhow!("recording rolling runtime handle lock is poisoned"))?;
+        let mut rolling = guard
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recording rolling runtime lock is poisoned"))?;
+        let runtime = rolling.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
+        })?;
+        runtime.prepare_cut(output_root, last_seconds, name)?
+    };
 
-    runtime.cut(&output_root, last_seconds, name)
+    let _cut_guard = cut_filesystem_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("recording cut filesystem lock is poisoned"))?;
+    execute_recording_cut(plan)
 }
 
 fn handle_rolling_clear(restart_if_active: bool) -> RecordingRollingClearReport {
@@ -959,8 +982,13 @@ fn handle_rolling_clear(restart_if_active: bool) -> RecordingRollingClearReport 
         (true, stopped_id, Some(settings), name)
     };
 
-    if clear_rolling_root(&root).is_err() {
-        return empty_clear_report();
+    {
+        let Ok(_cut_guard) = cut_filesystem_lock().lock() else {
+            return empty_clear_report();
+        };
+        if clear_rolling_root(&root).is_err() {
+            return empty_clear_report();
+        }
     }
 
     let (restarted, restarted_recording) = if restart_if_active && was_active {

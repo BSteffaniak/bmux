@@ -1817,10 +1817,10 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_recording_plugin_api",
  "serde",
  "serde_json",
  "tracing",
- "uuid",
 ]
 
 [[package]]

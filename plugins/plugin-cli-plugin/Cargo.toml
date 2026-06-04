@@ -14,16 +14,17 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bmux_plugin     = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
-serde           = { workspace = true, features = ["derive", "std"] }
-serde_json      = { workspace = true }
-tracing         = { workspace = true, features = ["std"] }
-uuid            = { workspace = true, features = ["serde", "std", "v4"] }
+bmux_plugin               = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+bmux_recording_plugin_api = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+serde_json                = { workspace = true }
+tracing                   = { workspace = true, features = ["std"] }
 
 [features]
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_recording_plugin_api/fail-on-warnings",
 ]
 static-bundled = []

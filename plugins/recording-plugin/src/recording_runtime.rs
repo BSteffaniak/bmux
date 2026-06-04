@@ -34,6 +34,19 @@ pub struct RecordingRuntime {
 }
 
 #[derive(Debug)]
+pub struct RecordingCutPlan {
+    source_dir: PathBuf,
+    output_root: PathBuf,
+    name: Option<String>,
+    window_secs: u64,
+    segment_mb: usize,
+    session_filter: Option<Uuid>,
+    capture_input: bool,
+    profile: RecordingProfile,
+    event_kinds: Vec<RecordingEventKind>,
+}
+
+#[derive(Debug)]
 struct ActiveRecording {
     id: Uuid,
     name: Option<String>,
@@ -425,17 +438,21 @@ impl RecordingRuntime {
         self.retention_days
     }
 
-    /// Cut a snapshot of the rolling recording for the given time window.
+    /// Prepare a cut of the rolling recording for the given time window.
+    ///
+    /// This clones all active-recording metadata needed by the expensive
+    /// filesystem work so callers can release the runtime mutex before reading
+    /// and copying recording segments.
     ///
     /// # Errors
-    /// Returns an error if no recording is active, the window is invalid,
-    /// or file I/O fails.
-    pub fn cut(
+    /// Returns an error if no recording is active or the requested window is
+    /// invalid.
+    pub fn prepare_cut(
         &mut self,
-        output_root: &Path,
+        output_root: PathBuf,
         last_seconds: Option<u64>,
         name: Option<String>,
-    ) -> Result<RecordingSummary> {
+    ) -> Result<RecordingCutPlan> {
         let active = self
             .active
             .as_ref()
@@ -461,75 +478,109 @@ impl RecordingRuntime {
             anyhow::bail!("recording cut window must be greater than zero seconds")
         }
 
-        let cutoff_ms = epoch_millis_now().saturating_sub(window_secs.saturating_mul(1000));
-        let segment_names = list_segment_names(&active.path)?;
-        let mut events = Vec::new();
-        for name in &segment_names {
-            let path = active.path.join(name);
-            let mut segment_events = read_recording_events(&path)?;
-            events.append(&mut segment_events);
-        }
-
-        events.retain(|event| event.wall_epoch_ms >= cutoff_ms);
-        if events.is_empty() {
-            anyhow::bail!("rolling recording has no events in the requested window")
-        }
-
-        let first_mono_ns = events.first().map_or(0, |event| event.mono_ns);
-        for (index, event) in events.iter_mut().enumerate() {
-            event.seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-            event.mono_ns = event.mono_ns.saturating_sub(first_mono_ns);
-        }
-
-        std::fs::create_dir_all(output_root).with_context(|| {
-            format!(
-                "failed creating recording cut output root {}",
-                output_root.display()
-            )
-        })?;
-
-        let id = Uuid::new_v4();
-        let cut_dir = output_root.join(id.to_string());
-        std::fs::create_dir_all(&cut_dir).with_context(|| {
-            format!(
-                "failed creating recording cut directory {}",
-                cut_dir.display()
-            )
-        })?;
-
-        let segments = write_recording_events_with_rotation(&cut_dir, &events, self.segment_mb)?;
-        let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
-        let payload_bytes = events
-            .iter()
-            .map(|event| payload_size(&event.payload))
-            .sum::<u64>();
-        let summary = RecordingSummary {
-            id,
+        Ok(RecordingCutPlan {
+            source_dir: active.path.clone(),
+            output_root,
             name,
-            format_version: RECORDING_FORMAT_VERSION,
-            session_id: active.session_filter,
+            window_secs,
+            segment_mb: self.segment_mb,
+            session_filter: active.session_filter,
             capture_input: active.capture_input,
             profile: active.profile,
             event_kinds: active.event_kinds.clone(),
-            started_epoch_ms: events
-                .first()
-                .map_or_else(epoch_millis_now, |event| event.wall_epoch_ms),
-            ended_epoch_ms: Some(epoch_millis_now()),
-            event_count,
-            payload_bytes,
-            path: cut_dir.to_string_lossy().to_string(),
-            segments,
-            total_segment_bytes: 0,
-        };
-
-        copy_display_tracks_for_cut(&active.path, &cut_dir, window_secs)?;
-        copy_owner_client_metadata(&active.path, &cut_dir)?;
-
-        let mut finalized = summary;
-        finalized.total_segment_bytes = compute_total_segment_bytes(&cut_dir, &finalized.segments);
-        write_manifest(&cut_dir.join(MANIFEST_FILE_NAME), &finalized)?;
-        Ok(finalized)
+        })
     }
+
+    /// Cut a snapshot of the rolling recording for the given time window.
+    ///
+    /// # Errors
+    /// Returns an error if no recording is active, the window is invalid,
+    /// or file I/O fails.
+    pub fn cut(
+        &mut self,
+        output_root: &Path,
+        last_seconds: Option<u64>,
+        name: Option<String>,
+    ) -> Result<RecordingSummary> {
+        let plan = self.prepare_cut(output_root.to_path_buf(), last_seconds, name)?;
+        execute_recording_cut(plan)
+    }
+}
+
+/// Execute a prepared recording cut.
+///
+/// # Errors
+/// Returns an error if the cut source cannot be read, contains no events in the
+/// requested window, or the cut output cannot be written.
+pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary> {
+    let cutoff_ms = epoch_millis_now().saturating_sub(plan.window_secs.saturating_mul(1000));
+    let segment_names = list_segment_names(&plan.source_dir)?;
+    let mut events = Vec::new();
+    for name in &segment_names {
+        let path = plan.source_dir.join(name);
+        let mut segment_events = read_recording_events(&path)?;
+        events.append(&mut segment_events);
+    }
+
+    events.retain(|event| event.wall_epoch_ms >= cutoff_ms);
+    if events.is_empty() {
+        anyhow::bail!("rolling recording has no events in the requested window")
+    }
+
+    let first_mono_ns = events.first().map_or(0, |event| event.mono_ns);
+    for (index, event) in events.iter_mut().enumerate() {
+        event.seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        event.mono_ns = event.mono_ns.saturating_sub(first_mono_ns);
+    }
+
+    std::fs::create_dir_all(&plan.output_root).with_context(|| {
+        format!(
+            "failed creating recording cut output root {}",
+            plan.output_root.display()
+        )
+    })?;
+
+    let id = Uuid::new_v4();
+    let cut_dir = plan.output_root.join(id.to_string());
+    std::fs::create_dir_all(&cut_dir).with_context(|| {
+        format!(
+            "failed creating recording cut directory {}",
+            cut_dir.display()
+        )
+    })?;
+
+    let segments = write_recording_events_with_rotation(&cut_dir, &events, plan.segment_mb)?;
+    let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    let payload_bytes = events
+        .iter()
+        .map(|event| payload_size(&event.payload))
+        .sum::<u64>();
+    let summary = RecordingSummary {
+        id,
+        name: plan.name,
+        format_version: RECORDING_FORMAT_VERSION,
+        session_id: plan.session_filter,
+        capture_input: plan.capture_input,
+        profile: plan.profile,
+        event_kinds: plan.event_kinds,
+        started_epoch_ms: events
+            .first()
+            .map_or_else(epoch_millis_now, |event| event.wall_epoch_ms),
+        ended_epoch_ms: Some(epoch_millis_now()),
+        event_count,
+        payload_bytes,
+        path: cut_dir.to_string_lossy().to_string(),
+        segments,
+        total_segment_bytes: 0,
+    };
+
+    copy_display_tracks_for_cut(&plan.source_dir, &cut_dir, plan.window_secs)?;
+    copy_owner_client_metadata(&plan.source_dir, &cut_dir)?;
+
+    let mut finalized = summary;
+    finalized.total_segment_bytes = compute_total_segment_bytes(&cut_dir, &finalized.segments);
+    write_manifest(&cut_dir.join(MANIFEST_FILE_NAME), &finalized)?;
+    Ok(finalized)
 }
 
 fn normalize_recording_name(name: Option<String>) -> Result<Option<String>> {

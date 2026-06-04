@@ -8,12 +8,13 @@ mod rebuild;
 mod run_cmd;
 mod suggest;
 
-use bmux_plugin::{HostRuntimeApi, ServiceCaller};
+use bmux_plugin::{HostRuntimeApi, ServiceCallerDispatchClient, block_on_typed_dispatch};
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext,
-    NativeCommandInvocationSource, PluginCommandError, RustPlugin, ServiceKind,
+    NativeCommandInvocationSource, PluginCommandError, RustPlugin,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
+use bmux_recording_plugin_api::recording_commands;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -96,21 +97,14 @@ fn run_core_proxy_command_background(
     std::thread::Builder::new()
         .name("bmux-recording-cut-command".to_string())
         .spawn(move || {
-            #[derive(Serialize)]
-            struct QueueCutRequest {
-                last_seconds: Option<u64>,
-                name: Option<String>,
-            }
-            let req = QueueCutRequest { last_seconds, name };
-            let result = context.call_service::<QueueCutRequest, uuid::Uuid>(
-                "bmux.recording.write",
-                ServiceKind::Command,
-                "recording-commands",
-                "queue-cut",
-                &req,
-            );
+            let mut client = ServiceCallerDispatchClient::new(&context);
+            let result = block_on_typed_dispatch(recording_commands::client::queue_cut(
+                &mut client,
+                last_seconds,
+                name,
+            ));
             if let Err(error) = result {
-                tracing::warn!("recording cut queue via service dispatch failed: {error}");
+                tracing::warn!("recording cut queue via typed service dispatch failed: {error}");
             }
         })
         .map_err(|error| {
