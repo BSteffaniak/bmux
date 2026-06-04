@@ -2619,6 +2619,59 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cli_prefers_recording_plugin_namespace_over_static_builtin() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("recording");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("recording.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest_with_commands(
+                    "bmux.recording",
+                    "recording.dylib",
+                    "owns_namespaces=['recording']\n[[commands]]\nname='recording-cut'\npath=['recording','cut']\nsummary='cut'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='args'\nkind='string'\nposition=0\nmultiple=true\ntrailing_var_arg=true\nallow_hyphen_values=true\n",
+                ),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("bmux.recording".to_string());
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("recording"),
+            OsString::from("cut"),
+            OsString::from("--last-seconds"),
+            OsString::from("5"),
+            OsString::from("--name"),
+            OsString::from("clip"),
+        ];
+
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            None,
+            bmux_config::ConfigLoadOverrides::default(),
+        )
+        .expect("runtime CLI should parse plugin-owned recording namespace command");
+        match parsed {
+            ParsedRuntimeCli::Plugin {
+                plugin_id,
+                command_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(plugin_id, "bmux.recording");
+                assert_eq!(command_name, "recording-cut");
+                assert_eq!(arguments, ["--last-seconds", "5", "--name", "clip"]);
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn runtime_cli_parses_bundled_plugin_command_without_explicit_enable() {
         let Some(bundled_root) = bundled_plugin_root() else {
             return;

@@ -21,13 +21,17 @@ pub use recording_runtime::{
     prune_old_recordings,
 };
 
-use bmux_plugin::{HostRuntimeApi, global_plugin_state_registry};
+use bmux_plugin::{
+    HostRuntimeApi, ServiceCallerDispatchClient, block_on_typed_dispatch,
+    global_plugin_state_registry,
+};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
 };
 use bmux_recording_plugin_api::{
-    ManualRecordingStartOptions, RecordingPluginConfig, recording_events, recording_types,
+    ManualRecordingStartOptions, RecordingPluginConfig, recording_commands, recording_events,
+    recording_types,
 };
 use bmux_recording_protocol::{
     RecordingCaptureTarget, RecordingEventKind, RecordingPayload as ProtocolRecordingPayload,
@@ -239,9 +243,12 @@ impl RustPlugin for RecordingPlugin {
 
     fn run_command(
         &mut self,
-        _context: NativeCommandContext,
+        context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        if should_queue_recording_cut_in_background(&context) {
+            return run_recording_cut_command_background(&context);
+        }
+        run_recording_command_sync(&context)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -324,6 +331,120 @@ impl RustPlugin for RecordingPlugin {
         // No typed Arc<dyn Trait> surface today — recording operations
         // dispatch exclusively through the byte-service path.
     }
+}
+
+fn recording_command_path(command_name: &str) -> Option<&'static [&'static str]> {
+    match command_name {
+        "recording-start" => Some(&["recording", "start"]),
+        "recording-stop" => Some(&["recording", "stop"]),
+        "recording-status" => Some(&["recording", "status"]),
+        "recording-path" => Some(&["recording", "path"]),
+        "recording-list" => Some(&["recording", "list"]),
+        "recording-delete" => Some(&["recording", "delete"]),
+        "recording-delete-all" => Some(&["recording", "delete-all"]),
+        "recording-cut" => Some(&["recording", "cut"]),
+        "recording-inspect" => Some(&["recording", "inspect"]),
+        "recording-analyze" => Some(&["recording", "analyze"]),
+        "recording-replay" => Some(&["recording", "replay"]),
+        "recording-verify-smoke" => Some(&["recording", "verify-smoke"]),
+        "recording-export" => Some(&["recording", "export"]),
+        "recording-prune" => Some(&["recording", "prune"]),
+        _ => None,
+    }
+}
+
+fn should_queue_recording_cut_in_background(context: &NativeCommandContext) -> bool {
+    context.command == "recording-cut"
+        && matches!(
+            context.invocation_source,
+            bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding
+                | bmux_plugin_sdk::NativeCommandInvocationSource::Internal
+        )
+}
+
+fn run_recording_cut_command_background(
+    context: &NativeCommandContext,
+) -> std::result::Result<i32, PluginCommandError> {
+    bmux_plugin_sdk::record_command_outcome_metadata(
+        bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+        serde_json::json!("recording cut queued"),
+    );
+
+    let last_seconds = parse_u64_option(&context.arguments, "last-seconds");
+    let export_fps = parse_u32_option(&context.arguments, "export-fps");
+    let name = parse_string_option(&context.arguments, "name");
+    let context = context.clone();
+    std::thread::Builder::new()
+        .name("bmux-recording-cut-command".to_string())
+        .spawn(move || {
+            let mut client = ServiceCallerDispatchClient::new(&context);
+            let result = block_on_typed_dispatch(recording_commands::client::queue_cut(
+                &mut client,
+                last_seconds,
+                name,
+                export_fps,
+            ));
+            if let Err(error) = result {
+                tracing::warn!("recording cut queue via typed service dispatch failed: {error}");
+            }
+        })
+        .map_err(|error| {
+            PluginCommandError::failed(format!(
+                "failed spawning background recording cut command: {error}"
+            ))
+        })?;
+    Ok(0)
+}
+
+fn run_recording_command_sync(
+    context: &NativeCommandContext,
+) -> std::result::Result<i32, PluginCommandError> {
+    let command_path = recording_command_path(context.command.as_str())
+        .ok_or_else(|| PluginCommandError::unknown_command(&context.command))?;
+    let request = CoreCliCommandRequest::new(
+        command_path.iter().map(ToString::to_string).collect(),
+        context.arguments.clone(),
+    );
+    let response = context
+        .core_cli_command_run_path(&request)
+        .map_err(|error| {
+            PluginCommandError::from(format!(
+                "failed running recording command path via host bridge: {error}"
+            ))
+        })?;
+    if let Some(error) = response.error {
+        return Err(PluginCommandError::new(response.exit_code.max(1), error));
+    }
+    Ok(response.exit_code)
+}
+
+fn parse_u64_option(arguments: &[String], long_name: &str) -> Option<u64> {
+    let long_flag = format!("--{long_name}");
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == &long_flag
+            && let Some(value) = iter.next()
+            && let Ok(value) = value.parse::<u64>()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_u32_option(arguments: &[String], long_name: &str) -> Option<u32> {
+    parse_u64_option(arguments, long_name).and_then(|value| u32::try_from(value).ok())
+}
+
+fn parse_string_option(arguments: &[String], long_name: &str) -> Option<String> {
+    let long_flag = format!("--{long_name}");
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == &long_flag {
+            return iter.next().cloned();
+        }
+    }
+    None
 }
 
 fn spawn_prune_loop(manual_runtime: Arc<Mutex<RecordingRuntime>>) {

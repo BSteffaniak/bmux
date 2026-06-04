@@ -1,7 +1,7 @@
 execution_class       = "native_fast"
 id                    = "bmux.recording"
 name                  = "bmux Recording"
-owns_namespaces       = []
+owns_namespaces       = ["recording"]
 provided_capabilities = ["bmux.recording.read", "bmux.recording.write"]
 provided_features     = ["bmux.recording"]
 required_capabilities = []
@@ -21,3 +21,216 @@ kind         = "command"
 delivery                     = "broadcast"
 forward_to_streaming_clients = true
 kind                         = "bmux.recording/recording-events"
+
+# User-facing recording CLI commands. The recording plugin owns this namespace;
+# command bodies can continue migrating behind this stable plugin-owned surface.
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-start"
+path          = ["recording", "start"]
+summary       = "Start explicit recording"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-stop"
+path          = ["recording", "stop"]
+summary       = "Stop active recording"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-status"
+path          = ["recording", "status"]
+summary       = "Show recording status"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-path"
+path          = ["recording", "path"]
+summary       = "Print recordings storage path"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-list"
+path          = ["recording", "list"]
+summary       = "List available recordings"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-delete"
+path          = ["recording", "delete"]
+summary       = "Delete one recording"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-delete-all"
+path          = ["recording", "delete-all"]
+summary       = "Delete all recordings"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-cut"
+path          = ["recording", "cut"]
+summary       = "Snapshot active rolling recording"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-inspect"
+path          = ["recording", "inspect"]
+summary       = "Inspect recording timeline"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-analyze"
+path          = ["recording", "analyze"]
+summary       = "Analyze recording diagnostics"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-replay"
+path          = ["recording", "replay"]
+summary       = "Replay recording timeline"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-verify-smoke"
+path          = ["recording", "verify-smoke"]
+summary       = "Emit recording verify smoke report"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-export"
+path          = ["recording", "export"]
+summary       = "Export recording media"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-prune"
+path          = ["recording", "prune"]
+summary       = "Delete completed recordings older than retention"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"

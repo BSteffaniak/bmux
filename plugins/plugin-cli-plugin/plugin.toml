@@ -401,7 +401,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-start"
 path          = ["recording", "start"]
 summary       = "Core recording start command proxy"
@@ -416,7 +416,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-stop"
 path          = ["recording", "stop"]
 summary       = "Core recording stop command proxy"
@@ -431,7 +431,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-status"
 path          = ["recording", "status"]
 summary       = "Core recording status command proxy"
@@ -446,7 +446,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-path"
 path          = ["recording", "path"]
 summary       = "Core recording path command proxy"
@@ -461,7 +461,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-list"
 path          = ["recording", "list"]
 summary       = "Core recording list command proxy"
@@ -476,7 +476,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-delete"
 path          = ["recording", "delete"]
 summary       = "Core recording delete command proxy"
@@ -491,7 +491,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-delete-all"
 path          = ["recording", "delete-all"]
 summary       = "Core recording delete-all command proxy"
@@ -506,7 +506,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-cut"
 path          = ["recording", "cut"]
 summary       = "Core recording cut command proxy"
@@ -521,7 +521,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-inspect"
 path          = ["recording", "inspect"]
 summary       = "Core recording inspect command proxy"
@@ -536,7 +536,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-replay"
 path          = ["recording", "replay"]
 summary       = "Core recording replay command proxy"
@@ -551,7 +551,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-verify-smoke"
 path          = ["recording", "verify-smoke"]
 summary       = "Core recording verify-smoke command proxy"
@@ -566,7 +566,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-export"
 path          = ["recording", "export"]
 summary       = "Core recording export command proxy"
@@ -581,7 +581,7 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-expose_in_cli = true
+expose_in_cli = false
 name          = "recording-prune"
 path          = ["recording", "prune"]
 summary       = "Core recording prune command proxy"

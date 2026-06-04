@@ -122,6 +122,21 @@ fn bundled_cluster_manifest_matches_pragmatic_command_surface() {
 }
 
 #[test]
+fn bundled_recording_manifest_owns_recording_cli_namespace() {
+    let recording = bundled_manifest("bmux.recording");
+    assert!(recording.owns_namespaces.contains("recording"));
+
+    let commands = recording
+        .commands
+        .iter()
+        .map(|command| (command.name.as_str(), command.expose_in_cli))
+        .collect::<Vec<_>>();
+    assert!(commands.contains(&("recording-cut", true)));
+    assert!(commands.contains(&("recording-path", true)));
+    assert!(commands.contains(&("recording-export", true)));
+}
+
+#[test]
 fn bundled_plugin_cli_manifest_includes_recording_cut_and_path() {
     let plugin_cli = bundled_manifest("bmux.plugin_cli");
     let commands = plugin_cli

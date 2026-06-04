@@ -33,7 +33,7 @@ use super::{
     ConnectionContext, build_runtime_command_state, dispatch::dispatch_built_in_command,
     effective_enabled_plugins, load_plugin, plugin_host_metadata, resolve_plugin_search_paths,
     run_keymap_doctor, run_logs_level, run_logs_path, run_plugin_keybinding_command,
-    run_plugin_keybinding_command_with_state, run_recording_path, run_terminal_install_terminfo,
+    run_plugin_keybinding_command_with_state, run_terminal_install_terminfo,
 };
 
 thread_local! {
@@ -454,10 +454,6 @@ fn run_core_built_in_command_fast_path(
         [keymap, doctor] if keymap == "keymap" && doctor == "doctor" => {
             let as_json = parse_json_only_flag(&request.arguments)?;
             return run_sync_built_in(|| run_keymap_doctor(as_json)).map(Some);
-        }
-        [recording, path] if recording == "recording" && path == "path" => {
-            let as_json = parse_json_only_flag(&request.arguments)?;
-            return run_sync_built_in(|| run_recording_path(as_json)).map(Some);
         }
         [terminal, install_terminfo]
             if terminal == "terminal" && install_terminfo == "install-terminfo" =>

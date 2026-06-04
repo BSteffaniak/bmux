@@ -18,7 +18,7 @@
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions]]
 //! name = "recording-cut"
-//! command = "plugin:bmux.plugin_cli:recording-cut --last-seconds {seconds} --export-fps {fps}"
+//! command = "plugin:bmux.recording:recording-cut --last-seconds {seconds} --export-fps {fps}"
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions.prompts]]
 //! key = "seconds"

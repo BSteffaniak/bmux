@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// use bmux_plugin_sdk::ActionDispatchRequest;
 ///
 /// let request = ActionDispatchRequest::new(
-///     "plugin:bmux.plugin_cli:recording-cut --last-seconds 30",
+///     "plugin:bmux.recording:recording-cut --last-seconds 30",
 /// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
