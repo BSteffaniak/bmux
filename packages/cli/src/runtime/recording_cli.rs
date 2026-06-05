@@ -6,11 +6,7 @@ use bmux_cli_schema::{
     RecordingReplayMode,
 };
 use bmux_client::BmuxClient;
-use bmux_config::{
-    BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
-    RecordingExportCursorPaintMode, RecordingExportCursorProfile, RecordingExportCursorShape,
-    RecordingExportCursorTextMode, RecordingExportPaletteSource,
-};
+use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_recording_protocol::{
     RecordingEventEnvelope as ProtocolRecordingEventEnvelope, RecordingEventKind,
     RecordingPayload as ProtocolRecordingPayload,
@@ -40,7 +36,7 @@ use crate::sandbox_meta::{
 use super::{
     ConnectionContext, VERIFY_SERVER_START_TIMEOUT_DEFAULT, bundled_plugin_roots,
     map_cli_client_error, parse_pid_content, recording, registered_plugin_entry_exists,
-    scan_available_plugins, try_kill_pid,
+    run_plugin_command, scan_available_plugins, try_kill_pid,
 };
 
 pub(super) async fn run_recording_start(
@@ -216,123 +212,59 @@ pub(super) async fn run_recording_export(
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
-    let paths = ConfigPaths::default();
-    let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
-    let export_defaults = &config.recording.export;
+    let unsupported_advanced_option = view_client.is_some()
+        || (speed - 1.0).abs() > f64::EPSILON
+        || max_duration.is_some()
+        || max_frames.is_some()
+        || !matches!(renderer, RecordingRenderMode::Font)
+        || cell_size.is_some()
+        || cell_width.is_some()
+        || cell_height.is_some()
+        || font_family.is_some()
+        || font_size.is_some()
+        || line_height.is_some()
+        || !font_path.is_empty()
+        || palette_source.is_some()
+        || palette_foreground.is_some()
+        || palette_background.is_some()
+        || !palette_color.is_empty()
+        || cursor.is_some()
+        || cursor_shape.is_some()
+        || cursor_blink.is_some()
+        || cursor_blink_period_ms.is_some()
+        || cursor_color.is_some()
+        || cursor_profile.is_some()
+        || cursor_solid_after_activity_ms.is_some()
+        || cursor_solid_after_input_ms.is_some()
+        || cursor_solid_after_output_ms.is_some()
+        || cursor_solid_after_cursor_ms.is_some()
+        || cursor_paint_mode.is_some()
+        || cursor_text_mode.is_some()
+        || cursor_bar_width_pct.is_some()
+        || cursor_underline_height_pct.is_some()
+        || export_metadata.is_some()
+        || show_progress;
+    if unsupported_advanced_option {
+        anyhow::bail!(
+            "recording export is now owned by bmux.recording; this path currently supports --format gif, --output, and --fps"
+        );
+    }
 
-    let resolved_fps = fps.unwrap_or_else(|| export_defaults.fps.max(1));
-    let resolved_cursor = cursor.unwrap_or(match export_defaults.cursor {
-        RecordingExportCursorMode::Auto => RecordingCursorMode::Auto,
-        RecordingExportCursorMode::On => RecordingCursorMode::On,
-        RecordingExportCursorMode::Off => RecordingCursorMode::Off,
-    });
-    let resolved_cursor_shape = cursor_shape.unwrap_or(match export_defaults.cursor_shape {
-        RecordingExportCursorShape::Auto => RecordingCursorShape::Auto,
-        RecordingExportCursorShape::Block => RecordingCursorShape::Block,
-        RecordingExportCursorShape::Bar => RecordingCursorShape::Bar,
-        RecordingExportCursorShape::Underline => RecordingCursorShape::Underline,
-    });
-    let resolved_cursor_blink = cursor_blink.unwrap_or(match export_defaults.cursor_blink {
-        RecordingExportCursorBlinkMode::Auto => RecordingCursorBlinkMode::Auto,
-        RecordingExportCursorBlinkMode::On => RecordingCursorBlinkMode::On,
-        RecordingExportCursorBlinkMode::Off => RecordingCursorBlinkMode::Off,
-    });
-    let resolved_cursor_blink_period_ms =
-        cursor_blink_period_ms.unwrap_or_else(|| export_defaults.cursor_blink_period_ms.max(1));
-    let resolved_cursor_color = cursor_color
-        .map(str::to_string)
-        .or_else(|| {
-            let value = export_defaults.cursor_color.trim();
-            (!value.is_empty()).then(|| value.to_string())
-        })
-        .unwrap_or_else(|| "auto".to_string());
-    let resolved_cursor_profile = cursor_profile.unwrap_or(match export_defaults.cursor_profile {
-        RecordingExportCursorProfile::Auto => RecordingCursorProfile::Auto,
-        RecordingExportCursorProfile::Ghostty => RecordingCursorProfile::Ghostty,
-        RecordingExportCursorProfile::Generic => RecordingCursorProfile::Generic,
-    });
-    let resolved_cursor_solid_after_activity_ms =
-        cursor_solid_after_activity_ms.or(export_defaults.cursor_solid_after_activity_ms);
-    let resolved_cursor_solid_after_input_ms =
-        cursor_solid_after_input_ms.or(export_defaults.cursor_solid_after_input_ms);
-    let resolved_cursor_solid_after_output_ms =
-        cursor_solid_after_output_ms.or(export_defaults.cursor_solid_after_output_ms);
-    let resolved_cursor_solid_after_cursor_ms =
-        cursor_solid_after_cursor_ms.or(export_defaults.cursor_solid_after_cursor_ms);
-    let resolved_cursor_paint_mode =
-        cursor_paint_mode.unwrap_or(match export_defaults.cursor_paint_mode {
-            RecordingExportCursorPaintMode::Auto => RecordingCursorPaintMode::Auto,
-            RecordingExportCursorPaintMode::Invert => RecordingCursorPaintMode::Invert,
-            RecordingExportCursorPaintMode::Fill => RecordingCursorPaintMode::Fill,
-            RecordingExportCursorPaintMode::Outline => RecordingCursorPaintMode::Outline,
-        });
-    let resolved_cursor_text_mode =
-        cursor_text_mode.unwrap_or(match export_defaults.cursor_text_mode {
-            RecordingExportCursorTextMode::Auto => RecordingCursorTextMode::Auto,
-            RecordingExportCursorTextMode::SwapFgBg => RecordingCursorTextMode::SwapFgBg,
-            RecordingExportCursorTextMode::ForceContrast => RecordingCursorTextMode::ForceContrast,
-        });
-    let resolved_cursor_bar_width_pct =
-        cursor_bar_width_pct.unwrap_or_else(|| export_defaults.cursor_bar_width_pct.clamp(1, 100));
-    let resolved_cursor_underline_height_pct = cursor_underline_height_pct
-        .unwrap_or_else(|| export_defaults.cursor_underline_height_pct.clamp(1, 100));
-    let resolved_palette_source = palette_source.unwrap_or(match export_defaults.palette_source {
-        RecordingExportPaletteSource::Auto => RecordingPaletteSource::Auto,
-        RecordingExportPaletteSource::Recording => RecordingPaletteSource::Recording,
-        RecordingExportPaletteSource::Terminal => RecordingPaletteSource::Terminal,
-        RecordingExportPaletteSource::Xterm => RecordingPaletteSource::Xterm,
-    });
-    let resolved_palette_foreground = palette_foreground
-        .map(str::to_string)
-        .or_else(|| export_defaults.palette_foreground.clone());
-    let resolved_palette_background = palette_background
-        .map(str::to_string)
-        .or_else(|| export_defaults.palette_background.clone());
-    let resolved_palette_color = if palette_color.is_empty() {
-        export_defaults.palette_colors.clone()
-    } else {
-        palette_color.to_vec()
-    };
+    let mut args = vec![
+        recording_id.to_string(),
+        "--format".to_string(),
+        match format {
+            RecordingExportFormat::Gif => "gif".to_string(),
+        },
+        "--output".to_string(),
+        output.to_string(),
+    ];
+    if let Some(fps) = fps {
+        args.push("--fps".to_string());
+        args.push(fps.to_string());
+    }
 
-    recording::run_recording_export(
-        recording_id,
-        format,
-        output,
-        view_client,
-        speed,
-        resolved_fps,
-        max_duration,
-        max_frames,
-        renderer,
-        cell_size,
-        cell_width,
-        cell_height,
-        font_family,
-        font_size,
-        line_height,
-        font_path,
-        resolved_palette_source,
-        resolved_palette_foreground.as_deref(),
-        resolved_palette_background.as_deref(),
-        &resolved_palette_color,
-        resolved_cursor,
-        resolved_cursor_shape,
-        resolved_cursor_blink,
-        resolved_cursor_blink_period_ms,
-        &resolved_cursor_color,
-        resolved_cursor_profile,
-        resolved_cursor_solid_after_activity_ms,
-        resolved_cursor_solid_after_input_ms,
-        resolved_cursor_solid_after_output_ms,
-        resolved_cursor_solid_after_cursor_ms,
-        resolved_cursor_paint_mode,
-        resolved_cursor_text_mode,
-        resolved_cursor_bar_width_pct,
-        resolved_cursor_underline_height_pct,
-        export_metadata,
-        show_progress,
-    )
-    .await
+    run_plugin_command("bmux.recording", "recording-export", &args).await
 }
 
 pub(super) async fn run_recording_auto_export_gif(

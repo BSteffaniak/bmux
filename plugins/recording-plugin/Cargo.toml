@@ -37,6 +37,7 @@ ttf-parser                = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
 
 [features]
+bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",

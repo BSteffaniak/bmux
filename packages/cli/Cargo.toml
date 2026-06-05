@@ -33,7 +33,6 @@ bmux_contexts_plugin_api        = { workspace = true }
 bmux_control_catalog_plugin_api = { workspace = true }
 bmux_diagnostic_log             = { workspace = true }
 bmux_env                        = { workspace = true }
-bmux_fonts                      = { workspace = true, default-features = false }
 bmux_ipc                        = { workspace = true }
 bmux_keybind                    = { workspace = true }
 bmux_keyboard                   = { workspace = true, features = ["crossterm"] }
@@ -114,20 +113,15 @@ bmux_windows_plugin = { workspace = true, optional = true, features = [
 ] }
 
 # Image protocol support (optional, feature-gated per protocol)
-ab_glyph = { workspace = true }
 anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events", "event-stream"] }
 dirs = { workspace = true }
-font8x8 = { workspace = true }
-fontdb = { workspace = true }
 futures = { workspace = true }
-gif = { workspace = true }
 git_sshripped_recipient = { workspace = true }
 git_sshripped_ssh_agent = { workspace = true }
 git_sshripped_ssh_identity = { workspace = true }
-image = { workspace = true, optional = true }
 iroh = { workspace = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }
 moosicbox_log_watch = { workspace = true, features = [
@@ -138,7 +132,6 @@ qrcode = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
-resvg = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -170,7 +163,6 @@ tracing-subscriber = { workspace = true, features = [
     "fmt",
     "std",
 ] }
-ttf-parser = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 
@@ -281,7 +273,7 @@ bundled-plugin-windows = ["dep:bmux_windows_plugin"]
 bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]
 
 # Optional features
-bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]
+bundled-fonts = ["bmux_recording_plugin?/bundled-fonts"]
 
 # IPC compression support
 compression = ["bmux_ipc/compression", "bmux_server/compression"]
@@ -292,14 +284,12 @@ serde = ["bmux_client/serde", "bmux_keyboard/serde", "bmux_server/serde"]
 # Terminal image protocol support
 image-iterm2 = [
     "dep:bmux_image",
-    "dep:image",
     "bmux_image/iterm2",
     "bmux_decoration_plugin_renderer?/image-iterm2",
     "bmux_pane_runtime_plugin/image-registry",
 ]
 image-kitty = [
     "dep:bmux_image",
-    "dep:image",
     "bmux_image/kitty",
     "bmux_attach_pipeline/image-kitty",
     "bmux_decoration_plugin_renderer?/image-kitty",

@@ -8,17 +8,14 @@ use crate::connection::{
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
-    RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
-    RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
-    RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
-    RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingEventKindArg, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
+    RecordingProfileArg, RecordingReplayMode,
 };
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths, push_process_config_overrides};
 use bmux_recording_protocol::{RecordingEventKind, RecordingStatus, RecordingSummary};
 use bmux_snapshot_plugin_api::offline_snapshot::offline_kill_sessions;
 use crossterm::terminal;
-use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;

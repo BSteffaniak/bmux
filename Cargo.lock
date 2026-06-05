@@ -1097,7 +1097,6 @@ dependencies = [
 name = "bmux_cli"
 version = "0.0.1-alpha.1"
 dependencies = [
- "ab_glyph",
  "anyhow",
  "bmux_appearance",
  "bmux_attach_image_protocol",
@@ -1124,7 +1123,6 @@ dependencies = [
  "bmux_decoration_plugin_renderer",
  "bmux_diagnostic_log",
  "bmux_env",
- "bmux_fonts",
  "bmux_image",
  "bmux_ipc",
  "bmux_keybind",
@@ -1161,14 +1159,10 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
- "font8x8",
- "fontdb",
  "futures",
- "gif",
  "git_sshripped_recipient",
  "git_sshripped_ssh_agent",
  "git_sshripped_ssh_identity",
- "image",
  "iroh",
  "moosicbox_log_runtime",
  "moosicbox_log_watch",
@@ -1176,7 +1170,6 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.13.3",
- "resvg",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -1194,7 +1187,6 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
- "ttf-parser",
  "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
@@ -5300,23 +5292,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "image"
-version = "0.25.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
-dependencies = [
- "bytemuck",
- "byteorder-lite",
- "color_quant",
- "gif",
- "moxcms",
- "num-traits",
- "png",
- "zune-core",
- "zune-jpeg",
-]
-
-[[package]]
 name = "image-webp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6459,16 +6434,6 @@ dependencies = [
  "moosicbox_assert",
  "qstring",
  "switchy_async",
-]
-
-[[package]]
-name = "moxcms"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
-dependencies = [
- "num-traits",
- "pxfm",
 ]
 
 [[package]]
@@ -7993,12 +7958,6 @@ dependencies = [
  "memchr",
  "unicase 2.9.0",
 ]
-
-[[package]]
-name = "pxfm"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
 name = "qrcode"

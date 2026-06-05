@@ -361,6 +361,7 @@ fn should_queue_recording_cut_for_non_cli(context: &NativeCommandContext) -> boo
 fn run_recording_export_command(
     context: &NativeCommandContext,
 ) -> std::result::Result<i32, PluginCommandError> {
+    reject_unsupported_recording_export_args(&context.arguments)?;
     let recording_id = first_positional_argument(&context.arguments)
         .ok_or_else(|| PluginCommandError::failed("recording export requires a recording id"))?;
     let format =
@@ -384,6 +385,24 @@ fn run_recording_export_command(
         serde_json::json!(format!("recording export complete: {output}")),
     );
     Ok(0)
+}
+
+fn reject_unsupported_recording_export_args(
+    arguments: &[String],
+) -> std::result::Result<(), PluginCommandError> {
+    const SUPPORTED_FLAGS: &[&str] = &["format", "output", "fps"];
+    for argument in arguments {
+        let Some(flag) = argument.strip_prefix("--") else {
+            continue;
+        };
+        let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+        if !SUPPORTED_FLAGS.contains(&name) {
+            return Err(PluginCommandError::failed(format!(
+                "unsupported recording export option '--{name}'; bmux.recording currently supports --format gif, --output, and --fps"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn recordings_root_for_command(
