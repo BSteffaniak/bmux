@@ -15,6 +15,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod commands;
 mod export;
 pub mod recording_runtime;
 pub use recording_runtime::{
@@ -22,10 +23,10 @@ pub use recording_runtime::{
     prune_old_recordings,
 };
 
-use bmux_plugin::{HostRuntimeApi, global_plugin_state_registry};
+use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    CoreCliCommandRequest, HostScope, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+    HostScope, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
     TypedServiceRegistrationContext, TypedServiceRegistry,
 };
 use bmux_recording_plugin_api::{
@@ -249,7 +250,7 @@ impl RustPlugin for RecordingPlugin {
         if context.command == "recording-export" {
             return run_recording_export_command(&context);
         }
-        run_recording_command_sync(&context)
+        commands::run_recording_command(&context)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -334,25 +335,6 @@ impl RustPlugin for RecordingPlugin {
     }
 }
 
-fn recording_command_path(command_name: &str) -> Option<&'static [&'static str]> {
-    match command_name {
-        "recording-start" => Some(&["recording", "start"]),
-        "recording-stop" => Some(&["recording", "stop"]),
-        "recording-status" => Some(&["recording", "status"]),
-        "recording-path" => Some(&["recording", "path"]),
-        "recording-list" => Some(&["recording", "list"]),
-        "recording-delete" => Some(&["recording", "delete"]),
-        "recording-delete-all" => Some(&["recording", "delete-all"]),
-        "recording-cut" => Some(&["recording", "cut"]),
-        "recording-inspect" => Some(&["recording", "inspect"]),
-        "recording-analyze" => Some(&["recording", "analyze"]),
-        "recording-replay" => Some(&["recording", "replay"]),
-        "recording-verify-smoke" => Some(&["recording", "verify-smoke"]),
-        "recording-prune" => Some(&["recording", "prune"]),
-        _ => None,
-    }
-}
-
 fn should_queue_recording_cut_for_non_cli(context: &NativeCommandContext) -> bool {
     context.command == "recording-cut"
         && context.invocation_source != bmux_plugin_sdk::NativeCommandInvocationSource::Cli
@@ -405,7 +387,7 @@ fn reject_unsupported_recording_export_args(
     Ok(())
 }
 
-fn recordings_root_for_command(
+pub(crate) fn recordings_root_for_command(
     context: &NativeCommandContext,
 ) -> std::result::Result<PathBuf, PluginCommandError> {
     if let Some(config_handle) = config_handle() {
@@ -501,28 +483,6 @@ fn queue_cut_service_context_from_command(context: &NativeCommandContext) -> Nat
         caller_client_id: context.caller_client_id,
         host_kernel_bridge: context.host_kernel_bridge,
     }
-}
-
-fn run_recording_command_sync(
-    context: &NativeCommandContext,
-) -> std::result::Result<i32, PluginCommandError> {
-    let command_path = recording_command_path(context.command.as_str())
-        .ok_or_else(|| PluginCommandError::unknown_command(&context.command))?;
-    let request = CoreCliCommandRequest::new(
-        command_path.iter().map(ToString::to_string).collect(),
-        context.arguments.clone(),
-    );
-    let response = context
-        .core_cli_command_run_path(&request)
-        .map_err(|error| {
-            PluginCommandError::from(format!(
-                "failed running recording command path via host bridge: {error}"
-            ))
-        })?;
-    if let Some(error) = response.error {
-        return Err(PluginCommandError::new(response.exit_code.max(1), error));
-    }
-    Ok(response.exit_code)
 }
 
 fn parse_u64_option(arguments: &[String], long_name: &str) -> Option<u64> {
@@ -929,13 +889,13 @@ fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest) {
     }
 }
 
-struct AutoExportSettings {
-    enabled: bool,
-    output_dir: Option<PathBuf>,
-    fps: u32,
+pub(crate) struct AutoExportSettings {
+    pub(crate) enabled: bool,
+    pub(crate) output_dir: Option<PathBuf>,
+    pub(crate) fps: u32,
 }
 
-fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExportSettings {
+pub(crate) fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExportSettings {
     let Some(config_handle) = config_handle() else {
         return AutoExportSettings {
             enabled: false,
@@ -957,7 +917,7 @@ fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExportSettings
     }
 }
 
-fn auto_export_output_path(
+pub(crate) fn auto_export_output_path(
     recording_dir: &Path,
     explicit_output_dir: Option<&Path>,
     recording_id: uuid::Uuid,
@@ -1063,7 +1023,7 @@ fn publish_recording_cut_failed(reason: String) {
     );
 }
 
-fn publish_recording_export_started(recording_id: uuid::Uuid, output_path: String) {
+pub(crate) fn publish_recording_export_started(recording_id: uuid::Uuid, output_path: String) {
     let _ = bmux_plugin::global_event_bus().emit(
         &recording_events::EVENT_KIND,
         recording_events::RecordingEvent::ExportStarted {
@@ -1073,7 +1033,7 @@ fn publish_recording_export_started(recording_id: uuid::Uuid, output_path: Strin
     );
 }
 
-fn publish_recording_export_completed(recording_id: uuid::Uuid, output_path: String) {
+pub(crate) fn publish_recording_export_completed(recording_id: uuid::Uuid, output_path: String) {
     let _ = bmux_plugin::global_event_bus().emit(
         &recording_events::EVENT_KIND,
         recording_events::RecordingEvent::ExportCompleted {
@@ -1083,7 +1043,11 @@ fn publish_recording_export_completed(recording_id: uuid::Uuid, output_path: Str
     );
 }
 
-fn publish_recording_export_failed(recording_id: uuid::Uuid, output_path: String, reason: String) {
+pub(crate) fn publish_recording_export_failed(
+    recording_id: uuid::Uuid,
+    output_path: String,
+    reason: String,
+) {
     let _ = bmux_plugin::global_event_bus().emit(
         &recording_events::EVENT_KIND,
         recording_events::RecordingEvent::ExportFailed {

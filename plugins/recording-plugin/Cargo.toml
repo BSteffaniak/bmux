@@ -25,6 +25,7 @@ bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol   = { workspace = true }
 bmux_recording_runtime    = { workspace = true }
 bmux_terminal_grid        = { workspace = true }
+crossterm                 = { workspace = true, features = ["events"] }
 font8x8                   = { workspace = true }
 fontdb                    = { workspace = true }
 gif                       = { workspace = true }
@@ -32,6 +33,7 @@ resvg                     = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true, features = ["std"] }
 thiserror                 = { workspace = true }
+tokio                     = { workspace = true, features = ["rt", "time"] }
 tracing                   = { workspace = true, features = ["std"] }
 ttf-parser                = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
