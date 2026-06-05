@@ -96,7 +96,6 @@ pub enum BuiltInHandlerId {
     PlaybookRun,
     PlaybookValidate,
     PlaybookInteractive,
-    PlaybookFromRecording,
     PlaybookDryRun,
     PlaybookDiff,
     PlaybookCleanup,
@@ -633,11 +632,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             "Start an interactive playbook session",
         ),
         BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookFromRecording,
-            &["playbook", "from-recording"],
-            "Generate a playbook from a recording",
-        ),
-        BuiltInExecutionCommand::new(
             BuiltInHandlerId::PlaybookDryRun,
             &["playbook", "dry-run"],
             "Dry-run a playbook: parse, validate, and print the execution plan",
@@ -914,6 +908,7 @@ mod tests {
             vec!["recording".to_string(), "export".to_string()],
             vec!["recording".to_string(), "prune".to_string()],
             vec!["server".to_string(), "recording".to_string()],
+            vec!["playbook".to_string(), "from-recording".to_string()],
         ] {
             assert!(
                 !paths.contains(&removed),

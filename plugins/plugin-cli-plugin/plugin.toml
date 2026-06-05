@@ -65,10 +65,6 @@ owns_paths = [
     ],
     [
         "playbook",
-        "from-recording",
-    ],
-    [
-        "playbook",
         "dry-run",
     ],
     [
@@ -383,21 +379,6 @@ expose_in_cli = true
 name          = "playbook-interactive"
 path          = ["playbook", "interactive"]
 summary       = "Core playbook interactive command proxy"
-
-[[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
-
-[[commands]]
-expose_in_cli = true
-name          = "playbook-from-recording"
-path          = ["playbook", "from-recording"]
-summary       = "Core playbook from-recording command proxy"
 
 [[commands.arguments]]
 allow_hyphen_values = true

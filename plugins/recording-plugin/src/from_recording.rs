@@ -426,7 +426,7 @@ const fn is_regex_meta(ch: char) -> bool {
 }
 
 /// Escape single quotes for DSL string values.
-pub(super) fn escape_single_quote(s: &str) -> String {
+pub(crate) fn escape_single_quote(s: &str) -> String {
     s.replace('\'', "\\'")
 }
 
@@ -570,7 +570,7 @@ fn request_to_dsl(
 // ---------------------------------------------------------------------------
 
 /// Escape bytes to C-style escape string for use in `send-keys keys='...'`.
-pub(super) fn bytes_to_c_escaped(data: &[u8]) -> String {
+pub(crate) fn bytes_to_c_escaped(data: &[u8]) -> String {
     let mut result = String::new();
     for &byte in data {
         match byte {

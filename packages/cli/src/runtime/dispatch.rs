@@ -25,7 +25,7 @@ use super::{
     run_logs_path, run_logs_profiles_delete, run_logs_profiles_list, run_logs_profiles_rename,
     run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off, run_perf_on,
     run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
-    run_playbook_from_recording, run_playbook_interactive, run_playbook_run, run_playbook_validate,
+    run_playbook_interactive, run_playbook_run, run_playbook_validate,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
     run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
@@ -163,7 +163,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
             PlaybookCommand::Validate { .. } => BuiltInHandlerId::PlaybookValidate,
             PlaybookCommand::Interactive { .. } => BuiltInHandlerId::PlaybookInteractive,
-            PlaybookCommand::FromRecording { .. } => BuiltInHandlerId::PlaybookFromRecording,
             PlaybookCommand::DryRun { .. } => BuiltInHandlerId::PlaybookDryRun,
             PlaybookCommand::Diff { .. } => BuiltInHandlerId::PlaybookDiff,
             PlaybookCommand::Cleanup { .. } => BuiltInHandlerId::PlaybookCleanup,
@@ -1052,16 +1051,6 @@ pub(super) async fn dispatch_built_in_command(
             )
             .await
         }
-        (
-            BuiltInHandlerId::PlaybookFromRecording,
-            Command::Playbook {
-                command:
-                    PlaybookCommand::FromRecording {
-                        recording_id,
-                        output,
-                    },
-            },
-        ) => run_playbook_from_recording(recording_id, output.as_deref()),
         (
             BuiltInHandlerId::PlaybookDryRun,
             Command::Playbook {

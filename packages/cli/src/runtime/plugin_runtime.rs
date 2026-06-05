@@ -2618,8 +2618,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runtime_cli_prefers_recording_plugin_namespace_over_static_builtin() {
+    fn recording_plugin_registry_for_cli_tests() -> (BmuxConfig, PluginRegistry) {
         let dir = temp_dir();
         let plugin_dir = dir.join("recording");
         fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
@@ -2631,31 +2630,72 @@ mod tests {
                 plugin_manifest_with_commands(
                     "bmux.recording",
                     "recording.dylib",
-                    "owns_namespaces=['recording']\nowns_paths=[['server','recording']]\n[[commands]]\nname='recording-cut'\npath=['recording','cut']\nsummary='cut'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='args'\nkind='string'\nposition=0\nmultiple=true\ntrailing_var_arg=true\nallow_hyphen_values=true\n[[commands]]\nname='server-recording'\npath=['server','recording']\nsummary='rolling'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='args'\nkind='string'\nposition=0\nmultiple=true\ntrailing_var_arg=true\nallow_hyphen_values=true\n",
+                    "owns_namespaces=['recording']
+owns_paths=[['server','recording'],['playbook','from-recording']]
+[[commands]]
+name='recording-cut'
+path=['recording','cut']
+summary='cut'
+execution='provider_exec'
+expose_in_cli=true
+[[commands.arguments]]
+name='args'
+kind='string'
+position=0
+multiple=true
+trailing_var_arg=true
+allow_hyphen_values=true
+[[commands]]
+name='server-recording'
+path=['server','recording']
+summary='rolling'
+execution='provider_exec'
+expose_in_cli=true
+[[commands.arguments]]
+name='args'
+kind='string'
+position=0
+multiple=true
+trailing_var_arg=true
+allow_hyphen_values=true
+[[commands]]
+name='playbook-from-recording'
+path=['playbook','from-recording']
+summary='from recording'
+execution='provider_exec'
+expose_in_cli=true
+[[commands.arguments]]
+name='args'
+kind='string'
+position=0
+multiple=true
+trailing_var_arg=true
+allow_hyphen_values=true
+",
                 ),
             )
             .expect("plugin should register");
 
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push("bmux.recording".to_string());
-        let argv = vec![
-            OsString::from("bmux"),
-            OsString::from("recording"),
-            OsString::from("cut"),
-            OsString::from("--last-seconds"),
-            OsString::from("5"),
-            OsString::from("--name"),
-            OsString::from("clip"),
-        ];
+        (config, registry)
+    }
 
+    fn assert_recording_plugin_cli_parse(
+        config: &BmuxConfig,
+        registry: &PluginRegistry,
+        argv: &[OsString],
+        expected_command: &str,
+        expected_args: &[&str],
+    ) {
         let parsed = parse_runtime_cli_with_registry(
-            &argv,
-            &config,
-            &registry,
+            argv,
+            config,
+            registry,
             None,
             bmux_config::ConfigLoadOverrides::default(),
         )
-        .expect("runtime CLI should parse plugin-owned recording namespace command");
+        .expect("runtime CLI should parse plugin-owned recording command");
         match parsed {
             ParsedRuntimeCli::Plugin {
                 plugin_id,
@@ -2664,40 +2704,58 @@ mod tests {
                 ..
             } => {
                 assert_eq!(plugin_id, "bmux.recording");
-                assert_eq!(command_name, "recording-cut");
-                assert_eq!(arguments, ["--last-seconds", "5", "--name", "clip"]);
+                assert_eq!(command_name, expected_command);
+                assert_eq!(arguments, expected_args);
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
         }
+    }
 
-        let argv = vec![
-            OsString::from("bmux"),
-            OsString::from("server"),
-            OsString::from("recording"),
-            OsString::from("status"),
-            OsString::from("--json"),
-        ];
-        let parsed = parse_runtime_cli_with_registry(
-            &argv,
+    #[test]
+    fn runtime_cli_prefers_recording_plugin_namespace_over_static_builtin() {
+        let (config, registry) = recording_plugin_registry_for_cli_tests();
+        assert_recording_plugin_cli_parse(
             &config,
             &registry,
-            None,
-            bmux_config::ConfigLoadOverrides::default(),
-        )
-        .expect("runtime CLI should parse plugin-owned server recording command");
-        match parsed {
-            ParsedRuntimeCli::Plugin {
-                plugin_id,
-                command_name,
-                arguments,
-                ..
-            } => {
-                assert_eq!(plugin_id, "bmux.recording");
-                assert_eq!(command_name, "server-recording");
-                assert_eq!(arguments, ["status", "--json"]);
-            }
-            other => panic!("expected plugin runtime parse, got {other:?}"),
-        }
+            &[
+                OsString::from("bmux"),
+                OsString::from("recording"),
+                OsString::from("cut"),
+                OsString::from("--last-seconds"),
+                OsString::from("5"),
+                OsString::from("--name"),
+                OsString::from("clip"),
+            ],
+            "recording-cut",
+            &["--last-seconds", "5", "--name", "clip"],
+        );
+        assert_recording_plugin_cli_parse(
+            &config,
+            &registry,
+            &[
+                OsString::from("bmux"),
+                OsString::from("server"),
+                OsString::from("recording"),
+                OsString::from("status"),
+                OsString::from("--json"),
+            ],
+            "server-recording",
+            &["status", "--json"],
+        );
+        assert_recording_plugin_cli_parse(
+            &config,
+            &registry,
+            &[
+                OsString::from("bmux"),
+                OsString::from("playbook"),
+                OsString::from("from-recording"),
+                OsString::from("abc123"),
+                OsString::from("--output"),
+                OsString::from("out.dsl"),
+            ],
+            "playbook-from-recording",
+            &["abc123", "--output", "out.dsl"],
+        );
     }
 
     #[test]

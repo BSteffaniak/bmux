@@ -903,14 +903,6 @@ pub enum PlaybookCommand {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// Generate a playbook stub from an existing recording
-    FromRecording {
-        /// Recording id/name or unique id/name prefix
-        recording_id: String,
-        /// Output file path (default: stdout)
-        #[arg(long, short)]
-        output: Option<String>,
-    },
     /// Dry-run: parse, validate, and print the execution plan without running
     DryRun {
         /// Path to playbook file, or `-` for stdin

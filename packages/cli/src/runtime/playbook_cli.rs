@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-use super::{
-    discover_bundled_plugin_ids, recording, run_plugin_command, sandbox_cli::run_sandbox_cleanup,
-};
+use super::{discover_bundled_plugin_ids, run_plugin_command, sandbox_cli::run_sandbox_cleanup};
 
 #[allow(
     clippy::too_many_lines,
@@ -300,21 +298,4 @@ pub(super) fn parse_viewport_string(viewport: &str) -> Result<(u16, u16)> {
         anyhow::bail!("viewport too small (minimum 10x5): {cols}x{rows}");
     }
     Ok((cols, rows))
-}
-
-pub(super) fn run_playbook_from_recording(recording_id: &str, output: Option<&str>) -> Result<u8> {
-    let recordings = recording::list_recordings_from_dir(&recording::recordings_root_dir())?;
-    let resolved_id = recording::resolve_recording_id_prefix(recording_id, &recordings)?;
-    let events = recording::load_recording_events(&resolved_id.to_string())?;
-    let playbook_dsl = crate::playbook::from_recording::events_to_playbook(&events);
-
-    if let Some(path) = output {
-        std::fs::write(path, &playbook_dsl)
-            .with_context(|| format!("failed writing playbook to {path}"))?;
-        println!("wrote playbook to {path}");
-    } else {
-        print!("{playbook_dsl}");
-    }
-
-    Ok(0)
 }

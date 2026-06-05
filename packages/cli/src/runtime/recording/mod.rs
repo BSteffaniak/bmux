@@ -7,9 +7,9 @@ use super::{
     BmuxConfig, BufWriter, ConfigPaths, ConnectionContext, ConnectionPolicyScope, Context, Instant,
     IsTerminal, Path, PathBuf, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
     RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg, RecordingProfileArg,
-    RecordingReplayMode, RecordingStatus, RecordingSummary, Result, Uuid, Write,
-    active_runtime_name, cleanup_stale_pid_file, connect_if_running_with_context,
-    current_cli_build_id, io, read_server_runtime_metadata, terminal,
+    RecordingStatus, RecordingSummary, Result, Uuid, Write, active_runtime_name,
+    cleanup_stale_pid_file, connect_if_running_with_context, current_cli_build_id, io,
+    read_server_runtime_metadata, terminal,
 };
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
 use bmux_performance_state::{
@@ -748,13 +748,16 @@ pub(super) async fn maybe_auto_export_recording(
     publish_recording_export_started(recording_id, output.clone());
     let recording_id_string = recording_id.to_string();
     let fps = fps_override.unwrap_or(settings.fps).max(1);
-    match super::recording_cli::run_recording_auto_export_gif(
-        &recording_id_string,
-        &output,
-        Some(fps),
-    )
-    .await
-    {
+    let args = vec![
+        recording_id_string,
+        "--format".to_string(),
+        "gif".to_string(),
+        "--output".to_string(),
+        output.clone(),
+        "--fps".to_string(),
+        fps.to_string(),
+    ];
+    match super::run_plugin_command("bmux.recording", "recording-export", &args).await {
         Ok(_) => {
             tracing::info!(
                 %recording_id,
@@ -2388,65 +2391,6 @@ pub(super) fn run_recording_analyze(recording_id: &str, perf: bool, as_json: boo
 
     print_perf_analysis_text(&report);
     Ok(0)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_recording_replay(
-    recording_id: &str,
-    mode: RecordingReplayMode,
-    speed: f64,
-    target_bmux: Option<&str>,
-    compare_recording: Option<&str>,
-    ignore: Option<&str>,
-    strict_timing: bool,
-    max_verify_duration_secs: Option<u64>,
-    verify_start_timeout_secs: Option<u64>,
-) -> Result<u8> {
-    let events = load_recording_events(recording_id)?;
-    match mode {
-        RecordingReplayMode::Watch => super::replay_watch(&events, speed),
-        RecordingReplayMode::Interactive => super::replay_interactive(&events, speed),
-        RecordingReplayMode::Verify => {
-            super::replay_verify(
-                &events,
-                target_bmux,
-                compare_recording,
-                ignore,
-                strict_timing,
-                max_verify_duration_secs,
-                verify_start_timeout_secs,
-            )
-            .await
-        }
-    }
-}
-
-pub(super) async fn run_recording_verify_smoke(
-    recording_id: &str,
-    target_bmux: Option<&str>,
-    compare_recording: Option<&str>,
-    ignore: Option<&str>,
-    strict_timing: bool,
-    max_verify_duration_secs: Option<u64>,
-    verify_start_timeout_secs: Option<u64>,
-) -> Result<u8> {
-    let events = load_recording_events(recording_id)?;
-    let report = super::verify_recording_report(
-        &events,
-        target_bmux,
-        compare_recording,
-        ignore,
-        strict_timing,
-        max_verify_duration_secs,
-        verify_start_timeout_secs,
-    )
-    .await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report)
-            .context("failed encoding verify smoke report json")?
-    );
-    Ok(u8::from(!report.pass))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

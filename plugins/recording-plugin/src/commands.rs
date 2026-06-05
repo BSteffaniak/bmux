@@ -107,6 +107,10 @@ impl<'a> ArgCursor<'a> {
                 }
                 continue;
             }
+            if arg == "-o" {
+                let _ = iter.next();
+                continue;
+            }
             result.push(arg);
         }
         result
@@ -126,6 +130,17 @@ impl<'a> ArgCursor<'a> {
                 return Some(value.to_string());
             }
             if arg == &long {
+                return iter.next().cloned();
+            }
+        }
+        None
+    }
+
+    fn short_option(&self, name: &str) -> Option<String> {
+        let short = format!("-{name}");
+        let mut iter = self.args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == &short {
                 return iter.next().cloned();
             }
         }
@@ -201,6 +216,7 @@ fn flag_takes_value(name: &str) -> bool {
             | "order"
             | "status"
             | "query"
+            | "output"
             | "mode"
             | "speed"
             | "compare-recording"
@@ -232,6 +248,7 @@ fn run_recording_command_inner(context: &NativeCommandContext) -> Result<i32> {
         "recording-verify-smoke" => run_verify_smoke(context, &args),
         "recording-prune" => run_prune(context, &args),
         "server-recording" => run_server_recording(context),
+        "playbook-from-recording" => run_playbook_from_recording(context, &args),
         _ => Err(anyhow::anyhow!(
             "unknown recording command '{}'",
             context.command
@@ -545,6 +562,26 @@ fn run_path(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32>
         );
     } else {
         println!("{}", root.display());
+    }
+    Ok(0)
+}
+
+fn run_playbook_from_recording(
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
+    let positional = args.positional();
+    let Some(recording_id) = positional.first() else {
+        anyhow::bail!("playbook from-recording requires a recording id/name or unique prefix");
+    };
+    let events = load_recording_events(context, recording_id)?;
+    let playbook_dsl = crate::from_recording::events_to_playbook(&events);
+    if let Some(output) = args.option("output").or_else(|| args.short_option("o")) {
+        std::fs::write(&output, playbook_dsl)
+            .with_context(|| format!("failed writing playbook to {output}"))?;
+        println!("wrote playbook to {output}");
+    } else {
+        print!("{playbook_dsl}");
     }
     Ok(0)
 }

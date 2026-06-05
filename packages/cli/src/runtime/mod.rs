@@ -9,7 +9,7 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
     RecordingEventKindArg, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
-    RecordingProfileArg, RecordingReplayMode,
+    RecordingProfileArg,
 };
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths, push_process_config_overrides};
@@ -46,7 +46,6 @@ mod plugin_kernel;
 mod plugin_runtime;
 mod prompt;
 mod recording;
-mod recording_cli;
 mod remote_cli;
 mod sandbox_cli;
 mod server_commands;
@@ -94,8 +93,8 @@ use kiosk_cli::{
 use logs_cli::{run_logs_level, run_logs_path, run_logs_tail};
 use perf_cli::{run_perf_off, run_perf_on, run_perf_status};
 use playbook_cli::{
-    run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_from_recording,
-    run_playbook_interactive, run_playbook_run, run_playbook_validate,
+    run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_interactive,
+    run_playbook_run, run_playbook_validate,
 };
 use plugin_kernel::{
     EFFECTIVE_LOG_LEVEL, KernelClientFactory, LOG_CONTROL, available_capability_providers,
@@ -104,11 +103,10 @@ use plugin_kernel::{
     service_descriptors_from_declarations,
 };
 use plugin_runtime::{
-    activate_loaded_plugins, build_runtime_command_state,
-    bundled_plugin_root as bundled_plugin_roots, command_accepts_repeat, deactivate_loaded_plugins,
-    discover_bundled_plugin_ids, dispatch_loaded_plugin_event, effective_enabled_plugins,
-    load_enabled_plugins, load_plugin, plugin_command_policy_hints, plugin_event_bridge_loop,
-    plugin_host_metadata, plugin_system_event, registered_plugin_entry_exists,
+    activate_loaded_plugins, build_runtime_command_state, command_accepts_repeat,
+    deactivate_loaded_plugins, discover_bundled_plugin_ids, dispatch_loaded_plugin_event,
+    effective_enabled_plugins, load_enabled_plugins, load_plugin, plugin_command_policy_hints,
+    plugin_event_bridge_loop, plugin_host_metadata, plugin_system_event,
     resolve_plugin_search_paths, run_external_plugin_command, run_plugin_command,
     run_plugin_command_with_state, run_plugin_keybinding_command,
     run_plugin_keybinding_command_with_active_bindings, run_plugin_keybinding_command_with_state,
@@ -119,7 +117,6 @@ pub use prompt::{
     PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
 };
 pub use recording::recording_plugin_error;
-use recording_cli::{replay_interactive, replay_verify, replay_watch, verify_recording_report};
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel,
     maybe_run_cluster_plugin_command_via_gateway, reconnect_backoff_ms, run_auth_login,
@@ -140,10 +137,9 @@ use server_commands::{
     run_server_stop, run_server_whoami_principal, server_event_name,
 };
 use server_runtime::{
-    cleanup_stale_pid_file, fetch_server_status, is_pid_running, parse_pid_content,
-    read_server_pid_file, remove_server_pid_file, server_is_running, try_kill_pid,
-    wait_for_process_exit, wait_for_server_running, wait_until_server_stopped,
-    write_server_pid_file,
+    cleanup_stale_pid_file, fetch_server_status, is_pid_running, read_server_pid_file,
+    remove_server_pid_file, server_is_running, try_kill_pid, wait_for_process_exit,
+    wait_for_server_running, wait_until_server_stopped, write_server_pid_file,
 };
 
 /// Re-export of [`server_runtime::is_pid_running`] for cross-module callers
@@ -171,7 +167,6 @@ const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const VERIFY_SERVER_START_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
 const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";
 const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";

@@ -10,7 +10,7 @@
 pub mod diff;
 pub mod display_track;
 pub mod engine;
-pub mod from_recording;
+mod escape;
 pub mod interactive;
 pub mod parse_dsl;
 pub mod parse_toml;

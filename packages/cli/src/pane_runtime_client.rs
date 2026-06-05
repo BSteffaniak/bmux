@@ -276,12 +276,6 @@ pub trait BmuxPaneRuntimeClientExt {
         status_bottom_inset: u16,
     ) -> impl Future<Output = ClientResult<(u16, u16)>> + Send;
 
-    fn attach_output(
-        &mut self,
-        session_id: Uuid,
-        max_bytes: usize,
-    ) -> impl Future<Output = ClientResult<Vec<u8>>> + Send;
-
     fn attach_layout(
         &mut self,
         session_id: Uuid,
@@ -488,15 +482,6 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
             Ok(Ok(set)) => Ok((set.cols, set.rows)),
             Ok(Err(err)) => typed_server_error("attach-set-viewport", err),
             Err(err) => typed_dispatch_error("attach-set-viewport", err),
-        }
-    }
-
-    async fn attach_output(&mut self, session_id: Uuid, max_bytes: usize) -> ClientResult<Vec<u8>> {
-        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match AttachCommands::client::attach_output(self, session_id, max_bytes_u32).await {
-            Ok(Ok(out)) => Ok(out.data),
-            Ok(Err(err)) => typed_server_error("attach-output", err),
-            Err(err) => typed_dispatch_error("attach-output", err),
         }
     }
 
@@ -851,15 +836,6 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
             Ok(Ok(set)) => Ok((set.cols, set.rows)),
             Ok(Err(err)) => typed_server_error("attach-set-viewport", err),
             Err(err) => typed_dispatch_error("attach-set-viewport", err),
-        }
-    }
-
-    async fn attach_output(&mut self, session_id: Uuid, max_bytes: usize) -> ClientResult<Vec<u8>> {
-        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match AttachCommands::client::attach_output(self, session_id, max_bytes_u32).await {
-            Ok(Ok(out)) => Ok(out.data),
-            Ok(Err(err)) => typed_server_error("attach-output", err),
-            Err(err) => typed_dispatch_error("attach-output", err),
         }
     }
 

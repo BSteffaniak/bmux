@@ -131,6 +131,12 @@ fn bundled_recording_manifest_owns_recording_cli_namespace() {
             .iter()
             .any(|path| path.0 == vec!["server".to_string(), "recording".to_string()])
     );
+    assert!(
+        recording
+            .owns_paths
+            .iter()
+            .any(|path| path.0 == vec!["playbook".to_string(), "from-recording".to_string()])
+    );
 
     let commands = recording
         .commands
@@ -141,6 +147,7 @@ fn bundled_recording_manifest_owns_recording_cli_namespace() {
     assert!(commands.contains(&("recording-path", true)));
     assert!(commands.contains(&("recording-export", true)));
     assert!(commands.contains(&("server-recording", true)));
+    assert!(commands.contains(&("playbook-from-recording", true)));
 }
 
 #[test]

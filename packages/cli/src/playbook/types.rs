@@ -681,7 +681,7 @@ impl Action {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn to_dsl(&self) -> String {
-        use super::from_recording::{bytes_to_c_escaped, escape_single_quote};
+        use super::escape::{bytes_to_c_escaped, escape_single_quote};
 
         match self {
             Self::NewSession { name } => name.as_ref().map_or_else(

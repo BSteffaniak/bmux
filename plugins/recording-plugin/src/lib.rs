@@ -17,6 +17,7 @@
 
 mod commands;
 mod export;
+mod from_recording;
 pub mod recording_runtime;
 pub use recording_runtime::{
     RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, execute_recording_cut,

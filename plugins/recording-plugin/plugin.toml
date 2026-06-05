@@ -2,7 +2,7 @@ execution_class       = "native_fast"
 id                    = "bmux.recording"
 name                  = "bmux Recording"
 owns_namespaces       = ["recording"]
-owns_paths            = [["server", "recording"]]
+owns_paths            = [["server", "recording"], ["playbook", "from-recording"]]
 provided_capabilities = ["bmux.recording.read", "bmux.recording.write"]
 provided_features     = ["bmux.recording"]
 required_capabilities = []
@@ -41,6 +41,21 @@ position            = 0
 trailing_var_arg    = true
 value_name          = "ARGS"
 
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-from-recording"
+path          = ["playbook", "from-recording"]
+summary       = "Generate a playbook from a recording"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
 
 [[commands]]
 expose_in_cli = true
