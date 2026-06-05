@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Transitional while remaining attach/playbook recording helpers move to bmux.recording.
+
 use super::cli_parse::{
     RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV, RECORDING_AUTO_EXPORT_OVERRIDE_ENV,
 };

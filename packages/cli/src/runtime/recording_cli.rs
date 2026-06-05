@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Transitional while replay/verify helpers move fully to bmux.recording.
+
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
     RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,

@@ -2,9 +2,9 @@ use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand,
     KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand,
-    RecordingCommand, RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
-    SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand,
-    SessionCommand, SlotCommand, TerminalCommand,
+    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
+    SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
+    SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -12,10 +12,10 @@ use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 use super::{
     BuiltInHandlerId, BundleIncludeOptions, BundleSandboxOptions, ConnectionContext,
     InspectTargetOptions, RerunSandboxOptions, RunSandboxOptions, TriageBundleOptions,
-    TriageSandboxOptions, built_in_command_by_handler, recording, run_access_add,
-    run_access_disable, run_access_enable, run_access_init, run_access_list, run_access_remove,
-    run_access_status, run_auth_login, run_auth_logout, run_auth_status, run_client_list,
-    run_config_get, run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
+    TriageSandboxOptions, built_in_command_by_handler, run_access_add, run_access_disable,
+    run_access_enable, run_access_init, run_access_list, run_access_remove, run_access_status,
+    run_auth_login, run_auth_logout, run_auth_status, run_client_list, run_config_get,
+    run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
     run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
     run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
     run_config_scope_explain, run_config_set, run_config_show, run_connect, run_doctor,
@@ -26,21 +26,18 @@ use super::{
     run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off, run_perf_on,
     run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
     run_playbook_from_recording, run_playbook_interactive, run_playbook_run, run_playbook_validate,
-    run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
-    run_recording_export, run_recording_inspect, run_recording_list, run_recording_path,
-    run_recording_replay, run_recording_start, run_recording_status, run_recording_stop,
-    run_recording_verify_smoke, run_remote_complete_sessions, run_remote_complete_targets,
-    run_remote_doctor, run_remote_init, run_remote_install_server, run_remote_list,
-    run_remote_test, run_remote_upgrade, run_sandbox_bundle, run_sandbox_cleanup,
-    run_sandbox_doctor, run_sandbox_inspect, run_sandbox_list, run_sandbox_open,
-    run_sandbox_rebuild_index, run_sandbox_rerun, run_sandbox_run, run_sandbox_status,
-    run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle, run_server_bridge,
-    run_server_gateway, run_server_recording_clear, run_server_recording_path,
-    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
-    run_server_restore, run_server_save, run_server_start, run_server_status, run_server_stop,
-    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
-    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
-    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
+    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
+    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
+    run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
+    run_sandbox_list, run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun,
+    run_sandbox_run, run_sandbox_status, run_sandbox_tail, run_sandbox_triage,
+    run_sandbox_verify_bundle, run_server_bridge, run_server_gateway, run_server_recording_clear,
+    run_server_recording_path, run_server_recording_start, run_server_recording_status,
+    run_server_recording_stop, run_server_restore, run_server_save, run_server_start,
+    run_server_status, run_server_stop, run_server_whoami_principal, run_session_attach,
+    run_session_detach, run_session_kill, run_session_kill_all, run_session_list, run_session_new,
+    run_setup, run_share, run_terminal_doctor, run_terminal_install_terminfo, run_unfollow,
+    run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -170,22 +167,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
         Command::Terminal { command } => match command {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
             TerminalCommand::InstallTerminfo { .. } => BuiltInHandlerId::TerminalInstallTerminfo,
-        },
-        Command::Recording { command } => match command {
-            RecordingCommand::Start { .. } => BuiltInHandlerId::RecordingStart,
-            RecordingCommand::Stop { .. } => BuiltInHandlerId::RecordingStop,
-            RecordingCommand::Status { .. } => BuiltInHandlerId::RecordingStatus,
-            RecordingCommand::Path { .. } => BuiltInHandlerId::RecordingPath,
-            RecordingCommand::List { .. } => BuiltInHandlerId::RecordingList,
-            RecordingCommand::Delete { .. } => BuiltInHandlerId::RecordingDelete,
-            RecordingCommand::DeleteAll { .. } => BuiltInHandlerId::RecordingDeleteAll,
-            RecordingCommand::Cut { .. } => BuiltInHandlerId::RecordingCut,
-            RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
-            RecordingCommand::Analyze { .. } => BuiltInHandlerId::RecordingAnalyze,
-            RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
-            RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
-            RecordingCommand::Export { .. } => BuiltInHandlerId::RecordingExport,
-            RecordingCommand::Prune { .. } => BuiltInHandlerId::RecordingPrune,
         },
         Command::Playbook { command } => match command {
             PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
@@ -1118,276 +1099,6 @@ pub(super) async fn dispatch_built_in_command(
                 command: TerminalCommand::InstallTerminfo { yes, check },
             },
         ) => run_terminal_install_terminfo(*yes, *check),
-        (
-            BuiltInHandlerId::RecordingStart,
-            Command::Recording {
-                command:
-                    RecordingCommand::Start {
-                        session_id,
-                        no_capture_input,
-                        name,
-                        profile,
-                        event_kind,
-                    },
-            },
-        ) => {
-            run_recording_start(
-                session_id.as_deref(),
-                !*no_capture_input,
-                name.as_deref(),
-                *profile,
-                event_kind,
-                connection_context,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RecordingStop,
-            Command::Recording {
-                command: RecordingCommand::Stop { recording_id },
-            },
-        ) => run_recording_stop(recording_id.as_deref(), connection_context).await,
-        (
-            BuiltInHandlerId::RecordingStatus,
-            Command::Recording {
-                command: RecordingCommand::Status { json },
-            },
-        ) => run_recording_status(*json, connection_context).await,
-        (
-            BuiltInHandlerId::RecordingPath,
-            Command::Recording {
-                command: RecordingCommand::Path { json },
-            },
-        ) => run_recording_path(*json),
-        (
-            BuiltInHandlerId::RecordingList,
-            Command::Recording {
-                command:
-                    RecordingCommand::List {
-                        json,
-                        limit,
-                        all,
-                        sort,
-                        order,
-                        status,
-                        query,
-                    },
-            },
-        ) => {
-            run_recording_list(
-                *json,
-                recording::RecordingListOptions {
-                    limit: *limit,
-                    all: *all,
-                    sort: *sort,
-                    order: *order,
-                    status: *status,
-                    query: query.as_deref(),
-                },
-                connection_context,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RecordingDelete,
-            Command::Recording {
-                command: RecordingCommand::Delete { recording_id },
-            },
-        ) => run_recording_delete(recording_id, connection_context).await,
-        (
-            BuiltInHandlerId::RecordingDeleteAll,
-            Command::Recording {
-                command: RecordingCommand::DeleteAll { yes },
-            },
-        ) => run_recording_delete_all(*yes, connection_context).await,
-        (
-            BuiltInHandlerId::RecordingCut,
-            Command::Recording {
-                command:
-                    RecordingCommand::Cut {
-                        last_seconds,
-                        export_fps,
-                        name,
-                    },
-            },
-        ) => {
-            run_recording_cut(
-                *last_seconds,
-                export_fps.as_ref().map(|fps| fps.get()),
-                name.as_deref(),
-                connection_context,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RecordingInspect,
-            Command::Recording {
-                command:
-                    RecordingCommand::Inspect {
-                        recording_id,
-                        limit,
-                        kind,
-                        json,
-                    },
-            },
-        ) => run_recording_inspect(recording_id, *limit, kind.as_deref(), *json),
-        (
-            BuiltInHandlerId::RecordingAnalyze,
-            Command::Recording {
-                command:
-                    RecordingCommand::Analyze {
-                        recording_id,
-                        perf,
-                        json,
-                    },
-            },
-        ) => run_recording_analyze(recording_id, *perf, *json),
-        (
-            BuiltInHandlerId::RecordingReplay,
-            Command::Recording {
-                command:
-                    RecordingCommand::Replay {
-                        recording_id,
-                        mode,
-                        speed,
-                        target_bmux,
-                        compare_recording,
-                        ignore,
-                        strict_timing,
-                        max_verify_duration,
-                        verify_start_timeout,
-                    },
-            },
-        ) => {
-            run_recording_replay(
-                recording_id,
-                *mode,
-                *speed,
-                target_bmux.as_deref(),
-                compare_recording.as_deref(),
-                ignore.as_deref(),
-                *strict_timing,
-                *max_verify_duration,
-                *verify_start_timeout,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RecordingVerifySmoke,
-            Command::Recording {
-                command:
-                    RecordingCommand::VerifySmoke {
-                        recording_id,
-                        target_bmux,
-                        compare_recording,
-                        ignore,
-                        strict_timing,
-                        max_verify_duration,
-                        verify_start_timeout,
-                    },
-            },
-        ) => {
-            run_recording_verify_smoke(
-                recording_id,
-                target_bmux.as_deref(),
-                compare_recording.as_deref(),
-                ignore.as_deref(),
-                *strict_timing,
-                *max_verify_duration,
-                *verify_start_timeout,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RecordingExport,
-            Command::Recording {
-                command:
-                    RecordingCommand::Export {
-                        recording_id,
-                        format,
-                        output,
-                        view_client,
-                        speed,
-                        fps,
-                        max_duration,
-                        max_frames,
-                        renderer,
-                        cell_size,
-                        cell_width,
-                        cell_height,
-                        font_family,
-                        font_size,
-                        line_height,
-                        font_path,
-                        palette_source,
-                        palette_foreground,
-                        palette_background,
-                        palette_color,
-                        cursor,
-                        cursor_shape,
-                        cursor_blink,
-                        cursor_blink_period_ms,
-                        cursor_color,
-                        cursor_profile,
-                        cursor_solid_after_activity_ms,
-                        cursor_solid_after_input_ms,
-                        cursor_solid_after_output_ms,
-                        cursor_solid_after_cursor_ms,
-                        cursor_paint_mode,
-                        cursor_text_mode,
-                        cursor_bar_width_pct,
-                        cursor_underline_height_pct,
-                        export_metadata,
-                        no_progress,
-                    },
-            },
-        ) => {
-            run_recording_export(
-                recording_id,
-                *format,
-                output,
-                view_client.as_deref(),
-                *speed,
-                fps.as_ref().map(|fps| fps.get()),
-                *max_duration,
-                *max_frames,
-                *renderer,
-                *cell_size,
-                *cell_width,
-                *cell_height,
-                font_family.as_deref(),
-                *font_size,
-                *line_height,
-                font_path,
-                *palette_source,
-                palette_foreground.as_deref(),
-                palette_background.as_deref(),
-                palette_color,
-                *cursor,
-                *cursor_shape,
-                *cursor_blink,
-                *cursor_blink_period_ms,
-                cursor_color.as_deref(),
-                *cursor_profile,
-                *cursor_solid_after_activity_ms,
-                *cursor_solid_after_input_ms,
-                *cursor_solid_after_output_ms,
-                *cursor_solid_after_cursor_ms,
-                *cursor_paint_mode,
-                *cursor_text_mode,
-                *cursor_bar_width_pct,
-                *cursor_underline_height_pct,
-                export_metadata.as_deref(),
-                !*no_progress,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RecordingPrune,
-            Command::Recording {
-                command: RecordingCommand::Prune { older_than, json },
-            },
-        ) => recording::run_recording_prune(*older_than, *json, connection_context).await,
         (
             BuiltInHandlerId::PlaybookRun,
             Command::Playbook {

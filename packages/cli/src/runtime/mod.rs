@@ -121,10 +121,7 @@ pub use prompt::{
 pub use recording::recording_plugin_error;
 use recording_cli::{
     recording_event_kind_name, replay_interactive, replay_verify, replay_watch,
-    run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
-    run_recording_export, run_recording_inspect, run_recording_list, run_recording_path,
-    run_recording_replay, run_recording_start, run_recording_status, run_recording_stop,
-    run_recording_verify_smoke, verify_recording_report,
+    run_recording_export, verify_recording_report,
 };
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel,
@@ -295,9 +292,7 @@ pub fn set_logging_client_id(client_id: impl Into<String>) {
 }
 
 const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
-    use bmux_cli_schema::{
-        Command, LogsCommand, PlaybookCommand, RecordingCommand, SessionCommand,
-    };
+    use bmux_cli_schema::{Command, LogsCommand, PlaybookCommand, SessionCommand};
     let Some(cmd) = command else {
         // Default path (no subcommand) = attach to server.
         return true;
@@ -310,9 +305,6 @@ const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> 
             | Command::Host { .. }
             | Command::Session {
                 command: SessionCommand::Attach { .. }
-            }
-            | Command::Recording {
-                command: RecordingCommand::Replay { .. }
             }
             | Command::Playbook {
                 command: PlaybookCommand::Run { .. } | PlaybookCommand::Interactive { .. }
