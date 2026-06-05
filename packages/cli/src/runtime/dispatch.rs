@@ -3,8 +3,8 @@ use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand,
     KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand,
     RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
-    SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
-    SlotCommand, TerminalCommand,
+    SandboxSourceArg, SandboxStatusArg, ServerCommand, SessionCommand, SlotCommand,
+    TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -31,13 +31,11 @@ use super::{
     run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
     run_sandbox_list, run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun,
     run_sandbox_run, run_sandbox_status, run_sandbox_tail, run_sandbox_triage,
-    run_sandbox_verify_bundle, run_server_bridge, run_server_gateway, run_server_recording_clear,
-    run_server_recording_path, run_server_recording_start, run_server_recording_status,
-    run_server_recording_stop, run_server_restore, run_server_save, run_server_start,
-    run_server_status, run_server_stop, run_server_whoami_principal, run_session_attach,
-    run_session_detach, run_session_kill, run_session_kill_all, run_session_list, run_session_new,
-    run_setup, run_share, run_terminal_doctor, run_terminal_install_terminfo, run_unfollow,
-    run_unshare,
+    run_sandbox_verify_bundle, run_server_bridge, run_server_gateway, run_server_restore,
+    run_server_save, run_server_start, run_server_status, run_server_stop,
+    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
+    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
+    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -113,13 +111,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ServerCommand::Save => BuiltInHandlerId::ServerSave,
             ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
-            ServerCommand::Recording { command } => match command {
-                ServerRecordingCommand::Start { .. } => BuiltInHandlerId::ServerRecordingStart,
-                ServerRecordingCommand::Stop => BuiltInHandlerId::ServerRecordingStop,
-                ServerRecordingCommand::Status { .. } => BuiltInHandlerId::ServerRecordingStatus,
-                ServerRecordingCommand::Path { .. } => BuiltInHandlerId::ServerRecordingPath,
-                ServerRecordingCommand::Clear { .. } => BuiltInHandlerId::ServerRecordingClear,
-            },
             ServerCommand::Gateway { .. } => BuiltInHandlerId::ServerGateway,
             ServerCommand::Bridge { .. } => BuiltInHandlerId::ServerBridge,
         },
@@ -723,106 +714,6 @@ pub(super) async fn dispatch_built_in_command(
                 command: ServerCommand::Stop,
             },
         ) => run_server_stop(connection_context).await,
-        (
-            BuiltInHandlerId::ServerRecordingStart,
-            Command::Server {
-                command:
-                    ServerCommand::Recording {
-                        command:
-                            ServerRecordingCommand::Start {
-                                rolling_window_secs,
-                                name,
-                                rolling_event_kind_all,
-                                rolling_event_kind,
-                                rolling_capture_input,
-                                no_rolling_capture_input,
-                                rolling_capture_output,
-                                no_rolling_capture_output,
-                                rolling_capture_events,
-                                no_rolling_capture_events,
-                                rolling_capture_protocol_replies,
-                                no_rolling_capture_protocol_replies,
-                                rolling_capture_images,
-                                no_rolling_capture_images,
-                            },
-                    },
-            },
-        ) => {
-            run_server_recording_start(
-                RecordingRollingStartOptions {
-                    window_secs: *rolling_window_secs,
-                    name: name.clone(),
-                    event_kinds: if *rolling_event_kind_all {
-                        Some(all_recording_event_kinds())
-                    } else if rolling_event_kind.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            rolling_event_kind
-                                .iter()
-                                .copied()
-                                .map(recording_event_kind_arg_to_ipc)
-                                .collect(),
-                        )
-                    },
-                    capture_input: bool_override(*rolling_capture_input, *no_rolling_capture_input),
-                    capture_output: bool_override(
-                        *rolling_capture_output,
-                        *no_rolling_capture_output,
-                    ),
-                    capture_events: bool_override(
-                        *rolling_capture_events,
-                        *no_rolling_capture_events,
-                    ),
-                    capture_protocol_replies: bool_override(
-                        *rolling_capture_protocol_replies,
-                        *no_rolling_capture_protocol_replies,
-                    ),
-                    capture_images: bool_override(
-                        *rolling_capture_images,
-                        *no_rolling_capture_images,
-                    ),
-                },
-                connection_context,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::ServerRecordingStop,
-            Command::Server {
-                command:
-                    ServerCommand::Recording {
-                        command: ServerRecordingCommand::Stop,
-                    },
-            },
-        ) => run_server_recording_stop(connection_context).await,
-        (
-            BuiltInHandlerId::ServerRecordingStatus,
-            Command::Server {
-                command:
-                    ServerCommand::Recording {
-                        command: ServerRecordingCommand::Status { json },
-                    },
-            },
-        ) => run_server_recording_status(*json, connection_context).await,
-        (
-            BuiltInHandlerId::ServerRecordingPath,
-            Command::Server {
-                command:
-                    ServerCommand::Recording {
-                        command: ServerRecordingCommand::Path { json },
-                    },
-            },
-        ) => run_server_recording_path(*json, connection_context).await,
-        (
-            BuiltInHandlerId::ServerRecordingClear,
-            Command::Server {
-                command:
-                    ServerCommand::Recording {
-                        command: ServerRecordingCommand::Clear { json, no_restart },
-                    },
-            },
-        ) => run_server_recording_clear(*json, *no_restart, connection_context).await,
         (
             BuiltInHandlerId::ServerGateway,
             Command::Server {

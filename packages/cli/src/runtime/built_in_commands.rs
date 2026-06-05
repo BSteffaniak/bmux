@@ -55,12 +55,6 @@ pub enum BuiltInHandlerId {
     ServerSave,
     ServerRestore,
     ServerStop,
-    ServerRecording,
-    ServerRecordingStart,
-    ServerRecordingStop,
-    ServerRecordingStatus,
-    ServerRecordingPath,
-    ServerRecordingClear,
     ServerGateway,
     ServerBridge,
     Logs,
@@ -432,36 +426,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerStop,
             &["server", "stop"],
             "Stop the server",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRecording,
-            &["server", "recording"],
-            "Control hidden rolling recording",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRecordingStart,
-            &["server", "recording", "start"],
-            "Start hidden rolling recording",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRecordingStop,
-            &["server", "recording", "stop"],
-            "Stop hidden rolling recording",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRecordingStatus,
-            &["server", "recording", "status"],
-            "Show hidden rolling recording status",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRecordingPath,
-            &["server", "recording", "path"],
-            "Show hidden rolling recording path",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRecordingClear,
-            &["server", "recording", "clear"],
-            "Clear hidden rolling recording data",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ServerGateway,
@@ -949,6 +913,7 @@ mod tests {
             vec!["recording".to_string(), "verify-smoke".to_string()],
             vec!["recording".to_string(), "export".to_string()],
             vec!["recording".to_string(), "prune".to_string()],
+            vec!["server".to_string(), "recording".to_string()],
         ] {
             assert!(
                 !paths.contains(&removed),

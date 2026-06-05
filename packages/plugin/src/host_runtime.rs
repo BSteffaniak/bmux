@@ -14,40 +14,10 @@ use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1,
     CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
     CoreCliCommandRequest, CoreCliCommandResponse, LogWriteRequest, PluginCliCommandRequest,
-    PluginCliCommandResponse, RecordingWriteEventRequest, RecordingWriteEventResponse, Result,
-    ServiceKind, StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    PluginCliCommandResponse, Result, ServiceKind, StorageGetRequest, StorageGetResponse,
+    StorageSetRequest,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
-const RECORDING_WRITE_CAPABILITY: &str = "bmux.recording.write";
-const RECORDING_COMMANDS_INTERFACE: &str = "recording-commands";
-const RECORDING_WRITE_CUSTOM_EVENT_OPERATION: &str = "write-custom-event";
-
-#[derive(Serialize)]
-struct RecordingWriteCustomEventWireRequest {
-    session_id: Option<uuid::Uuid>,
-    pane_id: Option<uuid::Uuid>,
-    source: String,
-    name: String,
-    #[serde(with = "bmux_codec::serde_bytes_vec")]
-    payload: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-enum RecordingWriteCustomEventWireError {
-    NoActive,
-    Unavailable,
-    Failed { reason: String },
-}
-
-impl RecordingWriteCustomEventWireError {
-    fn into_reason(self) -> Option<String> {
-        match self {
-            Self::NoActive | Self::Unavailable => None,
-            Self::Failed { reason } => Some(reason),
-        }
-    }
-}
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Trait for types that can dispatch cross-plugin service calls.
 ///
@@ -116,7 +86,7 @@ pub trait ServiceCaller {
 /// Generic host runtime API.
 ///
 /// Carries only domain-agnostic primitives: core-CLI command dispatch,
-/// plugin-command dispatch, key-value storage, logging, and recording.
+/// plugin-command dispatch, key-value storage, and logging.
 /// Every blanket-implemented method is a thin wrapper over a well-known
 /// host-provided service (`bmux.storage`, `bmux.logs.write`, etc.).
 ///
@@ -205,49 +175,6 @@ pub trait HostRuntimeApi: ServiceCaller {
             request,
         )
     }
-
-    /// Write a custom recording event.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the service call fails.
-    fn recording_write_event(
-        &self,
-        request: &RecordingWriteEventRequest,
-    ) -> Result<RecordingWriteEventResponse> {
-        let recording_request = RecordingWriteCustomEventWireRequest {
-            session_id: recording_attribute_uuid(request, "bmux.session_id"),
-            pane_id: recording_attribute_uuid(request, "bmux.pane_id"),
-            // `HostRuntimeApi` doesn't know which plugin is calling, so
-            // callers that need source identity should dispatch directly
-            // via the recording plugin's generated command client.
-            source: String::new(),
-            name: request.name.clone(),
-            payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
-        };
-        let response: std::result::Result<(), RecordingWriteCustomEventWireError> = self
-            .call_service(
-                RECORDING_WRITE_CAPABILITY,
-                ServiceKind::Command,
-                RECORDING_COMMANDS_INTERFACE,
-                RECORDING_WRITE_CUSTOM_EVENT_OPERATION,
-                &recording_request,
-            )?;
-        match response {
-            Ok(()) => Ok(RecordingWriteEventResponse { accepted: true }),
-            Err(err) => {
-                let _ = err.into_reason();
-                Ok(RecordingWriteEventResponse { accepted: false })
-            }
-        }
-    }
 }
 
 impl<T> HostRuntimeApi for T where T: ServiceCaller + ?Sized {}
-
-fn recording_attribute_uuid(request: &RecordingWriteEventRequest, key: &str) -> Option<uuid::Uuid> {
-    request
-        .attributes
-        .get(key)
-        .and_then(|value| uuid::Uuid::parse_str(value).ok())
-}

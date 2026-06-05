@@ -244,19 +244,6 @@ pub struct LogWriteRequest {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordingWriteEventRequest {
-    #[serde(default)]
-    pub attributes: BTreeMap<String, String>,
-    pub name: String,
-    pub payload: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordingWriteEventResponse {
-    pub accepted: bool,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCommandOutcome {
     /// Error message from the plugin command's `Err` return, if any.

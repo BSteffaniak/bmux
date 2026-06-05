@@ -119,10 +119,7 @@ pub use prompt::{
     PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
 };
 pub use recording::recording_plugin_error;
-use recording_cli::{
-    recording_event_kind_name, replay_interactive, replay_verify, replay_watch,
-    run_recording_export, verify_recording_report,
-};
+use recording_cli::{replay_interactive, replay_verify, replay_watch, verify_recording_report};
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel,
     maybe_run_cluster_plugin_command_via_gateway, reconnect_backoff_ms, run_auth_login,
@@ -139,10 +136,8 @@ use sandbox_cli::{
     run_sandbox_status, run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle,
 };
 use server_commands::{
-    run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,
-    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
-    run_server_restore, run_server_save, run_server_status, run_server_stop,
-    run_server_whoami_principal, server_event_name,
+    run_server_bridge, run_server_gateway, run_server_restore, run_server_save, run_server_status,
+    run_server_stop, run_server_whoami_principal, server_event_name,
 };
 use server_runtime::{
     cleanup_stale_pid_file, fetch_server_status, is_pid_running, parse_pid_content,

@@ -2,6 +2,7 @@ execution_class       = "native_fast"
 id                    = "bmux.recording"
 name                  = "bmux Recording"
 owns_namespaces       = ["recording"]
+owns_paths            = [["server", "recording"]]
 provided_capabilities = ["bmux.recording.read", "bmux.recording.write"]
 provided_features     = ["bmux.recording"]
 required_capabilities = []
@@ -24,6 +25,22 @@ kind                         = "bmux.recording/recording-events"
 
 # User-facing recording CLI commands. The recording plugin owns this namespace;
 # command bodies can continue migrating behind this stable plugin-owned surface.
+
+[[commands]]
+expose_in_cli = true
+name          = "server-recording"
+path          = ["server", "recording"]
+summary       = "Control hidden rolling recording"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
 
 [[commands]]
 expose_in_cli = true

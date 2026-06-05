@@ -83,11 +83,10 @@ pub use event::{
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
 pub use host_services::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, LogWriteLevel, LogWriteRequest, PluginCommandOutcome,
-    RecordingWriteEventRequest, RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse,
-    StorageKey, StorageKeyError, StorageSetRequest, VolatileStateClearRequest,
-    VolatileStateGetRequest, VolatileStateGetResponse, VolatileStateSetRequest,
-    begin_command_outcome_capture, finish_command_outcome_capture, record_command_outcome_metadata,
-    storage_key_is_valid,
+    StorageGetRequest, StorageGetResponse, StorageKey, StorageKeyError, StorageSetRequest,
+    VolatileStateClearRequest, VolatileStateGetRequest, VolatileStateGetResponse,
+    VolatileStateSetRequest, begin_command_outcome_capture, finish_command_outcome_capture,
+    record_command_outcome_metadata, storage_key_is_valid,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 

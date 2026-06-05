@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use bmux_cli_schema::{RecordingExportFormat, RecordingRenderMode};
 use std::time::Duration;
 
 use super::{
-    discover_bundled_plugin_ids, recording, run_recording_export, sandbox_cli::run_sandbox_cleanup,
+    discover_bundled_plugin_ids, recording, run_plugin_command, sandbox_cli::run_sandbox_cleanup,
 };
 
 #[allow(
@@ -79,46 +78,14 @@ pub(super) async fn run_playbook_run(
     if let Some(gif_path) = export_gif {
         if let Some(ref rec_id) = result.recording_id {
             let recording_id_str = rec_id.to_string();
-            match run_recording_export(
-                &recording_id_str,
-                RecordingExportFormat::Gif,
-                gif_path,
-                None,                        // view_client: auto-detect
-                1.0,                         // speed
-                None,                        // fps: recording.export.fps
-                None,                        // max_duration
-                None,                        // max_frames
-                RecordingRenderMode::Bitmap, // Use bitmap for headless (no real terminal fonts)
-                None,                        // cell_size
-                None,                        // cell_width
-                None,                        // cell_height
-                None,                        // font_family
-                None,                        // font_size
-                None,                        // line_height
-                &[],                         // font_path
-                None,                        // palette_source
-                None,                        // palette_foreground
-                None,                        // palette_background
-                &[],                         // palette_color
-                None,                        // cursor
-                None,                        // cursor_shape
-                None,                        // cursor_blink
-                None,                        // cursor_blink_period_ms
-                None,                        // cursor_color
-                None,                        // cursor_profile
-                None,                        // cursor_solid_after_activity_ms
-                None,                        // cursor_solid_after_input_ms
-                None,                        // cursor_solid_after_output_ms
-                None,                        // cursor_solid_after_cursor_ms
-                None,                        // cursor_paint_mode
-                None,                        // cursor_text_mode
-                None,                        // cursor_bar_width_pct
-                None,                        // cursor_underline_height_pct
-                None,                        // export_metadata
-                true,                        // show_progress
-            )
-            .await
-            {
+            let args = vec![
+                recording_id_str,
+                "--format".to_string(),
+                "gif".to_string(),
+                "--output".to_string(),
+                gif_path.to_string(),
+            ];
+            match run_plugin_command("bmux.recording", "recording-export", &args).await {
                 Ok(_) => {
                     if !json {
                         println!("exported GIF: {gif_path}");

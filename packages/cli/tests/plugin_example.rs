@@ -125,6 +125,12 @@ fn bundled_cluster_manifest_matches_pragmatic_command_surface() {
 fn bundled_recording_manifest_owns_recording_cli_namespace() {
     let recording = bundled_manifest("bmux.recording");
     assert!(recording.owns_namespaces.contains("recording"));
+    assert!(
+        recording
+            .owns_paths
+            .iter()
+            .any(|path| path.0 == vec!["server".to_string(), "recording".to_string()])
+    );
 
     let commands = recording
         .commands
@@ -134,6 +140,7 @@ fn bundled_recording_manifest_owns_recording_cli_namespace() {
     assert!(commands.contains(&("recording-cut", true)));
     assert!(commands.contains(&("recording-path", true)));
     assert!(commands.contains(&("recording-export", true)));
+    assert!(commands.contains(&("server-recording", true)));
 }
 
 #[test]

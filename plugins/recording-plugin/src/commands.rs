@@ -13,7 +13,8 @@ use bmux_plugin_sdk::{
 use bmux_recording_plugin_api::{recording_commands, recording_state, recording_types};
 use bmux_recording_protocol::{
     RecordingEventEnvelope as ProtocolRecordingEventEnvelope, RecordingEventKind,
-    RecordingPayload as ProtocolRecordingPayload, RecordingStatus, RecordingSummary, read_frames,
+    RecordingPayload as ProtocolRecordingPayload, RecordingRollingClearReport,
+    RecordingRollingStatus, RecordingStatus, RecordingSummary, read_frames,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -189,6 +190,8 @@ fn flag_takes_value(name: &str) -> bool {
             | "profile"
             | "kind"
             | "event-kind"
+            | "rolling-window-secs"
+            | "rolling-event-kind"
             | "last-seconds"
             | "export-fps"
             | "older-than"
@@ -228,6 +231,7 @@ fn run_recording_command_inner(context: &NativeCommandContext) -> Result<i32> {
         "recording-replay" => run_replay(context, &args),
         "recording-verify-smoke" => run_verify_smoke(context, &args),
         "recording-prune" => run_prune(context, &args),
+        "server-recording" => run_server_recording(context),
         _ => Err(anyhow::anyhow!(
             "unknown recording command '{}'",
             context.command
@@ -543,6 +547,264 @@ fn run_path(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32>
         println!("{}", root.display());
     }
     Ok(0)
+}
+
+fn run_server_recording(context: &NativeCommandContext) -> Result<i32> {
+    let Some(subcommand) = context.arguments.first().map(String::as_str) else {
+        anyhow::bail!("server recording requires a subcommand: start, stop, status, path, clear");
+    };
+    let args = ArgCursor::new(&context.arguments[1..]);
+    match subcommand {
+        "start" => run_server_recording_start(context, &args),
+        "stop" => run_server_recording_stop(context),
+        "status" => run_server_recording_status(context, &args),
+        "path" => run_server_recording_path(context, &args),
+        "clear" => run_server_recording_clear(context, &args),
+        other => anyhow::bail!("unknown server recording subcommand '{other}'"),
+    }
+}
+
+fn run_server_recording_start(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+    let event_kinds_raw = args.multi_options("rolling-event-kind");
+    let event_kinds = if args.has_flag("rolling-event-kind-all") {
+        Some(
+            all_recording_event_kinds()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
+    } else if event_kinds_raw.is_empty() {
+        None
+    } else {
+        Some(
+            event_kinds_raw
+                .iter()
+                .map(|value| parse_event_kind(value).map(Into::into))
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+    let options = recording_types::RecordingRollingStartOptions {
+        window_secs: args.u64_option("rolling-window-secs")?,
+        name: normalize_recording_name(args.option("name").as_deref())?,
+        event_kinds,
+        capture_input: bool_flag_override(
+            args.has_flag("rolling-capture-input"),
+            args.has_flag("no-rolling-capture-input"),
+            "rolling-capture-input",
+        )?,
+        capture_output: bool_flag_override(
+            args.has_flag("rolling-capture-output"),
+            args.has_flag("no-rolling-capture-output"),
+            "rolling-capture-output",
+        )?,
+        capture_events: bool_flag_override(
+            args.has_flag("rolling-capture-events"),
+            args.has_flag("no-rolling-capture-events"),
+            "rolling-capture-events",
+        )?,
+        capture_protocol_replies: bool_flag_override(
+            args.has_flag("rolling-capture-protocol-replies"),
+            args.has_flag("no-rolling-capture-protocol-replies"),
+            "rolling-capture-protocol-replies",
+        )?,
+        capture_images: bool_flag_override(
+            args.has_flag("rolling-capture-images"),
+            args.has_flag("no-rolling-capture-images"),
+            "rolling-capture-images",
+        )?,
+    };
+    let response: std::result::Result<
+        recording_types::RecordingSummary,
+        recording_types::RecordingError,
+    > = invoke_recording_service(
+        context,
+        "bmux.recording.write",
+        InvokeServiceKind::Command,
+        "rolling-start",
+        &options,
+    )?;
+    let recording: RecordingSummary = response.map_err(recording_plugin_error)?.into();
+    println!(
+        "server rolling recording started: {} name={} path={}",
+        recording.id,
+        recording.name.as_deref().unwrap_or("-"),
+        recording.path
+    );
+    Ok(0)
+}
+
+fn run_server_recording_stop(context: &NativeCommandContext) -> Result<i32> {
+    let response: std::result::Result<Uuid, recording_types::RecordingError> =
+        invoke_recording_service(
+            context,
+            "bmux.recording.write",
+            InvokeServiceKind::Command,
+            "rolling-stop",
+            &(),
+        )?;
+    let recording_id = response.map_err(recording_plugin_error)?;
+    println!("server rolling recording stopped: {recording_id}");
+    Ok(0)
+}
+
+fn fetch_server_recording_status(context: &NativeCommandContext) -> Result<RecordingRollingStatus> {
+    let status: recording_types::RecordingRollingStatus = invoke_recording_service(
+        context,
+        "bmux.recording.read",
+        InvokeServiceKind::Query,
+        "rolling-status",
+        &(),
+    )?;
+    Ok(status.into())
+}
+
+fn run_server_recording_status(
+    context: &NativeCommandContext,
+    args: &ArgCursor<'_>,
+) -> Result<i32> {
+    let status = fetch_server_recording_status(context)?;
+    if args.has_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(0);
+    }
+
+    println!("rolling root: {}", status.root_path);
+    println!(
+        "auto-start: {}",
+        if status.auto_start {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "configured: {}",
+        if status.available { "yes" } else { "no" }
+    );
+    match status.rolling_window_secs {
+        Some(window_secs) => println!("window seconds: {window_secs}"),
+        None => println!("window seconds: unset"),
+    }
+    if status.event_kinds.is_empty() {
+        println!("event kinds: none");
+    } else {
+        println!(
+            "event kinds: {}",
+            status
+                .event_kinds
+                .iter()
+                .map(|kind| recording_event_kind_name(*kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(active) = status.active {
+        println!(
+            "active: {} name={} events={} bytes={} ({}) path={}",
+            active.id,
+            active.name.as_deref().unwrap_or("-"),
+            active.event_count,
+            active.payload_bytes,
+            format_byte_size(active.payload_bytes),
+            active.path
+        );
+    } else {
+        println!("active: none");
+    }
+    println!(
+        "usage: bytes={} ({}) files={} dirs={} recordings={}",
+        status.usage.bytes,
+        format_byte_size(status.usage.bytes),
+        status.usage.files,
+        status.usage.directories,
+        status.usage.recording_dirs
+    );
+    Ok(0)
+}
+
+fn run_server_recording_path(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+    let status = fetch_server_recording_status(context)?;
+    if args.has_flag("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "path": status.root_path }))?
+        );
+    } else {
+        println!("{}", status.root_path);
+    }
+    Ok(0)
+}
+
+fn run_server_recording_clear(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
+    let restart_if_active = !args.has_flag("no-restart");
+    let report: RecordingRollingClearReport =
+        invoke_recording_service::<_, recording_types::RecordingRollingClearReport>(
+            context,
+            "bmux.recording.write",
+            InvokeServiceKind::Command,
+            "rolling-clear",
+            &restart_if_active,
+        )?
+        .into();
+
+    if args.has_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
+    }
+
+    println!("rolling root: {}", report.root_path);
+    println!(
+        "usage before: bytes={} ({}) files={} dirs={} recordings={}",
+        report.usage_before.bytes,
+        format_byte_size(report.usage_before.bytes),
+        report.usage_before.files,
+        report.usage_before.directories,
+        report.usage_before.recording_dirs
+    );
+    println!(
+        "usage after: bytes={} ({}) files={} dirs={} recordings={}",
+        report.usage_after.bytes,
+        format_byte_size(report.usage_after.bytes),
+        report.usage_after.files,
+        report.usage_after.directories,
+        report.usage_after.recording_dirs
+    );
+    if report.was_active {
+        println!("was active: yes");
+        if let Some(recording_id) = report.stopped_recording_id {
+            println!("stopped recording: {recording_id}");
+        }
+    } else {
+        println!("was active: no");
+    }
+    if report.restarted {
+        if let Some(recording) = report.restarted_recording {
+            println!(
+                "restarted: yes id={} name={} path={}",
+                recording.id,
+                recording.name.as_deref().unwrap_or("-"),
+                recording.path
+            );
+        } else {
+            println!("restarted: yes");
+        }
+    } else {
+        println!("restarted: no");
+    }
+    Ok(0)
+}
+
+fn bool_flag_override(enabled: bool, disabled: bool, name: &str) -> Result<Option<bool>> {
+    if enabled && disabled {
+        anyhow::bail!("--{name} conflicts with --no-{name}");
+    }
+    Ok(if enabled {
+        Some(true)
+    } else if disabled {
+        Some(false)
+    } else {
+        None
+    })
 }
 
 fn run_list(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
@@ -907,6 +1169,20 @@ fn parse_event_kind(value: &str) -> Result<RecordingEventKind> {
         "custom" => Ok(RecordingEventKind::Custom),
         _ => anyhow::bail!("unsupported recording event kind '{value}'"),
     }
+}
+
+fn all_recording_event_kinds() -> Vec<RecordingEventKind> {
+    vec![
+        RecordingEventKind::PaneInputRaw,
+        RecordingEventKind::PaneOutputRaw,
+        RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKind::PaneImage,
+        RecordingEventKind::ServerEvent,
+        RecordingEventKind::RequestStart,
+        RecordingEventKind::RequestDone,
+        RecordingEventKind::RequestError,
+        RecordingEventKind::Custom,
+    ]
 }
 
 fn default_event_kinds_for_profile(
