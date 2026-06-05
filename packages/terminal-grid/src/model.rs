@@ -181,6 +181,14 @@ impl Cell {
         self.wide_continuation
     }
 
+    #[must_use]
+    pub fn is_discardable_blank(&self) -> bool {
+        self.text.len() == 1
+            && self.text.as_bytes()[0] == b' '
+            && self.style == StyleId::DEFAULT
+            && !self.wide_continuation
+    }
+
     pub(crate) fn append_combining(&mut self, ch: char) {
         self.text.push(ch);
     }
@@ -244,11 +252,7 @@ impl PhysicalRow {
     }
 
     fn trim_trailing_blanks(&mut self) {
-        while self
-            .cells
-            .last()
-            .is_some_and(|cell| cell.text == " " && cell.style == StyleId::DEFAULT)
-        {
+        while self.cells.last().is_some_and(Cell::is_discardable_blank) {
             self.cells.pop();
         }
     }
@@ -1565,10 +1569,7 @@ fn row_logical_cells(row: &PhysicalRow, width: usize) -> Vec<Cell> {
 }
 
 fn trim_trailing_blank_cells(mut cells: Vec<Cell>) -> Vec<Cell> {
-    while cells
-        .last()
-        .is_some_and(|cell| cell.text() == " " && !cell.is_wide_continuation())
-    {
+    while cells.last().is_some_and(Cell::is_discardable_blank) {
         cells.pop();
     }
     cells
@@ -1584,7 +1585,7 @@ pub fn physical_row_is_blank(row: &PhysicalRow) -> bool {
     row.cells()
         .iter()
         .filter(|cell| !cell.is_wide_continuation())
-        .all(|cell| cell.text().trim().is_empty())
+        .all(Cell::is_discardable_blank)
 }
 
 fn trim_trailing_unused_rows(rows: &mut Vec<PhysicalRow>) {
@@ -1609,7 +1610,7 @@ fn logical_width(cells: &[Cell]) -> usize {
 }
 
 fn row_is_blank(row: &PhysicalRow) -> bool {
-    row.cells().iter().all(|cell| cell.text() == " ")
+    row.cells().iter().all(Cell::is_discardable_blank)
 }
 
 fn collect_reversed_row(

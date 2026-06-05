@@ -120,7 +120,7 @@ fn trim_trailing_blank_cells(cells: &[Cell]) -> &[Cell] {
     let mut end = cells.len();
     while end > 0 {
         let cell = &cells[end - 1];
-        if cell.text() == " " && !cell.is_wide_continuation() {
+        if cell.is_discardable_blank() {
             end -= 1;
         } else {
             break;

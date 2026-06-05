@@ -119,7 +119,7 @@ fn row_snapshot(row: &PhysicalRow, width: usize) -> RowSnapshot {
     let cells = row.visual_cells(width);
     let effective_len = cells
         .iter()
-        .rposition(|cell| cell.text() != " " || cell.style() != StyleId::DEFAULT)
+        .rposition(|cell| !cell.is_discardable_blank())
         .map_or(0, |index| index.saturating_add(1));
     let mut runs = Vec::new();
     let mut current_start = 0_usize;
@@ -130,7 +130,7 @@ fn row_snapshot(row: &PhysicalRow, width: usize) -> RowSnapshot {
         if cell.is_wide_continuation() {
             continue;
         }
-        if cell.text() == " " && cell.style() == StyleId::DEFAULT && current_text.is_empty() {
+        if cell.is_discardable_blank() && current_text.is_empty() {
             continue;
         }
         if current_style == Some(cell.style()) {
@@ -236,15 +236,41 @@ mod tests {
             Some(crate::Color::Rgb {
                 r: 12,
                 g: 24,
-                b: 32
+                b: 32,
             })
         );
     }
 
     #[test]
-    fn snapshot_omits_leading_default_spaces() {
+    fn snapshot_preserves_trailing_styled_spaces() {
         let mut grid = TerminalGrid::new(8, 1, GridLimits::default()).unwrap();
-        grid.process(b"  bar");
+        grid.process(b"\x1b[48;2;12;24;32mbar   ");
+        let snapshot = grid.snapshot(0, 1);
+
+        assert_eq!(snapshot.rows[0].runs.len(), 1);
+        assert_eq!(snapshot.rows[0].runs[0].start_col, 0);
+        assert_eq!(snapshot.rows[0].runs[0].text, "bar   ");
+
+        let hydrated = TerminalGrid::from_snapshot(&snapshot, GridLimits::default()).unwrap();
+        let rows = hydrated.viewport_rows();
+        let text = rows[0].cells()[2].style();
+        let trailing = rows[0].cells()[5].style();
+        assert_ne!(trailing, crate::style::StyleId::DEFAULT);
+        assert_eq!(text, trailing);
+        assert_eq!(
+            hydrated.palette().get(trailing).bg,
+            Some(crate::Color::Rgb {
+                r: 12,
+                g: 24,
+                b: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_omits_discardable_default_spaces() {
+        let mut grid = TerminalGrid::new(8, 1, GridLimits::default()).unwrap();
+        grid.process(b"  bar   ");
         let snapshot = grid.snapshot(0, 1);
 
         assert_eq!(snapshot.rows[0].runs.len(), 1);
