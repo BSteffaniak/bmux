@@ -14,8 +14,10 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+ab_glyph                  = { workspace = true }
 anyhow                    = { workspace = true, features = ["std"] }
 bmux_codec                = { workspace = true }
+bmux_fonts                = { workspace = true }
 bmux_ipc                  = { workspace = true }
 bmux_plugin               = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
@@ -23,10 +25,15 @@ bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol   = { workspace = true }
 bmux_recording_runtime    = { workspace = true }
 bmux_terminal_grid        = { workspace = true }
+font8x8                   = { workspace = true }
+fontdb                    = { workspace = true }
+gif                       = { workspace = true }
+resvg                     = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true, features = ["std"] }
 thiserror                 = { workspace = true }
 tracing                   = { workspace = true, features = ["std"] }
+ttf-parser                = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
 
 [features]

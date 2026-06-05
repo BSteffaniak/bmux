@@ -15,23 +15,21 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod export;
 pub mod recording_runtime;
 pub use recording_runtime::{
     RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, execute_recording_cut,
     prune_old_recordings,
 };
 
-use bmux_plugin::{
-    HostRuntimeApi, ServiceCallerDispatchClient, block_on_typed_dispatch,
-    global_plugin_state_registry,
-};
+use bmux_plugin::{HostRuntimeApi, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    CoreCliCommandRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
+    CoreCliCommandRequest, HostScope, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+    TypedServiceRegistrationContext, TypedServiceRegistry,
 };
 use bmux_recording_plugin_api::{
-    ManualRecordingStartOptions, RecordingPluginConfig, recording_commands, recording_events,
-    recording_types,
+    ManualRecordingStartOptions, RecordingPluginConfig, recording_events, recording_types,
 };
 use bmux_recording_protocol::{
     RecordingCaptureTarget, RecordingEventKind, RecordingPayload as ProtocolRecordingPayload,
@@ -245,8 +243,11 @@ impl RustPlugin for RecordingPlugin {
         &mut self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        if should_queue_recording_cut_in_background(&context) {
-            return run_recording_cut_command_background(&context);
+        if should_queue_recording_cut_for_non_cli(&context) {
+            return run_recording_cut_command_queued(&context);
+        }
+        if context.command == "recording-export" {
+            return run_recording_export_command(&context);
         }
         run_recording_command_sync(&context)
     }
@@ -347,49 +348,140 @@ fn recording_command_path(command_name: &str) -> Option<&'static [&'static str]>
         "recording-analyze" => Some(&["recording", "analyze"]),
         "recording-replay" => Some(&["recording", "replay"]),
         "recording-verify-smoke" => Some(&["recording", "verify-smoke"]),
-        "recording-export" => Some(&["recording", "export"]),
         "recording-prune" => Some(&["recording", "prune"]),
         _ => None,
     }
 }
 
-fn should_queue_recording_cut_in_background(context: &NativeCommandContext) -> bool {
+fn should_queue_recording_cut_for_non_cli(context: &NativeCommandContext) -> bool {
     context.command == "recording-cut"
         && context.invocation_source != bmux_plugin_sdk::NativeCommandInvocationSource::Cli
 }
 
-fn run_recording_cut_command_background(
+fn run_recording_export_command(
     context: &NativeCommandContext,
 ) -> std::result::Result<i32, PluginCommandError> {
+    let recording_id = first_positional_argument(&context.arguments)
+        .ok_or_else(|| PluginCommandError::failed("recording export requires a recording id"))?;
+    let format =
+        parse_string_option(&context.arguments, "format").unwrap_or_else(|| "gif".to_string());
+    if format != "gif" {
+        return Err(PluginCommandError::failed(format!(
+            "unsupported recording export format '{format}'; only gif is supported"
+        )));
+    }
+    let output = parse_string_option(&context.arguments, "output")
+        .ok_or_else(|| PluginCommandError::failed("recording export requires --output <PATH>"))?;
+    let fps = parse_u32_option(&context.arguments, "fps")
+        .unwrap_or(24)
+        .max(1);
+    let recordings_root = recordings_root_for_command(context)?;
+
+    export::export_recording_gif_from_root(&recordings_root, &recording_id, &output, fps)
+        .map_err(|error| PluginCommandError::failed(format!("recording export failed: {error}")))?;
     bmux_plugin_sdk::record_command_outcome_metadata(
         bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
-        serde_json::json!("recording cut queued"),
+        serde_json::json!(format!("recording export complete: {output}")),
     );
+    Ok(0)
+}
 
+fn recordings_root_for_command(
+    context: &NativeCommandContext,
+) -> std::result::Result<PathBuf, PluginCommandError> {
+    if let Some(config_handle) = config_handle() {
+        return Ok(config_handle
+            .read()
+            .map_err(|_| PluginCommandError::failed("recording plugin config lock is poisoned"))?
+            .recordings_dir
+            .clone());
+    }
+
+    Ok(Path::new(&context.connection.state_dir)
+        .join("runtime")
+        .join("recordings"))
+}
+
+fn first_positional_argument(arguments: &[String]) -> Option<String> {
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            return iter.next().cloned();
+        }
+        if arg.starts_with("--") {
+            let _ = iter.next();
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+fn run_recording_cut_command_queued(
+    context: &NativeCommandContext,
+) -> std::result::Result<i32, PluginCommandError> {
     let last_seconds = parse_u64_option(&context.arguments, "last-seconds");
     let export_fps = parse_u32_option(&context.arguments, "export-fps");
     let name = parse_string_option(&context.arguments, "name");
-    let context = context.clone();
-    std::thread::Builder::new()
-        .name("bmux-recording-cut-command".to_string())
-        .spawn(move || {
-            let mut client = ServiceCallerDispatchClient::new(&context);
-            let result = block_on_typed_dispatch(recording_commands::client::queue_cut(
-                &mut client,
-                last_seconds,
-                name,
-                export_fps,
-            ));
-            if let Err(error) = result {
-                tracing::warn!("recording cut queue via typed service dispatch failed: {error}");
-            }
-        })
-        .map_err(|error| {
-            PluginCommandError::failed(format!(
-                "failed spawning background recording cut command: {error}"
-            ))
-        })?;
+    tracing::info!(
+        invocation_source = ?context.invocation_source,
+        ?last_seconds,
+        ?export_fps,
+        name = ?name,
+        "recording cut enqueue requested"
+    );
+
+    let service_context = queue_cut_service_context_from_command(context);
+    let job = recording_queue_cut_generated(
+        QueueCutRequest {
+            last_seconds,
+            name,
+            export_fps,
+        },
+        &service_context,
+    )
+    .map_err(|error| {
+        tracing::warn!(?error, "recording cut queue failed");
+        PluginCommandError::failed(format!("failed queueing recording cut: {error:?}"))
+    })?;
+
+    tracing::info!(job_id = %job.id, status = ?job.status, "recording cut queued");
+    bmux_plugin_sdk::record_command_outcome_metadata(
+        bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+        serde_json::json!(format!("recording cut queued: {}", job.id)),
+    );
     Ok(0)
+}
+
+fn queue_cut_service_context_from_command(context: &NativeCommandContext) -> NativeServiceContext {
+    let service = RegisteredService {
+        capability: HostScope::new("bmux.recording.write")
+            .expect("recording write capability should be valid"),
+        kind: ServiceKind::Command,
+        interface_id: "recording-commands".to_string(),
+        provider: ProviderId::Plugin("bmux.recording".to_string()),
+    };
+    NativeServiceContext {
+        plugin_id: context.plugin_id.clone(),
+        request: ServiceRequest {
+            caller_plugin_id: context.plugin_id.clone(),
+            service,
+            operation: "queue-cut".to_string(),
+            payload: Vec::new(),
+        },
+        required_capabilities: context.required_capabilities.clone(),
+        provided_capabilities: context.provided_capabilities.clone(),
+        services: context.services.clone(),
+        available_capabilities: context.available_capabilities.clone(),
+        enabled_plugins: context.enabled_plugins.clone(),
+        plugin_search_roots: context.plugin_search_roots.clone(),
+        host: context.host.clone(),
+        connection: context.connection.clone(),
+        settings: context.settings.clone(),
+        plugin_settings_map: context.plugin_settings_map.clone(),
+        caller_client_id: context.caller_client_id,
+        host_kernel_bridge: context.host_kernel_bridge,
+    }
 }
 
 fn run_recording_command_sync(
@@ -625,7 +717,7 @@ fn recording_list_jobs_generated() -> Vec<recording_types::RecordingJob> {
 
 fn recording_queue_cut_generated(
     req: QueueCutRequest,
-    ctx: &NativeServiceContext,
+    _ctx: &NativeServiceContext,
 ) -> Result<recording_types::RecordingJob, recording_types::RecordingError> {
     // Validate preconditions synchronously so the caller gets fast failure when
     // the plugin state is unavailable.
@@ -664,11 +756,10 @@ fn recording_queue_cut_generated(
     upsert_recording_job(job.clone());
     publish_recording_job_updated(&job);
 
-    let worker_context = ctx.clone();
     let job_id = job.id;
     if let Err(error) = std::thread::Builder::new()
         .name("bmux-recording-cut-worker".to_string())
-        .spawn(move || run_queued_cut_job(job_id, req, &worker_context))
+        .spawn(move || run_queued_cut_job(job_id, req))
     {
         let reason = format!("failed spawning cut worker thread: {error}");
         let failed = update_recording_job(job_id, |job| {
@@ -717,7 +808,7 @@ fn update_recording_job(
     job.clone()
 }
 
-fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest, ctx: &NativeServiceContext) {
+fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest) {
     let cutting = update_recording_job(job_id, |job| {
         job.status = recording_types::RecordingJobStatus::Cutting;
     });
@@ -748,6 +839,11 @@ fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest, ctx: &NativeServ
 
     let export_settings = current_auto_export_settings(req.export_fps);
     if !export_settings.enabled {
+        tracing::info!(
+            job_id = %job_id,
+            recording_id = %summary.id,
+            "recording cut auto-export disabled"
+        );
         let completed = update_recording_job(job_id, |job| {
             job.status = recording_types::RecordingJobStatus::Completed;
         });
@@ -762,6 +858,13 @@ fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest, ctx: &NativeServ
         summary.id,
     );
     let output = output_path.to_string_lossy().to_string();
+    tracing::info!(
+        job_id = %job_id,
+        recording_id = %summary.id,
+        output_path = %output,
+        fps = export_settings.fps,
+        "recording cut auto-export starting"
+    );
     publish_recording_export_started(summary.id, output.clone());
     let exporting = update_recording_job(job_id, |job| {
         job.status = recording_types::RecordingJobStatus::Exporting;
@@ -769,8 +872,19 @@ fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest, ctx: &NativeServ
     });
     publish_recording_job_updated(&exporting);
 
-    match run_core_gif_export(ctx, summary.id, &output, export_settings.fps) {
+    match export::export_recording_gif_for_recording_dir(
+        &recording_dir,
+        summary.id,
+        &output,
+        export_settings.fps,
+    ) {
         Ok(()) => {
+            tracing::info!(
+                job_id = %job_id,
+                recording_id = %summary.id,
+                output_path = %output,
+                "recording cut auto-export completed"
+            );
             publish_recording_export_completed(summary.id, output);
             let completed = update_recording_job(job_id, |job| {
                 job.status = recording_types::RecordingJobStatus::Completed;
@@ -779,6 +893,13 @@ fn run_queued_cut_job(job_id: uuid::Uuid, req: QueueCutRequest, ctx: &NativeServ
         }
         Err(error) => {
             let reason = error.to_string();
+            tracing::warn!(
+                job_id = %job_id,
+                recording_id = %summary.id,
+                output_path = %output,
+                error = %reason,
+                "recording cut auto-export failed"
+            );
             publish_recording_export_failed(summary.id, output, reason.clone());
             let failed = update_recording_job(job_id, |job| {
                 job.status = recording_types::RecordingJobStatus::Failed;
@@ -811,7 +932,7 @@ fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExportSettings
         };
     };
     AutoExportSettings {
-        enabled: config.auto_export,
+        enabled: config.auto_export || config.auto_export_dir.is_some(),
         output_dir: config.auto_export_dir.clone(),
         fps: fps_override.unwrap_or(config.auto_export_fps).max(1),
     }
@@ -831,34 +952,6 @@ fn auto_export_output_path(
         Path::to_path_buf,
     );
     output_dir.join(format!("recording-{recording_id}.gif"))
-}
-
-fn run_core_gif_export(
-    ctx: &NativeServiceContext,
-    recording_id: uuid::Uuid,
-    output_path: &str,
-    fps: u32,
-) -> anyhow::Result<()> {
-    let request = CoreCliCommandRequest::new(
-        vec!["recording".to_string(), "export".to_string()],
-        vec![
-            recording_id.to_string(),
-            "--format".to_string(),
-            "gif".to_string(),
-            "--output".to_string(),
-            output_path.to_string(),
-            "--fps".to_string(),
-            fps.to_string(),
-        ],
-    );
-    let response = ctx.core_cli_command_run_path(&request)?;
-    if let Some(error) = response.error {
-        anyhow::bail!(error);
-    }
-    if response.exit_code != 0 {
-        anyhow::bail!("recording export exited with status {}", response.exit_code);
-    }
-    Ok(())
 }
 
 fn recording_rolling_start_generated(
@@ -1556,7 +1649,12 @@ bmux_plugin_sdk::export_plugin!(RecordingPlugin, include_str!("../plugin.toml"))
 
 #[cfg(test)]
 mod tests {
-    use super::auto_export_output_path;
+    use super::{RecordingPlugin, auto_export_output_path};
+    use bmux_plugin_sdk::{
+        CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
+        NativeCommandContext, NativeCommandInvocationSource, RustPlugin,
+    };
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     #[test]
@@ -1589,5 +1687,82 @@ mod tests {
             output,
             Path::new("/raw/recordings/recording-11111111-1111-4111-8111-111111111111.gif")
         );
+    }
+
+    #[test]
+    fn recording_plugin_export_does_not_shell_out_to_bmux_cli() {
+        let export_source = include_str!("export.rs");
+        let plugin_source = include_str!("lib.rs");
+
+        for forbidden in [
+            concat!("std::process", "::Command"),
+            concat!("current", "_exe"),
+            concat!("run_core", "_gif_export"),
+            concat!("recording export", " subprocess"),
+        ] {
+            assert!(
+                !export_source.contains(forbidden),
+                "export module must not contain {forbidden}"
+            );
+            assert!(
+                !plugin_source.contains(forbidden),
+                "plugin module must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_cli_recording_cut_reports_queue_precondition_without_self_dispatch_deadlock() {
+        let mut plugin = RecordingPlugin;
+        let error = plugin
+            .run_command(command_context(
+                "recording-cut",
+                &["--last-seconds", "30", "--export-fps", "12"],
+                NativeCommandInvocationSource::AttachKeybinding,
+            ))
+            .expect_err("recording cut should report missing queue precondition");
+
+        assert!(
+            error.to_string().contains("failed queueing recording cut"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn command_context(
+        command: &str,
+        arguments: &[&str],
+        invocation_source: NativeCommandInvocationSource,
+    ) -> NativeCommandContext {
+        NativeCommandContext {
+            plugin_id: "bmux.recording".to_string(),
+            command: command.to_string(),
+            arguments: arguments.iter().map(ToString::to_string).collect(),
+            required_capabilities: Vec::new(),
+            provided_capabilities: vec!["bmux.recording.write".to_string()],
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux-test".to_string(),
+                product_version: "0.0.0".to_string(),
+                plugin_api_version: CURRENT_PLUGIN_API_VERSION,
+                plugin_abi_version: CURRENT_PLUGIN_ABI_VERSION,
+            },
+            connection: HostConnectionInfo {
+                config_dir: String::new(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: String::new(),
+                data_dir: String::new(),
+                state_dir: String::new(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            invocation_source,
+            host_kernel_bridge: None,
+        }
     }
 }

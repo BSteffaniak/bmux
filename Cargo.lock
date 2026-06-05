@@ -1910,8 +1910,10 @@ dependencies = [
 name = "bmux_recording_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "bmux_codec",
+ "bmux_fonts",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1919,10 +1921,15 @@ dependencies = [
  "bmux_recording_protocol",
  "bmux_recording_runtime",
  "bmux_terminal_grid",
+ "font8x8",
+ "fontdb",
+ "gif",
+ "resvg",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "ttf-parser",
  "uuid",
 ]
 

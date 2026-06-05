@@ -9697,9 +9697,11 @@ async fn handle_attach_action_dispatch(
 ) -> Result<AttachLoopControl> {
     let now = SystemAttachClock.now();
     let action_str = &dispatch_request.action;
+    debug!(action = %action_str, "attach action dispatch received");
     let action = match parse_action(action_str) {
         Ok(action) => action,
         Err(error) => {
+            warn!(action = %action_str, %error, "invalid dispatched attach action");
             view_state.set_transient_status(
                 format!("invalid dispatched action: {error}"),
                 now,
