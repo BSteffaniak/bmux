@@ -4386,7 +4386,7 @@ fn build_render_frame_output_plan<'a>(
             .map(|surface| surface.surface_id)
             .collect::<BTreeSet<_>>();
 
-    let surfaces = ordered_surfaces
+    let surfaces: Vec<_> = ordered_surfaces
         .into_iter()
         .filter_map(|(surface_index, surface)| {
             build_surface_output_plan(
@@ -4409,8 +4409,13 @@ fn build_render_frame_output_plan<'a>(
         })
         .collect();
 
+    let full_frame_clear = frame_damage.is_full_frame()
+        && !surfaces
+            .iter()
+            .any(|surface| surface.surface_plan.sync_deferred);
+
     RenderFrameOutputPlan {
-        full_frame_clear: frame_damage.is_full_frame(),
+        full_frame_clear,
         terminal_size,
         status_insets,
         surfaces,
@@ -4523,13 +4528,14 @@ fn build_surface_output_plan<'a>(
         &after_content_output_plan.retained_cleanup_damage,
     );
 
-    // Defer drawing pane content while the inner application is inside a DEC
-    // mode 2026 synchronized update. The host terminal still shows the
-    // previous complete frame, so skipping render keeps the display stable.
-    // Never defer during a full-frame redraw because the screen was cleared.
+    // DEC 2026 synchronized-update means the pane application is publishing an
+    // atomic frame. Keep the previously committed attach frame visible until
+    // the PTY reader reports the synchronized update has ended. This must also
+    // apply to attach full-frame redraws; clearing/repainting while the inner
+    // application is mid-frame exposes partially updated pane content.
     let sync_deferred = pane_buffers
         .get(&pane_id)
-        .is_some_and(|b| b.sync_update_in_progress && !frame_damage.is_full_frame());
+        .is_some_and(|b| b.sync_update_in_progress);
 
     let focused = surface.cursor_owner
         || focused_surface_id == Some(surface.id)
@@ -5337,9 +5343,7 @@ mod tests {
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
-    use std::collections::BTreeMap;
-    #[cfg(feature = "image-kitty")]
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 
     #[cfg(feature = "image-kitty")]
@@ -10830,7 +10834,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_deferred_bypassed_during_full_pane_redraw() {
+    fn sync_deferred_is_respected_during_full_pane_redraw() {
         let pane_id = Uuid::from_u128(44);
         let scene = AttachScene {
             session_id: Uuid::from_u128(45),
@@ -10863,7 +10867,9 @@ mod tests {
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
         feed_pane_buffer(&mut buffer, 2, 10, b"content");
-        // Flag is set but full_pane_redraw overrides deferral.
+        // Full-frame attach redraws must not override inner synchronized-update
+        // deferral. Otherwise bmux can clear/repaint from a half-mutated pane
+        // grid while the application is still publishing an atomic frame.
         buffer.sync_update_in_progress = true;
         pane_buffers.insert(pane_id, buffer);
 
@@ -10886,12 +10892,16 @@ mod tests {
             DamageCoalescingPolicy::default(),
             &[],
         )
-        .expect("full redraw should succeed despite sync flag");
+        .expect("full redraw should defer while sync flag is active");
 
         let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(
-            rendered.contains("content"),
-            "full_pane_redraw must draw content even when sync_update_in_progress is set"
+            !rendered.contains("content"),
+            "full-frame redraw must not draw partial pane content while sync_update_in_progress is set"
+        );
+        assert!(
+            !rendered.contains("\x1b[2J"),
+            "full-frame redraw must not clear the host terminal while pane content is sync-deferred"
         );
     }
 
