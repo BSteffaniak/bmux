@@ -1085,6 +1085,9 @@ fn merge_component_paint_commands_for_id(
     let Some(component) = state.script_components.get_mut(component_id) else {
         return;
     };
+    if target.is_some() && json_array_is_empty(&panes) && component.script_events.is_empty() {
+        return;
+    }
     let Some(backend) = component.backend.as_ref() else {
         return;
     };
@@ -1163,6 +1166,10 @@ fn merge_component_paint_commands_for_id(
             surface.paint_commands.extend(commands);
         }
     }
+}
+
+fn json_array_is_empty(value: &serde_json::Value) -> bool {
+    value.as_array().is_some_and(Vec::is_empty)
 }
 
 fn component_settings_json(spec: &DecorationComponentSpec) -> serde_json::Value {
@@ -1801,6 +1808,54 @@ fn apply_theme_extension_toml_direct(
     publish_scene_if_changed(state);
     install_script_event_subscriptions(shared, state, script_access, subscription_generation);
     Ok(())
+}
+
+fn has_active_animation_demand(state: &State) -> bool {
+    if state.geometry.is_empty() || state.animation_hz.is_none_or(|hz| hz == 0) {
+        return false;
+    }
+    if state.script_backend.is_some()
+        && state
+            .current_theme
+            .as_ref()
+            .and_then(|theme| theme.animation.as_ref())
+            .is_some_and(|animation| animation.hz > 0)
+    {
+        return true;
+    }
+    state
+        .script_components
+        .values()
+        .any(|component| component_has_active_animation_demand(state, component))
+}
+
+fn component_has_active_animation_demand(
+    state: &State,
+    component: &ScriptComponentRuntime,
+) -> bool {
+    if component.backend.is_none()
+        || !component_enabled(&component.spec)
+        || component
+            .spec
+            .animation
+            .as_ref()
+            .is_none_or(|animation| animation.hz == 0)
+    {
+        return false;
+    }
+    component.spec.target.is_none()
+        || !component.script_events.is_empty()
+        || ordered_surface_ids(state)
+            .into_iter()
+            .enumerate()
+            .any(|(visible_index, surface_id)| {
+                component_target_matches(
+                    state,
+                    component.spec.target.as_ref(),
+                    surface_id,
+                    visible_index,
+                )
+            })
 }
 
 fn effective_animation_hz(extension: &DecorationThemeExtension) -> Option<u16> {
@@ -5781,6 +5836,96 @@ exited = ""
             ),
         )
         .expect("write script");
+    }
+
+    fn animated_component_runtime(target_kind: &str) -> ScriptComponentRuntime {
+        ScriptComponentRuntime {
+            id: "component".to_string(),
+            spec: DecorationComponentSpec {
+                enabled: None,
+                script: Some("test".to_string()),
+                script_instance: None,
+                entrypoint: None,
+                above: None,
+                below: None,
+                target: Some(DecorationComponentTargetSpec {
+                    kind: target_kind.to_string(),
+                    index: None,
+                    modulo: None,
+                    remainder: None,
+                }),
+                animation: Some(
+                    bmux_decoration_plugin_api::decoration_state::AnimationSpec {
+                        kind: "test".to_string(),
+                        hz: 12,
+                    },
+                ),
+                settings: None,
+                input: None,
+                visual_adapters: None,
+            },
+            instance_id: "component".to_string(),
+            backend: Some(Arc::new(TestScriptBackend)),
+            script_path: None,
+            script_source_hash: None,
+            script_started_at: None,
+            script_frame: 0,
+            script_perf: None,
+            script_events: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn active_animation_demand_requires_matching_target() {
+        let pane = Uuid::from_u128(0xabc1);
+        let mut state = State {
+            animation_hz: Some(12),
+            ..State::default()
+        };
+        state.geometry.insert(
+            pane,
+            PaneGeometry {
+                pane_id: pane,
+                rect: rect(0, 0, 20, 5),
+                content_rect: rect(1, 1, 18, 3),
+            },
+        );
+        state.visible_surface_order.push(pane);
+        state.script_components.insert(
+            "component".to_string(),
+            animated_component_runtime("focused-pane"),
+        );
+
+        assert!(!has_active_animation_demand(&state));
+
+        state.activity_mut(pane).focused = true;
+
+        assert!(has_active_animation_demand(&state));
+    }
+
+    #[test]
+    fn target_empty_component_render_is_skipped_without_events() {
+        let plugin = DecorationPlugin::new();
+        let focused = Uuid::from_u128(0xabc2);
+        seed_geometry(&plugin, focused, 20, 5);
+        set_activity(&plugin, focused, true, false);
+        plugin.state.with_state(|state| {
+            state.script_components.insert(
+                "component".to_string(),
+                animated_component_runtime("unfocused-panes"),
+            );
+        });
+
+        let scene = plugin.build_scene();
+        assert_eq!(
+            plugin.state.with_state(|state| state
+                .script_components
+                .get("component")
+                .map_or(0, |component| component.script_frame)),
+            0,
+            "target-empty component should not invoke its render script",
+        );
+        assert!(scene.surfaces.contains_key(&focused));
     }
 
     #[test]

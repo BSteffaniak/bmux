@@ -10,8 +10,8 @@ use uuid::Uuid;
 use super::extension_retained::{
     ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, build_extension_layer_diff_plan,
     load_retained_layer_snapshot, retained_layer_cache_key,
-    retained_scene_item_damage_for_render_damage, retained_scene_items_to_render_items,
-    retained_snapshot_from_plugin_scene,
+    retained_scene_item_damage_for_render_damage, retained_scene_items_for_render_damage,
+    retained_scene_items_to_render_items, retained_snapshot_from_plugin_scene,
 };
 use super::{
     DamageCoalescingPolicy, DamageRect, FrameDamage, RenderOpsOutputPlan,
@@ -466,7 +466,9 @@ fn build_retained_before_content_extension_output_plan(
         snapshot.surface_rect,
         policy,
     );
-    let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
+    let selected_items =
+        retained_scene_items_for_render_damage(retained_snapshot.items.as_slice(), &output_damage);
+    let output_items = retained_scene_items_to_render_items(&selected_items);
     Some(BeforeContentExtensionOutputPlan {
         snapshot: snapshot.clone(),
         cache_key: Some(retained_cache_key),
@@ -670,7 +672,17 @@ fn build_retained_after_content_extension_output_plan(
         snapshot.surface_rect,
         policy,
     );
-    let output_items = retained_scene_items_to_render_items(&diff_plan.output_items);
+    let retained_output_damage = merge_render_damage(
+        output_damage.clone(),
+        diff_plan.stale_cleanup_damage.clone(),
+        snapshot.surface_rect,
+        policy,
+    );
+    let selected_items = retained_scene_items_for_render_damage(
+        retained_snapshot.items.as_slice(),
+        &retained_output_damage,
+    );
+    let output_items = retained_scene_items_to_render_items(&selected_items);
     Some(AfterContentExtensionOutputPlan {
         surface_index,
         snapshot: snapshot.clone(),

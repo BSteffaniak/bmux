@@ -6,7 +6,8 @@ use crossterm::terminal;
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -151,13 +152,18 @@ const DISPLAY_CAPTURE_SEGMENT_MAX_AGE: Duration = Duration::from_secs(2);
 const DISPLAY_CAPTURE_PRUNE_GRACE: Duration = Duration::from_secs(5);
 pub(super) struct DisplayCaptureWriter {
     sender: mpsc::SyncSender<DisplayCaptureCommand>,
+    queued_commands: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
     dropped_events: u64,
 }
 
 enum DisplayCaptureCommand {
     Event(DisplayTrackEvent),
-    CursorSnapshot(Option<crate::runtime::attach::state::AttachCursorState>),
+    Frame {
+        data: Arc<[u8]>,
+        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
+        cursor_changed: bool,
+    },
     Flush(mpsc::Sender<Result<()>>),
     Close(mpsc::Sender<Result<()>>),
 }
@@ -201,12 +207,17 @@ impl DisplayCaptureWriter {
         )?;
         writer.record_stream_opened()?;
         let (sender, receiver) = mpsc::sync_channel(DISPLAY_CAPTURE_QUEUE_CAPACITY);
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let worker_queued_commands = Arc::clone(&queued_commands);
         let worker = thread::Builder::new()
             .name(format!("bmux-display-capture-{recording_id}"))
-            .spawn(move || display_capture_writer_loop(&mut writer, receiver))
+            .spawn(move || {
+                display_capture_writer_loop(&mut writer, receiver, &worker_queued_commands);
+            })
             .context("failed spawning display capture writer thread")?;
         Ok(Self {
             sender,
+            queued_commands,
             worker: Some(worker),
             dropped_events: 0,
         })
@@ -219,15 +230,28 @@ impl DisplayCaptureWriter {
         }))
     }
 
-    pub(super) fn record_frame_bytes(&mut self, data: &[u8]) -> Result<()> {
+    pub(super) fn has_frame_capacity(&self) -> bool {
+        self.queued_commands.load(Ordering::Relaxed) < DISPLAY_CAPTURE_QUEUE_CAPACITY
+    }
+
+    pub(super) fn record_frame(
+        &mut self,
+        data: Arc<[u8]>,
+        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
+        cursor_changed: bool,
+    ) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        self.enqueue(DisplayCaptureCommand::Event(
-            DisplayTrackEvent::FrameBytes {
-                data: data.to_vec(),
-            },
-        ))
+        if !self.has_frame_capacity() {
+            self.record_dropped_event();
+            return Ok(());
+        }
+        self.enqueue(DisplayCaptureCommand::Frame {
+            data,
+            cursor_state,
+            cursor_changed,
+        })
     }
 
     pub(super) fn record_activity(&mut self, kind: DisplayActivityKind) -> Result<()> {
@@ -236,18 +260,13 @@ impl DisplayCaptureWriter {
         }))
     }
 
-    pub(super) fn record_cursor_snapshot(
-        &mut self,
-        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
-    ) -> Result<()> {
-        self.enqueue(DisplayCaptureCommand::CursorSnapshot(cursor_state))
-    }
-
     pub(super) fn record_stream_closed(&mut self) -> Result<()> {
         let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(DisplayCaptureCommand::Close(sender))
-            .context("display capture writer is closed")?;
+        self.queued_commands.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self.sender.send(DisplayCaptureCommand::Close(sender)) {
+            self.queued_commands.fetch_sub(1, Ordering::Relaxed);
+            return Err(error).context("display capture writer is closed");
+        }
         let result = receiver
             .recv()
             .context("display capture writer closed without acknowledgement")?;
@@ -277,30 +296,39 @@ impl DisplayCaptureWriter {
 
     pub(super) fn flush(&self) -> Result<()> {
         let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(DisplayCaptureCommand::Flush(sender))
-            .context("display capture writer is closed")?;
+        self.queued_commands.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self.sender.send(DisplayCaptureCommand::Flush(sender)) {
+            self.queued_commands.fetch_sub(1, Ordering::Relaxed);
+            return Err(error).context("display capture writer is closed");
+        }
         receiver
             .recv()
             .context("display capture writer closed without flushing")?
     }
 
     fn enqueue(&mut self, command: DisplayCaptureCommand) -> Result<()> {
+        self.queued_commands.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(command) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => {
-                self.dropped_events = self.dropped_events.saturating_add(1);
-                if self.dropped_events == 1 || self.dropped_events.is_multiple_of(1024) {
-                    tracing::warn!(
-                        dropped_events = self.dropped_events,
-                        "display capture queue is full; dropping recording display events"
-                    );
-                }
+                self.queued_commands.fetch_sub(1, Ordering::Relaxed);
+                self.record_dropped_event();
                 Ok(())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.queued_commands.fetch_sub(1, Ordering::Relaxed);
                 Err(anyhow::anyhow!("display capture writer is closed"))
             }
+        }
+    }
+
+    fn record_dropped_event(&mut self) {
+        self.dropped_events = self.dropped_events.saturating_add(1);
+        if self.dropped_events == 1 || self.dropped_events.is_multiple_of(1024) {
+            tracing::warn!(
+                dropped_events = self.dropped_events,
+                "display capture queue is full; dropping recording display events"
+            );
         }
     }
 }
@@ -492,17 +520,40 @@ impl DisplayCaptureFileWriter {
 fn display_capture_writer_loop(
     writer: &mut DisplayCaptureFileWriter,
     receiver: mpsc::Receiver<DisplayCaptureCommand>,
+    queued_commands: &AtomicUsize,
 ) {
     for command in receiver {
+        queued_commands.fetch_sub(1, Ordering::Relaxed);
         match command {
             DisplayCaptureCommand::Event(event) => {
                 if let Err(error) = writer.record(event) {
                     tracing::warn!(error = %error, "display capture write failed");
                 }
             }
-            DisplayCaptureCommand::CursorSnapshot(cursor_state) => {
+            DisplayCaptureCommand::Frame {
+                data,
+                cursor_state,
+                cursor_changed,
+            } => {
+                if let Err(error) = writer.record(DisplayTrackEvent::FrameBytes {
+                    data: data.to_vec(),
+                }) {
+                    tracing::warn!(error = %error, "display capture write failed");
+                }
+                if let Err(error) = writer.record(DisplayTrackEvent::Activity {
+                    kind: DisplayActivityKind::Output,
+                }) {
+                    tracing::warn!(error = %error, "display capture activity write failed");
+                }
                 if let Err(error) = writer.record_cursor_snapshot(cursor_state) {
                     tracing::warn!(error = %error, "display capture cursor snapshot failed");
+                }
+                if cursor_changed
+                    && let Err(error) = writer.record(DisplayTrackEvent::Activity {
+                        kind: DisplayActivityKind::Cursor,
+                    })
+                {
+                    tracing::warn!(error = %error, "display capture cursor activity write failed");
                 }
             }
             DisplayCaptureCommand::Flush(ack) => {

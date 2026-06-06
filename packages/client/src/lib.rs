@@ -471,6 +471,7 @@ impl BmuxClient {
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
+        let request_detail = request_detail(&request);
         let timeout_ms = self.timeout.as_millis();
         let started_at = std::time::Instant::now();
         debug!(
@@ -494,6 +495,7 @@ impl BmuxClient {
             warn!(
                 request_id,
                 request = request_kind,
+                request_detail = request_detail.as_str(),
                 timeout_ms,
                 phase = "send",
                 duration_ms = started_at.elapsed().as_millis(),
@@ -517,6 +519,7 @@ impl BmuxClient {
                 warn!(
                     request_id,
                     request = request_kind,
+                    request_detail = request_detail.as_str(),
                     timeout_ms,
                     phase = "recv",
                     duration_ms = started_at.elapsed().as_millis(),
@@ -711,6 +714,7 @@ type TimedOutMap = Arc<tokio::sync::Mutex<BTreeMap<u64, TimedOutRequest>>>;
 #[derive(Debug, Clone)]
 struct TimedOutRequest {
     request: &'static str,
+    detail: String,
     elapsed_ms: u128,
 }
 
@@ -944,6 +948,7 @@ impl StreamingBmuxClient {
                             warn!(
                                 request_id = envelope.request_id,
                                 request = timed_out.request,
+                                request_detail = timed_out.detail,
                                 timed_out_elapsed_ms = timed_out.elapsed_ms,
                                 "streaming client received late response after timeout"
                             );
@@ -1002,6 +1007,7 @@ impl StreamingBmuxClient {
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
+        let request_detail = request_detail(&request);
         let started_at = std::time::Instant::now();
         debug!(
             request_id,
@@ -1039,6 +1045,7 @@ impl StreamingBmuxClient {
                 warn!(
                     request_id,
                     request = request_kind,
+                    request_detail = request_detail.as_str(),
                     timeout_ms = self.timeout.as_millis(),
                     elapsed_ms,
                     "streaming_ipc.request.timeout"
@@ -1051,6 +1058,7 @@ impl StreamingBmuxClient {
                         request_id,
                         TimedOutRequest {
                             request: request_kind,
+                            detail: request_detail,
                             elapsed_ms,
                         },
                     );
@@ -1407,6 +1415,25 @@ impl TypedDispatchClient for StreamingBmuxClient {
                 )),
             }
         }
+    }
+}
+
+fn request_detail(request: &Request) -> String {
+    match request {
+        Request::InvokeService {
+            capability,
+            kind,
+            interface_id,
+            operation,
+            ..
+        } => format!(
+            "capability={capability} kind={kind:?} interface={interface_id} operation={operation}"
+        ),
+        Request::InvokeServicePipeline { pipeline } => {
+            format!("pipeline_steps={}", pipeline.steps.len())
+        }
+        Request::EmitOnPluginBus { kind, .. } => format!("event_kind={kind}"),
+        _ => String::new(),
     }
 }
 

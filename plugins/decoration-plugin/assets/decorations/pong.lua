@@ -886,7 +886,8 @@ local function render_pane(pane, message)
     local rally_ms = component_setting_number(message, "rally_ms", RALLY_MS)
     local win_hold_ms = component_setting_number(message, "win_hold_ms", WIN_HOLD_MS)
     local content_bounce = component_setting_bool(message, "content_bounce", false)
-    local visual = visual_for_pane(message, pane)
+    local visual = nil
+    if content_bounce then visual = visual_for_pane(message, pane) end
     local game = simulate(pane, state.active_ms, rally_ms, win_hold_ms, content_bounce, visual)
     local cmds = {}
     if entrypoint == "ball" or entrypoint == "all" then render_ball(cmds, pane, game) end

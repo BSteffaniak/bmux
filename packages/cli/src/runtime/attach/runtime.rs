@@ -807,10 +807,27 @@ impl DisplayCaptureFanout {
         }
     }
 
-    fn record_frame_bytes(&mut self, data: &[u8]) {
+    fn record_frame(
+        &mut self,
+        data: &[u8],
+        cursor_state: Option<super::state::AttachCursorState>,
+        cursor_changed: bool,
+    ) {
+        if data.is_empty()
+            || !self
+                .writers
+                .values()
+                .any(display_capture::DisplayCaptureWriter::has_frame_capacity)
+        {
+            return;
+        }
+        let data = Arc::<[u8]>::from(data);
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
-            if writer.record_frame_bytes(data).is_err() {
+            if writer
+                .record_frame(Arc::clone(&data), cursor_state, cursor_changed)
+                .is_err()
+            {
                 failed.push(*id);
             }
         }
@@ -840,18 +857,6 @@ impl DisplayCaptureFanout {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
             if writer.record_images(images).is_err() {
-                failed.push(*id);
-            }
-        }
-        for id in failed {
-            self.close_recording(id);
-        }
-    }
-
-    fn record_cursor_snapshot(&mut self, cursor_state: Option<super::state::AttachCursorState>) {
-        let mut failed = Vec::new();
-        for (id, writer) in &mut self.writers {
-            if writer.record_cursor_snapshot(cursor_state).is_err() {
                 failed.push(*id);
             }
         }
@@ -1091,7 +1096,8 @@ fn classify_attach_render_inefficiency(
     let extension_cache_misses = stats
         .scene_render
         .extension_render_calls
-        .saturating_sub(stats.scene_render.extension_cache_hits);
+        .saturating_sub(stats.scene_render.extension_cache_hits)
+        .saturating_sub(stats.scene_render.retained_scene_calls);
     let extension_imperative_or_cache_miss = percent_at_least(
         stats
             .scene_render
@@ -7418,12 +7424,16 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         )?;
     }
 
-    display_capture.record_frame_bytes(&frame_bytes);
-    display_capture.record_activity(DisplayActivityKind::Output);
-    display_capture.record_cursor_snapshot(view_state.last_cursor_state);
-    if previous_cursor_state != view_state.last_cursor_state {
-        display_capture.record_activity(DisplayActivityKind::Cursor);
+    if frame_plan.use_synchronized_update {
+        queue!(frame_bytes, EndSynchronizedUpdate)
+            .context("failed queuing end synchronized update")?;
     }
+
+    display_capture.record_frame(
+        &frame_bytes,
+        view_state.last_cursor_state,
+        previous_cursor_state != view_state.last_cursor_state,
+    );
     // Record structured image data for GIF export.
     #[cfg(any(
         feature = "image-sixel",
@@ -7453,11 +7463,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             }
         }
         display_capture.record_images(&all_images);
-    }
-
-    if frame_plan.use_synchronized_update {
-        queue!(frame_bytes, EndSynchronizedUpdate)
-            .context("failed queuing end synchronized update")?;
     }
 
     let terminal_write_started_at = Instant::now();

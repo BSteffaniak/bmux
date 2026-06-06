@@ -20,8 +20,9 @@ use crate::scripting::ScriptHostAccess;
 use crate::{
     SharedState, State, VisualProjectionBatch, apply_attach_layout_snapshot, apply_focus_state_map,
     apply_theme_extension_toml_direct, apply_visual_projection_batch,
-    enqueue_script_json_event_direct, handle_attach_input_event, notify_pane_event_direct,
-    publish_scene_if_changed, set_default_border_direct, set_pane_border_direct,
+    enqueue_script_json_event_direct, handle_attach_input_event, has_active_animation_demand,
+    notify_pane_event_direct, publish_scene_if_changed, set_default_border_direct,
+    set_pane_border_direct,
 };
 
 const ANIMATION_TIMER_FLOOR: Duration = Duration::from_millis(1);
@@ -441,7 +442,7 @@ pub(crate) fn animation_driver_policy(state: &State) -> AnimationDriverPolicy {
 }
 
 fn animation_enabled(state: &State) -> bool {
-    state.animation_hz.is_some_and(|hz| hz > 0) && has_animation_backend(state)
+    has_active_animation_demand(state)
 }
 
 fn animation_period(state: &State) -> Duration {
@@ -449,24 +450,11 @@ fn animation_period(state: &State) -> Duration {
     Duration::from_micros((1_000_000u64 / u64::from(hz)).max(1)).max(ANIMATION_TIMER_FLOOR)
 }
 
-fn has_animation_backend(state: &State) -> bool {
-    // Plugin-only client awareness: attach layout geometry is the decoration
-    // plugin's current signal that at least one visible surface can consume
-    // animation output. True per-client pause/throttle requires attach/client
-    // presence semantics that are not part of the decoration inputs yet.
-    !state.geometry.is_empty()
-        && (state.script_backend.is_some()
-            || state
-                .script_components
-                .values()
-                .any(|component| component.backend.is_some()))
-}
-
 pub(crate) fn run_animation_tick_if_current(
     state: &mut State,
     policy: AnimationDriverPolicy,
 ) -> bool {
-    if animation_driver_policy(state) != policy || !has_animation_backend(state) {
+    if animation_driver_policy(state) != policy || !has_active_animation_demand(state) {
         return false;
     }
     publish_scene_if_changed(state);

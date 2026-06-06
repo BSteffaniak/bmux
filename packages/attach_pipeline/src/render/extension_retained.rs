@@ -273,6 +273,28 @@ pub(super) fn retained_scene_items_to_render_items(
         .collect()
 }
 
+pub(super) fn retained_scene_items_for_render_damage(
+    items: &[RenderSceneItem],
+    damage: &RenderDamage,
+) -> Vec<RenderSceneItem> {
+    match damage {
+        RenderDamage::None => items
+            .iter()
+            .filter(|item| matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. }))
+            .cloned()
+            .collect(),
+        RenderDamage::FullSurface => items.to_vec(),
+        RenderDamage::Regions(regions) => items
+            .iter()
+            .filter(|item| {
+                matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. })
+                    || regions.iter().any(|region| item.bounds.intersects(*region))
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
 pub(super) fn retained_scene_item_damage_for_render_damage(
     items: &[RenderSceneItem],
     damage: &RenderDamage,
@@ -594,6 +616,9 @@ pub(super) fn build_extension_layer_diff_plan(
         policy,
     );
     let content_replay_damage = render_damage_content_rects(&stale_cleanup_damage, content_rect);
+    let output_items = current.map_or_else(Vec::new, |snapshot| {
+        retained_scene_items_for_render_damage(snapshot.items.as_slice(), &update_damage)
+    });
     ExtensionLayerDiffPlan {
         update_damage,
         stale_cleanup_damage,
@@ -602,7 +627,7 @@ pub(super) fn build_extension_layer_diff_plan(
         changed_items,
         added_items,
         removed_items,
-        output_items: current.map_or_else(Vec::new, |snapshot| snapshot.items.clone()),
+        output_items,
     }
 }
 

@@ -60,7 +60,6 @@ use extension_plans::{
 use extension_retained::{
     ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, RenderSceneItemKind,
     commit_retained_layer_snapshot, retained_graphic_key_from_item_key,
-    retained_scene_items_to_render_items,
 };
 use terminal_graphics::{
     TerminalGraphicsFrameResources, begin_terminal_graphics_frame, finish_terminal_graphics_frame,
@@ -3636,19 +3635,13 @@ fn execute_before_content_extension_output_plan<W: io::Write>(
                 terminal_graphics,
                 render_context.capabilities,
             )?;
-            let retained_items = retained_scene_items_to_render_items(&retained_snapshot.items);
-            let render_items = if retained_items.is_empty() {
-                output_items.as_slice()
-            } else {
-                retained_items.as_slice()
-            };
             let ops = queue_before_content_render_items_with_cleanup(
                 stdout,
                 plan.snapshot.pane_id,
                 plan.snapshot.surface_id,
                 plan.snapshot.surface_rect,
                 output_damage,
-                render_items,
+                output_items,
                 terminal_graphics_cache,
                 terminal_graphics,
                 render_context.capabilities,
@@ -4092,12 +4085,6 @@ fn execute_retained_after_content_extension_output_plan<W: io::Write>(
             "retained render extension stale graphic cleanup failed",
         );
     }
-    let retained_items = retained_scene_items_to_render_items(&retained_snapshot.items);
-    let render_items = if retained_items.is_empty() {
-        output_items
-    } else {
-        retained_items.as_slice()
-    };
     if (!output_damage.is_none() || !diff_plan.stale_cleanup_damage.is_none())
         && let Err(err) = queue_render_items_for_frame_with_cleanup(
             stdout,
@@ -4105,7 +4092,7 @@ fn execute_retained_after_content_extension_output_plan<W: io::Write>(
             snapshot.surface_id,
             snapshot.surface_rect,
             output_damage,
-            render_items,
+            output_items,
             terminal_graphics_cache,
             terminal_graphics,
             render_context.capabilities,
