@@ -29,6 +29,7 @@ pub mod list;
 pub mod overlay;
 pub mod palette;
 pub mod picker;
+pub mod retained_list;
 pub mod style;
 pub mod terminal;
 pub mod text;
@@ -80,6 +81,7 @@ pub mod prelude {
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
     };
     pub use crate::picker::{Dropdown, ListPicker, ListPickerAreas};
+    pub use crate::retained_list::{RetainedListLayout, RetainedListLine, RetainedListSignature};
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{Line, Span, Text};
