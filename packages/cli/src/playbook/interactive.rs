@@ -20,7 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::engine::{drain_output_until_idle, execute_step, start_recording};
+use super::engine::{
+    drain_output_until_idle, execute_step, recording_plugin_error, start_recording,
+};
 use super::parse_dsl::parse_action_line;
 use super::sandbox::{SandboxServer, SandboxStartOptions};
 use super::screen::{ScreenDeltaEvent, ScreenDeltaFormat, ScreenInspector};
@@ -813,7 +815,7 @@ async fn run_interactive_session_managed(
         match recording_commands::client::stop(&mut client, Some(rid)).await {
             Ok(Ok(stopped)) => info!("recording stopped: {stopped}"),
             Ok(Err(error)) => {
-                let error = crate::runtime::recording_plugin_error(error);
+                let error = recording_plugin_error(error);
                 warn!("failed to stop recording: {error}");
             }
             Err(error) => warn!("failed to stop recording: {error}"),

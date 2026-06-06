@@ -1104,7 +1104,6 @@ dependencies = [
  "bmux_attach_pipeline",
  "bmux_attach_token_state",
  "bmux_attach_view_protocol",
- "bmux_cli_output",
  "bmux_cli_schema",
  "bmux_client",
  "bmux_clients_plugin",

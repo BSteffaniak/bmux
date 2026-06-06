@@ -518,7 +518,6 @@ pub(super) fn core_provided_capabilities() -> Vec<HostScope> {
         "bmux.terminal.observe",
         "bmux.terminal.input_intercept",
         "bmux.terminal.output_intercept",
-        "bmux.recording.write",
     ]
     .into_iter()
     .map(|scope| HostScope::new(scope).expect("supported plugin host scope should parse"))

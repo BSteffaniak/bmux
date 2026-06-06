@@ -21,9 +21,7 @@ use bmux_perf_telemetry::{
     PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,
 };
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
-use bmux_recording_protocol::{
-    RecordingEventKind, RecordingPayload as ProtocolRecordingPayload, RecordingRollingStartOptions,
-};
+use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
 use std::collections::BTreeMap;
@@ -35,13 +33,11 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
-
 use bmux_performance_state::{
-    PERF_RECORDING_SOURCE, PerformanceEventRateLimiter, PerformanceRecordingLevel,
-    PerformanceSettingsHandle, PerformanceSettingsReader, PerformanceSettingsStore,
+    PerformanceEventRateLimiter, PerformanceRecordingLevel, PerformanceSettingsHandle,
+    PerformanceSettingsReader, PerformanceSettingsStore,
 };
-use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle, RollingRecordingSettings};
+use bmux_recording_runtime::RollingRecordingSettings;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -1509,12 +1505,7 @@ async fn handle_connection(
         let request_kind = request_kind_name(&request);
         let service_metadata = ipc_service_request_metadata(&request);
         let exclusive = request_requires_exclusive(&request);
-        let request_record_encode_started = Instant::now();
-        let request_data = bmux_codec::to_positional_vec(&request).unwrap_or_else(|e| {
-            tracing::warn!("failed to serialize request for recording: {e}");
-            vec![]
-        });
-        let request_record_encode_us = request_record_encode_started.elapsed().as_micros();
+        let request_record_encode_us = 0_u128;
         let started_at = Instant::now();
         debug!(
             client_id = %client_id.0,
@@ -1523,22 +1514,7 @@ async fn handle_connection(
             exclusive,
             "server.request.start"
         );
-        let request_record_started = Instant::now();
-        record_to_all_runtimes(
-            RecordingEventKind::RequestStart,
-            RecordingPayload::RequestStart {
-                request_id: envelope.request_id,
-                request_kind: request_kind.to_string(),
-                exclusive,
-                request_data: request_data.clone(),
-            },
-            RecordMeta {
-                session_id: selected_session.map(|id| id.0),
-                pane_id: None,
-                client_id: Some(client_id.0),
-            },
-        );
-        let request_record_us = request_record_started.elapsed().as_micros();
+        let request_record_us = 0_u128;
 
         let handle_started = Instant::now();
         let response = handle_request(
@@ -1554,13 +1530,7 @@ async fn handle_connection(
         let elapsed_ms = started_at.elapsed().as_millis();
         let (response_record_encode_us, response_record_us) = match &response {
             Response::Ok(payload) => {
-                let response_record_encode_started = Instant::now();
-                let response_data = bmux_codec::to_positional_vec(payload).unwrap_or_else(|e| {
-                    tracing::warn!("failed to serialize response for recording: {e}");
-                    vec![]
-                });
-                let response_record_encode_us =
-                    response_record_encode_started.elapsed().as_micros();
+                let response_record_encode_us = 0_u128;
                 debug!(
                     client_id = %client_id.0,
                     request_id = envelope.request_id,
@@ -1569,28 +1539,7 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.done"
                 );
-                let response_record_started = Instant::now();
-                record_to_all_runtimes(
-                    RecordingEventKind::RequestDone,
-                    RecordingPayload::RequestDone {
-                        request_id: envelope.request_id,
-                        request_kind: request_kind.to_string(),
-                        response_kind: response_payload_kind_name(payload).to_string(),
-                        #[allow(clippy::cast_possible_truncation)]
-                        elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
-                        request_data,
-                        response_data,
-                    },
-                    RecordMeta {
-                        session_id: selected_session.map(|id| id.0),
-                        pane_id: None,
-                        client_id: Some(client_id.0),
-                    },
-                );
-                (
-                    response_record_encode_us,
-                    response_record_started.elapsed().as_micros(),
-                )
+                (response_record_encode_us, 0_u128)
             }
             Response::Err(error) => {
                 warn!(
@@ -1602,24 +1551,7 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.error"
                 );
-                let response_record_started = Instant::now();
-                record_to_all_runtimes(
-                    RecordingEventKind::RequestError,
-                    RecordingPayload::RequestError {
-                        request_id: envelope.request_id,
-                        request_kind: request_kind.to_string(),
-                        error_code: error.code,
-                        message: error.message.clone(),
-                        #[allow(clippy::cast_possible_truncation)]
-                        elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
-                    },
-                    RecordMeta {
-                        session_id: selected_session.map(|id| id.0),
-                        pane_id: None,
-                        client_id: Some(client_id.0),
-                    },
-                );
-                (0_u128, response_record_started.elapsed().as_micros())
+                (0_u128, 0_u128)
             }
         };
         let response_send_started = Instant::now();
@@ -1766,23 +1698,7 @@ async fn handle_connection(
                                         );
                                     }
 
-                                    if let Some(encoded_payload) =
-                                        push_perf_rate_limiter.encode_payload(payload)
-                                    {
-                                        record_to_all_runtimes(
-                                            RecordingEventKind::Custom,
-                                            RecordingPayload::Custom {
-                                                source: PERF_RECORDING_SOURCE.to_string(),
-                                                name: "server.push.window".to_string(),
-                                                payload: encoded_payload,
-                                            },
-                                            RecordMeta {
-                                                session_id: None,
-                                                pane_id: None,
-                                                client_id: Some(push_client_id.0),
-                                            },
-                                        );
-                                    }
+                                    let _ = push_perf_rate_limiter.encode_payload(payload);
                                     push_window_started_at = Instant::now();
                                     push_window_sent_events = 0;
                                     push_window_sent_bytes = 0;
@@ -1869,20 +1785,6 @@ async fn handle_connection(
 }
 
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
-    let session_id = match &event {
-        Event::ServerStarted | Event::ServerStopping | Event::PluginBusEvent { .. } => None,
-    };
-    record_to_all_runtimes(
-        RecordingEventKind::ServerEvent,
-        RecordingPayload::ServerEvent {
-            event: event.clone(),
-        },
-        RecordMeta {
-            session_id,
-            pane_id: None,
-            client_id: None,
-        },
-    );
     // Broadcast to streaming clients (ignore errors — no receivers is fine).
     let _ = state.event_broadcast.send(event.clone());
     state
@@ -2831,25 +2733,6 @@ fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
     }
     false
 }
-
-/// Fan out a recording event to both the manual and rolling recording
-/// runtimes by looking up the registered `RecordingSinkHandle` in the
-/// plugin state registry. Server code no longer holds `RecordingRuntime`
-/// references directly; the recording plugin installs the sink at
-/// server construction, and every hot-path write goes through the
-/// registered trait object.
-fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
-    let Some(handle) = bmux_plugin::global_plugin_state_registry().get::<RecordingSinkHandle>()
-    else {
-        return;
-    };
-    let Ok(guard) = handle.read() else {
-        return;
-    };
-    guard.0.record(kind, payload, meta);
-}
-
-// ── `ServerSessionRuntimeAdapter` ────────────────────────────────
 
 #[cfg(test)]
 #[allow(

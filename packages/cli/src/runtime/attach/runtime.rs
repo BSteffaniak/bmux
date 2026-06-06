@@ -357,12 +357,13 @@ use super::super::{
     attach_quit_failure_status, available_capability_providers, available_service_descriptors,
     command_accepts_repeat, effective_enabled_plugins, enter_host_kernel_connection,
     host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
-    parse_session_selector, parse_uuid_value, plugin_command_policy_hints, plugin_host_metadata,
-    recording, resolve_plugin_search_paths, run_plugin_keybinding_command_with_active_bindings,
-    scan_available_plugins,
+    parse_session_selector, parse_uuid_value, perf_telemetry, plugin_command_policy_hints,
+    plugin_host_metadata, resolve_plugin_search_paths,
+    run_plugin_keybinding_command_with_active_bindings, scan_available_plugins,
 };
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
+use super::display_capture;
 use super::events::{AttachLoopControl, AttachLoopEvent, AttachTerminalEvent};
 use super::input::{
     TerminalGeometry, TerminalInputEvent, TerminalKeyEvent, TerminalMouseButton,
@@ -750,7 +751,7 @@ where
 
 #[derive(Default)]
 pub struct DisplayCaptureFanout {
-    writers: BTreeMap<Uuid, recording::DisplayCaptureWriter>,
+    writers: BTreeMap<Uuid, display_capture::DisplayCaptureWriter>,
 }
 
 impl DisplayCaptureFanout {
@@ -758,7 +759,7 @@ impl DisplayCaptureFanout {
         if self.writers.contains_key(&target.recording_id) {
             return;
         }
-        match recording::DisplayCaptureWriter::open(
+        match display_capture::DisplayCaptureWriter::open(
             target.recording_id,
             Path::new(&target.path),
             client_id,
@@ -2276,7 +2277,7 @@ fn attach_perf_window_payload(
 }
 
 async fn maybe_emit_attach_perf_window(
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
     window: &mut AttachPerfWindow,
@@ -2352,8 +2353,8 @@ async fn maybe_emit_attach_perf_window(
     let payload = attach_perf_window_payload(
         window,
         elapsed,
-        perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed),
-        perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace),
+        perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Detailed),
+        perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Trace),
     );
     perf_emitter
         .emit_with_streaming_client(client, Some(session_id), None, "attach.window", payload)
@@ -2418,7 +2419,7 @@ fn attach_frame_trace_payload(
 
 #[allow(clippy::too_many_arguments)] // keep frame/attach telemetry emit context explicit
 async fn maybe_emit_attach_frame_perf(
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
     attach_started_at: Instant,
@@ -2436,7 +2437,8 @@ async fn maybe_emit_attach_frame_perf(
     }
 
     let since_attach_start_ms = duration_millis_u64(attach_started_at.elapsed());
-    if !*first_frame_emitted && perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+    if !*first_frame_emitted && perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic)
+    {
         perf_emitter
             .emit_with_streaming_client(
                 client,
@@ -2456,7 +2458,7 @@ async fn maybe_emit_attach_frame_perf(
 
     if scene_hydrated
         && !*interactive_ready_emitted
-        && perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic)
+        && perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic)
     {
         perf_emitter
             .emit_with_streaming_client(
@@ -2474,7 +2476,7 @@ async fn maybe_emit_attach_frame_perf(
         *interactive_ready_emitted = true;
     }
 
-    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace) {
+    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Trace) {
         perf_emitter
             .emit_with_streaming_client(
                 client,
@@ -2582,11 +2584,11 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     };
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
-    let mut perf_emitter = recording::PerfEventEmitter::new(
-        recording::PerfCaptureSettings::from_config(&attach_config),
+    let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
+        perf_telemetry::PerfCaptureSettings::from_config(&attach_config),
     );
     if let Ok(settings) = performance_state::client::get_settings(&mut client).await {
-        perf_emitter.update_settings(recording::PerfCaptureSettings::from_plugin_settings(
+        perf_emitter.update_settings(perf_telemetry::PerfCaptureSettings::from_plugin_settings(
             &settings,
         ));
     }
@@ -3731,7 +3733,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         .await?;
     }
 
-    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
         let mut payload = serde_json::json!({
             "attach_runtime_ms": duration_millis_u64(attach_started_at.elapsed()),
             "exit_reason": attach_exit_reason_label(exit_reason),
@@ -3739,7 +3741,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             "first_frame_recorded": first_frame_emitted,
             "interactive_ready_recorded": interactive_ready_emitted,
         });
-        if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace)
+        if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Trace)
             && let Some(object) = payload.as_object_mut()
         {
             object.insert(
@@ -3806,7 +3808,7 @@ async fn handle_attach_stream_server_event(
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
     attach_config: &BmuxConfig,
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     pane_output_pending: &mut bool,
     last_scene_revision: &mut u64,
 ) -> Result<AttachServerEventHandling> {
@@ -3821,7 +3823,7 @@ async fn handle_attach_stream_server_event(
             match serde_json::from_slice::<bmux_performance_plugin_api::PerformanceEvent>(payload) {
                 Ok(bmux_performance_plugin_api::PerformanceEvent::SettingsUpdated { settings }) => {
                     perf_emitter.update_settings(
-                        recording::PerfCaptureSettings::from_plugin_settings(&settings),
+                        perf_telemetry::PerfCaptureSettings::from_plugin_settings(&settings),
                     );
                 }
                 Err(error) => {

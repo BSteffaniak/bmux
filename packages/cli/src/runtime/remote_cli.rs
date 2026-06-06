@@ -25,7 +25,7 @@ use super::{
     hosted_output::{
         HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
     },
-    map_cli_client_error, recording, run_server_start, run_session_attach,
+    map_cli_client_error, perf_telemetry, run_server_start, run_session_attach,
     run_session_attach_with_client,
 };
 
@@ -649,13 +649,13 @@ const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
 }
 
 async fn emit_iroh_connect_perf_event(
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
     target: &IrohTarget,
     summary: &IrohConnectPerfSummary,
     reconnect_attempt: u64,
 ) -> Result<()> {
-    if !perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+    if !perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
         return Ok(());
     }
 
@@ -665,7 +665,7 @@ async fn emit_iroh_connect_perf_event(
         "connect_ms": summary.connect_ms,
         "total_ms": summary.total_ms,
     });
-    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed)
+    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Detailed)
         && let Some(object) = payload.as_object_mut()
     {
         object.insert(
@@ -703,7 +703,7 @@ async fn emit_iroh_connect_perf_event(
             serde_json::Value::from(summary.compression_enabled),
         );
     }
-    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace)
+    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Trace)
         && let Some(object) = payload.as_object_mut()
     {
         object.insert(
@@ -722,21 +722,21 @@ async fn emit_iroh_connect_perf_event(
 }
 
 async fn refresh_perf_emitter_settings_from_server(
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
 ) {
     if let Ok(settings) =
         bmux_performance_plugin_api::performance_state::client::get_settings(client).await
     {
         let settings = settings.into();
-        perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
+        perf_emitter.update_settings(perf_telemetry::PerfCaptureSettings::from_runtime_settings(
             &settings,
         ));
     }
 }
 
 async fn emit_iroh_attach_attempt_perf_event(
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
     target: &IrohTarget,
     attach_attempt: u64,
@@ -744,7 +744,7 @@ async fn emit_iroh_attach_attempt_perf_event(
     attach_runtime_ms: u64,
     exit_reason: AttachExitReason,
 ) -> Result<()> {
-    if !perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+    if !perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
         return Ok(());
     }
 
@@ -756,7 +756,7 @@ async fn emit_iroh_attach_attempt_perf_event(
         "exit_reason": attach_exit_reason_label(exit_reason),
         "stream_closed": matches!(exit_reason, AttachExitReason::StreamClosed),
     });
-    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace)
+    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Trace)
         && let Some(object) = payload.as_object_mut()
     {
         object.insert(
@@ -775,7 +775,7 @@ async fn emit_iroh_attach_attempt_perf_event(
 }
 
 async fn emit_iroh_reconnect_outage_perf_event(
-    perf_emitter: &mut recording::PerfEventEmitter,
+    perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
     target: &IrohTarget,
     reconnect_attempt: u64,
@@ -783,7 +783,7 @@ async fn emit_iroh_reconnect_outage_perf_event(
     outage_ms: u64,
     connect_summary: &IrohConnectPerfSummary,
 ) -> Result<()> {
-    if !perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+    if !perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Basic) {
         return Ok(());
     }
 
@@ -795,7 +795,7 @@ async fn emit_iroh_reconnect_outage_perf_event(
         "reconnect_connect_total_ms": connect_summary.total_ms,
         "reconnect_connect_ms": connect_summary.connect_ms,
     });
-    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed)
+    if perf_emitter.level_at_least(perf_telemetry::PerfCaptureLevel::Detailed)
         && let Some(object) = payload.as_object_mut()
     {
         object.insert(
@@ -1099,8 +1099,8 @@ pub(super) async fn run_connect(
             Ok(status)
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            let mut perf_emitter = recording::PerfEventEmitter::new(
-                recording::PerfCaptureSettings::from_config(&config),
+            let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
+                perf_telemetry::PerfCaptureSettings::from_config(&config),
             );
             let mut connect_perf = IrohConnectPerfSummary::default();
             let (mut client, iroh_connection) = connect_iroh_bridge(
@@ -3552,7 +3552,7 @@ async fn run_iroh_attach_with_reconnect(
     follow: Option<&str>,
     global: bool,
     reconnect_forever: bool,
-    mut perf_emitter: recording::PerfEventEmitter,
+    mut perf_emitter: perf_telemetry::PerfEventEmitter,
 ) -> Result<u8> {
     let mut reconnect_attempt = 0usize;
     let mut attach_attempt = 0_u64;
@@ -9862,17 +9862,6 @@ mod tests {
 
         let cli = Cli {
             config: None,
-            record: false,
-            no_capture_input: false,
-            recording_id_file: None,
-            record_profile: None,
-            record_name: None,
-            record_event_kind: Vec::new(),
-            stop_server_on_exit: false,
-            recordings_dir: None,
-            recording_auto_export: false,
-            no_recording_auto_export: false,
-            recording_auto_export_dir: None,
             target: None,
             runtime: None,
             core_builtins_only: false,
@@ -9931,17 +9920,6 @@ mod tests {
 
         let cli = Cli {
             config: None,
-            record: false,
-            no_capture_input: false,
-            recording_id_file: None,
-            record_profile: None,
-            record_name: None,
-            record_event_kind: Vec::new(),
-            stop_server_on_exit: false,
-            recordings_dir: None,
-            recording_auto_export: false,
-            no_recording_auto_export: false,
-            recording_auto_export_dir: None,
             target: None,
             runtime: None,
             core_builtins_only: false,

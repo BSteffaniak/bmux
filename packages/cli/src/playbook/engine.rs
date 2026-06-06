@@ -24,7 +24,10 @@ use bmux_plugin_sdk::{
     PluginCliCommandRequest, PluginCliCommandResponse, TypedServiceEndpoint,
     perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
 };
-use bmux_recording_plugin_api::{recording_commands, recording_types::RecordingEventKind};
+use bmux_recording_plugin_api::{
+    recording_commands,
+    recording_types::{RecordingError, RecordingEventKind},
+};
 use bmux_recording_protocol::{DisplayActivityKind, RecordingSummary};
 use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
@@ -2832,7 +2835,7 @@ async fn run_playbook_inner(
                 info!("recording stopped: {stopped_id}");
             }
             Ok(Err(error)) => {
-                let error = crate::runtime::recording_plugin_error(error);
+                let error = recording_plugin_error(error);
                 warn!("failed to stop recording: {error}");
             }
             Err(error) => {
@@ -3453,6 +3456,14 @@ async fn restore_playbook_perf_recording_level(
     }
 }
 
+pub(super) fn recording_plugin_error(error: RecordingError) -> anyhow::Error {
+    match error {
+        RecordingError::NoActive => anyhow::anyhow!("no active recording"),
+        RecordingError::Unavailable => anyhow::anyhow!("recording runtime unavailable"),
+        RecordingError::Failed { reason } => anyhow::anyhow!(reason),
+    }
+}
+
 /// Start a recording on the server, optionally filtered to a specific session.
 pub(super) async fn start_recording(
     client: &mut BmuxClient,
@@ -3468,7 +3479,7 @@ pub(super) async fn start_recording(
     )
     .await?
     .map(Into::into)
-    .map_err(crate::runtime::recording_plugin_error)
+    .map_err(recording_plugin_error)
     .map_err(|e| anyhow::anyhow!("recording start failed: {e}"))?;
     Ok(summary.id)
 }

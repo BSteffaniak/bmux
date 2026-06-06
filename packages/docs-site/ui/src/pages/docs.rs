@@ -777,20 +777,14 @@ mod tests {
         let doc = generate_cli_reference();
 
         assert!(!doc.contains("core-builtins-only"));
-        assert!(doc.contains("--record-profile"));
-        assert!(doc.contains("`full`, `functional`, `visual`"));
+        assert!(doc.contains("--rolling-event-kind"));
+        assert!(doc.contains("`pane-input-raw`"));
 
-        let recordings_dir_line = doc
+        let rolling_event_kind_line = doc
             .lines()
-            .find(|line| line.contains("--recordings-dir"))
-            .expect("missing --recordings-dir line");
-        assert!(recordings_dir_line.contains("path"));
-
-        let record_event_kind_line = doc
-            .lines()
-            .find(|line| line.contains("--record-event-kind"))
-            .expect("missing --record-event-kind line");
-        assert!(record_event_kind_line.contains("repeatable"));
+            .find(|line| line.contains("`--rolling-event-kind`"))
+            .expect("missing --rolling-event-kind line");
+        assert!(rolling_event_kind_line.contains("repeatable"));
     }
 
     #[test]

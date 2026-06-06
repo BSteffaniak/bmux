@@ -993,12 +993,12 @@ fn playbook_from_recording_cli() {
 
     // Step 3: Verify the generated DSL contains expected elements.
     assert!(
-        dsl.contains("new-session"),
-        "generated DSL should contain new-session: {dsl}"
+        dsl.contains("assert-screen"),
+        "generated DSL should contain screen assertions: {dsl}"
     );
     assert!(
-        dsl.contains("send-keys"),
-        "generated DSL should contain send-keys: {dsl}"
+        dsl.contains("hello_world_test"),
+        "generated DSL should preserve visible output: {dsl}"
     );
 
     // Step 4: Validate the generated DSL parses cleanly.

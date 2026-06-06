@@ -7,23 +7,12 @@ use crate::connection::{
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use anyhow::{Context, Result};
-use bmux_cli_schema::{
-    RecordingEventKindArg, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
-    RecordingProfileArg,
-};
 use bmux_client::BmuxClient;
-use bmux_config::{BmuxConfig, ConfigPaths, push_process_config_overrides};
-use bmux_recording_protocol::{RecordingEventKind, RecordingStatus, RecordingSummary};
+use bmux_config::{BmuxConfig, push_process_config_overrides};
 use bmux_snapshot_plugin_api::offline_snapshot::offline_kill_sessions;
-use crossterm::terminal;
-use std::io::{self, BufWriter, IsTerminal, Write};
-use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-type RecordingEventEnvelope =
-    bmux_recording_protocol::RecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 mod access_cli;
 mod action_dispatch;
@@ -39,13 +28,13 @@ mod kiosk_cli;
 mod logs_cli;
 mod logs_watch;
 mod perf_cli;
+mod perf_telemetry;
 mod playbook_cli;
 mod plugin_commands;
 mod plugin_host;
 mod plugin_kernel;
 mod plugin_runtime;
 mod prompt;
-mod recording;
 mod remote_cli;
 mod sandbox_cli;
 mod server_commands;
@@ -74,10 +63,7 @@ use bootstrap::{
     map_cli_client_error, run_default_server_attach, run_server_start, run_session_attach,
 };
 use built_in_commands::{BuiltInHandlerId, built_in_command_by_handler};
-use cli_parse::{
-    ParsedRuntimeCli, parse_runtime_cli, resolve_log_level, tracing_level,
-    validate_record_bootstrap_flags,
-};
+use cli_parse::{ParsedRuntimeCli, parse_runtime_cli, resolve_log_level, tracing_level};
 use config_cli::{
     run_config_get, run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
     run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
@@ -116,7 +102,6 @@ pub use prompt::{
     PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
     PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
 };
-pub use recording::recording_plugin_error;
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel,
     maybe_run_cluster_plugin_command_via_gateway, reconnect_backoff_ms, run_auth_login,
@@ -355,7 +340,6 @@ pub async fn run() -> Result<u8> {
                 core_builtins_only = cli.core_builtins_only,
                 "runtime.cli.builtin_start"
             );
-            validate_record_bootstrap_flags(&cli)?;
             maybe_print_slot_startup_banner(cli.command.as_ref());
             let connection_context = ConnectionContext::new(cli.target.as_deref());
             if should_proxy_to_target(&cli).await? {
@@ -366,16 +350,7 @@ pub async fn run() -> Result<u8> {
                 return Box::pin(run_command(command, connection_context)).await;
             }
 
-            let options = DefaultAttachOptions {
-                record: cli.record,
-                capture_input: !cli.no_capture_input,
-                profile: cli.record_profile,
-                name: cli.record_name.clone(),
-                event_kinds: cli.record_event_kind.clone(),
-                recording_id_file: cli.recording_id_file.clone(),
-                stop_server_on_exit: cli.stop_server_on_exit,
-            };
-            run_default_server_attach(options, connection_context).await
+            run_default_server_attach(DefaultAttachOptions, connection_context).await
         }
         ParsedRuntimeCli::Plugin {
             log_level,

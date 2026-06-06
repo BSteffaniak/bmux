@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod cursor;
+mod display_capture;
 pub mod events;
 pub mod input;
 pub mod layout;

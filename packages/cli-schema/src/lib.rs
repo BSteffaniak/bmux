@@ -38,13 +38,6 @@ pub enum RecordingReplayMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum RecordingProfileArg {
-    Full,
-    Functional,
-    Visual,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RecordingEventKindArg {
     PaneInputRaw,
     PaneOutputRaw,
@@ -171,14 +164,6 @@ fn parse_runtime_name(value: &str) -> Result<String, String> {
     Err("runtime name can only include letters, numbers, '-', '_' or '.'".to_string())
 }
 
-fn parse_recording_name(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("recording name cannot be empty".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -187,50 +172,6 @@ pub struct Cli {
     /// Merge an additional config file (highest precedence layer)
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<String>,
-
-    /// Start interactive bmux with full-session recording
-    #[arg(long)]
-    pub record: bool,
-
-    /// Do not capture pane input bytes when using --record
-    #[arg(long)]
-    pub no_capture_input: bool,
-
-    /// Write recording id to a file when using --record
-    #[arg(long)]
-    pub recording_id_file: Option<String>,
-
-    /// Recording profile when using --record
-    #[arg(long, value_enum)]
-    pub record_profile: Option<RecordingProfileArg>,
-
-    /// Recording name when using --record
-    #[arg(long, value_parser = parse_recording_name)]
-    pub record_name: Option<String>,
-
-    /// Explicit event kind allowlist when using --record (repeatable)
-    #[arg(long, value_enum)]
-    pub record_event_kind: Vec<RecordingEventKindArg>,
-
-    /// Stop the server when exiting a --record run
-    #[arg(long)]
-    pub stop_server_on_exit: bool,
-
-    /// Override recordings root directory for this invocation
-    #[arg(long, global = true, value_name = "PATH")]
-    pub recordings_dir: Option<String>,
-
-    /// Enable automatic GIF export after user-initiated recording stop/cut
-    #[arg(long, global = true, conflicts_with = "no_recording_auto_export")]
-    pub recording_auto_export: bool,
-
-    /// Disable automatic GIF export after user-initiated recording stop/cut
-    #[arg(long, global = true, conflicts_with = "recording_auto_export")]
-    pub no_recording_auto_export: bool,
-
-    /// Override directory for auto-exported recording GIFs
-    #[arg(long, global = true, value_name = "PATH")]
-    pub recording_auto_export_dir: Option<String>,
 
     /// Execute command against a configured target (local or remote)
     #[arg(long, global = true)]
@@ -1781,9 +1722,8 @@ mod tests {
         AccessCommand, AuthCommand, Cli, Command, ConfigCommand, ConfigProfilesCommand,
         GatewayHostMode, HostedModeArg, KeymapCommand, KioskCommand, LogsCommand,
         LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand, RecordingEventKindArg,
-        RecordingProfileArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
-        SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg, ServerCommand, SessionCommand,
-        TerminalCommand, TraceFamily,
+        RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
+        SandboxStatusArg, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -4080,88 +4020,5 @@ mod tests {
                 json: true,
             }
         ));
-    }
-
-    #[test]
-    fn parses_top_level_record_flags() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "--record",
-            "--no-capture-input",
-            "--record-profile",
-            "visual",
-            "--record-name",
-            "demo-repro",
-            "--record-event-kind",
-            "pane-output-raw",
-            "--recording-id-file",
-            "/tmp/rec.id",
-            "--stop-server-on-exit",
-        ])
-        .expect("valid CLI args");
-        assert!(cli.record);
-        assert!(cli.no_capture_input);
-        assert_eq!(cli.record_profile, Some(RecordingProfileArg::Visual));
-        assert_eq!(cli.record_name.as_deref(), Some("demo-repro"));
-        assert_eq!(
-            cli.record_event_kind,
-            vec![RecordingEventKindArg::PaneOutputRaw]
-        );
-        assert_eq!(cli.recording_id_file.as_deref(), Some("/tmp/rec.id"));
-        assert!(cli.stop_server_on_exit);
-        assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn parses_recording_override_flags_top_level() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "--recordings-dir",
-            "/tmp/recordings",
-            "--recording-auto-export",
-            "--recording-auto-export-dir",
-            "/tmp/exports",
-        ])
-        .expect("valid CLI args");
-        assert_eq!(cli.recordings_dir.as_deref(), Some("/tmp/recordings"));
-        assert!(cli.recording_auto_export);
-        assert!(!cli.no_recording_auto_export);
-        assert_eq!(
-            cli.recording_auto_export_dir.as_deref(),
-            Some("/tmp/exports")
-        );
-    }
-
-    #[test]
-    fn parses_recording_override_flags_for_subcommands() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "keymap",
-            "doctor",
-            "--recordings-dir",
-            "./recordings",
-            "--no-recording-auto-export",
-            "--recording-auto-export-dir",
-            "./exports",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Keymap { command }) = cli.command else {
-            panic!("expected keymap command");
-        };
-        assert!(matches!(command, KeymapCommand::Doctor { json: false }));
-        assert_eq!(cli.recordings_dir.as_deref(), Some("./recordings"));
-        assert!(!cli.recording_auto_export);
-        assert!(cli.no_recording_auto_export);
-        assert_eq!(cli.recording_auto_export_dir.as_deref(), Some("./exports"));
-    }
-
-    #[test]
-    fn rejects_conflicting_recording_auto_export_flags() {
-        Cli::try_parse_from([
-            "bmux",
-            "--recording-auto-export",
-            "--no-recording-auto-export",
-        ])
-        .expect_err("conflicting flags should fail");
     }
 }

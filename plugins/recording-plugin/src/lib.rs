@@ -632,9 +632,10 @@ fn recording_start_generated(
 fn recording_stop_generated(
     recording_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    let recording_id =
-        handle_stop(recording_id).ok_or(recording_types::RecordingError::NoActive)?;
+    let summary = handle_stop(recording_id).ok_or(recording_types::RecordingError::NoActive)?;
+    let recording_id = summary.id;
     publish_recording_stopped(recording_id);
+    maybe_auto_export_stopped_recording(&summary);
     Ok(recording_id)
 }
 
@@ -918,6 +919,54 @@ pub(crate) fn current_auto_export_settings(fps_override: Option<u32>) -> AutoExp
     }
 }
 
+fn maybe_auto_export_stopped_recording(summary: &RecordingSummary) {
+    let export_settings = current_auto_export_settings(None);
+    if !export_settings.enabled {
+        tracing::info!(recording_id = %summary.id, "recording stop auto-export disabled");
+        return;
+    }
+
+    let recording_dir = PathBuf::from(&summary.path);
+    let output_path = auto_export_output_path(
+        &recording_dir,
+        export_settings.output_dir.as_deref(),
+        summary.id,
+    );
+    let output = output_path.to_string_lossy().to_string();
+    tracing::info!(
+        recording_id = %summary.id,
+        output_path = %output,
+        fps = export_settings.fps,
+        "recording stop auto-export starting"
+    );
+    publish_recording_export_started(summary.id, output.clone());
+    match export::export_recording_gif_for_recording_dir(
+        &recording_dir,
+        summary.id,
+        &output,
+        export_settings.fps,
+    ) {
+        Ok(()) => {
+            tracing::info!(
+                recording_id = %summary.id,
+                output_path = %output,
+                "recording stop auto-export completed"
+            );
+            publish_recording_export_completed(summary.id, output);
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            tracing::warn!(
+                recording_id = %summary.id,
+                output_path = %output,
+                error = %reason,
+                "recording stop auto-export failed"
+            );
+            publish_recording_export_failed(summary.id, output, reason);
+        }
+    }
+}
+
 pub(crate) fn auto_export_output_path(
     recording_dir: &Path,
     explicit_output_dir: Option<&Path>,
@@ -1088,11 +1137,11 @@ fn handle_start(
         .ok()
 }
 
-fn handle_stop(recording_id: Option<uuid::Uuid>) -> Option<uuid::Uuid> {
+fn handle_stop(recording_id: Option<uuid::Uuid>) -> Option<RecordingSummary> {
     let handle = manual_handle()?;
     let guard = handle.read().ok()?;
     let mut runtime = guard.0.lock().ok()?;
-    runtime.stop(recording_id).ok().map(|summary| summary.id)
+    runtime.stop(recording_id).ok()
 }
 
 fn empty_status() -> RecordingStatus {

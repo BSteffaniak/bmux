@@ -1,15 +1,12 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, LogLevel};
-use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV};
+use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths};
 use bmux_plugin::PluginRegistry;
 use bmux_plugin_sdk::perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use clap::{CommandFactory, FromArgMatches};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Level;
-
-pub(super) const RECORDING_AUTO_EXPORT_OVERRIDE_ENV: &str = "BMUX_RECORDING_AUTO_EXPORT";
-pub(super) const RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDING_AUTO_EXPORT_DIR";
 
 use super::plugin_runtime::{RuntimeCommandState, build_runtime_command_state};
 use super::{
@@ -174,53 +171,6 @@ fn apply_runtime_override_from_raw_args(
             };
             let path = resolve_cli_path_override(&value.to_string_lossy(), "--config")?;
             overrides.config_path = Some(std::path::PathBuf::from(path));
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--recordings-dir=") {
-            let path = resolve_cli_path_override(value, "--recordings-dir")?;
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(RECORDINGS_DIR_OVERRIDE_ENV, path) };
-            index += 1;
-            continue;
-        }
-        if arg == "--recordings-dir" {
-            let Some(value) = argv.get(index + 1) else {
-                anyhow::bail!("--recordings-dir requires a value")
-            };
-            let path = resolve_cli_path_override(&value.to_string_lossy(), "--recordings-dir")?;
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(RECORDINGS_DIR_OVERRIDE_ENV, path) };
-            index += 2;
-            continue;
-        }
-        if arg == "--recording-auto-export" {
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_OVERRIDE_ENV, "1") };
-            index += 1;
-            continue;
-        }
-        if arg == "--no-recording-auto-export" {
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_OVERRIDE_ENV, "0") };
-            index += 1;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--recording-auto-export-dir=") {
-            let path = resolve_cli_path_override(value, "--recording-auto-export-dir")?;
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV, path) };
-            index += 1;
-            continue;
-        }
-        if arg == "--recording-auto-export-dir" {
-            let Some(value) = argv.get(index + 1) else {
-                anyhow::bail!("--recording-auto-export-dir requires a value")
-            };
-            let path =
-                resolve_cli_path_override(&value.to_string_lossy(), "--recording-auto-export-dir")?;
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV, path) };
             index += 2;
             continue;
         }
@@ -439,54 +389,6 @@ pub(super) const fn tracing_level(level: LogLevel) -> Level {
         LogLevel::Debug => Level::DEBUG,
         LogLevel::Trace => Level::TRACE,
     }
-}
-
-pub(super) fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
-    if cli.command.is_some() {
-        if cli.record {
-            anyhow::bail!(
-                "--record is only supported for top-level interactive start (no subcommand)"
-            )
-        }
-        if cli.no_capture_input {
-            anyhow::bail!("--no-capture-input requires --record")
-        }
-        if cli.recording_id_file.is_some() {
-            anyhow::bail!("--recording-id-file requires --record")
-        }
-        if cli.record_profile.is_some() {
-            anyhow::bail!("--record-profile requires --record")
-        }
-        if cli.record_name.is_some() {
-            anyhow::bail!("--record-name requires --record")
-        }
-        if !cli.record_event_kind.is_empty() {
-            anyhow::bail!("--record-event-kind requires --record")
-        }
-        if cli.stop_server_on_exit {
-            anyhow::bail!("--stop-server-on-exit requires --record")
-        }
-    } else if !cli.record {
-        if cli.no_capture_input {
-            anyhow::bail!("--no-capture-input requires --record")
-        }
-        if cli.recording_id_file.is_some() {
-            anyhow::bail!("--recording-id-file requires --record")
-        }
-        if cli.record_profile.is_some() {
-            anyhow::bail!("--record-profile requires --record")
-        }
-        if cli.record_name.is_some() {
-            anyhow::bail!("--record-name requires --record")
-        }
-        if !cli.record_event_kind.is_empty() {
-            anyhow::bail!("--record-event-kind requires --record")
-        }
-        if cli.stop_server_on_exit {
-            anyhow::bail!("--stop-server-on-exit requires --record")
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
