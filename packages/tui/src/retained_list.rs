@@ -18,11 +18,19 @@ pub struct RetainedListLayout<S> {
     entries: Vec<RetainedListEntry<S>>,
 }
 
-impl<S> Default for RetainedListLayout<S> {
-    fn default() -> Self {
+impl<S> RetainedListLayout<S> {
+    /// Create an empty retained list layout.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
+    }
+}
+
+impl<S> Default for RetainedListLayout<S> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
