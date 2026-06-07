@@ -53,9 +53,6 @@ kind = "rainbow_snake"
 [plugins."bmux.decoration".components.snake]
 script = "rainbow_snake"
 
-[plugins."bmux.decoration".components.snake.target]
-kind = "focused-pane"
-
 [plugins."bmux.decoration".components.snake.animation]
 hz   = 12
 kind = "rainbow_snake"

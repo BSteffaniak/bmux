@@ -96,9 +96,6 @@ script_instance = "pong"
 hz   = 16
 kind = "pong"
 
-[plugins."bmux.decoration".components."pong.ball".target]
-kind = "focused-pane"
-
 [plugins."bmux.decoration".components."pong.ball".settings]
 content_bounce = "false"
 rally_ms       = "5500"
@@ -111,7 +108,7 @@ dirty_only = true
 id         = "pong.content-presence"
 max_bytes  = 16384
 max_hz     = 30
-scope      = "focused-pane"
+scope      = "all-panes"
 
 [plugins."bmux.decoration".components."pong.ball".input]
 keys            = ["up", "down", "esc"]
@@ -128,9 +125,6 @@ script_instance = "pong"
 [plugins."bmux.decoration".components."pong.paddles".animation]
 hz   = 16
 kind = "pong"
-
-[plugins."bmux.decoration".components."pong.paddles".target]
-kind = "focused-pane"
 
 [plugins."bmux.decoration".components."pong.paddles".settings]
 content_bounce = "false"
@@ -152,9 +146,6 @@ script_instance = "pong"
 [plugins."bmux.decoration".components."pong.score".animation]
 hz   = 16
 kind = "pong"
-
-[plugins."bmux.decoration".components."pong.score".target]
-kind = "focused-pane"
 
 [plugins."bmux.decoration".components."pong.score".settings]
 content_bounce = "false"
