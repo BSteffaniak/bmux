@@ -10,7 +10,10 @@
 //! feature at a time.
 
 pub mod action_row;
+pub mod button;
+pub mod common;
 pub mod labeled_details;
 pub mod modal_frame;
+pub mod pane;
 #[cfg(feature = "text-input")]
 pub mod text_input;

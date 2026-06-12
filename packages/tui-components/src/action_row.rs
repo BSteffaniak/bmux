@@ -2,8 +2,9 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::Modifier;
+use bmux_tui::prelude::Style;
+
+use crate::button::{Button, ButtonState};
 
 /// One action button in an action row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,22 +27,7 @@ impl ActionButton {
 }
 
 /// Visual styles for an action row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActionRowStyles {
-    /// Button style when not focused.
-    pub button: Style,
-    /// Button style when focused.
-    pub focused_button: Style,
-}
-
-impl Default for ActionRowStyles {
-    fn default() -> Self {
-        Self {
-            button: Style::new(),
-            focused_button: Style::new().add_modifier(Modifier::REVERSED),
-        }
-    }
-}
+pub type ActionRowStyles = crate::button::ButtonStyles;
 
 /// Horizontal action-button row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,25 +102,20 @@ impl<'a> ActionRow<'a> {
             let Some(action) = self.actions.get(index) else {
                 return;
             };
-            let style = if index == self.focused {
-                self.styles.focused_button
-            } else {
-                self.styles.button
-            };
-            let line = Line::from_spans(vec![Span::styled(format!("[ {} ]", action.label), style)]);
+            let mut state = ButtonState::new();
+            state.set_focused(index == self.focused);
+            let button = Button::new(action.label.as_str()).styles(self.styles);
             if let Some(fallback) = fallback {
-                frame.write_line_with_fallback_style(action_area, &line, fallback);
+                button.render_with_fallback_style(action_area, &state, frame, fallback);
             } else {
-                frame.write_line(action_area, &line);
+                button.render(action_area, &state, frame);
             }
         }
     }
 }
 
 fn action_width(action: &ActionButton) -> u16 {
-    u16::try_from(bmux_tui::text_width::display_width(&action.label))
-        .unwrap_or(u16::MAX)
-        .saturating_add(4)
+    Button::new(action.label.as_str()).width()
 }
 
 #[cfg(test)]
