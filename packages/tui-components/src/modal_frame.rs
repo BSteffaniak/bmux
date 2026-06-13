@@ -7,7 +7,7 @@
 
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::prelude::Widget;
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::Line;
@@ -62,6 +62,10 @@ pub enum ModalPlacement {
     Centered,
     /// Center horizontally and place the modal around the upper third.
     UpperThird,
+    /// Center horizontally and place the modal around the lower third.
+    LowerThird,
+    /// Place the modal at an explicit top-left point, clamped to the parent.
+    Anchored(Point),
 }
 
 /// Modal sizing constraints.
@@ -80,6 +84,23 @@ impl ModalSizing {
     #[must_use]
     pub const fn new(min: Size, max: Size, margin: Insets) -> Self {
         Self { min, max, margin }
+    }
+
+    /// Create modal sizing constraints with equal min and max size.
+    #[must_use]
+    pub const fn fixed(size: Size, margin: Insets) -> Self {
+        Self {
+            min: size,
+            max: size,
+            margin,
+        }
+    }
+
+    /// Return this sizing with the maximum size changed.
+    #[must_use]
+    pub const fn max_size(mut self, max: Size) -> Self {
+        self.max = max;
+        self
     }
 
     fn resolve_size(self, parent: Rect) -> Size {
@@ -150,19 +171,31 @@ impl ModalFrame {
     #[must_use]
     pub fn panel_area(&self, parent: Rect) -> Rect {
         let size = self.sizing.resolve_size(parent);
-        let x = parent
-            .x
-            .saturating_add(parent.width.saturating_sub(size.width) / 2);
-        let y_offset = match self.placement {
-            ModalPlacement::Centered => parent.height.saturating_sub(size.height) / 2,
-            ModalPlacement::UpperThird => parent.height.saturating_sub(size.height) / 3,
+        let x = match self.placement {
+            ModalPlacement::Centered | ModalPlacement::UpperThird | ModalPlacement::LowerThird => {
+                parent
+                    .x
+                    .saturating_add(parent.width.saturating_sub(size.width) / 2)
+            }
+            ModalPlacement::Anchored(point) => {
+                point.x.min(parent.right().saturating_sub(size.width))
+            }
         };
-        Rect::new(
-            x,
-            parent.y.saturating_add(y_offset),
-            size.width,
-            size.height,
-        )
+        let y = match self.placement {
+            ModalPlacement::Centered => parent
+                .y
+                .saturating_add(parent.height.saturating_sub(size.height) / 2),
+            ModalPlacement::UpperThird => parent
+                .y
+                .saturating_add(parent.height.saturating_sub(size.height) / 3),
+            ModalPlacement::LowerThird => parent
+                .y
+                .saturating_add(parent.height.saturating_sub(size.height) * 2 / 3),
+            ModalPlacement::Anchored(point) => {
+                point.y.min(parent.bottom().saturating_sub(size.height))
+            }
+        };
+        Rect::new(x, y, size.width, size.height)
     }
 
     /// Return the resolved modal content area for a parent area.
@@ -264,6 +297,47 @@ mod tests {
         assert_eq!(
             modal.panel_area(Rect::new(0, 0, 40, 21)),
             Rect::new(15, 5, 10, 6)
+        );
+    }
+
+    #[test]
+    fn lower_third_placement_uses_last_third_of_remaining_space() {
+        let modal = ModalFrame::new(
+            ModalSizing::fixed(Size::new(10, 6), Insets::all(0)),
+            ModalTheme::dark(Color::Green),
+        )
+        .placement(ModalPlacement::LowerThird);
+
+        assert_eq!(
+            modal.panel_area(Rect::new(0, 0, 40, 21)),
+            Rect::new(15, 10, 10, 6)
+        );
+    }
+
+    #[test]
+    fn anchored_placement_is_clamped_to_parent() {
+        let modal = ModalFrame::new(
+            ModalSizing::fixed(Size::new(10, 6), Insets::all(0)),
+            ModalTheme::dark(Color::Green),
+        )
+        .placement(ModalPlacement::Anchored(Point::new(100, 100)));
+
+        assert_eq!(
+            modal.panel_area(Rect::new(0, 0, 40, 21)),
+            Rect::new(30, 15, 10, 6)
+        );
+    }
+
+    #[test]
+    fn sizing_clamps_to_available_parent_area() {
+        let modal = ModalFrame::new(
+            ModalSizing::new(Size::new(20, 10), Size::new(60, 40), Insets::all(2)),
+            ModalTheme::dark(Color::Green),
+        );
+
+        assert_eq!(
+            modal.panel_area(Rect::new(0, 0, 12, 8)),
+            Rect::new(2, 2, 8, 4)
         );
     }
 
