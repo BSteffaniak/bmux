@@ -34,3 +34,4 @@ pub mod tab_bar;
 pub mod text_input;
 #[cfg(feature = "text-input")]
 pub mod text_input_box;
+pub mod tree_view;
