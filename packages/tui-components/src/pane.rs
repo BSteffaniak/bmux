@@ -35,6 +35,7 @@ impl Default for PaneStyles {
 
 /// Configurable pane mouse behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PaneMousePolicy {
     /// Whether the pane accepts mouse events.
     pub enabled: bool,
@@ -42,6 +43,8 @@ pub struct PaneMousePolicy {
     pub click_to_focus: bool,
     /// Whether the title bar starts pane dragging.
     pub title_bar_drag: bool,
+    /// Whether wheel scroll events inside the pane are handled as scroll delegation.
+    pub scroll_wheel: bool,
     /// Whether pane edges/corners start resizing.
     pub resize_handles: ResizeHandles,
 }
@@ -54,6 +57,7 @@ impl PaneMousePolicy {
             enabled: false,
             click_to_focus: false,
             title_bar_drag: false,
+            scroll_wheel: false,
             resize_handles: ResizeHandles::NONE,
         }
     }
@@ -65,6 +69,7 @@ impl PaneMousePolicy {
             enabled: true,
             click_to_focus: true,
             title_bar_drag: true,
+            scroll_wheel: false,
             resize_handles: ResizeHandles::NONE,
         }
     }
@@ -242,6 +247,21 @@ pub enum PaneOutcome {
     Moved { area: Rect },
     /// Pane resized to a new area.
     Resized { area: Rect },
+    /// Scroll wheel was used inside the pane.
+    ScrollDelegated { direction: ScrollDirection },
+}
+
+/// Direction for delegated pane scroll input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDirection {
+    /// Scroll content upward.
+    Up,
+    /// Scroll content downward.
+    Down,
+    /// Scroll content leftward.
+    Left,
+    /// Scroll content rightward.
+    Right,
 }
 
 /// Configurable pane renderer and event handler.
@@ -377,6 +397,18 @@ impl Pane<'_> {
                     PaneOutcome::Redraw
                 }
             }
+            MouseEventKind::ScrollUp if self.policy.mouse.scroll_wheel => {
+                self.handle_scroll(state, mouse.position, ScrollDirection::Up)
+            }
+            MouseEventKind::ScrollDown if self.policy.mouse.scroll_wheel => {
+                self.handle_scroll(state, mouse.position, ScrollDirection::Down)
+            }
+            MouseEventKind::ScrollLeft if self.policy.mouse.scroll_wheel => {
+                self.handle_scroll(state, mouse.position, ScrollDirection::Left)
+            }
+            MouseEventKind::ScrollRight if self.policy.mouse.scroll_wheel => {
+                self.handle_scroll(state, mouse.position, ScrollDirection::Right)
+            }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
@@ -384,6 +416,19 @@ impl Pane<'_> {
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => PaneOutcome::Ignored,
+        }
+    }
+
+    fn handle_scroll(
+        &self,
+        state: &PaneState,
+        position: Point,
+        direction: ScrollDirection,
+    ) -> PaneOutcome {
+        if self.inner_area(state).contains(position) {
+            PaneOutcome::ScrollDelegated { direction }
+        } else {
+            PaneOutcome::Ignored
         }
     }
 
@@ -708,6 +753,7 @@ mod tests {
                 enabled: true,
                 click_to_focus: true,
                 title_bar_drag: false,
+                scroll_wheel: false,
                 resize_handles: ResizeHandles::ALL,
             },
             bounds: PaneBoundsPolicy::default(),
@@ -729,6 +775,49 @@ mod tests {
                 area: Rect::new(2, 2, 13, 6)
             }
         );
+    }
+
+    #[test]
+    fn scroll_wheel_inside_inner_area_is_delegated() {
+        let pane = Pane::new().padding(Insets::all(1)).policy(PanePolicy {
+            mouse: PaneMousePolicy {
+                enabled: true,
+                click_to_focus: false,
+                title_bar_drag: false,
+                scroll_wheel: true,
+                resize_handles: ResizeHandles::NONE,
+            },
+            bounds: PaneBoundsPolicy::default(),
+        });
+        let mut state = PaneState::new(Rect::new(0, 0, 10, 5));
+
+        let outcome = pane.handle_event(&mut state, &mouse(MouseEventKind::ScrollDown, 2, 2));
+
+        assert_eq!(
+            outcome,
+            PaneOutcome::ScrollDelegated {
+                direction: super::ScrollDirection::Down
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_wheel_on_chrome_is_ignored() {
+        let pane = Pane::new().padding(Insets::all(1)).policy(PanePolicy {
+            mouse: PaneMousePolicy {
+                enabled: true,
+                click_to_focus: false,
+                title_bar_drag: false,
+                scroll_wheel: true,
+                resize_handles: ResizeHandles::NONE,
+            },
+            bounds: PaneBoundsPolicy::default(),
+        });
+        let mut state = PaneState::new(Rect::new(0, 0, 10, 5));
+
+        let outcome = pane.handle_event(&mut state, &mouse(MouseEventKind::ScrollDown, 0, 0));
+
+        assert_eq!(outcome, PaneOutcome::Ignored);
     }
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
