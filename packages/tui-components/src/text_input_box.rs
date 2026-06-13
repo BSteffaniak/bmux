@@ -28,6 +28,10 @@ pub struct TextInputBoxPolicy {
     pub focused: bool,
     /// Whether input handling is disabled at this box layer.
     pub disabled: bool,
+    /// Minimum content rows to reserve.
+    pub min_rows: u16,
+    /// Maximum content rows to reserve.
+    pub max_rows: Option<u16>,
 }
 
 impl TextInputBoxPolicy {
@@ -41,6 +45,8 @@ impl TextInputBoxPolicy {
             cursor: true,
             focused: false,
             disabled: false,
+            min_rows: 1,
+            max_rows: None,
         }
     }
 
@@ -54,6 +60,8 @@ impl TextInputBoxPolicy {
             cursor: true,
             focused: false,
             disabled: false,
+            min_rows: 1,
+            max_rows: None,
         }
     }
 
@@ -67,6 +75,8 @@ impl TextInputBoxPolicy {
             cursor: true,
             focused: false,
             disabled: false,
+            min_rows: 1,
+            max_rows: None,
         }
     }
 
@@ -81,6 +91,14 @@ impl TextInputBoxPolicy {
     #[must_use]
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Return this policy with content row bounds updated.
+    #[must_use]
+    pub const fn rows(mut self, min_rows: u16, max_rows: Option<u16>) -> Self {
+        self.min_rows = min_rows;
+        self.max_rows = max_rows;
         self
     }
 }
@@ -268,6 +286,7 @@ impl<'a> TextInputBox<'a> {
         } else {
             panel
         };
+        let content = self.apply_row_bounds(content);
         TextInputBoxLayout {
             outer: area,
             field_control,
@@ -290,6 +309,7 @@ impl<'a> TextInputBox<'a> {
         } else {
             field_control
         };
+        let content = self.apply_row_bounds(content);
         if self.policy.background {
             frame.fill(content, " ", self.background_style());
         }
@@ -370,6 +390,13 @@ impl<'a> TextInputBox<'a> {
             self.styles.text
         }
     }
+
+    fn apply_row_bounds(&self, area: Rect) -> Rect {
+        let min_height = self.policy.min_rows;
+        let max_height = self.policy.max_rows.unwrap_or(u16::MAX);
+        let requested = area.height.max(min_height).min(max_height);
+        Rect::new(area.x, area.y, area.width, requested.min(area.height))
+    }
 }
 
 #[cfg(test)]
@@ -377,9 +404,9 @@ mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
     use bmux_text_edit::TextEditBuffer;
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::geometry::Rect;
 
     use super::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
     use crate::text_input::{TextInputPolicy, TextInputState};
@@ -460,19 +487,67 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_uses_box_content_area() {
+    fn renders_labeled_error_state() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 18, 6));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInputBox::new(policy)
+            .label("Name")
+            .error("Required")
+            .policy(TextInputBoxPolicy::labeled_field())
+            .render(Rect::new(0, 0, 18, 6), &mut state, &mut frame);
+
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(5)
+                .is_some_and(|row| row.contains("Required"))
+        );
+    }
+
+    #[test]
+    fn disabled_policy_ignores_events() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
+        let outcome = TextInputBox::new(policy)
+            .policy(TextInputBoxPolicy::field().disabled(true))
+            .handle_event(
+                Rect::new(0, 0, 12, 3),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Char('!'))),
+            );
+
+        assert_eq!(outcome, TextInputBoxOutcome::Ignored);
+        assert_eq!(state.buffer().text(), "Ada");
+    }
+
+    #[test]
+    fn paste_events_delegate_to_text_control() {
         let policy = TextInputPolicy::chat_composer();
         let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
         let outcome = TextInputBox::new(policy).handle_event(
             Rect::new(0, 0, 12, 3),
             &mut state,
-            &Event::Mouse(MouseEvent::new(
-                MouseEventKind::Down(MouseButton::Left),
-                Point::new(2, 1),
-            )),
+            &Event::Paste(" Lovelace".to_owned()),
         );
 
-        assert_eq!(outcome, TextInputBoxOutcome::Redraw);
-        assert_eq!(state.content_area(), Rect::new(2, 1, 8, 1));
+        assert_eq!(outcome, TextInputBoxOutcome::Edited);
+        assert_eq!(state.buffer().text(), "Ada Lovelace");
+    }
+
+    #[test]
+    fn content_area_respects_max_rows() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut state = TextInputState::new(TextEditBuffer::from_text("one\ntwo\nthree"));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 8));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextInputBox::new(policy)
+            .policy(TextInputBoxPolicy::field().rows(1, Some(2)))
+            .render(Rect::new(0, 0, 16, 8), &mut state, &mut frame);
+
+        assert_eq!(state.content_area(), Rect::new(2, 1, 12, 2));
     }
 }
