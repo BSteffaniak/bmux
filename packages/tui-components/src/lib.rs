@@ -17,5 +17,6 @@ pub mod form_field;
 pub mod labeled_details;
 pub mod modal_frame;
 pub mod pane;
+pub mod radio_group;
 #[cfg(feature = "text-input")]
 pub mod text_input;
