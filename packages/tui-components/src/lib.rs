@@ -20,6 +20,7 @@ pub mod labeled_details;
 pub mod menu;
 pub mod modal_frame;
 pub mod pane;
+pub mod panel_group;
 pub mod radio_group;
 pub mod scroll_area;
 pub mod select_dropdown;
