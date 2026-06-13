@@ -507,7 +507,7 @@ impl PanelGroup {
             MouseEventKind::Drag(MouseButton::Left)
                 if self.policy.mouse.drag_dividers && self.policy.resize.enabled =>
             {
-                self.drag_divider(state, mouse.position)
+                self.drag_divider(area, state, mouse.position)
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 state
@@ -554,7 +554,12 @@ impl PanelGroup {
         }
     }
 
-    fn drag_divider(&self, state: &mut PanelGroupState, position: Point) -> PanelGroupOutcome {
+    fn drag_divider(
+        &self,
+        area: Rect,
+        state: &mut PanelGroupState,
+        position: Point,
+    ) -> PanelGroupOutcome {
         let Some(active) = state.active_drag else {
             return PanelGroupOutcome::Ignored;
         };
@@ -578,8 +583,19 @@ impl PanelGroup {
         }
         let before_index = active.divider;
         let after_index = active.divider + 1;
-        let before = resolved_size(state.sizes[before_index]);
-        let after = resolved_size(state.sizes[after_index]);
+        let current_lengths = allocated_lengths(
+            primary_len(self.axis, area)
+                .saturating_sub(u16_saturating(state.sizes.len().saturating_sub(1))),
+            state,
+        );
+        let before = current_lengths
+            .get(before_index)
+            .copied()
+            .unwrap_or_else(|| resolved_size(state.sizes[before_index]));
+        let after = current_lengths
+            .get(after_index)
+            .copied()
+            .unwrap_or_else(|| resolved_size(state.sizes[after_index]));
         let total = before.saturating_add(after);
         let before_target = add_signed(before, delta);
         let before_min = state.constraint(before_index).min;

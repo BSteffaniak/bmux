@@ -12,6 +12,9 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, 
 use bmux_tui_components::pane::{
     Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
 };
+use bmux_tui_components::panel_group::{
+    PanelGroup, PanelGroupAxis, PanelGroupOutcome, PanelGroupPolicy, PanelGroupState, PanelSize,
+};
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 18;
@@ -19,6 +22,7 @@ pub const HEIGHT: u16 = 18;
 pub struct LayoutPlaygroundDemo {
     terminal_area: Rect,
     pane_state: PaneState,
+    panel_group_state: PanelGroupState,
     message: String,
 }
 
@@ -28,7 +32,12 @@ impl LayoutPlaygroundDemo {
         Self {
             terminal_area,
             pane_state: PaneState::new(Rect::new(2, 2, 30, 8)),
-            message: "Drag title; resize edges/corners; q quits".to_string(),
+            panel_group_state: PanelGroupState::new([
+                PanelSize::fixed(14),
+                PanelSize::flex(1),
+                PanelSize::fixed(12),
+            ]),
+            message: "Drag pane title/border or panel-group divider; q quits".to_string(),
         }
     }
 
@@ -38,7 +47,13 @@ impl LayoutPlaygroundDemo {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        render_playground(frame, self.terminal_area, &self.pane_state, &self.message);
+        render_playground(
+            frame,
+            self.terminal_area,
+            &self.pane_state,
+            &self.panel_group_state,
+            &self.message,
+        );
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
@@ -47,6 +62,31 @@ impl LayoutPlaygroundDemo {
         }
         if matches!(event, Event::Key(stroke) if should_quit(*stroke)) {
             return true;
+        }
+        let panel_group = interactive_panel_group();
+        match panel_group.handle_event(panel_group_area(), &mut self.panel_group_state, event) {
+            PanelGroupOutcome::Focused { panel } => {
+                self.message = format!("Panel group focused panel {panel}");
+                return false;
+            }
+            PanelGroupOutcome::DividerDragStarted { divider } => {
+                self.message = format!("Panel group divider {divider} drag started");
+                return false;
+            }
+            PanelGroupOutcome::Resized {
+                divider,
+                before,
+                after,
+            } => {
+                self.message = format!("Panel group divider {divider}: {before}/{after}");
+                return false;
+            }
+            PanelGroupOutcome::DividerDragEnded { divider } => {
+                self.message = format!("Panel group divider {divider} drag ended");
+                return false;
+            }
+            PanelGroupOutcome::Redraw | PanelGroupOutcome::Handled => return false,
+            PanelGroupOutcome::Ignored => {}
         }
         let pane = interactive_pane(self.terminal_area);
         match pane.handle_event(&mut self.pane_state, event) {
@@ -70,7 +110,8 @@ impl LayoutPlaygroundDemo {
             }
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && !self.pane_state.area.contains(mouse.position) =>
+                    && !self.pane_state.area.contains(mouse.position)
+                    && !panel_group_area().contains(mouse.position) =>
             {
                 self.clear_focus();
                 true
@@ -96,6 +137,16 @@ impl LayoutPlaygroundDemo {
     pub const fn pane_area(&self) -> Rect {
         self.pane_state.area
     }
+
+    #[must_use]
+    pub fn panel_group_widths(&self) -> Vec<u16> {
+        interactive_panel_group()
+            .layout(panel_group_area(), &self.panel_group_state)
+            .panels
+            .iter()
+            .map(|panel| panel.width)
+            .collect()
+    }
 }
 
 impl Default for LayoutPlaygroundDemo {
@@ -119,6 +170,7 @@ fn render_playground(
     frame: &mut Frame<'_>,
     terminal_area: Rect,
     pane_state: &PaneState,
+    panel_group_state: &PanelGroupState,
     message: &str,
 ) {
     let pane = interactive_pane(terminal_area);
@@ -141,7 +193,31 @@ fn render_playground(
         frame,
     );
 
+    let group = interactive_panel_group();
+    let group_area = panel_group_area();
+    let group_layout = group.layout(group_area, panel_group_state);
+    for (index, area) in group_layout.panels.iter().copied().enumerate() {
+        frame.write_line(
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y,
+                area.width.saturating_sub(1),
+                1,
+            ),
+            &Line::from(format!("Panel {index}")),
+        );
+    }
+    group.render_dividers(group_area, panel_group_state, frame);
+
     frame.write_line(Rect::new(1, 16, 68, 1), &Line::from(message));
+}
+
+fn panel_group_area() -> Rect {
+    Rect::new(2, 12, 64, 3)
+}
+
+fn interactive_panel_group() -> PanelGroup {
+    PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::interactive())
 }
 
 fn interactive_pane(parent: Rect) -> Pane<'static> {
@@ -226,6 +302,24 @@ pub fn demonstrate_pane_resize_clamps_to_max() -> Rect {
     demo.pane_area()
 }
 
+pub fn demonstrate_panel_group_resize() -> Vec<u16> {
+    let mut demo = LayoutPlaygroundDemo::default();
+    let group_area = panel_group_area();
+    let divider_x = group_area.x.saturating_add(14);
+    let y = group_area.y;
+    let _ = demo.handle_event(&mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        divider_x,
+        y,
+    ));
+    let _ = demo.handle_event(&mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        divider_x.saturating_add(4),
+        y,
+    ));
+    demo.panel_group_widths()
+}
+
 pub fn demonstrate_click_outside_unfocuses_pane() -> bool {
     let mut demo = LayoutPlaygroundDemo::default();
     let _ = demo.handle_event(&mouse_event(MouseEventKind::Down(MouseButton::Left), 4, 2));
@@ -273,8 +367,8 @@ mod tests {
     use super::{
         demonstrate_click_outside_unfocuses_pane, demonstrate_drag_delta,
         demonstrate_escape_unfocuses_pane, demonstrate_hit_region, demonstrate_pane_drag,
-        demonstrate_pane_resize, demonstrate_pane_resize_clamps_to_max, demonstrate_resize_bounds,
-        render_layout_playground, rows,
+        demonstrate_pane_resize, demonstrate_pane_resize_clamps_to_max,
+        demonstrate_panel_group_resize, demonstrate_resize_bounds, render_layout_playground, rows,
     };
 
     #[test]
@@ -283,7 +377,8 @@ mod tests {
 
         assert!(rendered.contains("Drag/resize me"));
         assert!(rendered.contains("Modal placement"));
-        assert!(rendered.contains("Drag title; resize edges/corners"));
+        assert!(rendered.contains("Panel 0"));
+        assert!(rendered.contains("Drag pane title/border or panel-group divider"));
     }
 
     #[test]
@@ -291,6 +386,11 @@ mod tests {
         assert_eq!(demonstrate_drag_delta(), (5, -2));
         assert_eq!(demonstrate_hit_region(), Some(HitRegionId(20)));
         assert_eq!(demonstrate_resize_bounds(), Size::new(12, 4));
+    }
+
+    #[test]
+    fn panel_group_resizes_from_divider_drag() {
+        assert_eq!(demonstrate_panel_group_resize(), vec![18, 32, 12]);
     }
 
     #[test]
