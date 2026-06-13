@@ -64,7 +64,7 @@ pub const fn command_for_key(
             KeyCode::End => Some(TextEditCommand::Move(
                 boundary_policy.motion(TextBoundary::End),
             )),
-            KeyCode::Char(ch) => Some(TextEditCommand::Insert(ch)),
+            KeyCode::Char(ch) => Some(TextEditCommand::Insert(shifted_input_char(ch, mods.shift))),
             KeyCode::Space => Some(TextEditCommand::Insert(' ')),
             _ => None,
         };
@@ -125,6 +125,14 @@ pub const fn command_for_key(
     }
 }
 
+const fn shifted_input_char(ch: char, shift: bool) -> char {
+    if shift && ch.is_ascii_lowercase() {
+        ch.to_ascii_uppercase()
+    } else {
+        ch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +169,22 @@ mod tests {
                 },
             )),
             Some(TextEditCommand::Delete(TextDelete::WordForward))
+        );
+    }
+
+    #[test]
+    fn inserts_shifted_ascii_letters_as_uppercase() {
+        let keymap = TextKeymap::default();
+
+        assert_eq!(
+            keymap.command_for_key(stroke(
+                KeyCode::Char('b'),
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            )),
+            Some(TextEditCommand::Insert('B'))
         );
     }
 

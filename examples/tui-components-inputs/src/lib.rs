@@ -227,6 +227,23 @@ pub fn demonstrate_text_input_edit() -> String {
     state.buffer().text().to_string()
 }
 
+pub fn demonstrate_text_input_uppercase_edit() -> String {
+    let policy = TextInputPolicy::chat_composer();
+    let control = TextInputControl::new(&policy);
+    let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
+    let _ = control.handle_event(
+        &mut state,
+        &Event::Key(KeyStroke::with_modifiers(
+            KeyCode::Char('b'),
+            bmux_keyboard::Modifiers {
+                shift: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        )),
+    );
+    state.buffer().text().to_string()
+}
+
 pub fn demonstrate_form_submit() -> FormOutcome {
     let fields = [
         FormFieldItem::new("name").required(true),
@@ -333,7 +350,8 @@ mod tests {
     use super::{
         demonstrate_click_checkbox_toggles_from_text_focus,
         demonstrate_click_radio_selects_and_focuses, demonstrate_click_text_focuses,
-        demonstrate_form_submit, demonstrate_text_input_edit, render_inputs, rows,
+        demonstrate_form_submit, demonstrate_text_input_edit,
+        demonstrate_text_input_uppercase_edit, render_inputs, rows,
     };
 
     #[test]
@@ -349,6 +367,7 @@ mod tests {
     #[test]
     fn text_input_policy_edits_buffer() {
         assert_eq!(demonstrate_text_input_edit(), "Ada!");
+        assert_eq!(demonstrate_text_input_uppercase_edit(), "AdaB");
     }
 
     #[test]
