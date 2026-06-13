@@ -13,6 +13,8 @@ pub mod action_row;
 pub mod button;
 pub mod checkbox;
 pub mod common;
+pub mod dialog;
+pub mod form;
 pub mod form_field;
 pub mod labeled_details;
 pub mod modal_frame;

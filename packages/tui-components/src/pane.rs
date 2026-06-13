@@ -778,6 +778,41 @@ mod tests {
     }
 
     #[test]
+    fn resize_clamps_to_max_size() {
+        let pane = Pane::new().policy(PanePolicy {
+            mouse: PaneMousePolicy {
+                enabled: true,
+                click_to_focus: true,
+                title_bar_drag: false,
+                scroll_wheel: false,
+                resize_handles: ResizeHandles::ALL,
+            },
+            bounds: PaneBoundsPolicy {
+                parent: None,
+                min_size: Size::new(3, 3),
+                max_size: Some(Size::new(12, 5)),
+            },
+        });
+        let mut state = PaneState::new(Rect::new(2, 2, 10, 4));
+
+        let _ = pane.handle_event(
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left), 11, 5),
+        );
+        let resized = pane.handle_event(
+            &mut state,
+            &mouse(MouseEventKind::Drag(MouseButton::Left), 30, 20),
+        );
+
+        assert_eq!(
+            resized,
+            PaneOutcome::Resized {
+                area: Rect::new(2, 2, 12, 5)
+            }
+        );
+    }
+
+    #[test]
     fn scroll_wheel_inside_inner_area_is_delegated() {
         let pane = Pane::new().padding(Insets::all(1)).policy(PanePolicy {
             mouse: PaneMousePolicy {
