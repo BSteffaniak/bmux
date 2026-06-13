@@ -7,9 +7,10 @@ use bmux_tui::style::Color;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::filtered_list::FilteredListState;
 use bmux_tui_components::form_field::FormField;
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing, ModalTheme};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 use bmux_tui_components::pane::{Pane, PaneState};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
 use bmux_tui_components::selectable_list::{
@@ -100,9 +101,17 @@ fn render_picker(frame: &mut Frame<'_>) {
     let items = [
         SelectableListItem::new("open", "Open file"),
         SelectableListItem::new("switch", "Switch tab"),
+        SelectableListItem::new("close", "Close window"),
     ];
-    let list_state = SelectableListState::new(Some(0));
-    SelectableList::new(&items).render(layout.list, &list_state, frame);
+    let mut filtered = FilteredListState::from_indices([0, 2]);
+    let visible_items = filtered
+        .indices()
+        .iter()
+        .map(|index| items[*index].clone())
+        .collect::<Vec<_>>();
+    filtered.select_visible(0);
+    let list_state = SelectableListState::new(filtered.selected_visible());
+    SelectableList::new(&visible_items).render(layout.list, &list_state, frame);
 }
 
 fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
@@ -110,7 +119,10 @@ fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
         ModalSizing::new(Size::new(24, 7), Size::new(24, 7), Insets::all(0)),
         theme,
     )
-    .title("Modal");
+    .title("Anchored modal")
+    .placement(ModalPlacement::Anchored(bmux_tui::geometry::Point::new(
+        36, 18,
+    )));
     modal.render(Rect::new(34, 18, 34, 6), frame);
     modal.render_line(
         modal.content_area(Rect::new(34, 18, 34, 6)),
