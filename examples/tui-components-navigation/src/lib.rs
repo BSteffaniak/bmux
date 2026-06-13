@@ -18,6 +18,7 @@ pub struct NavigationDemo {
     list: SelectableListState,
     menu: MenuState,
     scroll: ScrollAreaState,
+    pane_scroll: ScrollAreaState,
     message: String,
 }
 
@@ -32,12 +33,20 @@ impl NavigationDemo {
                 state.set_vertical_offset(1);
                 state
             },
+            pane_scroll: ScrollAreaState::new(),
             message: "Use arrows/Enter, wheel over scroll pane, q quits".to_string(),
         }
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        render_navigation_with_state(frame, &self.list, &self.menu, &self.scroll, &self.message);
+        render_navigation_with_state(
+            frame,
+            &self.list,
+            &self.menu,
+            &self.scroll,
+            &self.pane_scroll,
+            &self.message,
+        );
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
@@ -74,6 +83,39 @@ impl NavigationDemo {
         {
             self.message = format!("Scroll offset: {vertical_offset}");
         }
+
+        let pane = scroll_delegate_pane();
+        let mut pane_state = PaneState::new(scroll_delegate_pane_area());
+        if let PaneOutcome::ScrollDelegated { direction } =
+            pane.handle_event(&mut pane_state, event)
+        {
+            let delegated = match direction {
+                bmux_tui_components::pane::ScrollDirection::Up => {
+                    bmux_tui::event::MouseEventKind::ScrollUp
+                }
+                bmux_tui_components::pane::ScrollDirection::Down => {
+                    bmux_tui::event::MouseEventKind::ScrollDown
+                }
+                bmux_tui_components::pane::ScrollDirection::Left
+                | bmux_tui_components::pane::ScrollDirection::Right => return false,
+            };
+            let pane_lines = pane_scroll_lines();
+            if let ScrollAreaOutcome::Scrolled { vertical_offset } = ScrollArea::new(&pane_lines)
+                .handle_event(
+                    pane.inner_area(&pane_state),
+                    &mut self.pane_scroll,
+                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                        delegated,
+                        bmux_tui::geometry::Point::new(
+                            pane.inner_area(&pane_state).x,
+                            pane.inner_area(&pane_state).y,
+                        ),
+                    )),
+                )
+            {
+                self.message = format!("Delegated pane scroll offset: {vertical_offset}");
+            }
+        }
         false
     }
 }
@@ -96,6 +138,7 @@ fn render_navigation_with_state(
     list: &SelectableListState,
     menu: &MenuState,
     scroll: &ScrollAreaState,
+    pane_scroll: &ScrollAreaState,
     message: &str,
 ) {
     let list_items = list_items();
@@ -108,12 +151,10 @@ fn render_navigation_with_state(
     ScrollArea::new(&lines).render(Rect::new(1, 6, 24, 2), scroll, frame);
 
     let pane = scroll_delegate_pane();
-    let pane_state = PaneState::new(Rect::new(30, 6, 28, 7));
+    let pane_state = PaneState::new(scroll_delegate_pane_area());
     pane.render(&pane_state, frame);
-    frame.write_line(
-        pane.inner_area(&pane_state),
-        &Line::from("Wheel input delegates"),
-    );
+    let pane_lines = pane_scroll_lines();
+    ScrollArea::new(&pane_lines).render(pane.inner_area(&pane_state), pane_scroll, frame);
     frame.write_line(Rect::new(1, 15, 60, 1), &Line::from(message));
 }
 
@@ -138,6 +179,15 @@ pub fn demonstrate_pane_scroll_delegation() -> PaneOutcome {
             bmux_tui::geometry::Point::new(2, 2),
         )),
     )
+}
+
+pub fn demonstrate_delegated_pane_scroll_offset() -> u16 {
+    let mut demo = NavigationDemo::new();
+    let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
+        bmux_tui::event::MouseEventKind::ScrollDown,
+        bmux_tui::geometry::Point::new(32, 8),
+    )));
+    demo.pane_scroll.vertical_offset()
 }
 
 pub fn rows(buffer: &Buffer) -> Vec<String> {
@@ -170,6 +220,21 @@ fn scroll_lines() -> [Line; 4] {
     ]
 }
 
+fn pane_scroll_lines() -> [Line; 6] {
+    [
+        Line::from("Delegated line zero"),
+        Line::from("Delegated line one"),
+        Line::from("Delegated line two"),
+        Line::from("Delegated line three"),
+        Line::from("Delegated line four"),
+        Line::from("Delegated line five"),
+    ]
+}
+
+const fn scroll_delegate_pane_area() -> Rect {
+    Rect::new(30, 6, 28, 7)
+}
+
 fn scroll_delegate_pane() -> Pane<'static> {
     Pane::new()
         .title("Scroll delegate")
@@ -196,7 +261,8 @@ mod tests {
     use bmux_tui_components::pane::{PaneOutcome, ScrollDirection};
 
     use super::{
-        demonstrate_menu_activation, demonstrate_pane_scroll_delegation, render_navigation, rows,
+        demonstrate_delegated_pane_scroll_offset, demonstrate_menu_activation,
+        demonstrate_pane_scroll_delegation, render_navigation, rows,
     };
 
     #[test]
@@ -206,7 +272,7 @@ mod tests {
         assert!(rendered.contains("Second item"));
         assert!(rendered.contains("> Open"));
         assert!(rendered.contains("Scroll one"));
-        assert!(rendered.contains("Wheel input delegates"));
+        assert!(rendered.contains("Delegated line zero"));
     }
 
     #[test]
@@ -218,6 +284,11 @@ mod tests {
                 id: "open".to_string()
             }
         );
+    }
+
+    #[test]
+    fn delegated_pane_scroll_updates_nested_scroll_area() {
+        assert_eq!(demonstrate_delegated_pane_scroll_offset(), 3);
     }
 
     #[test]
