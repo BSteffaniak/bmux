@@ -28,6 +28,7 @@ pub mod radio_group;
 pub mod scroll_area;
 pub mod select_dropdown;
 pub mod selectable_list;
+pub mod tab_bar;
 #[cfg(feature = "text-input")]
 pub mod text_input;
 #[cfg(feature = "text-input")]
