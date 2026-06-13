@@ -1,3 +1,4 @@
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
@@ -10,6 +11,12 @@ use bmux_tui_components::form_field::FormField;
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing, ModalTheme};
 use bmux_tui_components::pane::{Pane, PaneState};
+use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListItem, SelectableListState,
+};
+use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 24;
@@ -28,6 +35,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_details(frame);
     render_field(frame);
     render_pane(frame);
+    render_picker(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
 }
@@ -74,15 +82,38 @@ fn render_pane(frame: &mut Frame<'_>) {
     frame.write_line(pane.inner_area(&state), &Line::from("Pane content area"));
 }
 
+fn render_picker(frame: &mut Frame<'_>) {
+    let picker = PickerFrame::new()
+        .title("Command Palette")
+        .header("Commands")
+        .footer("enter select · esc close")
+        .policy(PickerFramePolicy::palette().max_size(Size::new(30, 12)));
+    let layout = picker.render(Rect::new(34, 6, 34, 12), frame);
+
+    if let Some(input_area) = layout.input {
+        let mut input_state = TextInputState::new(TextEditBuffer::from_text("open"));
+        TextInputBox::new(TextInputPolicy::chat_composer())
+            .policy(TextInputBoxPolicy::bare().focused(true))
+            .render(input_area, &mut input_state, frame);
+    }
+
+    let items = [
+        SelectableListItem::new("open", "Open file"),
+        SelectableListItem::new("switch", "Switch tab"),
+    ];
+    let list_state = SelectableListState::new(Some(0));
+    SelectableList::new(&items).render(layout.list, &list_state, frame);
+}
+
 fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
     let modal = ModalFrame::new(
         ModalSizing::new(Size::new(24, 7), Size::new(24, 7), Insets::all(0)),
         theme,
     )
     .title("Modal");
-    modal.render(Rect::new(34, 8, 34, 10), frame);
+    modal.render(Rect::new(34, 18, 34, 6), frame);
     modal.render_line(
-        modal.content_area(Rect::new(34, 8, 34, 10)),
+        modal.content_area(Rect::new(34, 18, 34, 6)),
         &Line::from("Opaque modal frame"),
         frame,
     );
@@ -120,6 +151,8 @@ mod tests {
         assert!(rendered.contains("[ Save ]"));
         assert!(rendered.contains("LabeledDetails"));
         assert!(rendered.contains("Pane content area"));
+        assert!(rendered.contains("Command Palette"));
+        assert!(rendered.contains("Commands"));
         assert!(rendered.contains("Dialog body with actions"));
     }
 }

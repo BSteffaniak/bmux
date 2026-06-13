@@ -2204,6 +2204,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_keyboard",
+ "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
 ]
