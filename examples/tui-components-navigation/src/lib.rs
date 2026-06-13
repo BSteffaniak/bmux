@@ -6,77 +6,119 @@ use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::prelude::Line;
 use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{Pane, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState};
-use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaState};
+use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
 use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListItem, SelectableListState,
+    SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 18;
 
+pub struct NavigationDemo {
+    list: SelectableListState,
+    menu: MenuState,
+    scroll: ScrollAreaState,
+    message: String,
+}
+
+impl NavigationDemo {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            list: SelectableListState::new(Some(1)),
+            menu: MenuState::new(Some(0)),
+            scroll: {
+                let mut state = ScrollAreaState::new();
+                state.set_vertical_offset(1);
+                state
+            },
+            message: "Use arrows/Enter, wheel over scroll pane, q quits".to_string(),
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame<'_>) {
+        render_navigation_with_state(frame, &self.list, &self.menu, &self.scroll, &self.message);
+    }
+
+    pub fn handle_event(&mut self, event: &Event) -> bool {
+        if matches!(event, Event::Key(stroke) if should_quit(*stroke)) {
+            return true;
+        }
+        let list_items = list_items();
+        match SelectableList::new(&list_items).handle_event(
+            Rect::new(1, 1, 24, 3),
+            &mut self.list,
+            event,
+        ) {
+            SelectableListOutcome::Selected(index) => {
+                self.message = format!("List selected: {}", list_items[index].label);
+                return false;
+            }
+            SelectableListOutcome::Focused(index) => {
+                self.message = format!("List focus: {}", list_items[index].label);
+                return false;
+            }
+            SelectableListOutcome::Ignored | SelectableListOutcome::Redraw => {}
+        }
+
+        let menu_items = menu_items();
+        match Menu::new(&menu_items).handle_event(Rect::new(30, 1, 18, 2), &mut self.menu, event) {
+            MenuOutcome::Activated { id, .. } => self.message = format!("Menu action: {id}"),
+            MenuOutcome::Cancelled => self.message = "Menu cancelled".to_string(),
+            MenuOutcome::Ignored | MenuOutcome::Redraw | MenuOutcome::Focused(_) => {}
+        }
+
+        let lines = scroll_lines();
+        if let ScrollAreaOutcome::Scrolled { vertical_offset } =
+            ScrollArea::new(&lines).handle_event(Rect::new(1, 6, 24, 2), &mut self.scroll, event)
+        {
+            self.message = format!("Scroll offset: {vertical_offset}");
+        }
+        false
+    }
+}
+
+impl Default for NavigationDemo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn render_navigation() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
+    NavigationDemo::new().render(&mut frame);
+    buffer
+}
 
-    let list_items = [
-        SelectableListItem::new("one", "First item"),
-        SelectableListItem::new("two", "Second item"),
-        SelectableListItem::new("three", "Third item"),
-    ];
-    SelectableList::new(&list_items).render(
-        Rect::new(1, 1, 24, 3),
-        &SelectableListState::new(Some(1)),
-        &mut frame,
-    );
+fn render_navigation_with_state(
+    frame: &mut Frame<'_>,
+    list: &SelectableListState,
+    menu: &MenuState,
+    scroll: &ScrollAreaState,
+    message: &str,
+) {
+    let list_items = list_items();
+    SelectableList::new(&list_items).render(Rect::new(1, 1, 24, 3), list, frame);
 
-    let menu_items = [
-        MenuItem::new("open", "Open"),
-        MenuItem::new("close", "Close"),
-    ];
-    Menu::new(&menu_items).render(
-        Rect::new(30, 1, 18, 2),
-        &MenuState::new(Some(0)),
-        &mut frame,
-    );
+    let menu_items = menu_items();
+    Menu::new(&menu_items).render(Rect::new(30, 1, 18, 2), menu, frame);
 
-    let lines = [
-        Line::from("Scroll zero"),
-        Line::from("Scroll one"),
-        Line::from("Scroll two"),
-        Line::from("Scroll three"),
-    ];
-    let mut scroll_state = ScrollAreaState::new();
-    scroll_state.set_vertical_offset(1);
-    ScrollArea::new(&lines).render(Rect::new(1, 6, 24, 2), &scroll_state, &mut frame);
+    let lines = scroll_lines();
+    ScrollArea::new(&lines).render(Rect::new(1, 6, 24, 2), scroll, frame);
 
-    let pane = Pane::new()
-        .title("Scroll delegate")
-        .padding(Insets::all(1))
-        .policy(PanePolicy {
-            mouse: PaneMousePolicy {
-                enabled: true,
-                click_to_focus: false,
-                title_bar_drag: false,
-                scroll_wheel: true,
-                resize_handles: bmux_tui_components::pane::ResizeHandles::NONE,
-            },
-            bounds: Default::default(),
-        });
+    let pane = scroll_delegate_pane();
     let pane_state = PaneState::new(Rect::new(30, 6, 28, 7));
-    pane.render(&pane_state, &mut frame);
+    pane.render(&pane_state, frame);
     frame.write_line(
         pane.inner_area(&pane_state),
         &Line::from("Wheel input delegates"),
     );
-
-    buffer
+    frame.write_line(Rect::new(1, 15, 60, 1), &Line::from(message));
 }
 
 pub fn demonstrate_menu_activation() -> MenuOutcome {
-    let items = [
-        MenuItem::new("open", "Open"),
-        MenuItem::new("close", "Close"),
-    ];
+    let items = menu_items();
     let menu = Menu::new(&items);
     let mut state = MenuState::new(Some(0));
     menu.handle_event(
@@ -87,16 +129,7 @@ pub fn demonstrate_menu_activation() -> MenuOutcome {
 }
 
 pub fn demonstrate_pane_scroll_delegation() -> PaneOutcome {
-    let pane = Pane::new().padding(Insets::all(1)).policy(PanePolicy {
-        mouse: PaneMousePolicy {
-            enabled: true,
-            click_to_focus: false,
-            title_bar_drag: false,
-            scroll_wheel: true,
-            resize_handles: bmux_tui_components::pane::ResizeHandles::NONE,
-        },
-        bounds: Default::default(),
-    });
+    let pane = scroll_delegate_pane();
     let mut state = PaneState::new(Rect::new(0, 0, 10, 5));
     pane.handle_event(
         &mut state,
@@ -111,6 +144,50 @@ pub fn rows(buffer: &Buffer) -> Vec<String> {
     (0..buffer.area().height)
         .filter_map(|row| buffer.row_symbols(row))
         .collect()
+}
+
+fn list_items() -> [SelectableListItem; 3] {
+    [
+        SelectableListItem::new("one", "First item"),
+        SelectableListItem::new("two", "Second item"),
+        SelectableListItem::new("three", "Third item"),
+    ]
+}
+
+fn menu_items() -> [MenuItem; 2] {
+    [
+        MenuItem::new("open", "Open"),
+        MenuItem::new("close", "Close"),
+    ]
+}
+
+fn scroll_lines() -> [Line; 4] {
+    [
+        Line::from("Scroll zero"),
+        Line::from("Scroll one"),
+        Line::from("Scroll two"),
+        Line::from("Scroll three"),
+    ]
+}
+
+fn scroll_delegate_pane() -> Pane<'static> {
+    Pane::new()
+        .title("Scroll delegate")
+        .padding(Insets::all(1))
+        .policy(PanePolicy {
+            mouse: PaneMousePolicy {
+                enabled: true,
+                click_to_focus: false,
+                title_bar_drag: false,
+                scroll_wheel: true,
+                resize_handles: bmux_tui_components::pane::ResizeHandles::NONE,
+            },
+            bounds: Default::default(),
+        })
+}
+
+fn should_quit(stroke: KeyStroke) -> bool {
+    stroke.key == KeyCode::Escape || stroke.key == KeyCode::Char('q')
 }
 
 #[cfg(test)]

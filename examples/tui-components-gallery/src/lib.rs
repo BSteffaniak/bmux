@@ -17,16 +17,19 @@ pub const HEIGHT: u16 = 24;
 pub fn render_gallery() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
+    render_gallery_into(&mut frame);
+    buffer
+}
+
+pub fn render_gallery_into(frame: &mut Frame<'_>) {
     let theme = ModalTheme::dark(Color::Cyan);
 
-    render_buttons(&mut frame);
-    render_details(&mut frame);
-    render_field(&mut frame);
-    render_pane(&mut frame);
-    render_modal(&mut frame, theme);
-    render_dialog(&mut frame, theme);
-
-    buffer
+    render_buttons(frame);
+    render_details(frame);
+    render_field(frame);
+    render_pane(frame);
+    render_modal(frame, theme);
+    render_dialog(frame, theme);
 }
 
 fn render_buttons(frame: &mut Frame<'_>) {

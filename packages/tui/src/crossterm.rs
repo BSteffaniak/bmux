@@ -175,7 +175,7 @@ pub fn event_from_crossterm(event: CrosstermEvent) -> Option<Event> {
 
 /// Convert a crossterm key event into a BMUX keyboard stroke.
 #[must_use]
-pub fn key_from_crossterm(key: CrosstermKeyEvent) -> Option<bmux_keyboard::KeyStroke> {
+pub const fn key_from_crossterm(key: CrosstermKeyEvent) -> Option<bmux_keyboard::KeyStroke> {
     if crossterm_key_event_is_release(&key) {
         return None;
     }
@@ -185,7 +185,7 @@ pub fn key_from_crossterm(key: CrosstermKeyEvent) -> Option<bmux_keyboard::KeySt
 
 /// Convert crossterm mouse event data.
 #[must_use]
-pub fn mouse_from_crossterm(mouse: CrosstermMouseEvent) -> MouseEvent {
+pub const fn mouse_from_crossterm(mouse: CrosstermMouseEvent) -> MouseEvent {
     MouseEvent::new(
         mouse_kind_from_crossterm(mouse.kind),
         Point::new(mouse.column, mouse.row),
@@ -220,7 +220,7 @@ const fn mouse_kind_from_crossterm(kind: CrosstermMouseEventKind) -> MouseEventK
     }
 }
 
-fn mouse_modifiers_from_crossterm(modifiers: CrosstermKeyModifiers) -> MouseModifiers {
+const fn mouse_modifiers_from_crossterm(modifiers: CrosstermKeyModifiers) -> MouseModifiers {
     MouseModifiers {
         shift: modifiers.contains(CrosstermKeyModifiers::SHIFT),
         alt: modifiers.contains(CrosstermKeyModifiers::ALT),

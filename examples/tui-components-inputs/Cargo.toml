@@ -15,7 +15,7 @@ version     = { workspace = true }
 anyhow              = { workspace = true, features = ["std"] }
 bmux_keyboard       = { workspace = true }
 bmux_text_edit      = { workspace = true }
-bmux_tui            = { workspace = true }
+bmux_tui            = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = ["text-input"] }
 
 [features]

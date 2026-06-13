@@ -15,7 +15,11 @@ pub const HEIGHT: u16 = 18;
 pub fn render_layout_playground() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
+    render_layout_playground_into(&mut frame);
+    buffer
+}
 
+pub fn render_layout_playground_into(frame: &mut Frame<'_>) {
     let pane = Pane::new()
         .title("Bounded pane")
         .padding(Insets::all(1))
@@ -28,7 +32,7 @@ pub fn render_layout_playground() -> Buffer {
             },
         });
     let pane_state = PaneState::new(Rect::new(2, 2, 30, 8));
-    pane.render(&pane_state, &mut frame);
+    pane.render(&pane_state, frame);
     frame.write_line(
         pane.inner_area(&pane_state),
         &Line::from("Drag and resize bounds"),
@@ -40,14 +44,12 @@ pub fn render_layout_playground() -> Buffer {
     )
     .placement(ModalPlacement::UpperThird)
     .title("Upper third");
-    modal.render(Rect::new(36, 1, 32, 14), &mut frame);
+    modal.render(Rect::new(36, 1, 32, 14), frame);
     modal.render_line(
         modal.content_area(Rect::new(36, 1, 32, 14)),
         &Line::from("Modal placement"),
-        &mut frame,
+        frame,
     );
-
-    buffer
 }
 
 pub fn demonstrate_drag_delta() -> (i32, i32) {
