@@ -11,6 +11,7 @@
 
 pub mod action_row;
 pub mod button;
+pub mod checkbox;
 pub mod common;
 pub mod form_field;
 pub mod labeled_details;
