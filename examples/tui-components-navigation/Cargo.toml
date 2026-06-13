@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "gui"]
+description = "Navigation examples for bmux_tui_components"
+edition     = { workspace = true }
+keywords    = ["bmux", "example", "tui", "navigation"]
+license     = { workspace = true }
+name        = "bmux_tui_components_navigation"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow              = { workspace = true, features = ["std"] }
+bmux_keyboard       = { workspace = true }
+bmux_tui            = { workspace = true }
+bmux_tui_components = { workspace = true }
+
+[features]
+fail-on-warnings = ["bmux_tui_components/fail-on-warnings"]

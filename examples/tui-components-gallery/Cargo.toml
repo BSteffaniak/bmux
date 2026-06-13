@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "gui"]
+description = "Gallery examples for bmux_tui_components"
+edition     = { workspace = true }
+keywords    = ["bmux", "example", "tui", "components"]
+license     = { workspace = true }
+name        = "bmux_tui_components_gallery"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow              = { workspace = true, features = ["std"] }
+bmux_tui            = { workspace = true }
+bmux_tui_components = { workspace = true }
+
+[features]
+fail-on-warnings = ["bmux_tui_components/fail-on-warnings"]
