@@ -1,10 +1,11 @@
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
-use bmux_tui::event::Event;
+use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
-use bmux_tui::prelude::Line;
+use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::prelude::{Line, Span};
+use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
 use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
 use bmux_tui_components::form_field::FormField;
@@ -21,6 +22,11 @@ use bmux_tui_components::text_input::{
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 16;
 
+const TEXT_FIELD_AREA: Rect = Rect::new(1, 3, 34, 1);
+const CHECKBOX_AREA: Rect = Rect::new(1, 6, 30, 1);
+const RADIO_AREA: Rect = Rect::new(1, 8, 18, 2);
+const SELECT_AREA: Rect = Rect::new(38, 1, 24, 3);
+
 pub struct InputsDemo {
     text_policy: TextInputPolicy,
     text: TextInputState,
@@ -34,16 +40,19 @@ pub struct InputsDemo {
 impl InputsDemo {
     #[must_use]
     pub fn new() -> Self {
+        let mut text = TextInputState::new(TextEditBuffer::from_text("Ada"));
+        let policy = TextInputPolicy::chat_composer();
+        text.set_content_area(TEXT_FIELD_AREA, &policy);
         let mut checkbox = CheckboxState::new(true);
-        checkbox.set_focused(true);
+        checkbox.set_focused(false);
         Self {
-            text_policy: TextInputPolicy::chat_composer(),
-            text: TextInputState::new(TextEditBuffer::from_text("Ada")),
+            text_policy: policy,
+            text,
             checkbox,
             radio: RadioGroupState::new(Some(1)),
             select: SelectDropdownState::new(Some(1)),
             form: FormState::new(Some(0)),
-            message: "Tab through controls; Enter/Space activates; q quits".to_string(),
+            message: "Click controls or Tab through them; q quits".to_string(),
         }
     }
 
@@ -54,6 +63,7 @@ impl InputsDemo {
             &self.checkbox,
             &self.radio,
             &self.select,
+            self.focused_index(),
             &self.message,
         );
     }
@@ -67,53 +77,78 @@ impl InputsDemo {
             self.advance_focus();
             return false;
         }
+        if let Some(focus) = focus_for_mouse_event(event) {
+            self.set_focus(focus);
+        }
         match self.focused_index() {
-            0 => {
-                if matches!(
-                    TextInputControl::new(&self.text_policy).handle_event(&mut self.text, event),
-                    TextInputOutcome::Edited | TextInputOutcome::Redraw
-                ) {
-                    self.message = format!("Text: {}", self.text.buffer().text());
-                }
-            }
-            1 => match Checkbox::new("Subscribe to updates").handle_event(
-                Rect::new(1, 6, 30, 1),
-                &mut self.checkbox,
-                event,
-            ) {
-                CheckboxOutcome::Toggled(checked) => self.message = format!("Checkbox: {checked}"),
-                CheckboxOutcome::Ignored | CheckboxOutcome::Redraw => {}
-            },
-            2 => {
-                let radios = radio_options();
-                if let RadioGroupOutcome::Selected(index) = RadioGroup::new(&radios).handle_event(
-                    Rect::new(1, 8, 18, 2),
-                    &mut self.radio,
-                    event,
-                ) {
-                    self.message = format!("Radio selected: {}", radios[index].label);
-                }
-            }
-            3 => {
-                let options = select_options();
-                if let SelectDropdownOutcome::Selected(index) = SelectDropdown::new(&options)
-                    .handle_event(Rect::new(38, 1, 24, 3), &mut self.select, event)
-                {
-                    self.message = format!("Select: {}", options[index].label);
-                }
-            }
+            0 => self.handle_text_event(event),
+            1 => self.handle_checkbox_event(event),
+            2 => self.handle_radio_event(event),
+            3 => self.handle_select_event(event),
             _ => {}
         }
         false
     }
 
+    fn handle_text_event(&mut self, event: &Event) {
+        self.text
+            .set_content_area(TEXT_FIELD_AREA, &self.text_policy);
+        if matches!(
+            TextInputControl::new(&self.text_policy).handle_event(&mut self.text, event),
+            TextInputOutcome::Edited | TextInputOutcome::Redraw
+        ) {
+            self.message = format!("Text: {}", self.text.buffer().text());
+        }
+    }
+
+    fn handle_checkbox_event(&mut self, event: &Event) {
+        match Checkbox::new("Subscribe to updates").handle_event(
+            CHECKBOX_AREA,
+            &mut self.checkbox,
+            event,
+        ) {
+            CheckboxOutcome::Toggled(checked) => self.message = format!("Checkbox: {checked}"),
+            CheckboxOutcome::Ignored | CheckboxOutcome::Redraw => {}
+        }
+    }
+
+    fn handle_radio_event(&mut self, event: &Event) {
+        let radios = radio_options();
+        if let RadioGroupOutcome::Selected(index) =
+            RadioGroup::new(&radios).handle_event(RADIO_AREA, &mut self.radio, event)
+        {
+            self.message = format!("Radio selected: {}", radios[index].label);
+        }
+    }
+
+    fn handle_select_event(&mut self, event: &Event) {
+        let options = select_options();
+        match SelectDropdown::new(&options).handle_event(SELECT_AREA, &mut self.select, event) {
+            SelectDropdownOutcome::Selected(index) => {
+                self.message = format!("Select: {}", options[index].label);
+            }
+            SelectDropdownOutcome::Opened => self.message = "Select opened".to_string(),
+            SelectDropdownOutcome::Closed => self.message = "Select closed".to_string(),
+            SelectDropdownOutcome::Ignored
+            | SelectDropdownOutcome::Redraw
+            | SelectDropdownOutcome::Focused(_) => {}
+        }
+    }
+
     fn advance_focus(&mut self) {
         let next = (self.focused_index() + 1) % 4;
-        self.checkbox.set_focused(next == 1);
+        self.set_focus(next);
+    }
+
+    fn set_focus(&mut self, focus: usize) {
+        self.checkbox.set_focused(focus == 1);
         self.radio
-            .set_focused((next == 2).then_some(self.radio.selected().unwrap_or(0)));
-        self.select.interaction.focused = next == 3;
-        self.form.set_focused(Some(next));
+            .set_focused((focus == 2).then_some(self.radio.selected().unwrap_or(0)));
+        self.select.interaction.focused = focus == 3;
+        if focus != 3 {
+            self.select.set_open(false);
+        }
+        self.form.set_focused(Some(focus));
     }
 
     fn focused_index(&self) -> usize {
@@ -140,23 +175,45 @@ fn render_inputs_with_state(
     checkbox: &CheckboxState,
     radio: &RadioGroupState,
     select: &SelectDropdownState,
+    focused: usize,
     message: &str,
 ) {
-    let name_area = FormField::new("Name")
+    let _ = FormField::new("Name")
         .required(true)
-        .help("TextInputState owns editable text")
+        .help("Click the field, then type")
         .render(Rect::new(1, 1, 34, 4), frame);
-    frame.write_line(name_area, &Line::from(text.buffer().text()));
+    render_text_field(frame, text, focused == 0);
 
-    Checkbox::new("Subscribe to updates").render(Rect::new(1, 6, 30, 1), checkbox, frame);
+    Checkbox::new("Subscribe to updates").render(CHECKBOX_AREA, checkbox, frame);
 
     let radios = radio_options();
-    RadioGroup::new(&radios).render(Rect::new(1, 8, 18, 2), radio, frame);
+    RadioGroup::new(&radios).render(RADIO_AREA, radio, frame);
 
     let options = select_options();
-    SelectDropdown::new(&options).render(Rect::new(38, 1, 24, 3), select, frame);
+    SelectDropdown::new(&options).render(SELECT_AREA, select, frame);
 
     frame.write_line(Rect::new(38, 6, 32, 1), &Line::from(message));
+}
+
+fn render_text_field(frame: &mut Frame<'_>, text: &TextInputState, focused: bool) {
+    let style = if focused {
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::BrightCyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::BrightWhite).bg(Color::BrightBlack)
+    };
+    let content = format!(
+        " {}{}",
+        text.buffer().text(),
+        if focused { "▌" } else { "" }
+    );
+    frame.write_line_with_fallback_style(
+        TEXT_FIELD_AREA,
+        &Line::from_spans([Span::styled(content, style)]),
+        style,
+    );
 }
 
 pub fn demonstrate_text_input_edit() -> String {
@@ -181,6 +238,32 @@ pub fn demonstrate_form_submit() -> FormOutcome {
     form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Enter)))
 }
 
+pub fn demonstrate_click_checkbox_toggles_from_text_focus() -> bool {
+    let mut demo = InputsDemo::new();
+    let position = Point::new(CHECKBOX_AREA.x, CHECKBOX_AREA.y);
+    let _ = demo.handle_event(&mouse_down(position));
+    let _ = demo.handle_event(&mouse_up(position));
+    demo.checkbox.checked()
+}
+
+pub fn demonstrate_click_radio_selects_and_focuses() -> Option<usize> {
+    let mut demo = InputsDemo::new();
+    let position = Point::new(RADIO_AREA.x, RADIO_AREA.y);
+    let _ = demo.handle_event(&mouse_down(position));
+    let _ = demo.handle_event(&mouse_up(position));
+    demo.radio.selected()
+}
+
+pub fn demonstrate_click_text_focuses() -> usize {
+    let mut demo = InputsDemo::new();
+    demo.set_focus(1);
+    let _ = demo.handle_event(&mouse_down(Point::new(
+        TEXT_FIELD_AREA.x,
+        TEXT_FIELD_AREA.y,
+    )));
+    demo.focused_index()
+}
+
 pub fn rows(buffer: &Buffer) -> Vec<String> {
     (0..buffer.area().height)
         .filter_map(|row| buffer.row_symbols(row))
@@ -201,6 +284,44 @@ fn select_options() -> [SelectOption; 2] {
     ]
 }
 
+fn focus_for_mouse_event(event: &Event) -> Option<usize> {
+    let Event::Mouse(mouse) = event else {
+        return None;
+    };
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return None;
+    }
+    control_at(mouse.position)
+}
+
+fn control_at(position: Point) -> Option<usize> {
+    if TEXT_FIELD_AREA.contains(position) {
+        Some(0)
+    } else if CHECKBOX_AREA.contains(position) {
+        Some(1)
+    } else if RADIO_AREA.contains(position) {
+        Some(2)
+    } else if SELECT_AREA.contains(position) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn mouse_down(position: Point) -> Event {
+    Event::Mouse(MouseEvent::new(
+        MouseEventKind::Down(MouseButton::Left),
+        position,
+    ))
+}
+
+fn mouse_up(position: Point) -> Event {
+    Event::Mouse(MouseEvent::new(
+        MouseEventKind::Up(MouseButton::Left),
+        position,
+    ))
+}
+
 fn should_quit(stroke: KeyStroke) -> bool {
     stroke.key == KeyCode::Escape || stroke.key == KeyCode::Char('q')
 }
@@ -209,13 +330,18 @@ fn should_quit(stroke: KeyStroke) -> bool {
 mod tests {
     use bmux_tui_components::form::FormOutcome;
 
-    use super::{demonstrate_form_submit, demonstrate_text_input_edit, render_inputs, rows};
+    use super::{
+        demonstrate_click_checkbox_toggles_from_text_focus,
+        demonstrate_click_radio_selects_and_focuses, demonstrate_click_text_focuses,
+        demonstrate_form_submit, demonstrate_text_input_edit, render_inputs, rows,
+    };
 
     #[test]
     fn inputs_render_form_controls() {
         let rendered = rows(&render_inputs()).join("\n");
 
         assert!(rendered.contains("Name *"));
+        assert!(rendered.contains("Ada▌"));
         assert!(rendered.contains("[x] Subscribe"));
         assert!(rendered.contains("Published"));
     }
@@ -228,5 +354,12 @@ mod tests {
     #[test]
     fn form_submit_validates_values() {
         assert_eq!(demonstrate_form_submit(), FormOutcome::Submitted);
+    }
+
+    #[test]
+    fn mouse_click_changes_focus_and_activates_controls() {
+        assert!(!demonstrate_click_checkbox_toggles_from_text_focus());
+        assert_eq!(demonstrate_click_radio_selects_and_focuses(), Some(0));
+        assert_eq!(demonstrate_click_text_focuses(), 0);
     }
 }
