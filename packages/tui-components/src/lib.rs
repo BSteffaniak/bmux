@@ -17,6 +17,7 @@ pub mod dialog;
 pub mod form;
 pub mod form_field;
 pub mod labeled_details;
+pub mod menu;
 pub mod modal_frame;
 pub mod pane;
 pub mod radio_group;
