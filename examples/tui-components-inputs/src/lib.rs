@@ -4,11 +4,9 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::prelude::{Line, Span};
-use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::prelude::Line;
 use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
 use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
-use bmux_tui_components::form_field::FormField;
 use bmux_tui_components::radio_group::{
     RadioGroup, RadioGroupOutcome, RadioGroupState, RadioOption,
 };
@@ -18,11 +16,12 @@ use bmux_tui_components::select_dropdown::{
 use bmux_tui_components::text_input::{
     TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
+use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 16;
 
-const TEXT_FIELD_AREA: Rect = Rect::new(1, 3, 34, 1);
+const TEXT_CONTENT_AREA: Rect = Rect::new(3, 3, 30, 1);
 const CHECKBOX_AREA: Rect = Rect::new(1, 6, 30, 1);
 const RADIO_AREA: Rect = Rect::new(1, 8, 18, 2);
 const SELECT_AREA: Rect = Rect::new(38, 1, 24, 3);
@@ -42,7 +41,7 @@ impl InputsDemo {
     pub fn new() -> Self {
         let mut text = TextInputState::new(TextEditBuffer::from_text("Ada"));
         let policy = TextInputPolicy::chat_composer();
-        text.set_content_area(TEXT_FIELD_AREA, &policy);
+        text.set_content_area(TEXT_CONTENT_AREA, &policy);
         let mut checkbox = CheckboxState::new(true);
         checkbox.set_focused(false);
         Self {
@@ -92,7 +91,7 @@ impl InputsDemo {
 
     fn handle_text_event(&mut self, event: &Event) {
         self.text
-            .set_content_area(TEXT_FIELD_AREA, &self.text_policy);
+            .set_content_area(TEXT_CONTENT_AREA, &self.text_policy);
         if matches!(
             TextInputControl::new(&self.text_policy).handle_event(&mut self.text, event),
             TextInputOutcome::Edited | TextInputOutcome::Redraw
@@ -178,11 +177,13 @@ fn render_inputs_with_state(
     focused: usize,
     message: &str,
 ) {
-    let _ = FormField::new("Name")
+    let mut text_state = text.clone();
+    TextInputBox::new(TextInputPolicy::chat_composer())
+        .label("Name")
         .required(true)
         .help("Click the field, then type")
-        .render(Rect::new(1, 1, 34, 4), frame);
-    render_text_field(frame, text, focused == 0);
+        .policy(TextInputBoxPolicy::labeled_field().focused(focused == 0))
+        .render(Rect::new(1, 1, 34, 5), &mut text_state, frame);
 
     Checkbox::new("Subscribe to updates").render(CHECKBOX_AREA, checkbox, frame);
 
@@ -193,27 +194,6 @@ fn render_inputs_with_state(
     SelectDropdown::new(&options).render(SELECT_AREA, select, frame);
 
     frame.write_line(Rect::new(38, 6, 32, 1), &Line::from(message));
-}
-
-fn render_text_field(frame: &mut Frame<'_>, text: &TextInputState, focused: bool) {
-    let style = if focused {
-        Style::new()
-            .fg(Color::Black)
-            .bg(Color::BrightCyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(Color::BrightWhite).bg(Color::BrightBlack)
-    };
-    let content = format!(
-        " {}{}",
-        text.buffer().text(),
-        if focused { "▌" } else { "" }
-    );
-    frame.write_line_with_fallback_style(
-        TEXT_FIELD_AREA,
-        &Line::from_spans([Span::styled(content, style)]),
-        style,
-    );
 }
 
 pub fn demonstrate_text_input_edit() -> String {
@@ -275,8 +255,8 @@ pub fn demonstrate_click_text_focuses() -> usize {
     let mut demo = InputsDemo::new();
     demo.set_focus(1);
     let _ = demo.handle_event(&mouse_down(Point::new(
-        TEXT_FIELD_AREA.x,
-        TEXT_FIELD_AREA.y,
+        TEXT_CONTENT_AREA.x,
+        TEXT_CONTENT_AREA.y,
     )));
     demo.focused_index()
 }
@@ -312,7 +292,7 @@ fn focus_for_mouse_event(event: &Event) -> Option<usize> {
 }
 
 fn control_at(position: Point) -> Option<usize> {
-    if TEXT_FIELD_AREA.contains(position) {
+    if TEXT_CONTENT_AREA.contains(position) {
         Some(0)
     } else if CHECKBOX_AREA.contains(position) {
         Some(1)
@@ -359,7 +339,7 @@ mod tests {
         let rendered = rows(&render_inputs()).join("\n");
 
         assert!(rendered.contains("Name *"));
-        assert!(rendered.contains("Ada▌"));
+        assert!(rendered.contains("Ada"));
         assert!(rendered.contains("[x] Subscribe"));
         assert!(rendered.contains("Published"));
     }

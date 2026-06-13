@@ -27,3 +27,5 @@ pub mod select_dropdown;
 pub mod selectable_list;
 #[cfg(feature = "text-input")]
 pub mod text_input;
+#[cfg(feature = "text-input")]
+pub mod text_input_box;
