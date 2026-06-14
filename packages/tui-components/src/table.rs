@@ -187,6 +187,7 @@ impl TableRow {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableState {
     selected: Option<usize>,
+    selected_column: Option<usize>,
     hovered: Option<usize>,
     scroll: usize,
     /// Generic interaction flags.
@@ -199,6 +200,7 @@ impl TableState {
     pub const fn new(selected: Option<usize>) -> Self {
         Self {
             selected,
+            selected_column: None,
             hovered: None,
             scroll: 0,
             interaction: InteractionState::new(),
@@ -214,6 +216,17 @@ impl TableState {
     /// Set selected source row.
     pub const fn set_selected(&mut self, selected: Option<usize>) {
         self.selected = selected;
+    }
+
+    /// Return selected source column.
+    #[must_use]
+    pub const fn selected_column(&self) -> Option<usize> {
+        self.selected_column
+    }
+
+    /// Set selected source column.
+    pub const fn set_selected_column(&mut self, selected_column: Option<usize>) {
+        self.selected_column = selected_column;
     }
 
     /// Return row scroll offset.
@@ -289,6 +302,10 @@ pub struct TableStyles {
     pub row: Style,
     /// Selected row style.
     pub selected: Style,
+    /// Selected column style.
+    pub selected_column: Style,
+    /// Selected cell style.
+    pub selected_cell: Style,
     /// Hovered row style.
     pub hovered: Style,
     /// Disabled row style.
@@ -305,6 +322,8 @@ impl Default for TableStyles {
             header: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             row: Style::new().fg(Color::White),
             selected: Style::new().fg(Color::Black).bg(Color::Cyan),
+            selected_column: Style::new().bg(Color::Blue),
+            selected_cell: Style::new().fg(Color::Black).bg(Color::Yellow),
             hovered: Style::new().fg(Color::BrightWhite),
             disabled: Style::new().fg(Color::BrightBlack),
             separator: Style::new().fg(Color::BrightBlack),
@@ -372,6 +391,8 @@ impl<'a> Table<'a> {
                 header: Style::new(),
                 row: Style::new(),
                 selected: Style::new(),
+                selected_column: Style::new(),
+                selected_cell: Style::new(),
                 hovered: Style::new(),
                 disabled: Style::new(),
                 separator: Style::new(),
@@ -449,6 +470,8 @@ impl<'a> Table<'a> {
                     &layout.column_widths,
                     self.columns.iter().map(|column| Line::from(column.title)),
                     true,
+                    None,
+                    state,
                 ),
                 self.styles.header,
             );
@@ -488,6 +511,8 @@ impl<'a> Table<'a> {
                                 .unwrap_or_else(|| Line::from(""))
                         }),
                         false,
+                        Some(source),
+                        state,
                     ),
                     self.row_style(source, row, state),
                 );
@@ -507,6 +532,8 @@ impl<'a> Table<'a> {
                 KeyCode::Down => self.move_selection(state, 1),
                 KeyCode::Home => self.select_index(state, 0),
                 KeyCode::End => self.select_index(state, self.rows.len().saturating_sub(1)),
+                KeyCode::Left => self.move_column(state, -1),
+                KeyCode::Right => self.move_column(state, 1),
                 KeyCode::Enter => state
                     .selected
                     .map_or(TableOutcome::Ignored, TableOutcome::Selected),
@@ -597,6 +624,28 @@ impl<'a> Table<'a> {
         self.select_index(state, next)
     }
 
+    fn move_column(&self, state: &mut TableState, delta: i32) -> TableOutcome {
+        if self.columns.is_empty() {
+            return TableOutcome::Ignored;
+        }
+        let current = state
+            .selected_column
+            .unwrap_or(0)
+            .min(self.columns.len().saturating_sub(1));
+        let next = if delta.is_negative() {
+            current.saturating_sub(1)
+        } else {
+            current
+                .saturating_add(1)
+                .min(self.columns.len().saturating_sub(1))
+        };
+        if next == current && state.selected_column == Some(current) {
+            return TableOutcome::Ignored;
+        }
+        state.selected_column = Some(next);
+        TableOutcome::Redraw
+    }
+
     fn select_index(&self, state: &mut TableState, index: usize) -> TableOutcome {
         if self.rows.get(index).is_none_or(|row| row.disabled) {
             return TableOutcome::Ignored;
@@ -638,10 +687,17 @@ impl<'a> Table<'a> {
         let cells = widths
             .iter()
             .map(|width| Line::from("─".repeat(usize::from(*width))));
-        self.row_line(widths, cells, true)
+        self.row_line(widths, cells, true, None, &TableState::default())
     }
 
-    fn row_line(&self, widths: &[u16], cells: impl Iterator<Item = Line>, header: bool) -> Line {
+    fn row_line(
+        &self,
+        widths: &[u16],
+        cells: impl Iterator<Item = Line>,
+        header: bool,
+        row_index: Option<usize>,
+        state: &TableState,
+    ) -> Line {
         let mut spans = Vec::new();
         for (index, (cell, width)) in cells.zip(widths.iter().copied()).enumerate() {
             if index > 0 {
@@ -662,6 +718,10 @@ impl<'a> Table<'a> {
             );
             let base = if header {
                 self.styles.header
+            } else if row_index == state.selected && state.selected_column == Some(index) {
+                self.styles.selected_cell
+            } else if state.selected_column == Some(index) {
+                self.styles.selected_column
             } else {
                 self.styles.row
             };
@@ -864,6 +924,69 @@ mod tests {
             frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
             Some(TableStyles::default().row.patch(cell_style))
         );
+    }
+
+    #[test]
+    fn selected_column_and_cell_styles_are_applied() {
+        let columns = [
+            TableColumn::new("A").fixed(3),
+            TableColumn::new("B").fixed(3),
+        ];
+        let rows = [
+            TableRow::new(vec!["a1", "b1"]),
+            TableRow::new(vec!["a2", "b2"]),
+        ];
+        let styles = TableStyles {
+            selected: Style::new().bg(Color::Blue),
+            selected_column: Style::new().bg(Color::Green),
+            selected_cell: Style::new().bg(Color::Yellow),
+            ..TableStyles::default()
+        };
+        let state = {
+            let mut state = TableState::new(Some(1));
+            state.set_selected_column(Some(1));
+            state
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 7, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows).styles(styles).render(
+            Rect::new(0, 0, 7, 3),
+            &state,
+            &mut frame,
+        );
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(4, 1))
+                .map(|cell| cell.style.bg),
+            Some(Some(Color::Green))
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(4, 2))
+                .map(|cell| cell.style.bg),
+            Some(Some(Color::Yellow))
+        );
+    }
+
+    #[test]
+    fn left_and_right_keys_move_selected_column() {
+        let columns = [TableColumn::new("A"), TableColumn::new("B")];
+        let rows = [TableRow::new(vec!["a", "b"])];
+        let mut state = TableState::new(Some(0));
+
+        assert_eq!(
+            Table::new(&columns, &rows).handle_event(
+                Rect::new(0, 0, 8, 2),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            ),
+            TableOutcome::Redraw
+        );
+        assert_eq!(state.selected_column(), Some(1));
     }
 
     #[test]
