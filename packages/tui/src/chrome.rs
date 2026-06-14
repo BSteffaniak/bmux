@@ -54,6 +54,96 @@ impl BorderSet {
         horizontal: '-',
         vertical: '|',
     };
+
+    /// Double-line border glyphs.
+    pub const DOUBLE: Self = Self {
+        top_left: '╔',
+        top_right: '╗',
+        bottom_left: '╚',
+        bottom_right: '╝',
+        horizontal: '═',
+        vertical: '║',
+    };
+
+    /// Thick border glyphs.
+    pub const THICK: Self = Self {
+        top_left: '┏',
+        top_right: '┓',
+        bottom_left: '┗',
+        bottom_right: '┛',
+        horizontal: '━',
+        vertical: '┃',
+    };
+}
+
+/// Border side selection.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderSides {
+    /// Render the top edge.
+    pub top: bool,
+    /// Render the right edge.
+    pub right: bool,
+    /// Render the bottom edge.
+    pub bottom: bool,
+    /// Render the left edge.
+    pub left: bool,
+}
+
+impl BorderSides {
+    /// All border sides.
+    pub const ALL: Self = Self::new(true, true, true, true);
+    /// No border sides.
+    pub const NONE: Self = Self::new(false, false, false, false);
+    /// Top border side only.
+    pub const TOP: Self = Self::new(true, false, false, false);
+    /// Right border side only.
+    pub const RIGHT: Self = Self::new(false, true, false, false);
+    /// Bottom border side only.
+    pub const BOTTOM: Self = Self::new(false, false, true, false);
+    /// Left border side only.
+    pub const LEFT: Self = Self::new(false, false, false, true);
+
+    /// Create a border side selection.
+    #[allow(clippy::fn_params_excessive_bools)]
+    #[must_use]
+    pub const fn new(top: bool, right: bool, bottom: bool, left: bool) -> Self {
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    /// Horizontal-only border sides.
+    #[must_use]
+    pub const fn horizontal() -> Self {
+        Self::new(true, false, true, false)
+    }
+
+    /// Vertical-only border sides.
+    #[must_use]
+    pub const fn vertical() -> Self {
+        Self::new(false, true, false, true)
+    }
+
+    /// Insets occupied by these border sides.
+    #[must_use]
+    pub const fn insets(self) -> Insets {
+        Insets::new(
+            if self.top { 1 } else { 0 },
+            if self.right { 1 } else { 0 },
+            if self.bottom { 1 } else { 0 },
+            if self.left { 1 } else { 0 },
+        )
+    }
+}
+
+impl Default for BorderSides {
+    fn default() -> Self {
+        Self::ALL
+    }
 }
 
 /// Border configuration.
@@ -63,13 +153,19 @@ pub struct Border {
     pub set: BorderSet,
     /// Border style.
     pub style: Style,
+    /// Border sides to render.
+    pub sides: BorderSides,
 }
 
 impl Border {
     /// Create a border with a glyph set and style.
     #[must_use]
     pub const fn new(set: BorderSet, style: Style) -> Self {
-        Self { set, style }
+        Self {
+            set,
+            style,
+            sides: BorderSides::ALL,
+        }
     }
 
     /// Create a single-line border with default style.
@@ -88,6 +184,25 @@ impl Border {
     #[must_use]
     pub const fn ascii() -> Self {
         Self::new(BorderSet::ASCII, Style::new())
+    }
+
+    /// Create a double-line border with default style.
+    #[must_use]
+    pub const fn double() -> Self {
+        Self::new(BorderSet::DOUBLE, Style::new())
+    }
+
+    /// Create a thick border with default style.
+    #[must_use]
+    pub const fn thick() -> Self {
+        Self::new(BorderSet::THICK, Style::new())
+    }
+
+    /// Set border sides.
+    #[must_use]
+    pub const fn sides(mut self, sides: BorderSides) -> Self {
+        self.sides = sides;
+        self
     }
 
     /// Set border style.
@@ -150,8 +265,8 @@ impl Panel {
     /// Return the content area after border and padding are applied.
     #[must_use]
     pub const fn inner_area(&self, area: Rect) -> Rect {
-        let border_insets = if self.border.is_some() {
-            Insets::all(1)
+        let border_insets = if let Some(border) = &self.border {
+            border.sides.insets()
         } else {
             Insets::all(0)
         };
@@ -254,8 +369,9 @@ fn render_border(area: Rect, border: &Border, frame: &mut Frame<'_>) {
 
     let right = area.right().saturating_sub(1);
     let bottom = area.bottom().saturating_sub(1);
+    let sides = border.sides;
 
-    if area.height == 1 {
+    if sides.top {
         for x in area.x..area.right() {
             frame.buffer_mut().set_cell(
                 crate::geometry::Point::new(x, area.y),
@@ -263,10 +379,17 @@ fn render_border(area: Rect, border: &Border, frame: &mut Frame<'_>) {
                 border.style,
             );
         }
-        return;
     }
-
-    if area.width == 1 {
+    if sides.bottom && bottom != area.y {
+        for x in area.x..area.right() {
+            frame.buffer_mut().set_cell(
+                crate::geometry::Point::new(x, bottom),
+                border.set.horizontal.to_string(),
+                border.style,
+            );
+        }
+    }
+    if sides.left {
         for y in area.y..area.bottom() {
             frame.buffer_mut().set_cell(
                 crate::geometry::Point::new(area.x, y),
@@ -274,54 +397,46 @@ fn render_border(area: Rect, border: &Border, frame: &mut Frame<'_>) {
                 border.style,
             );
         }
-        return;
+    }
+    if sides.right && right != area.x {
+        for y in area.y..area.bottom() {
+            frame.buffer_mut().set_cell(
+                crate::geometry::Point::new(right, y),
+                border.set.vertical.to_string(),
+                border.style,
+            );
+        }
     }
 
-    frame.buffer_mut().set_cell(
-        crate::geometry::Point::new(area.x, area.y),
-        border.set.top_left.to_string(),
-        border.style,
-    );
-    frame.buffer_mut().set_cell(
-        crate::geometry::Point::new(right, area.y),
-        border.set.top_right.to_string(),
-        border.style,
-    );
-    frame.buffer_mut().set_cell(
-        crate::geometry::Point::new(area.x, bottom),
-        border.set.bottom_left.to_string(),
-        border.style,
-    );
-    frame.buffer_mut().set_cell(
-        crate::geometry::Point::new(right, bottom),
-        border.set.bottom_right.to_string(),
-        border.style,
-    );
-
-    for x in area.x.saturating_add(1)..right {
-        frame.buffer_mut().set_cell(
-            crate::geometry::Point::new(x, area.y),
-            border.set.horizontal.to_string(),
-            border.style,
-        );
-        frame.buffer_mut().set_cell(
-            crate::geometry::Point::new(x, bottom),
-            border.set.horizontal.to_string(),
-            border.style,
-        );
-    }
-
-    for y in area.y.saturating_add(1)..bottom {
-        frame.buffer_mut().set_cell(
-            crate::geometry::Point::new(area.x, y),
-            border.set.vertical.to_string(),
-            border.style,
-        );
-        frame.buffer_mut().set_cell(
-            crate::geometry::Point::new(right, y),
-            border.set.vertical.to_string(),
-            border.style,
-        );
+    if area.width > 1 && area.height > 1 {
+        if sides.top && sides.left {
+            frame.buffer_mut().set_cell(
+                crate::geometry::Point::new(area.x, area.y),
+                border.set.top_left.to_string(),
+                border.style,
+            );
+        }
+        if sides.top && sides.right {
+            frame.buffer_mut().set_cell(
+                crate::geometry::Point::new(right, area.y),
+                border.set.top_right.to_string(),
+                border.style,
+            );
+        }
+        if sides.bottom && sides.left {
+            frame.buffer_mut().set_cell(
+                crate::geometry::Point::new(area.x, bottom),
+                border.set.bottom_left.to_string(),
+                border.style,
+            );
+        }
+        if sides.bottom && sides.right {
+            frame.buffer_mut().set_cell(
+                crate::geometry::Point::new(right, bottom),
+                border.set.bottom_right.to_string(),
+                border.style,
+            );
+        }
     }
 }
 
@@ -341,7 +456,7 @@ fn render_title(area: Rect, title: &Line, style: Style, frame: &mut Frame<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Border, Modal, Panel};
+    use super::{Border, BorderSides, Modal, Panel};
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect, Size};
@@ -424,6 +539,67 @@ mod tests {
             .render(Rect::new(0, 0, 8, 3), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("+Title-+"));
+    }
+
+    #[test]
+    fn panel_inner_area_respects_selected_border_sides() {
+        let panel = Panel::new().border(Border::single().sides(BorderSides::horizontal()));
+
+        assert_eq!(
+            panel.inner_area(Rect::new(0, 0, 10, 5)),
+            Rect::new(0, 1, 10, 3)
+        );
+    }
+
+    #[test]
+    fn panel_renders_selected_border_sides() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Panel::new()
+            .border(Border::ascii().sides(BorderSides::horizontal()))
+            .render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("-----"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("     "));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("-----"));
+    }
+
+    #[test]
+    fn panel_renders_double_and_thick_borders() {
+        let mut double_buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let mut double_frame = Frame::new(&mut double_buffer);
+        Panel::new()
+            .border(Border::double())
+            .render(Rect::new(0, 0, 3, 2), &mut double_frame);
+        assert_eq!(double_frame.buffer().row_symbols(0).as_deref(), Some("╔═╗"));
+
+        let mut thick_buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let mut thick_frame = Frame::new(&mut thick_buffer);
+        Panel::new()
+            .border(Border::thick())
+            .render(Rect::new(0, 0, 3, 2), &mut thick_frame);
+        assert_eq!(thick_frame.buffer().row_symbols(0).as_deref(), Some("┏━┓"));
+    }
+
+    #[test]
+    fn panel_renders_one_cell_borders_by_orientation() {
+        let mut horizontal_buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut horizontal_frame = Frame::new(&mut horizontal_buffer);
+        Panel::new()
+            .border(Border::ascii().sides(BorderSides::TOP))
+            .render(Rect::new(0, 0, 3, 1), &mut horizontal_frame);
+        assert_eq!(
+            horizontal_frame.buffer().row_symbols(0).as_deref(),
+            Some("---")
+        );
+
+        let mut vertical_buffer = Buffer::empty(Rect::new(0, 0, 1, 3));
+        let mut vertical_frame = Frame::new(&mut vertical_buffer);
+        Panel::new()
+            .border(Border::ascii().sides(BorderSides::LEFT))
+            .render(Rect::new(0, 0, 1, 3), &mut vertical_frame);
+        assert_eq!(vertical_frame.buffer().row_symbols(1).as_deref(), Some("|"));
     }
 
     #[test]
