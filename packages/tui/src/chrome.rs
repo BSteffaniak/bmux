@@ -287,6 +287,8 @@ pub struct Panel {
     title: Option<PanelTitle>,
     padding: Insets,
     background: Option<Style>,
+    title_style: Option<Style>,
+    content_style: Option<Style>,
 }
 
 impl Panel {
@@ -298,6 +300,8 @@ impl Panel {
             title: None,
             padding: Insets::new(0, 0, 0, 0),
             background: None,
+            title_style: None,
+            content_style: None,
         }
     }
 
@@ -329,6 +333,20 @@ impl Panel {
         self
     }
 
+    /// Set the title fallback style.
+    #[must_use]
+    pub const fn title_style(mut self, style: Style) -> Self {
+        self.title_style = Some(style);
+        self
+    }
+
+    /// Set the content-area fallback style.
+    #[must_use]
+    pub const fn content_style(mut self, style: Style) -> Self {
+        self.content_style = Some(style);
+        self
+    }
+
     /// Return the content area after border and padding are applied.
     #[must_use]
     pub const fn inner_area(&self, area: Rect) -> Rect {
@@ -349,10 +367,13 @@ impl Widget for Panel {
         if let Some(style) = self.background {
             frame.fill(area, " ", style);
         }
+        if let Some(style) = self.content_style {
+            frame.fill(self.inner_area(area), " ", style);
+        }
         if let Some(border) = &self.border {
             render_border(area, border, frame);
             if let Some(title) = &self.title {
-                render_title(area, title, border.style, frame);
+                render_title(area, title, self.title_style.unwrap_or(border.style), frame);
             }
         }
     }
@@ -716,6 +737,62 @@ mod tests {
             .border(Border::ascii().sides(BorderSides::LEFT))
             .render(Rect::new(0, 0, 1, 3), &mut vertical_frame);
         assert_eq!(vertical_frame.buffer().row_symbols(1).as_deref(), Some("|"));
+    }
+
+    #[test]
+    fn panel_content_style_fills_inner_area() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+        let style = Style::new().bg(Color::Blue);
+
+        Panel::new()
+            .border(Border::single())
+            .content_style(style)
+            .render(Rect::new(0, 0, 5, 3), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(2, 1))
+                .map(|cell| cell.style),
+            Some(style)
+        );
+        assert_ne!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(style)
+        );
+    }
+
+    #[test]
+    fn panel_title_style_overrides_border_style() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 3));
+        let mut frame = Frame::new(&mut buffer);
+        let border_style = Style::new().fg(Color::Red);
+        let title_style = Style::new().fg(Color::Blue);
+
+        Panel::new()
+            .border(Border::ascii().style(border_style))
+            .title("Title")
+            .title_style(title_style)
+            .render(Rect::new(0, 0, 8, 3), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(1, 0))
+                .map(|cell| cell.style),
+            Some(title_style)
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(crate::geometry::Point::new(0, 0))
+                .map(|cell| cell.style),
+            Some(border_style)
+        );
     }
 
     #[test]
