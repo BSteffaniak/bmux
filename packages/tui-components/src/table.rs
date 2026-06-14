@@ -235,7 +235,7 @@ pub struct TablePolicy {
     /// Render header row.
     pub header: bool,
     /// Render separator row after header.
-    pub row_separator: bool,
+    pub header_separator: bool,
     /// Keyboard row navigation enabled.
     pub keyboard: bool,
     /// Mouse behavior.
@@ -252,7 +252,7 @@ impl TablePolicy {
     pub const fn bare() -> Self {
         Self {
             header: true,
-            row_separator: false,
+            header_separator: false,
             keyboard: false,
             mouse: ComponentMousePolicy::disabled(),
             auto_scroll_selected: false,
@@ -265,7 +265,7 @@ impl TablePolicy {
     pub const fn interactive() -> Self {
         Self {
             header: true,
-            row_separator: false,
+            header_separator: false,
             keyboard: true,
             mouse: ComponentMousePolicy::button(),
             auto_scroll_selected: true,
@@ -333,6 +333,8 @@ pub struct TableLayout {
     pub column_widths: Vec<u16>,
     /// Header area if visible.
     pub header: Option<Rect>,
+    /// Header separator area if visible.
+    pub header_separator: Option<Rect>,
     /// Body area.
     pub body: Rect,
 }
@@ -356,7 +358,7 @@ impl<'a> Table<'a> {
             rows,
             policy: TablePolicy {
                 header: true,
-                row_separator: false,
+                header_separator: false,
                 keyboard: true,
                 mouse: ComponentMousePolicy {
                     enabled: true,
@@ -404,9 +406,24 @@ impl<'a> Table<'a> {
     #[must_use]
     pub fn layout(&self, area: Rect) -> TableLayout {
         let header_rows = u16::from(self.policy.header && area.height > 0);
+        let separator_rows = u16::from(
+            self.policy.header && self.policy.header_separator && area.height > header_rows,
+        );
         let header = (header_rows > 0).then_some(Rect::new(area.x, area.y, area.width, 1));
-        let body_y = area.y.saturating_add(header_rows);
-        let body_height = area.height.saturating_sub(header_rows);
+        let header_separator = (separator_rows > 0).then_some(Rect::new(
+            area.x,
+            area.y.saturating_add(header_rows),
+            area.width,
+            1,
+        ));
+        let body_y = area
+            .y
+            .saturating_add(header_rows)
+            .saturating_add(separator_rows);
+        let body_height = area
+            .height
+            .saturating_sub(header_rows)
+            .saturating_sub(separator_rows);
         TableLayout {
             column_widths: resolve_column_widths(
                 self.columns,
@@ -414,6 +431,7 @@ impl<'a> Table<'a> {
                 self.policy.cell_separator,
             ),
             header,
+            header_separator,
             body: Rect::new(area.x, body_y, area.width, body_height),
         }
     }
@@ -433,6 +451,13 @@ impl<'a> Table<'a> {
                     true,
                 ),
                 self.styles.header,
+            );
+        }
+        if let Some(separator) = layout.header_separator {
+            frame.write_line_with_fallback_style(
+                separator,
+                &self.separator_line(&layout.column_widths),
+                self.styles.separator,
             );
         }
         if self.rows.is_empty() {
@@ -607,6 +632,13 @@ impl<'a> Table<'a> {
         } else {
             self.styles.row
         }
+    }
+
+    fn separator_line(&self, widths: &[u16]) -> Line {
+        let cells = widths
+            .iter()
+            .map(|width| Line::from("─".repeat(usize::from(*width))));
+        self.row_line(widths, cells, true)
     }
 
     fn row_line(&self, widths: &[u16], cells: impl Iterator<Item = Line>, header: bool) -> Line {
@@ -832,6 +864,28 @@ mod tests {
             frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
             Some(TableStyles::default().row.patch(cell_style))
         );
+    }
+
+    #[test]
+    fn renders_header_separator_when_enabled() {
+        let columns = [
+            TableColumn::new("Name").fixed(4),
+            TableColumn::new("Kind").fixed(4),
+        ];
+        let rows = [TableRow::new(vec!["alpha", "file"])];
+        let state = TableState::new(None);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 9, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(TablePolicy {
+                header_separator: true,
+                ..TablePolicy::default()
+            })
+            .render(Rect::new(0, 0, 9, 3), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("──── ────"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("alp… file"));
     }
 
     #[test]
