@@ -27,6 +27,14 @@ pub enum TableAlign {
 pub enum TableWidth {
     /// Fixed width in cells.
     Fixed(u16),
+    /// Minimum content width, then participates in flexible allocation.
+    Min(u16),
+    /// Maximum content width cap.
+    Max(u16),
+    /// Percentage of available table width.
+    Percentage(u16),
+    /// Ratio of available table width.
+    Ratio(u16, u16),
     /// Weighted flexible width.
     Flex(u16),
 }
@@ -60,6 +68,34 @@ impl<'a> TableColumn<'a> {
     #[must_use]
     pub const fn fixed(mut self, width: u16) -> Self {
         self.width = TableWidth::Fixed(width);
+        self
+    }
+
+    /// Return this column with minimum width.
+    #[must_use]
+    pub const fn min(mut self, width: u16) -> Self {
+        self.width = TableWidth::Min(width);
+        self
+    }
+
+    /// Return this column with maximum width.
+    #[must_use]
+    pub const fn max(mut self, width: u16) -> Self {
+        self.width = TableWidth::Max(width);
+        self
+    }
+
+    /// Return this column with percentage width.
+    #[must_use]
+    pub const fn percentage(mut self, percent: u16) -> Self {
+        self.width = TableWidth::Percentage(percent);
+        self
+    }
+
+    /// Return this column with ratio width.
+    #[must_use]
+    pub const fn ratio(mut self, numerator: u16, denominator: u16) -> Self {
+        self.width = TableWidth::Ratio(numerator, denominator);
         self
     }
 
@@ -585,28 +621,58 @@ fn resolve_column_widths(
     let fixed: u16 = columns
         .iter()
         .map(|column| match column.width {
-            TableWidth::Fixed(width) => width,
-            TableWidth::Flex(_) => 0,
+            TableWidth::Fixed(width) | TableWidth::Min(width) | TableWidth::Max(width) => width,
+            TableWidth::Percentage(percent) => {
+                u16::try_from((u32::from(available) * u32::from(percent.min(100))) / 100)
+                    .unwrap_or(available)
+            }
+            TableWidth::Ratio(numerator, denominator) if denominator > 0 => u16::try_from(
+                (u32::from(available) * u32::from(numerator)) / u32::from(denominator),
+            )
+            .unwrap_or(available),
+            TableWidth::Ratio(_, _) | TableWidth::Flex(_) => 0,
         })
         .sum();
     let flex_weight: u16 = columns
         .iter()
         .map(|column| match column.width {
-            TableWidth::Fixed(_) => 0,
-            TableWidth::Flex(weight) => weight.max(1),
+            TableWidth::Flex(weight) | TableWidth::Min(weight) => weight.max(1),
+            TableWidth::Fixed(_)
+            | TableWidth::Max(_)
+            | TableWidth::Percentage(_)
+            | TableWidth::Ratio(_, _) => 0,
         })
         .sum();
     let flex_available = available.saturating_sub(fixed);
     columns
         .iter()
         .map(|column| match column.width {
-            TableWidth::Fixed(width) => width.min(available),
+            TableWidth::Fixed(width) | TableWidth::Max(width) => width.min(available),
+            TableWidth::Min(minimum) if flex_weight > 0 => minimum.saturating_add(
+                u16::try_from(
+                    (u32::from(flex_available) * u32::from(minimum.max(1)))
+                        / u32::from(flex_weight),
+                )
+                .unwrap_or(flex_available),
+            ),
+            TableWidth::Min(minimum) => minimum,
+            TableWidth::Percentage(percent) => {
+                u16::try_from((u32::from(available) * u32::from(percent.min(100))) / 100)
+                    .unwrap_or(available)
+                    .max(1)
+            }
+            TableWidth::Ratio(numerator, denominator) if denominator > 0 => u16::try_from(
+                (u32::from(available) * u32::from(numerator)) / u32::from(denominator),
+            )
+            .unwrap_or(available)
+            .max(1),
+            TableWidth::Ratio(_, _) => 1,
             TableWidth::Flex(weight) if flex_weight > 0 => u16::try_from(
                 (u32::from(flex_available) * u32::from(weight.max(1))) / u32::from(flex_weight),
             )
             .unwrap_or(flex_available)
             .max(1),
-            TableWidth::Flex(_) => 1,
+            TableWidth::Flex(weight) => weight.max(1),
         })
         .collect()
 }
@@ -668,6 +734,25 @@ mod tests {
         assert_eq!(
             table.layout(Rect::new(0, 0, 12, 3)).column_widths,
             vec![4, 7]
+        );
+    }
+
+    #[test]
+    fn resolves_fixed_min_max_percentage_ratio_and_flex_columns() {
+        let columns = [
+            TableColumn::new("Fixed").fixed(4),
+            TableColumn::new("Pct").percentage(25),
+            TableColumn::new("Ratio").ratio(1, 4),
+            TableColumn::new("Min").min(2),
+            TableColumn::new("Max").max(3),
+            TableColumn::new("Flex").flex(1),
+        ];
+        let rows = [TableRow::new(vec!["a", "b", "c", "d", "e", "f"])];
+        let table = Table::new(&columns, &rows);
+
+        assert_eq!(
+            table.layout(Rect::new(0, 0, 41, 3)).column_widths,
+            vec![4, 9, 9, 8, 3, 3]
         );
     }
 
