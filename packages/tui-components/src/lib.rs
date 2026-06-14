@@ -31,6 +31,7 @@ pub mod picker_frame;
 pub mod progress_bar;
 pub mod radio_group;
 pub mod scroll_area;
+pub mod scrollbar;
 pub mod select_dropdown;
 pub mod selectable_list;
 pub mod sparkline;
