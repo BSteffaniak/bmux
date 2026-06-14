@@ -15,8 +15,8 @@ use crate::common::{ComponentMousePolicy, InteractionState};
 pub struct SelectableListItem {
     /// Stable item id chosen by the caller.
     pub id: String,
-    /// Visible rich item content.
-    pub line: Line,
+    /// Visible rich item content lines.
+    pub lines: Vec<Line>,
     /// Whether this item is disabled independently from the whole list.
     pub disabled: bool,
 }
@@ -28,7 +28,7 @@ impl SelectableListItem {
         let label = label.into();
         Self {
             id: id.into(),
-            line: Line::from(label),
+            lines: vec![Line::from(label)],
             disabled: false,
         }
     }
@@ -38,7 +38,17 @@ impl SelectableListItem {
     pub fn rich(id: impl Into<String>, line: impl Into<Line>) -> Self {
         Self {
             id: id.into(),
-            line: line.into(),
+            lines: vec![line.into()],
+            disabled: false,
+        }
+    }
+
+    /// Create an enabled selectable-list item with multiline rich content.
+    #[must_use]
+    pub fn multiline(id: impl Into<String>, lines: impl Into<Vec<Line>>) -> Self {
+        Self {
+            id: id.into(),
+            lines: lines.into(),
             disabled: false,
         }
     }
@@ -46,7 +56,17 @@ impl SelectableListItem {
     /// Return the plain-text label for compatibility with string-oriented callers.
     #[must_use]
     pub fn label(&self) -> String {
-        self.line.plain_text()
+        self.lines
+            .iter()
+            .map(Line::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Return rendered item height in rows.
+    #[must_use]
+    pub fn height(&self) -> usize {
+        self.lines.len().max(1)
     }
 
     /// Return this item with disabled state set.
@@ -288,13 +308,26 @@ impl<'a> SelectableList<'a> {
         let width = self
             .items
             .iter()
-            .map(|item| item.line.width().saturating_add(prefix_width))
+            .map(|item| {
+                item.lines
+                    .iter()
+                    .map(Line::width)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(prefix_width)
+            })
             .max()
             .unwrap_or(0);
 
         (
             u16::try_from(width).unwrap_or(u16::MAX).saturating_add(2),
-            u16::try_from(self.items.len()).unwrap_or(u16::MAX),
+            u16::try_from(
+                self.items
+                    .iter()
+                    .map(SelectableListItem::height)
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u16::MAX),
         )
     }
 
@@ -311,15 +344,20 @@ impl<'a> SelectableList<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
-        for (index, item) in self.items.iter().take(usize::from(area.height)).enumerate() {
-            let row = area
-                .y
-                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            frame.write_line_with_fallback_style(
-                Rect::new(area.x, row, area.width, 1),
-                &self.line(index, item, *state),
-                fallback,
-            );
+        let mut rendered_row = 0u16;
+        for (index, item) in self.items.iter().enumerate() {
+            for line_index in 0..item.height() {
+                if rendered_row >= area.height {
+                    return;
+                }
+                let row = area.y.saturating_add(rendered_row);
+                frame.write_line_with_fallback_style(
+                    Rect::new(area.x, row, area.width, 1),
+                    &self.line(index, item, line_index, *state),
+                    fallback,
+                );
+                rendered_row = rendered_row.saturating_add(1);
+            }
         }
     }
 
@@ -343,10 +381,16 @@ impl<'a> SelectableList<'a> {
         }
     }
 
-    fn line(&self, index: usize, item: &SelectableListItem, state: SelectableListState) -> Line {
+    fn line(
+        &self,
+        index: usize,
+        item: &SelectableListItem,
+        line_index: usize,
+        state: SelectableListState,
+    ) -> Line {
         let style = self.style_for(index, item, state);
         let mut spans = Vec::new();
-        let prefix = if state.selected == Some(index) {
+        let prefix = if line_index == 0 && state.selected == Some(index) {
             self.policy.highlight.symbol.to_string()
         } else if self.policy.highlight.repeat_spacing {
             " ".repeat(display_width(self.policy.highlight.symbol))
@@ -357,9 +401,10 @@ impl<'a> SelectableList<'a> {
             spans.push(Span::styled(format!("{prefix} "), style));
         }
         spans.extend(
-            item.line
-                .spans
-                .iter()
+            item.lines
+                .get(line_index)
+                .into_iter()
+                .flat_map(|line| line.spans.iter())
                 .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
         );
         Line::from_spans(spans)
@@ -596,12 +641,24 @@ impl<'a> SelectableList<'a> {
         if !area.contains(mouse.position) {
             return None;
         }
-        let index = usize::from(mouse.position.y.saturating_sub(area.y));
-        if index < self.items.len() && self.is_enabled_item(index) {
+        let index = self.index_at_row(usize::from(mouse.position.y.saturating_sub(area.y)))?;
+        if self.is_enabled_item(index) {
             Some(index)
         } else {
             None
         }
+    }
+
+    fn index_at_row(&self, row: usize) -> Option<usize> {
+        let mut offset = 0usize;
+        for (index, item) in self.items.iter().enumerate() {
+            let height = item.height();
+            if row < offset.saturating_add(height) {
+                return Some(index);
+            }
+            offset = offset.saturating_add(height);
+        }
+        None
     }
 
     fn normalize_state(&self, state: &mut SelectableListState) {
@@ -668,6 +725,41 @@ mod tests {
             frame.buffer().get(Point::new(8, 0)).map(|cell| cell.style),
             Some(SelectableListStyles::default().normal.patch(item_style))
         );
+    }
+
+    #[test]
+    fn renders_multiline_items_and_hit_tests_full_item_height() {
+        let items = [
+            SelectableListItem::multiline("rich", [Line::from("first"), Line::from("second")]),
+            SelectableListItem::new("next", "Next"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(None);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        list.render(Rect::new(0, 0, 12, 3), &state, &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("  first     ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("  second    ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(2).as_deref(),
+            Some("  Next      ")
+        );
+
+        let outcome = list.handle_event(
+            Rect::new(0, 0, 12, 3),
+            &mut state,
+            &Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(1, 1))),
+        );
+        assert_eq!(outcome, SelectableListOutcome::Redraw);
+        assert_eq!(state.hovered, Some(0));
     }
 
     #[test]

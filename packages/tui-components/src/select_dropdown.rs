@@ -516,7 +516,7 @@ impl<'a> SelectDropdown<'a> {
             .iter()
             .map(|option| SelectableListItem {
                 id: option.id.clone(),
-                line: Line::from(option.label.clone()),
+                lines: vec![Line::from(option.label.clone())],
                 disabled: option.disabled,
             })
             .collect()

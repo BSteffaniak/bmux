@@ -229,7 +229,7 @@ impl<'a> Menu<'a> {
             .iter()
             .map(|item| SelectableListItem {
                 id: item.id.clone(),
-                line: Line::from(item.label.clone()),
+                lines: vec![Line::from(item.label.clone())],
                 disabled: item.disabled,
             })
             .collect()
