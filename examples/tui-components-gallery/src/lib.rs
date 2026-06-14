@@ -19,6 +19,7 @@ use bmux_tui_components::progress_bar::{
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState,
 };
+use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
 
@@ -99,6 +100,10 @@ fn render_progress(frame: &mut Frame<'_>) {
     ProgressBar::new(ProgressBarValue::indeterminate(4))
         .policy(ProgressBarPolicy::bare())
         .render(Rect::new(1, 22, 28, 1), frame);
+    let samples = [1, 2, 3, 5, 8, 13, 8, 5, 3, 2, 1];
+    Sparkline::new(&samples)
+        .policy(SparklinePolicy::bare().max(Some(13)))
+        .render(Rect::new(1, 23, 28, 1), frame);
 }
 
 fn render_picker(frame: &mut Frame<'_>) {
@@ -182,6 +187,7 @@ mod tests {
         assert!(rendered.contains("LabeledDetails"));
         assert!(rendered.contains("Pane content area"));
         assert!(rendered.contains("70% indexed"));
+        assert!(rendered.contains("▁▂▂▃▅█"));
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("Commands"));
         assert!(rendered.contains("Dialog body with actions"));
