@@ -14,6 +14,7 @@ pub mod button;
 pub mod checkbox;
 pub mod common;
 pub mod dialog;
+pub mod empty_state;
 pub mod filtered_list;
 pub mod form;
 pub mod form_field;
