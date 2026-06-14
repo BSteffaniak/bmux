@@ -1,6 +1,7 @@
 //! Styled text primitives.
 
 use crate::style::Style;
+use crate::text_width::display_width;
 
 /// A styled text span.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -28,6 +29,17 @@ impl Span {
             content: content.into(),
             style,
         }
+    }
+    /// Return a copy of this span with `style` patched over its current style.
+    #[must_use]
+    pub fn patch_style(&self, style: Style) -> Self {
+        Self::styled(self.content.clone(), self.style.patch(style))
+    }
+
+    /// Return the terminal display width of this span.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        display_width(&self.content)
     }
 }
 
@@ -77,6 +89,23 @@ impl Line {
         )
     }
 
+    /// Return a copy of this line with `style` patched over each span.
+    #[must_use]
+    pub fn patch_style(&self, style: Style) -> Self {
+        Self::from_spans(
+            self.spans
+                .iter()
+                .map(|span| span.patch_style(style))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Return the terminal display width of this line.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+
     /// Append a span to the line.
     pub fn push_span(&mut self, span: Span) {
         self.spans.push(span);
@@ -120,6 +149,23 @@ impl Text {
         Self {
             lines: lines.into(),
         }
+    }
+
+    /// Return a copy of this text with `style` patched over each line.
+    #[must_use]
+    pub fn patch_style(&self, style: Style) -> Self {
+        Self::from_lines(
+            self.lines
+                .iter()
+                .map(|line| line.patch_style(style))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Return the maximum terminal display width of all lines.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.lines.iter().map(Line::width).max().unwrap_or(0)
     }
 
     /// Append a line.
@@ -166,7 +212,7 @@ impl From<String> for Text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Line, Span};
+    use super::{Line, Span, Text};
     use crate::style::{Color, Style};
 
     #[test]
@@ -188,5 +234,27 @@ mod tests {
         let styled = line.with_fallback_style(fallback);
 
         assert_eq!(styled.spans[0].style, fallback.patch(explicit));
+    }
+
+    #[test]
+    fn text_primitives_report_unicode_display_widths() {
+        let span = Span::raw("a界");
+        let line = Line::from_spans([span.clone(), Span::raw("b")]);
+        let text = Text::from_lines([line.clone(), Line::from("x")]);
+
+        assert_eq!(span.width(), 3);
+        assert_eq!(line.width(), 4);
+        assert_eq!(text.width(), 4);
+    }
+
+    #[test]
+    fn text_primitives_patch_styles() {
+        let line = Line::from_spans([Span::styled("hi", Style::new().fg(Color::Red))]);
+        let patched = line.patch_style(Style::new().bg(Color::Blue));
+
+        assert_eq!(
+            patched.spans[0].style,
+            Style::new().fg(Color::Red).bg(Color::Blue)
+        );
     }
 }
