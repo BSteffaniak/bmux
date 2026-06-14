@@ -155,11 +155,14 @@ impl NavigationDemo {
             event,
         ) {
             TableOutcome::Selected(index) => {
-                self.message = format!("Table selected: {}", table_rows[index].cells[0]);
+                self.message = format!(
+                    "Table selected: {}",
+                    table_rows[index].cells[0].plain_text()
+                );
                 return false;
             }
             TableOutcome::Focused(index) => {
-                self.message = format!("Table focus: {}", table_rows[index].cells[0]);
+                self.message = format!("Table focus: {}", table_rows[index].cells[0].plain_text());
                 return false;
             }
             TableOutcome::Ignored | TableOutcome::Redraw => {}
@@ -423,7 +426,9 @@ pub fn demonstrate_table_selection() -> String {
         &mut state,
         &Event::Key(KeyStroke::simple(KeyCode::Enter)),
     ) {
-        TableOutcome::Selected(index) => format!("Table selected: {}", rows[index].cells[0]),
+        TableOutcome::Selected(index) => {
+            format!("Table selected: {}", rows[index].cells[0].plain_text())
+        }
         TableOutcome::Ignored | TableOutcome::Redraw | TableOutcome::Focused(_) => {
             "Table ignored".to_string()
         }
@@ -490,7 +495,7 @@ fn table_columns() -> [TableColumn<'static>; 2] {
     ]
 }
 
-fn table_rows() -> [TableRow<'static>; 3] {
+fn table_rows() -> [TableRow; 3] {
     [
         TableRow::new(vec!["alpha", "file"]),
         TableRow::new(vec!["beta", "dir"]),

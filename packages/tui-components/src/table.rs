@@ -78,19 +78,28 @@ impl<'a> TableColumn<'a> {
     }
 }
 
-/// One table row with caller-owned cell labels.
+/// One table row with caller-owned cell content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableRow<'a> {
+pub struct TableRow {
     /// Row cells.
-    pub cells: Vec<&'a str>,
+    pub cells: Vec<Line>,
     /// Whether this row cannot be selected.
     pub disabled: bool,
 }
 
-impl<'a> TableRow<'a> {
+impl TableRow {
     /// Create a row from borrowed cell labels.
     #[must_use]
-    pub fn new(cells: impl Into<Vec<&'a str>>) -> Self {
+    pub fn new<'a>(cells: impl Into<Vec<&'a str>>) -> Self {
+        Self {
+            cells: cells.into().into_iter().map(Line::from).collect(),
+            disabled: false,
+        }
+    }
+
+    /// Create a row from rich cell content.
+    #[must_use]
+    pub fn rich(cells: impl Into<Vec<Line>>) -> Self {
         Self {
             cells: cells.into(),
             disabled: false,
@@ -263,7 +272,7 @@ pub struct TableLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table<'a> {
     columns: &'a [TableColumn<'a>],
-    rows: &'a [TableRow<'a>],
+    rows: &'a [TableRow],
     policy: TablePolicy,
     styles: TableStyles,
     empty: &'a str,
@@ -272,7 +281,7 @@ pub struct Table<'a> {
 impl<'a> Table<'a> {
     /// Create a table over caller-owned columns and rows.
     #[must_use]
-    pub const fn new(columns: &'a [TableColumn<'a>], rows: &'a [TableRow<'a>]) -> Self {
+    pub const fn new(columns: &'a [TableColumn<'a>], rows: &'a [TableRow]) -> Self {
         Self {
             columns,
             rows,
@@ -351,7 +360,7 @@ impl<'a> Table<'a> {
                 header,
                 &self.row_line(
                     &layout.column_widths,
-                    self.columns.iter().map(|column| column.title),
+                    self.columns.iter().map(|column| Line::from(column.title)),
                     true,
                 ),
                 self.styles.header,
@@ -375,7 +384,7 @@ impl<'a> Table<'a> {
             let row = &self.rows[source];
             frame.write_line_with_fallback_style(
                 rect,
-                &self.row_line(&layout.column_widths, row.cells.iter().copied(), false),
+                &self.row_line(&layout.column_widths, row.cells.iter().cloned(), false),
                 self.row_style(source, row, state),
             );
         }
@@ -502,7 +511,7 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn row_style(&self, index: usize, row: &TableRow<'_>, state: &TableState) -> Style {
+    fn row_style(&self, index: usize, row: &TableRow, state: &TableState) -> Style {
         if row.disabled {
             self.styles.disabled
         } else if state.selected == Some(index) {
@@ -514,12 +523,7 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn row_line<'b>(
-        &self,
-        widths: &[u16],
-        cells: impl Iterator<Item = &'b str>,
-        header: bool,
-    ) -> Line {
+    fn row_line(&self, widths: &[u16], cells: impl Iterator<Item = Line>, header: bool) -> Line {
         let mut spans = Vec::new();
         for (index, (cell, width)) in cells.zip(widths.iter().copied()).enumerate() {
             if index > 0 {
@@ -532,23 +536,39 @@ impl<'a> Table<'a> {
                 .columns
                 .get(index)
                 .map_or(TableAlign::Left, |column| column.align);
-            let text = format_cell(
-                cell,
+            let line = format_cell_line(
+                &cell,
                 width,
                 align,
                 self.columns.get(index).is_none_or(|column| column.truncate),
             );
-            spans.push(Span::styled(
-                text,
-                if header {
-                    self.styles.header
-                } else {
-                    self.styles.row
-                },
-            ));
+            let base = if header {
+                self.styles.header
+            } else {
+                self.styles.row
+            };
+            spans.extend(
+                line.spans
+                    .into_iter()
+                    .map(|span| Span::styled(span.content, base.patch(span.style))),
+            );
         }
         Line::from_spans(spans)
     }
+}
+
+fn format_cell_line(line: &Line, width: u16, align: TableAlign, truncate: bool) -> Line {
+    let width = usize::from(width);
+    let line_width = line.width();
+    if align == TableAlign::Left && (!truncate || line_width <= width) {
+        let mut line = line.clone();
+        if line_width < width {
+            line.push_span(Span::raw(" ".repeat(width.saturating_sub(line_width))));
+        }
+        return line;
+    }
+    let plain = line.plain_text();
+    Line::from(format_cell(&plain, u16_saturating(width), align, truncate))
 }
 
 fn resolve_column_widths(
@@ -628,10 +648,12 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::prelude::{Line, Span};
+    use bmux_tui::style::{Color, Style};
 
     use super::{
         Table, TableAlign, TableColumn, TableOutcome, TablePolicy, TableRow, TableState,
-        format_cell,
+        TableStyles, format_cell,
     };
 
     #[test]
@@ -654,6 +676,27 @@ mod tests {
         assert_eq!(format_cell("abcdef", 4, TableAlign::Left, true), "abc…");
         assert_eq!(format_cell("x", 3, TableAlign::Right, true), "  x");
         assert_eq!(format_cell("x", 3, TableAlign::Center, true), " x ");
+    }
+
+    #[test]
+    fn renders_rich_cell_content_preserving_span_style() {
+        let columns = [TableColumn::new("Name").fixed(8)];
+        let cell_style = Style::new().fg(Color::Yellow);
+        let rows = [TableRow::rich(vec![Line::from_spans([
+            Span::raw("a"),
+            Span::styled("b", cell_style),
+        ])])];
+        let state = TableState::new(None);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows).render(Rect::new(0, 0, 8, 2), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("ab      "));
+        assert_eq!(
+            frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
+            Some(TableStyles::default().row.patch(cell_style))
+        );
     }
 
     #[test]
