@@ -5,6 +5,9 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::prelude::Line;
 use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui_components::breadcrumbs::{
+    BreadcrumbItem, Breadcrumbs, BreadcrumbsOutcome, BreadcrumbsState,
+};
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarPolicy, KeyHintBarStyles};
 use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{Pane, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState};
@@ -26,6 +29,7 @@ pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 18;
 
 pub struct NavigationDemo {
+    breadcrumbs: BreadcrumbsState,
     tabs: TabBarState,
     tree: TreeViewState,
     list: SelectableListState,
@@ -41,6 +45,7 @@ impl NavigationDemo {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            breadcrumbs: BreadcrumbsState::new(Some(1)),
             tabs: TabBarState::new(Some(0)),
             tree: {
                 let mut state = TreeViewState::new(Some(0));
@@ -69,6 +74,14 @@ impl NavigationDemo {
         if matches!(event, Event::Key(stroke) if should_quit(*stroke)) {
             return true;
         }
+        let breadcrumb_items = breadcrumb_items();
+        if let BreadcrumbsOutcome::Activated { id, .. } = Breadcrumbs::new(&breadcrumb_items)
+            .handle_event(Rect::new(30, 0, 38, 1), &mut self.breadcrumbs, event)
+        {
+            self.message = format!("Breadcrumb activated: {id}");
+            return false;
+        }
+
         let tab_items = tab_items();
         match TabBar::new(&tab_items).handle_event(Rect::new(1, 0, 42, 1), &mut self.tabs, event) {
             TabBarOutcome::Selected(index) => {
@@ -222,7 +235,10 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             disabled: Style::new().fg(Color::BrightBlack),
             separator: Style::new().fg(Color::BrightBlack),
         })
-        .render(Rect::new(1, 0, 42, 1), &demo.tabs, frame);
+        .render(Rect::new(1, 0, 26, 1), &demo.tabs, frame);
+
+    let breadcrumb_items = breadcrumb_items();
+    Breadcrumbs::new(&breadcrumb_items).render(Rect::new(30, 0, 38, 1), &demo.breadcrumbs, frame);
 
     let list_items = list_items();
     SelectableList::new(&list_items).render(Rect::new(1, 1, 24, 3), &demo.list, frame);
@@ -361,6 +377,12 @@ pub fn demonstrate_tree_selection() -> String {
     demo.message
 }
 
+pub fn demonstrate_breadcrumb_activation() -> String {
+    let mut demo = NavigationDemo::new();
+    let _ = demo.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Enter)));
+    demo.message
+}
+
 pub fn demonstrate_text_view_scroll() -> usize {
     let mut demo = NavigationDemo::new();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
@@ -396,6 +418,14 @@ pub fn rows(buffer: &Buffer) -> Vec<String> {
     (0..buffer.area().height)
         .filter_map(|row| buffer.row_symbols(row))
         .collect()
+}
+
+fn breadcrumb_items() -> [BreadcrumbItem<'static>; 3] {
+    [
+        BreadcrumbItem::new("home", "Home"),
+        BreadcrumbItem::new("library", "Library"),
+        BreadcrumbItem::new("details", "Details"),
+    ]
 }
 
 fn tab_items() -> [TabItem<'static>; 3] {
@@ -503,9 +533,10 @@ mod tests {
     use bmux_tui_components::pane::{PaneOutcome, ScrollDirection};
 
     use super::{
-        demonstrate_delegated_pane_scroll_offset, demonstrate_menu_activation,
-        demonstrate_pane_scroll_delegation, demonstrate_table_selection,
-        demonstrate_text_view_scroll, demonstrate_tree_selection, render_navigation, rows,
+        demonstrate_breadcrumb_activation, demonstrate_delegated_pane_scroll_offset,
+        demonstrate_menu_activation, demonstrate_pane_scroll_delegation,
+        demonstrate_table_selection, demonstrate_text_view_scroll, demonstrate_tree_selection,
+        render_navigation, rows,
     };
 
     #[test]
@@ -513,6 +544,8 @@ mod tests {
         let rendered = rows(&render_navigation()).join("\n");
 
         assert!(rendered.contains("List"));
+        assert!(rendered.contains("Library"));
+        assert!(rendered.contains("Details"));
         assert!(rendered.contains("src"));
         assert!(rendered.contains("Second item"));
         assert!(rendered.contains("> Open"));
@@ -539,6 +572,14 @@ mod tests {
     #[test]
     fn delegated_pane_scroll_updates_nested_scroll_area() {
         assert_eq!(demonstrate_delegated_pane_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn breadcrumb_enter_activates_current_item() {
+        assert_eq!(
+            demonstrate_breadcrumb_activation(),
+            "Breadcrumb activated: library"
+        );
     }
 
     #[test]
