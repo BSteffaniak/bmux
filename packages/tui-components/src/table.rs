@@ -982,6 +982,28 @@ mod tests {
     }
 
     #[test]
+    fn tiny_area_does_not_panic() {
+        let columns = [TableColumn::new("Name").fixed(4)];
+        let rows = [TableRow::multiline(vec![vec![
+            Line::from("one"),
+            Line::from("two"),
+        ]])];
+        let state = TableState::new(Some(0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows).render(Rect::new(0, 0, 0, 0), &state, &mut frame);
+
+        assert_eq!(
+            Table::new(&columns, &rows)
+                .layout(Rect::new(0, 0, 0, 0))
+                .body
+                .height,
+            0
+        );
+    }
+
+    #[test]
     fn header_remains_sticky_when_body_scrolls() {
         let columns = [TableColumn::new("Name").fixed(8)];
         let rows = [
