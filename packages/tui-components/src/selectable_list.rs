@@ -207,6 +207,7 @@ pub struct SelectableListState {
     focused: Option<usize>,
     hovered: Option<usize>,
     pressed: Option<usize>,
+    vertical_scroll: usize,
 }
 
 impl SelectableListState {
@@ -219,6 +220,7 @@ impl SelectableListState {
             focused: selected,
             hovered: None,
             pressed: None,
+            vertical_scroll: 0,
         }
     }
 
@@ -243,6 +245,17 @@ impl SelectableListState {
     pub const fn set_focused(&mut self, focused: Option<usize>) {
         self.focused = focused;
         self.interaction.focused = focused.is_some();
+    }
+
+    /// Return vertical scroll offset in rendered rows.
+    #[must_use]
+    pub const fn vertical_scroll(self) -> usize {
+        self.vertical_scroll
+    }
+
+    /// Set vertical scroll offset in rendered rows.
+    pub const fn set_vertical_scroll(&mut self, vertical_scroll: usize) {
+        self.vertical_scroll = vertical_scroll;
     }
 
     /// Set disabled state for the whole list.
@@ -331,6 +344,17 @@ impl<'a> SelectableList<'a> {
         )
     }
 
+    /// Return maximum vertical scroll offset for this area.
+    #[must_use]
+    pub fn max_vertical_scroll(&self, area: Rect) -> usize {
+        self.total_height().saturating_sub(usize::from(area.height))
+    }
+
+    /// Clamp caller-owned state to valid scroll bounds for this area.
+    pub fn clamp_state(&self, area: Rect, state: &mut SelectableListState) {
+        state.vertical_scroll = state.vertical_scroll.min(self.max_vertical_scroll(area));
+    }
+
     /// Render the selectable list.
     pub fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
         self.render_with_fallback_style(area, state, frame, Style::new());
@@ -344,9 +368,14 @@ impl<'a> SelectableList<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
+        let mut skipped_rows = state.vertical_scroll;
         let mut rendered_row = 0u16;
         for (index, item) in self.items.iter().enumerate() {
             for line_index in 0..item.height() {
+                if skipped_rows > 0 {
+                    skipped_rows = skipped_rows.saturating_sub(1);
+                    continue;
+                }
                 if rendered_row >= area.height {
                     return;
                 }
@@ -373,7 +402,7 @@ impl<'a> SelectableList<'a> {
             return SelectableListOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) => self.handle_key(state, *stroke),
+            Event::Key(stroke) => self.handle_key(area, state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 SelectableListOutcome::Ignored
@@ -441,6 +470,7 @@ impl<'a> SelectableList<'a> {
 
     fn handle_key(
         &self,
+        area: Rect,
         state: &mut SelectableListState,
         stroke: KeyStroke,
     ) -> SelectableListOutcome {
@@ -464,6 +494,8 @@ impl<'a> SelectableList<'a> {
             KeyCode::Space | KeyCode::Char(' ') if self.policy.keyboard.space_selects => {
                 self.select_focused(state)
             }
+            KeyCode::PageUp => self.scroll_by(area, state, -i32::from(area.height.max(1))),
+            KeyCode::PageDown => self.scroll_by(area, state, i32::from(area.height.max(1))),
             KeyCode::Char(_)
             | KeyCode::Enter
             | KeyCode::Tab
@@ -477,8 +509,6 @@ impl<'a> SelectableList<'a> {
             | KeyCode::Right
             | KeyCode::Home
             | KeyCode::End
-            | KeyCode::PageUp
-            | KeyCode::PageDown
             | KeyCode::Insert
             | KeyCode::F(_) => SelectableListOutcome::Ignored,
         }
@@ -493,7 +523,7 @@ impl<'a> SelectableList<'a> {
         if !self.policy.mouse.enabled {
             return SelectableListOutcome::Ignored;
         }
-        let hit = self.hit_index(area, mouse);
+        let hit = self.hit_index(area, state, mouse);
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => Self::hover(state, hit),
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
@@ -505,11 +535,11 @@ impl<'a> SelectableList<'a> {
             MouseEventKind::Drag(MouseButton::Left) if self.policy.mouse.click => {
                 Self::drag(state, hit)
             }
+            MouseEventKind::ScrollUp => self.scroll_by(area, state, -1),
+            MouseEventKind::ScrollDown => self.scroll_by(area, state, 1),
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
-            | MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight
             | MouseEventKind::Move => SelectableListOutcome::Ignored,
@@ -559,6 +589,32 @@ impl<'a> SelectableList<'a> {
         } else {
             state.hovered = hit;
             state.pressed = pressed;
+            SelectableListOutcome::Redraw
+        }
+    }
+
+    fn scroll_by(
+        &self,
+        area: Rect,
+        state: &mut SelectableListState,
+        delta: i32,
+    ) -> SelectableListOutcome {
+        let current = i32::try_from(state.vertical_scroll).unwrap_or(i32::MAX);
+        let next = usize::try_from(current.saturating_add(delta).max(0)).unwrap_or(usize::MAX);
+        self.set_scroll(area, state, next)
+    }
+
+    fn set_scroll(
+        &self,
+        area: Rect,
+        state: &mut SelectableListState,
+        scroll: usize,
+    ) -> SelectableListOutcome {
+        let next = scroll.min(SelectableList::max_vertical_scroll(self, area));
+        if next == state.vertical_scroll {
+            SelectableListOutcome::Ignored
+        } else {
+            state.vertical_scroll = next;
             SelectableListOutcome::Redraw
         }
     }
@@ -637,16 +693,29 @@ impl<'a> SelectableList<'a> {
         Some(current)
     }
 
-    fn hit_index(&self, area: Rect, mouse: MouseEvent) -> Option<usize> {
+    fn hit_index(
+        &self,
+        area: Rect,
+        state: &SelectableListState,
+        mouse: MouseEvent,
+    ) -> Option<usize> {
         if !area.contains(mouse.position) {
             return None;
         }
-        let index = self.index_at_row(usize::from(mouse.position.y.saturating_sub(area.y)))?;
+        let index = self.index_at_row(
+            state
+                .vertical_scroll
+                .saturating_add(usize::from(mouse.position.y.saturating_sub(area.y))),
+        )?;
         if self.is_enabled_item(index) {
             Some(index)
         } else {
             None
         }
+    }
+
+    fn total_height(&self) -> usize {
+        self.items.iter().map(SelectableListItem::height).sum()
     }
 
     fn index_at_row(&self, row: usize) -> Option<usize> {
@@ -725,6 +794,61 @@ mod tests {
             frame.buffer().get(Point::new(8, 0)).map(|cell| cell.style),
             Some(SelectableListStyles::default().normal.patch(item_style))
         );
+    }
+
+    #[test]
+    fn viewport_scrolls_rendered_rows_and_hit_tests_visible_rows() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::multiline("two", [Line::from("Two A"), Line::from("Two B")]),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(None);
+        state.set_vertical_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        list.render(Rect::new(0, 0, 12, 2), &state, &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("  Two A     ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("  Two B     ")
+        );
+        assert_eq!(list.max_vertical_scroll(Rect::new(0, 0, 12, 2)), 2);
+
+        let outcome = list.handle_event(
+            Rect::new(0, 0, 12, 2),
+            &mut state,
+            &Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(1, 1))),
+        );
+        assert_eq!(outcome, SelectableListOutcome::Redraw);
+        assert_eq!(state.hovered, Some(1));
+    }
+
+    #[test]
+    fn page_keys_update_vertical_scroll() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(Some(0));
+
+        assert_eq!(
+            list.handle_event(
+                Rect::new(0, 0, 12, 1),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::PageDown)),
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(state.vertical_scroll(), 1);
     }
 
     #[test]
