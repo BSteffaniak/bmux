@@ -6,6 +6,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
+use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 
@@ -122,6 +123,32 @@ impl Default for SelectableListKeyboardPolicy {
     }
 }
 
+/// Highlight symbol behavior for selected list items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectableListHighlightPolicy {
+    /// Symbol rendered before the selected item.
+    pub symbol: &'static str,
+    /// Whether non-selected rows reserve equivalent spacing.
+    pub repeat_spacing: bool,
+}
+
+impl SelectableListHighlightPolicy {
+    /// Create a highlight policy.
+    #[must_use]
+    pub const fn new(symbol: &'static str, repeat_spacing: bool) -> Self {
+        Self {
+            symbol,
+            repeat_spacing,
+        }
+    }
+}
+
+impl Default for SelectableListHighlightPolicy {
+    fn default() -> Self {
+        Self::new(">", true)
+    }
+}
+
 /// Configurable selectable-list behavior policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectableListPolicy {
@@ -129,6 +156,8 @@ pub struct SelectableListPolicy {
     pub mouse: ComponentMousePolicy,
     /// Keyboard behavior.
     pub keyboard: SelectableListKeyboardPolicy,
+    /// Highlight symbol behavior.
+    pub highlight: SelectableListHighlightPolicy,
 }
 
 impl SelectableListPolicy {
@@ -138,6 +167,7 @@ impl SelectableListPolicy {
         Self {
             mouse: ComponentMousePolicy::button(),
             keyboard: SelectableListKeyboardPolicy::interactive(),
+            highlight: SelectableListHighlightPolicy::new(">", true),
         }
     }
 }
@@ -254,10 +284,11 @@ impl<'a> SelectableList<'a> {
     /// Return required render size.
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
+        let prefix_width = self.prefix_width();
         let width = self
             .items
             .iter()
-            .map(|item| item.line.width())
+            .map(|item| item.line.width().saturating_add(prefix_width))
             .max()
             .unwrap_or(0);
 
@@ -313,13 +344,18 @@ impl<'a> SelectableList<'a> {
     }
 
     fn line(&self, index: usize, item: &SelectableListItem, state: SelectableListState) -> Line {
-        let marker = if state.selected == Some(index) {
-            '>'
-        } else {
-            ' '
-        };
         let style = self.style_for(index, item, state);
-        let mut spans = vec![Span::styled(format!("{marker} "), style)];
+        let mut spans = Vec::new();
+        let prefix = if state.selected == Some(index) {
+            self.policy.highlight.symbol.to_string()
+        } else if self.policy.highlight.repeat_spacing {
+            " ".repeat(display_width(self.policy.highlight.symbol))
+        } else {
+            String::new()
+        };
+        if !prefix.is_empty() || self.policy.highlight.repeat_spacing {
+            spans.push(Span::styled(format!("{prefix} "), style));
+        }
         spans.extend(
             item.line
                 .spans
@@ -327,6 +363,14 @@ impl<'a> SelectableList<'a> {
                 .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
         );
         Line::from_spans(spans)
+    }
+
+    fn prefix_width(&self) -> usize {
+        if self.policy.highlight.repeat_spacing || !self.policy.highlight.symbol.is_empty() {
+            display_width(self.policy.highlight.symbol).saturating_add(1)
+        } else {
+            0
+        }
     }
 
     fn style_for(
@@ -599,8 +643,8 @@ mod tests {
     use bmux_tui::prelude::{Line, Span, Style};
 
     use super::{
-        SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
-        SelectableListStyles,
+        SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListOutcome,
+        SelectableListPolicy, SelectableListState, SelectableListStyles,
     };
 
     #[test]
@@ -623,6 +667,35 @@ mod tests {
         assert_eq!(
             frame.buffer().get(Point::new(8, 0)).map(|cell| cell.style),
             Some(SelectableListStyles::default().normal.patch(item_style))
+        );
+    }
+
+    #[test]
+    fn custom_highlight_symbol_and_spacing_policy_are_rendered() {
+        let items = vec![
+            SelectableListItem::new("draft", "Draft"),
+            SelectableListItem::new("published", "Published"),
+        ];
+        let list = SelectableList::new(&items).policy(SelectableListPolicy {
+            highlight: SelectableListHighlightPolicy::new("»", false),
+            ..SelectableListPolicy::default()
+        });
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        list.render(
+            Rect::new(0, 0, 14, 2),
+            &SelectableListState::new(Some(1)),
+            &mut frame,
+        );
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("Draft         ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("» Published   ")
         );
     }
 
