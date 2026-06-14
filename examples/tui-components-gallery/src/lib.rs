@@ -24,6 +24,7 @@ use bmux_tui_components::selectable_list::{
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
+use bmux_tui_components::toast_stack::{ToastItem, ToastSeverity, ToastStack, ToastStackState};
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 24;
@@ -48,6 +49,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_picker(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
+    render_toasts(frame);
 }
 
 fn render_buttons(frame: &mut Frame<'_>) {
@@ -132,6 +134,16 @@ fn render_empty_state(frame: &mut Frame<'_>) {
         .actions(&actions)
         .policy(EmptyStatePolicy::centered())
         .render(Rect::new(2, 14, 26, 4), frame);
+}
+
+fn render_toasts(frame: &mut Frame<'_>) {
+    let toasts = [
+        ToastItem::new("saved", "Saved")
+            .body("Changes persisted")
+            .severity(ToastSeverity::Success),
+        ToastItem::new("sync", "Syncing").severity(ToastSeverity::Info),
+    ];
+    ToastStack::new(&toasts).render(Rect::new(1, 20, 30, 4), &ToastStackState::default(), frame);
 }
 
 fn render_picker(frame: &mut Frame<'_>) {
@@ -220,6 +232,8 @@ mod tests {
         assert!(rendered.contains("▁▂▂▃▅█"));
         assert!(rendered.contains("Empty State"));
         assert!(rendered.contains("No matching components yet"));
+        assert!(rendered.contains("Saved ×"));
+        assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("Commands"));
         assert!(rendered.contains("Dialog body with actions"));
