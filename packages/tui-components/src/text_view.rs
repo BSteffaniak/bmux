@@ -781,6 +781,29 @@ mod tests {
     }
 
     #[test]
+    fn unicode_width_is_respected_when_wrapping_and_scrolling() {
+        let lines = [Line::from("a界b")];
+        let view = TextView::new(&lines);
+        let layout = view.layout(Rect::new(0, 0, 3, 2), &TextViewState::new());
+
+        assert_eq!(layout.lines[0].plain_text(), "a界");
+        assert_eq!(layout.lines[1].plain_text(), "b");
+
+        let mut state = TextViewState::new();
+        state.set_horizontal_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextView::new(&lines).policy(TextViewPolicy::bare()).render(
+            Rect::new(0, 0, 2, 1),
+            &state,
+            &mut frame,
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("界"));
+    }
+
+    #[test]
     fn selection_and_cursor_hooks_patch_styles_without_text_edit_behavior() {
         let lines = [Line::from("abcdef")];
         let view = TextView::new(&lines)
