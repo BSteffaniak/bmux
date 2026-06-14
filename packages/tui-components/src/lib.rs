@@ -10,6 +10,7 @@
 //! feature at a time.
 
 pub mod action_row;
+pub mod badge;
 pub mod button;
 pub mod checkbox;
 pub mod common;
