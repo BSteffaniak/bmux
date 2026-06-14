@@ -286,6 +286,7 @@ fn render_lines(lines: &[Line], width: u16, wrap: TextWrap, trim: bool) -> Vec<L
         match wrap {
             TextWrap::None => rendered.push(line),
             TextWrap::Character => rendered.extend(wrap_line(&line, usize::from(width.max(1)))),
+            TextWrap::Word => rendered.extend(wrap_line_words(&line, usize::from(width.max(1)))),
         }
     }
     rendered
@@ -308,6 +309,88 @@ fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
         }
     }
     lines
+}
+
+fn wrap_line_words(line: &Line, width: usize) -> Vec<Line> {
+    let mut lines = vec![Line::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for span in &line.spans {
+        let mut segment = String::new();
+        let mut segment_is_whitespace = false;
+        for ch in span.content.chars() {
+            let is_whitespace = ch.is_whitespace();
+            if segment.is_empty() {
+                segment_is_whitespace = is_whitespace;
+            }
+            if !segment.is_empty() && is_whitespace != segment_is_whitespace {
+                push_word_segment(
+                    &mut lines,
+                    &mut row,
+                    &mut col,
+                    &segment,
+                    span.style,
+                    width,
+                    segment_is_whitespace,
+                );
+                segment.clear();
+                segment_is_whitespace = is_whitespace;
+            }
+            segment.push(ch);
+        }
+        if !segment.is_empty() {
+            push_word_segment(
+                &mut lines,
+                &mut row,
+                &mut col,
+                &segment,
+                span.style,
+                width,
+                segment_is_whitespace,
+            );
+        }
+    }
+    lines.into_iter().map(|line| trim_line_end(&line)).collect()
+}
+
+fn push_word_segment(
+    lines: &mut Vec<Line>,
+    row: &mut usize,
+    col: &mut usize,
+    segment: &str,
+    style: Style,
+    width: usize,
+    is_whitespace: bool,
+) {
+    let segment_width = display_width(segment);
+    if is_whitespace && *col == 0 {
+        return;
+    }
+    if *col > 0 && col.saturating_add(segment_width) > width {
+        lines.push(Line::new());
+        *row = row.saturating_add(1);
+        *col = 0;
+        if is_whitespace {
+            return;
+        }
+    }
+    if segment_width > width {
+        for ch in segment.chars() {
+            let ch_width = display_width(&ch.to_string());
+            if *col > 0 && col.saturating_add(ch_width) > width {
+                lines.push(Line::new());
+                *row = row.saturating_add(1);
+                *col = 0;
+            }
+            push_styled_grapheme(&mut lines[*row], ch, style);
+            *col = col.saturating_add(ch_width);
+        }
+        return;
+    }
+    for ch in segment.chars() {
+        push_styled_grapheme(&mut lines[*row], ch, style);
+    }
+    *col = col.saturating_add(segment_width);
 }
 
 fn push_styled_grapheme(line: &mut Line, ch: char, style: Style) {
@@ -361,6 +444,19 @@ mod tests {
         let layout = view.layout(Rect::new(0, 0, 3, 5), &TextViewState::new());
 
         assert_eq!(layout.lines.len(), 2);
+    }
+
+    #[test]
+    fn word_wrap_prefers_word_boundaries() {
+        let lines = [Line::from("one two")];
+        let view = TextView::new(&lines).policy(TextViewPolicy {
+            wrap: bmux_tui::prelude::TextWrap::Word,
+            ..TextViewPolicy::bare()
+        });
+        let layout = view.layout(Rect::new(0, 0, 6, 2), &TextViewState::new());
+
+        assert_eq!(layout.lines[0].plain_text(), "one");
+        assert_eq!(layout.lines[1].plain_text(), "two");
     }
 
     #[test]
