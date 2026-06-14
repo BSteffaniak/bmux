@@ -796,6 +796,20 @@ mod tests {
     }
 
     #[test]
+    fn panel_zero_area_does_not_panic() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        Panel::new()
+            .border(Border::double())
+            .title(PanelTitle::new("Hidden").position(TitlePosition::Bottom))
+            .padding(Insets::all(1))
+            .background(Style::new().bg(Color::Blue))
+            .content_style(Style::new().bg(Color::Red))
+            .render(Rect::new(0, 0, 0, 0), &mut frame);
+    }
+
+    #[test]
     fn panel_background_fills_area() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
         let mut frame = Frame::new(&mut buffer);
