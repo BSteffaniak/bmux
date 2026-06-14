@@ -22,6 +22,7 @@ use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState,
 };
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy};
+use bmux_tui_components::stepper::{StepItem, StepStatus, Stepper, StepperPolicy};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
 use bmux_tui_components::toast_stack::{ToastItem, ToastSeverity, ToastStack, ToastStackState};
@@ -47,6 +48,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_progress(frame);
     render_empty_state(frame);
     render_picker(frame);
+    render_stepper(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
     render_toasts(frame);
@@ -134,6 +136,17 @@ fn render_empty_state(frame: &mut Frame<'_>) {
         .actions(&actions)
         .policy(EmptyStatePolicy::centered())
         .render(Rect::new(2, 14, 26, 4), frame);
+}
+
+fn render_stepper(frame: &mut Frame<'_>) {
+    let steps = [
+        StepItem::new("plan", "Plan").status(StepStatus::Complete),
+        StepItem::new("build", "Build").status(StepStatus::Current),
+        StepItem::new("ship", "Ship"),
+    ];
+    Stepper::new(&steps)
+        .policy(StepperPolicy::horizontal())
+        .render(Rect::new(35, 12, 33, 1), frame);
 }
 
 fn render_toasts(frame: &mut Frame<'_>) {
@@ -232,6 +245,7 @@ mod tests {
         assert!(rendered.contains("▁▂▂▃▅█"));
         assert!(rendered.contains("Empty State"));
         assert!(rendered.contains("No matching components yet"));
+        assert!(rendered.contains("✓ Plan ── ● Build"));
         assert!(rendered.contains("Saved ×"));
         assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
