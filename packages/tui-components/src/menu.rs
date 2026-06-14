@@ -4,7 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::prelude::Style;
+use bmux_tui::prelude::{Line, Style};
 
 use crate::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListPolicy,
@@ -229,7 +229,7 @@ impl<'a> Menu<'a> {
             .iter()
             .map(|item| SelectableListItem {
                 id: item.id.clone(),
-                label: item.label.clone(),
+                line: Line::from(item.label.clone()),
                 disabled: item.disabled,
             })
             .collect()

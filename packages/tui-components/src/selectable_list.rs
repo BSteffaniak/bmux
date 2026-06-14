@@ -14,8 +14,8 @@ use crate::common::{ComponentMousePolicy, InteractionState};
 pub struct SelectableListItem {
     /// Stable item id chosen by the caller.
     pub id: String,
-    /// Visible item label.
-    pub label: String,
+    /// Visible rich item content.
+    pub line: Line,
     /// Whether this item is disabled independently from the whole list.
     pub disabled: bool,
 }
@@ -24,11 +24,28 @@ impl SelectableListItem {
     /// Create an enabled selectable-list item.
     #[must_use]
     pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        let label = label.into();
         Self {
             id: id.into(),
-            label: label.into(),
+            line: Line::from(label),
             disabled: false,
         }
+    }
+
+    /// Create an enabled selectable-list item with rich line content.
+    #[must_use]
+    pub fn rich(id: impl Into<String>, line: impl Into<Line>) -> Self {
+        Self {
+            id: id.into(),
+            line: line.into(),
+            disabled: false,
+        }
+    }
+
+    /// Return the plain-text label for compatibility with string-oriented callers.
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.line.plain_text()
     }
 
     /// Return this item with disabled state set.
@@ -240,7 +257,7 @@ impl<'a> SelectableList<'a> {
         let width = self
             .items
             .iter()
-            .map(|item| bmux_tui::text_width::display_width(&item.label))
+            .map(|item| item.line.width())
             .max()
             .unwrap_or(0);
 
@@ -301,10 +318,15 @@ impl<'a> SelectableList<'a> {
         } else {
             ' '
         };
-        Line::from_spans(vec![Span::styled(
-            format!("{marker} {}", item.label),
-            self.style_for(index, item, state),
-        )])
+        let style = self.style_for(index, item, state);
+        let mut spans = vec![Span::styled(format!("{marker} "), style)];
+        spans.extend(
+            item.line
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
+        );
+        Line::from_spans(spans)
     }
 
     fn style_for(
@@ -574,8 +596,35 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::prelude::{Line, Span, Style};
 
-    use super::{SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState};
+    use super::{
+        SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
+        SelectableListStyles,
+    };
+
+    #[test]
+    fn renders_rich_line_items_preserving_span_style() {
+        let item_style = Style::new().fg(bmux_tui::style::Color::Yellow);
+        let items = [SelectableListItem::rich(
+            "rich",
+            Line::from_spans([Span::raw("plain "), Span::styled("rich", item_style)]),
+        )];
+        let state = SelectableListState::new(None);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        SelectableList::new(&items).render(Rect::new(0, 0, 14, 1), &state, &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("  plain rich  ")
+        );
+        assert_eq!(
+            frame.buffer().get(Point::new(8, 0)).map(|cell| cell.style),
+            Some(SelectableListStyles::default().normal.patch(item_style))
+        );
+    }
 
     #[test]
     fn renders_selected_item() {
