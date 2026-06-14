@@ -797,6 +797,22 @@ mod tests {
     }
 
     #[test]
+    fn tiny_area_does_not_panic() {
+        let items = [SelectableListItem::multiline(
+            "tiny",
+            [Line::from("first"), Line::from("second")],
+        )];
+        let list = SelectableList::new(&items);
+        let state = SelectableListState::new(Some(0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        list.render(Rect::new(0, 0, 0, 0), &state, &mut frame);
+
+        assert_eq!(list.size(), (10, 2));
+    }
+
+    #[test]
     fn viewport_scrolls_rendered_rows_and_hit_tests_visible_rows() {
         let items = [
             SelectableListItem::new("one", "One"),
