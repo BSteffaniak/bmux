@@ -2,8 +2,9 @@ use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::Line;
-use bmux_tui::style::Color;
+use bmux_tui::prelude::{Clear, Line};
+use bmux_tui::style::{Color, Style};
+use bmux_tui::widget::Widget;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::badge::{Badge, BadgePolicy, BadgeSeverity};
 use bmux_tui_components::bar_chart::{BarChart, BarChartItem, BarChartPolicy};
@@ -208,9 +209,13 @@ fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
     .placement(ModalPlacement::Anchored(bmux_tui::geometry::Point::new(
         36, 18,
     )));
-    modal.render(Rect::new(34, 18, 34, 6), frame);
+    let modal_area = Rect::new(34, 18, 34, 6);
+    Clear::new()
+        .style(Style::new().bg(Color::Black))
+        .render(modal_area, frame);
+    modal.render(modal_area, frame);
     modal.render_line(
-        modal.content_area(Rect::new(34, 18, 34, 6)),
+        modal.content_area(modal_area),
         &Line::from("Opaque modal frame"),
         frame,
     );
