@@ -5,6 +5,7 @@ use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::Line;
 use bmux_tui::style::Color;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
+use bmux_tui_components::badge::{Badge, BadgePolicy, BadgeSeverity};
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
@@ -38,6 +39,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     let theme = ModalTheme::dark(Color::Cyan);
 
     render_buttons(frame);
+    render_badges(frame);
     render_details(frame);
     render_field(frame);
     render_pane(frame);
@@ -64,6 +66,19 @@ fn render_buttons(frame: &mut Frame<'_>) {
     let mut state = ActionRowState::new();
     state.set_focused(Some(0));
     ActionRow::new(&actions).render_state(Rect::new(1, 3, 30, 1), &state, frame);
+}
+
+fn render_badges(frame: &mut Frame<'_>) {
+    Badge::new("info")
+        .severity(BadgeSeverity::Info)
+        .policy(BadgePolicy::pill().uppercase(true))
+        .render(Rect::new(1, 3, 10, 1), frame);
+    Badge::new("ok")
+        .severity(BadgeSeverity::Success)
+        .render(Rect::new(12, 3, 8, 1), frame);
+    Badge::new("warn")
+        .severity(BadgeSeverity::Warning)
+        .render(Rect::new(21, 3, 10, 1), frame);
 }
 
 fn render_details(frame: &mut Frame<'_>) {
@@ -197,6 +212,8 @@ mod tests {
         let rendered = rows(&render_gallery()).join("\n");
 
         assert!(rendered.contains("[ Save ]"));
+        assert!(rendered.contains("‹ INFO ›"));
+        assert!(rendered.contains("[ ok ]"));
         assert!(rendered.contains("LabeledDetails"));
         assert!(rendered.contains("Pane content area"));
         assert!(rendered.contains("70% indexed"));
