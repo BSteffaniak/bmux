@@ -407,11 +407,25 @@ fn render_lines(lines: &[Line], width: u16, wrap: TextWrap, trim: bool) -> Vec<L
         };
         match wrap {
             TextWrap::None => rendered.push(line),
-            TextWrap::Character => rendered.extend(wrap_line(&line, usize::from(width.max(1)))),
-            TextWrap::Word => rendered.extend(wrap_line_words(&line, usize::from(width.max(1)))),
+            TextWrap::Character => {
+                let wrapped = wrap_line(&line, usize::from(width.max(1)));
+                rendered.extend(trim_wrapped_lines(wrapped, trim));
+            }
+            TextWrap::Word => {
+                let wrapped = wrap_line_words(&line, usize::from(width.max(1)));
+                rendered.extend(trim_wrapped_lines(wrapped, trim));
+            }
         }
     }
     rendered
+}
+
+fn trim_wrapped_lines(lines: Vec<Line>, trim: bool) -> Vec<Line> {
+    if trim {
+        lines.into_iter().map(|line| trim_line_end(&line)).collect()
+    } else {
+        lines
+    }
 }
 
 fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
@@ -472,7 +486,7 @@ fn wrap_line_words(line: &Line, width: usize) -> Vec<Line> {
             );
         }
     }
-    lines.into_iter().map(|line| trim_line_end(&line)).collect()
+    lines
 }
 
 fn push_word_segment(
@@ -569,6 +583,19 @@ mod tests {
     }
 
     #[test]
+    fn wrap_trim_removes_trailing_whitespace_from_wrapped_rows() {
+        let lines = [Line::from("ab  cd")];
+        let view = TextView::new(&lines).policy(TextViewPolicy {
+            trim: true,
+            ..TextViewPolicy::default()
+        });
+        let layout = view.layout(Rect::new(0, 0, 4, 2), &TextViewState::new());
+
+        assert_eq!(layout.lines[0].plain_text(), "ab");
+        assert_eq!(layout.lines[1].plain_text(), "cd");
+    }
+
+    #[test]
     fn clamp_helpers_account_for_wrapped_line_count() {
         let lines = [Line::from("abcdef")];
         let view = TextView::new(&lines);
@@ -651,6 +678,7 @@ mod tests {
         let lines = [Line::from("one two")];
         let view = TextView::new(&lines).policy(TextViewPolicy {
             wrap: bmux_tui::prelude::TextWrap::Word,
+            trim: true,
             ..TextViewPolicy::bare()
         });
         let layout = view.layout(Rect::new(0, 0, 6, 2), &TextViewState::new());

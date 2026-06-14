@@ -140,11 +140,25 @@ fn render_lines_for_text_block(text: &Text, width: u16, wrap: TextWrap, trim: bo
         };
         match wrap {
             TextWrap::None => lines.push(line),
-            TextWrap::Character => lines.extend(wrap_line(&line, usize::from(width.max(1)))),
-            TextWrap::Word => lines.extend(wrap_line_words(&line, usize::from(width.max(1)))),
+            TextWrap::Character => {
+                let wrapped = wrap_line(&line, usize::from(width.max(1)));
+                lines.extend(trim_wrapped_lines(wrapped, trim));
+            }
+            TextWrap::Word => {
+                let wrapped = wrap_line_words(&line, usize::from(width.max(1)));
+                lines.extend(trim_wrapped_lines(wrapped, trim));
+            }
         }
     }
     lines
+}
+
+fn trim_wrapped_lines(lines: Vec<Line>, trim: bool) -> Vec<Line> {
+    if trim {
+        lines.into_iter().map(|line| trim_line_end(&line)).collect()
+    } else {
+        lines
+    }
 }
 
 fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
@@ -209,7 +223,7 @@ fn wrap_line_words(line: &Line, width: usize) -> Vec<Line> {
         }
     }
 
-    lines.into_iter().map(|line| trim_line_end(&line)).collect()
+    lines
 }
 
 fn push_word_segment(
@@ -389,6 +403,20 @@ mod tests {
                 .map(|cell| cell.style),
             Some(style)
         );
+    }
+
+    #[test]
+    fn text_block_wrap_trim_removes_trailing_whitespace_from_wrapped_rows() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextBlock::new("ab  cd")
+            .wrap(TextWrap::Character)
+            .trim(true)
+            .render(Rect::new(0, 0, 4, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("ab  "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("cd  "));
     }
 
     #[test]
