@@ -118,7 +118,7 @@ impl<'a> TableColumn<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRow {
     /// Row cells.
-    pub cells: Vec<Line>,
+    pub cells: Vec<Vec<Line>>,
     /// Whether this row cannot be selected.
     pub disabled: bool,
 }
@@ -128,18 +128,51 @@ impl TableRow {
     #[must_use]
     pub fn new<'a>(cells: impl Into<Vec<&'a str>>) -> Self {
         Self {
-            cells: cells.into().into_iter().map(Line::from).collect(),
+            cells: cells
+                .into()
+                .into_iter()
+                .map(|cell| vec![Line::from(cell)])
+                .collect(),
             disabled: false,
         }
     }
 
-    /// Create a row from rich cell content.
+    /// Create a row from rich single-line cell content.
     #[must_use]
     pub fn rich(cells: impl Into<Vec<Line>>) -> Self {
+        Self {
+            cells: cells.into().into_iter().map(|cell| vec![cell]).collect(),
+            disabled: false,
+        }
+    }
+
+    /// Create a row from rich multiline cell content.
+    #[must_use]
+    pub fn multiline(cells: impl Into<Vec<Vec<Line>>>) -> Self {
         Self {
             cells: cells.into(),
             disabled: false,
         }
+    }
+
+    /// Return row height in rendered lines.
+    #[must_use]
+    pub fn height(&self) -> usize {
+        self.cells.iter().map(Vec::len).max().unwrap_or(1).max(1)
+    }
+
+    /// Return plain text for one cell, joining multiline content with newlines.
+    #[must_use]
+    pub fn cell_plain_text(&self, index: usize) -> String {
+        self.cells
+            .get(index)
+            .map(|cell| {
+                cell.iter()
+                    .map(Line::plain_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
     }
 
     /// Return this row with disabled state set.
@@ -411,18 +444,30 @@ impl<'a> Table<'a> {
             return;
         }
         let scroll = self.effective_scroll(state, layout.body.height);
-        for (visible, source) in (scroll..self.rows.len())
-            .take(usize::from(layout.body.height))
-            .enumerate()
-        {
-            let y = layout.body.y.saturating_add(u16_saturating(visible));
-            let rect = Rect::new(layout.body.x, y, layout.body.width, 1);
+        let mut rendered = 0usize;
+        for source in scroll..self.rows.len() {
             let row = &self.rows[source];
-            frame.write_line_with_fallback_style(
-                rect,
-                &self.row_line(&layout.column_widths, row.cells.iter().cloned(), false),
-                self.row_style(source, row, state),
-            );
+            for line_index in 0..row.height() {
+                if rendered >= usize::from(layout.body.height) {
+                    return;
+                }
+                let y = layout.body.y.saturating_add(u16_saturating(rendered));
+                let rect = Rect::new(layout.body.x, y, layout.body.width, 1);
+                frame.write_line_with_fallback_style(
+                    rect,
+                    &self.row_line(
+                        &layout.column_widths,
+                        row.cells.iter().map(|cell| {
+                            cell.get(line_index)
+                                .cloned()
+                                .unwrap_or_else(|| Line::from(""))
+                        }),
+                        false,
+                    ),
+                    self.row_style(source, row, state),
+                );
+                rendered = rendered.saturating_add(1);
+            }
         }
     }
 
@@ -495,10 +540,15 @@ impl<'a> Table<'a> {
             return None;
         }
         let visible = usize::from(position.y.saturating_sub(layout.body.y));
-        let source = self
-            .effective_scroll(state, layout.body.height)
-            .saturating_add(visible);
-        (source < self.rows.len()).then_some(source)
+        let mut rendered = 0usize;
+        for source in self.effective_scroll(state, layout.body.height)..self.rows.len() {
+            let height = self.rows[source].height();
+            if visible < rendered.saturating_add(height) {
+                return Some(source);
+            }
+            rendered = rendered.saturating_add(height);
+        }
+        None
     }
 
     fn move_selection(&self, state: &mut TableState, delta: i32) -> TableOutcome {
@@ -782,6 +832,34 @@ mod tests {
             frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
             Some(TableStyles::default().row.patch(cell_style))
         );
+    }
+
+    #[test]
+    fn renders_multiline_rows_and_hit_tests_full_height() {
+        let columns = [TableColumn::new("Name").fixed(8)];
+        let rows = [
+            TableRow::multiline(vec![vec![Line::from("one-a"), Line::from("one-b")]]),
+            TableRow::new(vec!["two"]),
+        ];
+        let mut state = TableState::new(None);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows).render(Rect::new(0, 0, 8, 4), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("one-a   "));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("one-b   "));
+        assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("two     "));
+
+        assert_eq!(
+            Table::new(&columns, &rows).handle_event(
+                Rect::new(0, 0, 8, 4),
+                &mut state,
+                &Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(0, 2))),
+            ),
+            TableOutcome::Redraw
+        );
+        assert_eq!(state.hovered, Some(0));
     }
 
     #[test]

@@ -155,14 +155,11 @@ impl NavigationDemo {
             event,
         ) {
             TableOutcome::Selected(index) => {
-                self.message = format!(
-                    "Table selected: {}",
-                    table_rows[index].cells[0].plain_text()
-                );
+                self.message = format!("Table selected: {}", table_rows[index].cell_plain_text(0));
                 return false;
             }
             TableOutcome::Focused(index) => {
-                self.message = format!("Table focus: {}", table_rows[index].cells[0].plain_text());
+                self.message = format!("Table focus: {}", table_rows[index].cell_plain_text(0));
                 return false;
             }
             TableOutcome::Ignored | TableOutcome::Redraw => {}
@@ -427,7 +424,7 @@ pub fn demonstrate_table_selection() -> String {
         &Event::Key(KeyStroke::simple(KeyCode::Enter)),
     ) {
         TableOutcome::Selected(index) => {
-            format!("Table selected: {}", rows[index].cells[0].plain_text())
+            format!("Table selected: {}", rows[index].cell_plain_text(0))
         }
         TableOutcome::Ignored | TableOutcome::Redraw | TableOutcome::Focused(_) => {
             "Table ignored".to_string()
