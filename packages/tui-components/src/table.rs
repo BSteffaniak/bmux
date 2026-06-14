@@ -190,6 +190,7 @@ pub struct TableState {
     selected_column: Option<usize>,
     hovered: Option<usize>,
     scroll: usize,
+    horizontal_scroll: usize,
     /// Generic interaction flags.
     pub interaction: InteractionState,
 }
@@ -203,6 +204,7 @@ impl TableState {
             selected_column: None,
             hovered: None,
             scroll: 0,
+            horizontal_scroll: 0,
             interaction: InteractionState::new(),
         }
     }
@@ -227,6 +229,17 @@ impl TableState {
     /// Set selected source column.
     pub const fn set_selected_column(&mut self, selected_column: Option<usize>) {
         self.selected_column = selected_column;
+    }
+
+    /// Return horizontal scroll offset in rendered columns.
+    #[must_use]
+    pub const fn horizontal_scroll(&self) -> usize {
+        self.horizontal_scroll
+    }
+
+    /// Set horizontal scroll offset in rendered columns.
+    pub const fn set_horizontal_scroll(&mut self, horizontal_scroll: usize) {
+        self.horizontal_scroll = horizontal_scroll;
     }
 
     /// Return row scroll offset.
@@ -464,22 +477,24 @@ impl<'a> Table<'a> {
         }
         let layout = self.layout(area);
         if let Some(header) = layout.header {
+            let line = self.row_line(
+                &layout.column_widths,
+                self.columns.iter().map(|column| Line::from(column.title)),
+                true,
+                None,
+                state,
+            );
             frame.write_line_with_fallback_style(
                 header,
-                &self.row_line(
-                    &layout.column_widths,
-                    self.columns.iter().map(|column| Line::from(column.title)),
-                    true,
-                    None,
-                    state,
-                ),
+                &scroll_line(&line, state.horizontal_scroll),
                 self.styles.header,
             );
         }
         if let Some(separator) = layout.header_separator {
+            let line = self.separator_line(&layout.column_widths);
             frame.write_line_with_fallback_style(
                 separator,
-                &self.separator_line(&layout.column_widths),
+                &scroll_line(&line, state.horizontal_scroll),
                 self.styles.separator,
             );
         }
@@ -501,19 +516,20 @@ impl<'a> Table<'a> {
                 }
                 let y = layout.body.y.saturating_add(u16_saturating(rendered));
                 let rect = Rect::new(layout.body.x, y, layout.body.width, 1);
+                let line = self.row_line(
+                    &layout.column_widths,
+                    row.cells.iter().map(|cell| {
+                        cell.get(line_index)
+                            .cloned()
+                            .unwrap_or_else(|| Line::from(""))
+                    }),
+                    false,
+                    Some(source),
+                    state,
+                );
                 frame.write_line_with_fallback_style(
                     rect,
-                    &self.row_line(
-                        &layout.column_widths,
-                        row.cells.iter().map(|cell| {
-                            cell.get(line_index)
-                                .cloned()
-                                .unwrap_or_else(|| Line::from(""))
-                        }),
-                        false,
-                        Some(source),
-                        state,
-                    ),
+                    &scroll_line(&line, state.horizontal_scroll),
                     self.row_style(source, row, state),
                 );
                 rendered = rendered.saturating_add(1);
@@ -532,8 +548,8 @@ impl<'a> Table<'a> {
                 KeyCode::Down => self.move_selection(state, 1),
                 KeyCode::Home => self.select_index(state, 0),
                 KeyCode::End => self.select_index(state, self.rows.len().saturating_sub(1)),
-                KeyCode::Left => self.move_column(state, -1),
-                KeyCode::Right => self.move_column(state, 1),
+                KeyCode::Left => self.scroll_horizontal(state, -1),
+                KeyCode::Right => self.scroll_horizontal(state, 1),
                 KeyCode::Enter => state
                     .selected
                     .map_or(TableOutcome::Ignored, TableOutcome::Selected),
@@ -577,12 +593,12 @@ impl<'a> Table<'a> {
                 state.scroll = state.scroll.saturating_sub(1);
                 TableOutcome::Redraw
             }
+            MouseEventKind::ScrollLeft => self.scroll_horizontal(state, -1),
+            MouseEventKind::ScrollRight => self.scroll_horizontal(state, 1),
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
-            | MouseEventKind::Move
-            | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight => TableOutcome::Ignored,
+            | MouseEventKind::Move => TableOutcome::Ignored,
         }
     }
 
@@ -622,6 +638,20 @@ impl<'a> Table<'a> {
             return TableOutcome::Ignored;
         }
         self.select_index(state, next)
+    }
+
+    fn scroll_horizontal(&self, state: &mut TableState, delta: i32) -> TableOutcome {
+        let before_scroll = state.horizontal_scroll;
+        let before_column = state.selected_column;
+        let current = i32::try_from(state.horizontal_scroll).unwrap_or(i32::MAX);
+        state.horizontal_scroll =
+            usize::try_from(current.saturating_add(delta).max(0)).unwrap_or(usize::MAX);
+        let _ = self.move_column(state, delta);
+        if state.horizontal_scroll == before_scroll && state.selected_column == before_column {
+            TableOutcome::Ignored
+        } else {
+            TableOutcome::Redraw
+        }
     }
 
     fn move_column(&self, state: &mut TableState, delta: i32) -> TableOutcome {
@@ -733,6 +763,31 @@ impl<'a> Table<'a> {
         }
         Line::from_spans(spans)
     }
+}
+
+fn scroll_line(line: &Line, offset: usize) -> Line {
+    if offset == 0 {
+        return line.clone();
+    }
+    let mut remaining = offset;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let mut content = String::new();
+        for ch in span.content.chars() {
+            let mut buf = [0; 4];
+            let grapheme = ch.encode_utf8(&mut buf);
+            let width = display_width(grapheme);
+            if remaining >= width {
+                remaining = remaining.saturating_sub(width);
+            } else {
+                content.push_str(grapheme);
+            }
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    Line::from_spans(spans)
 }
 
 fn format_cell_line(line: &Line, width: u16, align: TableAlign, truncate: bool) -> Line {
@@ -924,6 +979,39 @@ mod tests {
             frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
             Some(TableStyles::default().row.patch(cell_style))
         );
+    }
+
+    #[test]
+    fn horizontal_scroll_offsets_rendered_columns_and_keys_mark_focus_column() {
+        let columns = [
+            TableColumn::new("A").fixed(4),
+            TableColumn::new("B").fixed(4),
+        ];
+        let rows = [TableRow::new(vec!["abcd", "efgh"])];
+        let mut state = TableState::new(Some(0));
+        state.set_horizontal_scroll(2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(TablePolicy {
+                header: false,
+                ..TablePolicy::default()
+            })
+            .render(Rect::new(0, 0, 5, 2), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cd ef"));
+
+        assert_eq!(
+            Table::new(&columns, &rows).handle_event(
+                Rect::new(0, 0, 5, 2),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            ),
+            TableOutcome::Redraw
+        );
+        assert_eq!(state.horizontal_scroll(), 3);
+        assert_eq!(state.selected_column(), Some(1));
     }
 
     #[test]
