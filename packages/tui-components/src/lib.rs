@@ -31,6 +31,7 @@ pub mod select_dropdown;
 pub mod selectable_list;
 pub mod status_bar;
 pub mod tab_bar;
+pub mod table;
 #[cfg(feature = "text-input")]
 pub mod text_input;
 #[cfg(feature = "text-input")]
