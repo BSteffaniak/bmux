@@ -17,6 +17,7 @@ use bmux_tui_components::status_bar::{
 };
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{Table, TableColumn, TableOutcome, TableRow, TableState};
+use bmux_tui_components::text_view::{TextView, TextViewState};
 use bmux_tui_components::tree_view::{
     TreeView, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
 };
@@ -31,6 +32,7 @@ pub struct NavigationDemo {
     menu: MenuState,
     table: TableState,
     scroll: ScrollAreaState,
+    text: TextViewState,
     pane_scroll: ScrollAreaState,
     message: String,
 }
@@ -53,6 +55,7 @@ impl NavigationDemo {
                 state.set_vertical_offset(1);
                 state
             },
+            text: TextViewState::new(),
             pane_scroll: ScrollAreaState::new(),
             message: "Use arrows/Enter, wheel over scroll pane, q quits".to_string(),
         }
@@ -145,6 +148,14 @@ impl NavigationDemo {
                 return false;
             }
             TableOutcome::Ignored | TableOutcome::Redraw => {}
+        }
+
+        let text_lines = text_view_lines();
+        if let bmux_tui_components::text_view::TextViewOutcome::Scrolled { vertical_scroll } =
+            TextView::new(&text_lines).handle_event(Rect::new(1, 13, 68, 2), &mut self.text, event)
+        {
+            self.message = format!("Text scrolled: {vertical_scroll}");
+            return false;
         }
 
         let pane = scroll_delegate_pane();
@@ -246,6 +257,9 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     pane.render(&pane_state, frame);
     let pane_lines = pane_scroll_lines();
     ScrollArea::new(&pane_lines).render(pane.inner_area(&pane_state), &demo.pane_scroll, frame);
+
+    let text_lines = text_view_lines();
+    TextView::new(&text_lines).render(Rect::new(1, 13, 68, 2), &demo.text, frame);
     MessageBar::new(&demo.message)
         .severity(StatusSeverity::Info)
         .styles(StatusBarStyles {
@@ -347,6 +361,15 @@ pub fn demonstrate_tree_selection() -> String {
     demo.message
 }
 
+pub fn demonstrate_text_view_scroll() -> usize {
+    let mut demo = NavigationDemo::new();
+    let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
+        bmux_tui::event::MouseEventKind::ScrollDown,
+        bmux_tui::geometry::Point::new(2, 13),
+    )));
+    demo.text.vertical_scroll()
+}
+
 pub fn demonstrate_table_selection() -> String {
     let columns = table_columns();
     let rows = table_rows();
@@ -431,6 +454,14 @@ fn scroll_lines() -> [Line; 4] {
     ]
 }
 
+fn text_view_lines() -> [Line; 3] {
+    [
+        Line::from("TextView wraps long read-only content for details panes."),
+        Line::from("Mouse wheel or PageDown scrolls without owning app state."),
+        Line::from("The caller still owns the text lines."),
+    ]
+}
+
 fn pane_scroll_lines() -> [Line; 6] {
     [
         Line::from("Delegated line zero"),
@@ -474,7 +505,7 @@ mod tests {
     use super::{
         demonstrate_delegated_pane_scroll_offset, demonstrate_menu_activation,
         demonstrate_pane_scroll_delegation, demonstrate_table_selection,
-        demonstrate_tree_selection, render_navigation, rows,
+        demonstrate_text_view_scroll, demonstrate_tree_selection, render_navigation, rows,
     };
 
     #[test]
@@ -489,6 +520,7 @@ mod tests {
         assert!(rendered.contains("Delegated line zero"));
         assert!(rendered.contains("Name"));
         assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("TextView wraps"));
         assert!(rendered.contains("enter select"));
         assert!(rendered.contains("ready"));
     }
@@ -507,6 +539,11 @@ mod tests {
     #[test]
     fn delegated_pane_scroll_updates_nested_scroll_area() {
         assert_eq!(demonstrate_delegated_pane_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn text_view_mouse_wheel_updates_scroll() {
+        assert_eq!(demonstrate_text_view_scroll(), 1);
     }
 
     #[test]
