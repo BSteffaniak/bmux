@@ -55,6 +55,32 @@ impl TextViewState {
     }
 }
 
+/// Highlight range applied to caller-owned source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextViewHighlight {
+    /// Source line index.
+    pub line: usize,
+    /// Start character offset, inclusive.
+    pub start: usize,
+    /// End character offset, exclusive.
+    pub end: usize,
+    /// Style patched onto highlighted text.
+    pub style: Style,
+}
+
+impl TextViewHighlight {
+    /// Create a highlight range.
+    #[must_use]
+    pub const fn new(line: usize, start: usize, end: usize, style: Style) -> Self {
+        Self {
+            line,
+            start,
+            end,
+            style,
+        }
+    }
+}
+
 /// Text-view behavior policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -152,6 +178,7 @@ pub struct TextViewLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextView<'a> {
     lines: &'a [Line],
+    highlights: &'a [TextViewHighlight],
     policy: TextViewPolicy,
     styles: TextViewStyles,
     empty: &'a str,
@@ -163,6 +190,7 @@ impl<'a> TextView<'a> {
     pub const fn new(lines: &'a [Line]) -> Self {
         Self {
             lines,
+            highlights: &[],
             policy: TextViewPolicy {
                 wrap: TextWrap::Character,
                 alignment: Alignment::Left,
@@ -178,6 +206,13 @@ impl<'a> TextView<'a> {
             },
             empty: "No content",
         }
+    }
+
+    /// Set highlighted source text ranges.
+    #[must_use]
+    pub const fn highlights(mut self, highlights: &'a [TextViewHighlight]) -> Self {
+        self.highlights = highlights;
+        self
     }
 
     /// Set behavior policy.
@@ -204,7 +239,8 @@ impl<'a> TextView<'a> {
     /// Compute rendered lines and clamped scroll.
     #[must_use]
     pub fn layout(&self, area: Rect, state: &TextViewState) -> TextViewLayout {
-        let lines = render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim);
+        let lines = apply_highlights(self.lines, self.highlights);
+        let lines = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim);
         let vertical_scroll = self.clamped_vertical_scroll(area, state);
         TextViewLayout {
             lines,
@@ -215,8 +251,8 @@ impl<'a> TextView<'a> {
     /// Return the maximum vertical scroll for this area.
     #[must_use]
     pub fn max_vertical_scroll(&self, area: Rect) -> usize {
-        let line_count =
-            render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim).len();
+        let lines = apply_highlights(self.lines, self.highlights);
+        let line_count = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim).len();
         clamp_scroll(line_count, line_count, area.height)
     }
 
@@ -233,8 +269,8 @@ impl<'a> TextView<'a> {
     /// Return the clamped vertical scroll for this area.
     #[must_use]
     pub fn clamped_vertical_scroll(&self, area: Rect, state: &TextViewState) -> usize {
-        let line_count =
-            render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim).len();
+        let lines = apply_highlights(self.lines, self.highlights);
+        let line_count = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim).len();
         clamp_scroll(state.vertical_scroll, line_count, area.height)
     }
 
@@ -248,8 +284,8 @@ impl<'a> TextView<'a> {
 
     /// Clamp caller-owned state to valid scroll bounds for this area.
     pub fn clamp_state(&self, area: Rect, state: &mut TextViewState) {
-        let line_count =
-            render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim).len();
+        let lines = apply_highlights(self.lines, self.highlights);
+        let line_count = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim).len();
         state.clamp_to(line_count, area.height, self.max_horizontal_scroll(area));
     }
 
@@ -367,6 +403,41 @@ impl<'a> TextView<'a> {
             TextViewOutcome::Redraw
         }
     }
+}
+
+fn apply_highlights(lines: &[Line], highlights: &[TextViewHighlight]) -> Vec<Line> {
+    if highlights.is_empty() {
+        return lines.to_vec();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(line_index, line)| apply_line_highlights(line, line_index, highlights))
+        .collect()
+}
+
+fn apply_line_highlights(line: &Line, line_index: usize, highlights: &[TextViewHighlight]) -> Line {
+    let line_highlights = highlights
+        .iter()
+        .copied()
+        .filter(|highlight| highlight.line == line_index && highlight.start < highlight.end)
+        .collect::<Vec<_>>();
+    if line_highlights.is_empty() {
+        return line.clone();
+    }
+    let mut spans = Vec::new();
+    let mut char_index = 0usize;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let style = line_highlights
+                .iter()
+                .filter(|highlight| char_index >= highlight.start && char_index < highlight.end)
+                .fold(span.style, |style, highlight| style.patch(highlight.style));
+            spans.push(Span::styled(ch.to_string(), style));
+            char_index = char_index.saturating_add(1);
+        }
+    }
+    Line::from_spans(spans)
 }
 
 fn horizontally_scrolled_line(line: &Line, scroll: usize) -> Line {
@@ -570,8 +641,9 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::prelude::{Alignment, Line};
+    use bmux_tui::style::{Color, Style};
 
-    use super::{TextView, TextViewOutcome, TextViewPolicy, TextViewState};
+    use super::{TextView, TextViewHighlight, TextViewOutcome, TextViewPolicy, TextViewState};
 
     #[test]
     fn wraps_content_to_area_width() {
@@ -580,6 +652,35 @@ mod tests {
         let layout = view.layout(Rect::new(0, 0, 3, 5), &TextViewState::new());
 
         assert_eq!(layout.lines.len(), 2);
+    }
+
+    #[test]
+    fn highlights_source_ranges_without_owning_search_state() {
+        let lines = [Line::from("abcdef")];
+        let highlights = [TextViewHighlight::new(
+            0,
+            2,
+            4,
+            Style::new().fg(Color::Yellow),
+        )];
+        let view = TextView::new(&lines).highlights(&highlights);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        view.render(Rect::new(0, 0, 6, 1), &TextViewState::new(), &mut frame);
+
+        assert_eq!(
+            frame.buffer().get(Point::new(1, 0)).map(|cell| cell.style),
+            Some(Style::new())
+        );
+        assert_eq!(
+            frame.buffer().get(Point::new(2, 0)).map(|cell| cell.style),
+            Some(Style::new().fg(Color::Yellow))
+        );
+        assert_eq!(
+            frame.buffer().get(Point::new(3, 0)).map(|cell| cell.style),
+            Some(Style::new().fg(Color::Yellow))
+        );
     }
 
     #[test]
