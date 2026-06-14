@@ -47,6 +47,12 @@ impl TextViewState {
     pub const fn set_horizontal_scroll(&mut self, horizontal_scroll: usize) {
         self.horizontal_scroll = horizontal_scroll;
     }
+
+    /// Clamp scroll offsets to the supplied rendered content bounds.
+    pub fn clamp_to(&mut self, line_count: usize, height: u16, max_horizontal_scroll: usize) {
+        self.vertical_scroll = clamp_scroll(self.vertical_scroll, line_count, height);
+        self.horizontal_scroll = self.horizontal_scroll.min(max_horizontal_scroll);
+    }
 }
 
 /// Text-view behavior policy.
@@ -199,11 +205,52 @@ impl<'a> TextView<'a> {
     #[must_use]
     pub fn layout(&self, area: Rect, state: &TextViewState) -> TextViewLayout {
         let lines = render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim);
-        let vertical_scroll = clamp_scroll(state.vertical_scroll, lines.len(), area.height);
+        let vertical_scroll = self.clamped_vertical_scroll(area, state);
         TextViewLayout {
             lines,
             vertical_scroll,
         }
+    }
+
+    /// Return the maximum vertical scroll for this area.
+    #[must_use]
+    pub fn max_vertical_scroll(&self, area: Rect) -> usize {
+        let line_count =
+            render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim).len();
+        clamp_scroll(line_count, line_count, area.height)
+    }
+
+    /// Return the maximum horizontal scroll for this area.
+    #[must_use]
+    pub fn max_horizontal_scroll(&self, area: Rect) -> usize {
+        if self.policy.wrap == TextWrap::None {
+            max_horizontal_scroll(self.lines, area.width)
+        } else {
+            0
+        }
+    }
+
+    /// Return the clamped vertical scroll for this area.
+    #[must_use]
+    pub fn clamped_vertical_scroll(&self, area: Rect, state: &TextViewState) -> usize {
+        let line_count =
+            render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim).len();
+        clamp_scroll(state.vertical_scroll, line_count, area.height)
+    }
+
+    /// Return the clamped horizontal scroll for this area.
+    #[must_use]
+    pub fn clamped_horizontal_scroll(&self, area: Rect, state: &TextViewState) -> usize {
+        state
+            .horizontal_scroll
+            .min(self.max_horizontal_scroll(area))
+    }
+
+    /// Clamp caller-owned state to valid scroll bounds for this area.
+    pub fn clamp_state(&self, area: Rect, state: &mut TextViewState) {
+        let line_count =
+            render_lines(self.lines, area.width, self.policy.wrap, self.policy.trim).len();
+        state.clamp_to(line_count, area.height, self.max_horizontal_scroll(area));
     }
 
     /// Render text view.
@@ -220,10 +267,11 @@ impl<'a> TextView<'a> {
         }
         let layout = self.layout(area, state);
         let lines = if self.policy.wrap == TextWrap::None && state.horizontal_scroll > 0 {
+            let horizontal_scroll = self.clamped_horizontal_scroll(area, state);
             layout
                 .lines
                 .into_iter()
-                .map(|line| horizontally_scrolled_line(&line, state.horizontal_scroll))
+                .map(|line| horizontally_scrolled_line(&line, horizontal_scroll))
                 .collect()
         } else {
             layout.lines
@@ -311,7 +359,7 @@ impl<'a> TextView<'a> {
         }
         let current = i32::try_from(state.horizontal_scroll).unwrap_or(i32::MAX);
         let next = usize::try_from(current.saturating_add(delta).max(0)).unwrap_or(usize::MAX);
-        let next = next.min(max_horizontal_scroll(self.lines, area.width));
+        let next = next.min(self.max_horizontal_scroll(area));
         if next == state.horizontal_scroll {
             TextViewOutcome::Ignored
         } else {
@@ -518,6 +566,38 @@ mod tests {
         let layout = view.layout(Rect::new(0, 0, 3, 5), &TextViewState::new());
 
         assert_eq!(layout.lines.len(), 2);
+    }
+
+    #[test]
+    fn clamp_helpers_account_for_wrapped_line_count() {
+        let lines = [Line::from("abcdef")];
+        let view = TextView::new(&lines);
+        let mut state = TextViewState::new();
+        state.set_vertical_scroll(99);
+
+        assert_eq!(view.max_vertical_scroll(Rect::new(0, 0, 3, 1)), 1);
+        assert_eq!(
+            view.clamped_vertical_scroll(Rect::new(0, 0, 3, 1), &state),
+            1
+        );
+        view.clamp_state(Rect::new(0, 0, 3, 1), &mut state);
+        assert_eq!(state.vertical_scroll(), 1);
+    }
+
+    #[test]
+    fn clamp_helpers_account_for_horizontal_scroll() {
+        let lines = [Line::from("abcdef")];
+        let view = TextView::new(&lines).policy(TextViewPolicy::bare());
+        let mut state = TextViewState::new();
+        state.set_horizontal_scroll(99);
+
+        assert_eq!(view.max_horizontal_scroll(Rect::new(0, 0, 3, 1)), 3);
+        assert_eq!(
+            view.clamped_horizontal_scroll(Rect::new(0, 0, 3, 1), &state),
+            3
+        );
+        view.clamp_state(Rect::new(0, 0, 3, 1), &mut state);
+        assert_eq!(state.horizontal_scroll(), 3);
     }
 
     #[test]
