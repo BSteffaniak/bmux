@@ -268,7 +268,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
 
     let table_columns = table_columns();
     let table_rows = table_rows();
-    Table::new(&table_columns, &table_rows).render(Rect::new(1, 9, 24, 4), &demo.table, frame);
+    Table::new(&table_columns, &table_rows).render(Rect::new(1, 9, 32, 4), &demo.table, frame);
 
     let pane = scroll_delegate_pane();
     let pane_state = PaneState::new(scroll_delegate_pane_area());
@@ -485,18 +485,28 @@ fn list_items() -> [SelectableListItem; 3] {
     ]
 }
 
-fn table_columns() -> [TableColumn<'static>; 2] {
+fn table_columns() -> [TableColumn<'static>; 3] {
     [
-        TableColumn::new("Name").fixed(12),
+        TableColumn::new("Name").min(8),
         TableColumn::new("Kind").fixed(8),
+        TableColumn::new("Progress").percentage(25),
     ]
 }
 
 fn table_rows() -> [TableRow; 3] {
     [
-        TableRow::new(vec!["alpha", "file"]),
-        TableRow::new(vec!["beta", "dir"]),
-        TableRow::new(vec!["gamma", "link"]),
+        TableRow::rich(vec![
+            Line::from_spans([Span::styled(
+                "alpha",
+                Style::new()
+                    .fg(Color::BrightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("file"),
+            Line::from("75%"),
+        ]),
+        TableRow::new(vec!["beta", "dir", "40%"]),
+        TableRow::new(vec!["gamma", "link", "10%"]),
     ]
 }
 
@@ -594,7 +604,7 @@ mod tests {
         assert!(rendered.contains("Scroll one"));
         assert!(rendered.contains("Delegated line zero"));
         assert!(rendered.contains("Name"));
-        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("75%"));
         assert!(rendered.contains("TextView wraps"));
         assert!(rendered.contains("enter select"));
         assert!(rendered.contains("ready"));
