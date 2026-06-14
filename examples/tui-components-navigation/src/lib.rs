@@ -20,7 +20,9 @@ use bmux_tui_components::status_bar::{
 };
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{Table, TableColumn, TableOutcome, TableRow, TableState};
-use bmux_tui_components::text_view::{TextView, TextViewState};
+use bmux_tui_components::text_view::{
+    TextView, TextViewCursor, TextViewHighlight, TextViewSelection, TextViewState,
+};
 use bmux_tui_components::tree_view::{
     TreeView, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
 };
@@ -275,7 +277,21 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     ScrollArea::new(&pane_lines).render(pane.inner_area(&pane_state), &demo.pane_scroll, frame);
 
     let text_lines = text_view_lines();
-    TextView::new(&text_lines).render(Rect::new(1, 13, 68, 2), &demo.text, frame);
+    let text_highlights = text_view_highlights();
+    TextView::new(&text_lines)
+        .highlights(&text_highlights)
+        .selection(Some(TextViewSelection::new(
+            1,
+            0,
+            11,
+            Style::new().bg(Color::Blue),
+        )))
+        .cursor(Some(TextViewCursor::new(
+            0,
+            8,
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )))
+        .render(Rect::new(1, 13, 68, 2), &demo.text, frame);
     MessageBar::new(&demo.message)
         .severity(StatusSeverity::Info)
         .styles(StatusBarStyles {
@@ -490,6 +506,15 @@ fn text_view_lines() -> [Line; 3] {
         Line::from("Mouse wheel or PageDown scrolls without owning app state."),
         Line::from("The caller still owns the text lines."),
     ]
+}
+
+fn text_view_highlights() -> [TextViewHighlight; 1] {
+    [TextViewHighlight::new(
+        0,
+        0,
+        8,
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn pane_scroll_lines() -> [Line; 6] {
