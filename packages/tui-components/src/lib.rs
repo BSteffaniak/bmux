@@ -36,4 +36,5 @@ pub mod table;
 pub mod text_input;
 #[cfg(feature = "text-input")]
 pub mod text_input_box;
+pub mod text_view;
 pub mod tree_view;
