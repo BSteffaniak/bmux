@@ -29,6 +29,7 @@ pub mod radio_group;
 pub mod scroll_area;
 pub mod select_dropdown;
 pub mod selectable_list;
+pub mod sparkline;
 pub mod status_bar;
 pub mod tab_bar;
 pub mod table;
