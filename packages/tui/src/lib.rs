@@ -12,6 +12,7 @@ pub mod ansi;
 pub mod blocks;
 pub mod buffer;
 pub mod chrome;
+pub mod clear;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
 pub mod dialog;
@@ -47,6 +48,7 @@ pub mod prelude {
     pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::chrome::{Border, BorderSet, Modal, Panel};
+    pub use crate::clear::Clear;
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
