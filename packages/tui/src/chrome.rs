@@ -5,6 +5,8 @@ use crate::geometry::{Insets, Rect, Size};
 use crate::layout::centered;
 use crate::style::Style;
 use crate::text::Line;
+use crate::text_block::Alignment;
+use crate::text_width::display_width;
 use crate::widget::Widget;
 
 /// Border glyph set.
@@ -213,11 +215,76 @@ impl Border {
     }
 }
 
+/// Panel title position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitlePosition {
+    /// Render title on the top border.
+    #[default]
+    Top,
+    /// Render title on the bottom border.
+    Bottom,
+}
+
+/// A panel title with position and alignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelTitle {
+    /// Title content.
+    pub line: Line,
+    /// Title position.
+    pub position: TitlePosition,
+    /// Horizontal title alignment.
+    pub alignment: Alignment,
+}
+
+impl PanelTitle {
+    /// Create a panel title.
+    #[must_use]
+    pub fn new(line: impl Into<Line>) -> Self {
+        Self {
+            line: line.into(),
+            position: TitlePosition::Top,
+            alignment: Alignment::Left,
+        }
+    }
+
+    /// Set title position.
+    #[must_use]
+    pub const fn position(mut self, position: TitlePosition) -> Self {
+        self.position = position;
+        self
+    }
+
+    /// Set title alignment.
+    #[must_use]
+    pub const fn alignment(mut self, alignment: Alignment) -> Self {
+        self.alignment = alignment;
+        self
+    }
+}
+
+impl From<Line> for PanelTitle {
+    fn from(line: Line) -> Self {
+        Self::new(line)
+    }
+}
+
+impl From<&str> for PanelTitle {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for PanelTitle {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
 /// A rectangular panel with optional border, title, padding, and background.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Panel {
     border: Option<Border>,
-    title: Option<Line>,
+    title: Option<PanelTitle>,
     padding: Insets,
     background: Option<Style>,
 }
@@ -243,7 +310,7 @@ impl Panel {
 
     /// Set the panel title.
     #[must_use]
-    pub fn title(mut self, title: impl Into<Line>) -> Self {
+    pub fn title(mut self, title: impl Into<PanelTitle>) -> Self {
         self.title = Some(title.into());
         self
     }
@@ -440,23 +507,36 @@ fn render_border(area: Rect, border: &Border, frame: &mut Frame<'_>) {
     }
 }
 
-fn render_title(area: Rect, title: &Line, style: Style, frame: &mut Frame<'_>) {
+fn render_title(area: Rect, title: &PanelTitle, style: Style, frame: &mut Frame<'_>) {
     if area.width <= 2 || area.height == 0 {
         return;
     }
+    let y = match title.position {
+        TitlePosition::Top => area.y,
+        TitlePosition::Bottom => area.bottom().saturating_sub(1),
+    };
+    let width = area.width.saturating_sub(2);
+    let title_width = u16::try_from(display_width(&title.line.plain_text()))
+        .unwrap_or(u16::MAX)
+        .min(width);
+    let x_offset = match title.alignment {
+        Alignment::Left => 0,
+        Alignment::Center => width.saturating_sub(title_width) / 2,
+        Alignment::Right => width.saturating_sub(title_width),
+    };
     let title_area = Rect::new(
-        area.x.saturating_add(1),
-        area.y,
-        area.width.saturating_sub(2),
+        area.x.saturating_add(1).saturating_add(x_offset),
+        y,
+        width.saturating_sub(x_offset),
         1,
     );
-    let styled_title = title.with_fallback_style(style);
+    let styled_title = title.line.with_fallback_style(style);
     frame.write_line(title_area, &styled_title);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Border, BorderSides, Modal, Panel};
+    use super::{Border, BorderSides, Modal, Panel, PanelTitle, TitlePosition};
     use crate::buffer::Buffer;
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect, Size};
@@ -539,6 +619,42 @@ mod tests {
             .render(Rect::new(0, 0, 8, 3), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("+Title-+"));
+    }
+
+    #[test]
+    fn panel_renders_aligned_bottom_title() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Panel::new()
+            .border(Border::ascii())
+            .title(
+                PanelTitle::new("Title")
+                    .position(TitlePosition::Bottom)
+                    .alignment(crate::text_block::Alignment::Right),
+            )
+            .render(Rect::new(0, 0, 12, 3), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(2).as_deref(),
+            Some("+-----Title+")
+        );
+    }
+
+    #[test]
+    fn panel_renders_centered_title() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 11, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Panel::new()
+            .border(Border::ascii())
+            .title(PanelTitle::new("Hi").alignment(crate::text_block::Alignment::Center))
+            .render(Rect::new(0, 0, 11, 3), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("+---Hi----+")
+        );
     }
 
     #[test]

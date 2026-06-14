@@ -47,7 +47,9 @@ pub mod prelude {
     };
     pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
-    pub use crate::chrome::{Border, BorderSet, BorderSides, Modal, Panel};
+    pub use crate::chrome::{
+        Border, BorderSet, BorderSides, Modal, Panel, PanelTitle, TitlePosition,
+    };
     pub use crate::clear::Clear;
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
