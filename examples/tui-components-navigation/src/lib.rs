@@ -16,6 +16,7 @@ use bmux_tui_components::status_bar::{
     MessageBar, StatusBar, StatusBarPolicy, StatusBarStyles, StatusSegment, StatusSeverity,
 };
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::table::{Table, TableColumn, TableOutcome, TableRow, TableState};
 use bmux_tui_components::tree_view::{
     TreeView, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
 };
@@ -28,6 +29,7 @@ pub struct NavigationDemo {
     tree: TreeViewState,
     list: SelectableListState,
     menu: MenuState,
+    table: TableState,
     scroll: ScrollAreaState,
     pane_scroll: ScrollAreaState,
     message: String,
@@ -45,6 +47,7 @@ impl NavigationDemo {
             },
             list: SelectableListState::new(Some(1)),
             menu: MenuState::new(Some(0)),
+            table: TableState::new(Some(0)),
             scroll: {
                 let mut state = ScrollAreaState::new();
                 state.set_vertical_offset(1);
@@ -124,6 +127,24 @@ impl NavigationDemo {
             ScrollArea::new(&lines).handle_event(Rect::new(1, 6, 24, 2), &mut self.scroll, event)
         {
             self.message = format!("Scroll offset: {vertical_offset}");
+        }
+
+        let table_columns = table_columns();
+        let table_rows = table_rows();
+        match Table::new(&table_columns, &table_rows).handle_event(
+            Rect::new(1, 9, 24, 4),
+            &mut self.table,
+            event,
+        ) {
+            TableOutcome::Selected(index) => {
+                self.message = format!("Table selected: {}", table_rows[index].cells[0]);
+                return false;
+            }
+            TableOutcome::Focused(index) => {
+                self.message = format!("Table focus: {}", table_rows[index].cells[0]);
+                return false;
+            }
+            TableOutcome::Ignored | TableOutcome::Redraw => {}
         }
 
         let pane = scroll_delegate_pane();
@@ -215,6 +236,10 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
 
     let lines = scroll_lines();
     ScrollArea::new(&lines).render(Rect::new(1, 6, 24, 2), &demo.scroll, frame);
+
+    let table_columns = table_columns();
+    let table_rows = table_rows();
+    Table::new(&table_columns, &table_rows).render(Rect::new(1, 9, 24, 4), &demo.table, frame);
 
     let pane = scroll_delegate_pane();
     let pane_state = PaneState::new(scroll_delegate_pane_area());
@@ -322,6 +347,28 @@ pub fn demonstrate_tree_selection() -> String {
     demo.message
 }
 
+pub fn demonstrate_table_selection() -> String {
+    let columns = table_columns();
+    let rows = table_rows();
+    let table = Table::new(&columns, &rows);
+    let mut state = TableState::new(Some(0));
+    let _ = table.handle_event(
+        Rect::new(1, 9, 24, 4),
+        &mut state,
+        &Event::Key(KeyStroke::simple(KeyCode::Down)),
+    );
+    match table.handle_event(
+        Rect::new(1, 9, 24, 4),
+        &mut state,
+        &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+    ) {
+        TableOutcome::Selected(index) => format!("Table selected: {}", rows[index].cells[0]),
+        TableOutcome::Ignored | TableOutcome::Redraw | TableOutcome::Focused(_) => {
+            "Table ignored".to_string()
+        }
+    }
+}
+
 pub fn rows(buffer: &Buffer) -> Vec<String> {
     (0..buffer.area().height)
         .filter_map(|row| buffer.row_symbols(row))
@@ -350,6 +397,21 @@ fn list_items() -> [SelectableListItem; 3] {
         SelectableListItem::new("one", "First item"),
         SelectableListItem::new("two", "Second item"),
         SelectableListItem::new("three", "Third item"),
+    ]
+}
+
+fn table_columns() -> [TableColumn<'static>; 2] {
+    [
+        TableColumn::new("Name").fixed(12),
+        TableColumn::new("Kind").fixed(8),
+    ]
+}
+
+fn table_rows() -> [TableRow<'static>; 3] {
+    [
+        TableRow::new(vec!["alpha", "file"]),
+        TableRow::new(vec!["beta", "dir"]),
+        TableRow::new(vec!["gamma", "link"]),
     ]
 }
 
@@ -411,7 +473,8 @@ mod tests {
 
     use super::{
         demonstrate_delegated_pane_scroll_offset, demonstrate_menu_activation,
-        demonstrate_pane_scroll_delegation, demonstrate_tree_selection, render_navigation, rows,
+        demonstrate_pane_scroll_delegation, demonstrate_table_selection,
+        demonstrate_tree_selection, render_navigation, rows,
     };
 
     #[test]
@@ -424,6 +487,8 @@ mod tests {
         assert!(rendered.contains("> Open"));
         assert!(rendered.contains("Scroll one"));
         assert!(rendered.contains("Delegated line zero"));
+        assert!(rendered.contains("Name"));
+        assert!(rendered.contains("alpha"));
         assert!(rendered.contains("enter select"));
         assert!(rendered.contains("ready"));
     }
@@ -442,6 +507,11 @@ mod tests {
     #[test]
     fn delegated_pane_scroll_updates_nested_scroll_area() {
         assert_eq!(demonstrate_delegated_pane_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn table_keyboard_selection_updates_navigation_message() {
+        assert_eq!(demonstrate_table_selection(), "Table selected: beta");
     }
 
     #[test]
