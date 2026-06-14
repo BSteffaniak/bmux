@@ -11,6 +11,7 @@
 
 pub mod action_row;
 pub mod badge;
+pub mod bar_chart;
 pub mod breadcrumbs;
 pub mod button;
 pub mod checkbox;
