@@ -13,6 +13,9 @@ use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 use bmux_tui_components::pane::{Pane, PaneState};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
+use bmux_tui_components::progress_bar::{
+    ProgressBar, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement,
+};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState,
 };
@@ -36,6 +39,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_details(frame);
     render_field(frame);
     render_pane(frame);
+    render_progress(frame);
     render_picker(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
@@ -81,6 +85,20 @@ fn render_pane(frame: &mut Frame<'_>) {
     let state = PaneState::new(Rect::new(1, 11, 28, 8));
     pane.render(&state, frame);
     frame.write_line(pane.inner_area(&state), &Line::from("Pane content area"));
+}
+
+fn render_progress(frame: &mut Frame<'_>) {
+    ProgressBar::new(ProgressBarValue::determinate(7, 10))
+        .label("70% indexed")
+        .policy(
+            ProgressBarPolicy::compact()
+                .background(true)
+                .label(ProgressLabelPlacement::Right),
+        )
+        .render(Rect::new(1, 20, 28, 1), frame);
+    ProgressBar::new(ProgressBarValue::indeterminate(4))
+        .policy(ProgressBarPolicy::bare())
+        .render(Rect::new(1, 22, 28, 1), frame);
 }
 
 fn render_picker(frame: &mut Frame<'_>) {
@@ -163,6 +181,7 @@ mod tests {
         assert!(rendered.contains("[ Save ]"));
         assert!(rendered.contains("LabeledDetails"));
         assert!(rendered.contains("Pane content area"));
+        assert!(rendered.contains("70% indexed"));
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("Commands"));
         assert!(rendered.contains("Dialog body with actions"));
