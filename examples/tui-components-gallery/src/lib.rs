@@ -6,6 +6,7 @@ use bmux_tui::prelude::Line;
 use bmux_tui::style::Color;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::badge::{Badge, BadgePolicy, BadgeSeverity};
+use bmux_tui_components::bar_chart::{BarChart, BarChartItem, BarChartPolicy};
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
@@ -49,6 +50,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_empty_state(frame);
     render_picker(frame);
     render_stepper(frame);
+    render_bar_chart(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
     render_toasts(frame);
@@ -149,6 +151,13 @@ fn render_stepper(frame: &mut Frame<'_>) {
         .render(Rect::new(35, 12, 33, 1), frame);
 }
 
+fn render_bar_chart(frame: &mut Frame<'_>) {
+    let items = [BarChartItem::new("CPU", 7), BarChartItem::new("Mem", 4)];
+    BarChart::new(&items)
+        .policy(BarChartPolicy::compact().max(Some(10)))
+        .render(Rect::new(35, 13, 28, 2), frame);
+}
+
 fn render_toasts(frame: &mut Frame<'_>) {
     let toasts = [
         ToastItem::new("saved", "Saved")
@@ -246,6 +255,8 @@ mod tests {
         assert!(rendered.contains("Empty State"));
         assert!(rendered.contains("No matching components yet"));
         assert!(rendered.contains("✓ Plan ── ● Build"));
+        assert!(rendered.contains("CPU"));
+        assert!(rendered.contains("██████"));
         assert!(rendered.contains("Saved ×"));
         assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
