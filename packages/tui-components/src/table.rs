@@ -982,6 +982,25 @@ mod tests {
     }
 
     #[test]
+    fn header_remains_sticky_when_body_scrolls() {
+        let columns = [TableColumn::new("Name").fixed(8)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::new(vec!["two"]),
+            TableRow::new(vec!["three"]),
+        ];
+        let mut state = TableState::new(None);
+        state.set_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows).render(Rect::new(0, 0, 8, 2), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Name    "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("two     "));
+    }
+
+    #[test]
     fn horizontal_scroll_offsets_rendered_columns_and_keys_mark_focus_column() {
         let columns = [
             TableColumn::new("A").fixed(4),
