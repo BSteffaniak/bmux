@@ -13,13 +13,17 @@ use bmux_tui::widget::Widget;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TextViewState {
     vertical_scroll: usize,
+    horizontal_scroll: usize,
 }
 
 impl TextViewState {
     /// Create text-view state.
     #[must_use]
     pub const fn new() -> Self {
-        Self { vertical_scroll: 0 }
+        Self {
+            vertical_scroll: 0,
+            horizontal_scroll: 0,
+        }
     }
 
     /// Return vertical scroll offset in rendered rows.
@@ -31,6 +35,17 @@ impl TextViewState {
     /// Set vertical scroll offset in rendered rows.
     pub const fn set_vertical_scroll(&mut self, vertical_scroll: usize) {
         self.vertical_scroll = vertical_scroll;
+    }
+
+    /// Return horizontal scroll offset in cells for no-wrap mode.
+    #[must_use]
+    pub const fn horizontal_scroll(&self) -> usize {
+        self.horizontal_scroll
+    }
+
+    /// Set horizontal scroll offset in cells for no-wrap mode.
+    pub const fn set_horizontal_scroll(&mut self, horizontal_scroll: usize) {
+        self.horizontal_scroll = horizontal_scroll;
     }
 }
 
@@ -204,7 +219,16 @@ impl<'a> TextView<'a> {
             return;
         }
         let layout = self.layout(area, state);
-        let text = Text::from_lines(layout.lines);
+        let lines = if self.policy.wrap == TextWrap::None && state.horizontal_scroll > 0 {
+            layout
+                .lines
+                .into_iter()
+                .map(|line| horizontally_scrolled_line(&line, state.horizontal_scroll))
+                .collect()
+        } else {
+            layout.lines
+        };
+        let text = Text::from_lines(lines);
         TextBlock::new(text)
             .style(self.styles.text)
             .alignment(self.policy.alignment)
@@ -231,6 +255,8 @@ impl<'a> TextView<'a> {
                     let line_count = self.layout(area, state).lines.len();
                     self.set_scroll(area, state, line_count)
                 }
+                KeyCode::Left => self.scroll_horizontal_by(area, state, -1),
+                KeyCode::Right => self.scroll_horizontal_by(area, state, 1),
                 _ => TextViewOutcome::Ignored,
             },
             Event::Mouse(mouse) if self.policy.mouse_wheel && area.contains(mouse.position) => {
@@ -273,6 +299,54 @@ impl<'a> TextView<'a> {
             }
         }
     }
+
+    fn scroll_horizontal_by(
+        &self,
+        area: Rect,
+        state: &mut TextViewState,
+        delta: i32,
+    ) -> TextViewOutcome {
+        if self.policy.wrap != TextWrap::None {
+            return TextViewOutcome::Ignored;
+        }
+        let current = i32::try_from(state.horizontal_scroll).unwrap_or(i32::MAX);
+        let next = usize::try_from(current.saturating_add(delta).max(0)).unwrap_or(usize::MAX);
+        let next = next.min(max_horizontal_scroll(self.lines, area.width));
+        if next == state.horizontal_scroll {
+            TextViewOutcome::Ignored
+        } else {
+            state.horizontal_scroll = next;
+            TextViewOutcome::Redraw
+        }
+    }
+}
+
+fn horizontally_scrolled_line(line: &Line, scroll: usize) -> Line {
+    let mut remaining = scroll;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let mut content = String::new();
+        for ch in span.content.chars() {
+            let width = display_width(&ch.to_string());
+            if remaining >= width {
+                remaining = remaining.saturating_sub(width);
+            } else {
+                content.push(ch);
+            }
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    Line::from_spans(spans)
+}
+
+fn max_horizontal_scroll(lines: &[Line], width: u16) -> usize {
+    lines
+        .iter()
+        .map(|line| display_width(&line.plain_text()).saturating_sub(usize::from(width)))
+        .max()
+        .unwrap_or(0)
 }
 
 fn render_lines(lines: &[Line], width: u16, wrap: TextWrap, trim: bool) -> Vec<Line> {
@@ -444,6 +518,52 @@ mod tests {
         let layout = view.layout(Rect::new(0, 0, 3, 5), &TextViewState::new());
 
         assert_eq!(layout.lines.len(), 2);
+    }
+
+    #[test]
+    fn horizontal_scroll_clips_no_wrap_content() {
+        let lines = [Line::from("abcdef")];
+        let mut state = TextViewState::new();
+        state.set_horizontal_scroll(2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextView::new(&lines).policy(TextViewPolicy::bare()).render(
+            Rect::new(0, 0, 3, 1),
+            &state,
+            &mut frame,
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cde"));
+    }
+
+    #[test]
+    fn keyboard_left_right_scrolls_horizontally_in_no_wrap_mode() {
+        let lines = [Line::from("abcdef")];
+        let view = TextView::new(&lines).policy(TextViewPolicy {
+            keyboard: true,
+            ..TextViewPolicy::bare()
+        });
+        let mut state = TextViewState::new();
+
+        assert_eq!(
+            view.handle_event(
+                Rect::new(0, 0, 3, 1),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            ),
+            TextViewOutcome::Redraw
+        );
+        assert_eq!(state.horizontal_scroll(), 1);
+        assert_eq!(
+            view.handle_event(
+                Rect::new(0, 0, 3, 1),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Left)),
+            ),
+            TextViewOutcome::Redraw
+        );
+        assert_eq!(state.horizontal_scroll(), 0);
     }
 
     #[test]
