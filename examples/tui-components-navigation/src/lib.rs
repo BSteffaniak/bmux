@@ -3,7 +3,7 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
-use bmux_tui::prelude::Line;
+use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::breadcrumbs::{
     BreadcrumbItem, Breadcrumbs, BreadcrumbsOutcome, BreadcrumbsState,
@@ -123,11 +123,11 @@ impl NavigationDemo {
             event,
         ) {
             SelectableListOutcome::Selected(index) => {
-                self.message = format!("List selected: {}", list_items[index].label);
+                self.message = format!("List selected: {}", list_items[index].label());
                 return false;
             }
             SelectableListOutcome::Focused(index) => {
-                self.message = format!("List focus: {}", list_items[index].label);
+                self.message = format!("List focus: {}", list_items[index].label());
                 return false;
             }
             SelectableListOutcome::Ignored | SelectableListOutcome::Redraw => {}
@@ -243,7 +243,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     Breadcrumbs::new(&breadcrumb_items).render(Rect::new(30, 0, 38, 1), &demo.breadcrumbs, frame);
 
     let list_items = list_items();
-    SelectableList::new(&list_items).render(Rect::new(1, 1, 24, 3), &demo.list, frame);
+    SelectableList::new(&list_items).render(Rect::new(1, 1, 24, 4), &demo.list, frame);
 
     let menu_items = menu_items();
     Menu::new(&menu_items).render(Rect::new(30, 1, 18, 2), &demo.menu, frame);
@@ -464,7 +464,21 @@ fn tree_items() -> [TreeViewItem; 4] {
 fn list_items() -> [SelectableListItem; 3] {
     [
         SelectableListItem::new("one", "First item"),
-        SelectableListItem::new("two", "Second item"),
+        SelectableListItem::multiline(
+            "two",
+            [
+                Line::from_spans([
+                    Span::raw("Second "),
+                    Span::styled(
+                        "rich",
+                        Style::new()
+                            .fg(Color::BrightYellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from("details line"),
+            ],
+        ),
         SelectableListItem::new("three", "Third item"),
     ]
 }
@@ -572,7 +586,8 @@ mod tests {
         assert!(rendered.contains("Library"));
         assert!(rendered.contains("Details"));
         assert!(rendered.contains("src"));
-        assert!(rendered.contains("Second item"));
+        assert!(rendered.contains("Second rich"));
+        assert!(rendered.contains("details line"));
         assert!(rendered.contains("> Open"));
         assert!(rendered.contains("Scroll one"));
         assert!(rendered.contains("Delegated line zero"));
