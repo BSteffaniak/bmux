@@ -7,6 +7,7 @@ use bmux_tui::style::Color;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
 use bmux_tui_components::filtered_list::FilteredListState;
 use bmux_tui_components::form_field::FormField;
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails};
@@ -41,6 +42,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_field(frame);
     render_pane(frame);
     render_progress(frame);
+    render_empty_state(frame);
     render_picker(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
@@ -106,6 +108,17 @@ fn render_progress(frame: &mut Frame<'_>) {
         .render(Rect::new(1, 23, 28, 1), frame);
 }
 
+fn render_empty_state(frame: &mut Frame<'_>) {
+    let body = [Line::from("No matching components yet")];
+    let actions = [Line::from("Press / to filter")];
+    EmptyState::new("Empty State")
+        .icon("∅")
+        .body(&body)
+        .actions(&actions)
+        .policy(EmptyStatePolicy::centered())
+        .render(Rect::new(2, 14, 26, 4), frame);
+}
+
 fn render_picker(frame: &mut Frame<'_>) {
     let picker = PickerFrame::new()
         .title("Command Palette")
@@ -166,7 +179,7 @@ fn render_dialog(frame: &mut Frame<'_>, theme: ModalTheme) {
             Size::new(30, 7),
             Insets::all(0),
         ))
-        .render(Rect::new(35, 15, 34, 9), &state, frame);
+        .render(Rect::new(35, 13, 34, 9), &state, frame);
 }
 
 pub fn rows(buffer: &Buffer) -> Vec<String> {
@@ -188,6 +201,8 @@ mod tests {
         assert!(rendered.contains("Pane content area"));
         assert!(rendered.contains("70% indexed"));
         assert!(rendered.contains("▁▂▂▃▅█"));
+        assert!(rendered.contains("Empty State"));
+        assert!(rendered.contains("No matching components yet"));
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("Commands"));
         assert!(rendered.contains("Dialog body with actions"));
