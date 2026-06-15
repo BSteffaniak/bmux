@@ -87,7 +87,7 @@ impl NavigationDemo {
         let tab_items = tab_items();
         match TabBar::new(&tab_items).handle_event(Rect::new(1, 0, 42, 1), &mut self.tabs, event) {
             TabBarOutcome::Selected(index) => {
-                self.message = format!("Tab selected: {}", tab_items[index].label);
+                self.message = format!("Tab selected: {}", tab_items[index].label());
                 return false;
             }
             TabBarOutcome::Ignored | TabBarOutcome::Redraw => {}

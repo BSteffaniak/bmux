@@ -16,7 +16,7 @@ pub struct TabItem<'a> {
     /// Stable tab id chosen by the caller.
     pub id: &'a str,
     /// Visible tab label.
-    pub label: &'a str,
+    pub label: Line,
     /// Whether this tab is disabled.
     pub disabled: bool,
 }
@@ -24,12 +24,28 @@ pub struct TabItem<'a> {
 impl<'a> TabItem<'a> {
     /// Create an enabled tab item.
     #[must_use]
-    pub const fn new(id: &'a str, label: &'a str) -> Self {
+    pub fn new(id: &'a str, label: &'a str) -> Self {
+        Self {
+            id,
+            label: Line::from(label),
+            disabled: false,
+        }
+    }
+
+    /// Create an enabled tab item from rich label content.
+    #[must_use]
+    pub const fn rich(id: &'a str, label: Line) -> Self {
         Self {
             id,
             label,
             disabled: false,
         }
+    }
+
+    /// Return visible label as plain text.
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.label.plain_text()
     }
 
     /// Return this item with disabled state set.
@@ -311,7 +327,7 @@ impl<'a> TabBar<'a> {
     pub fn text(&self) -> String {
         self.items
             .iter()
-            .map(|item| format!(" {} ", item.label))
+            .map(|item| format!(" {} ", item.label.plain_text()))
             .collect::<Vec<_>>()
             .join(self.policy.separator)
     }
@@ -354,7 +370,14 @@ impl<'a> TabBar<'a> {
                 spans.push(Span::styled(self.policy.separator, self.styles.separator));
             }
             let style = self.item_style(index, item, state);
-            spans.push(Span::styled(format!(" {} ", item.label), style));
+            spans.push(Span::styled(" ", style));
+            spans.extend(
+                item.label
+                    .spans
+                    .iter()
+                    .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
+            );
+            spans.push(Span::styled(" ", style));
         }
         Line::from_spans(spans)
     }
@@ -490,7 +513,7 @@ fn next_enabled(
 }
 
 fn tab_label_width(item: &TabItem<'_>) -> usize {
-    display_width(item.label).saturating_add(2)
+    display_width(&item.label.plain_text()).saturating_add(2)
 }
 
 fn u16_saturating(value: usize) -> u16 {
@@ -504,6 +527,8 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::prelude::{Line, Span};
+    use bmux_tui::style::{Color, Style};
 
     use super::{TabBar, TabBarOutcome, TabBarPolicy};
     use crate::tab_bar::{TabBarKeyboardPolicy, TabBarState, TabItem};
@@ -520,6 +545,29 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some(" One   Two ")
+        );
+    }
+
+    #[test]
+    fn renders_rich_tab_label_preserving_span_style() {
+        let accent = Style::new().fg(Color::Yellow);
+        let items = [TabItem::rich(
+            "one",
+            Line::from_spans([Span::raw("O"), Span::styled("ne", accent)]),
+        )];
+        let state = TabBarState::new(Some(0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TabBar::new(&items).render(Rect::new(0, 0, 5, 1), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" One "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(2, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Yellow))
         );
     }
 
