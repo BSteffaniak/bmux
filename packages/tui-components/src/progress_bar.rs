@@ -78,6 +78,8 @@ pub struct ProgressBarPolicy {
     pub filled: &'static str,
     /// Empty cell symbol.
     pub empty: &'static str,
+    /// Partial determinate cell symbol used when progress falls between cells.
+    pub partial: &'static str,
     /// Indeterminate pulse symbol.
     pub pulse: &'static str,
     /// Width of the indeterminate pulse in cells.
@@ -99,6 +101,7 @@ impl ProgressBarPolicy {
         Self {
             filled: "█",
             empty: "░",
+            partial: "▒",
             pulse: "█",
             pulse_width: 3,
             label: ProgressLabelPlacement::Inside,
@@ -114,6 +117,7 @@ impl ProgressBarPolicy {
         Self {
             filled: "█",
             empty: "░",
+            partial: "▒",
             pulse: "█",
             pulse_width: 3,
             label: ProgressLabelPlacement::Hidden,
@@ -136,6 +140,27 @@ impl ProgressBarPolicy {
         self.background = background;
         self
     }
+    /// Return this policy with determinate bar symbols changed.
+    #[must_use]
+    pub const fn symbols(
+        mut self,
+        filled: &'static str,
+        empty: &'static str,
+        partial: &'static str,
+    ) -> Self {
+        self.filled = filled;
+        self.empty = empty;
+        self.partial = partial;
+        self
+    }
+
+    /// Return this policy with indeterminate pulse symbol changed.
+    #[must_use]
+    pub const fn pulse_symbol(mut self, pulse: &'static str) -> Self {
+        self.pulse = pulse;
+        self
+    }
+
     /// Return this policy with render mode changed.
     #[must_use]
     pub const fn mode(mut self, mode: ProgressBarMode) -> Self {
@@ -211,6 +236,7 @@ impl<'a> ProgressBar<'a> {
             policy: ProgressBarPolicy {
                 filled: "█",
                 empty: "░",
+                partial: "▒",
                 pulse: "█",
                 pulse_width: 3,
                 label: ProgressLabelPlacement::Inside,
@@ -278,6 +304,19 @@ impl<'a> ProgressBar<'a> {
         }
     }
 
+    /// Return determinate partial cell count for `width`.
+    #[must_use]
+    pub fn partial_width(&self, width: u16) -> u16 {
+        match self.value {
+            ProgressBarValue::Determinate { value, total } if total > 0 && width > 0 => {
+                let clamped = value.min(total);
+                let scaled = clamped.saturating_mul(u64::from(width));
+                u16::from(scaled % total > 0 && scaled / total < u64::from(width))
+            }
+            ProgressBarValue::Determinate { .. } | ProgressBarValue::Indeterminate { .. } => 0,
+        }
+    }
+
     /// Render progress bar.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
         if area.is_empty() {
@@ -312,6 +351,7 @@ impl<'a> ProgressBar<'a> {
             area.width
         };
         let filled_width = self.filled_width(bar_width).min(bar_width);
+        let partial_width = self.partial_width(bar_width);
         let mut spans = Vec::new();
         if filled_width > 0 {
             spans.push(Span::styled(
@@ -319,7 +359,15 @@ impl<'a> ProgressBar<'a> {
                 self.filled_style(),
             ));
         }
-        let empty_width = bar_width.saturating_sub(filled_width);
+        if partial_width > 0 {
+            spans.push(Span::styled(
+                self.policy.partial.repeat(usize::from(partial_width)),
+                self.filled_style(),
+            ));
+        }
+        let empty_width = bar_width
+            .saturating_sub(filled_width)
+            .saturating_sub(partial_width);
         if empty_width > 0 {
             spans.push(Span::styled(
                 self.policy.empty.repeat(usize::from(empty_width)),
@@ -362,6 +410,7 @@ impl<'a> ProgressBar<'a> {
             area.width
         };
         let filled_width = self.filled_width(gauge_width).min(gauge_width);
+        let partial_width = self.partial_width(gauge_width);
         let mut spans = Vec::new();
         if filled_width > 0 {
             spans.push(Span::styled(
@@ -369,7 +418,15 @@ impl<'a> ProgressBar<'a> {
                 self.filled_style(),
             ));
         }
-        let empty_width = gauge_width.saturating_sub(filled_width);
+        if partial_width > 0 {
+            spans.push(Span::styled(
+                self.policy.partial.repeat(usize::from(partial_width)),
+                self.filled_style(),
+            ));
+        }
+        let empty_width = gauge_width
+            .saturating_sub(filled_width)
+            .saturating_sub(partial_width);
         if empty_width > 0 {
             spans.push(Span::styled(
                 self.policy.empty.repeat(usize::from(empty_width)),
@@ -470,6 +527,18 @@ mod tests {
 
         assert_eq!(bar.label_text().as_deref(), Some("0%"));
         assert_eq!(bar.filled_width(8), 0);
+    }
+
+    #[test]
+    fn custom_symbols_render_partial_segment() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        ProgressBar::ratio(1, 3)
+            .policy(ProgressBarPolicy::bare().symbols("=", ".", ">"))
+            .render(Rect::new(0, 0, 4, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("=>.."));
     }
 
     #[test]
