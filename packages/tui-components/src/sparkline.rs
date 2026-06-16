@@ -277,6 +277,19 @@ mod tests {
     }
 
     #[test]
+    fn max_override_scales_non_zero_flat_samples() {
+        let samples = [5, 5, 5];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Sparkline::new(&samples)
+            .policy(SparklinePolicy::bare().max(Some(10)))
+            .render(Rect::new(0, 0, 3, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▄▄▄"));
+    }
+
+    #[test]
     fn window_and_width_clip_to_latest_samples() {
         let samples = [1, 2, 3, 4, 5];
         let sparkline = Sparkline::new(&samples).policy(SparklinePolicy::bare().window(Some(4)));
