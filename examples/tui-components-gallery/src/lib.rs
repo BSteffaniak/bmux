@@ -121,6 +121,13 @@ fn render_progress(frame: &mut Frame<'_>) {
                 .label(ProgressLabelPlacement::Right),
         )
         .render(Rect::new(1, 20, 28, 1), frame);
+    ProgressBar::ratio(1, 3)
+        .policy(
+            ProgressBarPolicy::compact()
+                .line_gauge()
+                .symbols("━", "─", "╸"),
+        )
+        .render(Rect::new(1, 21, 28, 1), frame);
     ProgressBar::new(ProgressBarValue::indeterminate(4))
         .policy(ProgressBarPolicy::bare())
         .render(Rect::new(1, 22, 28, 1), frame);
