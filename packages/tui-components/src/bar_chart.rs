@@ -13,13 +13,25 @@ pub struct BarChartItem<'a> {
     pub label: &'a str,
     /// Bar value.
     pub value: u64,
+    /// Optional grouped values rendered as adjacent bar segments.
+    pub group: &'a [u64],
 }
 
 impl<'a> BarChartItem<'a> {
     /// Create a bar chart item.
     #[must_use]
     pub const fn new(label: &'a str, value: u64) -> Self {
-        Self { label, value }
+        Self {
+            label,
+            value,
+            group: &[],
+        }
+    }
+    /// Return this item with grouped values.
+    #[must_use]
+    pub const fn group(mut self, group: &'a [u64]) -> Self {
+        self.group = group;
+        self
     }
 }
 
@@ -205,10 +217,13 @@ impl<'a> BarChart<'a> {
             );
             return;
         }
-        let max = self
-            .policy
-            .max
-            .unwrap_or_else(|| self.items.iter().map(|item| item.value).max().unwrap_or(0));
+        let max = self.policy.max.unwrap_or_else(|| {
+            self.items
+                .iter()
+                .flat_map(|item| std::iter::once(item.value).chain(item.group.iter().copied()))
+                .max()
+                .unwrap_or(0)
+        });
         let row_step = usize::from(self.policy.bar_gap).saturating_add(1);
         for (index, item) in self.items.iter().enumerate() {
             let y_offset = index.saturating_mul(row_step);
@@ -242,18 +257,59 @@ impl<'a> BarChart<'a> {
             .unwrap_or(available_bar_width)
             .min(available_bar_width);
         let label = format_label(item.label, label_width, self.policy.truncate_labels);
-        let filled = self.filled_width(item.value, max, bar_width).min(bar_width);
-        let empty = bar_width.saturating_sub(filled);
-        Line::from_spans([
-            Span::styled(label, self.styles.label),
-            Span::raw(self.policy.separator),
-            Span::styled(self.policy.bar.repeat(usize::from(filled)), self.styles.bar),
-            Span::styled(
+        let segment_count = if item.group.is_empty() {
+            1
+        } else {
+            item.group.len().saturating_add(1)
+        };
+        let segment_gap = u16::from(segment_count > 1);
+        let total_gap = segment_gap.saturating_mul(u16_saturating(segment_count.saturating_sub(1)));
+        let segment_width = if segment_count > 1 {
+            bar_width
+                .saturating_sub(total_gap)
+                .checked_div(u16_saturating(segment_count).max(1))
+                .unwrap_or(0)
+        } else {
+            bar_width
+        };
+        let mut spans = Vec::new();
+        spans.push(Span::styled(label, self.styles.label));
+        spans.push(Span::raw(self.policy.separator));
+        if item.group.is_empty() {
+            let filled = self.filled_width(item.value, max, bar_width).min(bar_width);
+            let empty = bar_width.saturating_sub(filled);
+            spans.push(Span::styled(
+                self.policy.bar.repeat(usize::from(filled)),
+                self.styles.bar,
+            ));
+            spans.push(Span::styled(
                 self.policy.empty.repeat(usize::from(empty)),
                 self.styles.empty,
-            ),
-            Span::styled(value_text, self.styles.value),
-        ])
+            ));
+        } else {
+            for (index, value) in std::iter::once(item.value)
+                .chain(item.group.iter().copied())
+                .enumerate()
+            {
+                if index > 0 && segment_gap > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                let filled = self
+                    .filled_width(value, max, segment_width)
+                    .min(segment_width);
+                let empty = segment_width.saturating_sub(filled);
+                spans.push(Span::styled(
+                    self.policy.bar.repeat(usize::from(filled)),
+                    self.styles.bar,
+                ));
+                spans.push(Span::styled(
+                    self.policy.empty.repeat(usize::from(empty)),
+                    self.styles.empty,
+                ));
+            }
+        }
+        spans.push(Span::styled(value_text, self.styles.value));
+        Line::from_spans(spans)
     }
 }
 
@@ -343,6 +399,23 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(2).as_deref(),
             Some("b      ████ ")
+        );
+    }
+
+    #[test]
+    fn renders_grouped_bars() {
+        let group = [5, 10];
+        let items = [BarChartItem::new("a", 0).group(&group)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        BarChart::new(&items)
+            .policy(BarChartPolicy::compact().max(Some(10)).bar_width(Some(8)))
+            .render(Rect::new(0, 0, 16, 1), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("a      ░░ █░ ██ ")
         );
     }
 
