@@ -111,6 +111,94 @@ impl ChartBounds {
     }
 }
 
+/// Chart axis label configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChartAxis<'a> {
+    /// Optional axis title.
+    pub title: Option<&'a str>,
+    /// Caller-owned axis labels.
+    pub labels: &'a [&'a str],
+    /// Axis style.
+    pub style: Style,
+}
+
+impl<'a> ChartAxis<'a> {
+    /// Create an axis with no title or labels.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            title: None,
+            labels: &[],
+            style: Style::new(),
+        }
+    }
+
+    /// Return this axis with a title.
+    #[must_use]
+    pub const fn title(mut self, title: &'a str) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// Return this axis with labels.
+    #[must_use]
+    pub const fn labels(mut self, labels: &'a [&'a str]) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// Return this axis with style.
+    #[must_use]
+    pub const fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+}
+
+/// Chart axes model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChartAxes<'a> {
+    /// X axis configuration.
+    pub x: ChartAxis<'a>,
+    /// Y axis configuration.
+    pub y: ChartAxis<'a>,
+    /// Whether to reserve/render legend metadata.
+    pub legend: bool,
+}
+
+impl<'a> ChartAxes<'a> {
+    /// Create empty axes.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            x: ChartAxis::empty(),
+            y: ChartAxis::empty(),
+            legend: false,
+        }
+    }
+
+    /// Return this model with x axis changed.
+    #[must_use]
+    pub const fn x(mut self, x: ChartAxis<'a>) -> Self {
+        self.x = x;
+        self
+    }
+
+    /// Return this model with y axis changed.
+    #[must_use]
+    pub const fn y(mut self, y: ChartAxis<'a>) -> Self {
+        self.y = y;
+        self
+    }
+
+    /// Return this model with legend visibility changed.
+    #[must_use]
+    pub const fn legend(mut self, legend: bool) -> Self {
+        self.legend = legend;
+        self
+    }
+}
+
 /// Chart visual styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChartStyles {
@@ -134,6 +222,7 @@ impl Default for ChartStyles {
 pub struct Chart<'a> {
     datasets: &'a [ChartDataset<'a>],
     bounds: ChartBounds,
+    axes: ChartAxes<'a>,
     styles: ChartStyles,
     empty: &'a str,
 }
@@ -145,12 +234,20 @@ impl<'a> Chart<'a> {
         Self {
             datasets,
             bounds,
+            axes: ChartAxes::empty(),
             styles: ChartStyles {
                 dataset: Style::new(),
                 empty: Style::new(),
             },
             empty: "No data",
         }
+    }
+
+    /// Set axes model.
+    #[must_use]
+    pub const fn axes(mut self, axes: ChartAxes<'a>) -> Self {
+        self.axes = axes;
+        self
     }
 
     /// Set visual styles.
@@ -165,6 +262,12 @@ impl<'a> Chart<'a> {
     pub const fn empty(mut self, empty: &'a str) -> Self {
         self.empty = empty;
         self
+    }
+
+    /// Return chart axes.
+    #[must_use]
+    pub const fn axes_model(&self) -> ChartAxes<'a> {
+        self.axes
     }
 
     /// Map a chart point into an area cell.
@@ -245,7 +348,7 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
 
-    use super::{Chart, ChartBounds, ChartDataset, ChartPoint};
+    use super::{Chart, ChartAxes, ChartAxis, ChartBounds, ChartDataset, ChartPoint};
 
     #[test]
     fn maps_points_to_chart_cells() {
@@ -257,6 +360,24 @@ mod tests {
             chart.map_point(Rect::new(0, 0, 11, 11), points[0]),
             Some((5, 5))
         );
+    }
+
+    #[test]
+    fn stores_axes_labels_titles_and_legend_policy() {
+        let points = [ChartPoint::new(0.0, 0.0)];
+        let datasets = [ChartDataset::scatter("points", &points)];
+        let x_labels = ["0", "10"];
+        let y_labels = ["low", "high"];
+        let axes = ChartAxes::empty()
+            .x(ChartAxis::empty().title("time").labels(&x_labels))
+            .y(ChartAxis::empty().title("value").labels(&y_labels))
+            .legend(true);
+
+        let chart = Chart::new(&datasets, ChartBounds::new(0.0, 10.0, 0.0, 10.0)).axes(axes);
+
+        assert_eq!(chart.axes_model().x.title, Some("time"));
+        assert_eq!(chart.axes_model().y.labels, y_labels);
+        assert!(chart.axes_model().legend);
     }
 
     #[test]
