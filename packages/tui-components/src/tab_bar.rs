@@ -773,4 +773,16 @@ mod tests {
         assert_eq!(outcome, TabBarOutcome::Ignored);
         assert_eq!(state.selected(), Some(0));
     }
+
+    #[test]
+    fn tiny_area_does_not_panic() {
+        let items = [TabItem::new("one", "One")];
+        let state = TabBarState::new(Some(0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        TabBar::new(&items).render(Rect::new(0, 0, 0, 0), &state, &mut frame);
+
+        assert!(TabBar::new(&items).hit_rects(Rect::new(0, 0, 0, 0))[0].is_empty());
+    }
 }
