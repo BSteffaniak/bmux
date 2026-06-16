@@ -30,6 +30,10 @@ pub struct BarChartPolicy {
     pub max: Option<u64>,
     /// Width reserved for labels.
     pub label_width: u16,
+    /// Optional maximum width for the rendered bar area.
+    pub bar_width: Option<u16>,
+    /// Blank rows between bars.
+    pub bar_gap: u16,
     /// Bar fill symbol.
     pub bar: &'static str,
     /// Empty bar symbol.
@@ -49,6 +53,8 @@ impl BarChartPolicy {
         Self {
             max: None,
             label_width: 6,
+            bar_width: None,
+            bar_gap: 0,
             bar: "█",
             empty: "░",
             separator: " ",
@@ -70,6 +76,19 @@ impl BarChartPolicy {
     #[must_use]
     pub const fn max(mut self, max: Option<u64>) -> Self {
         self.max = max;
+        self
+    }
+    /// Return this policy with maximum bar width changed.
+    #[must_use]
+    pub const fn bar_width(mut self, bar_width: Option<u16>) -> Self {
+        self.bar_width = bar_width;
+        self
+    }
+
+    /// Return this policy with blank rows between bars changed.
+    #[must_use]
+    pub const fn bar_gap(mut self, bar_gap: u16) -> Self {
+        self.bar_gap = bar_gap;
         self
     }
 }
@@ -127,6 +146,8 @@ impl<'a> BarChart<'a> {
             policy: BarChartPolicy {
                 max: None,
                 label_width: 6,
+                bar_width: None,
+                bar_gap: 0,
                 bar: "█",
                 empty: "░",
                 separator: " ",
@@ -188,8 +209,13 @@ impl<'a> BarChart<'a> {
             .policy
             .max
             .unwrap_or_else(|| self.items.iter().map(|item| item.value).max().unwrap_or(0));
-        for (index, item) in self.items.iter().take(usize::from(area.height)).enumerate() {
-            let Ok(y_offset) = u16::try_from(index) else {
+        let row_step = usize::from(self.policy.bar_gap).saturating_add(1);
+        for (index, item) in self.items.iter().enumerate() {
+            let y_offset = index.saturating_mul(row_step);
+            if y_offset >= usize::from(area.height) {
+                return;
+            }
+            let Ok(y_offset) = u16::try_from(y_offset) else {
                 return;
             };
             let row = Rect::new(area.x, area.y.saturating_add(y_offset), area.width, 1);
@@ -206,10 +232,15 @@ impl<'a> BarChart<'a> {
             String::new()
         };
         let value_width = u16_saturating(display_width(&value_text));
-        let bar_width = width
+        let available_bar_width = width
             .saturating_sub(label_width)
             .saturating_sub(separator_width)
             .saturating_sub(value_width);
+        let bar_width = self
+            .policy
+            .bar_width
+            .unwrap_or(available_bar_width)
+            .min(available_bar_width);
         let label = format_label(item.label, label_width, self.policy.truncate_labels);
         let filled = self.filled_width(item.value, max, bar_width).min(bar_width);
         let empty = bar_width.saturating_sub(filled);
@@ -283,6 +314,35 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(1).as_deref(),
             Some("beta   █████████")
+        );
+    }
+
+    #[test]
+    fn bar_width_and_gap_are_configurable() {
+        let items = [BarChartItem::new("a", 5), BarChartItem::new("b", 10)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        BarChart::new(&items)
+            .policy(
+                BarChartPolicy::compact()
+                    .max(Some(10))
+                    .bar_width(Some(4))
+                    .bar_gap(1),
+            )
+            .render(Rect::new(0, 0, 12, 3), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("a      ██░░ ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("            ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(2).as_deref(),
+            Some("b      ████ ")
         );
     }
 
