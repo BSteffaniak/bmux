@@ -6,6 +6,7 @@ use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 
 /// Sparkline rendering policy.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparklinePolicy {
     /// Optional maximum sample value. When absent, the maximum is derived from samples.
@@ -16,6 +17,10 @@ pub struct SparklinePolicy {
     pub symbols: &'static [&'static str],
     /// Whether the latest visible sample gets a distinct style.
     pub highlight_latest: bool,
+    /// Whether the first visible sample gets a distinct style.
+    pub highlight_first: bool,
+    /// Whether visible high samples get a distinct style.
+    pub highlight_high: bool,
     /// Fill background before rendering.
     pub background: bool,
 }
@@ -29,6 +34,8 @@ impl SparklinePolicy {
             window: None,
             symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
             highlight_latest: true,
+            highlight_first: false,
+            highlight_high: false,
             background: false,
         }
     }
@@ -41,6 +48,8 @@ impl SparklinePolicy {
             window: None,
             symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
             highlight_latest: false,
+            highlight_first: false,
+            highlight_high: false,
             background: false,
         }
     }
@@ -56,6 +65,20 @@ impl SparklinePolicy {
     #[must_use]
     pub const fn window(mut self, window: Option<usize>) -> Self {
         self.window = window;
+        self
+    }
+
+    /// Return this policy with first-sample highlighting changed.
+    #[must_use]
+    pub const fn highlight_first(mut self, highlight_first: bool) -> Self {
+        self.highlight_first = highlight_first;
+        self
+    }
+
+    /// Return this policy with high-sample highlighting changed.
+    #[must_use]
+    pub const fn highlight_high(mut self, highlight_high: bool) -> Self {
+        self.highlight_high = highlight_high;
         self
     }
 
@@ -80,6 +103,10 @@ pub struct SparklineStyles {
     pub normal: Style,
     /// Latest sample style.
     pub latest: Style,
+    /// First visible sample style.
+    pub first: Style,
+    /// High visible sample style.
+    pub high: Style,
     /// Empty-content style.
     pub empty: Style,
     /// Background fill style.
@@ -92,6 +119,10 @@ impl Default for SparklineStyles {
             normal: Style::new().fg(Color::Cyan),
             latest: Style::new()
                 .fg(Color::BrightCyan)
+                .add_modifier(Modifier::BOLD),
+            first: Style::new().fg(Color::BrightBlue),
+            high: Style::new()
+                .fg(Color::BrightGreen)
                 .add_modifier(Modifier::BOLD),
             empty: Style::new().fg(Color::BrightBlack),
             background: Style::new(),
@@ -119,11 +150,15 @@ impl<'a> Sparkline<'a> {
                 window: None,
                 symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
                 highlight_latest: true,
+                highlight_first: false,
+                highlight_high: false,
                 background: false,
             },
             styles: SparklineStyles {
                 normal: Style::new(),
                 latest: Style::new(),
+                first: Style::new(),
+                high: Style::new(),
                 empty: Style::new(),
                 background: Style::new(),
             },
@@ -181,6 +216,7 @@ impl<'a> Sparkline<'a> {
             .policy
             .max
             .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
+        let high = samples.iter().copied().max().unwrap_or(0);
         let last = samples.len().saturating_sub(1);
         let spans = samples
             .iter()
@@ -188,6 +224,10 @@ impl<'a> Sparkline<'a> {
             .map(|(index, sample)| {
                 let style = if self.policy.highlight_latest && index == last {
                     self.styles.latest
+                } else if self.policy.highlight_first && index == 0 {
+                    self.styles.first
+                } else if self.policy.highlight_high && *sample == high {
+                    self.styles.high
                 } else {
                     self.styles.normal
                 };
@@ -224,9 +264,10 @@ fn glyph_for(value: u64, max: u64, symbols: &[&'static str]) -> &'static str {
 mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
+    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::style::{Color, Style};
 
-    use super::{Sparkline, SparklinePolicy};
+    use super::{Sparkline, SparklinePolicy, SparklineStyles};
 
     #[test]
     fn maps_empty_samples_to_empty_message() {
@@ -287,6 +328,43 @@ mod tests {
             .render(Rect::new(0, 0, 3, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▄▄▄"));
+    }
+
+    #[test]
+    fn first_latest_and_high_samples_can_be_styled() {
+        let samples = [1, 3, 2];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let styles = SparklineStyles {
+            first: Style::new().fg(Color::Blue),
+            high: Style::new().fg(Color::Green),
+            latest: Style::new().fg(Color::Yellow),
+            ..SparklineStyles::default()
+        };
+
+        Sparkline::new(&samples)
+            .policy(
+                SparklinePolicy::bare()
+                    .highlight_first(true)
+                    .highlight_high(true),
+            )
+            .styles(styles)
+            .render(Rect::new(0, 0, 3, 1), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(0, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Blue))
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(1, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Green))
+        );
     }
 
     #[test]
