@@ -115,6 +115,10 @@ pub struct TabBarPolicy {
     pub overflow: TabBarOverflow,
     /// Separator between tabs.
     pub separator: &'static str,
+    /// Left padding for each tab label.
+    pub padding_left: &'static str,
+    /// Right padding for each tab label.
+    pub padding_right: &'static str,
 }
 
 impl TabBarPolicy {
@@ -126,6 +130,8 @@ impl TabBarPolicy {
             mouse: ComponentMousePolicy::disabled(),
             overflow: TabBarOverflow::Truncate,
             separator: " ",
+            padding_left: " ",
+            padding_right: " ",
         }
     }
 
@@ -137,7 +143,23 @@ impl TabBarPolicy {
             mouse: ComponentMousePolicy::button(),
             overflow: TabBarOverflow::Truncate,
             separator: " ",
+            padding_left: " ",
+            padding_right: " ",
         }
+    }
+    /// Return this policy with custom separator.
+    #[must_use]
+    pub const fn separator(mut self, separator: &'static str) -> Self {
+        self.separator = separator;
+        self
+    }
+
+    /// Return this policy with custom tab label padding.
+    #[must_use]
+    pub const fn padding(mut self, left: &'static str, right: &'static str) -> Self {
+        self.padding_left = left;
+        self.padding_right = right;
+        self
     }
 }
 
@@ -263,6 +285,8 @@ impl<'a> TabBar<'a> {
                 },
                 overflow: TabBarOverflow::Truncate,
                 separator: " ",
+                padding_left: " ",
+                padding_right: " ",
             },
             styles: TabBarStyles {
                 normal: Style::new(),
@@ -299,7 +323,7 @@ impl<'a> TabBar<'a> {
             if index > 0 {
                 x = x.saturating_add(u16_saturating(display_width(self.policy.separator)));
             }
-            let width = u16_saturating(tab_label_width(item));
+            let width = u16_saturating(tab_label_width_with_policy(item, self.policy));
             rects.push(Rect::new(x, area.y, width, area.height.min(1)));
             x = x.saturating_add(width);
         }
@@ -327,7 +351,14 @@ impl<'a> TabBar<'a> {
     pub fn text(&self) -> String {
         self.items
             .iter()
-            .map(|item| format!(" {} ", item.label.plain_text()))
+            .map(|item| {
+                format!(
+                    "{}{}{}",
+                    self.policy.padding_left,
+                    item.label.plain_text(),
+                    self.policy.padding_right
+                )
+            })
             .collect::<Vec<_>>()
             .join(self.policy.separator)
     }
@@ -370,14 +401,14 @@ impl<'a> TabBar<'a> {
                 spans.push(Span::styled(self.policy.separator, self.styles.separator));
             }
             let style = self.item_style(index, item, state);
-            spans.push(Span::styled(" ", style));
+            spans.push(Span::styled(self.policy.padding_left, style));
             spans.extend(
                 item.label
                     .spans
                     .iter()
                     .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
             );
-            spans.push(Span::styled(" ", style));
+            spans.push(Span::styled(self.policy.padding_right, style));
         }
         Line::from_spans(spans)
     }
@@ -512,8 +543,10 @@ fn next_enabled(
     None
 }
 
-fn tab_label_width(item: &TabItem<'_>) -> usize {
-    display_width(&item.label.plain_text()).saturating_add(2)
+fn tab_label_width_with_policy(item: &TabItem<'_>, policy: TabBarPolicy) -> usize {
+    display_width(policy.padding_left)
+        .saturating_add(display_width(&item.label.plain_text()))
+        .saturating_add(display_width(policy.padding_right))
 }
 
 fn u16_saturating(value: usize) -> u16 {
@@ -572,6 +605,24 @@ mod tests {
     }
 
     #[test]
+    fn custom_separator_and_padding_are_rendered_and_hit_tested() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let state = TabBarState::new(Some(0));
+        let policy = TabBarPolicy::interactive().separator("|").padding("[", "]");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 11, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        let bar = TabBar::new(&items).policy(policy);
+        bar.render(Rect::new(0, 0, 11, 1), &state, &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("[One]|[Two]")
+        );
+        assert_eq!(bar.hit_rects(Rect::new(0, 0, 11, 1))[1].x, 6);
+    }
+
+    #[test]
     fn keyboard_navigation_selects_next_enabled_tab() {
         let items = [
             TabItem::new("one", "One"),
@@ -600,7 +651,7 @@ mod tests {
                 wrap: false,
                 home_end: true,
             },
-            ..TabBarPolicy::interactive()
+            ..TabBarPolicy::interactive().padding("[", "]")
         });
 
         let outcome = bar.handle_event(
