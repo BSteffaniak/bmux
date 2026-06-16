@@ -32,6 +32,8 @@ pub struct SparklinePolicy {
     pub highlight_first: bool,
     /// Whether visible high samples get a distinct style.
     pub highlight_high: bool,
+    /// Whether visible low samples get a distinct style.
+    pub highlight_low: bool,
     /// Fill background before rendering.
     pub background: bool,
 }
@@ -48,6 +50,7 @@ impl SparklinePolicy {
             highlight_latest: true,
             highlight_first: false,
             highlight_high: false,
+            highlight_low: false,
             background: false,
         }
     }
@@ -63,6 +66,7 @@ impl SparklinePolicy {
             highlight_latest: false,
             highlight_first: false,
             highlight_high: false,
+            highlight_low: false,
             background: false,
         }
     }
@@ -102,6 +106,13 @@ impl SparklinePolicy {
         self
     }
 
+    /// Return this policy with low-sample highlighting changed.
+    #[must_use]
+    pub const fn highlight_low(mut self, highlight_low: bool) -> Self {
+        self.highlight_low = highlight_low;
+        self
+    }
+
     /// Return this policy with background fill changed.
     #[must_use]
     pub const fn background(mut self, background: bool) -> Self {
@@ -127,6 +138,8 @@ pub struct SparklineStyles {
     pub first: Style,
     /// High visible sample style.
     pub high: Style,
+    /// Low visible sample style.
+    pub low: Style,
     /// Empty-content style.
     pub empty: Style,
     /// Background fill style.
@@ -144,6 +157,7 @@ impl Default for SparklineStyles {
             high: Style::new()
                 .fg(Color::BrightGreen)
                 .add_modifier(Modifier::BOLD),
+            low: Style::new().fg(Color::BrightRed),
             empty: Style::new().fg(Color::BrightBlack),
             background: Style::new(),
         }
@@ -173,6 +187,7 @@ impl<'a> Sparkline<'a> {
                 highlight_latest: true,
                 highlight_first: false,
                 highlight_high: false,
+                highlight_low: false,
                 background: false,
             },
             styles: SparklineStyles {
@@ -180,6 +195,7 @@ impl<'a> Sparkline<'a> {
                 latest: Style::new(),
                 first: Style::new(),
                 high: Style::new(),
+                low: Style::new(),
                 empty: Style::new(),
                 background: Style::new(),
             },
@@ -238,6 +254,7 @@ impl<'a> Sparkline<'a> {
             .max
             .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
         let high = samples.iter().copied().max().unwrap_or(0);
+        let low = samples.iter().copied().min().unwrap_or(0);
         let last = samples.len().saturating_sub(1);
         let iter: Box<dyn Iterator<Item = (usize, &u64)> + '_> = match self.policy.direction {
             SparklineDirection::LeftToRight => Box::new(samples.iter().enumerate()),
@@ -251,6 +268,8 @@ impl<'a> Sparkline<'a> {
                     self.styles.first
                 } else if self.policy.highlight_high && *sample == high {
                     self.styles.high
+                } else if self.policy.highlight_low && *sample == low {
+                    self.styles.low
                 } else {
                     self.styles.normal
                 };
@@ -355,12 +374,13 @@ mod tests {
 
     #[test]
     fn first_latest_and_high_samples_can_be_styled() {
-        let samples = [1, 3, 2];
+        let samples = [2, 3, 1];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
         let mut frame = Frame::new(&mut buffer);
         let styles = SparklineStyles {
             first: Style::new().fg(Color::Blue),
             high: Style::new().fg(Color::Green),
+            low: Style::new().fg(Color::Red),
             latest: Style::new().fg(Color::Yellow),
             ..SparklineStyles::default()
         };
@@ -369,7 +389,8 @@ mod tests {
             .policy(
                 SparklinePolicy::bare()
                     .highlight_first(true)
-                    .highlight_high(true),
+                    .highlight_high(true)
+                    .highlight_low(true),
             )
             .styles(styles)
             .render(Rect::new(0, 0, 3, 1), &mut frame);
@@ -387,6 +408,13 @@ mod tests {
                 .get(Point::new(1, 0))
                 .map(|cell| cell.style.fg),
             Some(Some(Color::Green))
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(2, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Red))
         );
     }
 
