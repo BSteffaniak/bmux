@@ -7,7 +7,9 @@ use bmux_tui::style::{Color, Style};
 use bmux_tui::widget::Widget;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::badge::{Badge, BadgePolicy, BadgeSeverity};
-use bmux_tui_components::bar_chart::{BarChart, BarChartItem, BarChartPolicy};
+use bmux_tui_components::bar_chart::{
+    BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement,
+};
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
@@ -160,10 +162,20 @@ fn render_stepper(frame: &mut Frame<'_>) {
 }
 
 fn render_bar_chart(frame: &mut Frame<'_>) {
-    let items = [BarChartItem::new("CPU", 7), BarChartItem::new("Mem", 4)];
+    let mem_group = [4, 6];
+    let items = [
+        BarChartItem::new("CPU", 7),
+        BarChartItem::new("Mem", 4).group(&mem_group),
+    ];
     BarChart::new(&items)
-        .policy(BarChartPolicy::compact().max(Some(10)))
-        .render(Rect::new(35, 13, 28, 2), frame);
+        .policy(
+            BarChartPolicy::with_values()
+                .max(Some(10))
+                .bar_width(Some(12))
+                .bar_gap(1)
+                .value_placement(BarChartValuePlacement::Right),
+        )
+        .render(Rect::new(35, 13, 32, 3), frame);
 }
 
 fn render_toasts(frame: &mut Frame<'_>) {
