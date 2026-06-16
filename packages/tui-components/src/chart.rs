@@ -423,11 +423,60 @@ impl<'a> Chart<'a> {
             } else {
                 dataset.style
             };
+            if matches!(dataset.kind, ChartDatasetKind::Line)
+                && matches!(self.policy.interpolation, ChartInterpolation::Straight)
+            {
+                for pair in dataset.points.windows(2) {
+                    if let (Some((x0, y0)), Some((x1, y1))) =
+                        (self.map_point(area, pair[0]), self.map_point(area, pair[1]))
+                    {
+                        draw_line(frame, area, (x0, y0), (x1, y1), dataset.marker, style);
+                    }
+                }
+            }
             for point in dataset.points {
                 if let Some((x, y)) = self.map_point(area, *point) {
                     draw_cell(frame, area, x, y, dataset.marker, style);
                 }
             }
+        }
+    }
+}
+
+fn draw_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    start: (u16, u16),
+    end: (u16, u16),
+    marker: &str,
+    style: Style,
+) {
+    let x0 = i32::from(start.0);
+    let y0 = i32::from(start.1);
+    let x1 = i32::from(end.0);
+    let y1 = i32::from(end.1);
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    let mut x = x0;
+    let mut y = y0;
+    loop {
+        if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
+            draw_cell(frame, area, x, y, marker, style);
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let double_error = error.saturating_mul(2);
+        if double_error >= dy {
+            error += dy;
+            x += sx;
+        }
+        if double_error <= dx {
+            error += dx;
+            y += sy;
         }
     }
 }
@@ -550,6 +599,39 @@ mod tests {
         let chart = Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0)).policy(policy);
 
         assert_eq!(chart.policy_model(), policy);
+    }
+
+    #[test]
+    fn renders_line_dataset_segments() {
+        let points = [ChartPoint::new(0.0, 0.0), ChartPoint::new(2.0, 2.0)];
+        let datasets = [ChartDataset::line("line", &points).marker("*")];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 2.0, 0.0, 2.0))
+            .render(Rect::new(0, 0, 3, 3), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(0, 2))
+                .map(|cell| cell.symbol.as_str()),
+            Some("*")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(1, 1))
+                .map(|cell| cell.symbol.as_str()),
+            Some("*")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(2, 0))
+                .map(|cell| cell.symbol.as_str()),
+            Some("*")
+        );
     }
 
     #[test]
