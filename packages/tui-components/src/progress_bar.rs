@@ -53,6 +53,15 @@ pub enum ProgressLabelPlacement {
     Right,
 }
 
+/// Render mode for [`ProgressBar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressBarMode {
+    /// Filled bar gauge.
+    Bar,
+    /// Compact line gauge.
+    LineGauge,
+}
+
 /// Behavior policy for [`ProgressBar`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressBarPolicy {
@@ -70,6 +79,8 @@ pub struct ProgressBarPolicy {
     pub percentage: bool,
     /// Fill row background before rendering.
     pub background: bool,
+    /// Progress render mode.
+    pub mode: ProgressBarMode,
 }
 
 impl ProgressBarPolicy {
@@ -84,6 +95,7 @@ impl ProgressBarPolicy {
             label: ProgressLabelPlacement::Inside,
             percentage: true,
             background: false,
+            mode: ProgressBarMode::Bar,
         }
     }
 
@@ -98,6 +110,7 @@ impl ProgressBarPolicy {
             label: ProgressLabelPlacement::Hidden,
             percentage: false,
             background: false,
+            mode: ProgressBarMode::Bar,
         }
     }
 
@@ -112,6 +125,20 @@ impl ProgressBarPolicy {
     #[must_use]
     pub const fn background(mut self, background: bool) -> Self {
         self.background = background;
+        self
+    }
+    /// Return this policy with render mode changed.
+    #[must_use]
+    pub const fn mode(mut self, mode: ProgressBarMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Return this policy configured for line-gauge rendering.
+    #[must_use]
+    pub const fn line_gauge(mut self) -> Self {
+        self.mode = ProgressBarMode::LineGauge;
+        self.label = ProgressLabelPlacement::Right;
         self
     }
 }
@@ -180,6 +207,7 @@ impl<'a> ProgressBar<'a> {
                 label: ProgressLabelPlacement::Inside,
                 percentage: true,
                 background: false,
+                mode: ProgressBarMode::Bar,
             },
             styles: ProgressBarStyles {
                 filled: Style::new(),
@@ -244,6 +272,11 @@ impl<'a> ProgressBar<'a> {
             frame.fill(area, " ", self.styles.background);
         }
         match self.value {
+            ProgressBarValue::Determinate { .. }
+                if matches!(self.policy.mode, ProgressBarMode::LineGauge) =>
+            {
+                self.render_line_gauge(area, frame);
+            }
             ProgressBarValue::Determinate { .. } => self.render_determinate(area, frame),
             ProgressBarValue::Indeterminate { offset } => {
                 self.render_indeterminate(area, offset, frame);
@@ -286,7 +319,9 @@ impl<'a> ProgressBar<'a> {
                 spans.push(Span::styled(label.clone(), self.styles.label));
             }
         }
-        let line = if matches!(self.policy.label, ProgressLabelPlacement::Inside) {
+        let line = if matches!(self.policy.label, ProgressLabelPlacement::Inside)
+            && !matches!(self.policy.mode, ProgressBarMode::LineGauge)
+        {
             overlay_label(
                 Line::from_spans(spans),
                 label.as_deref(),
@@ -297,6 +332,44 @@ impl<'a> ProgressBar<'a> {
             Line::from_spans(spans)
         };
         frame.write_line(area, &line);
+    }
+
+    fn render_line_gauge(&self, area: Rect, frame: &mut Frame<'_>) {
+        let label = self.label_text();
+        let label_width = label.as_ref().map_or(0, |label| display_width(label));
+        let right_label =
+            label_width > 0 && !matches!(self.policy.label, ProgressLabelPlacement::Hidden);
+        let gap = u16::from(right_label);
+        let gauge_width = if right_label {
+            area.width
+                .saturating_sub(u16_saturating(label_width).saturating_add(gap))
+        } else {
+            area.width
+        };
+        let filled_width = self.filled_width(gauge_width).min(gauge_width);
+        let mut spans = Vec::new();
+        if filled_width > 0 {
+            spans.push(Span::styled(
+                self.policy.filled.repeat(usize::from(filled_width)),
+                self.filled_style(),
+            ));
+        }
+        let empty_width = gauge_width.saturating_sub(filled_width);
+        if empty_width > 0 {
+            spans.push(Span::styled(
+                self.policy.empty.repeat(usize::from(empty_width)),
+                self.styles.empty,
+            ));
+        }
+        if right_label {
+            if gauge_width < area.width {
+                spans.push(Span::raw(" "));
+            }
+            if let Some(label) = label {
+                spans.push(Span::styled(label, self.styles.label));
+            }
+        }
+        frame.write_line(area, &Line::from_spans(spans));
     }
 
     fn render_indeterminate(&self, area: Rect, offset: u16, frame: &mut Frame<'_>) {
@@ -386,6 +459,21 @@ mod tests {
             .render(Rect::new(0, 0, 10, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█████░░░░░"));
+    }
+
+    #[test]
+    fn renders_line_gauge_mode() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        ProgressBar::new(ProgressBarValue::determinate(1, 2))
+            .policy(ProgressBarPolicy::compact().line_gauge())
+            .render(Rect::new(0, 0, 12, 1), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("████░░░░ 50%")
+        );
     }
 
     #[test]
