@@ -199,6 +199,104 @@ impl<'a> ChartAxes<'a> {
     }
 }
 
+/// Chart line interpolation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartInterpolation {
+    /// Render only dataset markers.
+    PointsOnly,
+    /// Connect line datasets with straight segments.
+    Straight,
+}
+
+/// Chart clipping policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartClipping {
+    /// Drop points outside bounds.
+    Clip,
+    /// Clamp points outside bounds to the nearest chart edge.
+    Clamp,
+}
+
+/// Chart legend placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartLegendPlacement {
+    /// Do not render a legend.
+    Hidden,
+    /// Render legend metadata at the top-right edge.
+    TopRight,
+    /// Render legend metadata at the bottom-right edge.
+    BottomRight,
+}
+
+/// Chart axis visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartAxisVisibility {
+    /// Do not render axis metadata.
+    Hidden,
+    /// Render axis metadata.
+    Visible,
+}
+
+/// Chart rendering policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChartPolicy {
+    /// Line interpolation mode.
+    pub interpolation: ChartInterpolation,
+    /// Point clipping behavior.
+    pub clipping: ChartClipping,
+    /// Legend placement.
+    pub legend: ChartLegendPlacement,
+    /// Axis visibility.
+    pub axes: ChartAxisVisibility,
+}
+
+impl ChartPolicy {
+    /// Compact default chart policy.
+    #[must_use]
+    pub const fn compact() -> Self {
+        Self {
+            interpolation: ChartInterpolation::Straight,
+            clipping: ChartClipping::Clip,
+            legend: ChartLegendPlacement::Hidden,
+            axes: ChartAxisVisibility::Hidden,
+        }
+    }
+
+    /// Return this policy with interpolation changed.
+    #[must_use]
+    pub const fn interpolation(mut self, interpolation: ChartInterpolation) -> Self {
+        self.interpolation = interpolation;
+        self
+    }
+
+    /// Return this policy with clipping changed.
+    #[must_use]
+    pub const fn clipping(mut self, clipping: ChartClipping) -> Self {
+        self.clipping = clipping;
+        self
+    }
+
+    /// Return this policy with legend placement changed.
+    #[must_use]
+    pub const fn legend(mut self, legend: ChartLegendPlacement) -> Self {
+        self.legend = legend;
+        self
+    }
+
+    /// Return this policy with axis visibility changed.
+    #[must_use]
+    pub const fn axes(mut self, axes: ChartAxisVisibility) -> Self {
+        self.axes = axes;
+        self
+    }
+}
+
+impl Default for ChartPolicy {
+    fn default() -> Self {
+        Self::compact()
+    }
+}
+
 /// Chart visual styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChartStyles {
@@ -223,6 +321,7 @@ pub struct Chart<'a> {
     datasets: &'a [ChartDataset<'a>],
     bounds: ChartBounds,
     axes: ChartAxes<'a>,
+    policy: ChartPolicy,
     styles: ChartStyles,
     empty: &'a str,
 }
@@ -235,6 +334,7 @@ impl<'a> Chart<'a> {
             datasets,
             bounds,
             axes: ChartAxes::empty(),
+            policy: ChartPolicy::compact(),
             styles: ChartStyles {
                 dataset: Style::new(),
                 empty: Style::new(),
@@ -250,6 +350,13 @@ impl<'a> Chart<'a> {
         self
     }
 
+    /// Set chart rendering policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: ChartPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: ChartStyles) -> Self {
@@ -262,6 +369,12 @@ impl<'a> Chart<'a> {
     pub const fn empty(mut self, empty: &'a str) -> Self {
         self.empty = empty;
         self
+    }
+
+    /// Return chart policy.
+    #[must_use]
+    pub const fn policy_model(&self) -> ChartPolicy {
+        self.policy
     }
 
     /// Return chart axes.
@@ -348,7 +461,10 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
 
-    use super::{Chart, ChartAxes, ChartAxis, ChartBounds, ChartDataset, ChartPoint};
+    use super::{
+        Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartClipping, ChartDataset,
+        ChartInterpolation, ChartLegendPlacement, ChartPoint, ChartPolicy,
+    };
 
     #[test]
     fn maps_points_to_chart_cells() {
@@ -378,6 +494,21 @@ mod tests {
         assert_eq!(chart.axes_model().x.title, Some("time"));
         assert_eq!(chart.axes_model().y.labels, y_labels);
         assert!(chart.axes_model().legend);
+    }
+
+    #[test]
+    fn stores_chart_rendering_policy() {
+        let points = [ChartPoint::new(0.0, 0.0)];
+        let datasets = [ChartDataset::line("line", &points)];
+        let policy = ChartPolicy::compact()
+            .interpolation(ChartInterpolation::PointsOnly)
+            .clipping(ChartClipping::Clamp)
+            .legend(ChartLegendPlacement::TopRight)
+            .axes(ChartAxisVisibility::Visible);
+
+        let chart = Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0)).policy(policy);
+
+        assert_eq!(chart.policy_model(), policy);
     }
 
     #[test]
