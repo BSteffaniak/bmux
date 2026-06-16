@@ -22,6 +22,15 @@ impl ProgressBarValue {
         Self::Determinate { value, total }
     }
 
+    /// Create determinate progress from a ratio numerator and denominator.
+    #[must_use]
+    pub const fn ratio(numerator: u64, denominator: u64) -> Self {
+        Self::Determinate {
+            value: numerator,
+            total: denominator,
+        }
+    }
+
     /// Create indeterminate progress with caller-provided animation offset.
     #[must_use]
     pub const fn indeterminate(offset: u16) -> Self {
@@ -218,6 +227,12 @@ impl<'a> ProgressBar<'a> {
                 background: Style::new(),
             },
         }
+    }
+
+    /// Create a progress bar from a ratio numerator and denominator.
+    #[must_use]
+    pub const fn ratio(numerator: u64, denominator: u64) -> Self {
+        Self::new(ProgressBarValue::ratio(numerator, denominator))
     }
 
     /// Set explicit label.
@@ -424,6 +439,14 @@ mod tests {
     use bmux_tui::geometry::Rect;
 
     use super::{ProgressBar, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement};
+
+    #[test]
+    fn ratio_constructor_builds_determinate_progress() {
+        let bar = ProgressBar::ratio(3, 4);
+
+        assert_eq!(bar.label_text().as_deref(), Some("75%"));
+        assert_eq!(bar.filled_width(8), 6);
+    }
 
     #[test]
     fn computes_determinate_percent_and_fill_width() {
