@@ -5,6 +5,15 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 
+/// Sparkline render direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparklineDirection {
+    /// Render samples from oldest to newest, left to right.
+    LeftToRight,
+    /// Render samples from newest to oldest, left to right.
+    RightToLeft,
+}
+
 /// Sparkline rendering policy.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +22,8 @@ pub struct SparklinePolicy {
     pub max: Option<u64>,
     /// Render only the latest `window` samples when set.
     pub window: Option<usize>,
+    /// Render direction.
+    pub direction: SparklineDirection,
     /// Glyphs from lowest to highest value.
     pub symbols: &'static [&'static str],
     /// Whether the latest visible sample gets a distinct style.
@@ -32,6 +43,7 @@ impl SparklinePolicy {
         Self {
             max: None,
             window: None,
+            direction: SparklineDirection::LeftToRight,
             symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
             highlight_latest: true,
             highlight_first: false,
@@ -46,6 +58,7 @@ impl SparklinePolicy {
         Self {
             max: None,
             window: None,
+            direction: SparklineDirection::LeftToRight,
             symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
             highlight_latest: false,
             highlight_first: false,
@@ -65,6 +78,13 @@ impl SparklinePolicy {
     #[must_use]
     pub const fn window(mut self, window: Option<usize>) -> Self {
         self.window = window;
+        self
+    }
+
+    /// Return this policy with render direction changed.
+    #[must_use]
+    pub const fn direction(mut self, direction: SparklineDirection) -> Self {
+        self.direction = direction;
         self
     }
 
@@ -148,6 +168,7 @@ impl<'a> Sparkline<'a> {
             policy: SparklinePolicy {
                 max: None,
                 window: None,
+                direction: SparklineDirection::LeftToRight,
                 symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
                 highlight_latest: true,
                 highlight_first: false,
@@ -218,9 +239,11 @@ impl<'a> Sparkline<'a> {
             .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
         let high = samples.iter().copied().max().unwrap_or(0);
         let last = samples.len().saturating_sub(1);
-        let spans = samples
-            .iter()
-            .enumerate()
+        let iter: Box<dyn Iterator<Item = (usize, &u64)> + '_> = match self.policy.direction {
+            SparklineDirection::LeftToRight => Box::new(samples.iter().enumerate()),
+            SparklineDirection::RightToLeft => Box::new(samples.iter().enumerate().rev()),
+        };
+        let spans = iter
             .map(|(index, sample)| {
                 let style = if self.policy.highlight_latest && index == last {
                     self.styles.latest
@@ -267,7 +290,7 @@ mod tests {
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::style::{Color, Style};
 
-    use super::{Sparkline, SparklinePolicy, SparklineStyles};
+    use super::{Sparkline, SparklineDirection, SparklinePolicy, SparklineStyles};
 
     #[test]
     fn maps_empty_samples_to_empty_message() {
@@ -365,6 +388,23 @@ mod tests {
                 .map(|cell| cell.style.fg),
             Some(Some(Color::Green))
         );
+    }
+
+    #[test]
+    fn right_to_left_direction_renders_latest_first() {
+        let samples = [1, 2, 3];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Sparkline::new(&samples)
+            .policy(
+                SparklinePolicy::bare()
+                    .max(Some(3))
+                    .direction(SparklineDirection::RightToLeft),
+            )
+            .render(Rect::new(0, 0, 3, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█▅▃"));
     }
 
     #[test]
