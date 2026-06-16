@@ -35,6 +35,17 @@ impl<'a> BarChartItem<'a> {
     }
 }
 
+/// Value label placement for [`BarChart`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarChartValuePlacement {
+    /// Do not render value labels.
+    Hidden,
+    /// Render values after bars.
+    Right,
+    /// Render values over the bar area near the right edge.
+    Inside,
+}
+
 /// Bar chart rendering policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BarChartPolicy {
@@ -52,6 +63,8 @@ pub struct BarChartPolicy {
     pub empty: &'static str,
     /// Separator between label and bar.
     pub separator: &'static str,
+    /// Value label placement.
+    pub value_placement: BarChartValuePlacement,
     /// Render numeric values after bars.
     pub values: bool,
     /// Truncate labels to reserved width.
@@ -70,6 +83,7 @@ impl BarChartPolicy {
             bar: "█",
             empty: "░",
             separator: " ",
+            value_placement: BarChartValuePlacement::Hidden,
             values: false,
             truncate_labels: true,
         }
@@ -79,6 +93,7 @@ impl BarChartPolicy {
     #[must_use]
     pub const fn with_values() -> Self {
         Self {
+            value_placement: BarChartValuePlacement::Right,
             values: true,
             ..Self::compact()
         }
@@ -90,6 +105,14 @@ impl BarChartPolicy {
         self.max = max;
         self
     }
+    /// Return this policy with value label placement changed.
+    #[must_use]
+    pub const fn value_placement(mut self, value_placement: BarChartValuePlacement) -> Self {
+        self.value_placement = value_placement;
+        self.values = !matches!(value_placement, BarChartValuePlacement::Hidden);
+        self
+    }
+
     /// Return this policy with maximum bar width changed.
     #[must_use]
     pub const fn bar_width(mut self, bar_width: Option<u16>) -> Self {
@@ -163,6 +186,7 @@ impl<'a> BarChart<'a> {
                 bar: "█",
                 empty: "░",
                 separator: " ",
+                value_placement: BarChartValuePlacement::Hidden,
                 values: false,
                 truncate_labels: true,
             },
@@ -242,11 +266,17 @@ impl<'a> BarChart<'a> {
         let label_width = self.policy.label_width.min(width);
         let separator_width = u16_saturating(display_width(self.policy.separator));
         let value_text = if self.policy.values {
-            format!(" {}", item.value)
+            item.value.to_string()
         } else {
             String::new()
         };
-        let value_width = u16_saturating(display_width(&value_text));
+        let right_value = matches!(self.policy.value_placement, BarChartValuePlacement::Right)
+            && !value_text.is_empty();
+        let value_width = if right_value {
+            u16_saturating(display_width(&format!(" {value_text}")))
+        } else {
+            0
+        };
         let available_bar_width = width
             .saturating_sub(label_width)
             .saturating_sub(separator_width)
@@ -308,9 +338,29 @@ impl<'a> BarChart<'a> {
                 ));
             }
         }
-        spans.push(Span::styled(value_text, self.styles.value));
+        if matches!(self.policy.value_placement, BarChartValuePlacement::Inside)
+            && !value_text.is_empty()
+        {
+            spans.push(Span::styled(
+                format_inside_value(&value_text, bar_width),
+                self.styles.value,
+            ));
+        }
+        if right_value {
+            spans.push(Span::styled(format!(" {value_text}"), self.styles.value));
+        }
         Line::from_spans(spans)
     }
+}
+
+fn format_inside_value(value: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
+    }
+    let value = truncate_to_display_width(value, width);
+    let left = width.saturating_sub(display_width(&value));
+    format!("{}{}", " ".repeat(left), value)
 }
 
 fn filled_width(value: u64, max: u64, width: u16) -> u16 {
@@ -344,7 +394,7 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
 
-    use super::{BarChart, BarChartItem, BarChartPolicy};
+    use super::{BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement};
 
     #[test]
     fn scales_bars_against_derived_max() {
@@ -399,6 +449,27 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(2).as_deref(),
             Some("b      ████ ")
+        );
+    }
+
+    #[test]
+    fn renders_inside_value_label() {
+        let items = [BarChartItem::new("a", 5)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 17, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        BarChart::new(&items)
+            .policy(
+                BarChartPolicy::compact()
+                    .max(Some(10))
+                    .bar_width(Some(5))
+                    .value_placement(BarChartValuePlacement::Inside),
+            )
+            .render(Rect::new(0, 0, 17, 1), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("a      ██░░░    5")
         );
     }
 
