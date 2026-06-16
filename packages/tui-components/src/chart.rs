@@ -1,7 +1,7 @@
 //! Lightweight generic chart component.
 
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::style::{Color, Style};
 
 /// One chart point.
@@ -386,7 +386,18 @@ impl<'a> Chart<'a> {
     /// Map a chart point into an area cell.
     #[must_use]
     pub fn map_point(&self, area: Rect, point: ChartPoint) -> Option<(u16, u16)> {
-        map_point(area, self.bounds, point)
+        map_point(area, self.bounds, point, self.policy.clipping)
+    }
+
+    /// Map a chart point into an area cell with an explicit clipping mode.
+    #[must_use]
+    pub fn map_point_with_clipping(
+        &self,
+        area: Rect,
+        point: ChartPoint,
+        clipping: ChartClipping,
+    ) -> Option<(u16, u16)> {
+        map_point(area, self.bounds, point, clipping)
     }
 
     /// Render chart datasets.
@@ -414,18 +425,19 @@ impl<'a> Chart<'a> {
             };
             for point in dataset.points {
                 if let Some((x, y)) = self.map_point(area, *point) {
-                    frame.buffer_mut().set_cell(
-                        bmux_tui::geometry::Point::new(
-                            area.x.saturating_add(x),
-                            area.y.saturating_add(y),
-                        ),
-                        dataset.marker,
-                        style,
-                    );
+                    draw_cell(frame, area, x, y, dataset.marker, style);
                 }
             }
         }
     }
+}
+
+fn draw_cell(frame: &mut Frame<'_>, area: Rect, x: u16, y: u16, marker: &str, style: Style) {
+    frame.buffer_mut().set_cell(
+        Point::new(area.x.saturating_add(x), area.y.saturating_add(y)),
+        marker,
+        style,
+    );
 }
 
 fn rounded_u16(value: f64) -> u16 {
@@ -437,16 +449,29 @@ fn rounded_u16(value: f64) -> u16 {
         .unwrap_or(0)
 }
 
-fn map_point(area: Rect, bounds: ChartBounds, point: ChartPoint) -> Option<(u16, u16)> {
-    if area.is_empty()
-        || bounds.x_min >= bounds.x_max
-        || bounds.y_min >= bounds.y_max
-        || point.x < bounds.x_min
-        || point.x > bounds.x_max
-        || point.y < bounds.y_min
-        || point.y > bounds.y_max
-    {
+fn map_point(
+    area: Rect,
+    bounds: ChartBounds,
+    mut point: ChartPoint,
+    clipping: ChartClipping,
+) -> Option<(u16, u16)> {
+    if area.is_empty() || bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
         return None;
+    }
+    match clipping {
+        ChartClipping::Clip
+            if point.x < bounds.x_min
+                || point.x > bounds.x_max
+                || point.y < bounds.y_min
+                || point.y > bounds.y_max =>
+        {
+            return None;
+        }
+        ChartClipping::Clip => {}
+        ChartClipping::Clamp => {
+            point.x = point.x.clamp(bounds.x_min, bounds.x_max);
+            point.y = point.y.clamp(bounds.y_min, bounds.y_max);
+        }
     }
     let x_span = bounds.x_max - bounds.x_min;
     let y_span = bounds.y_max - bounds.y_min;
@@ -459,7 +484,7 @@ fn map_point(area: Rect, bounds: ChartBounds, point: ChartPoint) -> Option<(u16,
 mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::geometry::{Point as TuiPoint, Rect};
 
     use super::{
         Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartClipping, ChartDataset,
@@ -475,6 +500,22 @@ mod tests {
         assert_eq!(
             chart.map_point(Rect::new(0, 0, 11, 11), points[0]),
             Some((5, 5))
+        );
+    }
+
+    #[test]
+    fn clips_or_clamps_points_to_bounds() {
+        let points = [ChartPoint::new(12.0, -1.0)];
+        let datasets = [ChartDataset::scatter("points", &points)];
+        let chart = Chart::new(&datasets, ChartBounds::new(0.0, 10.0, 0.0, 10.0));
+
+        assert_eq!(
+            chart.map_point_with_clipping(Rect::new(0, 0, 11, 11), points[0], ChartClipping::Clip),
+            None
+        );
+        assert_eq!(
+            chart.map_point_with_clipping(Rect::new(0, 0, 11, 11), points[0], ChartClipping::Clamp),
+            Some((10, 10))
         );
     }
 
@@ -524,14 +565,14 @@ mod tests {
         assert_eq!(
             frame
                 .buffer()
-                .get(Point::new(0, 10))
+                .get(TuiPoint::new(0, 10))
                 .map(|cell| cell.symbol.as_str()),
             Some("x")
         );
         assert_eq!(
             frame
                 .buffer()
-                .get(Point::new(10, 0))
+                .get(TuiPoint::new(10, 0))
                 .map(|cell| cell.symbol.as_str()),
             Some("x")
         );
