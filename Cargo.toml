@@ -285,6 +285,9 @@ rustls-native-certs = { version = "0.8.3", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = [
     "std",
 ] }
+security-framework = { version = "3.7.0", default-features = false, features = [
+    "OSX_10_14",
+] }
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [

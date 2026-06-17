@@ -3816,25 +3816,10 @@ fn run_device_seal_broker_request(payload: &[u8]) -> Result<Vec<u8>> {
 
     let response = match request.operation {
         sshenv_vault_models::DeviceSealBrokerOperation::Load => {
-            let output = std::process::Command::new("/usr/bin/security")
-                .arg("find-generic-password")
-                .arg("-w")
-                .arg("-s")
-                .arg(&request.service)
-                .arg("-a")
-                .arg(&request.account)
-                .output()
-                .context("failed to invoke macOS security command")?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "macOS Keychain device seal secret not found or unavailable: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            let secret_hex = String::from_utf8(output.stdout)
-                .context("macOS Keychain returned non-UTF8 device seal secret")?
-                .trim()
-                .to_string();
+            let secret_hex = load_device_seal_keychain_secret(
+                request.service.as_str(),
+                request.account.as_str(),
+            )?;
             sshenv_vault_models::DeviceSealBrokerResponse {
                 secret_hex: Some(secret_hex),
                 error: None,
@@ -3846,23 +3831,11 @@ fn run_device_seal_broker_request(payload: &[u8]) -> Result<Vec<u8>> {
                 .as_deref()
                 .filter(|value| !value.is_empty())
                 .context("store request is missing secret_hex")?;
-            let output = std::process::Command::new("/usr/bin/security")
-                .arg("add-generic-password")
-                .arg("-U")
-                .arg("-s")
-                .arg(&request.service)
-                .arg("-a")
-                .arg(&request.account)
-                .arg("-w")
-                .arg(secret_hex)
-                .output()
-                .context("failed to invoke macOS security command")?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "failed to store device seal in macOS Keychain: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            store_device_seal_keychain_secret(
+                request.service.as_str(),
+                request.account.as_str(),
+                secret_hex,
+            )?;
             sshenv_vault_models::DeviceSealBrokerResponse {
                 secret_hex: None,
                 error: None,
@@ -3870,6 +3843,35 @@ fn run_device_seal_broker_request(payload: &[u8]) -> Result<Vec<u8>> {
         }
     };
     serde_json::to_vec(&response).context("failed to encode device-seal broker response")
+}
+
+#[cfg(target_os = "macos")]
+fn load_device_seal_keychain_secret(service: &str, account: &str) -> Result<String> {
+    let secret = security_framework::passwords::get_generic_password(service, account)
+        .with_context(|| "macOS Keychain device seal secret not found or unavailable")?;
+    String::from_utf8(secret)
+        .map(|secret| secret.trim().to_string())
+        .context("macOS Keychain returned non-UTF8 device seal secret")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_device_seal_keychain_secret(_service: &str, _account: &str) -> Result<String> {
+    anyhow::bail!("macOS Keychain device seal broker is only supported on macOS")
+}
+
+#[cfg(target_os = "macos")]
+fn store_device_seal_keychain_secret(service: &str, account: &str, secret_hex: &str) -> Result<()> {
+    security_framework::passwords::set_generic_password(service, account, secret_hex.as_bytes())
+        .with_context(|| "failed to store device seal in macOS Keychain")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn store_device_seal_keychain_secret(
+    _service: &str,
+    _account: &str,
+    _secret_hex: &str,
+) -> Result<()> {
+    anyhow::bail!("macOS Keychain device seal broker is only supported on macOS")
 }
 
 struct AttachServerEventHandling {
