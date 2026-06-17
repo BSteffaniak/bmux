@@ -58,11 +58,11 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_picker(frame);
     render_stepper(frame);
     render_bar_chart(frame);
-    render_chart(frame);
-    render_canvas(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
     render_toasts(frame);
+    render_chart(frame);
+    render_canvas(frame);
 }
 
 fn render_buttons(frame: &mut Frame<'_>) {
@@ -314,7 +314,9 @@ mod tests {
         assert!(rendered.contains("No matching components yet"));
         assert!(rendered.contains("✓ Plan ── ● Build"));
         assert!(rendered.contains("CPU"));
-        assert!(rendered.contains("██████"));
+        assert!(rendered.contains("◆"));
+        assert!(rendered.contains("□"));
+        assert!(rendered.contains("●"));
         assert!(rendered.contains("Saved ×"));
         assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
