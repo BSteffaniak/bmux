@@ -25,7 +25,7 @@ pub struct ScrollbarState {
     pub content_len: u16,
     /// Visible viewport length in cells/items.
     pub viewport_len: u16,
-    dragging: bool,
+    pub(crate) dragging: bool,
 }
 
 impl ScrollbarState {

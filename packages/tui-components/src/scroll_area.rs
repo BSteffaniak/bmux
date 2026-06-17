@@ -7,7 +7,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Style};
 
 use crate::common::InteractionState;
-use crate::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState};
+use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 
 /// Runtime scroll-area state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +279,7 @@ impl<'a> ScrollArea<'a> {
         state: &mut ScrollAreaState,
         event: &Event,
     ) -> ScrollAreaOutcome {
-        self.normalize_state(area, state);
+        self.normalize_state(self.content_area(area), state);
         if state.interaction.disabled {
             return ScrollAreaOutcome::Ignored;
         }
@@ -308,18 +308,30 @@ impl<'a> ScrollArea<'a> {
             return ScrollAreaOutcome::Ignored;
         }
         match stroke.key {
-            KeyCode::Up if self.policy.arrows_scroll => self.scroll_by(area, state, -1),
-            KeyCode::Down if self.policy.arrows_scroll => self.scroll_by(area, state, 1),
-            KeyCode::PageUp if self.policy.page_keys_scroll => {
-                self.scroll_by(area, state, -i32::from(area.height.max(1)))
+            KeyCode::Up if self.policy.arrows_scroll => {
+                self.scroll_by(self.content_area(area), state, -1)
             }
-            KeyCode::PageDown if self.policy.page_keys_scroll => {
-                self.scroll_by(area, state, i32::from(area.height.max(1)))
+            KeyCode::Down if self.policy.arrows_scroll => {
+                self.scroll_by(self.content_area(area), state, 1)
             }
-            KeyCode::Home if self.policy.home_end_scroll => self.scroll_to(area, state, 0),
-            KeyCode::End if self.policy.home_end_scroll => {
-                self.scroll_to(area, state, self.max_vertical_offset(area))
+            KeyCode::PageUp if self.policy.page_keys_scroll => self.scroll_by(
+                self.content_area(area),
+                state,
+                -i32::from(area.height.max(1)),
+            ),
+            KeyCode::PageDown if self.policy.page_keys_scroll => self.scroll_by(
+                self.content_area(area),
+                state,
+                i32::from(area.height.max(1)),
+            ),
+            KeyCode::Home if self.policy.home_end_scroll => {
+                self.scroll_to(self.content_area(area), state, 0)
             }
+            KeyCode::End if self.policy.home_end_scroll => self.scroll_to(
+                self.content_area(area),
+                state,
+                self.max_vertical_offset(self.content_area(area)),
+            ),
             KeyCode::Char(_)
             | KeyCode::Enter
             | KeyCode::Tab
@@ -346,15 +358,44 @@ impl<'a> ScrollArea<'a> {
         state: &mut ScrollAreaState,
         mouse: MouseEvent,
     ) -> ScrollAreaOutcome {
+        if let Some(scrollbar_area) = self.scrollbar_area(area) {
+            let mut scrollbar_state =
+                ScrollbarState::new(self.content_height(), self.content_area(area).height)
+                    .offset(state.vertical_offset);
+            scrollbar_state.dragging = state.interaction.pressed;
+            match Scrollbar::new()
+                .policy(self.policy.scrollbar_policy)
+                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse))
+            {
+                ScrollbarOutcome::Changed { offset } => {
+                    state.vertical_offset = offset;
+                    state.interaction.pressed = scrollbar_state.dragging;
+                    return ScrollAreaOutcome::Scrolled {
+                        vertical_offset: offset,
+                    };
+                }
+                ScrollbarOutcome::Redraw => {
+                    state.interaction.pressed = scrollbar_state.dragging;
+                    return ScrollAreaOutcome::Handled;
+                }
+                ScrollbarOutcome::Ignored => {
+                    state.interaction.pressed = scrollbar_state.dragging;
+                    if state.interaction.pressed {
+                        return ScrollAreaOutcome::Handled;
+                    }
+                }
+            }
+        }
         if !area.contains(mouse.position) {
             return ScrollAreaOutcome::Ignored;
         }
+        let content_area = self.content_area(area);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll_by(area, state, -i32::from(self.policy.wheel_lines))
+                self.scroll_by(content_area, state, -i32::from(self.policy.wheel_lines))
             }
             MouseEventKind::ScrollDown => {
-                self.scroll_by(area, state, i32::from(self.policy.wheel_lines))
+                self.scroll_by(content_area, state, i32::from(self.policy.wheel_lines))
             }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
@@ -395,7 +436,7 @@ fn offset_u16(value: u16, delta: i32) -> u16 {
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::prelude::Line;
@@ -444,6 +485,27 @@ mod tests {
             gutter_frame.buffer().row_symbols(0).as_deref(),
             Some("one    █")
         );
+    }
+
+    #[test]
+    fn scrollbar_drag_handoff_scrolls_area() {
+        let lines = lines(&["zero", "one", "two", "three", "four"]);
+        let area = ScrollArea::new(&lines).policy(
+            super::ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Overlay),
+        );
+        let mut state = ScrollAreaState::new();
+
+        let outcome = area.handle_event(
+            Rect::new(0, 0, 8, 2),
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(7, 1),
+            )),
+        );
+
+        assert!(outcome.is_handled());
+        assert!(state.vertical_offset() > 0);
     }
 
     #[test]
