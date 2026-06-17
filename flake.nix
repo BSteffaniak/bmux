@@ -65,7 +65,7 @@
             cargo-deny
             cargo-ndk
             cargoMachete
-            nodePackages.markdownlint-cli
+            markdownlint-cli
             pkg-config
             openssl
             jdk21_headless
