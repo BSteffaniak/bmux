@@ -3846,12 +3846,30 @@ fn run_device_seal_broker_request(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(target_os = "macos")]
+fn device_seal_password_options(
+    service: &str,
+    account: &str,
+) -> security_framework::passwords::PasswordOptions {
+    security_framework::passwords::PasswordOptions::new_generic_password(service, account)
+}
+
+#[cfg(target_os = "macos")]
 fn load_device_seal_keychain_secret(service: &str, account: &str) -> Result<String> {
-    let secret = security_framework::passwords::get_generic_password(service, account)
-        .with_context(|| "macOS Keychain device seal secret not found or unavailable")?;
-    String::from_utf8(secret)
-        .map(|secret| secret.trim().to_string())
-        .context("macOS Keychain returned non-UTF8 device seal secret")
+    match security_framework::passwords::generic_password(device_seal_password_options(
+        service, account,
+    )) {
+        Ok(secret) => String::from_utf8(secret)
+            .map(|secret| secret.trim().to_string())
+            .context("macOS Keychain returned non-UTF8 device seal secret"),
+        Err(keychain_error) => match load_device_seal_fallback_secret(service, account) {
+            Ok(secret_hex) => Ok(secret_hex),
+            Err(fallback_error) => Err(anyhow::anyhow!(
+                "macOS Keychain device seal secret not found or unavailable: OSStatus {} ({}); fallback file unavailable: {fallback_error}",
+                keychain_error.code(),
+                keychain_error
+            )),
+        },
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3861,8 +3879,93 @@ fn load_device_seal_keychain_secret(_service: &str, _account: &str) -> Result<St
 
 #[cfg(target_os = "macos")]
 fn store_device_seal_keychain_secret(service: &str, account: &str, secret_hex: &str) -> Result<()> {
-    security_framework::passwords::set_generic_password(service, account, secret_hex.as_bytes())
-        .with_context(|| "failed to store device seal in macOS Keychain")
+    match security_framework::passwords::set_generic_password_options(
+        secret_hex.as_bytes(),
+        device_seal_password_options(service, account),
+    ) {
+        Ok(()) => Ok(()),
+        Err(keychain_error) => {
+            tracing::warn!(
+                service,
+                account,
+                os_status = keychain_error.code(),
+                error = %keychain_error,
+                "device_seal_broker.keychain_store_failed_using_file_fallback"
+            );
+            store_device_seal_fallback_secret(service, account, secret_hex).map_err(|fallback_error| {
+                anyhow::anyhow!(
+                    "failed to store device seal in macOS Keychain: OSStatus {} ({}); fallback file store failed: {fallback_error}",
+                    keychain_error.code(),
+                    keychain_error
+                )
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn device_seal_fallback_path(service: &str, account: &str) -> Result<std::path::PathBuf> {
+    let base = dirs::data_local_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Library").join("Application Support")))
+        .context("could not resolve user data directory for device-seal fallback")?;
+    let file_name = format!(
+        "{}-{}.hex",
+        sanitize_device_seal_path_component(service),
+        sanitize_device_seal_path_component(account)
+    );
+    Ok(base
+        .join("sshenv")
+        .join("device-seal-broker")
+        .join(file_name))
+}
+
+#[cfg(target_os = "macos")]
+fn sanitize_device_seal_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn load_device_seal_fallback_secret(service: &str, account: &str) -> Result<String> {
+    let path = device_seal_fallback_path(service, account)?;
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))
+        .map(|secret| secret.trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn store_device_seal_fallback_secret(service: &str, account: &str, secret_hex: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let path = device_seal_fallback_path(service, account)?;
+    let parent = path
+        .parent()
+        .context("device-seal fallback path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", parent.display()))?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    writeln!(file, "{secret_hex}")
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 #[cfg(not(target_os = "macos"))]

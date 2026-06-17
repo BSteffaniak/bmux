@@ -357,7 +357,7 @@ pub enum Request {
         ok: bool,
         #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         error: Option<String>,
     },
 }
@@ -801,6 +801,16 @@ mod tests {
             },
             Request::SubscribeEvents,
             Request::PollEvents { max_events: 100 },
+            Request::EnableEventPush,
+            Request::DeviceSealBroker {
+                payload: vec![1, 2, 3],
+            },
+            Request::DeviceSealBrokerResponse {
+                request_id: id,
+                ok: true,
+                payload: vec![4, 5, 6],
+                error: None,
+            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -872,6 +882,10 @@ mod tests {
             ResponsePayload::ServiceInvoked {
                 payload: vec![9, 8, 7],
             },
+            ResponsePayload::DeviceSealBrokered {
+                payload: vec![6, 5, 4],
+            },
+            ResponsePayload::DeviceSealBrokerResponseAccepted,
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -915,7 +929,20 @@ mod tests {
 
     #[test]
     fn event_all_variants_roundtrip() {
-        let variants: Vec<Event> = vec![Event::ServerStarted, Event::ServerStopping];
+        let id = Uuid::from_u128(1);
+        let variants: Vec<Event> = vec![
+            Event::ServerStarted,
+            Event::ServerStopping,
+            Event::PluginBusEvent {
+                kind: "test.event".into(),
+                payload: vec![1, 2, 3],
+            },
+            Event::DeviceSealBrokerRequest {
+                request_id: id,
+                target_client_id: id,
+                payload: vec![4, 5, 6],
+            },
+        ];
 
         for (i, variant) in variants.iter().enumerate() {
             let bytes =
