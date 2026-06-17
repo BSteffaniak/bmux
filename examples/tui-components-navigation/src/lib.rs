@@ -600,7 +600,10 @@ mod tests {
     fn navigation_renders_lists_menus_and_scroll_content() {
         let rendered = rows(&render_navigation()).join("\n");
 
+        assert!(rendered.contains("Library"));
         assert!(rendered.contains("List"));
+        assert!(rendered.contains("Tree"));
+        assert!(rendered.contains("Scroll"));
         assert!(rendered.contains("Library"));
         assert!(rendered.contains("Details"));
         assert!(rendered.contains("src"));
@@ -611,6 +614,7 @@ mod tests {
         assert!(rendered.contains("Delegated line zero"));
         assert!(rendered.contains("Name"));
         assert!(rendered.contains("75%"));
+        assert!(rendered.contains("█"));
         assert!(rendered.contains("TextView wraps"));
         assert!(rendered.contains("enter select"));
         assert!(rendered.contains("ready"));
