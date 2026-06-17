@@ -7,6 +7,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Style};
 
 use crate::common::InteractionState;
+use crate::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState};
 
 /// Runtime scroll-area state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,17 @@ impl Default for ScrollAreaState {
     }
 }
 
+/// Scrollbar layout mode for scroll areas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAreaScrollbarMode {
+    /// Do not render an integrated scrollbar.
+    Hidden,
+    /// Render scrollbar over the right edge of the content area.
+    Overlay,
+    /// Reserve a one-cell gutter on the right for the scrollbar.
+    Gutter,
+}
+
 /// Configurable scroll-area behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -63,6 +75,10 @@ pub struct ScrollAreaPolicy {
     pub page_keys_scroll: bool,
     /// Whether Home and End scroll to the beginning/end.
     pub home_end_scroll: bool,
+    /// Integrated scrollbar layout mode.
+    pub scrollbar: ScrollAreaScrollbarMode,
+    /// Scrollbar policy used when integrated scrollbar rendering is enabled.
+    pub scrollbar_policy: ScrollbarPolicy,
     /// Number of lines moved for each mouse-wheel event.
     pub wheel_lines: u16,
 }
@@ -77,6 +93,8 @@ impl ScrollAreaPolicy {
             arrows_scroll: true,
             page_keys_scroll: true,
             home_end_scroll: true,
+            scrollbar: ScrollAreaScrollbarMode::Hidden,
+            scrollbar_policy: ScrollbarPolicy::vertical(),
             wheel_lines: 3,
         }
     }
@@ -90,8 +108,23 @@ impl ScrollAreaPolicy {
             arrows_scroll: false,
             page_keys_scroll: false,
             home_end_scroll: false,
+            scrollbar: ScrollAreaScrollbarMode::Hidden,
+            scrollbar_policy: ScrollbarPolicy::bare(),
             wheel_lines: 0,
         }
+    }
+    /// Return this policy with integrated scrollbar mode changed.
+    #[must_use]
+    pub const fn scrollbar(mut self, scrollbar: ScrollAreaScrollbarMode) -> Self {
+        self.scrollbar = scrollbar;
+        self
+    }
+
+    /// Return this policy with integrated scrollbar policy changed.
+    #[must_use]
+    pub const fn scrollbar_policy(mut self, scrollbar_policy: ScrollbarPolicy) -> Self {
+        self.scrollbar_policy = scrollbar_policy;
+        self
     }
 }
 
@@ -145,6 +178,8 @@ impl<'a> ScrollArea<'a> {
                 arrows_scroll: true,
                 page_keys_scroll: true,
                 home_end_scroll: true,
+                scrollbar: ScrollAreaScrollbarMode::Hidden,
+                scrollbar_policy: ScrollbarPolicy::vertical(),
                 wheel_lines: 3,
             },
         }
@@ -167,6 +202,30 @@ impl<'a> ScrollArea<'a> {
     #[must_use]
     pub fn max_vertical_offset(&self, area: Rect) -> u16 {
         self.content_height().saturating_sub(area.height)
+    }
+
+    /// Return content area after integrated scrollbar reservation.
+    #[must_use]
+    pub const fn content_area(&self, area: Rect) -> Rect {
+        if matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Gutter) && area.width > 0 {
+            Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
+        } else {
+            area
+        }
+    }
+
+    /// Return integrated scrollbar area when enabled.
+    #[must_use]
+    pub const fn scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        if matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Hidden) || area.width == 0 {
+            return None;
+        }
+        Some(Rect::new(
+            area.right().saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        ))
     }
 
     /// Return the visible content line range for `area` and `state`.
@@ -192,16 +251,24 @@ impl<'a> ScrollArea<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
-        let range = self.visible_range(area, state);
+        let content_area = self.content_area(area);
+        let range = self.visible_range(content_area, state);
         for (row, line) in self.lines[range].iter().enumerate() {
             let y = area
                 .y
                 .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
             frame.write_line_with_fallback_style(
-                Rect::new(area.x, y, area.width, 1),
+                Rect::new(content_area.x, y, content_area.width, 1),
                 line,
                 fallback,
             );
+        }
+        if let Some(scrollbar_area) = self.scrollbar_area(area) {
+            let scrollbar_state = ScrollbarState::new(self.content_height(), content_area.height)
+                .offset(state.vertical_offset);
+            Scrollbar::new()
+                .policy(self.policy.scrollbar_policy)
+                .render(scrollbar_area, &scrollbar_state, frame);
         }
     }
 
@@ -333,7 +400,7 @@ mod tests {
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::prelude::Line;
 
-    use super::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
+    use super::{ScrollArea, ScrollAreaOutcome, ScrollAreaScrollbarMode, ScrollAreaState};
 
     #[test]
     fn renders_visible_lines_from_offset() {
@@ -348,6 +415,35 @@ mod tests {
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("one     "));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("two     "));
+    }
+
+    #[test]
+    fn renders_overlay_and_gutter_scrollbars_when_enabled() {
+        let lines = lines(&["zero", "one", "two", "three"]);
+        let mut state = ScrollAreaState::new();
+        state.set_vertical_offset(1);
+
+        let overlay = ScrollArea::new(&lines).policy(
+            super::ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Overlay),
+        );
+        let mut overlay_buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut overlay_frame = Frame::new(&mut overlay_buffer);
+        overlay.render(Rect::new(0, 0, 8, 2), &state, &mut overlay_frame);
+        assert_eq!(
+            overlay_frame.buffer().row_symbols(0).as_deref(),
+            Some("one    █")
+        );
+
+        let gutter = ScrollArea::new(&lines).policy(
+            super::ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter),
+        );
+        let mut gutter_buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut gutter_frame = Frame::new(&mut gutter_buffer);
+        gutter.render(Rect::new(0, 0, 8, 2), &state, &mut gutter_frame);
+        assert_eq!(
+            gutter_frame.buffer().row_symbols(0).as_deref(),
+            Some("one    █")
+        );
     }
 
     #[test]
