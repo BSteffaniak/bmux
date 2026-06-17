@@ -11,6 +11,9 @@ use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement,
 };
 use bmux_tui_components::button::{Button, ButtonState};
+use bmux_tui_components::chart::{
+    Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
+};
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
 use bmux_tui_components::filtered_list::FilteredListState;
@@ -54,6 +57,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_picker(frame);
     render_stepper(frame);
     render_bar_chart(frame);
+    render_chart(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
     render_toasts(frame);
@@ -176,6 +180,23 @@ fn render_bar_chart(frame: &mut Frame<'_>) {
                 .value_placement(BarChartValuePlacement::Right),
         )
         .render(Rect::new(35, 13, 32, 3), frame);
+}
+
+fn render_chart(frame: &mut Frame<'_>) {
+    let trend = [
+        ChartPoint::new(0.0, 1.0),
+        ChartPoint::new(1.0, 2.0),
+        ChartPoint::new(2.0, 1.5),
+        ChartPoint::new(3.0, 3.0),
+    ];
+    let points = [ChartPoint::new(0.5, 2.5), ChartPoint::new(2.5, 2.0)];
+    let datasets = [
+        ChartDataset::line("trend", &trend).marker("·"),
+        ChartDataset::scatter("events", &points).marker("◆"),
+    ];
+    Chart::new(&datasets, ChartBounds::new(0.0, 3.0, 0.0, 3.0))
+        .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
+        .render(Rect::new(35, 17, 32, 5), frame);
 }
 
 fn render_toasts(frame: &mut Frame<'_>) {
