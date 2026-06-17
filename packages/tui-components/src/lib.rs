@@ -14,6 +14,7 @@ pub mod badge;
 pub mod bar_chart;
 pub mod breadcrumbs;
 pub mod button;
+pub mod canvas;
 pub mod chart;
 pub mod checkbox;
 pub mod common;
