@@ -2,6 +2,7 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 
 /// One chart point.
@@ -417,6 +418,18 @@ impl<'a> Chart<'a> {
             );
             return;
         }
+        if matches!(self.policy.axes, ChartAxisVisibility::Visible) {
+            render_axes(frame, area, self.axes, self.styles.dataset);
+        }
+        if !matches!(self.policy.legend, ChartLegendPlacement::Hidden) {
+            render_legend(
+                frame,
+                area,
+                self.datasets,
+                self.policy.legend,
+                self.styles.dataset,
+            );
+        }
         for dataset in self.datasets {
             let style = if dataset.style == Style::new() {
                 self.styles.dataset
@@ -439,6 +452,58 @@ impl<'a> Chart<'a> {
                     draw_cell(frame, area, x, y, dataset.marker, style);
                 }
             }
+        }
+    }
+}
+
+fn render_axes(frame: &mut Frame<'_>, area: Rect, axes: ChartAxes<'_>, style: Style) {
+    if let Some(title) = axes.x.title {
+        frame.write_line(
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            &Line::from_spans([Span::styled(title, axes.x.style_or(style))]),
+        );
+    }
+    if let Some(title) = axes.y.title {
+        frame.write_line(
+            Rect::new(area.x, area.y, area.width, 1),
+            &Line::from_spans([Span::styled(title, axes.y.style_or(style))]),
+        );
+    }
+}
+
+fn render_legend(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    datasets: &[ChartDataset<'_>],
+    placement: ChartLegendPlacement,
+    style: Style,
+) {
+    let names = datasets
+        .iter()
+        .filter(|dataset| !dataset.name.is_empty())
+        .map(|dataset| dataset.name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if names.is_empty() {
+        return;
+    }
+    let y = match placement {
+        ChartLegendPlacement::Hidden => return,
+        ChartLegendPlacement::TopRight => area.y,
+        ChartLegendPlacement::BottomRight => area.bottom().saturating_sub(1),
+    };
+    frame.write_line(
+        Rect::new(area.x, y, area.width, 1),
+        &Line::from_spans([Span::styled(names, style)]),
+    );
+}
+
+impl ChartAxis<'_> {
+    fn style_or(self, fallback: Style) -> Style {
+        if self.style == Style::new() {
+            fallback
+        } else {
+            self.style
         }
     }
 }
@@ -632,6 +697,88 @@ mod tests {
                 .map(|cell| cell.symbol.as_str()),
             Some("*")
         );
+    }
+
+    #[test]
+    fn renders_axes_titles_and_legend() {
+        let points = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [ChartDataset::scatter("series", &points).marker("x")];
+        let axes = ChartAxes::empty()
+            .x(ChartAxis::empty().title("x axis"))
+            .y(ChartAxis::empty().title("y axis"));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 2.0, 0.0, 2.0))
+            .axes(axes)
+            .policy(
+                ChartPolicy::compact()
+                    .axes(ChartAxisVisibility::Visible)
+                    .legend(ChartLegendPlacement::BottomRight),
+            )
+            .render(Rect::new(0, 0, 12, 4), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("y axis      ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(3).as_deref(),
+            Some("series      ")
+        );
+    }
+
+    #[test]
+    fn renders_empty_data_message() {
+        let datasets = [ChartDataset::scatter("empty", &[])];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+            .render(Rect::new(0, 0, 8, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("No data "));
+    }
+
+    #[test]
+    fn multiple_datasets_and_unicode_markers_render() {
+        let points_a = [ChartPoint::new(0.0, 0.0)];
+        let points_b = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [
+            ChartDataset::scatter("a", &points_a).marker("◆"),
+            ChartDataset::scatter("b", &points_b).marker("○"),
+        ];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+            .render(Rect::new(0, 0, 2, 2), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(0, 1))
+                .map(|cell| cell.symbol.as_str()),
+            Some("◆")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(1, 0))
+                .map(|cell| cell.symbol.as_str()),
+            Some("○")
+        );
+    }
+
+    #[test]
+    fn tiny_area_does_not_panic() {
+        let points = [ChartPoint::new(0.0, 0.0)];
+        let datasets = [ChartDataset::scatter("points", &points)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+            .render(Rect::new(0, 0, 0, 0), &mut frame);
     }
 
     #[test]
