@@ -285,9 +285,6 @@ rustls-native-certs = { version = "0.8.3", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = [
     "std",
 ] }
-security-framework = { version = "3.7.0", default-features = false, features = [
-    "OSX_10_14",
-] }
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [
@@ -296,7 +293,9 @@ serde_json = { version = "1.0.149", default-features = false, features = [
 sha2 = { version = "=0.11.0-rc.5", default-features = false }
 similar = { version = "3.1.0" }
 ssh2 = { version = "0.9.5" }
-sshenv_vault_models = { git = "https://github.com/BSteffaniak/sshenv.git", branch = "master", version = "0.0.1-alpha.1" }
+sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", branch = "master", version = "0.0.1-alpha.1", features = [
+    "macos-keychain",
+] }
 syn = { version = "2.0.117", default-features = false }
 sysinfo = { version = "0.38.1" }
 tempfile = { version = "3.27.0", default-features = false }

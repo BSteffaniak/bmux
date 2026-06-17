@@ -53,10 +53,7 @@ bmux_terminal_grid              = { workspace = true }
 bmux_terminal_protocol          = { workspace = true }
 bmux_text_edit                  = { workspace = true }
 bmux_windows_plugin_api         = { workspace = true }
-sshenv_vault_models             = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { workspace = true }
+sshenv_vault                    = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
 bmux_clients_plugin = { workspace = true, optional = true, features = [

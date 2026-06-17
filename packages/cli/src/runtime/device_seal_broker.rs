@@ -11,9 +11,6 @@ pub(super) async fn run_device_seal_broker(
         .read_to_end(&mut input)
         .await
         .context("failed to read device-seal broker request from stdin")?;
-    let _request: sshenv_vault_models::DeviceSealBrokerRequest = serde_json::from_slice(&input)
-        .context("device-seal broker request was not valid sshenv JSON")?;
-
     let mut client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-device-seal-broker",
