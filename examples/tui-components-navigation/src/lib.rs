@@ -11,7 +11,9 @@ use bmux_tui_components::breadcrumbs::{
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarPolicy, KeyHintBarStyles};
 use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{Pane, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState};
-use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
+use bmux_tui_components::scroll_area::{
+    ScrollArea, ScrollAreaOutcome, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
+};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
@@ -264,7 +266,9 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
         .render(Rect::new(48, 1, 22, 6), &demo.tree, frame);
 
     let lines = scroll_lines();
-    ScrollArea::new(&lines).render(Rect::new(1, 6, 24, 2), &demo.scroll, frame);
+    ScrollArea::new(&lines)
+        .policy(ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter))
+        .render(Rect::new(1, 6, 24, 2), &demo.scroll, frame);
 
     let table_columns = table_columns();
     let table_rows = table_rows();
@@ -274,7 +278,9 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     let pane_state = PaneState::new(scroll_delegate_pane_area());
     pane.render(&pane_state, frame);
     let pane_lines = pane_scroll_lines();
-    ScrollArea::new(&pane_lines).render(pane.inner_area(&pane_state), &demo.pane_scroll, frame);
+    ScrollArea::new(&pane_lines)
+        .policy(ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Overlay))
+        .render(pane.inner_area(&pane_state), &demo.pane_scroll, frame);
 
     let text_lines = text_view_lines();
     let text_highlights = text_view_highlights();
