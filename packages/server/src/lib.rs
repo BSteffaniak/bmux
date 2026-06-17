@@ -24,7 +24,7 @@ use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,7 @@ struct ServerState {
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
+    event_push_clients: AsyncMutex<BTreeSet<ClientId>>,
     client_principals: Arc<Mutex<BTreeMap<ClientId, Uuid>>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
@@ -883,6 +884,7 @@ impl BmuxServer {
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
+                event_push_clients: AsyncMutex::new(BTreeSet::new()),
                 client_principals,
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -1615,6 +1617,8 @@ async fn handle_connection(
         // as serialized frames through the writer channel.
         //
         if is_enable_push && event_push_task.is_none() {
+            state.event_push_clients.lock().await.insert(client_id);
+            debug!(%client_id, "event_push.client_registered");
             replay_retained_plugin_state_to_client(
                 &state,
                 &frame_tx,
@@ -1762,6 +1766,8 @@ async fn handle_connection(
         }
     }
 
+    state.event_push_clients.lock().await.remove(&client_id);
+
     // Abort the event push task if running.
     if let Some(task) = event_push_task {
         task.abort();
@@ -1791,13 +1797,24 @@ async fn handle_connection(
     Ok(())
 }
 
-fn select_device_seal_broker_client() -> Option<ClientId> {
-    follow_handle()
-        .0
-        .snapshot()
-        .attached_stream_sessions
-        .into_iter()
-        .find_map(|(client_id, session_id)| session_id.map(|_| client_id))
+async fn select_device_seal_broker_client(state: &Arc<ServerState>) -> Option<ClientId> {
+    let event_push_clients = state.event_push_clients.lock().await.clone();
+    let snapshot = follow_handle().0.snapshot();
+    let selected =
+        snapshot
+            .attached_stream_sessions
+            .into_iter()
+            .find_map(|(client_id, session_id)| {
+                (session_id.is_some() && event_push_clients.contains(&client_id))
+                    .then_some(client_id)
+            });
+    if selected.is_none() {
+        warn!(
+            active_event_push_clients = event_push_clients.len(),
+            "device_seal_broker.no_active_attached_client"
+        );
+    }
+    selected
 }
 
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
@@ -2277,7 +2294,7 @@ async fn handle_request(
             )
         }
         Request::DeviceSealBroker { payload } => {
-            let Some(target_client_id) = select_device_seal_broker_client() else {
+            let Some(target_client_id) = select_device_seal_broker_client(state).await else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: "no attached bmux client available for device-seal broker".to_string(),
@@ -2291,6 +2308,12 @@ async fn handle_request(
                     target_client_id,
                     response_tx,
                 },
+            );
+            info!(
+                %request_id,
+                %target_client_id,
+                payload_len = payload.len(),
+                "device_seal_broker.forwarding"
             );
             emit_event(
                 state,

@@ -3903,10 +3903,29 @@ async fn handle_attach_stream_server_event(
     } = server_event
     {
         if target_client_id == self_client_id {
+            tracing::info!(
+                %request_id,
+                payload_len = payload.len(),
+                "device_seal_broker.request_received"
+            );
             let (ok, response_payload, error) = handle_device_seal_broker_request(&payload);
+            tracing::info!(
+                %request_id,
+                ok,
+                response_payload_len = response_payload.len(),
+                has_error = error.is_some(),
+                "device_seal_broker.responding"
+            );
             client
                 .respond_device_seal_broker(request_id, ok, response_payload, error)
                 .await?;
+        } else {
+            tracing::debug!(
+                %request_id,
+                %target_client_id,
+                %self_client_id,
+                "device_seal_broker.request_ignored_for_other_client"
+            );
         }
         return Ok(AttachServerEventHandling {
             control: AttachLoopControl::Continue,
