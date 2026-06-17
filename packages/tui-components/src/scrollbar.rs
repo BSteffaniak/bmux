@@ -64,10 +64,14 @@ impl ScrollbarState {
 pub struct ScrollbarPolicy {
     /// Orientation.
     pub orientation: ScrollbarOrientation,
+    /// Begin/end cap symbol.
+    pub begin: &'static str,
     /// Track symbol.
     pub track: &'static str,
     /// Thumb symbol.
     pub thumb: &'static str,
+    /// End cap symbol.
+    pub end: &'static str,
     /// Minimum thumb size.
     pub min_thumb: u16,
     /// Mouse dragging enabled.
@@ -80,8 +84,10 @@ impl ScrollbarPolicy {
     pub const fn vertical() -> Self {
         Self {
             orientation: ScrollbarOrientation::Vertical,
+            begin: "│",
             track: "│",
             thumb: "█",
+            end: "│",
             min_thumb: 1,
             mouse_drag: true,
         }
@@ -92,8 +98,10 @@ impl ScrollbarPolicy {
     pub const fn horizontal() -> Self {
         Self {
             orientation: ScrollbarOrientation::Horizontal,
+            begin: "─",
             track: "─",
             thumb: "█",
+            end: "─",
             min_thumb: 1,
             mouse_drag: true,
         }
@@ -104,11 +112,28 @@ impl ScrollbarPolicy {
     pub const fn bare() -> Self {
         Self {
             orientation: ScrollbarOrientation::Vertical,
+            begin: "│",
             track: "│",
             thumb: "█",
+            end: "│",
             min_thumb: 1,
             mouse_drag: false,
         }
+    }
+    /// Return policy with symbols changed.
+    #[must_use]
+    pub const fn symbols(
+        mut self,
+        begin: &'static str,
+        track: &'static str,
+        thumb: &'static str,
+        end: &'static str,
+    ) -> Self {
+        self.begin = begin;
+        self.track = track;
+        self.thumb = thumb;
+        self.end = end;
+        self
     }
 }
 
@@ -121,17 +146,23 @@ impl Default for ScrollbarPolicy {
 /// Scrollbar styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollbarStyles {
+    /// Begin cap style.
+    pub begin: Style,
     /// Track style.
     pub track: Style,
     /// Thumb style.
     pub thumb: Style,
+    /// End cap style.
+    pub end: Style,
 }
 
 impl Default for ScrollbarStyles {
     fn default() -> Self {
         Self {
+            begin: Style::new().fg(Color::BrightBlack),
             track: Style::new().fg(Color::BrightBlack),
             thumb: Style::new().fg(Color::BrightCyan),
+            end: Style::new().fg(Color::BrightBlack),
         }
     }
 }
@@ -172,14 +203,18 @@ impl Scrollbar {
         Self {
             policy: ScrollbarPolicy {
                 orientation: ScrollbarOrientation::Vertical,
+                begin: "│",
                 track: "│",
                 thumb: "█",
+                end: "│",
                 min_thumb: 1,
                 mouse_drag: true,
             },
             styles: ScrollbarStyles {
+                begin: Style::new(),
                 track: Style::new(),
                 thumb: Style::new(),
+                end: Style::new(),
             },
         }
     }
@@ -245,17 +280,16 @@ impl Scrollbar {
         match self.policy.orientation {
             ScrollbarOrientation::Vertical => {
                 for y in 0..area.height {
-                    let symbol = if y >= layout.thumb_start
+                    let (symbol, style) = if y >= layout.thumb_start
                         && y < layout.thumb_start.saturating_add(layout.thumb_len)
                     {
-                        self.policy.thumb
+                        (self.policy.thumb, self.styles.thumb)
+                    } else if y == 0 {
+                        (self.policy.begin, self.styles.begin)
+                    } else if y == area.height.saturating_sub(1) {
+                        (self.policy.end, self.styles.end)
                     } else {
-                        self.policy.track
-                    };
-                    let style = if symbol == self.policy.thumb {
-                        self.styles.thumb
-                    } else {
-                        self.styles.track
+                        (self.policy.track, self.styles.track)
                     };
                     frame.write_line(
                         Rect::new(area.x, area.y.saturating_add(y), area.width, 1),
@@ -266,13 +300,18 @@ impl Scrollbar {
             ScrollbarOrientation::Horizontal => {
                 let mut spans = Vec::new();
                 for x in 0..area.width {
-                    if x >= layout.thumb_start
+                    let (symbol, style) = if x >= layout.thumb_start
                         && x < layout.thumb_start.saturating_add(layout.thumb_len)
                     {
-                        spans.push(Span::styled(self.policy.thumb, self.styles.thumb));
+                        (self.policy.thumb, self.styles.thumb)
+                    } else if x == 0 {
+                        (self.policy.begin, self.styles.begin)
+                    } else if x == area.width.saturating_sub(1) {
+                        (self.policy.end, self.styles.end)
                     } else {
-                        spans.push(Span::styled(self.policy.track, self.styles.track));
-                    }
+                        (self.policy.track, self.styles.track)
+                    };
+                    spans.push(Span::styled(symbol, style));
                 }
                 frame.write_line(area, &Line::from_spans(spans));
             }
@@ -359,7 +398,9 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
 
-    use super::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
+    use bmux_tui::style::{Color, Style};
+
+    use super::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
 
     #[test]
     fn computes_thumb_size_and_position() {
@@ -379,6 +420,34 @@ mod tests {
         Scrollbar::new().render(Rect::new(0, 0, 1, 5), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("█"));
+    }
+
+    #[test]
+    fn customizes_begin_end_track_thumb_symbols_and_styles() {
+        let state = ScrollbarState::new(100, 20).offset(50);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 5));
+        let mut frame = Frame::new(&mut buffer);
+        let styles = ScrollbarStyles {
+            begin: Style::new().fg(Color::Blue),
+            track: Style::new().fg(Color::Green),
+            thumb: Style::new().fg(Color::Red),
+            end: Style::new().fg(Color::Yellow),
+        };
+
+        Scrollbar::new()
+            .policy(ScrollbarPolicy::vertical().symbols("^", "|", "#", "v"))
+            .styles(styles)
+            .render(Rect::new(0, 0, 1, 5), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("^"));
+        assert_eq!(frame.buffer().row_symbols(4).as_deref(), Some("v"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(0, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Blue))
+        );
     }
 
     #[test]
