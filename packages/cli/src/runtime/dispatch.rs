@@ -18,9 +18,9 @@ use super::{
     run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
     run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
     run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
-    run_config_scope_explain, run_config_set, run_config_show, run_connect, run_doctor,
-    run_external_plugin_command, run_follow, run_host, run_hosts, run_join, run_keymap_doctor,
-    run_keymap_explain, run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token,
+    run_config_scope_explain, run_config_set, run_config_show, run_connect, run_device_seal_broker,
+    run_doctor, run_external_plugin_command, run_follow, run_host, run_hosts, run_join,
+    run_keymap_doctor, run_keymap_explain, run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token,
     run_kiosk_revoke_token, run_kiosk_ssh_print_config, run_kiosk_status, run_logs_level,
     run_logs_path, run_logs_profiles_delete, run_logs_profiles_list, run_logs_profiles_rename,
     run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off, run_perf_on,
@@ -184,6 +184,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SandboxCommand::Clean { .. } => BuiltInHandlerId::SandboxClean,
             SandboxCommand::RebuildIndex { .. } => BuiltInHandlerId::SandboxRebuildIndex,
         },
+        Command::DeviceSealBroker => BuiltInHandlerId::DeviceSealBroker,
         Command::Slot { command } | Command::Env { command } => match command {
             SlotCommand::List { .. } => BuiltInHandlerId::SlotList,
             SlotCommand::Show { .. } => BuiltInHandlerId::SlotShow,
@@ -1441,6 +1442,9 @@ pub(super) async fn dispatch_built_in_command(
                 source_filter,
                 *json,
             )
+        }
+        (BuiltInHandlerId::DeviceSealBroker, Command::DeviceSealBroker) => {
+            run_device_seal_broker(connection_context).await
         }
         (
             BuiltInHandlerId::SlotList,

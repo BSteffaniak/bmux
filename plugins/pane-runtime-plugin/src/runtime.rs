@@ -1028,6 +1028,15 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
     }
 }
 
+fn configure_device_seal_broker_env(command: &mut CommandBuilder) {
+    if let Ok(exe) = std::env::current_exe() {
+        command.env(
+            "SSHENV_DEVICE_SEAL_COMMAND",
+            format!("{} device-seal-broker", exe.display()),
+        );
+    }
+}
+
 fn configure_shell_integration_command(
     command: &mut CommandBuilder,
     shell: &str,
@@ -2942,6 +2951,7 @@ impl SessionRuntimeManager {
                 for (key, value) in &launch.env {
                     command.env(key, value);
                 }
+                configure_device_seal_broker_env(&mut command);
                 if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref())
                     && !cwd.is_empty()
                 {
@@ -2951,6 +2961,7 @@ impl SessionRuntimeManager {
             } else {
                 let mut command = CommandBuilder::new(&shell);
                 command.env("TERM", &pane_term);
+                configure_device_seal_broker_env(&mut command);
                 if let Some(cwd) = initial_cwd.as_deref()
                     && !cwd.is_empty()
                 {

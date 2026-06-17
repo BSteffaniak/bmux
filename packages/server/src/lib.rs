@@ -65,6 +65,12 @@ struct ServerState {
     service_registry: Mutex<ServiceRegistry>,
     service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
     plugin_state_replayers: Mutex<Vec<PluginStateReplayer>>,
+    device_seal_pending: AsyncMutex<BTreeMap<Uuid, DeviceSealPending>>,
+}
+
+struct DeviceSealPending {
+    target_client_id: ClientId,
+    response_tx: oneshot::Sender<Vec<u8>>,
 }
 
 type PluginStateReplayer = Arc<dyn Fn() -> Option<Event> + Send + Sync>;
@@ -883,6 +889,7 @@ impl BmuxServer {
                 service_registry: Mutex::new(ServiceRegistry::default()),
                 service_resolver: Mutex::new(None),
                 plugin_state_replayers: Mutex::new(Vec::new()),
+                device_seal_pending: AsyncMutex::new(BTreeMap::new()),
             }),
             shutdown_tx,
         }
@@ -1784,6 +1791,15 @@ async fn handle_connection(
     Ok(())
 }
 
+fn select_device_seal_broker_client() -> Option<ClientId> {
+    follow_handle()
+        .0
+        .snapshot()
+        .attached_stream_sessions
+        .into_iter()
+        .find_map(|(client_id, session_id)| session_id.map(|_| client_id))
+}
+
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     // Broadcast to streaming clients (ignore errors — no receivers is fine).
     let _ = state.event_broadcast.send(event.clone());
@@ -2260,6 +2276,85 @@ async fn handle_request(
                 |events| Response::Ok(ResponsePayload::EventBatch { events }),
             )
         }
+        Request::DeviceSealBroker { payload } => {
+            let Some(target_client_id) = select_device_seal_broker_client() else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "no attached bmux client available for device-seal broker".to_string(),
+                }));
+            };
+            let request_id = Uuid::new_v4();
+            let (response_tx, response_rx) = oneshot::channel();
+            state.device_seal_pending.lock().await.insert(
+                request_id,
+                DeviceSealPending {
+                    target_client_id,
+                    response_tx,
+                },
+            );
+            emit_event(
+                state,
+                Event::DeviceSealBrokerRequest {
+                    request_id,
+                    target_client_id: target_client_id.0,
+                    payload,
+                },
+            )?;
+            match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
+                Ok(Ok(payload)) => Response::Ok(ResponsePayload::DeviceSealBrokered { payload }),
+                Ok(Err(_)) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: "device-seal broker response channel closed".to_string(),
+                }),
+                Err(_) => {
+                    state.device_seal_pending.lock().await.remove(&request_id);
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::Timeout,
+                        message: "timed out waiting for attached client device-seal broker"
+                            .to_string(),
+                    })
+                }
+            }
+        }
+        Request::DeviceSealBrokerResponse {
+            request_id,
+            ok,
+            payload,
+            error,
+        } => {
+            let mut pending_requests = state.device_seal_pending.lock().await;
+            let Some(pending_target_client_id) = pending_requests
+                .get(&request_id)
+                .map(|pending| pending.target_client_id)
+            else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "device-seal broker request not found".to_string(),
+                }));
+            };
+            if pending_target_client_id != client_id {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "device-seal broker response came from the wrong client".to_string(),
+                }));
+            }
+            let Some(pending) = pending_requests.remove(&request_id) else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "device-seal broker request not found".to_string(),
+                }));
+            };
+            drop(pending_requests);
+            let payload = if ok || !payload.is_empty() {
+                payload
+            } else {
+                error
+                    .unwrap_or_else(|| "device-seal broker failed".to_string())
+                    .into_bytes()
+            };
+            let _ = pending.response_tx.send(payload);
+            Response::Ok(ResponsePayload::DeviceSealBrokerResponseAccepted)
+        }
         // EnableEventPush is handled in handle_connection after the response
         // is sent — the actual push task spawning happens there. Here we just
         // acknowledge the request.
@@ -2299,6 +2394,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
         Request::SubscribeEvents => "subscribe_events",
+        Request::DeviceSealBroker { .. } => "device_seal_broker",
+        Request::DeviceSealBrokerResponse { .. } => "device_seal_broker_response",
     }
 }
 
@@ -2558,6 +2655,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
         ResponsePayload::PluginBusEmitted { .. } => "plugin_bus_emitted",
+        ResponsePayload::DeviceSealBrokered { .. } => "device_seal_brokered",
+        ResponsePayload::DeviceSealBrokerResponseAccepted => "device_seal_broker_response_accepted",
     }
 }
 

@@ -359,6 +359,7 @@ pub(super) fn server_event_name(event: &bmux_client::ServerEvent) -> &'static st
         bmux_client::ServerEvent::PluginBusEvent { kind, payload } => {
             plugin_bus_event_name(kind, payload)
         }
+        bmux_client::ServerEvent::DeviceSealBrokerRequest { .. } => "device_seal_broker_request",
     }
 }
 

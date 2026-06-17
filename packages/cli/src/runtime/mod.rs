@@ -21,6 +21,7 @@ mod bootstrap;
 mod built_in_commands;
 mod cli_parse;
 mod config_cli;
+mod device_seal_broker;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;
@@ -70,6 +71,7 @@ use config_cli::{
     run_config_profiles_resolve, run_config_profiles_set_active_at_path, run_config_profiles_show,
     run_config_profiles_switch, run_config_scope_explain, run_config_set, run_config_show,
 };
+use device_seal_broker::run_device_seal_broker;
 use dispatch::run_command;
 use doctor_cli::run_doctor;
 use kiosk_cli::{

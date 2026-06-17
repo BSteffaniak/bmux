@@ -124,6 +124,7 @@ pub enum BuiltInHandlerId {
     SlotShell,
     SlotExec,
     SlotPrint,
+    DeviceSealBroker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -780,6 +781,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             "Print the resolved env-var set as structured data",
         )
         .with_alias(&["env", "print"]),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::DeviceSealBroker,
+            &["device-seal-broker"],
+            "Internal sshenv device-seal broker",
+        ),
     ]
 }
 

@@ -433,6 +433,8 @@ pub enum Command {
         #[command(subcommand)]
         command: SlotCommand,
     },
+    /// Internal sshenv device-seal broker used by panes.
+    DeviceSealBroker,
     #[command(external_subcommand)]
     External(Vec<String>),
 }

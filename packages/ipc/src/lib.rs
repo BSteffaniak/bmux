@@ -348,6 +348,18 @@ pub enum Request {
     /// clients (which split the socket into read/write halves and demux
     /// incoming frames) should send this request.
     EnableEventPush,
+    DeviceSealBroker {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+    },
+    DeviceSealBrokerResponse {
+        request_id: Uuid,
+        ok: bool,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +437,11 @@ pub enum ResponsePayload {
     HelloIncompatible {
         reason: IncompatibilityReason,
     },
+    DeviceSealBrokered {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+    },
+    DeviceSealBrokerResponseAccepted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -538,6 +555,12 @@ pub enum Event {
         /// Canonical event kind (e.g. `"bmux.scene/scene-protocol"`).
         kind: String,
         /// `bmux_codec`-encoded typed payload.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+    },
+    DeviceSealBrokerRequest {
+        request_id: Uuid,
+        target_client_id: Uuid,
         #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },

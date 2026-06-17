@@ -3790,6 +3790,88 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     })
 }
 
+fn handle_device_seal_broker_request(payload: &[u8]) -> (bool, Vec<u8>, Option<String>) {
+    match run_device_seal_broker_request(payload) {
+        Ok(response) => (true, response, None),
+        Err(error) => {
+            let response = sshenv_vault_models::DeviceSealBrokerResponse {
+                secret_hex: None,
+                error: Some(error.to_string()),
+            };
+            let payload = serde_json::to_vec(&response).unwrap_or_default();
+            (false, payload, Some(error.to_string()))
+        }
+    }
+}
+
+fn run_device_seal_broker_request(payload: &[u8]) -> Result<Vec<u8>> {
+    let request: sshenv_vault_models::DeviceSealBrokerRequest = serde_json::from_slice(payload)
+        .context("device-seal broker request was not valid sshenv JSON")?;
+    if request.backend != "macos-keychain"
+        || request.service != "sshenv device seal"
+        || request.account != "default"
+    {
+        anyhow::bail!("unsupported device-seal broker target");
+    }
+
+    let response = match request.operation {
+        sshenv_vault_models::DeviceSealBrokerOperation::Load => {
+            let output = std::process::Command::new("/usr/bin/security")
+                .arg("find-generic-password")
+                .arg("-w")
+                .arg("-s")
+                .arg(&request.service)
+                .arg("-a")
+                .arg(&request.account)
+                .output()
+                .context("failed to invoke macOS security command")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "macOS Keychain device seal secret not found or unavailable: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let secret_hex = String::from_utf8(output.stdout)
+                .context("macOS Keychain returned non-UTF8 device seal secret")?
+                .trim()
+                .to_string();
+            sshenv_vault_models::DeviceSealBrokerResponse {
+                secret_hex: Some(secret_hex),
+                error: None,
+            }
+        }
+        sshenv_vault_models::DeviceSealBrokerOperation::Store => {
+            let secret_hex = request
+                .secret_hex
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .context("store request is missing secret_hex")?;
+            let output = std::process::Command::new("/usr/bin/security")
+                .arg("add-generic-password")
+                .arg("-U")
+                .arg("-s")
+                .arg(&request.service)
+                .arg("-a")
+                .arg(&request.account)
+                .arg("-w")
+                .arg(secret_hex)
+                .output()
+                .context("failed to invoke macOS security command")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "failed to store device seal in macOS Keychain: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            sshenv_vault_models::DeviceSealBrokerResponse {
+                secret_hex: None,
+                error: None,
+            }
+        }
+    };
+    serde_json::to_vec(&response).context("failed to encode device-seal broker response")
+}
+
 struct AttachServerEventHandling {
     control: AttachLoopControl,
     image_fetch_requested: bool,
@@ -3813,6 +3895,24 @@ async fn handle_attach_stream_server_event(
     last_scene_revision: &mut u64,
 ) -> Result<AttachServerEventHandling> {
     let mut image_fetch_requested = false;
+
+    if let bmux_client::ServerEvent::DeviceSealBrokerRequest {
+        request_id,
+        target_client_id,
+        payload,
+    } = server_event
+    {
+        if target_client_id == self_client_id {
+            let (ok, response_payload, error) = handle_device_seal_broker_request(&payload);
+            client
+                .respond_device_seal_broker(request_id, ok, response_payload, error)
+                .await?;
+        }
+        return Ok(AttachServerEventHandling {
+            control: AttachLoopControl::Continue,
+            image_fetch_requested,
+        });
+    }
 
     if let bmux_client::ServerEvent::PluginBusEvent {
         ref kind,

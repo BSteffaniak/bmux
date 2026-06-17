@@ -612,6 +612,20 @@ impl BmuxClient {
         }
     }
 
+    /// Broker an sshenv device-seal request through an attached client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no attached client can satisfy the request.
+    pub async fn device_seal_broker(&mut self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        match self.request(Request::DeviceSealBroker { payload }).await? {
+            ResponsePayload::DeviceSealBrokered { payload } => Ok(payload),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected device seal brokered response",
+            )),
+        }
+    }
+
     async fn request(&mut self, request: Request) -> Result<ResponsePayload> {
         let response = self.request_raw(request).await?;
         match response {
@@ -1202,6 +1216,48 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Broker an sshenv device-seal request through an attached client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no attached client can satisfy the request.
+    pub async fn device_seal_broker(&mut self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        match self.request(Request::DeviceSealBroker { payload }).await? {
+            ResponsePayload::DeviceSealBrokered { payload } => Ok(payload),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected device seal brokered response",
+            )),
+        }
+    }
+
+    /// Respond to a device-seal broker request delivered over event push.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is rejected.
+    pub async fn respond_device_seal_broker(
+        &mut self,
+        request_id: uuid::Uuid,
+        ok: bool,
+        payload: Vec<u8>,
+        error: Option<String>,
+    ) -> Result<()> {
+        match self
+            .request(Request::DeviceSealBrokerResponse {
+                request_id,
+                ok,
+                payload,
+                error,
+            })
+            .await?
+        {
+            ResponsePayload::DeviceSealBrokerResponseAccepted => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected device seal broker response accepted",
+            )),
+        }
+    }
+
     /// Invoke a generic service request over IPC.
     ///
     /// # Errors
@@ -1367,6 +1423,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
+        Request::DeviceSealBroker { .. } => "device_seal_broker",
+        Request::DeviceSealBrokerResponse { .. } => "device_seal_broker_response",
     }
 }
 
@@ -1509,6 +1567,10 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",
             ResponsePayload::PluginBusEmitted { .. } => "plugin_bus_emitted",
+            ResponsePayload::DeviceSealBrokered { .. } => "device_seal_brokered",
+            ResponsePayload::DeviceSealBrokerResponseAccepted => {
+                "device_seal_broker_response_accepted"
+            }
         },
         Response::Err(_) => "error",
     }
