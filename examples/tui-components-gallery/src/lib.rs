@@ -11,6 +11,7 @@ use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement,
 };
 use bmux_tui_components::button::{Button, ButtonState};
+use bmux_tui_components::canvas::{Canvas, CanvasBounds, CanvasLine, CanvasPoint, CanvasRect};
 use bmux_tui_components::chart::{
     Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
 };
@@ -58,6 +59,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_stepper(frame);
     render_bar_chart(frame);
     render_chart(frame);
+    render_canvas(frame);
     render_modal(frame, theme);
     render_dialog(frame, theme);
     render_toasts(frame);
@@ -197,6 +199,17 @@ fn render_chart(frame: &mut Frame<'_>) {
     Chart::new(&datasets, ChartBounds::new(0.0, 3.0, 0.0, 3.0))
         .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
         .render(Rect::new(35, 17, 32, 5), frame);
+}
+
+fn render_canvas(frame: &mut Frame<'_>) {
+    let points = [CanvasPoint::new(1.0, 1.0, "●")];
+    let lines = [CanvasLine::new(0.0, 0.0, 3.0, 2.0, "·")];
+    let rects = [CanvasRect::new(0.0, 0.0, 3.0, 2.0, "□")];
+
+    Canvas::new(&points, CanvasBounds::new(0.0, 3.0, 0.0, 2.0))
+        .lines(&lines)
+        .rects(&rects)
+        .render(Rect::new(35, 22, 18, 2), frame);
 }
 
 fn render_toasts(frame: &mut Frame<'_>) {
