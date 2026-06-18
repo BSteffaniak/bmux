@@ -53,17 +53,10 @@ impl TypedDispatchClient for FakeClient {
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     use std::pin::pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut context = Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
     let mut future = pin!(future);
     loop {
         match future.as_mut().poll(&mut context) {

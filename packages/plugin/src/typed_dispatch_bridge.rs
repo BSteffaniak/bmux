@@ -8,8 +8,7 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll};
 
 use bmux_ipc::InvokeServiceKind;
 use bmux_plugin_sdk::{ServiceKind, TypedDispatchClient, TypedDispatchClientError};
@@ -73,14 +72,8 @@ where
 /// the caller passed a future that depends on an async runtime rather
 /// than a synchronous service-caller-backed typed helper.
 pub fn block_on_typed_dispatch<F: Future>(future: F) -> F::Output {
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut context = Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
     let mut future = pin!(future);
     match future.as_mut().poll(&mut context) {
         Poll::Ready(output) => output,

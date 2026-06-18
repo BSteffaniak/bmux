@@ -1348,16 +1348,10 @@ pub(super) fn ready_tracker_snapshot() -> bmux_plugin_sdk::ReadyTracker {
 fn block_on_future<T>(
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,
 ) -> T {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
     let mut pinned = fut;
     loop {
         match pinned.as_mut().poll(&mut cx) {
