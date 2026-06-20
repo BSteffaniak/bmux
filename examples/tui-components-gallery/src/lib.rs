@@ -12,7 +12,7 @@ use bmux_tui_components::bar_chart::{
 };
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::canvas::{
-    Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasRect,
+    Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasPolicy, CanvasRect,
 };
 use bmux_tui_components::chart::{
     Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset,
@@ -228,6 +228,7 @@ fn render_canvas(frame: &mut Frame<'_>) {
         .lines(&lines)
         .rects(&rects)
         .circles(&circles)
+        .policy(CanvasPolicy::braille())
         .render(Rect::new(35, 22, 18, 2), frame);
 }
 
@@ -334,9 +335,11 @@ mod tests {
         assert!(rendered.contains("✓ Plan ── ● Build"));
         assert!(rendered.contains("CPU"));
         assert!(rendered.contains("◆"));
-        assert!(rendered.contains("□"));
-        assert!(rendered.contains("○"));
-        assert!(rendered.contains("●"));
+        assert!(
+            rendered
+                .chars()
+                .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
+        );
         assert!(rendered.contains("Saved ×"));
         assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
