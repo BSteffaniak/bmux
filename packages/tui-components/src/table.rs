@@ -6,7 +6,8 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text::{line_viewport, truncate_line_to_display_width};
+use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 
@@ -486,7 +487,7 @@ impl<'a> Table<'a> {
             );
             frame.write_line_with_fallback_style(
                 header,
-                &scroll_line(&line, state.horizontal_scroll),
+                &line_viewport(&line, state.horizontal_scroll, usize::from(header.width)),
                 self.styles.header,
             );
         }
@@ -494,7 +495,7 @@ impl<'a> Table<'a> {
             let line = self.separator_line(&layout.column_widths);
             frame.write_line_with_fallback_style(
                 separator,
-                &scroll_line(&line, state.horizontal_scroll),
+                &line_viewport(&line, state.horizontal_scroll, usize::from(separator.width)),
                 self.styles.separator,
             );
         }
@@ -529,7 +530,7 @@ impl<'a> Table<'a> {
                 );
                 frame.write_line_with_fallback_style(
                     rect,
-                    &scroll_line(&line, state.horizontal_scroll),
+                    &line_viewport(&line, state.horizontal_scroll, usize::from(rect.width)),
                     self.row_style(source, row, state),
                 );
                 rendered = rendered.saturating_add(1);
@@ -765,31 +766,6 @@ impl<'a> Table<'a> {
     }
 }
 
-fn scroll_line(line: &Line, offset: usize) -> Line {
-    if offset == 0 {
-        return line.clone();
-    }
-    let mut remaining = offset;
-    let mut spans = Vec::new();
-    for span in &line.spans {
-        let mut content = String::new();
-        for ch in span.content.chars() {
-            let mut buf = [0; 4];
-            let grapheme = ch.encode_utf8(&mut buf);
-            let width = display_width(grapheme);
-            if remaining >= width {
-                remaining = remaining.saturating_sub(width);
-            } else {
-                content.push_str(grapheme);
-            }
-        }
-        if !content.is_empty() {
-            spans.push(Span::styled(content, span.style));
-        }
-    }
-    Line::from_spans(spans)
-}
-
 fn format_cell_line(line: &Line, width: u16, align: TableAlign, truncate: bool) -> Line {
     let width = usize::from(width);
     let line_width = line.width();
@@ -800,8 +776,27 @@ fn format_cell_line(line: &Line, width: u16, align: TableAlign, truncate: bool) 
         }
         return line;
     }
-    let plain = line.plain_text();
-    Line::from(format_cell(&plain, u16_saturating(width), align, truncate))
+    let line = if truncate && line_width > width {
+        truncate_line_to_display_width(line, width)
+    } else {
+        line.clone()
+    };
+    let line_width = line.width();
+    let padding = width.saturating_sub(line_width);
+    let (left, right) = match align {
+        TableAlign::Left => (0, padding),
+        TableAlign::Center => (padding / 2, padding.saturating_sub(padding / 2)),
+        TableAlign::Right => (padding, 0),
+    };
+    let mut spans = Vec::new();
+    if left > 0 {
+        spans.push(Span::raw(" ".repeat(left)));
+    }
+    spans.extend(line.spans);
+    if right > 0 {
+        spans.push(Span::raw(" ".repeat(right)));
+    }
+    Line::from_spans(spans)
 }
 
 fn resolve_column_widths(
@@ -874,30 +869,10 @@ fn resolve_column_widths(
         .collect()
 }
 
+#[cfg(test)]
 fn format_cell(text: &str, width: u16, align: TableAlign, truncate: bool) -> String {
-    let width = usize::from(width);
-    if width == 0 {
-        return String::new();
-    }
-    let text = if truncate && display_width(text) > width {
-        truncate_to_display_width(text, width)
-    } else {
-        text.to_owned()
-    };
-    let text_width = display_width(&text);
-    if text_width >= width {
-        return text;
-    }
-    let padding = width.saturating_sub(text_width);
-    match align {
-        TableAlign::Left => format!("{text}{}", " ".repeat(padding)),
-        TableAlign::Center => {
-            let left = padding / 2;
-            let right = padding.saturating_sub(left);
-            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
-        }
-        TableAlign::Right => format!("{}{text}", " ".repeat(padding)),
-    }
+    let line = Line::from(text);
+    format_cell_line(&line, width, align, truncate).plain_text()
 }
 
 fn u16_saturating(value: usize) -> u16 {

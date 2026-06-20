@@ -3,7 +3,7 @@
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::line_viewport;
@@ -11,13 +11,14 @@ use bmux_tui::text_width::display_width;
 use bmux_tui::widget::Widget;
 
 use crate::scroll_area::ScrollAreaScrollbarMode;
-use crate::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState};
+use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 
 /// Runtime state for [`TextView`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TextViewState {
     vertical_scroll: usize,
     horizontal_scroll: usize,
+    dragging_scrollbar: Option<TextViewScrollbarAxis>,
 }
 
 impl TextViewState {
@@ -27,6 +28,7 @@ impl TextViewState {
         Self {
             vertical_scroll: 0,
             horizontal_scroll: 0,
+            dragging_scrollbar: None,
         }
     }
 
@@ -57,6 +59,13 @@ impl TextViewState {
         self.vertical_scroll = clamp_scroll(self.vertical_scroll, line_count, height);
         self.horizontal_scroll = self.horizontal_scroll.min(max_horizontal_scroll);
     }
+}
+
+/// Text-view scrollbar axis currently being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextViewScrollbarAxis {
+    Vertical,
+    Horizontal,
 }
 
 /// Highlight range applied to caller-owned source text.
@@ -565,6 +574,12 @@ impl<'a> TextView<'a> {
         state: &mut TextViewState,
         event: &Event,
     ) -> TextViewOutcome {
+        if let Event::Mouse(mouse) = event
+            && let Some(outcome) =
+                self.handle_scrollbar_event(area, state, mouse.kind, mouse.position)
+        {
+            return outcome;
+        }
         match event {
             Event::Key(stroke) if self.policy.keyboard => match stroke.key {
                 KeyCode::Up => self.scroll_by(area, state, -1),
@@ -584,12 +599,12 @@ impl<'a> TextView<'a> {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.scroll_by(area, state, -1),
                     MouseEventKind::ScrollDown => self.scroll_by(area, state, 1),
+                    MouseEventKind::ScrollLeft => self.scroll_horizontal_by(area, state, -1),
+                    MouseEventKind::ScrollRight => self.scroll_horizontal_by(area, state, 1),
                     MouseEventKind::Down(_)
                     | MouseEventKind::Up(_)
                     | MouseEventKind::Drag(_)
-                    | MouseEventKind::Move
-                    | MouseEventKind::ScrollLeft
-                    | MouseEventKind::ScrollRight => TextViewOutcome::Ignored,
+                    | MouseEventKind::Move => TextViewOutcome::Ignored,
                 }
             }
             Event::Key(_)
@@ -600,6 +615,88 @@ impl<'a> TextView<'a> {
             | Event::Tick
             | Event::User(_) => TextViewOutcome::Ignored,
         }
+    }
+
+    fn handle_scrollbar_event(
+        &self,
+        area: Rect,
+        state: &mut TextViewState,
+        kind: MouseEventKind,
+        position: Point,
+    ) -> Option<TextViewOutcome> {
+        let event = Event::Mouse(bmux_tui::event::MouseEvent::new(kind, position));
+        if let Some(scrollbar_area) = self.vertical_scrollbar_area(area) {
+            let content_area = self.content_area(area);
+            let content_len = self.layout(area, state).lines.len();
+            let mut scrollbar_state = ScrollbarState::new(
+                u16::try_from(content_len).unwrap_or(u16::MAX),
+                content_area.height,
+            )
+            .offset(u16::try_from(self.clamped_vertical_scroll(area, state)).unwrap_or(u16::MAX));
+            scrollbar_state.dragging =
+                state.dragging_scrollbar == Some(TextViewScrollbarAxis::Vertical);
+            match Scrollbar::new()
+                .policy(ScrollbarPolicy::vertical())
+                .handle_event(scrollbar_area, &mut scrollbar_state, &event)
+            {
+                ScrollbarOutcome::Changed { offset } => {
+                    state.vertical_scroll = usize::from(offset);
+                    state.dragging_scrollbar = scrollbar_state
+                        .dragging
+                        .then_some(TextViewScrollbarAxis::Vertical);
+                    return Some(TextViewOutcome::Scrolled {
+                        vertical_scroll: state.vertical_scroll,
+                    });
+                }
+                ScrollbarOutcome::Redraw => {
+                    state.dragging_scrollbar = None;
+                    return Some(TextViewOutcome::Redraw);
+                }
+                ScrollbarOutcome::Ignored => {
+                    state.dragging_scrollbar = scrollbar_state
+                        .dragging
+                        .then_some(TextViewScrollbarAxis::Vertical);
+                    if scrollbar_state.dragging {
+                        return Some(TextViewOutcome::Redraw);
+                    }
+                }
+            }
+        }
+        if let Some(scrollbar_area) = self.horizontal_scrollbar_area(area) {
+            let content_area = self.content_area(area);
+            let mut scrollbar_state = ScrollbarState::new(
+                u16::try_from(self.content_width()).unwrap_or(u16::MAX),
+                content_area.width,
+            )
+            .offset(u16::try_from(self.clamped_horizontal_scroll(area, state)).unwrap_or(u16::MAX));
+            scrollbar_state.dragging =
+                state.dragging_scrollbar == Some(TextViewScrollbarAxis::Horizontal);
+            match Scrollbar::new()
+                .policy(ScrollbarPolicy::horizontal())
+                .handle_event(scrollbar_area, &mut scrollbar_state, &event)
+            {
+                ScrollbarOutcome::Changed { offset } => {
+                    state.horizontal_scroll = usize::from(offset);
+                    state.dragging_scrollbar = scrollbar_state
+                        .dragging
+                        .then_some(TextViewScrollbarAxis::Horizontal);
+                    return Some(TextViewOutcome::Redraw);
+                }
+                ScrollbarOutcome::Redraw => {
+                    state.dragging_scrollbar = None;
+                    return Some(TextViewOutcome::Redraw);
+                }
+                ScrollbarOutcome::Ignored => {
+                    state.dragging_scrollbar = scrollbar_state
+                        .dragging
+                        .then_some(TextViewScrollbarAxis::Horizontal);
+                    if scrollbar_state.dragging {
+                        return Some(TextViewOutcome::Redraw);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn scroll_by(&self, area: Rect, state: &mut TextViewState, delta: i32) -> TextViewOutcome {
