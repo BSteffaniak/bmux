@@ -13,7 +13,8 @@ use bmux_tui_components::bar_chart::{
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::canvas::{Canvas, CanvasBounds, CanvasLine, CanvasPoint, CanvasRect};
 use bmux_tui_components::chart::{
-    Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
+    Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset,
+    ChartLegendPlacement, ChartPoint, ChartPolicy,
 };
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
@@ -196,8 +197,19 @@ fn render_chart(frame: &mut Frame<'_>) {
         ChartDataset::line("trend", &trend).marker("·"),
         ChartDataset::scatter("events", &points).marker("◆"),
     ];
+    let x_labels = ["0", "3"];
+    let y_labels = ["3", "0"];
     Chart::new(&datasets, ChartBounds::new(0.0, 3.0, 0.0, 3.0))
-        .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
+        .axes(
+            ChartAxes::empty()
+                .x(ChartAxis::empty().title("x").labels(&x_labels))
+                .y(ChartAxis::empty().title("y").labels(&y_labels)),
+        )
+        .policy(
+            ChartPolicy::compact()
+                .axes(ChartAxisVisibility::Visible)
+                .legend(ChartLegendPlacement::TopRight),
+        )
         .render(Rect::new(35, 17, 32, 5), frame);
 }
 
