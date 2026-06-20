@@ -261,6 +261,12 @@ impl<'a> ProgressBar<'a> {
         Self::new(ProgressBarValue::ratio(numerator, denominator))
     }
 
+    /// Create a compact line-gauge style progress bar from a ratio.
+    #[must_use]
+    pub const fn line_gauge(numerator: u64, denominator: u64) -> Self {
+        Self::ratio(numerator, denominator).policy(ProgressBarPolicy::compact().line_gauge())
+    }
+
     /// Set explicit label.
     #[must_use]
     pub const fn label(mut self, label: &'a str) -> Self {
@@ -438,7 +444,13 @@ impl<'a> ProgressBar<'a> {
                 spans.push(Span::raw(" "));
             }
             if let Some(label) = label {
-                spans.push(Span::styled(label, self.styles.label));
+                spans.push(Span::styled(
+                    truncate_to_display_width(
+                        &label,
+                        usize::from(area.width.saturating_sub(gauge_width).saturating_sub(gap)),
+                    ),
+                    self.styles.label,
+                ));
             }
         }
         frame.write_line(area, &Line::from_spans(spans));
@@ -566,6 +578,28 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("████░░░░ 50%")
         );
+    }
+
+    #[test]
+    fn line_gauge_constructor_renders_compact_gauge() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        ProgressBar::line_gauge(1, 4).render(Rect::new(0, 0, 10, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█▒░░░░ 25%"));
+    }
+
+    #[test]
+    fn line_gauge_truncates_long_right_label() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        ProgressBar::line_gauge(1, 2)
+            .label("loading")
+            .render(Rect::new(0, 0, 8, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" loading"));
     }
 
     #[test]
