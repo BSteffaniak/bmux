@@ -384,6 +384,12 @@ impl<'a> Chart<'a> {
         self.axes
     }
 
+    /// Return the plot area after reserving space for visible axes.
+    #[must_use]
+    pub fn plot_area(&self, area: Rect) -> Rect {
+        plot_area(area, self.axes, self.policy.axes)
+    }
+
     /// Map a chart point into an area cell.
     #[must_use]
     pub fn map_point(&self, area: Rect, point: ChartPoint) -> Option<(u16, u16)> {
@@ -430,6 +436,7 @@ impl<'a> Chart<'a> {
                 self.styles.dataset,
             );
         }
+        let plot_area = self.plot_area(area);
         for dataset in self.datasets {
             let style = if dataset.style == Style::new() {
                 self.styles.dataset
@@ -440,20 +447,36 @@ impl<'a> Chart<'a> {
                 && matches!(self.policy.interpolation, ChartInterpolation::Straight)
             {
                 for pair in dataset.points.windows(2) {
-                    if let (Some((x0, y0)), Some((x1, y1))) =
-                        (self.map_point(area, pair[0]), self.map_point(area, pair[1]))
-                    {
-                        draw_line(frame, area, (x0, y0), (x1, y1), dataset.marker, style);
+                    if let (Some((x0, y0)), Some((x1, y1))) = (
+                        self.map_point(plot_area, pair[0]),
+                        self.map_point(plot_area, pair[1]),
+                    ) {
+                        draw_line(frame, plot_area, (x0, y0), (x1, y1), dataset.marker, style);
                     }
                 }
             }
             for point in dataset.points {
-                if let Some((x, y)) = self.map_point(area, *point) {
-                    draw_cell(frame, area, x, y, dataset.marker, style);
+                if let Some((x, y)) = self.map_point(plot_area, *point) {
+                    draw_cell(frame, plot_area, x, y, dataset.marker, style);
                 }
             }
         }
     }
+}
+
+fn plot_area(area: Rect, axes: ChartAxes<'_>, visibility: ChartAxisVisibility) -> Rect {
+    if area.is_empty() || matches!(visibility, ChartAxisVisibility::Hidden) {
+        return area;
+    }
+    let top = u16::from(axes.y.title.is_some());
+    let bottom = u16::from(axes.x.title.is_some() || !axes.x.labels.is_empty());
+    let left = u16::from(!axes.y.labels.is_empty());
+    Rect::new(
+        area.x.saturating_add(left),
+        area.y.saturating_add(top),
+        area.width.saturating_sub(left),
+        area.height.saturating_sub(top.saturating_add(bottom)),
+    )
 }
 
 fn render_axes(frame: &mut Frame<'_>, area: Rect, axes: ChartAxes<'_>, style: Style) {
@@ -467,6 +490,68 @@ fn render_axes(frame: &mut Frame<'_>, area: Rect, axes: ChartAxes<'_>, style: St
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans([Span::styled(title, axes.y.style_or(style))]),
+        );
+    }
+    if !axes.x.labels.is_empty() {
+        render_even_labels(
+            frame,
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            axes.x.labels,
+            axes.x.style_or(style),
+        );
+    }
+    if !axes.y.labels.is_empty() {
+        render_vertical_labels(frame, area, axes.y.labels, axes.y.style_or(style));
+    }
+}
+
+fn render_even_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style: Style) {
+    if area.is_empty() || labels.is_empty() {
+        return;
+    }
+    let last = labels.len().saturating_sub(1);
+    for (index, label) in labels.iter().enumerate() {
+        let x_offset = if last == 0 {
+            0
+        } else {
+            u16::try_from(
+                (index * usize::from(area.width.saturating_sub(1)))
+                    .checked_div(last)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u16::MAX)
+        };
+        frame.write_line(
+            Rect::new(
+                area.x.saturating_add(x_offset),
+                area.y,
+                area.width.saturating_sub(x_offset),
+                1,
+            ),
+            &Line::from_spans([Span::styled(*label, style)]),
+        );
+    }
+}
+
+fn render_vertical_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style: Style) {
+    if area.is_empty() || labels.is_empty() {
+        return;
+    }
+    let last = labels.len().saturating_sub(1);
+    for (index, label) in labels.iter().enumerate() {
+        let y_offset = if last == 0 {
+            0
+        } else {
+            u16::try_from(
+                (index * usize::from(area.height.saturating_sub(1)))
+                    .checked_div(last)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u16::MAX)
+        };
+        frame.write_line(
+            Rect::new(area.x, area.y.saturating_add(y_offset), area.width, 1),
+            &Line::from_spans([Span::styled(*label, style)]),
         );
     }
 }
@@ -630,6 +715,59 @@ mod tests {
         assert_eq!(
             chart.map_point_with_clipping(Rect::new(0, 0, 11, 11), points[0], ChartClipping::Clamp),
             Some((10, 10))
+        );
+    }
+
+    #[test]
+    fn reserves_plot_area_for_visible_axes() {
+        let points = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [ChartDataset::scatter("points", &points)];
+        let y_labels = ["hi", "lo"];
+        let chart = Chart::new(&datasets, ChartBounds::new(0.0, 2.0, 0.0, 2.0))
+            .axes(
+                ChartAxes::empty()
+                    .x(ChartAxis::empty().title("x").labels(&["0", "2"]))
+                    .y(ChartAxis::empty().title("y").labels(&y_labels)),
+            )
+            .policy(ChartPolicy::compact().axes(ChartAxisVisibility::Visible));
+
+        assert_eq!(
+            chart.plot_area(Rect::new(0, 0, 10, 5)),
+            Rect::new(1, 1, 9, 3)
+        );
+    }
+
+    #[test]
+    fn renders_axis_tick_labels() {
+        let points = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [ChartDataset::scatter("points", &points)];
+        let x_labels = ["0", "2"];
+        let y_labels = ["hi", "lo"];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 2.0, 0.0, 2.0))
+            .axes(
+                ChartAxes::empty()
+                    .x(ChartAxis::empty().labels(&x_labels))
+                    .y(ChartAxis::empty().labels(&y_labels)),
+            )
+            .policy(ChartPolicy::compact().axes(ChartAxisVisibility::Visible))
+            .render(Rect::new(0, 0, 8, 4), &mut frame);
+
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(0)
+                .as_deref()
+                .is_some_and(|row| row.contains("hi"))
+        );
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(3)
+                .as_deref()
+                .is_some_and(|row| row.contains('2'))
         );
     }
 
