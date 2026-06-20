@@ -4,8 +4,8 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::text_width::display_width;
+use bmux_tui::prelude::{Line, Style};
+use bmux_tui::text::line_viewport;
 
 use crate::common::InteractionState;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
@@ -394,7 +394,11 @@ impl<'a> ScrollArea<'a> {
                 .content
                 .y
                 .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-            let visible_line = line_viewport(line, state.horizontal_offset, layout.content.width);
+            let visible_line = line_viewport(
+                line,
+                usize::from(state.horizontal_offset),
+                usize::from(layout.content.width),
+            );
             frame.write_line_with_fallback_style(
                 Rect::new(layout.content.x, y, layout.content.width, 1),
                 &visible_line,
@@ -684,43 +688,6 @@ impl ScrollAxis {
     }
 }
 
-fn line_viewport(line: &Line, horizontal_offset: u16, width: u16) -> Line {
-    if horizontal_offset == 0 {
-        return line.clone();
-    }
-    let start = usize::from(horizontal_offset);
-    let end = start.saturating_add(usize::from(width));
-    let mut cursor = 0usize;
-    let mut spans = Vec::new();
-    for span in &line.spans {
-        let mut content = String::new();
-        for ch in span.content.chars() {
-            let grapheme = ch.to_string();
-            let grapheme_width = display_width(&grapheme);
-            if grapheme_width == 0 {
-                continue;
-            }
-            let next = cursor.saturating_add(grapheme_width);
-            if next <= start {
-                cursor = next;
-                continue;
-            }
-            if cursor >= end || next > end {
-                break;
-            }
-            content.push(ch);
-            cursor = next;
-        }
-        if !content.is_empty() {
-            spans.push(Span::styled(content, span.style));
-        }
-        if cursor >= end {
-            break;
-        }
-    }
-    Line::from_spans(spans)
-}
-
 fn offset_u16(value: u16, delta: i32) -> u16 {
     u16::try_from((i32::from(value) + delta).max(0)).unwrap_or(u16::MAX)
 }
@@ -732,7 +699,8 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
-    use bmux_tui::prelude::Line;
+    use bmux_tui::prelude::{Line, Span};
+    use bmux_tui::style::{Color, Style};
 
     use super::{ScrollArea, ScrollAreaOutcome, ScrollAreaScrollbarMode, ScrollAreaState};
 
@@ -966,6 +934,39 @@ mod tests {
 
         assert!(outcome.is_handled());
         assert!(state.horizontal_offset() > 0);
+    }
+
+    #[test]
+    fn horizontal_viewport_preserves_span_style() {
+        let style = Style::new().fg(Color::Red);
+        let lines = [Line::from_spans([Span::styled("abcdef", style)])];
+        let area = ScrollArea::new(&lines);
+        let mut state = ScrollAreaState::new();
+        state.set_horizontal_offset(2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        area.render(Rect::new(0, 0, 3, 1), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cde"));
+        assert_eq!(
+            frame.buffer().get(Point::new(0, 0)).map(|cell| cell.style),
+            Some(style)
+        );
+    }
+
+    #[test]
+    fn horizontal_viewport_handles_wide_characters() {
+        let lines = lines(&["a界b"]);
+        let area = ScrollArea::new(&lines);
+        let mut state = ScrollAreaState::new();
+        state.set_horizontal_offset(2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        area.render(Rect::new(0, 0, 2, 1), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("b "));
     }
 
     #[test]

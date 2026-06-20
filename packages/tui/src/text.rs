@@ -2,6 +2,7 @@
 
 use crate::style::Style;
 use crate::text_width::display_width;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A styled text span.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -106,6 +107,15 @@ impl Line {
         self.spans.iter().map(Span::width).sum()
     }
 
+    /// Return a styled viewport clipped to terminal display cells.
+    ///
+    /// Graphemes that would be split by the left or right viewport edge are
+    /// omitted, preserving valid terminal cell alignment and span styles.
+    #[must_use]
+    pub fn viewport(&self, horizontal_offset: usize, width: usize) -> Self {
+        line_viewport(self, horizontal_offset, width)
+    }
+
     /// Append a span to the line.
     pub fn push_span(&mut self, span: Span) {
         self.spans.push(span);
@@ -119,6 +129,62 @@ impl Line {
             .map(|span| span.content.as_str())
             .collect()
     }
+}
+
+/// Return a styled viewport clipped to terminal display cells.
+///
+/// This helper preserves span styles and never splits a Unicode grapheme. When
+/// the viewport begins or ends inside a wide grapheme, that grapheme is omitted
+/// so subsequent cells remain aligned.
+#[must_use]
+pub fn line_viewport(line: &Line, horizontal_offset: usize, width: usize) -> Line {
+    if width == 0 {
+        return Line::new();
+    }
+    if horizontal_offset == 0 && line.width() <= width {
+        return line.clone();
+    }
+
+    let start = horizontal_offset;
+    let end = start.saturating_add(width);
+    let mut cursor = 0usize;
+    let mut spans: Vec<Span> = Vec::new();
+    for span in &line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if grapheme_width == 0 {
+                continue;
+            }
+            let next = cursor.saturating_add(grapheme_width);
+            if next <= start || cursor < start {
+                cursor = next;
+                continue;
+            }
+            if cursor >= end || next > end {
+                break;
+            }
+            content.push_str(grapheme);
+            cursor = next;
+        }
+        if !content.is_empty() {
+            push_or_merge_span(&mut spans, content, span.style);
+        }
+        if cursor >= end {
+            break;
+        }
+    }
+    Line::from_spans(spans)
+}
+
+fn push_or_merge_span(spans: &mut Vec<Span>, content: String, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.push_str(&content);
+        return;
+    }
+    spans.push(Span::styled(content, style));
 }
 
 /// Multiple lines of styled text.
@@ -212,7 +278,7 @@ impl From<String> for Text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Line, Span, Text};
+    use super::{Line, Span, Text, line_viewport};
     use crate::style::{Color, Style};
 
     #[test]
@@ -245,6 +311,58 @@ mod tests {
         assert_eq!(span.width(), 3);
         assert_eq!(line.width(), 4);
         assert_eq!(text.width(), 4);
+    }
+
+    #[test]
+    fn line_viewport_clips_ascii_and_preserves_styles() {
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().fg(Color::Blue);
+        let line = Line::from_spans([Span::styled("ab", red), Span::styled("cde", blue)]);
+        let viewport = line_viewport(&line, 1, 3);
+
+        assert_eq!(viewport.plain_text(), "bcd");
+        assert_eq!(viewport.spans.len(), 2);
+        assert_eq!(viewport.spans[0], Span::styled("b", red));
+        assert_eq!(viewport.spans[1], Span::styled("cd", blue));
+    }
+
+    #[test]
+    fn line_viewport_merges_adjacent_same_style_spans() {
+        let style = Style::new().fg(Color::Green);
+        let line = Line::from_spans([Span::styled("ab", style), Span::styled("cd", style)]);
+        let viewport = line_viewport(&line, 1, 2);
+
+        assert_eq!(viewport.spans, vec![Span::styled("bc", style)]);
+    }
+
+    #[test]
+    fn line_viewport_does_not_split_combining_graphemes() {
+        let line = Line::from("e\u{301}e\u{301}x");
+
+        assert_eq!(line_viewport(&line, 0, 2).plain_text(), "e\u{301}e\u{301}");
+        assert_eq!(line_viewport(&line, 1, 1).plain_text(), "e\u{301}");
+    }
+
+    #[test]
+    fn line_viewport_does_not_split_emoji_zwj_sequences() {
+        let family = "👨‍👩‍👧‍👦";
+        let line = Line::from(format!("a{family}b"));
+
+        assert_eq!(
+            line_viewport(&line, 0, 3).plain_text(),
+            format!("a{family}")
+        );
+        assert_eq!(line_viewport(&line, 2, 2).plain_text(), "b");
+        assert_eq!(line_viewport(&line, 3, 1).plain_text(), "b");
+    }
+
+    #[test]
+    fn line_viewport_omits_wide_graphemes_cut_by_edges() {
+        let line = Line::from("a界b");
+
+        assert_eq!(line_viewport(&line, 0, 2).plain_text(), "a");
+        assert_eq!(line_viewport(&line, 1, 2).plain_text(), "界");
+        assert_eq!(line_viewport(&line, 2, 2).plain_text(), "b");
     }
 
     #[test]

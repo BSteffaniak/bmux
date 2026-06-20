@@ -6,6 +6,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
 use bmux_tui::style::{Color, Style};
+use bmux_tui::text::line_viewport;
 use bmux_tui::text_width::display_width;
 use bmux_tui::widget::Widget;
 
@@ -374,7 +375,7 @@ impl<'a> TextView<'a> {
             layout
                 .lines
                 .into_iter()
-                .map(|line| horizontally_scrolled_line(&line, horizontal_scroll))
+                .map(|line| line_viewport(&line, horizontal_scroll, usize::from(area.width)))
                 .collect()
         } else {
             layout.lines
@@ -529,26 +530,6 @@ fn apply_line_ranges(
             }
             spans.push(Span::styled(ch.to_string(), style));
             char_index = char_index.saturating_add(1);
-        }
-    }
-    Line::from_spans(spans)
-}
-
-fn horizontally_scrolled_line(line: &Line, scroll: usize) -> Line {
-    let mut remaining = scroll;
-    let mut spans = Vec::new();
-    for span in &line.spans {
-        let mut content = String::new();
-        for ch in span.content.chars() {
-            let width = display_width(&ch.to_string());
-            if remaining >= width {
-                remaining = remaining.saturating_sub(width);
-            } else {
-                content.push(ch);
-            }
-        }
-        if !content.is_empty() {
-            spans.push(Span::styled(content, span.style));
         }
     }
     Line::from_spans(spans)
@@ -893,6 +874,23 @@ mod tests {
         );
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cde"));
+    }
+
+    #[test]
+    fn horizontal_scroll_handles_wide_characters() {
+        let lines = [Line::from("a界b")];
+        let mut state = TextViewState::new();
+        state.set_horizontal_scroll(2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextView::new(&lines).policy(TextViewPolicy::bare()).render(
+            Rect::new(0, 0, 2, 1),
+            &state,
+            &mut frame,
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("b "));
     }
 
     #[test]
