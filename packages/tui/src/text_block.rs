@@ -443,4 +443,16 @@ mod tests {
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  hi  "));
     }
+
+    #[test]
+    fn text_block_honors_right_alignment() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextBlock::new("hi")
+            .alignment(Alignment::Right)
+            .render(Rect::new(0, 0, 6, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("    hi"));
+    }
 }
