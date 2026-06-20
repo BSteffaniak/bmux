@@ -11,7 +11,9 @@ use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement,
 };
 use bmux_tui_components::button::{Button, ButtonState};
-use bmux_tui_components::canvas::{Canvas, CanvasBounds, CanvasLine, CanvasPoint, CanvasRect};
+use bmux_tui_components::canvas::{
+    Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasRect,
+};
 use bmux_tui_components::chart::{
     Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset,
     ChartLegendPlacement, ChartPoint, ChartPolicy,
@@ -216,11 +218,16 @@ fn render_chart(frame: &mut Frame<'_>) {
 fn render_canvas(frame: &mut Frame<'_>) {
     let points = [CanvasPoint::new(1.0, 1.0, "●")];
     let lines = [CanvasLine::new(0.0, 0.0, 3.0, 2.0, "·")];
-    let rects = [CanvasRect::new(0.0, 0.0, 3.0, 2.0, "□")];
+    let rects = [
+        CanvasRect::new(0.0, 0.0, 3.0, 2.0, "□"),
+        CanvasRect::new(0.2, 0.2, 0.8, 0.8, "▒").fill(),
+    ];
+    let circles = [CanvasCircle::new(2.0, 1.0, 0.8, "○")];
 
     Canvas::new(&points, CanvasBounds::new(0.0, 3.0, 0.0, 2.0))
         .lines(&lines)
         .rects(&rects)
+        .circles(&circles)
         .render(Rect::new(35, 22, 18, 2), frame);
 }
 
@@ -328,6 +335,7 @@ mod tests {
         assert!(rendered.contains("CPU"));
         assert!(rendered.contains("◆"));
         assert!(rendered.contains("□"));
+        assert!(rendered.contains("○"));
         assert!(rendered.contains("●"));
         assert!(rendered.contains("Saved ×"));
         assert!(rendered.contains("Changes persisted"));
