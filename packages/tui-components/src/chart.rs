@@ -697,6 +697,7 @@ mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point as TuiPoint, Rect};
+    use bmux_tui::style::{Color, Style};
 
     use super::{
         Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartClipping, ChartDataset,
@@ -940,6 +941,40 @@ mod tests {
             .render(Rect::new(0, 0, 8, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("No data "));
+    }
+
+    #[test]
+    fn dataset_style_overrides_chart_fallback_style() {
+        let points_a = [ChartPoint::new(0.0, 0.0)];
+        let points_b = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [
+            ChartDataset::scatter("fallback", &points_a),
+            ChartDataset::scatter("override", &points_b).style(Style::new().fg(Color::Red)),
+        ];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+            .styles(super::ChartStyles {
+                dataset: Style::new().fg(Color::Blue),
+                empty: Style::new(),
+            })
+            .render(Rect::new(0, 0, 2, 2), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(0, 1))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Blue))
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(1, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Red))
+        );
     }
 
     #[test]
