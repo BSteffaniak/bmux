@@ -35,6 +35,10 @@ impl CanvasBounds {
 pub enum CanvasMarkerMode {
     /// Render one marker per terminal cell.
     Cell,
+    /// Render 1×2 sub-cells using Unicode half-block characters.
+    HalfBlock,
+    /// Render 2×2 sub-cells using Unicode quadrant block characters.
+    Quadrant,
     /// Render sub-cell dots using Unicode Braille characters.
     Braille,
 }
@@ -52,6 +56,22 @@ impl CanvasPolicy {
     pub const fn cell() -> Self {
         Self {
             marker_mode: CanvasMarkerMode::Cell,
+        }
+    }
+
+    /// Half-block high-resolution canvas policy.
+    #[must_use]
+    pub const fn half_block() -> Self {
+        Self {
+            marker_mode: CanvasMarkerMode::HalfBlock,
+        }
+    }
+
+    /// Quadrant high-resolution canvas policy.
+    #[must_use]
+    pub const fn quadrant() -> Self {
+        Self {
+            marker_mode: CanvasMarkerMode::Quadrant,
         }
     }
 
@@ -321,6 +341,8 @@ impl<'a> Canvas<'a> {
         }
         match self.policy.marker_mode {
             CanvasMarkerMode::Cell => self.render_cell(area, frame),
+            CanvasMarkerMode::HalfBlock => self.render_subcell(area, frame, SubcellMode::HalfBlock),
+            CanvasMarkerMode::Quadrant => self.render_subcell(area, frame, SubcellMode::Quadrant),
             CanvasMarkerMode::Braille => self.render_braille(area, frame),
         }
     }
@@ -354,6 +376,32 @@ impl<'a> Canvas<'a> {
             }
         }
     }
+    fn render_subcell(&self, area: Rect, frame: &mut Frame<'_>, mode: SubcellMode) {
+        let Some(mut raster) = SubcellRaster::new(area, self.bounds, mode) else {
+            return;
+        };
+        for line in self.lines {
+            if let (Some(start), Some(end)) = (
+                raster.map_point(line.x0, line.y0),
+                raster.map_point(line.x1, line.y1),
+            ) {
+                raster.draw_line(start, end, style_or(line.style, self.style));
+            }
+        }
+        for rect in self.rects {
+            raster.draw_rect(*rect, style_or(rect.style, self.style));
+        }
+        for circle in self.circles {
+            raster.draw_circle(*circle, style_or(circle.style, self.style));
+        }
+        for point in self.points {
+            if let Some((x, y)) = raster.map_point(point.x, point.y) {
+                raster.set_subcell(x, y, style_or(point.style, self.style));
+            }
+        }
+        raster.flush(frame);
+    }
+
     fn render_braille(&self, area: Rect, frame: &mut Frame<'_>) {
         let Some(mut raster) = BrailleRaster::new(area, self.bounds) else {
             return;
@@ -437,6 +485,278 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubcellMode {
+    HalfBlock,
+    Quadrant,
+}
+
+impl SubcellMode {
+    const fn width(self) -> u16 {
+        match self {
+            Self::HalfBlock => 1,
+            Self::Quadrant => 2,
+        }
+    }
+
+    const fn height() -> u16 {
+        2
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Subcell {
+    mask: u8,
+    style: Style,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SubcellRaster {
+    area: Rect,
+    bounds: CanvasBounds,
+    mode: SubcellMode,
+    subcell_width: u16,
+    subcell_height: u16,
+    cells: Vec<Subcell>,
+}
+
+impl SubcellRaster {
+    fn new(area: Rect, bounds: CanvasBounds, mode: SubcellMode) -> Option<Self> {
+        if area.is_empty() || bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
+            return None;
+        }
+        let cell_count = usize::from(area.width).checked_mul(usize::from(area.height))?;
+        Some(Self {
+            area,
+            bounds,
+            mode,
+            subcell_width: area.width.saturating_mul(mode.width()),
+            subcell_height: area.height.saturating_mul(SubcellMode::height()),
+            cells: vec![
+                Subcell {
+                    mask: 0,
+                    style: Style::new()
+                };
+                cell_count
+            ],
+        })
+    }
+
+    fn map_point(&self, x: f64, y: f64) -> Option<(u16, u16)> {
+        if x < self.bounds.x_min
+            || x > self.bounds.x_max
+            || y < self.bounds.y_min
+            || y > self.bounds.y_max
+        {
+            return None;
+        }
+        let x_span = self.bounds.x_max - self.bounds.x_min;
+        let y_span = self.bounds.y_max - self.bounds.y_min;
+        let x_scaled =
+            (x - self.bounds.x_min) / x_span * f64::from(self.subcell_width.saturating_sub(1));
+        let y_scaled =
+            (self.bounds.y_max - y) / y_span * f64::from(self.subcell_height.saturating_sub(1));
+        Some((
+            rounded_u16(x_scaled).min(self.subcell_width.saturating_sub(1)),
+            rounded_u16(y_scaled).min(self.subcell_height.saturating_sub(1)),
+        ))
+    }
+
+    fn subcell_center(&self, x: u16, y: u16) -> (f64, f64) {
+        let x_ratio = if self.subcell_width <= 1 {
+            0.5
+        } else {
+            f64::from(x) / f64::from(self.subcell_width.saturating_sub(1))
+        };
+        let y_ratio = if self.subcell_height <= 1 {
+            0.5
+        } else {
+            f64::from(y) / f64::from(self.subcell_height.saturating_sub(1))
+        };
+        (
+            self.bounds.x_min + x_ratio * (self.bounds.x_max - self.bounds.x_min),
+            self.bounds.y_max - y_ratio * (self.bounds.y_max - self.bounds.y_min),
+        )
+    }
+
+    fn set_subcell(&mut self, x: u16, y: u16, style: Style) {
+        if x >= self.subcell_width || y >= self.subcell_height {
+            return;
+        }
+        let cell_x = x / self.mode.width();
+        let cell_y = y / SubcellMode::height();
+        let local_x = x % self.mode.width();
+        let local_y = y % SubcellMode::height();
+        let index = usize::from(cell_y)
+            .saturating_mul(usize::from(self.area.width))
+            .saturating_add(usize::from(cell_x));
+        let mask = match self.mode {
+            SubcellMode::HalfBlock => half_block_mask(local_y),
+            SubcellMode::Quadrant => quadrant_mask(local_x, local_y),
+        };
+        if let Some(cell) = self.cells.get_mut(index) {
+            cell.mask |= mask;
+            cell.style = style;
+        }
+    }
+
+    fn draw_line(&mut self, start: (u16, u16), end: (u16, u16), style: Style) {
+        let x0 = i32::from(start.0);
+        let y0 = i32::from(start.1);
+        let x1 = i32::from(end.0);
+        let y1 = i32::from(end.1);
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut error = dx + dy;
+        let mut x = x0;
+        let mut y = y0;
+        loop {
+            if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
+                self.set_subcell(x, y, style);
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let double_error = error.saturating_mul(2);
+            if double_error >= dy {
+                error += dy;
+                x += sx;
+            }
+            if double_error <= dx {
+                error += dx;
+                y += sy;
+            }
+        }
+    }
+
+    fn draw_rect(&mut self, rect: CanvasRect<'_>, style: Style) {
+        let (Some(a), Some(b)) = (
+            self.map_point(rect.x0, rect.y0),
+            self.map_point(rect.x1, rect.y1),
+        ) else {
+            return;
+        };
+        let x_min = a.0.min(b.0);
+        let x_max = a.0.max(b.0);
+        let y_min = a.1.min(b.1);
+        let y_max = a.1.max(b.1);
+        if matches!(rect.mode, CanvasRectMode::Fill) {
+            for y in y_min..=y_max {
+                for x in x_min..=x_max {
+                    self.set_subcell(x, y, style);
+                }
+            }
+        } else {
+            self.draw_line((x_min, y_min), (x_max, y_min), style);
+            self.draw_line((x_max, y_min), (x_max, y_max), style);
+            self.draw_line((x_max, y_max), (x_min, y_max), style);
+            self.draw_line((x_min, y_max), (x_min, y_min), style);
+        }
+    }
+
+    fn draw_circle(&mut self, circle: CanvasCircle<'_>, style: Style) {
+        if circle.radius <= 0.0 {
+            return;
+        }
+        let x_step = (self.bounds.x_max - self.bounds.x_min) / f64::from(self.subcell_width.max(1));
+        let y_step =
+            (self.bounds.y_max - self.bounds.y_min) / f64::from(self.subcell_height.max(1));
+        let tolerance = x_step.max(y_step).max(f64::EPSILON);
+        for y in 0..self.subcell_height {
+            for x in 0..self.subcell_width {
+                let (canvas_x, canvas_y) = self.subcell_center(x, y);
+                let distance = (canvas_x - circle.x).hypot(canvas_y - circle.y);
+                let should_draw = if circle.filled {
+                    distance <= circle.radius
+                } else {
+                    (distance - circle.radius).abs() <= tolerance
+                };
+                if should_draw {
+                    self.set_subcell(x, y, style);
+                }
+            }
+        }
+    }
+
+    fn flush(&self, frame: &mut Frame<'_>) {
+        for cell_y in 0..self.area.height {
+            for cell_x in 0..self.area.width {
+                let index = usize::from(cell_y)
+                    .saturating_mul(usize::from(self.area.width))
+                    .saturating_add(usize::from(cell_x));
+                let Some(cell) = self.cells.get(index).copied() else {
+                    continue;
+                };
+                if cell.mask == 0 {
+                    continue;
+                }
+                let symbol = match self.mode {
+                    SubcellMode::HalfBlock => half_block_char(cell.mask),
+                    SubcellMode::Quadrant => quadrant_char(cell.mask),
+                };
+                frame.buffer_mut().set_cell(
+                    Point::new(
+                        self.area.x.saturating_add(cell_x),
+                        self.area.y.saturating_add(cell_y),
+                    ),
+                    symbol.to_string(),
+                    cell.style,
+                );
+            }
+        }
+    }
+}
+
+const fn half_block_mask(y: u16) -> u8 {
+    match y {
+        0 => 0x01,
+        1 => 0x02,
+        _ => 0,
+    }
+}
+
+const fn half_block_char(mask: u8) -> char {
+    match mask & 0x03 {
+        0x01 => '▀',
+        0x02 => '▄',
+        0x03 => '█',
+        _ => ' ',
+    }
+}
+
+const fn quadrant_mask(x: u16, y: u16) -> u8 {
+    match (x, y) {
+        (0, 0) => 0x01,
+        (1, 0) => 0x02,
+        (0, 1) => 0x04,
+        (1, 1) => 0x08,
+        _ => 0,
+    }
+}
+
+const fn quadrant_char(mask: u8) -> char {
+    match mask & 0x0f {
+        0x01 => '▘',
+        0x02 => '▝',
+        0x03 => '▀',
+        0x04 => '▖',
+        0x05 => '▌',
+        0x06 => '▞',
+        0x07 => '▛',
+        0x08 => '▗',
+        0x09 => '▚',
+        0x0a => '▐',
+        0x0b => '▜',
+        0x0c => '▄',
+        0x0d => '▙',
+        0x0e => '▟',
+        0x0f => '█',
+        _ => ' ',
     }
 }
 
@@ -859,6 +1179,63 @@ mod tests {
                 .map(|cell| cell.symbol.as_str()),
             Some("p")
         );
+    }
+
+    #[test]
+    fn half_block_mode_maps_vertical_subcells() {
+        let upper = [CanvasPoint::new(0.0, 1.0, "ignored")];
+        let lower = [CanvasPoint::new(0.0, 0.0, "ignored")];
+        let both = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
+
+        let mut upper_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut upper_frame = Frame::new(&mut upper_buffer);
+        Canvas::new(&upper, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .policy(CanvasPolicy::half_block())
+            .render(Rect::new(0, 0, 1, 1), &mut upper_frame);
+        assert_eq!(upper_frame.buffer().row_symbols(0).as_deref(), Some("▀"));
+
+        let mut lower_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut lower_frame = Frame::new(&mut lower_buffer);
+        Canvas::new(&lower, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .policy(CanvasPolicy::half_block())
+            .render(Rect::new(0, 0, 1, 1), &mut lower_frame);
+        assert_eq!(lower_frame.buffer().row_symbols(0).as_deref(), Some("▄"));
+
+        let mut both_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut both_frame = Frame::new(&mut both_buffer);
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .rects(&both)
+            .policy(CanvasPolicy::half_block())
+            .render(Rect::new(0, 0, 1, 1), &mut both_frame);
+        assert_eq!(both_frame.buffer().row_symbols(0).as_deref(), Some("█"));
+    }
+
+    #[test]
+    fn quadrant_mode_maps_four_subcells() {
+        let rects = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .rects(&rects)
+            .policy(CanvasPolicy::quadrant())
+            .render(Rect::new(0, 0, 1, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█"));
+    }
+
+    #[test]
+    fn quadrant_mode_can_render_diagonal_line() {
+        let lines = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .lines(&lines)
+            .policy(CanvasPolicy::quadrant())
+            .render(Rect::new(0, 0, 1, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▞"));
     }
 
     #[test]
