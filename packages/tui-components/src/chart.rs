@@ -2,7 +2,7 @@
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::prelude::{Line, Span};
+use bmux_tui::prelude::{Line, Span, display_width};
 use bmux_tui::style::{Color, Style};
 
 /// One chart point.
@@ -427,15 +427,6 @@ impl<'a> Chart<'a> {
         if matches!(self.policy.axes, ChartAxisVisibility::Visible) {
             render_axes(frame, area, self.axes, self.styles.dataset);
         }
-        if !matches!(self.policy.legend, ChartLegendPlacement::Hidden) {
-            render_legend(
-                frame,
-                area,
-                self.datasets,
-                self.policy.legend,
-                self.styles.dataset,
-            );
-        }
         let plot_area = self.plot_area(area);
         for dataset in self.datasets {
             let style = if dataset.style == Style::new() {
@@ -460,6 +451,17 @@ impl<'a> Chart<'a> {
                     draw_cell(frame, plot_area, x, y, dataset.marker, style);
                 }
             }
+        }
+        if !matches!(self.policy.legend, ChartLegendPlacement::Hidden) {
+            render_legend(
+                frame,
+                area,
+                self.datasets,
+                self.policy.legend,
+                self.axes,
+                self.policy.axes,
+                self.styles.dataset,
+            );
         }
     }
 }
@@ -561,6 +563,8 @@ fn render_legend(
     area: Rect,
     datasets: &[ChartDataset<'_>],
     placement: ChartLegendPlacement,
+    axes: ChartAxes<'_>,
+    axis_visibility: ChartAxisVisibility,
     style: Style,
 ) {
     let names = datasets
@@ -574,11 +578,20 @@ fn render_legend(
     }
     let y = match placement {
         ChartLegendPlacement::Hidden => return,
-        ChartLegendPlacement::TopRight => area.y,
-        ChartLegendPlacement::BottomRight => area.bottom().saturating_sub(1),
+        ChartLegendPlacement::TopRight => area.y.saturating_add(u16::from(
+            matches!(axis_visibility, ChartAxisVisibility::Visible) && axes.y.title.is_some(),
+        )),
+        ChartLegendPlacement::BottomRight => {
+            area.bottom().saturating_sub(1).saturating_sub(u16::from(
+                matches!(axis_visibility, ChartAxisVisibility::Visible)
+                    && (axes.x.title.is_some() || !axes.x.labels.is_empty()),
+            ))
+        }
     };
+    let width = u16::try_from(display_width(&names)).unwrap_or(u16::MAX);
+    let x = area.right().saturating_sub(width).max(area.x);
     frame.write_line(
-        Rect::new(area.x, y, area.width, 1),
+        Rect::new(x, y, area.right().saturating_sub(x), 1),
         &Line::from_spans([Span::styled(names, style)]),
     );
 }
@@ -772,6 +785,50 @@ mod tests {
     }
 
     #[test]
+    fn places_legend_without_axis_row_collision() {
+        let points = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [ChartDataset::scatter("series", &points)];
+        let axes = ChartAxes::empty()
+            .x(ChartAxis::empty().title("x axis"))
+            .y(ChartAxis::empty().title("y axis"));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 2.0, 0.0, 2.0))
+            .axes(axes)
+            .policy(
+                ChartPolicy::compact()
+                    .axes(ChartAxisVisibility::Visible)
+                    .legend(ChartLegendPlacement::TopRight),
+            )
+            .render(Rect::new(0, 0, 14, 4), &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("y axis        ")
+        );
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(1)
+                .as_deref()
+                .is_some_and(|row| row.ends_with("series"))
+        );
+    }
+
+    #[test]
+    fn hides_legend_in_tiny_empty_areas() {
+        let points = [ChartPoint::new(0.0, 0.0)];
+        let datasets = [ChartDataset::scatter("series", &points)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+            .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
+            .render(Rect::new(0, 0, 0, 0), &mut frame);
+    }
+
+    #[test]
     fn stores_axes_labels_titles_and_legend_policy() {
         let points = [ChartPoint::new(0.0, 0.0)];
         let datasets = [ChartDataset::scatter("points", &points)];
@@ -860,9 +917,16 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("y axis      ")
         );
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(2)
+                .as_deref()
+                .is_some_and(|row| row.ends_with("series"))
+        );
         assert_eq!(
             frame.buffer().row_symbols(3).as_deref(),
-            Some("series      ")
+            Some("x axis      ")
         );
     }
 
