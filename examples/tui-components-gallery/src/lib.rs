@@ -12,7 +12,7 @@ use bmux_tui_components::bar_chart::{
 };
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::canvas::{
-    Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasPolicy, CanvasRect,
+    Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasRect,
 };
 use bmux_tui_components::chart::{
     Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset,
@@ -228,7 +228,6 @@ fn render_canvas(frame: &mut Frame<'_>) {
         .lines(&lines)
         .rects(&rects)
         .circles(&circles)
-        .policy(CanvasPolicy::braille())
         .render(Rect::new(35, 22, 18, 2), frame);
 }
 

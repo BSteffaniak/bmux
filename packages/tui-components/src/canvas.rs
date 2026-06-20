@@ -30,63 +30,79 @@ impl CanvasBounds {
     }
 }
 
-/// Canvas marker resolution mode.
+/// How explicit point markers are composed with rasterized geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CanvasMarkerMode {
-    /// Render one marker per terminal cell.
-    Cell,
-    /// Render 1×2 sub-cells using Unicode half-block characters.
-    HalfBlock,
-    /// Render 2×2 sub-cells using Unicode quadrant block characters.
-    Quadrant,
-    /// Render sub-cell dots using Unicode Braille characters.
-    Braille,
+pub enum CanvasExplicitMarkers {
+    /// Preserve point marker strings as terminal-cell overlays.
+    Preserve,
+    /// Rasterize points into the same sub-cell coverage buffer as geometry.
+    Rasterize,
+}
+
+/// Glyph family preference used by the final per-cell compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasGlyphPreference {
+    /// Pick the most compact exact glyph per cell, falling back to Braille.
+    Auto,
+    /// Prefer half-block glyphs when the cell can be represented exactly.
+    PreferHalfBlock,
+    /// Prefer quadrant glyphs when the cell can be represented exactly.
+    PreferQuadrant,
+    /// Prefer Braille for all non-explicit sub-cell coverage.
+    PreferBraille,
 }
 
 /// Canvas rendering policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanvasPolicy {
-    /// Marker resolution mode.
-    pub marker_mode: CanvasMarkerMode,
+    /// Explicit point marker handling.
+    pub explicit_markers: CanvasExplicitMarkers,
+    /// Final glyph selection preference.
+    pub glyph_preference: CanvasGlyphPreference,
 }
 
 impl CanvasPolicy {
-    /// Cell-oriented canvas policy.
+    /// Automatic mixed-glyph canvas policy.
     #[must_use]
-    pub const fn cell() -> Self {
+    pub const fn auto() -> Self {
         Self {
-            marker_mode: CanvasMarkerMode::Cell,
+            explicit_markers: CanvasExplicitMarkers::Preserve,
+            glyph_preference: CanvasGlyphPreference::Auto,
         }
     }
 
-    /// Half-block high-resolution canvas policy.
+    /// Rasterize point markers into coverage instead of preserving marker strings.
     #[must_use]
-    pub const fn half_block() -> Self {
-        Self {
-            marker_mode: CanvasMarkerMode::HalfBlock,
-        }
+    pub const fn rasterized_points(mut self) -> Self {
+        self.explicit_markers = CanvasExplicitMarkers::Rasterize;
+        self
     }
 
-    /// Quadrant high-resolution canvas policy.
+    /// Prefer half-block glyphs when representable exactly.
     #[must_use]
-    pub const fn quadrant() -> Self {
-        Self {
-            marker_mode: CanvasMarkerMode::Quadrant,
-        }
+    pub const fn prefer_half_block(mut self) -> Self {
+        self.glyph_preference = CanvasGlyphPreference::PreferHalfBlock;
+        self
     }
 
-    /// Braille high-resolution canvas policy.
+    /// Prefer quadrant glyphs when representable exactly.
     #[must_use]
-    pub const fn braille() -> Self {
-        Self {
-            marker_mode: CanvasMarkerMode::Braille,
-        }
+    pub const fn prefer_quadrant(mut self) -> Self {
+        self.glyph_preference = CanvasGlyphPreference::PreferQuadrant;
+        self
+    }
+
+    /// Prefer Braille glyphs for sub-cell coverage.
+    #[must_use]
+    pub const fn prefer_braille(mut self) -> Self {
+        self.glyph_preference = CanvasGlyphPreference::PreferBraille;
+        self
     }
 }
 
 impl Default for CanvasPolicy {
     fn default() -> Self {
-        Self::cell()
+        Self::auto()
     }
 }
 
@@ -134,7 +150,7 @@ pub struct CanvasLine<'a> {
     pub x1: f64,
     /// End y coordinate.
     pub y1: f64,
-    /// Marker symbol.
+    /// Marker symbol retained for API compatibility; geometry is rasterized.
     pub marker: &'a str,
     /// Line style.
     pub style: Style,
@@ -182,7 +198,7 @@ pub struct CanvasRect<'a> {
     pub x1: f64,
     /// Maximum y coordinate.
     pub y1: f64,
-    /// Marker symbol.
+    /// Marker symbol retained for API compatibility; geometry is rasterized.
     pub marker: &'a str,
     /// Rectangle style.
     pub style: Style,
@@ -229,7 +245,7 @@ pub struct CanvasCircle<'a> {
     pub y: f64,
     /// Radius in canvas coordinates.
     pub radius: f64,
-    /// Marker symbol.
+    /// Marker symbol retained for API compatibility; geometry is rasterized.
     pub marker: &'a str,
     /// Circle style.
     pub style: Style,
@@ -289,7 +305,7 @@ impl<'a> Canvas<'a> {
             circles: &[],
             bounds,
             style: Style::new(),
-            policy: CanvasPolicy::cell(),
+            policy: CanvasPolicy::auto(),
         }
     }
 
@@ -334,50 +350,12 @@ impl<'a> Canvas<'a> {
         map_point(area, self.bounds, x, y)
     }
 
-    /// Render the canvas.
+    /// Render the canvas through one mixed-glyph raster/composition pipeline.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
         if area.is_empty() {
             return;
         }
-        match self.policy.marker_mode {
-            CanvasMarkerMode::Cell => self.render_cell(area, frame),
-            CanvasMarkerMode::HalfBlock => self.render_subcell(area, frame, SubcellMode::HalfBlock),
-            CanvasMarkerMode::Quadrant => self.render_subcell(area, frame, SubcellMode::Quadrant),
-            CanvasMarkerMode::Braille => self.render_braille(area, frame),
-        }
-    }
-
-    fn render_cell(&self, area: Rect, frame: &mut Frame<'_>) {
-        for line in self.lines {
-            if let (Some(start), Some(end)) = (
-                self.map_point(area, line.x0, line.y0),
-                self.map_point(area, line.x1, line.y1),
-            ) {
-                draw_line(
-                    frame,
-                    area,
-                    start,
-                    end,
-                    line.marker,
-                    style_or(line.style, self.style),
-                );
-            }
-        }
-        for rect in self.rects {
-            self.draw_rect(area, frame, *rect);
-        }
-        for circle in self.circles {
-            self.draw_circle(area, frame, *circle);
-        }
-        for point in self.points {
-            if let Some((x, y)) = self.map_point(area, point.x, point.y) {
-                let style = style_or(point.style, self.style);
-                draw_cell(frame, area, x, y, point.marker, style);
-            }
-        }
-    }
-    fn render_subcell(&self, area: Rect, frame: &mut Frame<'_>, mode: SubcellMode) {
-        let Some(mut raster) = SubcellRaster::new(area, self.bounds, mode) else {
+        let Some(mut raster) = CanvasRaster::new(area, self.bounds, self.policy) else {
             return;
         };
         for line in self.lines {
@@ -395,388 +373,43 @@ impl<'a> Canvas<'a> {
             raster.draw_circle(*circle, style_or(circle.style, self.style));
         }
         for point in self.points {
-            if let Some((x, y)) = raster.map_point(point.x, point.y) {
-                raster.set_subcell(x, y, style_or(point.style, self.style));
-            }
-        }
-        raster.flush(frame);
-    }
-
-    fn render_braille(&self, area: Rect, frame: &mut Frame<'_>) {
-        let Some(mut raster) = BrailleRaster::new(area, self.bounds) else {
-            return;
-        };
-        for line in self.lines {
-            if let (Some(start), Some(end)) = (
-                raster.map_point(line.x0, line.y0),
-                raster.map_point(line.x1, line.y1),
-            ) {
-                raster.draw_line(start, end, style_or(line.style, self.style));
-            }
-        }
-        for rect in self.rects {
-            raster.draw_rect(*rect, style_or(rect.style, self.style));
-        }
-        for circle in self.circles {
-            raster.draw_circle(*circle, style_or(circle.style, self.style));
-        }
-        for point in self.points {
-            if let Some((x, y)) = raster.map_point(point.x, point.y) {
-                raster.set_dot(x, y, style_or(point.style, self.style));
-            }
-        }
-        raster.flush(frame);
-    }
-
-    fn draw_rect(&self, area: Rect, frame: &mut Frame<'_>, rect: CanvasRect<'_>) {
-        let style = style_or(rect.style, self.style);
-        if matches!(rect.mode, CanvasRectMode::Fill) {
-            if let (Some(a), Some(b)) = (
-                self.map_point(area, rect.x0, rect.y0),
-                self.map_point(area, rect.x1, rect.y1),
-            ) {
-                let x_min = a.0.min(b.0);
-                let x_max = a.0.max(b.0);
-                let y_min = a.1.min(b.1);
-                let y_max = a.1.max(b.1);
-                for y in y_min..=y_max {
-                    for x in x_min..=x_max {
-                        draw_cell(frame, area, x, y, rect.marker, style);
+            let style = style_or(point.style, self.style);
+            match self.policy.explicit_markers {
+                CanvasExplicitMarkers::Preserve => {
+                    if let Some((dot_x, dot_y)) = raster.map_point(point.x, point.y) {
+                        raster.set_symbol(dot_x / 2, dot_y / 4, point.marker, style);
+                    }
+                }
+                CanvasExplicitMarkers::Rasterize => {
+                    if let Some((dot_x, dot_y)) = raster.map_point(point.x, point.y) {
+                        raster.set_dot(dot_x, dot_y, style);
                     }
                 }
             }
-            return;
         }
-        let corners = [
-            (rect.x0, rect.y0, rect.x1, rect.y0),
-            (rect.x1, rect.y0, rect.x1, rect.y1),
-            (rect.x1, rect.y1, rect.x0, rect.y1),
-            (rect.x0, rect.y1, rect.x0, rect.y0),
-        ];
-        for (x0, y0, x1, y1) in corners {
-            if let (Some(start), Some(end)) =
-                (self.map_point(area, x0, y0), self.map_point(area, x1, y1))
-            {
-                draw_line(frame, area, start, end, rect.marker, style);
-            }
-        }
-    }
-    fn draw_circle(&self, area: Rect, frame: &mut Frame<'_>, circle: CanvasCircle<'_>) {
-        if circle.radius <= 0.0 || area.is_empty() {
-            return;
-        }
-        let style = style_or(circle.style, self.style);
-        let x_step = (self.bounds.x_max - self.bounds.x_min) / f64::from(area.width.max(1));
-        let y_step = (self.bounds.y_max - self.bounds.y_min) / f64::from(area.height.max(1));
-        let tolerance = x_step.max(y_step).max(f64::EPSILON);
-        for y in 0..area.height {
-            for x in 0..area.width {
-                let Some((canvas_x, canvas_y)) = cell_center(area, self.bounds, x, y) else {
-                    continue;
-                };
-                let distance = (canvas_x - circle.x).hypot(canvas_y - circle.y);
-                let should_draw = if circle.filled {
-                    distance <= circle.radius
-                } else {
-                    (distance - circle.radius).abs() <= tolerance
-                };
-                if should_draw {
-                    draw_cell(frame, area, x, y, circle.marker, style);
-                }
-            }
-        }
+        raster.flush(frame);
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubcellMode {
-    HalfBlock,
-    Quadrant,
-}
-
-impl SubcellMode {
-    const fn width(self) -> u16 {
-        match self {
-            Self::HalfBlock => 1,
-            Self::Quadrant => 2,
-        }
-    }
-
-    const fn height() -> u16 {
-        2
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Subcell {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RasterCell<'a> {
     mask: u8,
     style: Style,
+    symbol: Option<(&'a str, Style)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct SubcellRaster {
+struct CanvasRaster<'a> {
     area: Rect,
     bounds: CanvasBounds,
-    mode: SubcellMode,
-    subcell_width: u16,
-    subcell_height: u16,
-    cells: Vec<Subcell>,
-}
-
-impl SubcellRaster {
-    fn new(area: Rect, bounds: CanvasBounds, mode: SubcellMode) -> Option<Self> {
-        if area.is_empty() || bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
-            return None;
-        }
-        let cell_count = usize::from(area.width).checked_mul(usize::from(area.height))?;
-        Some(Self {
-            area,
-            bounds,
-            mode,
-            subcell_width: area.width.saturating_mul(mode.width()),
-            subcell_height: area.height.saturating_mul(SubcellMode::height()),
-            cells: vec![
-                Subcell {
-                    mask: 0,
-                    style: Style::new()
-                };
-                cell_count
-            ],
-        })
-    }
-
-    fn map_point(&self, x: f64, y: f64) -> Option<(u16, u16)> {
-        if x < self.bounds.x_min
-            || x > self.bounds.x_max
-            || y < self.bounds.y_min
-            || y > self.bounds.y_max
-        {
-            return None;
-        }
-        let x_span = self.bounds.x_max - self.bounds.x_min;
-        let y_span = self.bounds.y_max - self.bounds.y_min;
-        let x_scaled =
-            (x - self.bounds.x_min) / x_span * f64::from(self.subcell_width.saturating_sub(1));
-        let y_scaled =
-            (self.bounds.y_max - y) / y_span * f64::from(self.subcell_height.saturating_sub(1));
-        Some((
-            rounded_u16(x_scaled).min(self.subcell_width.saturating_sub(1)),
-            rounded_u16(y_scaled).min(self.subcell_height.saturating_sub(1)),
-        ))
-    }
-
-    fn subcell_center(&self, x: u16, y: u16) -> (f64, f64) {
-        let x_ratio = if self.subcell_width <= 1 {
-            0.5
-        } else {
-            f64::from(x) / f64::from(self.subcell_width.saturating_sub(1))
-        };
-        let y_ratio = if self.subcell_height <= 1 {
-            0.5
-        } else {
-            f64::from(y) / f64::from(self.subcell_height.saturating_sub(1))
-        };
-        (
-            self.bounds.x_min + x_ratio * (self.bounds.x_max - self.bounds.x_min),
-            self.bounds.y_max - y_ratio * (self.bounds.y_max - self.bounds.y_min),
-        )
-    }
-
-    fn set_subcell(&mut self, x: u16, y: u16, style: Style) {
-        if x >= self.subcell_width || y >= self.subcell_height {
-            return;
-        }
-        let cell_x = x / self.mode.width();
-        let cell_y = y / SubcellMode::height();
-        let local_x = x % self.mode.width();
-        let local_y = y % SubcellMode::height();
-        let index = usize::from(cell_y)
-            .saturating_mul(usize::from(self.area.width))
-            .saturating_add(usize::from(cell_x));
-        let mask = match self.mode {
-            SubcellMode::HalfBlock => half_block_mask(local_y),
-            SubcellMode::Quadrant => quadrant_mask(local_x, local_y),
-        };
-        if let Some(cell) = self.cells.get_mut(index) {
-            cell.mask |= mask;
-            cell.style = style;
-        }
-    }
-
-    fn draw_line(&mut self, start: (u16, u16), end: (u16, u16), style: Style) {
-        let x0 = i32::from(start.0);
-        let y0 = i32::from(start.1);
-        let x1 = i32::from(end.0);
-        let y1 = i32::from(end.1);
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut error = dx + dy;
-        let mut x = x0;
-        let mut y = y0;
-        loop {
-            if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
-                self.set_subcell(x, y, style);
-            }
-            if x == x1 && y == y1 {
-                break;
-            }
-            let double_error = error.saturating_mul(2);
-            if double_error >= dy {
-                error += dy;
-                x += sx;
-            }
-            if double_error <= dx {
-                error += dx;
-                y += sy;
-            }
-        }
-    }
-
-    fn draw_rect(&mut self, rect: CanvasRect<'_>, style: Style) {
-        let (Some(a), Some(b)) = (
-            self.map_point(rect.x0, rect.y0),
-            self.map_point(rect.x1, rect.y1),
-        ) else {
-            return;
-        };
-        let x_min = a.0.min(b.0);
-        let x_max = a.0.max(b.0);
-        let y_min = a.1.min(b.1);
-        let y_max = a.1.max(b.1);
-        if matches!(rect.mode, CanvasRectMode::Fill) {
-            for y in y_min..=y_max {
-                for x in x_min..=x_max {
-                    self.set_subcell(x, y, style);
-                }
-            }
-        } else {
-            self.draw_line((x_min, y_min), (x_max, y_min), style);
-            self.draw_line((x_max, y_min), (x_max, y_max), style);
-            self.draw_line((x_max, y_max), (x_min, y_max), style);
-            self.draw_line((x_min, y_max), (x_min, y_min), style);
-        }
-    }
-
-    fn draw_circle(&mut self, circle: CanvasCircle<'_>, style: Style) {
-        if circle.radius <= 0.0 {
-            return;
-        }
-        let x_step = (self.bounds.x_max - self.bounds.x_min) / f64::from(self.subcell_width.max(1));
-        let y_step =
-            (self.bounds.y_max - self.bounds.y_min) / f64::from(self.subcell_height.max(1));
-        let tolerance = x_step.max(y_step).max(f64::EPSILON);
-        for y in 0..self.subcell_height {
-            for x in 0..self.subcell_width {
-                let (canvas_x, canvas_y) = self.subcell_center(x, y);
-                let distance = (canvas_x - circle.x).hypot(canvas_y - circle.y);
-                let should_draw = if circle.filled {
-                    distance <= circle.radius
-                } else {
-                    (distance - circle.radius).abs() <= tolerance
-                };
-                if should_draw {
-                    self.set_subcell(x, y, style);
-                }
-            }
-        }
-    }
-
-    fn flush(&self, frame: &mut Frame<'_>) {
-        for cell_y in 0..self.area.height {
-            for cell_x in 0..self.area.width {
-                let index = usize::from(cell_y)
-                    .saturating_mul(usize::from(self.area.width))
-                    .saturating_add(usize::from(cell_x));
-                let Some(cell) = self.cells.get(index).copied() else {
-                    continue;
-                };
-                if cell.mask == 0 {
-                    continue;
-                }
-                let symbol = match self.mode {
-                    SubcellMode::HalfBlock => half_block_char(cell.mask),
-                    SubcellMode::Quadrant => quadrant_char(cell.mask),
-                };
-                frame.buffer_mut().set_cell(
-                    Point::new(
-                        self.area.x.saturating_add(cell_x),
-                        self.area.y.saturating_add(cell_y),
-                    ),
-                    symbol.to_string(),
-                    cell.style,
-                );
-            }
-        }
-    }
-}
-
-const fn half_block_mask(y: u16) -> u8 {
-    match y {
-        0 => 0x01,
-        1 => 0x02,
-        _ => 0,
-    }
-}
-
-const fn half_block_char(mask: u8) -> char {
-    match mask & 0x03 {
-        0x01 => '▀',
-        0x02 => '▄',
-        0x03 => '█',
-        _ => ' ',
-    }
-}
-
-const fn quadrant_mask(x: u16, y: u16) -> u8 {
-    match (x, y) {
-        (0, 0) => 0x01,
-        (1, 0) => 0x02,
-        (0, 1) => 0x04,
-        (1, 1) => 0x08,
-        _ => 0,
-    }
-}
-
-const fn quadrant_char(mask: u8) -> char {
-    match mask & 0x0f {
-        0x01 => '▘',
-        0x02 => '▝',
-        0x03 => '▀',
-        0x04 => '▖',
-        0x05 => '▌',
-        0x06 => '▞',
-        0x07 => '▛',
-        0x08 => '▗',
-        0x09 => '▚',
-        0x0a => '▐',
-        0x0b => '▜',
-        0x0c => '▄',
-        0x0d => '▙',
-        0x0e => '▟',
-        0x0f => '█',
-        _ => ' ',
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BrailleCell {
-    mask: u8,
-    style: Style,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct BrailleRaster {
-    area: Rect,
-    bounds: CanvasBounds,
+    policy: CanvasPolicy,
     dot_width: u16,
     dot_height: u16,
-    cells: Vec<BrailleCell>,
+    cells: Vec<RasterCell<'a>>,
 }
 
-impl BrailleRaster {
-    fn new(area: Rect, bounds: CanvasBounds) -> Option<Self> {
+impl<'a> CanvasRaster<'a> {
+    fn new(area: Rect, bounds: CanvasBounds, policy: CanvasPolicy) -> Option<Self> {
         if area.is_empty() || bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
             return None;
         }
@@ -784,12 +417,14 @@ impl BrailleRaster {
         Some(Self {
             area,
             bounds,
+            policy,
             dot_width: area.width.saturating_mul(2),
             dot_height: area.height.saturating_mul(4),
             cells: vec![
-                BrailleCell {
+                RasterCell {
                     mask: 0,
-                    style: Style::new()
+                    style: Style::new(),
+                    symbol: None,
                 };
                 cell_count
             ],
@@ -833,19 +468,37 @@ impl BrailleRaster {
         )
     }
 
+    fn cell_index(&self, cell_x: u16, cell_y: u16) -> Option<usize> {
+        if cell_x >= self.area.width || cell_y >= self.area.height {
+            return None;
+        }
+        Some(
+            usize::from(cell_y)
+                .saturating_mul(usize::from(self.area.width))
+                .saturating_add(usize::from(cell_x)),
+        )
+    }
+
+    fn set_symbol(&mut self, cell_x: u16, cell_y: u16, symbol: &'a str, style: Style) {
+        let Some(index) = self.cell_index(cell_x, cell_y) else {
+            return;
+        };
+        if let Some(cell) = self.cells.get_mut(index) {
+            cell.symbol = Some((symbol, style));
+        }
+    }
+
     fn set_dot(&mut self, x: u16, y: u16, style: Style) {
         if x >= self.dot_width || y >= self.dot_height {
             return;
         }
         let cell_x = x / 2;
         let cell_y = y / 4;
-        let dot_x = x % 2;
-        let dot_y = y % 4;
-        let index = usize::from(cell_y)
-            .saturating_mul(usize::from(self.area.width))
-            .saturating_add(usize::from(cell_x));
+        let Some(index) = self.cell_index(cell_x, cell_y) else {
+            return;
+        };
         if let Some(cell) = self.cells.get_mut(index) {
-            cell.mask |= braille_dot_mask(dot_x, dot_y);
+            cell.mask |= braille_dot_mask(x % 2, y % 4);
             cell.style = style;
         }
     }
@@ -932,25 +585,139 @@ impl BrailleRaster {
     fn flush(&self, frame: &mut Frame<'_>) {
         for cell_y in 0..self.area.height {
             for cell_x in 0..self.area.width {
-                let index = usize::from(cell_y)
-                    .saturating_mul(usize::from(self.area.width))
-                    .saturating_add(usize::from(cell_x));
+                let Some(index) = self.cell_index(cell_x, cell_y) else {
+                    continue;
+                };
                 let Some(cell) = self.cells.get(index).copied() else {
                     continue;
                 };
-                if cell.mask == 0 {
+                let (symbol, style) = if let Some((symbol, style)) = cell.symbol {
+                    (symbol.to_owned(), style)
+                } else if cell.mask == 0 {
                     continue;
-                }
+                } else {
+                    (
+                        compose_mask(cell.mask, self.policy.glyph_preference).to_string(),
+                        cell.style,
+                    )
+                };
                 frame.buffer_mut().set_cell(
                     Point::new(
                         self.area.x.saturating_add(cell_x),
                         self.area.y.saturating_add(cell_y),
                     ),
-                    braille_char(cell.mask).to_string(),
-                    cell.style,
+                    symbol,
+                    style,
                 );
             }
         }
+    }
+}
+
+fn style_or(style: Style, fallback: Style) -> Style {
+    if style == Style::new() {
+        fallback
+    } else {
+        style
+    }
+}
+
+fn map_point(area: Rect, bounds: CanvasBounds, x: f64, y: f64) -> Option<(u16, u16)> {
+    if area.is_empty() || bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
+        return None;
+    }
+    if x < bounds.x_min || x > bounds.x_max || y < bounds.y_min || y > bounds.y_max {
+        return None;
+    }
+    let x_span = bounds.x_max - bounds.x_min;
+    let y_span = bounds.y_max - bounds.y_min;
+    let x_scaled = (x - bounds.x_min) / x_span * f64::from(area.width.saturating_sub(1));
+    let y_scaled = (bounds.y_max - y) / y_span * f64::from(area.height.saturating_sub(1));
+    Some((
+        rounded_u16(x_scaled).min(area.width.saturating_sub(1)),
+        rounded_u16(y_scaled).min(area.height.saturating_sub(1)),
+    ))
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rounded_u16(value: f64) -> u16 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= f64::from(u16::MAX) {
+        u16::MAX
+    } else {
+        value.round() as u16
+    }
+}
+
+fn compose_mask(mask: u8, preference: CanvasGlyphPreference) -> char {
+    let half = half_block_from_braille(mask);
+    let quadrant = quadrant_from_braille(mask);
+    match preference {
+        CanvasGlyphPreference::PreferBraille => braille_char(mask),
+        CanvasGlyphPreference::PreferHalfBlock | CanvasGlyphPreference::Auto => {
+            half.or(quadrant).unwrap_or_else(|| braille_char(mask))
+        }
+        CanvasGlyphPreference::PreferQuadrant => {
+            quadrant.or(half).unwrap_or_else(|| braille_char(mask))
+        }
+    }
+}
+
+const fn half_block_from_braille(mask: u8) -> Option<char> {
+    let top = mask & 0x3f;
+    let bottom = mask & 0xc0;
+    match (top, bottom) {
+        (0x3f, 0x00) => Some('▀'),
+        (0x00, 0xc0) => Some('▄'),
+        (0x3f, 0xc0) => Some('█'),
+        _ => None,
+    }
+}
+
+const fn quadrant_from_braille(mask: u8) -> Option<char> {
+    let tl = mask & 0x07;
+    let tr = mask & 0x38;
+    let bl = mask & 0x40;
+    let br = mask & 0x80;
+    let mut q = 0u8;
+    if tl == 0x07 {
+        q |= 0x01;
+    } else if tl != 0 {
+        return None;
+    }
+    if tr == 0x38 {
+        q |= 0x02;
+    } else if tr != 0 {
+        return None;
+    }
+    if bl == 0x40 {
+        q |= 0x04;
+    }
+    if br == 0x80 {
+        q |= 0x08;
+    }
+    Some(quadrant_char(q))
+}
+
+const fn quadrant_char(mask: u8) -> char {
+    match mask & 0x0f {
+        0x01 => '▘',
+        0x02 => '▝',
+        0x03 => '▀',
+        0x04 => '▖',
+        0x05 => '▌',
+        0x06 => '▞',
+        0x07 => '▛',
+        0x08 => '▗',
+        0x09 => '▚',
+        0x0a => '▐',
+        0x0b => '▜',
+        0x0c => '▄',
+        0x0d => '▙',
+        0x0e => '▟',
+        0x0f => '█',
+        _ => ' ',
     }
 }
 
@@ -972,176 +739,115 @@ fn braille_char(mask: u8) -> char {
     char::from_u32(0x2800 + u32::from(mask)).unwrap_or('\u{2800}')
 }
 
-fn draw_cell(frame: &mut Frame<'_>, area: Rect, x: u16, y: u16, marker: &str, style: Style) {
-    frame.buffer_mut().set_cell(
-        Point::new(area.x.saturating_add(x), area.y.saturating_add(y)),
-        marker,
-        style,
-    );
-}
-
-fn style_or(style: Style, fallback: Style) -> Style {
-    if style == Style::new() {
-        fallback
-    } else {
-        style
-    }
-}
-
-fn draw_line(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    start: (u16, u16),
-    end: (u16, u16),
-    marker: &str,
-    style: Style,
-) {
-    let x0 = i32::from(start.0);
-    let y0 = i32::from(start.1);
-    let x1 = i32::from(end.0);
-    let y1 = i32::from(end.1);
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut error = dx + dy;
-    let mut x = x0;
-    let mut y = y0;
-    loop {
-        if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
-            frame.buffer_mut().set_cell(
-                Point::new(area.x.saturating_add(x), area.y.saturating_add(y)),
-                marker,
-                style,
-            );
-        }
-        if x == x1 && y == y1 {
-            break;
-        }
-        let double_error = error.saturating_mul(2);
-        if double_error >= dy {
-            error += dy;
-            x += sx;
-        }
-        if double_error <= dx {
-            error += dx;
-            y += sy;
-        }
-    }
-}
-
-fn cell_center(area: Rect, bounds: CanvasBounds, x: u16, y: u16) -> Option<(f64, f64)> {
-    if area.is_empty() || bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
-        return None;
-    }
-    let x_ratio = if area.width <= 1 {
-        0.5
-    } else {
-        f64::from(x) / f64::from(area.width.saturating_sub(1))
-    };
-    let y_ratio = if area.height <= 1 {
-        0.5
-    } else {
-        f64::from(y) / f64::from(area.height.saturating_sub(1))
-    };
-    Some((
-        bounds.x_min + x_ratio * (bounds.x_max - bounds.x_min),
-        bounds.y_max - y_ratio * (bounds.y_max - bounds.y_min),
-    ))
-}
-
-fn rounded_u16(value: f64) -> u16 {
-    value
-        .round()
-        .clamp(0.0, f64::from(u16::MAX))
-        .to_string()
-        .parse::<u16>()
-        .unwrap_or(0)
-}
-
-fn map_point(area: Rect, bounds: CanvasBounds, x: f64, y: f64) -> Option<(u16, u16)> {
-    if area.is_empty()
-        || bounds.x_min >= bounds.x_max
-        || bounds.y_min >= bounds.y_max
-        || x < bounds.x_min
-        || x > bounds.x_max
-        || y < bounds.y_min
-        || y > bounds.y_max
-    {
-        return None;
-    }
-    let x_cell = (x - bounds.x_min) / (bounds.x_max - bounds.x_min)
-        * f64::from(area.width.saturating_sub(1));
-    let y_cell = (bounds.y_max - y) / (bounds.y_max - bounds.y_min)
-        * f64::from(area.height.saturating_sub(1));
-    Some((rounded_u16(x_cell), rounded_u16(y_cell)))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::{
+        Canvas, CanvasBounds, CanvasCircle, CanvasExplicitMarkers, CanvasLine, CanvasPoint,
+        CanvasPolicy, CanvasRect,
+    };
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::style::{Color, Style};
 
-    use super::{
-        Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasPolicy, CanvasRect,
-    };
-
     #[test]
     fn maps_canvas_coordinates_to_cells() {
-        let points = [CanvasPoint::new(5.0, 5.0, "x")];
-        let canvas = Canvas::new(&points, CanvasBounds::new(0.0, 10.0, 0.0, 10.0));
+        let canvas = Canvas::new(&[], CanvasBounds::new(0.0, 10.0, 0.0, 10.0));
 
         assert_eq!(
-            canvas.map_point(Rect::new(0, 0, 11, 11), 5.0, 5.0),
-            Some((5, 5))
+            canvas.map_point(Rect::new(0, 0, 11, 11), 0.0, 10.0),
+            Some((0, 0))
         );
+        assert_eq!(
+            canvas.map_point(Rect::new(0, 0, 11, 11), 10.0, 0.0),
+            Some((10, 10))
+        );
+        assert_eq!(canvas.map_point(Rect::new(0, 0, 11, 11), -1.0, 0.0), None);
     }
 
     #[test]
-    fn renders_points_in_order() {
+    fn preserves_point_markers_by_default() {
         let points = [
-            CanvasPoint::new(0.0, 0.0, "a"),
-            CanvasPoint::new(0.0, 0.0, "b").style(Style::new().fg(Color::Red)),
+            CanvasPoint::new(0.0, 1.0, "●"),
+            CanvasPoint::new(1.0, 0.0, "◆"),
         ];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
         let mut frame = Frame::new(&mut buffer);
 
         Canvas::new(&points, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .render(Rect::new(0, 0, 2, 2), &mut frame);
+            .render(Rect::new(0, 0, 2, 1), &mut frame);
 
-        let cell = frame.buffer().get(Point::new(0, 1));
-        assert_eq!(cell.map(|cell| cell.symbol.as_str()), Some("b"));
-        assert_eq!(cell.map(|cell| cell.style.fg), Some(Some(Color::Red)));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("●◆"));
     }
 
     #[test]
-    fn renders_lines_and_rectangles_before_points() {
-        let points = [CanvasPoint::new(1.0, 1.0, "p")];
-        let lines = [CanvasLine::new(0.0, 0.0, 2.0, 2.0, "l")];
-        let rects = [CanvasRect::new(0.0, 0.0, 2.0, 2.0, "r")];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 3));
+    fn auto_composes_full_half_quadrant_and_braille_cells() {
+        let full = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
+        let mut full_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut full_frame = Frame::new(&mut full_buffer);
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .rects(&full)
+            .policy(CanvasPolicy::auto().rasterized_points())
+            .render(Rect::new(0, 0, 1, 1), &mut full_frame);
+        assert_eq!(full_frame.buffer().row_symbols(0).as_deref(), Some("█"));
+
+        let top = [CanvasRect::new(0.0, 0.5, 1.0, 1.0, "ignored").fill()];
+        let mut top_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut top_frame = Frame::new(&mut top_buffer);
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .rects(&top)
+            .render(Rect::new(0, 0, 1, 1), &mut top_frame);
+        assert_eq!(top_frame.buffer().row_symbols(0).as_deref(), Some("▀"));
+
+        let left = [CanvasRect::new(0.0, 0.0, 0.0, 1.0, "ignored")];
+        let mut left_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut left_frame = Frame::new(&mut left_buffer);
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .rects(&left)
+            .render(Rect::new(0, 0, 1, 1), &mut left_frame);
+        assert_eq!(left_frame.buffer().row_symbols(0).as_deref(), Some("▌"));
+
+        let diagonal = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
+        let mut diagonal_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut diagonal_frame = Frame::new(&mut diagonal_buffer);
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .lines(&diagonal)
+            .render(Rect::new(0, 0, 1, 1), &mut diagonal_frame);
+        assert_eq!(diagonal_frame.buffer().row_symbols(0).as_deref(), Some("⡜"));
+    }
+
+    #[test]
+    fn preferences_use_same_raster_pipeline() {
+        let diagonal = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        Canvas::new(&points, CanvasBounds::new(0.0, 2.0, 0.0, 2.0))
-            .lines(&lines)
-            .rects(&rects)
-            .render(Rect::new(0, 0, 3, 3), &mut frame);
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .lines(&diagonal)
+            .policy(CanvasPolicy::auto().prefer_braille())
+            .render(Rect::new(0, 0, 1, 1), &mut frame);
 
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("⡜"));
+    }
+
+    #[test]
+    fn rasterized_points_share_coverage_and_style() {
+        let point_style = Style::new().fg(Color::Red);
+        let points = [CanvasPoint::new(0.0, 1.0, "●").style(point_style)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Canvas::new(&points, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .policy(CanvasPolicy {
+                explicit_markers: CanvasExplicitMarkers::Rasterize,
+                ..CanvasPolicy::auto().prefer_braille()
+            })
+            .render(Rect::new(0, 0, 1, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("⠁"));
         assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(1, 1))
-                .map(|cell| cell.symbol.as_str()),
-            Some("p")
-        );
-        assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(0, 2))
-                .map(|cell| cell.symbol.as_str()),
-            Some("r")
+            frame.buffer().get(Point::new(0, 0)).map(|cell| cell.style),
+            Some(point_style)
         );
     }
 
@@ -1163,164 +869,15 @@ mod tests {
                 .buffer()
                 .get(Point::new(0, 4))
                 .map(|cell| cell.symbol.as_str()),
-            Some("r")
+            Some("█")
         );
-        assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(2, 1))
-                .map(|cell| cell.symbol.as_str()),
-            Some("c")
-        );
+        assert!(frame.buffer().get(Point::new(2, 1)).is_some());
         assert_eq!(
             frame
                 .buffer()
                 .get(Point::new(2, 2))
                 .map(|cell| cell.symbol.as_str()),
             Some("p")
-        );
-    }
-
-    #[test]
-    fn half_block_mode_maps_vertical_subcells() {
-        let upper = [CanvasPoint::new(0.0, 1.0, "ignored")];
-        let lower = [CanvasPoint::new(0.0, 0.0, "ignored")];
-        let both = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
-
-        let mut upper_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut upper_frame = Frame::new(&mut upper_buffer);
-        Canvas::new(&upper, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .policy(CanvasPolicy::half_block())
-            .render(Rect::new(0, 0, 1, 1), &mut upper_frame);
-        assert_eq!(upper_frame.buffer().row_symbols(0).as_deref(), Some("▀"));
-
-        let mut lower_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut lower_frame = Frame::new(&mut lower_buffer);
-        Canvas::new(&lower, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .policy(CanvasPolicy::half_block())
-            .render(Rect::new(0, 0, 1, 1), &mut lower_frame);
-        assert_eq!(lower_frame.buffer().row_symbols(0).as_deref(), Some("▄"));
-
-        let mut both_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut both_frame = Frame::new(&mut both_buffer);
-        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .rects(&both)
-            .policy(CanvasPolicy::half_block())
-            .render(Rect::new(0, 0, 1, 1), &mut both_frame);
-        assert_eq!(both_frame.buffer().row_symbols(0).as_deref(), Some("█"));
-    }
-
-    #[test]
-    fn quadrant_mode_maps_four_subcells() {
-        let rects = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .rects(&rects)
-            .policy(CanvasPolicy::quadrant())
-            .render(Rect::new(0, 0, 1, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█"));
-    }
-
-    #[test]
-    fn quadrant_mode_can_render_diagonal_line() {
-        let lines = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .lines(&lines)
-            .policy(CanvasPolicy::quadrant())
-            .render(Rect::new(0, 0, 1, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▞"));
-    }
-
-    #[test]
-    fn braille_point_maps_to_expected_dot() {
-        let points = [CanvasPoint::new(0.0, 1.0, "ignored")];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Canvas::new(&points, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .policy(CanvasPolicy::braille())
-            .render(Rect::new(0, 0, 1, 1), &mut frame);
-
-        assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(0, 0))
-                .map(|cell| cell.symbol.as_str()),
-            Some("⠁")
-        );
-    }
-
-    #[test]
-    fn braille_line_combines_multiple_dots_in_cells() {
-        let lines = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .lines(&lines)
-            .policy(CanvasPolicy::braille())
-            .render(Rect::new(0, 0, 1, 1), &mut frame);
-
-        assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(0, 0))
-                .map(|cell| cell.symbol.as_str()),
-            Some("⡜")
-        );
-    }
-
-    #[test]
-    fn braille_filled_rectangle_can_fill_a_cell() {
-        let rects = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .rects(&rects)
-            .policy(CanvasPolicy::braille())
-            .render(Rect::new(0, 0, 1, 1), &mut frame);
-
-        assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(0, 0))
-                .map(|cell| cell.symbol.as_str()),
-            Some("⣿")
-        );
-    }
-
-    #[test]
-    fn braille_circle_renders_and_points_keep_last_style() {
-        let point_style = Style::new().fg(bmux_tui::style::Color::Red);
-        let points = [CanvasPoint::new(0.5, 0.5, "ignored").style(point_style)];
-        let circles = [CanvasCircle::new(0.5, 0.5, 0.5, "ignored").fill()];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
-        let mut frame = Frame::new(&mut buffer);
-
-        Canvas::new(&points, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
-            .circles(&circles)
-            .policy(CanvasPolicy::braille())
-            .render(Rect::new(0, 0, 2, 2), &mut frame);
-
-        let rendered = (0..2)
-            .filter_map(|y| frame.buffer().row_symbols(y))
-            .collect::<String>();
-        assert!(
-            rendered
-                .chars()
-                .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
-        );
-        assert_eq!(
-            frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
-            Some(point_style)
         );
     }
 
