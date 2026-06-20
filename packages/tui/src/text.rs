@@ -107,6 +107,12 @@ impl Line {
         self.spans.iter().map(Span::width).sum()
     }
 
+    /// Return a copy truncated to terminal display width with an ellipsis when clipped.
+    #[must_use]
+    pub fn truncate(&self, width: usize) -> Self {
+        truncate_line_to_display_width(self, width)
+    }
+
     /// Return a styled viewport clipped to terminal display cells.
     ///
     /// Graphemes that would be split by the left or right viewport edge are
@@ -129,6 +135,59 @@ impl Line {
             .map(|span| span.content.as_str())
             .collect()
     }
+}
+
+/// Return a copy of a styled line truncated to terminal display width.
+///
+/// The ellipsis inherits the style of the first clipped grapheme, or the final
+/// visible span when clipping happens at the end of the line.
+#[must_use]
+pub fn truncate_line_to_display_width(line: &Line, width: usize) -> Line {
+    if line.width() <= width {
+        return line.clone();
+    }
+    if width == 0 {
+        return Line::new();
+    }
+    if width == 1 {
+        let style = line
+            .spans
+            .iter()
+            .find(|span| !span.content.is_empty())
+            .map_or_else(Style::new, |span| span.style);
+        return Line::from_spans([Span::styled("…", style)]);
+    }
+
+    let body_width = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut ellipsis_style = None;
+    'outer: for span in &line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if grapheme_width == 0 {
+                continue;
+            }
+            if used.saturating_add(grapheme_width) > body_width {
+                if !content.is_empty() {
+                    push_or_merge_span(&mut spans, content, span.style);
+                }
+                ellipsis_style = Some(span.style);
+                break 'outer;
+            }
+            content.push_str(grapheme);
+            used = used.saturating_add(grapheme_width);
+        }
+        if !content.is_empty() {
+            push_or_merge_span(&mut spans, content, span.style);
+        }
+    }
+    let style = ellipsis_style
+        .or_else(|| spans.last().map(|span| span.style))
+        .unwrap_or_else(Style::new);
+    push_or_merge_span(&mut spans, "…".to_owned(), style);
+    Line::from_spans(spans)
 }
 
 /// Return a styled viewport clipped to terminal display cells.
@@ -311,6 +370,37 @@ mod tests {
         assert_eq!(span.width(), 3);
         assert_eq!(line.width(), 4);
         assert_eq!(text.width(), 4);
+    }
+
+    #[test]
+    fn line_truncate_preserves_styles_and_adds_ellipsis() {
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().fg(Color::Blue);
+        let line = Line::from_spans([Span::styled("ab", red), Span::styled("界cd", blue)]);
+        let truncated = line.truncate(4);
+
+        assert_eq!(truncated.plain_text(), "ab…");
+        assert_eq!(truncated.spans[0], Span::styled("ab", red));
+        assert_eq!(truncated.spans[1], Span::styled("…", blue));
+    }
+
+    #[test]
+    fn line_truncate_handles_tiny_widths() {
+        let style = Style::new().fg(Color::Red);
+        let line = Line::from_spans([Span::styled("abc", style)]);
+
+        assert_eq!(line.truncate(0), Line::new());
+        assert_eq!(
+            line.truncate(1),
+            Line::from_spans([Span::styled("…", style)])
+        );
+    }
+
+    #[test]
+    fn line_truncate_does_not_split_graphemes() {
+        let line = Line::from("a👨‍👩‍👧‍👦b");
+
+        assert_eq!(line.truncate(3).plain_text(), "a…");
     }
 
     #[test]

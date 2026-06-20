@@ -10,6 +10,9 @@ use bmux_tui::text::line_viewport;
 use bmux_tui::text_width::display_width;
 use bmux_tui::widget::Widget;
 
+use crate::scroll_area::ScrollAreaScrollbarMode;
+use crate::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState};
+
 /// Runtime state for [`TextView`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TextViewState {
@@ -147,6 +150,10 @@ pub struct TextViewPolicy {
     pub mouse_wheel: bool,
     /// Fill background before rendering.
     pub background: bool,
+    /// Integrated vertical scrollbar layout mode.
+    pub vertical_scrollbar: ScrollAreaScrollbarMode,
+    /// Integrated horizontal scrollbar layout mode.
+    pub horizontal_scrollbar: ScrollAreaScrollbarMode,
 }
 
 impl TextViewPolicy {
@@ -160,6 +167,8 @@ impl TextViewPolicy {
             keyboard: false,
             mouse_wheel: false,
             background: false,
+            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
         }
     }
 
@@ -173,7 +182,25 @@ impl TextViewPolicy {
             keyboard: true,
             mouse_wheel: true,
             background: false,
+            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
         }
+    }
+    /// Return this policy with integrated vertical scrollbar mode changed.
+    #[must_use]
+    pub const fn vertical_scrollbar(mut self, vertical_scrollbar: ScrollAreaScrollbarMode) -> Self {
+        self.vertical_scrollbar = vertical_scrollbar;
+        self
+    }
+
+    /// Return this policy with integrated horizontal scrollbar mode changed.
+    #[must_use]
+    pub const fn horizontal_scrollbar(
+        mut self,
+        horizontal_scrollbar: ScrollAreaScrollbarMode,
+    ) -> Self {
+        self.horizontal_scrollbar = horizontal_scrollbar;
+        self
     }
 }
 
@@ -252,6 +279,8 @@ impl<'a> TextView<'a> {
                 keyboard: true,
                 mouse_wheel: true,
                 background: false,
+                vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+                horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
             },
             styles: TextViewStyles {
                 text: Style::new(),
@@ -307,8 +336,14 @@ impl<'a> TextView<'a> {
     /// Compute rendered lines and clamped scroll.
     #[must_use]
     pub fn layout(&self, area: Rect, state: &TextViewState) -> TextViewLayout {
+        let render_area = self.content_area(area);
         let lines = apply_ranges(self.lines, self.highlights, self.selection, self.cursor);
-        let lines = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim);
+        let lines = render_lines(
+            &lines,
+            render_area.width,
+            self.policy.wrap,
+            self.policy.trim,
+        );
         let vertical_scroll = self.clamped_vertical_scroll(area, state);
         TextViewLayout {
             lines,
@@ -316,19 +351,98 @@ impl<'a> TextView<'a> {
         }
     }
 
+    /// Return content area after integrated scrollbar reservation.
+    #[must_use]
+    pub const fn content_area(&self, area: Rect) -> Rect {
+        let reserve_vertical = matches!(
+            self.policy.vertical_scrollbar,
+            ScrollAreaScrollbarMode::Gutter
+        ) && area.width > 0;
+        let reserve_horizontal = matches!(
+            self.policy.horizontal_scrollbar,
+            ScrollAreaScrollbarMode::Gutter
+        ) && area.height > 0;
+        Rect::new(
+            area.x,
+            area.y,
+            if reserve_vertical {
+                area.width.saturating_sub(1)
+            } else {
+                area.width
+            },
+            if reserve_horizontal {
+                area.height.saturating_sub(1)
+            } else {
+                area.height
+            },
+        )
+    }
+
+    /// Return integrated vertical scrollbar area when enabled.
+    #[must_use]
+    pub const fn vertical_scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        if matches!(
+            self.policy.vertical_scrollbar,
+            ScrollAreaScrollbarMode::Hidden
+        ) || area.width == 0
+        {
+            None
+        } else {
+            Some(Rect::new(
+                area.right().saturating_sub(1),
+                area.y,
+                1,
+                self.content_area(area).height,
+            ))
+        }
+    }
+
+    /// Return integrated horizontal scrollbar area when enabled.
+    #[must_use]
+    pub const fn horizontal_scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        if matches!(
+            self.policy.horizontal_scrollbar,
+            ScrollAreaScrollbarMode::Hidden
+        ) || area.height == 0
+        {
+            None
+        } else {
+            Some(Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                self.content_area(area).width,
+                1,
+            ))
+        }
+    }
+
+    /// Return maximum source line display width.
+    #[must_use]
+    pub fn content_width(&self) -> usize {
+        self.lines.iter().map(Line::width).max().unwrap_or(0)
+    }
+
     /// Return the maximum vertical scroll for this area.
     #[must_use]
     pub fn max_vertical_scroll(&self, area: Rect) -> usize {
+        let content_area = self.content_area(area);
         let lines = apply_ranges(self.lines, self.highlights, self.selection, self.cursor);
-        let line_count = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim).len();
-        clamp_scroll(line_count, line_count, area.height)
+        let line_count = render_lines(
+            &lines,
+            content_area.width,
+            self.policy.wrap,
+            self.policy.trim,
+        )
+        .len();
+        clamp_scroll(line_count, line_count, content_area.height)
     }
 
     /// Return the maximum horizontal scroll for this area.
     #[must_use]
     pub fn max_horizontal_scroll(&self, area: Rect) -> usize {
+        let content_area = self.content_area(area);
         if self.policy.wrap == TextWrap::None {
-            max_horizontal_scroll(self.lines, area.width)
+            max_horizontal_scroll(self.lines, content_area.width)
         } else {
             0
         }
@@ -337,9 +451,16 @@ impl<'a> TextView<'a> {
     /// Return the clamped vertical scroll for this area.
     #[must_use]
     pub fn clamped_vertical_scroll(&self, area: Rect, state: &TextViewState) -> usize {
+        let content_area = self.content_area(area);
         let lines = apply_ranges(self.lines, self.highlights, self.selection, self.cursor);
-        let line_count = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim).len();
-        clamp_scroll(state.vertical_scroll, line_count, area.height)
+        let line_count = render_lines(
+            &lines,
+            content_area.width,
+            self.policy.wrap,
+            self.policy.trim,
+        )
+        .len();
+        clamp_scroll(state.vertical_scroll, line_count, content_area.height)
     }
 
     /// Return the clamped horizontal scroll for this area.
@@ -352,9 +473,20 @@ impl<'a> TextView<'a> {
 
     /// Clamp caller-owned state to valid scroll bounds for this area.
     pub fn clamp_state(&self, area: Rect, state: &mut TextViewState) {
+        let content_area = self.content_area(area);
         let lines = apply_ranges(self.lines, self.highlights, self.selection, self.cursor);
-        let line_count = render_lines(&lines, area.width, self.policy.wrap, self.policy.trim).len();
-        state.clamp_to(line_count, area.height, self.max_horizontal_scroll(area));
+        let line_count = render_lines(
+            &lines,
+            content_area.width,
+            self.policy.wrap,
+            self.policy.trim,
+        )
+        .len();
+        state.clamp_to(
+            line_count,
+            content_area.height,
+            self.max_horizontal_scroll(area),
+        );
     }
 
     /// Render text view.
@@ -369,13 +501,16 @@ impl<'a> TextView<'a> {
             frame.write_line_with_fallback_style(area, &Line::from(self.empty), self.styles.empty);
             return;
         }
+        let content_area = self.content_area(area);
         let layout = self.layout(area, state);
         let lines = if self.policy.wrap == TextWrap::None && state.horizontal_scroll > 0 {
             let horizontal_scroll = self.clamped_horizontal_scroll(area, state);
             layout
                 .lines
                 .into_iter()
-                .map(|line| line_viewport(&line, horizontal_scroll, usize::from(area.width)))
+                .map(|line| {
+                    line_viewport(&line, horizontal_scroll, usize::from(content_area.width))
+                })
                 .collect()
         } else {
             layout.lines
@@ -386,7 +521,41 @@ impl<'a> TextView<'a> {
             .alignment(self.policy.alignment)
             .wrap(TextWrap::None)
             .vertical_scroll(layout.vertical_scroll)
-            .render(area, frame);
+            .render(content_area, frame);
+        self.render_scrollbars(area, content_area, state, layout.vertical_scroll, frame);
+    }
+
+    fn render_scrollbars(
+        &self,
+        area: Rect,
+        content_area: Rect,
+        state: &TextViewState,
+        vertical_scroll: usize,
+        frame: &mut Frame<'_>,
+    ) {
+        if let Some(scrollbar_area) = self.vertical_scrollbar_area(area) {
+            let content_len = self.layout(area, state).lines.len();
+            let scrollbar_state = ScrollbarState::new(
+                u16::try_from(content_len).unwrap_or(u16::MAX),
+                content_area.height,
+            )
+            .offset(u16::try_from(vertical_scroll).unwrap_or(u16::MAX));
+            Scrollbar::new().policy(ScrollbarPolicy::vertical()).render(
+                scrollbar_area,
+                &scrollbar_state,
+                frame,
+            );
+        }
+        if let Some(scrollbar_area) = self.horizontal_scrollbar_area(area) {
+            let scrollbar_state = ScrollbarState::new(
+                u16::try_from(self.content_width()).unwrap_or(u16::MAX),
+                content_area.width,
+            )
+            .offset(u16::try_from(self.clamped_horizontal_scroll(area, state)).unwrap_or(u16::MAX));
+            Scrollbar::new()
+                .policy(ScrollbarPolicy::horizontal())
+                .render(scrollbar_area, &scrollbar_state, frame);
+        }
     }
 
     /// Handle one event.
@@ -722,6 +891,7 @@ mod tests {
         TextView, TextViewCursor, TextViewHighlight, TextViewOutcome, TextViewPolicy,
         TextViewSelection, TextViewState,
     };
+    use crate::scroll_area::ScrollAreaScrollbarMode;
 
     #[test]
     fn wraps_content_to_area_width() {
@@ -874,6 +1044,32 @@ mod tests {
         );
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cde"));
+    }
+
+    #[test]
+    fn renders_integrated_scrollbars() {
+        let lines = [
+            Line::from("abcdef"),
+            Line::from("ghijkl"),
+            Line::from("mnopqr"),
+        ];
+        let mut state = TextViewState::new();
+        state.set_vertical_scroll(1);
+        state.set_horizontal_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextView::new(&lines)
+            .policy(
+                TextViewPolicy::bare()
+                    .vertical_scrollbar(ScrollAreaScrollbarMode::Gutter)
+                    .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+            )
+            .render(Rect::new(0, 0, 4, 3), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("hij│"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("nop█"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("█── "));
     }
 
     #[test]
