@@ -6,7 +6,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 
@@ -339,8 +339,7 @@ impl<'a> TabBar<'a> {
         if display_width(&text) > usize::from(area.width)
             && matches!(self.policy.overflow, TabBarOverflow::Truncate)
         {
-            let text = truncate_to_display_width(&text, usize::from(area.width));
-            frame.write_line(area, &Line::from(text));
+            frame.write_line(area, &self.line(state).truncate(usize::from(area.width)));
         } else {
             frame.write_line(area, &self.line(state));
         }

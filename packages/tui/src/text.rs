@@ -122,6 +122,18 @@ impl Line {
         line_viewport(self, horizontal_offset, width)
     }
 
+    /// Return this line wrapped at grapheme boundaries.
+    #[must_use]
+    pub fn wrap_character(&self, width: usize) -> Vec<Self> {
+        wrap_line_character(self, width)
+    }
+
+    /// Return this line wrapped at word boundaries when possible.
+    #[must_use]
+    pub fn wrap_word(&self, width: usize) -> Vec<Self> {
+        wrap_line_word(self, width)
+    }
+
     /// Append a span to the line.
     pub fn push_span(&mut self, span: Span) {
         self.spans.push(span);
@@ -246,6 +258,115 @@ fn push_or_merge_span(spans: &mut Vec<Span>, content: String, style: Style) {
     spans.push(Span::styled(content, style));
 }
 
+/// Return a styled line wrapped at grapheme boundaries.
+#[must_use]
+pub fn wrap_line_character(line: &Line, width: usize) -> Vec<Line> {
+    let width = width.max(1);
+    let mut lines = vec![Line::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if col > 0 && col.saturating_add(grapheme_width) > width {
+                lines.push(Line::new());
+                row = row.saturating_add(1);
+                col = 0;
+            }
+            push_or_merge_span(&mut lines[row].spans, grapheme.to_owned(), span.style);
+            col = col.saturating_add(grapheme_width);
+        }
+    }
+
+    lines
+}
+
+/// Return a styled line wrapped at word boundaries when possible.
+#[must_use]
+pub fn wrap_line_word(line: &Line, width: usize) -> Vec<Line> {
+    let width = width.max(1);
+    let mut lines = vec![Line::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for span in &line.spans {
+        let mut segment = String::new();
+        let mut segment_is_whitespace = false;
+        for grapheme in span.content.graphemes(true) {
+            let is_whitespace = grapheme.chars().all(char::is_whitespace);
+            if segment.is_empty() {
+                segment_is_whitespace = is_whitespace;
+            }
+            if !segment.is_empty() && is_whitespace != segment_is_whitespace {
+                push_word_segment(
+                    &mut lines,
+                    &mut row,
+                    &mut col,
+                    &segment,
+                    span.style,
+                    width,
+                    segment_is_whitespace,
+                );
+                segment.clear();
+                segment_is_whitespace = is_whitespace;
+            }
+            segment.push_str(grapheme);
+        }
+        if !segment.is_empty() {
+            push_word_segment(
+                &mut lines,
+                &mut row,
+                &mut col,
+                &segment,
+                span.style,
+                width,
+                segment_is_whitespace,
+            );
+        }
+    }
+
+    lines
+}
+
+fn push_word_segment(
+    lines: &mut Vec<Line>,
+    row: &mut usize,
+    col: &mut usize,
+    segment: &str,
+    style: Style,
+    width: usize,
+    is_whitespace: bool,
+) {
+    let segment_width = display_width(segment);
+    if is_whitespace && *col == 0 {
+        return;
+    }
+    if *col > 0 && col.saturating_add(segment_width) > width {
+        lines.push(Line::new());
+        *row = row.saturating_add(1);
+        *col = 0;
+        if is_whitespace {
+            return;
+        }
+    }
+    if segment_width > width {
+        for grapheme in segment.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if *col > 0 && col.saturating_add(grapheme_width) > width {
+                lines.push(Line::new());
+                *row = row.saturating_add(1);
+                *col = 0;
+            }
+            push_or_merge_span(&mut lines[*row].spans, grapheme.to_owned(), style);
+            *col = col.saturating_add(grapheme_width);
+        }
+        return;
+    }
+    push_or_merge_span(&mut lines[*row].spans, segment.to_owned(), style);
+    *col = col.saturating_add(segment_width);
+}
+
 /// Multiple lines of styled text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Text {
@@ -337,7 +458,7 @@ impl From<String> for Text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Line, Span, Text, line_viewport};
+    use super::{Line, Span, Text, line_viewport, wrap_line_word};
     use crate::style::{Color, Style};
 
     #[test]
@@ -453,6 +574,17 @@ mod tests {
         assert_eq!(line_viewport(&line, 0, 2).plain_text(), "a");
         assert_eq!(line_viewport(&line, 1, 2).plain_text(), "界");
         assert_eq!(line_viewport(&line, 2, 2).plain_text(), "b");
+    }
+
+    #[test]
+    fn shared_wrapping_helpers_preserve_styles() {
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().fg(Color::Blue);
+        let line = Line::from_spans([Span::styled("one ", red), Span::styled("two", blue)]);
+        let wrapped = wrap_line_word(&line, 4);
+
+        assert_eq!(wrapped[0], Line::from_spans([Span::styled("one ", red)]));
+        assert_eq!(wrapped[1], Line::from_spans([Span::styled("two", blue)]));
     }
 
     #[test]

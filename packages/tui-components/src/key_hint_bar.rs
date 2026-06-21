@@ -4,7 +4,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text_width::display_width;
 
 /// One key/action hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +188,7 @@ impl<'a> KeyHintBar<'a> {
             frame.fill(area, " ", self.styles.background);
         }
         let line = if display_width(&text) > usize::from(area.width) {
-            Line::from(truncate_to_display_width(&text, usize::from(area.width)))
+            self.styled_line().truncate(usize::from(area.width))
         } else {
             self.styled_line()
         };

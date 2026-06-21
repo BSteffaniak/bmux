@@ -6,8 +6,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
 use bmux_tui::style::{Color, Style};
-use bmux_tui::text::line_viewport;
-use bmux_tui::text_width::display_width;
+use bmux_tui::text::{line_viewport, wrap_line_character, wrap_line_word};
 use bmux_tui::widget::Widget;
 
 use crate::scroll_area::ScrollAreaScrollbarMode;
@@ -798,7 +797,7 @@ fn apply_line_ranges(
 fn max_horizontal_scroll(lines: &[Line], width: u16) -> usize {
     lines
         .iter()
-        .map(|line| display_width(&line.plain_text()).saturating_sub(usize::from(width)))
+        .map(|line| line.width().saturating_sub(usize::from(width)))
         .max()
         .unwrap_or(0)
 }
@@ -814,11 +813,11 @@ fn render_lines(lines: &[Line], width: u16, wrap: TextWrap, trim: bool) -> Vec<L
         match wrap {
             TextWrap::None => rendered.push(line),
             TextWrap::Character => {
-                let wrapped = wrap_line(&line, usize::from(width.max(1)));
+                let wrapped = wrap_line_character(&line, usize::from(width.max(1)));
                 rendered.extend(trim_wrapped_lines(wrapped, trim));
             }
             TextWrap::Word => {
-                let wrapped = wrap_line_words(&line, usize::from(width.max(1)));
+                let wrapped = wrap_line_word(&line, usize::from(width.max(1)));
                 rendered.extend(trim_wrapped_lines(wrapped, trim));
             }
         }
@@ -832,117 +831,6 @@ fn trim_wrapped_lines(lines: Vec<Line>, trim: bool) -> Vec<Line> {
     } else {
         lines
     }
-}
-
-fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for span in &line.spans {
-        for ch in span.content.chars() {
-            let ch_width = display_width(&ch.to_string());
-            if col > 0 && col.saturating_add(ch_width) > width {
-                lines.push(Line::new());
-                row = row.saturating_add(1);
-                col = 0;
-            }
-            push_styled_grapheme(&mut lines[row], ch, span.style);
-            col = col.saturating_add(ch_width);
-        }
-    }
-    lines
-}
-
-fn wrap_line_words(line: &Line, width: usize) -> Vec<Line> {
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for span in &line.spans {
-        let mut segment = String::new();
-        let mut segment_is_whitespace = false;
-        for ch in span.content.chars() {
-            let is_whitespace = ch.is_whitespace();
-            if segment.is_empty() {
-                segment_is_whitespace = is_whitespace;
-            }
-            if !segment.is_empty() && is_whitespace != segment_is_whitespace {
-                push_word_segment(
-                    &mut lines,
-                    &mut row,
-                    &mut col,
-                    &segment,
-                    span.style,
-                    width,
-                    segment_is_whitespace,
-                );
-                segment.clear();
-                segment_is_whitespace = is_whitespace;
-            }
-            segment.push(ch);
-        }
-        if !segment.is_empty() {
-            push_word_segment(
-                &mut lines,
-                &mut row,
-                &mut col,
-                &segment,
-                span.style,
-                width,
-                segment_is_whitespace,
-            );
-        }
-    }
-    lines
-}
-
-fn push_word_segment(
-    lines: &mut Vec<Line>,
-    row: &mut usize,
-    col: &mut usize,
-    segment: &str,
-    style: Style,
-    width: usize,
-    is_whitespace: bool,
-) {
-    let segment_width = display_width(segment);
-    if is_whitespace && *col == 0 {
-        return;
-    }
-    if *col > 0 && col.saturating_add(segment_width) > width {
-        lines.push(Line::new());
-        *row = row.saturating_add(1);
-        *col = 0;
-        if is_whitespace {
-            return;
-        }
-    }
-    if segment_width > width {
-        for ch in segment.chars() {
-            let ch_width = display_width(&ch.to_string());
-            if *col > 0 && col.saturating_add(ch_width) > width {
-                lines.push(Line::new());
-                *row = row.saturating_add(1);
-                *col = 0;
-            }
-            push_styled_grapheme(&mut lines[*row], ch, style);
-            *col = col.saturating_add(ch_width);
-        }
-        return;
-    }
-    for ch in segment.chars() {
-        push_styled_grapheme(&mut lines[*row], ch, style);
-    }
-    *col = col.saturating_add(segment_width);
-}
-
-fn push_styled_grapheme(line: &mut Line, ch: char, style: Style) {
-    if let Some(last) = line.spans.last_mut()
-        && last.style == style
-    {
-        last.content.push(ch);
-        return;
-    }
-    line.push_span(Span::styled(ch.to_string(), style));
 }
 
 fn trim_line_end(line: &Line) -> Line {

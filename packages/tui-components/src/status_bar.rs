@@ -4,7 +4,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text_width::display_width;
 
 /// Status severity for message/status segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,13 +247,11 @@ impl<'a> StatusBar<'a> {
                 .saturating_add(area.width.saturating_sub(u16_saturating(width))),
         };
         let rect = Rect::new(x, area.y, u16_saturating(width), 1);
+        let line = self.line(segments);
         if self.policy.truncate && full_width > usize::from(rect.width) {
-            frame.write_line(
-                rect,
-                &Line::from(truncate_to_display_width(&text, usize::from(rect.width))),
-            );
+            frame.write_line(rect, &line.truncate(usize::from(rect.width)));
         } else {
-            frame.write_line_with_fallback_style(rect, &self.line(segments), self.styles.default);
+            frame.write_line_with_fallback_style(rect, &line, self.styles.default);
         }
     }
 

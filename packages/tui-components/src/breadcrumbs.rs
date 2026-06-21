@@ -6,7 +6,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text_width::display_width;
 
 use crate::common::ComponentMousePolicy;
 
@@ -219,10 +219,7 @@ impl<'a> Breadcrumbs<'a> {
         }
         let mut line = self.line(state);
         if self.policy.truncate {
-            let text = line.plain_text();
-            if display_width(&text) > usize::from(area.width) {
-                line = Line::from(truncate_to_display_width(&text, usize::from(area.width)));
-            }
+            line = line.truncate(usize::from(area.width));
         }
         frame.write_line(area, &line);
     }

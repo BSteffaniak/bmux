@@ -1,12 +1,9 @@
 //! Styled text block widget and wrapping helpers.
 
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
-
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::style::Style;
-use crate::text::{Line, Span, Text};
+use crate::text::{Line, Text, wrap_line_character, wrap_line_word};
 use crate::widget::Widget;
 
 /// Horizontal text alignment.
@@ -141,11 +138,11 @@ fn render_lines_for_text_block(text: &Text, width: u16, wrap: TextWrap, trim: bo
         match wrap {
             TextWrap::None => lines.push(line),
             TextWrap::Character => {
-                let wrapped = wrap_line(&line, usize::from(width.max(1)));
+                let wrapped = wrap_line_character(&line, usize::from(width.max(1)));
                 lines.extend(trim_wrapped_lines(wrapped, trim));
             }
             TextWrap::Word => {
-                let wrapped = wrap_line_words(&line, usize::from(width.max(1)));
+                let wrapped = wrap_line_word(&line, usize::from(width.max(1)));
                 lines.extend(trim_wrapped_lines(wrapped, trim));
             }
         }
@@ -159,119 +156,6 @@ fn trim_wrapped_lines(lines: Vec<Line>, trim: bool) -> Vec<Line> {
     } else {
         lines
     }
-}
-
-fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-
-    for span in &line.spans {
-        for grapheme in span.content.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if col > 0 && col.saturating_add(grapheme_width) > width {
-                lines.push(Line::new());
-                row = row.saturating_add(1);
-                col = 0;
-            }
-            push_styled_grapheme(&mut lines[row], grapheme, span.style);
-            col = col.saturating_add(grapheme_width);
-        }
-    }
-
-    lines
-}
-
-fn wrap_line_words(line: &Line, width: usize) -> Vec<Line> {
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-
-    for span in &line.spans {
-        let mut current_word = String::new();
-        let mut current_is_whitespace = false;
-        for grapheme in span.content.graphemes(true) {
-            let is_whitespace = grapheme.chars().all(char::is_whitespace);
-            if current_word.is_empty() {
-                current_is_whitespace = is_whitespace;
-            }
-            if !current_word.is_empty() && is_whitespace != current_is_whitespace {
-                push_word_segment(
-                    &mut lines,
-                    &mut row,
-                    &mut col,
-                    &current_word,
-                    span.style,
-                    width,
-                    current_is_whitespace,
-                );
-                current_word.clear();
-                current_is_whitespace = is_whitespace;
-            }
-            current_word.push_str(grapheme);
-        }
-        if !current_word.is_empty() {
-            push_word_segment(
-                &mut lines,
-                &mut row,
-                &mut col,
-                &current_word,
-                span.style,
-                width,
-                current_is_whitespace,
-            );
-        }
-    }
-
-    lines
-}
-
-fn push_word_segment(
-    lines: &mut Vec<Line>,
-    row: &mut usize,
-    col: &mut usize,
-    segment: &str,
-    style: Style,
-    width: usize,
-    is_whitespace: bool,
-) {
-    let segment_width = UnicodeWidthStr::width(segment);
-    if is_whitespace && *col == 0 {
-        return;
-    }
-    if *col > 0 && col.saturating_add(segment_width) > width {
-        lines.push(Line::new());
-        *row = row.saturating_add(1);
-        *col = 0;
-        if is_whitespace {
-            return;
-        }
-    }
-    if segment_width > width {
-        for grapheme in segment.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if *col > 0 && col.saturating_add(grapheme_width) > width {
-                lines.push(Line::new());
-                *row = row.saturating_add(1);
-                *col = 0;
-            }
-            push_styled_grapheme(&mut lines[*row], grapheme, style);
-            *col = col.saturating_add(grapheme_width);
-        }
-        return;
-    }
-    push_styled_grapheme(&mut lines[*row], segment, style);
-    *col = col.saturating_add(segment_width);
-}
-
-fn push_styled_grapheme(line: &mut Line, grapheme: &str, style: Style) {
-    if let Some(last) = line.spans.last_mut()
-        && last.style == style
-    {
-        last.content.push_str(grapheme);
-        return;
-    }
-    line.push_span(Span::styled(grapheme.to_owned(), style));
 }
 
 fn trim_line_end(line: &Line) -> Line {
