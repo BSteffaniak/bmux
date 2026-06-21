@@ -4,7 +4,6 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
 /// Generic badge severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -202,11 +201,11 @@ impl<'a> Badge<'a> {
         if area.is_empty() {
             return;
         }
-        let mut text = self.text();
-        if self.policy.truncate && display_width(&text) > usize::from(area.width) {
-            text = truncate_to_display_width(&text, usize::from(area.width));
+        let mut line = Line::from_spans([Span::styled(self.text(), self.style())]);
+        if self.policy.truncate {
+            line = line.truncate(usize::from(area.width));
         }
-        frame.write_line(area, &Line::from_spans([Span::styled(text, self.style())]));
+        frame.write_line(area, &line);
     }
 
     const fn style(&self) -> Style {

@@ -12,6 +12,7 @@ use bmux_tui::widget::Widget;
 
 use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
+use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
 /// Runtime state for [`TextView`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -363,66 +364,40 @@ impl<'a> TextView<'a> {
     /// Return content area after integrated scrollbar reservation.
     #[must_use]
     pub const fn content_area(&self, area: Rect) -> Rect {
-        let reserve_vertical = matches!(
-            self.policy.vertical_scrollbar,
-            ScrollAreaScrollbarMode::Gutter
-        ) && area.width > 0;
-        let reserve_horizontal = matches!(
-            self.policy.horizontal_scrollbar,
-            ScrollAreaScrollbarMode::Gutter
-        ) && area.height > 0;
-        Rect::new(
-            area.x,
-            area.y,
-            if reserve_vertical {
-                area.width.saturating_sub(1)
-            } else {
-                area.width
-            },
-            if reserve_horizontal {
-                area.height.saturating_sub(1)
-            } else {
-                area.height
-            },
+        scrollbar_layout(
+            area,
+            ScrollbarLayoutPolicy::new(
+                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
+                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+            ),
         )
+        .content
     }
 
     /// Return integrated vertical scrollbar area when enabled.
     #[must_use]
     pub const fn vertical_scrollbar_area(&self, area: Rect) -> Option<Rect> {
-        if matches!(
-            self.policy.vertical_scrollbar,
-            ScrollAreaScrollbarMode::Hidden
-        ) || area.width == 0
-        {
-            None
-        } else {
-            Some(Rect::new(
-                area.right().saturating_sub(1),
-                area.y,
-                1,
-                self.content_area(area).height,
-            ))
-        }
+        scrollbar_layout(
+            area,
+            ScrollbarLayoutPolicy::new(
+                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
+                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+            ),
+        )
+        .vertical_scrollbar
     }
 
     /// Return integrated horizontal scrollbar area when enabled.
     #[must_use]
     pub const fn horizontal_scrollbar_area(&self, area: Rect) -> Option<Rect> {
-        if matches!(
-            self.policy.horizontal_scrollbar,
-            ScrollAreaScrollbarMode::Hidden
-        ) || area.height == 0
-        {
-            None
-        } else {
-            Some(Rect::new(
-                area.x,
-                area.bottom().saturating_sub(1),
-                self.content_area(area).width,
-                1,
-            ))
-        }
+        scrollbar_layout(
+            area,
+            ScrollbarLayoutPolicy::new(
+                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
+                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+            ),
+        )
+        .horizontal_scrollbar
     }
 
     /// Return maximum source line display width.
@@ -564,6 +539,17 @@ impl<'a> TextView<'a> {
             Scrollbar::new()
                 .policy(ScrollbarPolicy::horizontal())
                 .render(scrollbar_area, &scrollbar_state, frame);
+        }
+        if let Some(corner) = scrollbar_layout(
+            area,
+            ScrollbarLayoutPolicy::new(
+                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
+                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+            ),
+        )
+        .corner
+        {
+            frame.fill(corner, " ", self.styles.background);
         }
     }
 
@@ -736,6 +722,14 @@ impl<'a> TextView<'a> {
             state.horizontal_scroll = next;
             TextViewOutcome::Redraw
         }
+    }
+}
+
+const fn text_view_axis_layout_mode(mode: ScrollAreaScrollbarMode) -> ScrollbarAxisLayoutMode {
+    match mode {
+        ScrollAreaScrollbarMode::Hidden => ScrollbarAxisLayoutMode::Hidden,
+        ScrollAreaScrollbarMode::Overlay => ScrollbarAxisLayoutMode::Overlay,
+        ScrollAreaScrollbarMode::Gutter => ScrollbarAxisLayoutMode::Gutter,
     }
 }
 

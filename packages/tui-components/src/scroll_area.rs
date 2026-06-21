@@ -9,6 +9,7 @@ use bmux_tui::text::line_viewport;
 
 use crate::common::InteractionState;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
+use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
 /// Runtime scroll-area state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +226,8 @@ pub struct ScrollAreaLayout {
     pub vertical_scrollbar: Option<Rect>,
     /// Horizontal scrollbar area, when enabled.
     pub horizontal_scrollbar: Option<Rect>,
+    /// Bottom-right corner cell reserved when both gutter scrollbars are enabled.
+    pub corner: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,56 +296,18 @@ impl<'a> ScrollArea<'a> {
     /// Return resolved content and scrollbar layout for `area`.
     #[must_use]
     pub const fn layout(&self, area: Rect) -> ScrollAreaLayout {
-        let reserve_vertical =
-            matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Gutter) && area.width > 0;
-        let reserve_horizontal = matches!(
-            self.policy.horizontal_scrollbar,
-            ScrollAreaScrollbarMode::Gutter
-        ) && area.height > 0;
-        let content = Rect::new(
-            area.x,
-            area.y,
-            if reserve_vertical {
-                area.width.saturating_sub(1)
-            } else {
-                area.width
-            },
-            if reserve_horizontal {
-                area.height.saturating_sub(1)
-            } else {
-                area.height
-            },
+        let layout = scrollbar_layout(
+            area,
+            ScrollbarLayoutPolicy::new(
+                axis_layout_mode(self.policy.scrollbar),
+                axis_layout_mode(self.policy.horizontal_scrollbar),
+            ),
         );
-        let vertical_scrollbar = if matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Hidden)
-            || area.width == 0
-        {
-            None
-        } else {
-            Some(Rect::new(
-                area.right().saturating_sub(1),
-                area.y,
-                1,
-                content.height,
-            ))
-        };
-        let horizontal_scrollbar = if matches!(
-            self.policy.horizontal_scrollbar,
-            ScrollAreaScrollbarMode::Hidden
-        ) || area.height == 0
-        {
-            None
-        } else {
-            Some(Rect::new(
-                area.x,
-                area.bottom().saturating_sub(1),
-                content.width,
-                1,
-            ))
-        };
         ScrollAreaLayout {
-            content,
-            vertical_scrollbar,
-            horizontal_scrollbar,
+            content: layout.content,
+            vertical_scrollbar: layout.vertical_scrollbar,
+            horizontal_scrollbar: layout.horizontal_scrollbar,
+            corner: layout.corner,
         }
     }
 
@@ -418,6 +383,9 @@ impl<'a> ScrollArea<'a> {
             Scrollbar::new()
                 .policy(self.policy.horizontal_scrollbar_policy)
                 .render(scrollbar_area, &scrollbar_state, frame);
+        }
+        if let Some(corner) = layout.corner {
+            frame.fill(corner, " ", fallback);
         }
     }
 
@@ -651,6 +619,14 @@ impl<'a> ScrollArea<'a> {
         state.horizontal_offset = state
             .horizontal_offset
             .min(self.max_offset(ScrollAxis::Horizontal, area));
+    }
+}
+
+const fn axis_layout_mode(mode: ScrollAreaScrollbarMode) -> ScrollbarAxisLayoutMode {
+    match mode {
+        ScrollAreaScrollbarMode::Hidden => ScrollbarAxisLayoutMode::Hidden,
+        ScrollAreaScrollbarMode::Overlay => ScrollbarAxisLayoutMode::Overlay,
+        ScrollAreaScrollbarMode::Gutter => ScrollbarAxisLayoutMode::Gutter,
     }
 }
 
