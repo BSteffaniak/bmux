@@ -1,13 +1,13 @@
 //! Reusable scroll-area behavior and renderer.
 
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
+use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Style};
 use bmux_tui::text::line_viewport;
 
-use crate::common::InteractionState;
+use crate::common::{DragState, InteractionState};
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
@@ -18,6 +18,7 @@ pub struct ScrollAreaState {
     pub interaction: InteractionState,
     vertical_offset: u16,
     horizontal_offset: u16,
+    drag: Option<DragState>,
 }
 
 impl ScrollAreaState {
@@ -28,6 +29,7 @@ impl ScrollAreaState {
             interaction: InteractionState::new(),
             vertical_offset: 0,
             horizontal_offset: 0,
+            drag: None,
         }
     }
 
@@ -51,6 +53,18 @@ impl ScrollAreaState {
     /// Set the horizontal content offset in terminal cells.
     pub const fn set_horizontal_offset(&mut self, offset: u16) {
         self.horizontal_offset = offset;
+    }
+
+    /// Return the active content-drag pan state.
+    #[must_use]
+    pub const fn drag(self) -> Option<DragState> {
+        self.drag
+    }
+
+    /// Clear active content-drag pan state.
+    pub const fn clear_drag(&mut self) {
+        self.drag = None;
+        self.interaction.pressed = false;
     }
 
     /// Set disabled state for the scroll area.
@@ -90,6 +104,8 @@ pub struct ScrollAreaPolicy {
     pub page_keys_scroll: bool,
     /// Whether Home and End scroll to the beginning/end.
     pub home_end_scroll: bool,
+    /// Whether primary-button dragging over content pans the viewport.
+    pub drag_pan: bool,
     /// Integrated vertical scrollbar layout mode.
     pub scrollbar: ScrollAreaScrollbarMode,
     /// Vertical scrollbar policy used when integrated scrollbar rendering is enabled.
@@ -112,6 +128,7 @@ impl ScrollAreaPolicy {
             arrows_scroll: true,
             page_keys_scroll: true,
             home_end_scroll: true,
+            drag_pan: true,
             scrollbar: ScrollAreaScrollbarMode::Hidden,
             scrollbar_policy: ScrollbarPolicy::vertical(),
             horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -129,6 +146,7 @@ impl ScrollAreaPolicy {
             arrows_scroll: false,
             page_keys_scroll: false,
             home_end_scroll: false,
+            drag_pan: false,
             scrollbar: ScrollAreaScrollbarMode::Hidden,
             scrollbar_policy: ScrollbarPolicy::bare(),
             horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -167,6 +185,13 @@ impl ScrollAreaPolicy {
         horizontal_scrollbar_policy: ScrollbarPolicy,
     ) -> Self {
         self.horizontal_scrollbar_policy = horizontal_scrollbar_policy;
+        self
+    }
+
+    /// Return this policy with content drag-to-pan changed.
+    #[must_use]
+    pub const fn drag_pan(mut self, drag_pan: bool) -> Self {
+        self.drag_pan = drag_pan;
         self
     }
 }
@@ -248,6 +273,7 @@ impl<'a> ScrollArea<'a> {
                 arrows_scroll: true,
                 page_keys_scroll: true,
                 home_end_scroll: true,
+                drag_pan: true,
                 scrollbar: ScrollAreaScrollbarMode::Hidden,
                 scrollbar_policy: ScrollbarPolicy::vertical(),
                 horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -522,10 +548,57 @@ impl<'a> ScrollArea<'a> {
                 state,
                 i32::from(self.policy.wheel_lines),
             ),
+            MouseEventKind::Down(MouseButton::Left)
+                if self.policy.drag_pan && content_area.contains(mouse.position) =>
+            {
+                state.drag = Some(DragState::new(mouse.position));
+                state.interaction.pressed = true;
+                ScrollAreaOutcome::Handled
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.policy.drag_pan => {
+                self.handle_drag_pan(content_area, state, mouse.position)
+            }
+            MouseEventKind::Up(MouseButton::Left) if state.drag.is_some() => {
+                state.clear_drag();
+                ScrollAreaOutcome::Handled
+            }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
             | MouseEventKind::Move => ScrollAreaOutcome::Ignored,
+        }
+    }
+
+    fn handle_drag_pan(
+        &self,
+        content_area: Rect,
+        state: &mut ScrollAreaState,
+        position: Point,
+    ) -> ScrollAreaOutcome {
+        let Some(drag) = state.drag else {
+            return ScrollAreaOutcome::Ignored;
+        };
+        let horizontal_delta = i32::from(drag.current.x) - i32::from(position.x);
+        let vertical_delta = i32::from(drag.current.y) - i32::from(position.y);
+        state.drag = Some(drag.moved_to(position));
+        let previous_horizontal = state.horizontal_offset;
+        let previous_vertical = state.vertical_offset;
+        let next_horizontal = offset_u16(previous_horizontal, horizontal_delta)
+            .min(self.max_offset(ScrollAxis::Horizontal, content_area));
+        let next_vertical = offset_u16(previous_vertical, vertical_delta)
+            .min(self.max_offset(ScrollAxis::Vertical, content_area));
+        state.horizontal_offset = next_horizontal;
+        state.vertical_offset = next_vertical;
+        if next_vertical != previous_vertical {
+            ScrollAreaOutcome::Scrolled {
+                vertical_offset: next_vertical,
+            }
+        } else if next_horizontal != previous_horizontal {
+            ScrollAreaOutcome::HorizontalScrolled {
+                horizontal_offset: next_horizontal,
+            }
+        } else {
+            ScrollAreaOutcome::Handled
         }
     }
 
@@ -943,6 +1016,79 @@ mod tests {
         area.render(Rect::new(0, 0, 2, 1), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("b "));
+    }
+
+    #[test]
+    fn content_drag_pan_scrolls_hidden_scroll_area() {
+        let lines = lines(&[
+            "abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "01234567890123456789",
+            "extra row",
+        ]);
+        let area = ScrollArea::new(&lines);
+        let mut state = ScrollAreaState::new();
+        state.set_horizontal_offset(4);
+        state.set_vertical_offset(1);
+        let viewport = Rect::new(0, 0, 6, 2);
+
+        assert_eq!(
+            area.handle_event(
+                viewport,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(3, 1),
+                )),
+            ),
+            ScrollAreaOutcome::Handled
+        );
+        assert!(state.drag().is_some());
+
+        let outcome = area.handle_event(
+            viewport,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(MouseButton::Left),
+                Point::new(1, 0),
+            )),
+        );
+
+        assert!(outcome.needs_redraw());
+        assert_eq!(state.horizontal_offset(), 6);
+        assert_eq!(state.vertical_offset(), 2);
+        assert_eq!(
+            area.handle_event(
+                viewport,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+            ),
+            ScrollAreaOutcome::Handled
+        );
+        assert!(state.drag().is_none());
+    }
+
+    #[test]
+    fn drag_pan_policy_can_be_disabled() {
+        let lines = lines(&["abcdef", "ghijkl"]);
+        let area =
+            ScrollArea::new(&lines).policy(super::ScrollAreaPolicy::interactive().drag_pan(false));
+        let mut state = ScrollAreaState::new();
+
+        let outcome = area.handle_event(
+            Rect::new(0, 0, 3, 1),
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 0),
+            )),
+        );
+
+        assert_eq!(outcome, ScrollAreaOutcome::Ignored);
+        assert!(state.drag().is_none());
     }
 
     #[test]
