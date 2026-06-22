@@ -45,6 +45,10 @@ pub enum BuiltInHandlerId {
     RemoteInit,
     RemoteInstallServer,
     RemoteUpgrade,
+    RemoteTrust,
+    RemoteTrustList,
+    RemoteTrustAdd,
+    RemoteTrustRemove,
     RemoteComplete,
     RemoteCompleteTargets,
     RemoteCompleteSessions,
@@ -376,6 +380,26 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RemoteUpgrade,
             &["remote", "upgrade"],
             "Upgrade remote bmux runtime on targets",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteTrust,
+            &["remote", "trust"],
+            "Manage TLS gateway trust pins",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteTrustList,
+            &["remote", "trust", "list"],
+            "List TLS gateway trust pins",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteTrustAdd,
+            &["remote", "trust", "add"],
+            "Trust and pin a TLS gateway",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteTrustRemove,
+            &["remote", "trust", "remove"],
+            "Remove a local TLS gateway trust pin",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::RemoteComplete,

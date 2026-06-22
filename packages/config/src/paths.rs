@@ -161,6 +161,12 @@ impl ConfigPaths {
         self.state_dir().join("config-overlay.toml")
     }
 
+    /// Get the mutable TLS known gateways store path.
+    #[must_use]
+    pub fn known_gateways_file(&self) -> PathBuf {
+        self.state_dir().join("known-gateways.toml")
+    }
+
     /// Add a config directory candidate ahead of existing candidates.
     pub fn prepend_config_dir_candidate(&mut self, path: PathBuf) {
         self.config_dir_candidates

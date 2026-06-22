@@ -772,14 +772,14 @@ fn resolve_gateway_tls_files(
 
 fn generate_quick_gateway_cert_pair() -> Result<(String, String)> {
     let paths = ConfigPaths::default();
-    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+    std::fs::create_dir_all(paths.data_dir.join("tls")).with_context(|| {
         format!(
-            "failed creating runtime dir {}",
-            paths.runtime_dir.display()
+            "failed creating TLS data dir {}",
+            paths.data_dir.join("tls").display()
         )
     })?;
-    let cert_path = paths.runtime_dir.join("gateway-quick-cert.pem");
-    let key_path = paths.runtime_dir.join("gateway-quick-key.pem");
+    let cert_path = paths.data_dir.join("tls").join("gateway-quick-cert.pem");
+    let key_path = paths.data_dir.join("tls").join("gateway-quick-key.pem");
 
     if cert_path.exists() && key_path.exists() {
         return Ok((
@@ -788,7 +788,18 @@ fn generate_quick_gateway_cert_pair() -> Result<(String, String)> {
         ));
     }
 
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+    let mut san_names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        && !hostname.trim().is_empty()
+    {
+        san_names.push(hostname.clone());
+        san_names.push(format!("{}.local", hostname.trim_end_matches(".local")));
+    }
+    let cert = rcgen::generate_simple_self_signed(san_names)
         .context("failed generating quick self-signed gateway certificate")?;
     let cert_pem = cert.cert.pem();
     let key_pem = cert.signing_key.serialize_pem();

@@ -109,8 +109,9 @@ use remote_cli::{
     maybe_run_cluster_plugin_command_via_gateway, reconnect_backoff_ms, run_auth_login,
     run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade, run_setup,
-    run_share, run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
+    run_remote_install_server, run_remote_list, run_remote_test, run_remote_trust_add,
+    run_remote_trust_list, run_remote_trust_remove, run_remote_upgrade, run_setup, run_share,
+    run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
 };
 use sandbox_cli::{
     BundleIncludeOptions, BundleSandboxOptions, InspectTargetOptions, RerunSandboxOptions,

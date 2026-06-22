@@ -2,9 +2,9 @@ use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand,
     KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand,
-    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
-    SandboxSourceArg, SandboxStatusArg, ServerCommand, SessionCommand, SlotCommand,
-    TerminalCommand,
+    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, RemoteTrustCommand,
+    SandboxCommand, SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg, ServerCommand,
+    SessionCommand, SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -27,15 +27,16 @@ use super::{
     run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
     run_playbook_interactive, run_playbook_run, run_playbook_validate,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
-    run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
-    run_sandbox_list, run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun,
-    run_sandbox_run, run_sandbox_status, run_sandbox_tail, run_sandbox_triage,
-    run_sandbox_verify_bundle, run_server_bridge, run_server_gateway, run_server_restore,
-    run_server_save, run_server_start, run_server_status, run_server_stop,
-    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
-    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
-    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
+    run_remote_install_server, run_remote_list, run_remote_test, run_remote_trust_add,
+    run_remote_trust_list, run_remote_trust_remove, run_remote_upgrade, run_sandbox_bundle,
+    run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect, run_sandbox_list,
+    run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun, run_sandbox_run,
+    run_sandbox_status, run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle,
+    run_server_bridge, run_server_gateway, run_server_restore, run_server_save, run_server_start,
+    run_server_status, run_server_stop, run_server_whoami_principal, run_session_attach,
+    run_session_detach, run_session_kill, run_session_kill_all, run_session_list, run_session_new,
+    run_setup, run_share, run_terminal_doctor, run_terminal_install_terminfo, run_unfollow,
+    run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -99,6 +100,11 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             RemoteCommand::Init { .. } => BuiltInHandlerId::RemoteInit,
             RemoteCommand::InstallServer { .. } => BuiltInHandlerId::RemoteInstallServer,
             RemoteCommand::Upgrade { .. } => BuiltInHandlerId::RemoteUpgrade,
+            RemoteCommand::Trust { command } => match command {
+                RemoteTrustCommand::List => BuiltInHandlerId::RemoteTrustList,
+                RemoteTrustCommand::Add { .. } => BuiltInHandlerId::RemoteTrustAdd,
+                RemoteTrustCommand::Remove { .. } => BuiltInHandlerId::RemoteTrustRemove,
+            },
             RemoteCommand::Complete { command } => match command {
                 RemoteCompleteCommand::Targets => BuiltInHandlerId::RemoteCompleteTargets,
                 RemoteCompleteCommand::Sessions { .. } => BuiltInHandlerId::RemoteCompleteSessions,
@@ -595,6 +601,33 @@ pub(super) async fn dispatch_built_in_command(
                 command: RemoteCommand::Upgrade { target },
             },
         ) => run_remote_upgrade(target.as_deref()).await,
+        (
+            BuiltInHandlerId::RemoteTrustList,
+            Command::Remote {
+                command:
+                    RemoteCommand::Trust {
+                        command: RemoteTrustCommand::List,
+                    },
+            },
+        ) => run_remote_trust_list(),
+        (
+            BuiltInHandlerId::RemoteTrustAdd,
+            Command::Remote {
+                command:
+                    RemoteCommand::Trust {
+                        command: RemoteTrustCommand::Add { target, yes },
+                    },
+            },
+        ) => run_remote_trust_add(target, *yes).await,
+        (
+            BuiltInHandlerId::RemoteTrustRemove,
+            Command::Remote {
+                command:
+                    RemoteCommand::Trust {
+                        command: RemoteTrustCommand::Remove { endpoint },
+                    },
+            },
+        ) => run_remote_trust_remove(endpoint),
         (
             BuiltInHandlerId::RemoteCompleteTargets,
             Command::Remote {

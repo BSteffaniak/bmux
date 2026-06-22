@@ -765,10 +765,34 @@ pub enum RemoteCommand {
         /// Target name (omit to upgrade all configured targets)
         target: Option<String>,
     },
+    /// Manage TLS gateway trust pins
+    Trust {
+        #[command(subcommand)]
+        command: RemoteTrustCommand,
+    },
     /// Shell completion helpers for targets/sessions
     Complete {
         #[command(subcommand)]
         command: RemoteCompleteCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemoteTrustCommand {
+    /// List effective TLS gateway trust pins
+    List,
+    /// Probe and trust a TLS gateway
+    Add {
+        /// TLS target URL or host[:port]
+        target: String,
+        /// Trust without an interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove a local TLS gateway trust pin
+    Remove {
+        /// Endpoint key (`host:port`)
+        endpoint: String,
     },
 }
 

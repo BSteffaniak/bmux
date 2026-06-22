@@ -1161,9 +1161,48 @@ pub struct ConnectionsConfig {
     pub recent_sessions: BTreeMap<String, Vec<String>>,
     /// User-defined share links (bmux://<name> -> target reference)
     pub share_links: BTreeMap<String, String>,
+    /// Declarative TLS gateway trust policy and pins.
+    #[config_doc(nested)]
+    pub tls_trust: TlsTrustConfig,
     /// Optional SSH-key allowlist and enforcement for iroh connections.
     #[config_doc(nested)]
     pub iroh_ssh_access: IrohSshAccessConfig,
+}
+
+/// TLS gateway trust policy and declarative pins.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct TlsTrustConfig {
+    /// Trust mode for TLS gateways without CA validation or a known pin.
+    pub mode: TlsTrustMode,
+    /// Endpoint (`host:port`) -> pinned gateway metadata map.
+    #[config_doc(nested, map_key = "<host:port>")]
+    pub known_gateways: BTreeMap<String, TlsKnownGatewayConfig>,
+}
+
+/// TLS trust behavior for unknown gateways.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsTrustMode {
+    /// Prompt in interactive terminals; require a known pin otherwise.
+    #[default]
+    Prompt,
+    /// Refuse gateways unless CA validation or a known pin succeeds.
+    RequireKnown,
+    /// Automatically trust and pin first-seen gateway certificates.
+    TrustNew,
+}
+
+/// Declarative TLS gateway pin metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct TlsKnownGatewayConfig {
+    /// Pinned SHA-256 fingerprint of the gateway leaf certificate.
+    pub fingerprint_sha256: String,
+    /// Expected TLS server name for display/auditing.
+    pub server_name: Option<String>,
+    /// Human-readable target label.
+    pub label: Option<String>,
 }
 
 /// SSH-key allowlist configuration for iroh access control.

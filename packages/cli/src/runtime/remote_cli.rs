@@ -6,15 +6,16 @@ use crate::ssh_access::{
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
-use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_config::{BmuxConfig, ConfigPaths, TlsTrustMode};
 use bmux_ipc::InvokeServiceKind;
 use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
 use bmux_recording_protocol::RecordingRollingStartOptions;
 use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
+use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::BTreeMap, collections::BTreeSet};
 use uuid::Uuid;
 
@@ -45,9 +46,11 @@ use bmux_ipc::transport::{ErasedIpcStream, LocalIpcStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use qrcode::QrCode;
 use qrcode::render::unicode;
-use rustls::RootCertStore;
-use rustls::pki_types::ServerName;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -595,6 +598,45 @@ struct TlsTarget {
     server_name: String,
     ca_file: Option<PathBuf>,
     connect_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct KnownGatewaysStore {
+    gateways: BTreeMap<String, KnownGatewayState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KnownGatewayState {
+    fingerprint_sha256: String,
+    trusted_at_unix_ms: u64,
+    server_name: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsPinSource {
+    Config,
+    Local,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveTlsPin {
+    fingerprint_sha256: String,
+    source: TlsPinSource,
+}
+
+#[derive(Debug, Clone)]
+struct TlsTrustDecision {
+    key: String,
+    mode: TlsTrustMode,
+    pin: Option<EffectiveTlsPin>,
+}
+
+#[derive(Debug)]
+struct BmuxTlsServerVerifier {
+    trust: TlsTrustDecision,
+    webpki: Option<Arc<dyn ServerCertVerifier>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7211,6 +7253,10 @@ pub(super) async fn run_remote_init(
         target.user = None;
     }
 
+    if let Some(tls_target) = tls_target_from_config(name, &target)? {
+        ensure_tls_gateway_trusted_interactively(&tls_target).await?;
+    }
+
     config
         .connections
         .targets
@@ -7283,6 +7329,101 @@ fn save_remote_target_state_overlay(
     std::fs::write(&path, contents)
         .with_context(|| format!("failed writing state config overlay {}", path.display()))?;
     Ok(())
+}
+
+pub(super) fn run_remote_trust_list() -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let store = load_known_gateways_store(&ConfigPaths::default())?;
+    let mut keys = BTreeSet::new();
+    keys.extend(config.connections.tls_trust.known_gateways.keys().cloned());
+    keys.extend(store.gateways.keys().cloned());
+    if keys.is_empty() {
+        println!("no TLS gateway trust pins configured");
+        return Ok(0);
+    }
+    for key in keys {
+        if let Some(pin) = config.connections.tls_trust.known_gateways.get(&key) {
+            println!(
+                "{key}\t{}\tsource=config\tlabel={}",
+                pin.fingerprint_sha256,
+                pin.label.as_deref().unwrap_or("-")
+            );
+        }
+        if let Some(pin) = store.gateways.get(&key)
+            && !config
+                .connections
+                .tls_trust
+                .known_gateways
+                .contains_key(&key)
+        {
+            println!(
+                "{key}\t{}\tsource=local\tlabel={}",
+                pin.fingerprint_sha256,
+                pin.label.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    Ok(0)
+}
+
+pub(super) async fn run_remote_trust_add(target: &str, yes: bool) -> Result<u8> {
+    let resolved = if target.starts_with("tls://") {
+        parse_inline_tls_target(target)?
+    } else {
+        parse_inline_tls_target(&format!("tls://{target}"))?
+    };
+    let ResolvedTarget::Tls(target) = resolved else {
+        anyhow::bail!("remote trust add only supports TLS targets");
+    };
+    let fingerprint = probe_tls_gateway_fingerprint(&target).await?;
+    let key = tls_gateway_key(&target.host, target.port);
+    let config = BmuxConfig::load().unwrap_or_default();
+    if let Some(pin) = config.connections.tls_trust.known_gateways.get(&key) {
+        if fingerprints_equal(&pin.fingerprint_sha256, &fingerprint) {
+            println!("TLS gateway {key} already trusted by declarative config");
+            return Ok(0);
+        }
+        anyhow::bail!(
+            "TLS gateway {key} conflicts with declarative config pin: expected {}, received {fingerprint}",
+            pin.fingerprint_sha256
+        );
+    }
+    if !yes {
+        println!("The bmux TLS gateway at {key} presented:");
+        println!("  {fingerprint}\n");
+        print!("Trust this gateway and remember it? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+            anyhow::bail!("TLS gateway trust declined for {key}");
+        }
+    }
+    trust_tls_gateway(&target, &fingerprint, None)?;
+    println!("trusted TLS gateway {key}: {fingerprint}");
+    Ok(0)
+}
+
+pub(super) fn run_remote_trust_remove(endpoint: &str) -> Result<u8> {
+    let config = BmuxConfig::load().unwrap_or_default();
+    if config
+        .connections
+        .tls_trust
+        .known_gateways
+        .contains_key(endpoint)
+    {
+        anyhow::bail!(
+            "cannot remove declarative TLS trust pin for {endpoint}; edit bmux config instead"
+        );
+    }
+    let paths = ConfigPaths::default();
+    let mut store = load_known_gateways_store(&paths)?;
+    if store.gateways.remove(endpoint).is_some() {
+        save_known_gateways_store(&paths, &store)?;
+        println!("removed local TLS trust pin for {endpoint}");
+        return Ok(0);
+    }
+    anyhow::bail!("local TLS trust pin not found for {endpoint}")
 }
 
 pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {
@@ -7592,7 +7733,20 @@ async fn connect_remote_bridge(
 }
 
 async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<BmuxClient> {
-    let connector = build_tls_connector(target)?;
+    ensure_tls_gateway_trusted_for_policy(target).await?;
+    match try_connect_tls_bridge(target, client_name).await {
+        Ok(client) => Ok(client),
+        Err(error) if should_retry_after_tls_trust_prompt(&error) => {
+            ensure_tls_gateway_trusted_interactively(target).await?;
+            try_connect_tls_bridge(target, client_name).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn try_connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<BmuxClient> {
+    let config = BmuxConfig::load().unwrap_or_default();
+    let connector = build_tls_connector(target, &config)?;
     let address = format!("{}:{}", target.host, target.port);
     let connect_future = TcpStream::connect(&address);
     let tcp_stream = tokio::time::timeout(
@@ -7612,7 +7766,6 @@ async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<Bmu
     let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
 
     // Optionally wrap the TLS stream with transport-level compression (Layer 3).
-    let config = BmuxConfig::load().unwrap_or_default();
     let use_transport_compression = config.behavior.compression.enabled
         && matches!(
             config.behavior.compression.remote,
@@ -7873,7 +8026,19 @@ fn build_tls_kernel_client_factory(target: &TlsTarget) -> KernelClientFactory {
     })
 }
 
-fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
+fn build_tls_connector(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsConnector> {
+    let verifier = build_tls_server_verifier(target, config)?;
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+fn build_tls_server_verifier(
+    target: &TlsTarget,
+    config: &BmuxConfig,
+) -> Result<Arc<dyn ServerCertVerifier>> {
     let mut roots = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for cert in native.certs {
@@ -7897,17 +8062,385 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
         }
     }
 
-    if roots.is_empty() {
+    let webpki = if roots.is_empty() {
+        if target.ca_file.is_some() {
+            anyhow::bail!(
+                "no TLS trust roots available for target '{}'; install system certs or set ca_file",
+                target.label
+            );
+        }
+        None
+    } else {
+        Some(
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .context("failed building TLS server verifier")?
+                as Arc<dyn ServerCertVerifier>,
+        )
+    };
+    Ok(Arc::new(BmuxTlsServerVerifier {
+        trust: tls_trust_decision(target, config)?,
+        webpki,
+    }))
+}
+
+fn tls_gateway_key(host: &str, port: u16) -> String {
+    format!("{}:{port}", host.trim())
+}
+
+fn certificate_fingerprint_sha256(cert: &[u8]) -> String {
+    let digest = Sha256::digest(cert);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("SHA256:{hex}")
+}
+
+fn load_known_gateways_store(paths: &ConfigPaths) -> Result<KnownGatewaysStore> {
+    let path = paths.known_gateways_file();
+    if !path.exists() {
+        return Ok(KnownGatewaysStore::default());
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed reading known gateways store {}", path.display()))?;
+    toml::from_str(&contents)
+        .with_context(|| format!("failed parsing known gateways store {}", path.display()))
+}
+
+fn save_known_gateways_store(paths: &ConfigPaths, store: &KnownGatewaysStore) -> Result<()> {
+    let path = paths.known_gateways_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating known gateways directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let contents = toml::to_string_pretty(store).context("failed serializing known gateways")?;
+    std::fs::write(&path, contents)
+        .with_context(|| format!("failed writing known gateways store {}", path.display()))?;
+    Ok(())
+}
+
+fn tls_trust_decision(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsTrustDecision> {
+    let key = tls_gateway_key(&target.host, target.port);
+    let config_pin = config
+        .connections
+        .tls_trust
+        .known_gateways
+        .get(&key)
+        .filter(|gateway| !gateway.fingerprint_sha256.trim().is_empty());
+    let local_store = load_known_gateways_store(&ConfigPaths::default())?;
+    let local_pin = local_store
+        .gateways
+        .get(&key)
+        .filter(|gateway| !gateway.fingerprint_sha256.trim().is_empty());
+    let pin = config_pin
+        .map(|gateway| EffectiveTlsPin {
+            fingerprint_sha256: gateway.fingerprint_sha256.clone(),
+            source: TlsPinSource::Config,
+        })
+        .or_else(|| {
+            local_pin.map(|gateway| EffectiveTlsPin {
+                fingerprint_sha256: gateway.fingerprint_sha256.clone(),
+                source: TlsPinSource::Local,
+            })
+        });
+    Ok(TlsTrustDecision {
+        key,
+        mode: config.connections.tls_trust.mode,
+        pin,
+    })
+}
+
+impl ServerCertVerifier for BmuxTlsServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        if let Some(webpki) = self.webpki.as_ref()
+            && webpki
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .is_ok()
+        {
+            return Ok(ServerCertVerified::assertion());
+        }
+
+        let fingerprint = certificate_fingerprint_sha256(end_entity.as_ref());
+        if let Some(pin) = self.trust.pin.as_ref() {
+            if fingerprints_equal(&fingerprint, &pin.fingerprint_sha256) {
+                return Ok(ServerCertVerified::assertion());
+            }
+            let source = match pin.source {
+                TlsPinSource::Config => "declarative config",
+                TlsPinSource::Local => "local known-gateways store",
+            };
+            return Err(RustlsError::General(format!(
+                "bmux TLS gateway identity changed for {}; expected {} from {}, received {}",
+                self.trust.key, pin.fingerprint_sha256, source, fingerprint
+            )));
+        }
+
+        match self.trust.mode {
+            TlsTrustMode::TrustNew => Ok(ServerCertVerified::assertion()),
+            TlsTrustMode::Prompt => Err(RustlsError::General(format!(
+                "bmux TLS gateway {} is unknown; fingerprint {}; trust prompt required",
+                self.trust.key, fingerprint
+            ))),
+            TlsTrustMode::RequireKnown => Err(RustlsError::General(format!(
+                "bmux TLS gateway {} is unknown; add a declarative pin or run 'bmux remote trust add tls://{}'",
+                self.trust.key, self.trust.key
+            ))),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        if let Some(webpki) = self.webpki.as_ref() {
+            return webpki.verify_tls12_signature(message, cert, dss);
+        }
+        let algorithms = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| {
+                RustlsError::General("rustls crypto provider is not installed".to_string())
+            })?
+            .signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        if let Some(webpki) = self.webpki.as_ref() {
+            return webpki.verify_tls13_signature(message, cert, dss);
+        }
+        let algorithms = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| {
+                RustlsError::General("rustls crypto provider is not installed".to_string())
+            })?
+            .signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        if let Some(webpki) = self.webpki.as_ref() {
+            return webpki.supported_verify_schemes();
+        }
+        rustls::crypto::CryptoProvider::get_default().map_or_else(Vec::new, |provider| {
+            provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        })
+    }
+}
+
+fn fingerprints_equal(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn should_retry_after_tls_trust_prompt(error: &anyhow::Error) -> bool {
+    error.to_string().contains("trust prompt required")
+}
+
+async fn ensure_tls_gateway_trusted_for_policy(target: &TlsTarget) -> Result<()> {
+    let config = BmuxConfig::load().unwrap_or_default();
+    if target.ca_file.is_some() || config.connections.tls_trust.mode != TlsTrustMode::TrustNew {
+        return Ok(());
+    }
+    let decision = tls_trust_decision(target, &config)?;
+    if decision.pin.is_some() {
+        return Ok(());
+    }
+    let fingerprint = probe_tls_gateway_fingerprint(target).await?;
+    trust_tls_gateway(target, &fingerprint, None)
+}
+
+async fn ensure_tls_gateway_trusted_interactively(target: &TlsTarget) -> Result<()> {
+    let peer_fingerprint = probe_tls_gateway_fingerprint(target).await?;
+    let config = BmuxConfig::load().unwrap_or_default();
+    let key = tls_gateway_key(&target.host, target.port);
+    if let Some(pin) = config.connections.tls_trust.known_gateways.get(&key)
+        && !fingerprints_equal(&pin.fingerprint_sha256, &peer_fingerprint)
+    {
         anyhow::bail!(
-            "no TLS trust roots available for target '{}'; install system certs or set ca_file",
-            target.label
+            "bmux TLS gateway identity changed for {key}; expected {} from declarative config, received {peer_fingerprint}",
+            pin.fingerprint_sha256
         );
     }
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
+    let paths = ConfigPaths::default();
+    let local_store = load_known_gateways_store(&paths)?;
+    if let Some(pin) = local_store.gateways.get(&key) {
+        if fingerprints_equal(&pin.fingerprint_sha256, &peer_fingerprint) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "bmux TLS gateway identity changed for {key}; expected {} from local known-gateways store, received {peer_fingerprint}",
+            pin.fingerprint_sha256
+        );
+    }
+
+    if config.connections.tls_trust.mode == TlsTrustMode::RequireKnown {
+        anyhow::bail!(
+            "bmux TLS gateway {key} is unknown; add a declarative pin or run 'bmux remote trust add tls://{key}'"
+        );
+    }
+
+    if config.connections.tls_trust.mode == TlsTrustMode::Prompt && !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "bmux TLS gateway {key} is unknown; refusing to prompt without an interactive terminal"
+        );
+    }
+
+    if config.connections.tls_trust.mode == TlsTrustMode::Prompt {
+        println!("The bmux TLS gateway at {key} is unknown.\n");
+        println!("Certificate fingerprint:");
+        println!("  {peer_fingerprint}\n");
+        print!("Trust this gateway and remember it? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+            anyhow::bail!("TLS gateway trust declined for {key}");
+        }
+    }
+
+    trust_tls_gateway(target, &peer_fingerprint, None)?;
+    Ok(())
+}
+
+fn trust_tls_gateway(target: &TlsTarget, fingerprint: &str, label: Option<&str>) -> Result<()> {
+    let paths = ConfigPaths::default();
+    let mut store = load_known_gateways_store(&paths)?;
+    let key = tls_gateway_key(&target.host, target.port);
+    store.gateways.insert(
+        key,
+        KnownGatewayState {
+            fingerprint_sha256: fingerprint.to_string(),
+            trusted_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            server_name: Some(target.server_name.clone()),
+            label: label
+                .map(str::to_string)
+                .or_else(|| Some(target.label.clone())),
+        },
+    );
+    save_known_gateways_store(&paths, &store)
+}
+
+async fn probe_tls_gateway_fingerprint(target: &TlsTarget) -> Result<String> {
+    let verifier = Arc::new(ProbeTlsServerVerifier::default());
+    let connector = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone())
+            .with_no_client_auth(),
+    ));
+    let address = format!("{}:{}", target.host, target.port);
+    let tcp_stream = tokio::time::timeout(
+        Duration::from_millis(target.connect_timeout_ms.max(1)),
+        TcpStream::connect(&address),
+    )
+    .await
+    .with_context(|| format!("timed out probing TLS target '{}'", target.label))?
+    .with_context(|| format!("failed probing TLS target '{}'", target.label))?;
+    let server_name = ServerName::try_from(target.server_name.clone())
+        .map_err(|_| anyhow::anyhow!("invalid TLS server name '{}'", target.server_name))?;
+    let _ = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .with_context(|| {
+            format!(
+                "failed probing TLS certificate for target '{}'",
+                target.label
+            )
+        })?;
+    verifier
+        .fingerprint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "TLS gateway '{}' did not present a certificate",
+                target.label
+            )
+        })
+}
+
+#[derive(Debug, Default)]
+struct ProbeTlsServerVerifier {
+    fingerprint: Mutex<Option<String>>,
+}
+
+impl ServerCertVerifier for ProbeTlsServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        *self
+            .fingerprint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(certificate_fingerprint_sha256(end_entity.as_ref()));
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        let algorithms = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| {
+                RustlsError::General("rustls crypto provider is not installed".to_string())
+            })?
+            .signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        let algorithms = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| {
+                RustlsError::General("rustls crypto provider is not installed".to_string())
+            })?
+            .signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::CryptoProvider::get_default().map_or_else(Vec::new, |provider| {
+            provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        })
+    }
 }
 
 #[allow(clippy::unused_async)] // Async signature for caller consistency in async dispatch chain
@@ -8358,6 +8891,29 @@ fn resolve_target_reference_inner(config: &BmuxConfig, target: &str) -> Result<R
     parse_inline_ssh_target(target)
 }
 
+fn tls_target_from_config(
+    name: &str,
+    target: &ConnectionTargetConfig,
+) -> Result<Option<TlsTarget>> {
+    if target.transport != ConnectionTransport::Tls {
+        return Ok(None);
+    }
+    let host = target
+        .host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TLS target '{name}' requires host"))?
+        .to_string();
+    Ok(Some(TlsTarget {
+        label: name.to_string(),
+        port: target.port.unwrap_or(443),
+        server_name: target.server_name.clone().unwrap_or_else(|| host.clone()),
+        ca_file: target.ca_file.clone(),
+        connect_timeout_ms: target.connect_timeout_ms.max(1),
+        host,
+    }))
+}
+
 fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<ResolvedTarget> {
     match target.transport {
         ConnectionTransport::Local => Ok(ResolvedTarget::Local),
@@ -8382,24 +8938,10 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
                 server_start_mode: target.server_start_mode,
             }))
         }
-        ConnectionTransport::Tls => {
-            let host = target
-                .host
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("TLS target '{name}' requires host"))?
-                .to_string();
-            let port = target.port.unwrap_or(443);
-            let server_name = target.server_name.clone().unwrap_or_else(|| host.clone());
-            Ok(ResolvedTarget::Tls(TlsTarget {
-                label: name.to_string(),
-                host,
-                port,
-                server_name,
-                ca_file: target.ca_file.clone(),
-                connect_timeout_ms: target.connect_timeout_ms.max(1),
-            }))
-        }
+        ConnectionTransport::Tls => tls_target_from_config(name, target)?.map_or_else(
+            || unreachable!("TLS transport should produce a TLS target"),
+            |target| Ok(ResolvedTarget::Tls(target)),
+        ),
         ConnectionTransport::Iroh => {
             let endpoint_id = target
                 .endpoint_id
