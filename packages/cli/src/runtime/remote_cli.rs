@@ -4784,16 +4784,34 @@ fn gateway_effective_candidate_health(
     execution_mode: GatewayExecutionMode,
 ) -> GatewayCandidateHealth {
     ensure_gateway_runtime_state_loaded();
+    let Ok(mut state_map) = cluster_gateway_state_map().lock() else {
+        return GatewayCandidateHealth::default();
+    };
+    let (health, persist_needed) = gateway_effective_candidate_health_in_state(
+        &mut state_map,
+        cluster_name,
+        candidate,
+        execution_mode,
+    );
+    if persist_needed {
+        let snapshot = state_map.clone();
+        drop(state_map);
+        persist_gateway_runtime_state_snapshot(&snapshot);
+    }
+    health
+}
+
+fn gateway_effective_candidate_health_in_state(
+    state_map: &mut BTreeMap<String, ClusterGatewayRuntimeState>,
+    cluster_name: &str,
+    candidate: &str,
+    execution_mode: GatewayExecutionMode,
+) -> (GatewayCandidateHealth, bool) {
     let now = Instant::now();
     let mut persist_needed = false;
-    let mut health = cluster_gateway_state_map()
-        .lock()
-        .ok()
-        .and_then(|state_map| {
-            state_map
-                .get(cluster_name)
-                .and_then(|cluster_state| cluster_state.candidate_health.get(candidate).cloned())
-        })
+    let mut health = state_map
+        .get(cluster_name)
+        .and_then(|cluster_state| cluster_state.candidate_health.get(candidate).cloned())
         .unwrap_or_default();
 
     if health.breaker_state == GatewayBreakerState::Open
@@ -4804,22 +4822,15 @@ fn gateway_effective_candidate_health(
         health.breaker_open_until = None;
         health.half_open_success_streak = 0;
         if execution_mode == GatewayExecutionMode::Mutating {
+            let cluster_state = state_map.entry(cluster_name.to_string()).or_default();
+            cluster_state
+                .candidate_health
+                .insert(candidate.to_string(), health.clone());
             persist_needed = true;
         }
     }
 
-    if persist_needed && let Ok(mut state_map) = cluster_gateway_state_map().lock() {
-        let cluster_state = state_map
-            .entry(cluster_name.to_string())
-            .or_insert_with(ClusterGatewayRuntimeState::default);
-        cluster_state
-            .candidate_health
-            .insert(candidate.to_string(), health.clone());
-        let snapshot = state_map.clone();
-        drop(state_map);
-        persist_gateway_runtime_state_snapshot(&snapshot);
-    }
-    health
+    (health, persist_needed)
 }
 
 fn gateway_candidate_skip_reason(
@@ -4976,41 +4987,55 @@ fn record_gateway_success(
 ) {
     ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
-        let cluster_state = state_map
-            .entry(cluster_name.to_string())
-            .or_insert_with(ClusterGatewayRuntimeState::default);
-        cluster_state.last_good = Some(GatewayLastGood {
-            target: candidate.to_string(),
-            observed_at: Instant::now(),
-        });
-        cluster_state.cooldown_until.remove(candidate);
-        let health = cluster_state
-            .candidate_health
-            .entry(candidate.to_string())
-            .or_insert_with(GatewayCandidateHealth::default);
-        if health.breaker_state == GatewayBreakerState::HalfOpen {
-            health.half_open_success_streak = health.half_open_success_streak.saturating_add(1);
-            if health.half_open_success_streak
-                >= gateway_effective_policy_values(definition).breaker_half_open_required_successes
-            {
-                health.breaker_state = GatewayBreakerState::Closed;
-                health.breaker_open_until = None;
-                health.half_open_success_streak = 0;
-            }
-        } else {
-            health.breaker_state = GatewayBreakerState::Closed;
-            health.breaker_open_until = None;
-            health.half_open_success_streak = 0;
-        }
-        health.successes = health.successes.saturating_add(1);
-        health.consecutive_failures = 0;
-        health.adaptive_cooldown_level = 0;
-        health.last_failure_reason = None;
-        health.last_latency_ms = Some(u128_to_u64_saturating(latency_ms));
+        record_gateway_success_in_state(
+            &mut state_map,
+            cluster_name,
+            candidate,
+            definition,
+            latency_ms,
+        );
         let snapshot = state_map.clone();
         drop(state_map);
         persist_gateway_runtime_state_snapshot(&snapshot);
     }
+}
+
+fn record_gateway_success_in_state(
+    state_map: &mut BTreeMap<String, ClusterGatewayRuntimeState>,
+    cluster_name: &str,
+    candidate: &str,
+    definition: &ClusterGatewayDefinition,
+    latency_ms: u128,
+) {
+    let cluster_state = state_map.entry(cluster_name.to_string()).or_default();
+    cluster_state.last_good = Some(GatewayLastGood {
+        target: candidate.to_string(),
+        observed_at: Instant::now(),
+    });
+    cluster_state.cooldown_until.remove(candidate);
+    let health = cluster_state
+        .candidate_health
+        .entry(candidate.to_string())
+        .or_default();
+    if health.breaker_state == GatewayBreakerState::HalfOpen {
+        health.half_open_success_streak = health.half_open_success_streak.saturating_add(1);
+        if health.half_open_success_streak
+            >= gateway_effective_policy_values(definition).breaker_half_open_required_successes
+        {
+            health.breaker_state = GatewayBreakerState::Closed;
+            health.breaker_open_until = None;
+            health.half_open_success_streak = 0;
+        }
+    } else {
+        health.breaker_state = GatewayBreakerState::Closed;
+        health.breaker_open_until = None;
+        health.half_open_success_streak = 0;
+    }
+    health.successes = health.successes.saturating_add(1);
+    health.consecutive_failures = 0;
+    health.adaptive_cooldown_level = 0;
+    health.last_failure_reason = None;
+    health.last_latency_ms = Some(u128_to_u64_saturating(latency_ms));
 }
 
 fn record_gateway_failure(
@@ -5022,45 +5047,60 @@ fn record_gateway_failure(
 ) {
     ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
-        let cluster_state = state_map
-            .entry(cluster_name.to_string())
-            .or_insert_with(ClusterGatewayRuntimeState::default);
-        let health = cluster_state
-            .candidate_health
-            .entry(candidate.to_string())
-            .or_insert_with(GatewayCandidateHealth::default);
-        let failed_from_half_open = health.breaker_state == GatewayBreakerState::HalfOpen;
-        health.failures = health.failures.saturating_add(1);
-        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
-        let level_increment = gateway_reason_class_cooldown_multiplier(reason_code);
-        health.adaptive_cooldown_level = health
-            .adaptive_cooldown_level
-            .saturating_add(u32::try_from(level_increment).unwrap_or(u32::MAX));
-        health.half_open_success_streak = 0;
-        health.last_failure_reason = Some(reason_code.to_string());
-        health.last_latency_ms = Some(u128_to_u64_saturating(latency_ms));
-        if failed_from_half_open
-            || health.consecutive_failures
-                >= gateway_reason_breaker_threshold(definition, reason_code)
-        {
-            health.breaker_state = GatewayBreakerState::Open;
-            health.breaker_open_until =
-                Some(Instant::now() + gateway_breaker_half_open_after(definition));
-        }
-        cluster_state.cooldown_until.insert(
-            candidate.to_string(),
-            Instant::now()
-                + gateway_failure_cooldown_for_level(
-                    definition,
-                    candidate,
-                    health.adaptive_cooldown_level,
-                    reason_code,
-                ),
+        record_gateway_failure_in_state(
+            &mut state_map,
+            cluster_name,
+            candidate,
+            definition,
+            latency_ms,
+            reason_code,
         );
         let snapshot = state_map.clone();
         drop(state_map);
         persist_gateway_runtime_state_snapshot(&snapshot);
     }
+}
+
+fn record_gateway_failure_in_state(
+    state_map: &mut BTreeMap<String, ClusterGatewayRuntimeState>,
+    cluster_name: &str,
+    candidate: &str,
+    definition: &ClusterGatewayDefinition,
+    latency_ms: u128,
+    reason_code: &str,
+) {
+    let cluster_state = state_map.entry(cluster_name.to_string()).or_default();
+    let health = cluster_state
+        .candidate_health
+        .entry(candidate.to_string())
+        .or_default();
+    let failed_from_half_open = health.breaker_state == GatewayBreakerState::HalfOpen;
+    health.failures = health.failures.saturating_add(1);
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    let level_increment = gateway_reason_class_cooldown_multiplier(reason_code);
+    health.adaptive_cooldown_level = health
+        .adaptive_cooldown_level
+        .saturating_add(u32::try_from(level_increment).unwrap_or(u32::MAX));
+    health.half_open_success_streak = 0;
+    health.last_failure_reason = Some(reason_code.to_string());
+    health.last_latency_ms = Some(u128_to_u64_saturating(latency_ms));
+    if failed_from_half_open
+        || health.consecutive_failures >= gateway_reason_breaker_threshold(definition, reason_code)
+    {
+        health.breaker_state = GatewayBreakerState::Open;
+        health.breaker_open_until =
+            Some(Instant::now() + gateway_breaker_half_open_after(definition));
+    }
+    cluster_state.cooldown_until.insert(
+        candidate.to_string(),
+        Instant::now()
+            + gateway_failure_cooldown_for_level(
+                definition,
+                candidate,
+                health.adaptive_cooldown_level,
+                reason_code,
+            ),
+    );
 }
 
 fn record_gateway_history_entry(
@@ -5070,9 +5110,7 @@ fn record_gateway_history_entry(
 ) {
     ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
-        let cluster_state = state_map
-            .entry(cluster_name.to_string())
-            .or_insert_with(ClusterGatewayRuntimeState::default);
+        let cluster_state = state_map.entry(cluster_name.to_string()).or_default();
         cluster_state.history.push(GatewayHistoryEntry {
             observed_at: Instant::now(),
             command: input.command_name.to_string(),
@@ -5551,9 +5589,7 @@ fn run_cluster_gateway_history_clear_command(
                     .get(cluster_name.as_str())
                     .cloned()
                     .unwrap_or_default();
-                let state = state_map
-                    .entry(cluster_name)
-                    .or_insert_with(ClusterGatewayRuntimeState::default);
+                let state = state_map.entry(cluster_name).or_default();
                 removed = clear_gateway_history_for_cluster(state, &definition, &query);
                 trim_gateway_history_entries(state, &definition);
             }
@@ -10098,22 +10134,21 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn breaker_opens_after_three_consecutive_failures() {
-        clear_gateway_runtime_state_for_tests();
+        let mut state = BTreeMap::new();
         let definition = ClusterGatewayDefinition {
             targets: vec!["db-a".to_string()],
             gateway_mode: ClusterGatewayMode::Auto,
             ..ClusterGatewayDefinition::default()
         };
-        record_gateway_failure("prod", "db-a", &definition, 30, "timeout");
-        record_gateway_failure("prod", "db-a", &definition, 40, "timeout");
-        record_gateway_failure("prod", "db-a", &definition, 50, "timeout");
+        record_gateway_failure_in_state(&mut state, "prod", "db-a", &definition, 30, "timeout");
+        record_gateway_failure_in_state(&mut state, "prod", "db-a", &definition, 40, "timeout");
+        record_gateway_failure_in_state(&mut state, "prod", "db-a", &definition, 50, "timeout");
 
-        let health = gateway_effective_candidate_health(
+        let (health, _) = gateway_effective_candidate_health_in_state(
+            &mut state,
             "prod",
             "db-a",
-            &definition,
             GatewayExecutionMode::Observational,
         );
         assert_eq!(health.breaker_state, GatewayBreakerState::Open);
@@ -10121,9 +10156,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn half_open_requires_multiple_successes_before_closing() {
-        clear_gateway_runtime_state_for_tests();
+        let mut state = BTreeMap::new();
         let definition = ClusterGatewayDefinition {
             targets: vec!["db-a".to_string()],
             gateway_mode: ClusterGatewayMode::Auto,
@@ -10133,21 +10167,21 @@ mod tests {
             ..ClusterGatewayDefinition::default()
         };
 
-        record_gateway_failure("prod", "db-a", &definition, 30, "timeout");
+        record_gateway_failure_in_state(&mut state, "prod", "db-a", &definition, 30, "timeout");
         std::thread::sleep(Duration::from_millis(3));
-        let half_open = gateway_effective_candidate_health(
+        let (half_open, _) = gateway_effective_candidate_health_in_state(
+            &mut state,
             "prod",
             "db-a",
-            &definition,
             GatewayExecutionMode::Mutating,
         );
         assert_eq!(half_open.breaker_state, GatewayBreakerState::HalfOpen);
 
-        record_gateway_success("prod", "db-a", &definition, 20);
-        let after_one_success = gateway_effective_candidate_health(
+        record_gateway_success_in_state(&mut state, "prod", "db-a", &definition, 20);
+        let (after_one_success, _) = gateway_effective_candidate_health_in_state(
+            &mut state,
             "prod",
             "db-a",
-            &definition,
             GatewayExecutionMode::Observational,
         );
         assert_eq!(
@@ -10155,11 +10189,11 @@ mod tests {
             GatewayBreakerState::HalfOpen
         );
 
-        record_gateway_success("prod", "db-a", &definition, 20);
-        let after_second_success = gateway_effective_candidate_health(
+        record_gateway_success_in_state(&mut state, "prod", "db-a", &definition, 20);
+        let (after_second_success, _) = gateway_effective_candidate_health_in_state(
+            &mut state,
             "prod",
             "db-a",
-            &definition,
             GatewayExecutionMode::Observational,
         );
         assert_eq!(
@@ -10169,30 +10203,29 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn adaptive_cooldown_level_increments_on_failure_and_resets_on_success() {
-        clear_gateway_runtime_state_for_tests();
+        let mut state = BTreeMap::new();
         let definition = ClusterGatewayDefinition {
             targets: vec!["db-a".to_string()],
             gateway_mode: ClusterGatewayMode::Auto,
             ..ClusterGatewayDefinition::default()
         };
 
-        record_gateway_failure("prod", "db-a", &definition, 10, "timeout");
-        record_gateway_failure("prod", "db-a", &definition, 11, "timeout");
-        let after_failures = gateway_effective_candidate_health(
+        record_gateway_failure_in_state(&mut state, "prod", "db-a", &definition, 10, "timeout");
+        record_gateway_failure_in_state(&mut state, "prod", "db-a", &definition, 11, "timeout");
+        let (after_failures, _) = gateway_effective_candidate_health_in_state(
+            &mut state,
             "prod",
             "db-a",
-            &definition,
             GatewayExecutionMode::Observational,
         );
         assert_eq!(after_failures.adaptive_cooldown_level, 2);
 
-        record_gateway_success("prod", "db-a", &definition, 5);
-        let after_success = gateway_effective_candidate_health(
+        record_gateway_success_in_state(&mut state, "prod", "db-a", &definition, 5);
+        let (after_success, _) = gateway_effective_candidate_health_in_state(
+            &mut state,
             "prod",
             "db-a",
-            &definition,
             GatewayExecutionMode::Observational,
         );
         assert_eq!(after_success.adaptive_cooldown_level, 0);
