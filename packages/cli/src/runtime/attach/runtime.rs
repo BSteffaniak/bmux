@@ -9256,7 +9256,7 @@ pub async fn handle_attach_terminal_event(
                     // responses.  Only transport-level send failures are
                     // treated as fatal here.
                     if let Err(error) =
-                        send_attach_bytes_to_focused_pane(client, view_state, bytes).await
+                        send_attach_bytes_to_focused(client, view_state, bytes).await
                     {
                         return Err(map_attach_client_error(error));
                     }
@@ -9772,8 +9772,7 @@ async fn handle_attach_action_dispatch(
         }
         AttachEventAction::Send(bytes) => {
             if view_state.can_write
-                && let Err(error) =
-                    send_attach_bytes_to_focused_pane(client, view_state, bytes).await
+                && let Err(error) = send_attach_bytes_to_focused(client, view_state, bytes).await
             {
                 return Err(map_attach_client_error(error));
             }
@@ -10000,9 +9999,7 @@ fn attach_input_pane_context_for_id(
         })
 }
 
-fn attach_input_focused_pane_context(
-    view_state: &AttachViewState,
-) -> Option<AttachInputPaneContext> {
+fn attach_input_focused_context(view_state: &AttachViewState) -> Option<AttachInputPaneContext> {
     let pane_id = view_state.cached_layout_state.as_ref()?.focused_pane_id;
     attach_input_pane_context_for_id(view_state, pane_id)
 }
@@ -10079,7 +10076,7 @@ async fn try_handle_attach_input_hook_mouse(
     capture_only: bool,
 ) -> std::result::Result<bool, ClientError> {
     let (phase, button) = attach_input_mouse_phase(mouse_event.kind);
-    let focused = attach_input_focused_pane_context(view_state);
+    let focused = attach_input_focused_context(view_state);
     let hovered =
         attach_input_hovered_pane_context(view_state, mouse_event.column, mouse_event.row);
     let hooks = if let Some(capture) = view_state.mouse.input_capture.clone() {
@@ -10149,7 +10146,7 @@ async fn try_handle_attach_input_hook_key(
     } else {
         attach_input_hooks()
     };
-    let focused = attach_input_focused_pane_context(view_state);
+    let focused = attach_input_focused_context(view_state);
     for hook in hooks {
         if !hook_matches_key(&hook, &key_name) {
             continue;
@@ -10184,6 +10181,116 @@ async fn try_handle_attach_input_hook_key(
         }
     }
     Ok(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPointerFocusEventKind {
+    Move,
+    Wheel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPointerFocusDecision {
+    None,
+    Focus(Uuid),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachMouseTargetContext {
+    focus_target: Option<Uuid>,
+    focused: Option<Uuid>,
+    in_focused: bool,
+}
+
+fn attach_mouse_target_context(
+    view_state: &AttachViewState,
+    column: u16,
+    row: u16,
+) -> AttachMouseTargetContext {
+    let focus_target = attach_scene_pane_at(view_state, column, row);
+    let focused = view_state
+        .mouse
+        .last_focused_pane_id
+        .or_else(|| focused_attach_pane_id(view_state));
+    AttachMouseTargetContext {
+        focus_target,
+        focused,
+        in_focused: focus_target.is_some() && focus_target == focused,
+    }
+}
+
+fn reduce_attach_pointer_focus(
+    view_state: &mut AttachViewState,
+    focus_target: Option<Uuid>,
+    focused: Option<Uuid>,
+    event_kind: AttachPointerFocusEventKind,
+    now: Instant,
+) -> AttachPointerFocusDecision {
+    if !view_state.mouse.config.focus_on_hover {
+        return AttachPointerFocusDecision::None;
+    }
+
+    if focus_target != view_state.mouse.hovered_pane_id {
+        view_state.mouse.hovered_pane_id = focus_target;
+        view_state.mouse.hover_started_at = focus_target.map(|_| now);
+    }
+
+    let Some(pane_id) = focus_target else {
+        view_state.mouse.hover_started_at = None;
+        return AttachPointerFocusDecision::None;
+    };
+
+    if focused == Some(pane_id) || view_state.mouse.last_focused_pane_id == Some(pane_id) {
+        return AttachPointerFocusDecision::None;
+    }
+
+    if view_state.mouse.config.hover_delay_ms == 0 {
+        view_state.mouse.hover_started_at = Some(now);
+        return AttachPointerFocusDecision::Focus(pane_id);
+    }
+
+    if event_kind != AttachPointerFocusEventKind::Move {
+        return AttachPointerFocusDecision::None;
+    }
+
+    let Some(hover_started_at) = view_state.mouse.hover_started_at else {
+        view_state.mouse.hover_started_at = Some(now);
+        return AttachPointerFocusDecision::None;
+    };
+
+    if now.duration_since(hover_started_at)
+        >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
+    {
+        view_state.mouse.hover_started_at = Some(now);
+        return AttachPointerFocusDecision::Focus(pane_id);
+    }
+
+    AttachPointerFocusDecision::None
+}
+
+async fn execute_attach_pointer_focus_decision(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    decision: AttachPointerFocusDecision,
+    kernel_client_factory: Option<&KernelClientFactory>,
+    now: Instant,
+) -> std::result::Result<bool, ClientError> {
+    let AttachPointerFocusDecision::Focus(pane_id) = decision else {
+        return Ok(false);
+    };
+
+    if !handle_attach_mouse_gesture_action(
+        client,
+        view_state,
+        "hover_focus",
+        kernel_client_factory,
+        now,
+    )
+    .await?
+    {
+        focus_attach_pane(client, view_state, pane_id).await?;
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10268,12 +10375,8 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
-    let target_pane = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
-    let focused_pane = view_state
-        .cached_layout_state
-        .as_ref()
-        .map(|layout| layout.focused_pane_id);
-    let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
+    let mut target_context =
+        attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
 
     if matches!(
         mouse_event.kind,
@@ -10312,14 +10415,34 @@ async fn handle_attach_mouse_event_at(
         mouse_event.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
     ) {
+        let decision = reduce_attach_pointer_focus(
+            view_state,
+            target_context.focus_target,
+            target_context.focused,
+            AttachPointerFocusEventKind::Wheel,
+            now,
+        );
+        if execute_attach_pointer_focus_decision(
+            client,
+            view_state,
+            decision,
+            kernel_client_factory,
+            now,
+        )
+        .await?
+        {
+            target_context =
+                attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
+        }
+
         match view_state.mouse.config.effective_wheel_propagation() {
             bmux_config::MouseWheelPropagation::Auto => {
                 let _ = handle_attach_mouse_wheel_auto(
                     client,
                     view_state,
                     mouse_event,
-                    target_pane,
-                    in_focused_pane,
+                    target_context.focus_target,
+                    target_context.in_focused,
                 )
                 .await?;
                 return Ok(());
@@ -10329,8 +10452,8 @@ async fn handle_attach_mouse_event_at(
                     client,
                     view_state,
                     mouse_event,
-                    target_pane,
-                    in_focused_pane,
+                    target_context.focus_target,
+                    target_context.in_focused,
                     false,
                 )
                 .await?;
@@ -10350,8 +10473,8 @@ async fn handle_attach_mouse_event_at(
                     client,
                     view_state,
                     mouse_event,
-                    target_pane,
-                    in_focused_pane,
+                    target_context.focus_target,
+                    target_context.in_focused,
                     false,
                 )
                 .await?;
@@ -10368,7 +10491,7 @@ async fn handle_attach_mouse_event_at(
 
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let target = target_pane;
+            let target = target_context.focus_target;
             view_state.mouse.hovered_pane_id = target;
             view_state.mouse.hover_started_at = Some(now);
             if !handle_attach_mouse_gesture_action(
@@ -10396,7 +10519,7 @@ async fn handle_attach_mouse_event_at(
                             view_state,
                             mouse_event,
                             target,
-                            in_focused_pane,
+                            target_context.in_focused,
                             false,
                         )
                         .await?;
@@ -10407,7 +10530,7 @@ async fn handle_attach_mouse_event_at(
                             view_state,
                             mouse_event,
                             target,
-                            in_focused_pane,
+                            target_context.in_focused,
                             true,
                         )
                         .await?;
@@ -10421,8 +10544,8 @@ async fn handle_attach_mouse_event_at(
                     client,
                     view_state,
                     mouse_event,
-                    target_pane,
-                    in_focused_pane,
+                    target_context.focus_target,
+                    target_context.in_focused,
                     false,
                 )
                 .await?;
@@ -10433,59 +10556,35 @@ async fn handle_attach_mouse_event_at(
                 client,
                 view_state,
                 mouse_event,
-                target_pane,
-                in_focused_pane,
+                target_context.focus_target,
+                target_context.in_focused,
                 false,
             )
             .await?;
 
-            if view_state.mouse.config.focus_on_hover {
-                let target = target_pane;
-                if target != view_state.mouse.hovered_pane_id {
-                    view_state.mouse.hovered_pane_id = target;
-                    view_state.mouse.hover_started_at = Some(now);
-                    return Ok(());
-                }
-
-                let Some(pane_id) = target else {
-                    view_state.mouse.hover_started_at = None;
-                    return Ok(());
-                };
-
-                if view_state.mouse.last_focused_pane_id == Some(pane_id) {
-                    return Ok(());
-                }
-
-                let Some(hover_started_at) = view_state.mouse.hover_started_at else {
-                    view_state.mouse.hover_started_at = Some(now);
-                    return Ok(());
-                };
-
-                if now.duration_since(hover_started_at)
-                    >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
-                {
-                    if !handle_attach_mouse_gesture_action(
-                        client,
-                        view_state,
-                        "hover_focus",
-                        kernel_client_factory,
-                        now,
-                    )
-                    .await?
-                    {
-                        focus_attach_pane(client, view_state, pane_id).await?;
-                    }
-                    view_state.mouse.hover_started_at = Some(now);
-                }
-            }
+            let decision = reduce_attach_pointer_focus(
+                view_state,
+                target_context.focus_target,
+                target_context.focused,
+                AttachPointerFocusEventKind::Move,
+                now,
+            );
+            let _ = execute_attach_pointer_focus_decision(
+                client,
+                view_state,
+                decision,
+                kernel_client_factory,
+                now,
+            )
+            .await?;
         }
         MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
             let _ = maybe_forward_attach_mouse_event(
                 client,
                 view_state,
                 mouse_event,
-                target_pane,
-                in_focused_pane,
+                target_context.focus_target,
+                target_context.in_focused,
                 false,
             )
             .await?;
@@ -10812,31 +10911,31 @@ pub async fn maybe_forward_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
-    target_pane: Option<Uuid>,
-    in_focused_pane: bool,
+    focus_target: Option<Uuid>,
+    in_focused: bool,
     focus_before_forward: bool,
 ) -> std::result::Result<bool, ClientError> {
-    let Some(target_pane) = target_pane else {
+    let Some(focus_target) = focus_target else {
         return Ok(false);
     };
 
-    if focus_before_forward && !in_focused_pane {
-        focus_attach_pane(client, view_state, target_pane).await?;
-    } else if !in_focused_pane {
+    if focus_before_forward && !in_focused {
+        focus_attach_pane(client, view_state, focus_target).await?;
+    } else if !in_focused {
         return Ok(false);
     }
 
     let Some(bytes) = attach_mouse_forward_bytes_for_target(
         view_state,
         mouse_event,
-        Some(target_pane),
-        in_focused_pane || focus_before_forward,
+        Some(focus_target),
+        in_focused || focus_before_forward,
     ) else {
         return Ok(false);
     };
 
     client
-        .send_one_way_pane_direct_input(view_state.attached_id, target_pane, bytes)
+        .send_one_way_pane_direct_input(view_state.attached_id, focus_target, bytes)
         .await?;
     Ok(true)
 }
@@ -10844,14 +10943,14 @@ pub async fn maybe_forward_attach_mouse_event(
 pub fn attach_mouse_forward_bytes_for_target(
     view_state: &AttachViewState,
     mouse_event: MouseEvent,
-    target_pane: Option<Uuid>,
-    in_focused_pane: bool,
+    focus_target: Option<Uuid>,
+    in_focused: bool,
 ) -> Option<Vec<u8>> {
-    if !in_focused_pane {
+    if !in_focused {
         return None;
     }
-    let target_pane = target_pane?;
-    let protocol = attach_pane_mouse_protocol(view_state, target_pane)?;
+    let focus_target = focus_target?;
+    let protocol = attach_pane_mouse_protocol(view_state, focus_target)?;
     // Programs running inside a pane (nvim, tmux, etc.) expect mouse
     // coordinates relative to the pane's own virtual terminal (its PTY
     // interior), not the whole attach UI and not the outer surface bounds
@@ -10860,7 +10959,7 @@ pub fn attach_mouse_forward_bytes_for_target(
     // published by the scene producer — so clicks on the first visible
     // content cell encode to SGR `(1, 1)` regardless of how thick or thin
     // the surrounding decoration is.
-    let pane_content_rect = attach_scene_pane_content_rect(view_state, target_pane)?;
+    let pane_content_rect = attach_scene_pane_content_rect(view_state, focus_target)?;
     let shared_event = mouse_event_to_shared(mouse_event);
     let local_event = attach_mouse::translate_event_to_pane_local(shared_event, pane_content_rect)?;
     attach_mouse::encode_for_protocol(
@@ -11438,16 +11537,16 @@ pub async fn handle_attach_mouse_wheel_auto(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
-    target_pane: Option<Uuid>,
-    in_focused_pane: bool,
+    focus_target: Option<Uuid>,
+    in_focused: bool,
 ) -> std::result::Result<bool, ClientError> {
-    if pane_mouse_protocol_reports_event(view_state, target_pane, mouse_event.kind)
+    if pane_mouse_protocol_reports_event(view_state, focus_target, mouse_event.kind)
         && maybe_forward_attach_mouse_event(
             client,
             view_state,
             mouse_event,
-            target_pane,
-            in_focused_pane,
+            focus_target,
+            in_focused,
             false,
         )
         .await?
@@ -11455,15 +11554,15 @@ pub async fn handle_attach_mouse_wheel_auto(
         return Ok(true);
     }
 
-    if !in_focused_pane {
+    if !in_focused {
         return Ok(false);
     }
 
-    let Some(target_pane) = target_pane else {
+    let Some(focus_target) = focus_target else {
         return Ok(false);
     };
 
-    if attach_pane_uses_alternate_screen(view_state, target_pane) {
+    if attach_pane_uses_alternate_screen(view_state, focus_target) {
         return match view_state.mouse.config.alternate_screen_wheel {
             bmux_config::AlternateScreenWheelBehavior::Ignore => Ok(false),
             bmux_config::AlternateScreenWheelBehavior::ForwardOnly => {
@@ -11471,8 +11570,8 @@ pub async fn handle_attach_mouse_wheel_auto(
                     client,
                     view_state,
                     mouse_event,
-                    Some(target_pane),
-                    in_focused_pane,
+                    Some(focus_target),
+                    in_focused,
                     false,
                 )
                 .await
@@ -11489,13 +11588,13 @@ pub async fn handle_attach_mouse_wheel_auto(
 
 pub fn pane_mouse_protocol_reports_event(
     view_state: &AttachViewState,
-    target_pane: Option<Uuid>,
+    focus_target: Option<Uuid>,
     kind: MouseEventKind,
 ) -> bool {
-    let Some(target_pane) = target_pane else {
+    let Some(focus_target) = focus_target else {
         return false;
     };
-    let Some(protocol) = attach_pane_mouse_protocol(view_state, target_pane) else {
+    let Some(protocol) = attach_pane_mouse_protocol(view_state, focus_target) else {
         return false;
     };
     attach_mouse::mode_reports_event(protocol.mode, mouse_event_kind_to_shared(kind))
@@ -11510,7 +11609,7 @@ pub fn attach_pane_uses_alternate_screen(view_state: &AttachViewState, pane_id: 
 
 pub fn maybe_begin_attach_mouse_selection_drag(
     view_state: &mut AttachViewState,
-    target_pane: Option<Uuid>,
+    focus_target: Option<Uuid>,
     mouse_event: MouseEvent,
 ) -> bool {
     if view_state.mouse.config.effective_wheel_propagation()
@@ -11521,21 +11620,21 @@ pub fn maybe_begin_attach_mouse_selection_drag(
         return false;
     }
 
-    let Some(target_pane) = target_pane else {
+    let Some(focus_target) = focus_target else {
         return false;
     };
-    if focused_attach_pane_id(view_state) != Some(target_pane) {
+    if focused_attach_pane_id(view_state) != Some(focus_target) {
         return false;
     }
-    if pane_mouse_protocol_reports_event(view_state, Some(target_pane), mouse_event.kind)
-        || attach_pane_uses_alternate_screen(view_state, target_pane)
+    if pane_mouse_protocol_reports_event(view_state, Some(focus_target), mouse_event.kind)
+        || attach_pane_uses_alternate_screen(view_state, focus_target)
     {
         return false;
     }
 
     let Some(anchor) = attach_mouse_scrollback_position_for_event(
         view_state,
-        target_pane,
+        focus_target,
         mouse_event.column,
         mouse_event.row,
         false,
@@ -11544,7 +11643,7 @@ pub fn maybe_begin_attach_mouse_selection_drag(
     };
 
     view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
-        pane_id: target_pane,
+        pane_id: focus_target,
         anchor,
         active: false,
     });
@@ -11737,7 +11836,7 @@ pub fn handle_attach_mouse_scrollback(
     }
 }
 
-async fn send_attach_bytes_to_focused_pane(
+async fn send_attach_bytes_to_focused(
     client: &mut StreamingBmuxClient,
     view_state: &AttachViewState,
     bytes: Vec<u8>,
@@ -12382,6 +12481,104 @@ mod tests {
 
         assert_eq!(caps.cell_pixel_width, 8);
         assert_eq!(caps.cell_pixel_height, 16);
+    }
+
+    #[test]
+    fn pointer_focus_immediate_focuses_target_on_first_move() {
+        let session_id = Uuid::new_v4();
+        let focused = Uuid::new_v4();
+        let focus_target = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.mouse.config.focus_on_hover = true;
+        view_state.mouse.config.hover_delay_ms = 0;
+
+        let decision = reduce_attach_pointer_focus(
+            &mut view_state,
+            Some(focus_target),
+            Some(focused),
+            AttachPointerFocusEventKind::Move,
+            Instant::now(),
+        );
+
+        assert_eq!(decision, AttachPointerFocusDecision::Focus(focus_target));
+        assert_eq!(view_state.mouse.hovered_pane_id, Some(focus_target));
+    }
+
+    #[test]
+    fn pointer_focus_delayed_waits_for_move_dwell() {
+        let session_id = Uuid::new_v4();
+        let focused = Uuid::new_v4();
+        let focus_target = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.mouse.config.focus_on_hover = true;
+        view_state.mouse.config.hover_delay_ms = 175;
+        let now = Instant::now();
+
+        let first_decision = reduce_attach_pointer_focus(
+            &mut view_state,
+            Some(focus_target),
+            Some(focused),
+            AttachPointerFocusEventKind::Move,
+            now,
+        );
+        let dwell_decision = reduce_attach_pointer_focus(
+            &mut view_state,
+            Some(focus_target),
+            Some(focused),
+            AttachPointerFocusEventKind::Move,
+            now + Duration::from_millis(175),
+        );
+
+        assert_eq!(first_decision, AttachPointerFocusDecision::None);
+        assert_eq!(
+            dwell_decision,
+            AttachPointerFocusDecision::Focus(focus_target)
+        );
+    }
+
+    #[test]
+    fn pointer_focus_wheel_only_focuses_when_immediate() {
+        let session_id = Uuid::new_v4();
+        let focused = Uuid::new_v4();
+        let focus_target = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.mouse.config.focus_on_hover = true;
+        view_state.mouse.config.hover_delay_ms = 175;
+        let now = Instant::now();
+
+        let delayed_decision = reduce_attach_pointer_focus(
+            &mut view_state,
+            Some(focus_target),
+            Some(focused),
+            AttachPointerFocusEventKind::Wheel,
+            now + Duration::from_millis(175),
+        );
+        view_state.mouse.config.hover_delay_ms = 0;
+        let immediate_decision = reduce_attach_pointer_focus(
+            &mut view_state,
+            Some(focus_target),
+            Some(focused),
+            AttachPointerFocusEventKind::Wheel,
+            now,
+        );
+
+        assert_eq!(delayed_decision, AttachPointerFocusDecision::None);
+        assert_eq!(
+            immediate_decision,
+            AttachPointerFocusDecision::Focus(focus_target)
+        );
     }
 
     #[test]
@@ -14363,18 +14560,18 @@ mod tests {
             _ => panic!("unexpected attach actions for mouse event"),
         };
 
-        let target_pane = attach_scene_pane_at(&view_state, mouse_event.column, mouse_event.row);
-        let focused_pane = view_state
+        let focus_target = attach_scene_pane_at(&view_state, mouse_event.column, mouse_event.row);
+        let focused = view_state
             .cached_layout_state
             .as_ref()
             .map(|layout| layout.focused_pane_id);
-        let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
+        let in_focused = focus_target.is_some() && focus_target == focused;
 
         let forwarded = attach_mouse_forward_bytes_for_target(
             &view_state,
             mouse_event,
-            target_pane,
-            in_focused_pane,
+            focus_target,
+            in_focused,
         );
         assert!(
             forwarded.is_none(),
@@ -14391,8 +14588,8 @@ mod tests {
         let forwarded = attach_mouse_forward_bytes_for_target(
             &view_state,
             mouse_event,
-            target_pane,
-            in_focused_pane,
+            focus_target,
+            in_focused,
         )
         .expect("mouse move should forward once pane enables any-motion mode");
         // Fixture has outer rect (0,0,9,6) with content_rect inset by 1 on each side,

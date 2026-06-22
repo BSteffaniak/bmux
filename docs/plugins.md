@@ -524,6 +524,8 @@ enabled = true
 focus_on_click = true
 click_propagation = "focus_and_forward"
 focus_on_hover = false
+# 0 = immediate/event-based focus; set >0 to require hover dwell before focusing.
+hover_delay_ms = 0
 scroll_scrollback = true
 # auto = terminal-like: forward to mouse-aware panes, otherwise use bmux scrollback.
 # Explicit alternatives: forward_only, scrollback_only, forward_and_scrollback.

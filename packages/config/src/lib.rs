@@ -1988,7 +1988,7 @@ impl Default for MouseBehaviorConfig {
             focus_on_click: true,
             click_propagation: MouseClickPropagation::default(),
             focus_on_hover: false,
-            hover_delay_ms: 175,
+            hover_delay_ms: 0,
             scroll_scrollback: true,
             wheel_propagation: MouseWheelPropagation::default(),
             scroll_lines_per_tick: 3,
@@ -3304,13 +3304,6 @@ impl BmuxConfig {
             });
         }
 
-        if self.behavior.mouse.hover_delay_ms == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "behavior.mouse.hover_delay_ms".to_string(),
-                value: "0".to_string(),
-            });
-        }
-
         if self.behavior.mouse.scroll_lines_per_tick == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "behavior.mouse.scroll_lines_per_tick".to_string(),
@@ -3439,14 +3432,6 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "general.mouse_support={} -> behavior.mouse.enabled={}",
                 self.general.mouse_support, self.general.mouse_support
-            ));
-        }
-
-        if self.behavior.mouse.hover_delay_ms == 0 {
-            self.behavior.mouse.hover_delay_ms = MouseBehaviorConfig::default().hover_delay_ms;
-            repaired_fields.push(format!(
-                "behavior.mouse.hover_delay_ms=0 -> {}",
-                self.behavior.mouse.hover_delay_ms
             ));
         }
 
@@ -4416,7 +4401,7 @@ timeout_profile = "missing"
     }
 
     #[test]
-    fn load_repairs_invalid_mouse_values_without_persisting() {
+    fn load_preserves_zero_hover_delay_and_repairs_invalid_mouse_values_without_persisting() {
         let path = temp_config_path();
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
@@ -4426,7 +4411,7 @@ timeout_profile = "missing"
         .expect("failed writing invalid config fixture");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        assert_eq!(config.behavior.mouse.hover_delay_ms, 175);
+        assert_eq!(config.behavior.mouse.hover_delay_ms, 0);
         assert_eq!(config.behavior.mouse.scroll_lines_per_tick, 3);
 
         let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
@@ -4453,6 +4438,7 @@ timeout_profile = "missing"
             MouseSelectionReleaseBehavior::Select
         );
         assert!(mouse.resize_borders);
+        assert_eq!(mouse.hover_delay_ms, 0);
     }
 
     #[test]
