@@ -9154,10 +9154,21 @@ async fn maybe_sync_remote_clipboard(
     now: Instant,
 ) {
     if let Err(error) = sync_remote_clipboard(client, view_state, trigger, now).await {
-        tracing::debug!(?error, ?trigger, "remote clipboard sync skipped");
+        tracing::warn!(
+            error = %error,
+            "remote clipboard sync failed"
+        );
     }
 }
 
+#[tracing::instrument(
+    skip(client, view_state),
+    fields(
+        bmux.component = "clipboard.remote_sync",
+        bmux.operation = "sync",
+        trigger = ?trigger,
+    )
+)]
 async fn sync_remote_clipboard(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -9170,9 +9181,15 @@ async fn sync_remote_clipboard(
         || sync.mode == ClipboardRemoteSyncMode::Off
         || sync.mode == ClipboardRemoteSyncMode::Manual
     {
+        tracing::debug!(
+            enabled = sync.enabled,
+            mode = ?sync.mode,
+            "remote clipboard sync disabled by config"
+        );
         return Ok(());
     }
     if sync.mode != ClipboardRemoteSyncMode::FocusLazy {
+        tracing::debug!(mode = ?sync.mode, "remote clipboard sync mode not active for focus-lazy runtime");
         return Ok(());
     }
     if let Some(last_attempt) = view_state.clipboard_sync_state.attempt_at {
@@ -9183,6 +9200,7 @@ async fn sync_remote_clipboard(
             ClipboardSyncTrigger::Connect | ClipboardSyncTrigger::ActivityAfterIdle => min_interval,
         };
         if now.duration_since(last_attempt) < required {
+            tracing::debug!("remote clipboard sync rate limited");
             return Ok(());
         }
     }
@@ -9192,10 +9210,13 @@ async fn sync_remote_clipboard(
         bmux_clipboard::read_payload(sync.images).map_err(|error| anyhow::anyhow!(error))?;
     let mime = payload.mime().to_string();
     let bytes_len = payload.bytes_len();
+    tracing::debug!(mime, bytes_len, "remote clipboard payload read");
     if mime == "text/plain" && !sync.text {
+        tracing::debug!("remote clipboard sync skipped because text is disabled");
         return Ok(());
     }
     if mime == "image/png" && !sync.images {
+        tracing::debug!("remote clipboard sync skipped because images are disabled");
         return Ok(());
     }
     let max_for_type = if mime == "text/plain" {
@@ -9219,9 +9240,11 @@ async fn sync_remote_clipboard(
     };
     let payload_hash = clipboard_payload_hash(&mime, &bytes);
     if view_state.clipboard_sync_state.payload_hash.as_deref() == Some(payload_hash.as_str()) {
+        tracing::debug!(hash = %payload_hash, "remote clipboard sync skipped unchanged payload");
         return Ok(());
     }
     let request = ClipboardRemotePayloadRequest { mime, bytes, text };
+    tracing::debug!(hash = %payload_hash, "remote clipboard materialization invoke started");
     let payload =
         bmux_codec::to_positional_vec(&request).context("encoding clipboard sync payload")?;
     let sync_future = client.invoke_service_raw(
@@ -9238,7 +9261,8 @@ async fn sync_remote_clipboard(
     .await
     .context("remote clipboard sync timed out")?
     .map_err(|error| anyhow::anyhow!(error))?;
-    view_state.clipboard_sync_state.payload_hash = Some(payload_hash);
+    view_state.clipboard_sync_state.payload_hash = Some(payload_hash.clone());
+    tracing::info!(hash = %payload_hash, "remote clipboard sync succeeded");
     Ok(())
 }
 

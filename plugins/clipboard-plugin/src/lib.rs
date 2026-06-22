@@ -16,20 +16,31 @@ impl RustPlugin for ClipboardPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        let span = tracing::debug_span!(
+            "clipboard_plugin_service",
+            bmux.component = "clipboard.remote_sync",
+            bmux.operation = %context.request.operation,
+            interface_id = %context.request.service.interface_id,
+        );
+        let _guard = span.enter();
         bmux_plugin_sdk::route_service!(context, {
             "clipboard-write/v1", "copy_text" => |req: ClipboardCopyRequest, _ctx| {
+                tracing::debug!("clipboard copy_text invoked");
                 bmux_clipboard::copy_text(&req.text).map_err(map_clipboard_error)?;
                 Ok(())
             },
             "clipboard-write/v1", "copy_image_png" => |req: ClipboardImageRequest, _ctx| {
+                tracing::debug!(bytes_len = req.bytes.len(), "clipboard copy_image_png invoked");
                 bmux_clipboard::copy_png_image(&req.bytes).map_err(map_clipboard_error)?;
                 Ok(())
             },
             "clipboard-read/v1", "read_payload" => |req: ClipboardReadRequest, _ctx| {
+                tracing::debug!(prefer_image = req.prefer_image, "clipboard read_payload invoked");
                 let payload = bmux_clipboard::read_payload(req.prefer_image).map_err(map_clipboard_error)?;
                 Ok(ClipboardPayloadResponse::from_payload(payload))
             },
             "clipboard-remote-sync/v1", "materialize_payload" => |req: ClipboardPayloadResponse, ctx| {
+                tracing::debug!(mime = %req.mime, bytes_len = req.bytes.len(), "clipboard materialize_payload invoked");
                 materialize_payload(&req, &ctx.connection.state_dir).map_err(|message| {
                     ServiceResponse::error("materialize_failed", message)
                 })
@@ -97,6 +108,7 @@ fn materialize_payload(
                 .clone()
                 .unwrap_or_else(|| String::from_utf8_lossy(&payload.bytes).into_owned());
             bmux_clipboard::copy_text(&text).map_err(|error| error.to_string())?;
+            tracing::info!(bytes_len = text.len(), "clipboard text materialized");
             Ok(ClipboardMaterializeResponse {
                 mime: payload.mime.clone(),
                 bytes_len: text.len(),
@@ -109,7 +121,14 @@ fn materialize_payload(
             fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
             let path = dir.join(format!("{hash}.png"));
             fs::write(&path, &payload.bytes).map_err(|error| error.to_string())?;
-            let _ = bmux_clipboard::copy_png_image(&payload.bytes);
+            match bmux_clipboard::copy_png_image(&payload.bytes) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), bytes_len = payload.bytes.len(), "clipboard image materialized and copied");
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "clipboard image materialized but OS clipboard write failed");
+                }
+            }
             Ok(ClipboardMaterializeResponse {
                 mime: payload.mime.clone(),
                 bytes_len: payload.bytes.len(),

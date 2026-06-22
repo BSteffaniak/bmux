@@ -992,6 +992,9 @@ pub struct BmuxConfig {
     /// Runtime diagnostic log rotation, retention, and sink selection
     #[config_doc(nested)]
     pub logs: LogsConfig,
+    /// Structured operational diagnostics captured from tracing events
+    #[config_doc(nested)]
+    pub diagnostics: DiagnosticsConfig,
     /// Kiosk profiles and SSH/bootstrap settings for locked-down access flows
     #[config_doc(nested)]
     pub kiosk: KioskConfig,
@@ -1066,6 +1069,68 @@ pub enum ClipboardRemoteSyncMode {
     FocusLazy,
     PasteLazy,
     Eager,
+}
+
+/// Structured operational diagnostics captured from tracing events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "diagnostics")]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// Enable the operational diagnostics event sink.
+    pub enabled: bool,
+    /// Persist selected diagnostics to `$BMUX_STATE_DIR/diagnostics/events.jsonl`.
+    pub persist: bool,
+    /// Minimum event level captured when no component override applies.
+    pub min_level: DiagnosticTraceLevel,
+    /// Maximum persisted JSONL events retained after pruning.
+    pub max_events: usize,
+    /// Component-specific capture policy keyed by semantic component name.
+    #[config_doc(nested, map_key = "<component>")]
+    pub components: BTreeMap<String, DiagnosticsComponentConfig>,
+    /// Target/module-prefix rules for automatically assigning semantic components.
+    #[config_doc(nested, map_key = "<target-prefix>")]
+    pub targets: BTreeMap<String, DiagnosticsTargetConfig>,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            persist: true,
+            min_level: DiagnosticTraceLevel::Warn,
+            max_events: 1_000,
+            components: BTreeMap::new(),
+            targets: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDoc)]
+#[serde(default)]
+pub struct DiagnosticsComponentConfig {
+    /// Minimum event level captured for this component.
+    pub min_level: Option<DiagnosticTraceLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDoc)]
+#[serde(default)]
+pub struct DiagnosticsTargetConfig {
+    /// Semantic component name assigned to matching tracing targets.
+    pub component: String,
+    /// Optional minimum event level captured for this target rule.
+    pub min_level: Option<DiagnosticTraceLevel>,
+}
+
+/// Tracing level used by operational diagnostics capture policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticTraceLevel {
+    Error,
+    #[default]
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 /// Kiosk profile configuration for SSH-first locked sessions.

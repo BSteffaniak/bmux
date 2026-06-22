@@ -1323,6 +1323,7 @@ dependencies = [
  "bmux_clipboard",
  "bmux_plugin_sdk",
  "serde",
+ "tracing",
 ]
 
 [[package]]

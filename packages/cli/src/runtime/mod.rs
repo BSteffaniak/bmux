@@ -22,6 +22,7 @@ mod built_in_commands;
 mod cli_parse;
 mod config_cli;
 mod device_seal_broker;
+mod diagnostics_layer;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;

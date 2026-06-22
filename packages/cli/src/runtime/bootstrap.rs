@@ -28,6 +28,7 @@ use super::{
     try_kill_pid, validate_enabled_plugins, wait_for_server_running, write_server_pid_file,
     write_server_runtime_metadata,
 };
+use crate::runtime::diagnostics_layer::OperationalDiagnosticsLayer;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DefaultAttachOptions;
@@ -883,10 +884,13 @@ fn init_segmented_logging(
         .with_writer(non_blocking_writer);
     let stderr_layer =
         (!file_only).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+    let diagnostics_layer =
+        OperationalDiagnosticsLayer::new(config.diagnostics.clone(), &paths.state_dir);
     let subscriber = tracing_subscriber::registry()
         .with(env_filter)
         .with(file_layer)
-        .with(stderr_layer);
+        .with(stderr_layer)
+        .with(diagnostics_layer);
     tracing::subscriber::set_global_default(subscriber)?;
     let _ = tracing_log::LogTracer::init();
     Ok(RuntimeLoggingHandle::Diagnostic {

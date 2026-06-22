@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 bmux_clipboard  = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 serde           = { workspace = true, features = ["derive", "std"] }
+tracing         = { workspace = true }
 
 [features]
 fail-on-warnings = [
