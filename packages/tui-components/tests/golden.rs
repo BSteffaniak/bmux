@@ -25,8 +25,7 @@ fn golden_styled_truncation_components() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
     let mut frame = Frame::new(&mut buffer);
 
-    Badge::new("very-long")
-        .render(Rect::new(0, 0, 6, 1), &mut frame);
+    Badge::new("very-long").render(Rect::new(0, 0, 6, 1), &mut frame);
 
     let breadcrumbs_items = [
         BreadcrumbItem::new("home", "Home"),
@@ -45,7 +44,9 @@ fn golden_styled_truncation_components() {
         StatusSegment::new("ready"),
         StatusSegment::new("warning").severity(StatusSeverity::Warning),
     ];
-    StatusBar::new().left(&status_segments).render(Rect::new(0, 3, 9, 1), &mut frame);
+    StatusBar::new()
+        .left(&status_segments)
+        .render(Rect::new(0, 3, 9, 1), &mut frame);
 
     let tabs = [
         bmux_tui_components::tab_bar::TabItem::new("one", "One"),
@@ -54,9 +55,11 @@ fn golden_styled_truncation_components() {
             Line::from_spans([Span::styled("VeryLong", Style::new().fg(Color::Green))]),
         ),
     ];
-    TabBar::new(&tabs)
-        .policy(TabBarPolicy::bare())
-        .render(Rect::new(0, 4, 9, 1), &TabBarState::new(Some(1)), &mut frame);
+    TabBar::new(&tabs).policy(TabBarPolicy::bare()).render(
+        Rect::new(0, 4, 9, 1),
+        &TabBarState::new(Some(1)),
+        &mut frame,
+    );
 
     assert_eq!(
         buffer_rows(frame.buffer()),
@@ -73,7 +76,11 @@ fn golden_styled_truncation_components() {
 
 #[test]
 fn golden_scroll_area_and_text_view_both_axis_scrollbars() {
-    let lines = [Line::from("abcdef"), Line::from("ghijkl"), Line::from("mnopqr")];
+    let lines = [
+        Line::from("abcdef"),
+        Line::from("ghijkl"),
+        Line::from("mnopqr"),
+    ];
 
     let mut scroll_buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
     let mut scroll_frame = Frame::new(&mut scroll_buffer);
@@ -139,6 +146,10 @@ fn golden_table_rich_truncation_and_text_view_wrapping() {
             wrap: TextWrap::Word,
             ..TextViewPolicy::bare()
         })
-        .render(Rect::new(0, 0, 4, 2), &TextViewState::new(), &mut text_frame);
+        .render(
+            Rect::new(0, 0, 4, 2),
+            &TextViewState::new(),
+            &mut text_frame,
+        );
     assert_eq!(buffer_rows(text_frame.buffer()), vec!["one ", "two "]);
 }

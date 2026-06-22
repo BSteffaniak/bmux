@@ -7,13 +7,13 @@ use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::terminal::Terminal;
-use bmux_tui_components_gallery::render_gallery_into;
+use bmux_tui_components_gallery::{HEIGHT, WIDTH, render_gallery_into};
 
 fn main() -> Result<()> {
     let mut guard = CrosstermTerminalGuard::enter(stdout())?;
     {
         let writer = guard.writer_mut().expect("guard should own stdout");
-        let mut terminal = Terminal::new(writer, Rect::new(0, 0, 72, 24));
+        let mut terminal = Terminal::new(writer, Rect::new(0, 0, WIDTH, HEIGHT));
 
         loop {
             terminal.draw(render_gallery_into)?;

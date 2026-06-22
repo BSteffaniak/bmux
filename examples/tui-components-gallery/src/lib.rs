@@ -2,7 +2,7 @@ use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::{Clear, Line};
+use bmux_tui::prelude::{Clear, Line, Span, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::widget::Widget;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
@@ -29,17 +29,22 @@ use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
 use bmux_tui_components::progress_bar::{
     ProgressBar, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement,
 };
+use bmux_tui_components::scroll_area::{
+    ScrollArea, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
+};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState,
 };
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy};
 use bmux_tui_components::stepper::{StepItem, StepStatus, Stepper, StepperPolicy};
+use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
+use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState};
 use bmux_tui_components::toast_stack::{ToastItem, ToastSeverity, ToastStack, ToastStackState};
 
 pub const WIDTH: u16 = 72;
-pub const HEIGHT: u16 = 24;
+pub const HEIGHT: u16 = 30;
 
 pub fn render_gallery() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
@@ -66,6 +71,7 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_toasts(frame);
     render_chart(frame);
     render_canvas(frame);
+    render_recent_text_polish(frame);
 }
 
 fn render_buttons(frame: &mut Frame<'_>) {
@@ -231,6 +237,47 @@ fn render_canvas(frame: &mut Frame<'_>) {
         .render(Rect::new(35, 22, 18, 2), frame);
 }
 
+fn render_recent_text_polish(frame: &mut Frame<'_>) {
+    let scroll_lines = [
+        Line::from("horizontal scroll area"),
+        Line::from("wide content with gutter"),
+        Line::from("bottom row visible"),
+    ];
+    let mut scroll_state = ScrollAreaState::new();
+    scroll_state.set_vertical_offset(1);
+    scroll_state.set_horizontal_offset(5);
+    ScrollArea::new(&scroll_lines)
+        .policy(
+            ScrollAreaPolicy::interactive()
+                .scrollbar(ScrollAreaScrollbarMode::Gutter)
+                .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+        )
+        .render(Rect::new(1, 24, 22, 3), &scroll_state, frame);
+
+    let text_lines = [Line::from_spans([
+        Span::styled("Styled ", Style::new().fg(Color::Yellow)),
+        Span::styled("wrapping ", Style::new().fg(Color::Cyan)),
+        Span::styled("demo", Style::new().fg(Color::Magenta)),
+    ])];
+    TextView::new(&text_lines)
+        .policy(TextViewPolicy {
+            wrap: TextWrap::Word,
+            ..TextViewPolicy::bare()
+        })
+        .render(Rect::new(25, 24, 14, 3), &TextViewState::new(), frame);
+
+    let columns = [TableColumn::new("Rich").fixed(8)];
+    let rows = [TableRow::rich([Line::from_spans([
+        Span::styled("red", Style::new().fg(Color::Red)),
+        Span::styled("blue", Style::new().fg(Color::Blue)),
+    ])])];
+    Table::new(&columns, &rows).render(Rect::new(41, 24, 10, 3), &TableState::new(Some(0)), frame);
+
+    Badge::new("truncated-style")
+        .severity(BadgeSeverity::Info)
+        .render(Rect::new(53, 24, 12, 1), frame);
+}
+
 fn render_toasts(frame: &mut Frame<'_>) {
     let toasts = [
         ToastItem::new("saved", "Saved")
@@ -343,6 +390,9 @@ mod tests {
         assert!(rendered.contains("Changes persisted"));
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("Styled"));
+        assert!(rendered.contains("Rich"));
+        assert!(rendered.contains("truncated"));
         assert!(rendered.contains("Dialog body with actions"));
     }
 }
