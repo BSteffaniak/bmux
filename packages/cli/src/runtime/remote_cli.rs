@@ -7211,11 +7211,14 @@ pub(super) async fn run_remote_init(
         target.user = None;
     }
 
-    config.connections.targets.insert(name.to_string(), target);
+    config
+        .connections
+        .targets
+        .insert(name.to_string(), target.clone());
     if set_default {
         config.connections.default_target = Some(name.to_string());
     }
-    config.save()?;
+    save_remote_target_state_overlay(name, &target, set_default)?;
 
     println!("saved remote target '{name}'");
     let test_status = run_remote_test(name).await?;
@@ -7223,6 +7226,63 @@ pub(super) async fn run_remote_init(
         println!("remote init validation succeeded for '{name}'");
     }
     Ok(0)
+}
+
+fn save_remote_target_state_overlay(
+    name: &str,
+    target: &ConnectionTargetConfig,
+    set_default: bool,
+) -> Result<()> {
+    let paths = ConfigPaths::default();
+    let path = paths.state_config_file();
+    let mut overlay = if path.exists() {
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed reading state config overlay {}", path.display()))?;
+        toml::from_str::<toml::Value>(&contents)
+            .with_context(|| format!("failed parsing state config overlay {}", path.display()))?
+    } else {
+        toml::Value::Table(toml::Table::new())
+    };
+
+    let table = overlay
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("state config overlay root must be a TOML table"))?;
+    let connections = table
+        .entry("connections")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("state config overlay connections must be a TOML table"))?;
+    let targets = connections
+        .entry("targets")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!("state config overlay connections.targets must be a TOML table")
+        })?;
+    targets.insert(
+        name.to_string(),
+        toml::Value::try_from(target).context("failed serializing remote target")?,
+    );
+    if set_default {
+        connections.insert(
+            "default_target".to_string(),
+            toml::Value::String(name.to_string()),
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating state config overlay directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let contents =
+        toml::to_string_pretty(&overlay).context("failed serializing state config overlay")?;
+    std::fs::write(&path, contents)
+        .with_context(|| format!("failed writing state config overlay {}", path.display()))?;
+    Ok(())
 }
 
 pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {

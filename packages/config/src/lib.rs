@@ -638,7 +638,7 @@ fn merged_raw_config_value_with_overrides(
         .unwrap_or_else(|| ConfigLoadOverrides::from_env_with_cli(None));
 
     // Precedence (low → high):
-    //   base_config_path → primary config → BMUX_CONFIG env → --config flag
+    //   base_config_path → primary config → mutable state overlay → BMUX_CONFIG env → --config flag
     // Prepend the base layer so it sits below everything else. Skip the
     // base layer entirely when `BMUX_NO_BASE_CONFIG` is truthy.
     if !base_config_disabled()
@@ -646,6 +646,11 @@ fn merged_raw_config_value_with_overrides(
         && base.exists()
     {
         source_paths.insert(0, base.clone());
+    }
+
+    let state_overlay_path = ConfigPaths::default().state_config_file();
+    if state_overlay_path.exists() {
+        source_paths.push(state_overlay_path);
     }
 
     if let Some(value) = resolved_overrides.env_config_path {
@@ -3247,6 +3252,16 @@ impl BmuxConfig {
     pub fn save(&self) -> Result<()> {
         let paths = ConfigPaths::default();
         self.save_to_path(&paths.config_file())
+    }
+
+    /// Save configuration to the mutable state overlay location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state overlay file cannot be written.
+    pub fn save_state_overlay(&self) -> Result<()> {
+        let paths = ConfigPaths::default();
+        self.save_to_path(&paths.state_config_file())
     }
 
     /// Save configuration to a specific path

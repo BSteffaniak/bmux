@@ -155,6 +155,12 @@ impl ConfigPaths {
         self.resolve("bmux.toml")
     }
 
+    /// Get the mutable state overlay config file path.
+    #[must_use]
+    pub fn state_config_file(&self) -> PathBuf {
+        self.state_dir().join("config-overlay.toml")
+    }
+
     /// Add a config directory candidate ahead of existing candidates.
     pub fn prepend_config_dir_candidate(&mut self, path: PathBuf) {
         self.config_dir_candidates
