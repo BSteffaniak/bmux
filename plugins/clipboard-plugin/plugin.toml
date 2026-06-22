@@ -1,13 +1,27 @@
-execution_class       = "native_fast"
-id                    = "bmux.clipboard"
-name                  = "bmux Clipboard"
-provided_capabilities = ["bmux.clipboard.write"]
-provided_features     = ["bmux.clipboard"]
-version               = "0.0.1-alpha.0"
+execution_class = "native_fast"
+id = "bmux.clipboard"
+name = "bmux Clipboard"
+provided_capabilities = [
+    "bmux.clipboard.write",
+    "bmux.clipboard.read",
+    "bmux.clipboard.remote_sync",
+]
+provided_features = ["bmux.clipboard"]
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.clipboard.write"
 interface_id = "clipboard-write/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.clipboard.read"
+interface_id = "clipboard-read/v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.clipboard.remote_sync"
+interface_id = "clipboard-remote-sync/v1"
 kind         = "command"
 
 [keybindings.runtime]

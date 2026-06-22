@@ -24,7 +24,10 @@ use bmux_client::{
     AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
     StreamingBmuxClient,
 };
-use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
+use bmux_config::{
+    BmuxConfig, ClipboardRemoteSyncMode, ConfigPaths, PaneRestoreMethod, ResolvedTimeout,
+    StatusPosition,
+};
 use bmux_context_state::ContextSelector;
 use bmux_ipc::InvokeServiceKind;
 use bmux_keybind::{action_to_config_name, parse_action};
@@ -55,6 +58,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::Path;
 use std::pin::Pin;
@@ -2819,6 +2823,13 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     )
     .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
+    maybe_sync_remote_clipboard(
+        &mut client,
+        &mut view_state,
+        ClipboardSyncTrigger::Connect,
+        Instant::now(),
+    )
+    .await;
     // `hydrate_attach_state_from_snapshot` populated
     // `cached_layout_state`; emit the first attach-layout snapshot so
     // plugins subscribing to the state channel observe initial
@@ -9122,6 +9133,122 @@ pub fn attach_view_event_matches_target(
     event_session_id == view_state.attached_id
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClipboardRemotePayloadRequest {
+    mime: String,
+    bytes: Vec<u8>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardSyncTrigger {
+    Connect,
+    FocusGained,
+    ActivityAfterIdle,
+}
+
+async fn maybe_sync_remote_clipboard(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    trigger: ClipboardSyncTrigger,
+    now: Instant,
+) {
+    if let Err(error) = sync_remote_clipboard(client, view_state, trigger, now).await {
+        tracing::debug!(?error, ?trigger, "remote clipboard sync skipped");
+    }
+}
+
+async fn sync_remote_clipboard(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    trigger: ClipboardSyncTrigger,
+    now: Instant,
+) -> Result<()> {
+    let config = BmuxConfig::load().unwrap_or_default();
+    let sync = &config.clipboard.remote_sync;
+    if !sync.enabled
+        || sync.mode == ClipboardRemoteSyncMode::Off
+        || sync.mode == ClipboardRemoteSyncMode::Manual
+    {
+        return Ok(());
+    }
+    if sync.mode != ClipboardRemoteSyncMode::FocusLazy {
+        return Ok(());
+    }
+    if let Some(last_attempt) = view_state.clipboard_sync_state.attempt_at {
+        let min_interval = Duration::from_millis(sync.min_interval_ms);
+        let debounce = Duration::from_millis(sync.debounce_ms);
+        let required = match trigger {
+            ClipboardSyncTrigger::FocusGained => min_interval.max(debounce),
+            ClipboardSyncTrigger::Connect | ClipboardSyncTrigger::ActivityAfterIdle => min_interval,
+        };
+        if now.duration_since(last_attempt) < required {
+            return Ok(());
+        }
+    }
+    view_state.clipboard_sync_state.attempt_at = Some(now);
+
+    let payload =
+        bmux_clipboard::read_payload(sync.images).map_err(|error| anyhow::anyhow!(error))?;
+    let mime = payload.mime().to_string();
+    let bytes_len = payload.bytes_len();
+    if mime == "text/plain" && !sync.text {
+        return Ok(());
+    }
+    if mime == "image/png" && !sync.images {
+        return Ok(());
+    }
+    let max_for_type = if mime == "text/plain" {
+        sync.max_text_bytes
+    } else {
+        sync.max_image_bytes
+    };
+    let bytes_len_u64 = u64::try_from(bytes_len).unwrap_or(u64::MAX);
+    if bytes_len_u64 > max_for_type || bytes_len_u64 > sync.max_total_bytes {
+        tracing::debug!(
+            mime,
+            bytes_len,
+            "remote clipboard sync skipped oversized payload"
+        );
+        return Ok(());
+    }
+
+    let (bytes, text) = match payload {
+        bmux_clipboard::ClipboardPayload::Text(text) => (text.as_bytes().to_vec(), Some(text)),
+        bmux_clipboard::ClipboardPayload::ImagePng(bytes) => (bytes, None),
+    };
+    let payload_hash = clipboard_payload_hash(&mime, &bytes);
+    if view_state.clipboard_sync_state.payload_hash.as_deref() == Some(payload_hash.as_str()) {
+        return Ok(());
+    }
+    let request = ClipboardRemotePayloadRequest { mime, bytes, text };
+    let payload =
+        bmux_codec::to_positional_vec(&request).context("encoding clipboard sync payload")?;
+    let sync_future = client.invoke_service_raw(
+        "bmux.clipboard.remote_sync",
+        InvokeServiceKind::Command,
+        "clipboard-remote-sync/v1",
+        "materialize_payload",
+        payload,
+    );
+    tokio::time::timeout(
+        Duration::from_millis(sync.request_timeout_ms.max(1)),
+        sync_future,
+    )
+    .await
+    .context("remote clipboard sync timed out")?
+    .map_err(|error| anyhow::anyhow!(error))?;
+    view_state.clipboard_sync_state.payload_hash = Some(payload_hash);
+    Ok(())
+}
+
+fn clipboard_payload_hash(mime: &str, bytes: &[u8]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    mime.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // Attach event handling threads shared mutable runtime state through one hot path.
 pub async fn handle_attach_terminal_event(
@@ -9137,6 +9264,42 @@ pub async fn handle_attach_terminal_event(
     let geometry = terminal_event.geometry;
     let normalized_event = terminal_event.normalized;
     let raw_event = terminal_event.raw;
+    match &normalized_event {
+        Some(TerminalInputEvent::FocusGained) => {
+            maybe_sync_remote_clipboard(client, view_state, ClipboardSyncTrigger::FocusGained, now)
+                .await;
+        }
+        Some(
+            TerminalInputEvent::Key(_)
+            | TerminalInputEvent::Mouse(_)
+            | TerminalInputEvent::Bytes(_),
+        ) => {
+            if view_state
+                .clipboard_sync_state
+                .activity_at
+                .is_some_and(|last| {
+                    now.duration_since(last)
+                        >= Duration::from_millis(
+                            BmuxConfig::load()
+                                .unwrap_or_default()
+                                .clipboard
+                                .remote_sync
+                                .idle_after_ms,
+                        )
+                })
+            {
+                maybe_sync_remote_clipboard(
+                    client,
+                    view_state,
+                    ClipboardSyncTrigger::ActivityAfterIdle,
+                    now,
+                )
+                .await;
+            }
+            view_state.clipboard_sync_state.activity_at = Some(now);
+        }
+        _ => {}
+    }
     if matches!(&raw_event, Event::Resize(_, _)) {
         update_attach_viewport_with_geometry(
             client,
@@ -9154,9 +9317,12 @@ pub async fn handle_attach_terminal_event(
             {
                 Some(view_state.prompt.handle_terminal_key_event(key))
             }
-            Some(TerminalInputEvent::Key(_) | TerminalInputEvent::Bytes(_)) => {
-                Some(PromptKeyDisposition::NotActive)
-            }
+            Some(
+                TerminalInputEvent::Key(_)
+                | TerminalInputEvent::Bytes(_)
+                | TerminalInputEvent::FocusGained
+                | TerminalInputEvent::FocusLost,
+            ) => Some(PromptKeyDisposition::NotActive),
             Some(TerminalInputEvent::Mouse(mouse)) => Some(
                 view_state
                     .prompt
@@ -12233,7 +12399,9 @@ fn attach_terminal_input_event_actions(
             || Ok(vec![AttachEventAction::Ignore]),
             |mouse| Ok(vec![AttachEventAction::Mouse(mouse)]),
         ),
-        TerminalInputEvent::Resize { .. } => Ok(vec![AttachEventAction::Redraw]),
+        TerminalInputEvent::Resize { .. }
+        | TerminalInputEvent::FocusGained
+        | TerminalInputEvent::FocusLost => Ok(vec![AttachEventAction::Redraw]),
         TerminalInputEvent::Bytes(_) => Ok(vec![AttachEventAction::Ignore]),
     }
 }

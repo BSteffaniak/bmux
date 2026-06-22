@@ -977,6 +977,9 @@ pub struct BmuxConfig {
     /// Local and remote connection target profiles
     #[config_doc(nested)]
     pub connections: ConnectionsConfig,
+    /// Clipboard integration and remote sync behavior
+    #[config_doc(nested)]
+    pub clipboard: ClipboardConfig,
     /// Content and layout of the status bar displayed at the top or bottom of the terminal
     #[config_doc(nested)]
     pub status_bar: StatusBarConfig,
@@ -995,6 +998,74 @@ pub struct BmuxConfig {
     /// Sandbox workflow defaults for cleanup and isolation operations
     #[config_doc(nested)]
     pub sandbox: SandboxConfig,
+}
+
+/// Clipboard integration and remote sync behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "clipboard")]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// Remote clipboard sync policy.
+    #[config_doc(nested)]
+    pub remote_sync: ClipboardRemoteSyncConfig,
+}
+
+/// Remote clipboard sync policy and limits.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct ClipboardRemoteSyncConfig {
+    /// Enable client-to-remote clipboard sync.
+    pub enabled: bool,
+    /// Sync trigger mode.
+    pub mode: ClipboardRemoteSyncMode,
+    /// Sync text clipboard payloads.
+    pub text: bool,
+    /// Sync PNG/image clipboard payloads.
+    pub images: bool,
+    /// Maximum text clipboard bytes to sync.
+    pub max_text_bytes: u64,
+    /// Maximum image clipboard bytes to sync.
+    pub max_image_bytes: u64,
+    /// Maximum total clipboard payload bytes to sync.
+    pub max_total_bytes: u64,
+    /// Minimum milliseconds between sync attempts per client process.
+    pub min_interval_ms: u64,
+    /// Debounce milliseconds for focus/activity-triggered syncs.
+    pub debounce_ms: u64,
+    /// Idle milliseconds before first-input fallback triggers sync.
+    pub idle_after_ms: u64,
+    /// Clipboard request timeout in milliseconds.
+    pub request_timeout_ms: u64,
+}
+
+impl Default for ClipboardRemoteSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: ClipboardRemoteSyncMode::FocusLazy,
+            text: true,
+            images: true,
+            max_text_bytes: 1024 * 1024,
+            max_image_bytes: 10 * 1024 * 1024,
+            max_total_bytes: 10 * 1024 * 1024,
+            min_interval_ms: 1_000,
+            debounce_ms: 250,
+            idle_after_ms: 2_000,
+            request_timeout_ms: 500,
+        }
+    }
+}
+
+/// Remote clipboard sync trigger mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardRemoteSyncMode {
+    Off,
+    Manual,
+    #[default]
+    FocusLazy,
+    PasteLazy,
+    Eager,
 }
 
 /// Kiosk profile configuration for SSH-first locked sessions.

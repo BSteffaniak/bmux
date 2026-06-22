@@ -205,6 +205,178 @@ fn is_file(path: &Path) -> bool {
     path.metadata().is_ok_and(|metadata| metadata.is_file())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardPayload {
+    Text(String),
+    ImagePng(Vec<u8>),
+}
+
+impl ClipboardPayload {
+    #[must_use]
+    pub const fn mime(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text/plain",
+            Self::ImagePng(_) => "image/png",
+        }
+    }
+
+    #[must_use]
+    pub const fn bytes_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::ImagePng(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// Read the current system clipboard, preferring PNG image data when available.
+///
+/// # Errors
+///
+/// Returns [`ClipboardError`] if no supported clipboard backend is available or
+/// the backend command fails.
+pub fn read_payload(prefer_image: bool) -> Result<ClipboardPayload, ClipboardError> {
+    if prefer_image && env::consts::OS == "macos" && command_exists("osascript") {
+        match read_macos_png_clipboard() {
+            Ok(Some(bytes)) => return Ok(ClipboardPayload::ImagePng(bytes)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    read_text().map(ClipboardPayload::Text)
+}
+
+/// Read text from the system clipboard.
+///
+/// # Errors
+///
+/// Returns [`ClipboardError`] if no supported read backend is available or the
+/// backend command fails.
+pub fn read_text() -> Result<String, ClipboardError> {
+    let (program, args): (&str, &[&str]) = match env::consts::OS {
+        "macos" => ("pbpaste", &[]),
+        "linux" if command_exists("wl-paste") => ("wl-paste", &["--no-newline"]),
+        "linux" if command_exists("xclip") => ("xclip", &["-selection", "clipboard", "-out"]),
+        "linux" if command_exists("xsel") => ("xsel", &["--clipboard", "--output"]),
+        os => return Err(ClipboardError::BackendUnavailable { os: os.to_string() }),
+    };
+    let output = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| ClipboardError::BackendFailed {
+            program: program.to_string(),
+            message: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(ClipboardError::BackendFailed {
+            program: program.to_string(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|error| ClipboardError::BackendFailed {
+        program: program.to_string(),
+        message: error.to_string(),
+    })
+}
+
+/// Copy PNG image bytes to the system clipboard when supported.
+///
+/// # Errors
+///
+/// Returns [`ClipboardError`] if image clipboard writes are unsupported or fail.
+pub fn copy_png_image(bytes: &[u8]) -> Result<(), ClipboardError> {
+    if env::consts::OS != "macos" || !command_exists("osascript") {
+        return Err(ClipboardError::BackendUnavailable {
+            os: env::consts::OS.to_string(),
+        });
+    }
+    let temp_path = env::temp_dir().join(format!("bmux-clipboard-{}.png", std::process::id()));
+    std::fs::write(&temp_path, bytes).map_err(|error| ClipboardError::BackendFailed {
+        program: "write-temp-png".to_string(),
+        message: error.to_string(),
+    })?;
+    let script = format!(
+        "set the clipboard to (read (POSIX file {}) as «class PNGf»)",
+        applescript_quote(&temp_path.to_string_lossy())
+    );
+    let result = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .map_err(|error| ClipboardError::BackendFailed {
+            program: "osascript".to_string(),
+            message: error.to_string(),
+        });
+    let _ = std::fs::remove_file(&temp_path);
+    let status = result?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ClipboardError::BackendFailed {
+            program: "osascript".to_string(),
+            message: format!("exited with status {status}"),
+        })
+    }
+}
+
+fn read_macos_png_clipboard() -> Result<Option<Vec<u8>>, ClipboardError> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("try\n  the clipboard as «class PNGf»\non error\n  return \"\"\nend try")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| ClipboardError::BackendFailed {
+            program: "osascript".to_string(),
+            message: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(ClipboardError::BackendFailed {
+            program: "osascript".to_string(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(hex) = extract_applescript_data_hex(&stdout) else {
+        return Ok(None);
+    };
+    decode_hex(hex)
+        .map(Some)
+        .map_err(|message| ClipboardError::BackendFailed {
+            program: "osascript".to_string(),
+            message,
+        })
+}
+
+fn extract_applescript_data_hex(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let start = trimmed.find("«data PNGf")? + "«data PNGf".len();
+    let end = trimmed[start..].find('»')? + start;
+    Some(trimmed[start..end].trim())
+}
+
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    let compact = hex
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    if compact.len() % 2 != 0 {
+        return Err("hex clipboard payload had odd length".to_string());
+    }
+    (0..compact.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&compact[index..index + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn applescript_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Clipboard, ClipboardCommand, ClipboardError, detect_backend};

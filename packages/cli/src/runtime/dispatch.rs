@@ -417,13 +417,13 @@ pub(super) async fn dispatch_built_in_command(
                 reconnect_forever,
             },
         ) => {
-            run_connect(
+            Box::pin(run_connect(
                 target.as_deref(),
                 session.as_deref(),
                 follow.as_deref(),
                 *global,
                 *reconnect_forever,
-            )
+            ))
             .await
         }
         (BuiltInHandlerId::NewSession, Command::NewSession { name }) => {

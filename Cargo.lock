@@ -1154,6 +1154,7 @@ dependencies = [
  "bmux_client",
  "bmux_clients_plugin",
  "bmux_clients_plugin_api",
+ "bmux_clipboard",
  "bmux_clipboard_plugin",
  "bmux_cluster_plugin",
  "bmux_codec",

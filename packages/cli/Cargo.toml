@@ -59,6 +59,7 @@ sshenv_vault                    = { workspace = true }
 bmux_clients_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_clipboard = { workspace = true }
 bmux_clipboard_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }

@@ -11,6 +11,8 @@ pub enum TerminalInputEvent {
     Key(TerminalKeyEvent),
     Mouse(TerminalMouseEvent),
     Resize { cols: u16, rows: u16 },
+    FocusGained,
+    FocusLost,
     Bytes(Vec<u8>),
 }
 
@@ -116,7 +118,8 @@ impl TerminalInputEvent {
             }
             crossterm::event::Event::Resize(cols, rows) => Some(Self::Resize { cols, rows }),
             crossterm::event::Event::Paste(text) => Some(Self::Bytes(text.into_bytes())),
-            crossterm::event::Event::FocusGained | crossterm::event::Event::FocusLost => None,
+            crossterm::event::Event::FocusGained => Some(Self::FocusGained),
+            crossterm::event::Event::FocusLost => Some(Self::FocusLost),
         }
     }
 }

@@ -1835,7 +1835,14 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
     print_join_preview(&config, &target, resumed_session, invite_metadata.as_ref());
     confirm_risky_invite(&target, invite_metadata.as_ref())?;
     println!("Connecting...");
-    run_connect(Some(&target), resumed_session, None, false, true).await
+    Box::pin(run_connect(
+        Some(&target),
+        resumed_session,
+        None,
+        false,
+        true,
+    ))
+    .await
 }
 
 pub(super) fn run_hosts(verbose: bool) -> Result<u8> {

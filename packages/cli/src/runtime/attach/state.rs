@@ -280,6 +280,7 @@ pub struct AttachViewState {
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
     pub scoped_pane_appearances: BTreeMap<Uuid, RuntimeAppearance>,
     pub terminal_graphics_cache: TerminalGraphicsCache,
+    pub clipboard_sync_state: ClipboardSyncState,
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
     pub status_position: StatusPosition,
@@ -329,6 +330,13 @@ pub struct AttachViewState {
         feature = "image-iterm2"
     ))]
     pub image_decode_mode: bmux_image::config::ImageDecodeMode,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardSyncState {
+    pub attempt_at: Option<Instant>,
+    pub activity_at: Option<Instant>,
+    pub payload_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +530,7 @@ impl AttachViewState {
             pane_buffers: BTreeMap::new(),
             scoped_pane_appearances: BTreeMap::new(),
             terminal_graphics_cache: TerminalGraphicsCache::new(),
+            clipboard_sync_state: ClipboardSyncState::default(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
             status_position: StatusPosition::Bottom,
