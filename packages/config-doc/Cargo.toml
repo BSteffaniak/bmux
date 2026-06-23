@@ -10,4 +10,8 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[features]
+fail-on-warnings = ["hyperchad_docs_config/fail-on-warnings"]
+
 [dependencies]
+hyperchad_docs_config = { workspace = true }

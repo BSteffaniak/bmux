@@ -4,7 +4,7 @@ use hyperchad::actions::logic::if_responsive;
 use hyperchad::template::{Containers, container};
 use hyperchad::transformer::models::LayoutDirection;
 
-use crate::layout;
+use crate::home_layout as layout;
 
 /// The landing page for bmux docs site.
 #[must_use]

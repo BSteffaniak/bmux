@@ -10,7 +10,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = bmux_docs_site::init()
         .with_viewport(bmux_docs_site::VIEWPORT.clone())
-        .with_router(bmux_docs_site::ROUTER.clone())
         .with_runtime_handle(runtime.handle());
 
     bmux_docs_site::build_app(app)?.run()?;

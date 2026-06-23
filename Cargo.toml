@@ -137,58 +137,61 @@ version    = "0.0.1-alpha.1"
 [workspace.dependencies]
 arc-swap = { version = "1.9", default-features = false }
 # Internal bmux packages
-bmux                        = { version = "0.0.1-alpha.1", default-features = false, path = "packages/bmux" }
-bmux_appearance             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/appearance" }
-bmux_attach_image_protocol  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-image-protocol" }
-bmux_attach_layout_protocol = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-layout-protocol" }
-bmux_attach_pipeline        = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach_pipeline" }
-bmux_attach_pipeline_models = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach_pipeline/models" }
-bmux_attach_token_state     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-token-state" }
-bmux_attach_view_protocol   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-view-protocol" }
-bmux_cli                    = { version = "0.0.1-alpha.1", default-features = false, path = "packages/cli" }
-bmux_cli_output             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/cli_output" }
-bmux_cli_schema             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/cli-schema" }
-bmux_client                 = { version = "0.0.1-alpha.1", default-features = false, path = "packages/client" }
-bmux_client_state           = { version = "0.0.1-alpha.1", default-features = false, path = "packages/client-state" }
-bmux_clipboard              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/clipboard" }
-bmux_codec                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/codec" }
-bmux_config                 = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config" }
-bmux_config_doc             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config-doc" }
-bmux_config_doc_derive      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config-doc-derive" }
-bmux_context_state          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/context-state" }
-bmux_diagnostic_log         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/diagnostic-log" }
-bmux_env                    = { version = "0.0.1-alpha.1", default-features = false, path = "packages/bmux-env" }
-bmux_event_models           = { version = "0.0.1-alpha.1", default-features = false, path = "packages/event/models" }
-bmux_fonts                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/fonts" }
-bmux_image                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/image" }
-bmux_ipc                    = { version = "0.0.1-alpha.1", default-features = false, path = "packages/ipc" }
-bmux_keybind                = { version = "0.0.1-alpha.1", default-features = false, path = "packages/keybind" }
-bmux_keyboard               = { version = "0.0.1-alpha.1", default-features = false, path = "packages/keyboard" }
-bmux_mobile_core            = { version = "0.0.1-alpha.1", default-features = false, path = "packages/mobile-core" }
-bmux_mobile_ffi             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/mobile-ffi" }
-bmux_pane_runtime_state     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/pane-runtime-state" }
-bmux_perf_telemetry         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/perf-telemetry" }
-bmux_performance_state      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/performance-state" }
-bmux_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin" }
-bmux_plugin_schema          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema" }
-bmux_plugin_schema_macros   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema-macros" }
-bmux_plugin_sdk             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-sdk" }
-bmux_recording_protocol     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/recording-protocol" }
-bmux_recording_runtime      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/recording-runtime" }
-bmux_sandbox_harness        = { version = "0.0.1-alpha.1", default-features = false, path = "packages/sandbox-harness" }
-bmux_scene_protocol         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/scene-protocol" }
-bmux_scene_protocol_render  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/scene-protocol-render" }
-bmux_server                 = { version = "0.0.1-alpha.1", default-features = false, path = "packages/server" }
-bmux_session_models         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/session/models" }
-bmux_session_state          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/session-state" }
-bmux_slots                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/slots" }
-bmux_snapshot_protocol      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/snapshot-protocol" }
-bmux_snapshot_runtime       = { version = "0.0.1-alpha.1", default-features = false, path = "packages/snapshot-runtime" }
-bmux_terminal_grid          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/terminal-grid" }
-bmux_terminal_protocol      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/terminal_protocol" }
-bmux_text_edit              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/text-edit" }
-bmux_tui                    = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui" }
-bmux_tui_components         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-components" }
+bmux                         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/bmux" }
+bmux_appearance              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/appearance" }
+bmux_attach_image_protocol   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-image-protocol" }
+bmux_attach_layout_protocol  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-layout-protocol" }
+bmux_attach_pipeline         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach_pipeline" }
+bmux_attach_pipeline_models  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach_pipeline/models" }
+bmux_attach_token_state      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-token-state" }
+bmux_attach_view_protocol    = { version = "0.0.1-alpha.1", default-features = false, path = "packages/attach-view-protocol" }
+bmux_cli                     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/cli" }
+bmux_cli_output              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/cli_output" }
+bmux_cli_schema              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/cli-schema" }
+bmux_client                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/client" }
+bmux_client_state            = { version = "0.0.1-alpha.1", default-features = false, path = "packages/client-state" }
+bmux_clipboard               = { version = "0.0.1-alpha.1", default-features = false, path = "packages/clipboard" }
+bmux_codec                   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/codec" }
+bmux_config                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config" }
+bmux_config_doc              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config-doc" }
+bmux_config_doc_derive       = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config-doc-derive" }
+bmux_context_state           = { version = "0.0.1-alpha.1", default-features = false, path = "packages/context-state" }
+bmux_diagnostic_log          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/diagnostic-log" }
+bmux_env                     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/bmux-env" }
+bmux_event_models            = { version = "0.0.1-alpha.1", default-features = false, path = "packages/event/models" }
+bmux_fonts                   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/fonts" }
+bmux_image                   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/image" }
+bmux_ipc                     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/ipc" }
+bmux_keybind                 = { version = "0.0.1-alpha.1", default-features = false, path = "packages/keybind" }
+bmux_keyboard                = { version = "0.0.1-alpha.1", default-features = false, path = "packages/keyboard" }
+bmux_mobile_core             = { version = "0.0.1-alpha.1", default-features = false, path = "packages/mobile-core" }
+bmux_mobile_ffi              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/mobile-ffi" }
+bmux_pane_runtime_state      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/pane-runtime-state" }
+bmux_perf_telemetry          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/perf-telemetry" }
+bmux_performance_state       = { version = "0.0.1-alpha.1", default-features = false, path = "packages/performance-state" }
+bmux_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin" }
+bmux_plugin_schema           = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema" }
+bmux_plugin_schema_macros    = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema-macros" }
+bmux_plugin_sdk              = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-sdk" }
+bmux_recording_protocol      = { version = "0.0.1-alpha.1", default-features = false, path = "packages/recording-protocol" }
+bmux_recording_runtime       = { version = "0.0.1-alpha.1", default-features = false, path = "packages/recording-runtime" }
+bmux_sandbox_harness         = { version = "0.0.1-alpha.1", default-features = false, path = "packages/sandbox-harness" }
+bmux_scene_protocol          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/scene-protocol" }
+bmux_scene_protocol_render   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/scene-protocol-render" }
+bmux_server                  = { version = "0.0.1-alpha.1", default-features = false, path = "packages/server" }
+bmux_session_models          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/session/models" }
+bmux_session_state           = { version = "0.0.1-alpha.1", default-features = false, path = "packages/session-state" }
+bmux_slots                   = { version = "0.0.1-alpha.1", default-features = false, path = "packages/slots" }
+bmux_snapshot_protocol       = { version = "0.0.1-alpha.1", default-features = false, path = "packages/snapshot-protocol" }
+bmux_snapshot_runtime        = { version = "0.0.1-alpha.1", default-features = false, path = "packages/snapshot-runtime" }
+bmux_terminal_grid           = { version = "0.0.1-alpha.1", default-features = false, path = "packages/terminal-grid" }
+bmux_terminal_protocol       = { version = "0.0.1-alpha.1", default-features = false, path = "packages/terminal_protocol" }
+bmux_text_edit               = { version = "0.0.1-alpha.1", default-features = false, path = "packages/text-edit" }
+bmux_tui                     = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui" }
+bmux_tui_components          = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-components" }
+hyperchad_docs_config        = { version = "0.3.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_docs_config_derive = { version = "0.3.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_docs_site          = { version = "0.3.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
 bmux_clients_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clients-plugin" }
@@ -225,14 +228,14 @@ bmux_windows_plugin_api              = { version = "0.0.1-alpha.1", default-feat
 # Docs site crates
 bmux_docs_site_ui = { version = "0.0.1-alpha.1", default-features = false, path = "packages/docs-site/ui" }
 
-hyperchad                    = { version = "0.3.0", package = "hyperchad", default-features = false }
-hyperchad_color              = { version = "0.3.0", package = "hyperchad_color", default-features = false }
-hyperchad_renderer           = { version = "0.3.0", package = "hyperchad_renderer", default-features = false }
-hyperchad_template           = { version = "0.3.0", package = "hyperchad_template", default-features = false }
-hyperchad_transformer        = { version = "0.3.0", package = "hyperchad_transformer", default-features = false }
-hyperchad_transformer_models = { version = "0.3.0", package = "hyperchad_transformer_models", default-features = false }
+hyperchad                    = { version = "0.3.0", package = "hyperchad", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_color              = { version = "0.3.0", package = "hyperchad_color", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_renderer           = { version = "0.3.0", package = "hyperchad_renderer", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_template           = { version = "0.3.0", package = "hyperchad_template", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_transformer        = { version = "0.3.0", package = "hyperchad_transformer", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+hyperchad_transformer_models = { version = "0.3.0", package = "hyperchad_transformer_models", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 
-switchy = { version = "0.3.0", package = "switchy", default-features = false }
+switchy = { version = "0.3.0", package = "switchy", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 
 moosicbox_log_runtime = { version = "0.3.0", package = "moosicbox_log_runtime", default-features = false }
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", rev = "4b3d808ecfc83a755b720db4b96eef0405b78549", package = "moosicbox_log_watch", default-features = false }
@@ -262,7 +265,7 @@ image = { version = "0.25", default-features = false, features = [
     "gif",
     "bmp",
 ] }
-iroh = { version = "0.98.2", default-features = true }
+iroh = { version = "1.0.0", default-features = true }
 libc = { version = "0.2" }
 libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 log = { version = "0.4.29", default-features = false }
@@ -294,7 +297,7 @@ serde = { version = "1.0.228", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
-sha2 = { version = "=0.11.0-rc.5", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
 similar = { version = "3.1.0" }
 ssh2 = { version = "0.9.5" }
 sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", branch = "master", version = "0.0.1-alpha.1", features = [

@@ -2512,6 +2512,7 @@ async fn maybe_emit_attach_frame_perf(
 /// Called once per attach session from
 /// [`run_session_attach_with_client`]; subsequent attaches reuse the
 /// already-installed extensions.
+#[allow(clippy::missing_const_for_fn)]
 fn install_bundled_render_extensions() {
     #[cfg(feature = "bundled-plugin-decoration")]
     {
