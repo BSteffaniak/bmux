@@ -9,6 +9,7 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
 use crate::common::ComponentMousePolicy;
+use crate::hit_test::{HitRegion, hit_region_at};
 
 /// One breadcrumb item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,21 +325,24 @@ impl<'a> Breadcrumbs<'a> {
         })
     }
 
-    fn item_at(&self, area: Rect, position: Point) -> Option<usize> {
-        if !area.contains(position) || position.y != area.y {
-            return None;
-        }
+    fn item_hit_regions(&self, area: Rect) -> Vec<HitRegion<usize>> {
         let mut x = area.x;
+        let mut regions = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
             let width = u16_saturating(display_width(item.label));
-            if position.x >= x && position.x < x.saturating_add(width) {
-                return Some(index);
-            }
+            regions.push(HitRegion::new(index, Rect::new(x, area.y, width, 1)));
             x = x
                 .saturating_add(width)
                 .saturating_add(u16_saturating(display_width(self.policy.separator)));
         }
-        None
+        regions
+    }
+
+    fn item_at(&self, area: Rect, position: Point) -> Option<usize> {
+        if !area.contains(position) || position.y != area.y {
+            return None;
+        }
+        hit_region_at(&self.item_hit_regions(area), position).map(|region| region.key)
     }
 
     fn line(&self, state: &BreadcrumbsState) -> Line {

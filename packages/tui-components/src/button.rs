@@ -8,6 +8,7 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::hit_test::HitRegion;
 
 /// Visual styles for a button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,7 +282,7 @@ impl<'a> Button<'a> {
         if !self.policy.mouse.enabled {
             return ButtonOutcome::Ignored;
         }
-        let contains = area.contains(mouse.position);
+        let contains = HitRegion::new((), area).contains(mouse.position);
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => set_hovered(state, contains),
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click && contains => {

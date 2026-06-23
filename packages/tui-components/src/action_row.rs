@@ -8,6 +8,7 @@ use bmux_tui::prelude::Style;
 
 use crate::button::{Button, ButtonState};
 use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::hit_test::{HitRegion, hit_region_at};
 
 /// One action button in an action row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,10 +495,16 @@ impl<'a> ActionRow<'a> {
         }
     }
 
-    fn action_index_at(&self, area: Rect, point: Point) -> Option<usize> {
+    fn action_hit_regions(&self, area: Rect) -> Vec<HitRegion<usize>> {
         self.action_areas(area)
             .into_iter()
-            .position(|action_area| action_area.contains(point))
+            .enumerate()
+            .map(|(index, rect)| HitRegion::new(index, rect))
+            .collect()
+    }
+
+    fn action_index_at(&self, area: Rect, point: Point) -> Option<usize> {
+        hit_region_at(&self.action_hit_regions(area), point).map(|region| region.key)
     }
 }
 
