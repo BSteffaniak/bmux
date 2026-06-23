@@ -9,6 +9,7 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::hit_test::{HitRegion, hit_region_at};
 
 /// One tab-bar item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,10 +477,20 @@ impl<'a> TabBar<'a> {
         }
     }
 
-    fn hit_index(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
+    fn hit_regions(&self, area: Rect) -> Vec<HitRegion<usize>> {
         self.hit_rects(area)
-            .iter()
-            .position(|rect| rect.contains(bmux_tui::geometry::Point::new(x, y)))
+            .into_iter()
+            .enumerate()
+            .map(|(index, rect)| HitRegion::new(index, rect))
+            .collect()
+    }
+
+    fn hit_index(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
+        hit_region_at(
+            &self.hit_regions(area),
+            bmux_tui::geometry::Point::new(x, y),
+        )
+        .map(|region| region.key)
     }
 
     fn select_relative(&self, state: &mut TabBarState, delta: i32) -> TabBarOutcome {

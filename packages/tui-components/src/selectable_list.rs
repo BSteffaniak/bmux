@@ -9,6 +9,7 @@ use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::hit_test::{HitRegion, hit_region_at};
 
 /// One selectable list item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,14 +700,8 @@ impl<'a> SelectableList<'a> {
         state: &SelectableListState,
         mouse: MouseEvent,
     ) -> Option<usize> {
-        if !area.contains(mouse.position) {
-            return None;
-        }
-        let index = self.index_at_row(
-            state
-                .vertical_scroll
-                .saturating_add(usize::from(mouse.position.y.saturating_sub(area.y))),
-        )?;
+        let regions = self.visible_hit_regions(area, state);
+        let index = hit_region_at(&regions, mouse.position)?.key;
         if self.is_enabled_item(index) {
             Some(index)
         } else {
@@ -714,20 +709,46 @@ impl<'a> SelectableList<'a> {
         }
     }
 
-    fn total_height(&self) -> usize {
-        self.items.iter().map(SelectableListItem::height).sum()
+    fn visible_hit_regions(
+        &self,
+        area: Rect,
+        state: &SelectableListState,
+    ) -> Vec<HitRegion<usize>> {
+        let mut skipped_rows = state.vertical_scroll;
+        let mut rendered_row = 0u16;
+        let mut regions = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            let item_height = item.height();
+            if skipped_rows >= item_height {
+                skipped_rows = skipped_rows.saturating_sub(item_height);
+                continue;
+            }
+            let visible_height = item_height.saturating_sub(skipped_rows);
+            skipped_rows = 0;
+            if rendered_row >= area.height {
+                break;
+            }
+            let region_height = u16::try_from(visible_height)
+                .unwrap_or(u16::MAX)
+                .min(area.height.saturating_sub(rendered_row));
+            if region_height > 0 {
+                regions.push(HitRegion::new(
+                    index,
+                    Rect::new(
+                        area.x,
+                        area.y.saturating_add(rendered_row),
+                        area.width,
+                        region_height,
+                    ),
+                ));
+                rendered_row = rendered_row.saturating_add(region_height);
+            }
+        }
+        regions
     }
 
-    fn index_at_row(&self, row: usize) -> Option<usize> {
-        let mut offset = 0usize;
-        for (index, item) in self.items.iter().enumerate() {
-            let height = item.height();
-            if row < offset.saturating_add(height) {
-                return Some(index);
-            }
-            offset = offset.saturating_add(height);
-        }
-        None
+    fn total_height(&self) -> usize {
+        self.items.iter().map(SelectableListItem::height).sum()
     }
 
     fn normalize_state(&self, state: &mut SelectableListState) {

@@ -23,6 +23,7 @@ pub mod empty_state;
 pub mod filtered_list;
 pub mod form;
 pub mod form_field;
+pub mod hit_test;
 pub mod key_hint_bar;
 pub mod labeled_details;
 pub mod menu;
