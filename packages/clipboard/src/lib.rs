@@ -241,6 +241,81 @@ impl ClipboardPayload {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardPayloadSource {
+    ArboardImage,
+    FileReference,
+    Text,
+}
+
+impl ClipboardPayloadSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArboardImage => "arboard_image",
+            Self::FileReference => "file_reference",
+            Self::Text => "text",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardReadResult {
+    pub payload: ClipboardPayload,
+    pub source: ClipboardPayloadSource,
+    pub report: ClipboardReadReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardReadReport {
+    pub prefer_image: bool,
+    pub attempts: Vec<ClipboardReadAttempt>,
+}
+
+impl ClipboardReadReport {
+    #[must_use]
+    pub fn attempts_summary(&self) -> String {
+        self.attempts
+            .iter()
+            .map(|attempt| {
+                format!(
+                    "{}:{}:{}",
+                    attempt.backend,
+                    attempt.operation,
+                    attempt.outcome.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardReadAttempt {
+    pub backend: &'static str,
+    pub operation: &'static str,
+    pub outcome: ClipboardReadAttemptOutcome,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardReadAttemptOutcome {
+    Selected,
+    Unavailable,
+    Failed,
+}
+
+impl ClipboardReadAttemptOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Read the current system clipboard, preferring PNG image data when available.
 ///
 /// # Errors
@@ -248,6 +323,21 @@ impl ClipboardPayload {
 /// Returns [`ClipboardError`] if no supported clipboard backend is available or
 /// the backend command fails.
 pub fn read_payload(prefer_image: bool) -> Result<ClipboardPayload, ClipboardError> {
+    read_payload_detailed(prefer_image).map(|result| result.payload)
+}
+
+/// Read the current system clipboard with structured backend-attempt diagnostics.
+///
+/// # Errors
+///
+/// Returns [`ClipboardError`] if no supported clipboard backend is available or
+/// the backend command fails.
+#[allow(clippy::too_many_lines)]
+pub fn read_payload_detailed(prefer_image: bool) -> Result<ClipboardReadResult, ClipboardError> {
+    let mut report = ClipboardReadReport {
+        prefer_image,
+        attempts: Vec::new(),
+    };
     tracing::debug!(
         bmux.component = "clipboard.remote_sync",
         prefer_image,
@@ -256,71 +346,150 @@ pub fn read_payload(prefer_image: bool) -> Result<ClipboardPayload, ClipboardErr
     if prefer_image {
         match read_arboard_image() {
             Ok(Some(payload)) => {
+                report.attempts.push(ClipboardReadAttempt {
+                    backend: "arboard",
+                    operation: "get_image",
+                    outcome: ClipboardReadAttemptOutcome::Selected,
+                    error: None,
+                });
+                return Ok(clipboard_read_result(
+                    payload,
+                    ClipboardPayloadSource::ArboardImage,
+                    report,
+                ));
+            }
+            Ok(None) => {
+                report.attempts.push(ClipboardReadAttempt {
+                    backend: "arboard",
+                    operation: "get_image",
+                    outcome: ClipboardReadAttemptOutcome::Unavailable,
+                    error: None,
+                });
                 tracing::debug!(
                     bmux.component = "clipboard.remote_sync",
-                    mime = payload.mime(),
-                    bytes_len = payload.bytes_len(),
-                    source = "arboard_image",
-                    "clipboard payload selected"
+                    backend = "arboard",
+                    operation = "get_image",
+                    outcome = "unavailable",
+                    "clipboard backend attempt completed"
                 );
-                return Ok(payload);
             }
-            Ok(None) => tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "arboard_image",
-                "clipboard image payload unavailable"
-            ),
-            Err(error) => tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "arboard_image",
-                error = %error,
-                "clipboard image payload read failed"
-            ),
+            Err(error) => {
+                report.attempts.push(ClipboardReadAttempt {
+                    backend: "arboard",
+                    operation: "get_image",
+                    outcome: ClipboardReadAttemptOutcome::Failed,
+                    error: Some(error.to_string()),
+                });
+                tracing::debug!(
+                    bmux.component = "clipboard.remote_sync",
+                    backend = "arboard",
+                    operation = "get_image",
+                    outcome = "failed",
+                    error = %error,
+                    "clipboard backend attempt completed"
+                );
+            }
         }
         match read_image_file_reference_payload() {
             Ok(Some(payload)) => {
+                report.attempts.push(ClipboardReadAttempt {
+                    backend: "arboard",
+                    operation: "get_text_file_reference",
+                    outcome: ClipboardReadAttemptOutcome::Selected,
+                    error: None,
+                });
+                return Ok(clipboard_read_result(
+                    payload,
+                    ClipboardPayloadSource::FileReference,
+                    report,
+                ));
+            }
+            Ok(None) => {
+                report.attempts.push(ClipboardReadAttempt {
+                    backend: "arboard",
+                    operation: "get_text_file_reference",
+                    outcome: ClipboardReadAttemptOutcome::Unavailable,
+                    error: None,
+                });
                 tracing::debug!(
                     bmux.component = "clipboard.remote_sync",
-                    mime = payload.mime(),
-                    bytes_len = payload.bytes_len(),
-                    source = "file_reference",
-                    "clipboard payload selected"
+                    backend = "arboard",
+                    operation = "get_text_file_reference",
+                    outcome = "unavailable",
+                    "clipboard backend attempt completed"
                 );
-                return Ok(payload);
             }
-            Ok(None) => tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "file_reference",
-                "clipboard image file-reference payload unavailable"
-            ),
-            Err(error) => tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "file_reference",
-                error = %error,
-                "clipboard image file-reference payload read failed"
-            ),
+            Err(error) => {
+                report.attempts.push(ClipboardReadAttempt {
+                    backend: "arboard",
+                    operation: "get_text_file_reference",
+                    outcome: ClipboardReadAttemptOutcome::Failed,
+                    error: Some(error.to_string()),
+                });
+                tracing::debug!(
+                    bmux.component = "clipboard.remote_sync",
+                    backend = "arboard",
+                    operation = "get_text_file_reference",
+                    outcome = "failed",
+                    error = %error,
+                    "clipboard backend attempt completed"
+                );
+            }
         }
     }
     match read_text() {
         Ok(text) => {
-            tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                mime = "text/plain",
-                bytes_len = text.len(),
-                source = "text",
-                "clipboard payload selected"
-            );
-            Ok(ClipboardPayload::Text(text))
+            let payload = ClipboardPayload::Text(text);
+            report.attempts.push(ClipboardReadAttempt {
+                backend: "arboard_or_command",
+                operation: "get_text",
+                outcome: ClipboardReadAttemptOutcome::Selected,
+                error: None,
+            });
+            Ok(clipboard_read_result(
+                payload,
+                ClipboardPayloadSource::Text,
+                report,
+            ))
         }
         Err(error) => {
+            report.attempts.push(ClipboardReadAttempt {
+                backend: "arboard_or_command",
+                operation: "get_text",
+                outcome: ClipboardReadAttemptOutcome::Failed,
+                error: Some(error.to_string()),
+            });
             tracing::debug!(
                 bmux.component = "clipboard.remote_sync",
-                stage = "text",
+                backend = "arboard_or_command",
+                operation = "get_text",
+                outcome = "failed",
                 error = %error,
-                "clipboard text payload read failed"
+                attempts = %report.attempts_summary(),
+                "clipboard read completed without supported payload"
             );
             Err(error)
         }
+    }
+}
+
+fn clipboard_read_result(
+    payload: ClipboardPayload,
+    source: ClipboardPayloadSource,
+    report: ClipboardReadReport,
+) -> ClipboardReadResult {
+    tracing::debug!(
+        bmux.component = "clipboard.remote_sync",
+        selected_source = source.as_str(),
+        selected_mime = payload.mime(),
+        bytes_len = payload.bytes_len(),
+        attempts = %report.attempts_summary(),
+        "clipboard read completed"
+    );
+    ClipboardReadResult {
+        payload,
+        source,
+        report,
     }
 }
 

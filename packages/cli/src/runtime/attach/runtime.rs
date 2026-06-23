@@ -9138,6 +9138,18 @@ struct ClipboardRemotePayloadRequest {
     mime: String,
     bytes: Vec<u8>,
     text: Option<String>,
+    source: String,
+    attempts: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClipboardRemoteMaterializeResponse {
+    mime: String,
+    bytes_len: usize,
+    path: Option<String>,
+    clipboard_written: bool,
+    backend: Option<String>,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9213,11 +9225,20 @@ async fn sync_remote_clipboard(
         images_enabled = sync.images,
         "remote clipboard local payload read starting"
     );
-    let payload =
-        bmux_clipboard::read_payload(sync.images).map_err(|error| anyhow::anyhow!(error))?;
+    let read_result = bmux_clipboard::read_payload_detailed(sync.images)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let source = read_result.source.as_str();
+    let attempts = read_result.report.attempts_summary();
+    let payload = read_result.payload;
     let mime = payload.mime().to_string();
     let bytes_len = payload.bytes_len();
-    tracing::debug!(mime, bytes_len, "remote clipboard payload read");
+    tracing::debug!(
+        mime,
+        bytes_len,
+        source,
+        attempts = %attempts,
+        "remote clipboard payload read"
+    );
     if mime == "text/plain" && !sync.text {
         tracing::debug!("remote clipboard sync skipped because text is disabled");
         return Ok(());
@@ -9247,14 +9268,29 @@ async fn sync_remote_clipboard(
     };
     let payload_hash = clipboard_payload_hash(&mime, &bytes);
     if view_state.clipboard_sync_state.payload_hash.as_deref() == Some(payload_hash.as_str()) {
-        tracing::debug!(hash = %payload_hash, "remote clipboard sync skipped unchanged payload");
+        tracing::debug!(
+            hash = %payload_hash,
+            mime,
+            bytes_len,
+            source,
+            attempts = %attempts,
+            "remote clipboard sync skipped unchanged payload"
+        );
         return Ok(());
     }
-    let request = ClipboardRemotePayloadRequest { mime, bytes, text };
+    let request = ClipboardRemotePayloadRequest {
+        mime,
+        bytes,
+        text,
+        source: source.to_string(),
+        attempts: attempts.clone(),
+    };
     tracing::debug!(
         hash = %payload_hash,
         mime = request.mime.as_str(),
         bytes_len,
+        source,
+        attempts = %attempts,
         "remote clipboard materialization invoke started"
     );
     let payload =
@@ -9266,20 +9302,41 @@ async fn sync_remote_clipboard(
         "materialize_payload",
         payload,
     );
-    tokio::time::timeout(
+    let response_bytes = tokio::time::timeout(
         Duration::from_millis(sync.request_timeout_ms.max(1)),
         sync_future,
     )
     .await
     .context("remote clipboard sync timed out")?
     .map_err(|error| anyhow::anyhow!(error))?;
+    let materialize_response: ClipboardRemoteMaterializeResponse =
+        bmux_codec::from_positional_bytes(&response_bytes)
+            .context("decoding clipboard materialize response")?;
     view_state.clipboard_sync_state.payload_hash = Some(payload_hash.clone());
-    tracing::info!(
-        hash = %payload_hash,
-        mime = request.mime.as_str(),
-        bytes_len,
-        "remote clipboard sync succeeded"
-    );
+    if materialize_response.clipboard_written {
+        tracing::info!(
+            hash = %payload_hash,
+            mime = request.mime.as_str(),
+            bytes_len,
+            source,
+            attempts = %attempts,
+            remote_clipboard_written = true,
+            fallback_path = materialize_response.path.as_deref().unwrap_or(""),
+            "remote clipboard sync completed"
+        );
+    } else {
+        tracing::warn!(
+            hash = %payload_hash,
+            mime = request.mime.as_str(),
+            bytes_len,
+            source,
+            attempts = %attempts,
+            remote_clipboard_written = false,
+            fallback_path = materialize_response.path.as_deref().unwrap_or(""),
+            warning = materialize_response.warning.as_deref().unwrap_or(""),
+            "remote clipboard sync completed without OS clipboard write"
+        );
+    }
     Ok(())
 }
 

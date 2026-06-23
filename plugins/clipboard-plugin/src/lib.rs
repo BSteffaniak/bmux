@@ -40,7 +40,7 @@ impl RustPlugin for ClipboardPlugin {
                 Ok(ClipboardPayloadResponse::from_payload(payload))
             },
             "clipboard-remote-sync/v1", "materialize_payload" => |req: ClipboardPayloadResponse, ctx| {
-                tracing::debug!(mime = %req.mime, bytes_len = req.bytes.len(), "clipboard materialize_payload invoked");
+                tracing::debug!(mime = %req.mime, bytes_len = req.bytes.len(), source = req.source.as_deref().unwrap_or("unknown"), attempts = req.attempts.as_deref().unwrap_or(""), "clipboard materialize_payload invoked");
                 materialize_payload(&req, &ctx.connection.state_dir).map_err(|message| {
                     ServiceResponse::error("materialize_failed", message)
                 })
@@ -71,6 +71,8 @@ struct ClipboardPayloadResponse {
     mime: String,
     bytes: Vec<u8>,
     text: Option<String>,
+    source: Option<String>,
+    attempts: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +80,9 @@ struct ClipboardMaterializeResponse {
     mime: String,
     bytes_len: usize,
     path: Option<String>,
+    clipboard_written: bool,
+    backend: Option<String>,
+    warning: Option<String>,
 }
 
 impl ClipboardPayloadResponse {
@@ -87,11 +92,15 @@ impl ClipboardPayloadResponse {
                 mime: "text/plain".to_string(),
                 bytes: text.as_bytes().to_vec(),
                 text: Some(text),
+                source: None,
+                attempts: None,
             },
             ClipboardPayload::ImagePng(bytes) => Self {
                 mime: "image/png".to_string(),
                 bytes,
                 text: None,
+                source: None,
+                attempts: None,
             },
         }
     }
@@ -108,11 +117,20 @@ fn materialize_payload(
                 .clone()
                 .unwrap_or_else(|| String::from_utf8_lossy(&payload.bytes).into_owned());
             bmux_clipboard::copy_text(&text).map_err(|error| error.to_string())?;
-            tracing::info!(bytes_len = text.len(), "clipboard text materialized");
+            tracing::info!(
+                bytes_len = text.len(),
+                source = payload.source.as_deref().unwrap_or("unknown"),
+                attempts = payload.attempts.as_deref().unwrap_or(""),
+                clipboard_written = true,
+                "clipboard text materialized"
+            );
             Ok(ClipboardMaterializeResponse {
                 mime: payload.mime.clone(),
                 bytes_len: text.len(),
                 path: None,
+                clipboard_written: true,
+                backend: Some("arboard_or_command".to_string()),
+                warning: None,
             })
         }
         "image/png" => {
@@ -121,18 +139,24 @@ fn materialize_payload(
             fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
             let path = dir.join(format!("{hash}.png"));
             fs::write(&path, &payload.bytes).map_err(|error| error.to_string())?;
-            match bmux_clipboard::copy_png_image(&payload.bytes) {
+            let (clipboard_written, warning) = match bmux_clipboard::copy_png_image(&payload.bytes)
+            {
                 Ok(()) => {
-                    tracing::info!(path = %path.display(), bytes_len = payload.bytes.len(), "clipboard image materialized and copied");
+                    tracing::info!(path = %path.display(), bytes_len = payload.bytes.len(), source = payload.source.as_deref().unwrap_or("unknown"), attempts = payload.attempts.as_deref().unwrap_or(""), clipboard_written = true, "clipboard image materialized and copied");
+                    (true, None)
                 }
                 Err(error) => {
-                    tracing::warn!(path = %path.display(), error = %error, "clipboard image materialized but OS clipboard write failed");
+                    tracing::warn!(path = %path.display(), error = %error, source = payload.source.as_deref().unwrap_or("unknown"), attempts = payload.attempts.as_deref().unwrap_or(""), clipboard_written = false, "clipboard image materialized but OS clipboard write failed");
+                    (false, Some(error.to_string()))
                 }
-            }
+            };
             Ok(ClipboardMaterializeResponse {
                 mime: payload.mime.clone(),
                 bytes_len: payload.bytes.len(),
                 path: Some(path.to_string_lossy().into_owned()),
+                clipboard_written,
+                backend: Some("arboard".to_string()),
+                warning,
             })
         }
         other => Err(format!("unsupported clipboard payload MIME type '{other}'")),
