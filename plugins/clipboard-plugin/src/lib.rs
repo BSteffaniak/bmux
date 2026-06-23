@@ -37,10 +37,18 @@ impl RustPlugin for ClipboardPlugin {
             "clipboard-read/v1", "read_payload" => |req: ClipboardReadRequest, _ctx| {
                 tracing::debug!(prefer_image = req.prefer_image, "clipboard read_payload invoked");
                 let payload = bmux_clipboard::read_payload(req.prefer_image).map_err(map_clipboard_error)?;
-                Ok(ClipboardPayloadResponse::from_payload(payload))
+                Ok(ClipboardPayloadV1Response::from_payload(payload))
             },
-            "clipboard-remote-sync/v1", "materialize_payload" => |req: ClipboardPayloadResponse, ctx| {
-                tracing::debug!(mime = %req.mime, bytes_len = req.bytes.len(), source = req.source.as_deref().unwrap_or("unknown"), attempts = req.attempts.as_deref().unwrap_or(""), "clipboard materialize_payload invoked");
+            "clipboard-remote-sync/v1", "materialize_payload" => |req: ClipboardPayloadV1Response, ctx| {
+                tracing::debug!(mime = %req.mime, bytes_len = req.bytes.len(), "clipboard materialize_payload v1 invoked");
+                materialize_payload(&ClipboardPayloadV2Response::from_v1(req), &ctx.connection.state_dir)
+                    .map(ClipboardMaterializeV1Response::from)
+                    .map_err(|message| {
+                        ServiceResponse::error("materialize_failed", message)
+                    })
+            },
+            "clipboard-remote-sync/v2", "materialize_payload" => |req: ClipboardPayloadV2Response, ctx| {
+                tracing::debug!(mime = %req.mime, bytes_len = req.bytes.len(), source = %req.source, attempts = %req.attempts, "clipboard materialize_payload v2 invoked");
                 materialize_payload(&req, &ctx.connection.state_dir).map_err(|message| {
                     ServiceResponse::error("materialize_failed", message)
                 })
@@ -67,12 +75,26 @@ struct ClipboardReadRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ClipboardPayloadResponse {
+struct ClipboardPayloadV1Response {
     mime: String,
     bytes: Vec<u8>,
     text: Option<String>,
-    source: Option<String>,
-    attempts: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClipboardPayloadV2Response {
+    mime: String,
+    bytes: Vec<u8>,
+    text: Option<String>,
+    source: String,
+    attempts: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClipboardMaterializeV1Response {
+    mime: String,
+    bytes_len: usize,
+    path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,29 +107,47 @@ struct ClipboardMaterializeResponse {
     warning: Option<String>,
 }
 
-impl ClipboardPayloadResponse {
+impl From<ClipboardMaterializeResponse> for ClipboardMaterializeV1Response {
+    fn from(response: ClipboardMaterializeResponse) -> Self {
+        Self {
+            mime: response.mime,
+            bytes_len: response.bytes_len,
+            path: response.path,
+        }
+    }
+}
+
+impl ClipboardPayloadV2Response {
+    fn from_v1(payload: ClipboardPayloadV1Response) -> Self {
+        Self {
+            mime: payload.mime,
+            bytes: payload.bytes,
+            text: payload.text,
+            source: "unknown".to_string(),
+            attempts: String::new(),
+        }
+    }
+}
+
+impl ClipboardPayloadV1Response {
     fn from_payload(payload: ClipboardPayload) -> Self {
         match payload {
             ClipboardPayload::Text(text) => Self {
                 mime: "text/plain".to_string(),
                 bytes: text.as_bytes().to_vec(),
                 text: Some(text),
-                source: None,
-                attempts: None,
             },
             ClipboardPayload::ImagePng(bytes) => Self {
                 mime: "image/png".to_string(),
                 bytes,
                 text: None,
-                source: None,
-                attempts: None,
             },
         }
     }
 }
 
 fn materialize_payload(
-    payload: &ClipboardPayloadResponse,
+    payload: &ClipboardPayloadV2Response,
     state_dir: &str,
 ) -> Result<ClipboardMaterializeResponse, String> {
     match payload.mime.as_str() {
@@ -119,8 +159,8 @@ fn materialize_payload(
             bmux_clipboard::copy_text(&text).map_err(|error| error.to_string())?;
             tracing::info!(
                 bytes_len = text.len(),
-                source = payload.source.as_deref().unwrap_or("unknown"),
-                attempts = payload.attempts.as_deref().unwrap_or(""),
+                source = payload.source.as_str(),
+                attempts = payload.attempts.as_str(),
                 clipboard_written = true,
                 "clipboard text materialized"
             );
@@ -142,11 +182,11 @@ fn materialize_payload(
             let (clipboard_written, warning) = match bmux_clipboard::copy_png_image(&payload.bytes)
             {
                 Ok(()) => {
-                    tracing::info!(path = %path.display(), bytes_len = payload.bytes.len(), source = payload.source.as_deref().unwrap_or("unknown"), attempts = payload.attempts.as_deref().unwrap_or(""), clipboard_written = true, "clipboard image materialized and copied");
+                    tracing::info!(path = %path.display(), bytes_len = payload.bytes.len(), source = payload.source.as_str(), attempts = payload.attempts.as_str(), clipboard_written = true, "clipboard image materialized and copied");
                     (true, None)
                 }
                 Err(error) => {
-                    tracing::warn!(path = %path.display(), error = %error, source = payload.source.as_deref().unwrap_or("unknown"), attempts = payload.attempts.as_deref().unwrap_or(""), clipboard_written = false, "clipboard image materialized but OS clipboard write failed");
+                    tracing::warn!(path = %path.display(), error = %error, source = payload.source.as_str(), attempts = payload.attempts.as_str(), clipboard_written = false, "clipboard image materialized but OS clipboard write failed");
                     (false, Some(error.to_string()))
                 }
             };

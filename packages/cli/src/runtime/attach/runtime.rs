@@ -9134,7 +9134,14 @@ pub fn attach_view_event_matches_target(
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ClipboardRemotePayloadRequest {
+struct ClipboardRemotePayloadV1Request {
+    mime: String,
+    bytes: Vec<u8>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClipboardRemotePayloadV2Request {
     mime: String,
     bytes: Vec<u8>,
     text: Option<String>,
@@ -9143,7 +9150,14 @@ struct ClipboardRemotePayloadRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ClipboardRemoteMaterializeResponse {
+struct ClipboardRemoteMaterializeV1Response {
+    mime: String,
+    bytes_len: usize,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClipboardRemoteMaterializeV2Response {
     mime: String,
     bytes_len: usize,
     path: Option<String>,
@@ -9278,62 +9292,113 @@ async fn sync_remote_clipboard(
         );
         return Ok(());
     }
-    let request = ClipboardRemotePayloadRequest {
-        mime,
-        bytes,
-        text,
+    let request_v2 = ClipboardRemotePayloadV2Request {
+        mime: mime.clone(),
+        bytes: bytes.clone(),
+        text: text.clone(),
         source: source.to_string(),
         attempts: attempts.clone(),
     };
     tracing::debug!(
         hash = %payload_hash,
-        mime = request.mime.as_str(),
+        mime = request_v2.mime.as_str(),
         bytes_len,
         source,
         attempts = %attempts,
+        protocol = "v2",
         "remote clipboard materialization invoke started"
     );
-    let payload =
-        bmux_codec::to_positional_vec(&request).context("encoding clipboard sync payload")?;
-    let sync_future = client.invoke_service_raw(
+    let v2_payload =
+        bmux_codec::to_positional_vec(&request_v2).context("encoding clipboard sync v2 payload")?;
+    let v2_future = client.invoke_service_raw(
         "bmux.clipboard.remote_sync",
         InvokeServiceKind::Command,
-        "clipboard-remote-sync/v1",
+        "clipboard-remote-sync/v2",
         "materialize_payload",
-        payload,
+        v2_payload,
     );
-    let response_bytes = tokio::time::timeout(
+    let v2_result = tokio::time::timeout(
         Duration::from_millis(sync.request_timeout_ms.max(1)),
-        sync_future,
+        v2_future,
     )
     .await
-    .context("remote clipboard sync timed out")?
-    .map_err(|error| anyhow::anyhow!(error))?;
-    let materialize_response: ClipboardRemoteMaterializeResponse =
-        bmux_codec::from_positional_bytes(&response_bytes)
-            .context("decoding clipboard materialize response")?;
+    .context("remote clipboard sync timed out")?;
+
+    let (protocol, path, clipboard_written, warning) = match v2_result {
+        Ok(response_bytes) => {
+            let response: ClipboardRemoteMaterializeV2Response =
+                bmux_codec::from_positional_bytes(&response_bytes)
+                    .context("decoding clipboard materialize v2 response")?;
+            (
+                "v2",
+                response.path,
+                Some(response.clipboard_written),
+                response.warning,
+            )
+        }
+        Err(
+            error @ ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::NotFound,
+                ..
+            },
+        ) => {
+            tracing::debug!(
+                error = %error,
+                protocol = "v1",
+                "remote clipboard v2 unavailable; falling back to v1"
+            );
+            let request_v1 = ClipboardRemotePayloadV1Request {
+                mime: mime.clone(),
+                bytes,
+                text,
+            };
+            let v1_payload = bmux_codec::to_positional_vec(&request_v1)
+                .context("encoding clipboard sync v1 payload")?;
+            let v1_future = client.invoke_service_raw(
+                "bmux.clipboard.remote_sync",
+                InvokeServiceKind::Command,
+                "clipboard-remote-sync/v1",
+                "materialize_payload",
+                v1_payload,
+            );
+            let response_bytes = tokio::time::timeout(
+                Duration::from_millis(sync.request_timeout_ms.max(1)),
+                v1_future,
+            )
+            .await
+            .context("remote clipboard sync timed out")?
+            .map_err(|error| anyhow::anyhow!(error))?;
+            let response: ClipboardRemoteMaterializeV1Response =
+                bmux_codec::from_positional_bytes(&response_bytes)
+                    .context("decoding clipboard materialize v1 response")?;
+            ("v1", response.path, None, None)
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
     view_state.clipboard_sync_state.payload_hash = Some(payload_hash.clone());
-    if materialize_response.clipboard_written {
+    if clipboard_written.unwrap_or(true) {
         tracing::info!(
             hash = %payload_hash,
-            mime = request.mime.as_str(),
+            mime,
             bytes_len,
             source,
             attempts = %attempts,
-            remote_clipboard_written = true,
-            fallback_path = materialize_response.path.as_deref().unwrap_or(""),
+            protocol,
+            remote_clipboard_written = clipboard_written.map_or("unknown", |written| if written { "true" } else { "false" }),
+            fallback_path = path.as_deref().unwrap_or(""),
             "remote clipboard sync completed"
         );
     } else {
         tracing::warn!(
             hash = %payload_hash,
-            mime = request.mime.as_str(),
+            mime,
             bytes_len,
             source,
             attempts = %attempts,
-            remote_clipboard_written = false,
-            fallback_path = materialize_response.path.as_deref().unwrap_or(""),
-            warning = materialize_response.warning.as_deref().unwrap_or(""),
+            protocol,
+            remote_clipboard_written = "false",
+            fallback_path = path.as_deref().unwrap_or(""),
+            warning = warning.as_deref().unwrap_or(""),
             "remote clipboard sync completed without OS clipboard write"
         );
     }
