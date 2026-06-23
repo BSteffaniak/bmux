@@ -9169,6 +9169,7 @@ async fn maybe_sync_remote_clipboard(
         trigger = ?trigger,
     )
 )]
+#[allow(clippy::too_many_lines)]
 async fn sync_remote_clipboard(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -9206,6 +9207,12 @@ async fn sync_remote_clipboard(
     }
     view_state.clipboard_sync_state.attempt_at = Some(now);
 
+    tracing::debug!(
+        prefer_image = sync.images,
+        text_enabled = sync.text,
+        images_enabled = sync.images,
+        "remote clipboard local payload read starting"
+    );
     let payload =
         bmux_clipboard::read_payload(sync.images).map_err(|error| anyhow::anyhow!(error))?;
     let mime = payload.mime().to_string();
@@ -9244,7 +9251,12 @@ async fn sync_remote_clipboard(
         return Ok(());
     }
     let request = ClipboardRemotePayloadRequest { mime, bytes, text };
-    tracing::debug!(hash = %payload_hash, "remote clipboard materialization invoke started");
+    tracing::debug!(
+        hash = %payload_hash,
+        mime = request.mime.as_str(),
+        bytes_len,
+        "remote clipboard materialization invoke started"
+    );
     let payload =
         bmux_codec::to_positional_vec(&request).context("encoding clipboard sync payload")?;
     let sync_future = client.invoke_service_raw(
@@ -9262,7 +9274,12 @@ async fn sync_remote_clipboard(
     .context("remote clipboard sync timed out")?
     .map_err(|error| anyhow::anyhow!(error))?;
     view_state.clipboard_sync_state.payload_hash = Some(payload_hash.clone());
-    tracing::info!(hash = %payload_hash, "remote clipboard sync succeeded");
+    tracing::info!(
+        hash = %payload_hash,
+        mime = request.mime.as_str(),
+        bytes_len,
+        "remote clipboard sync succeeded"
+    );
     Ok(())
 }
 
