@@ -4,7 +4,7 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -18,8 +18,10 @@ struct ClipboardCommand {
 pub enum ClipboardError {
     #[error("clipboard backend not available on {os}")]
     BackendUnavailable { os: String },
+    #[error("clipboard backend '{backend}' failed: {message}")]
+    BackendFailed { backend: String, message: String },
     #[error("clipboard command '{program}' failed: {message}")]
-    BackendFailed { program: String, message: String },
+    CommandFailed { program: String, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +56,7 @@ impl Clipboard {
     ///
     /// # Errors
     ///
-    /// Returns [`ClipboardError::BackendFailed`] if the clipboard command
+    /// Returns [`ClipboardError::CommandFailed`] if the clipboard command
     /// cannot be spawned, stdin writing fails, or the command exits with a
     /// non-zero status.
     pub fn copy_text(&self, text: &str) -> Result<(), ClipboardError> {
@@ -64,7 +66,7 @@ impl Clipboard {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| ClipboardError::BackendFailed {
+            .map_err(|error| ClipboardError::CommandFailed {
                 program: self.command.program.to_string(),
                 message: error.to_string(),
             })?;
@@ -73,7 +75,7 @@ impl Clipboard {
             stdin
                 .write_all(text.as_bytes())
                 .and_then(|()| stdin.flush())
-                .map_err(|error| ClipboardError::BackendFailed {
+                .map_err(|error| ClipboardError::CommandFailed {
                     program: self.command.program.to_string(),
                     message: error.to_string(),
                 })?;
@@ -81,7 +83,7 @@ impl Clipboard {
 
         let output = child
             .wait_with_output()
-            .map_err(|error| ClipboardError::BackendFailed {
+            .map_err(|error| ClipboardError::CommandFailed {
                 program: self.command.program.to_string(),
                 message: error.to_string(),
             })?;
@@ -89,7 +91,7 @@ impl Clipboard {
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(ClipboardError::BackendFailed {
+            Err(ClipboardError::CommandFailed {
                 program: self.command.program.to_string(),
                 message: if stderr.is_empty() {
                     format!("exit status {}", output.status)
@@ -109,9 +111,19 @@ impl Clipboard {
 /// # Errors
 ///
 /// Returns [`ClipboardError::BackendUnavailable`] if no clipboard backend
-/// is found, or [`ClipboardError::BackendFailed`] if the copy command fails.
+/// is found, or [`ClipboardError::BackendFailed`] / [`ClipboardError::CommandFailed`] if copying fails.
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
-    Clipboard::new()?.copy_text(text)
+    match arboard_clipboard() {
+        Ok(mut clipboard) => {
+            clipboard
+                .set_text(text.to_string())
+                .map_err(|error| ClipboardError::BackendFailed {
+                    backend: "arboard".to_string(),
+                    message: error.to_string(),
+                })
+        }
+        Err(_) => Clipboard::new()?.copy_text(text),
+    }
 }
 
 fn detect_backend<F>(os: &str, exists: &mut F) -> Option<ClipboardCommand>
@@ -236,11 +248,12 @@ impl ClipboardPayload {
 /// Returns [`ClipboardError`] if no supported clipboard backend is available or
 /// the backend command fails.
 pub fn read_payload(prefer_image: bool) -> Result<ClipboardPayload, ClipboardError> {
-    if prefer_image && env::consts::OS == "macos" && command_exists("osascript") {
-        match read_macos_png_clipboard() {
-            Ok(Some(bytes)) => return Ok(ClipboardPayload::ImagePng(bytes)),
-            Ok(None) => {}
-            Err(error) => return Err(error),
+    if prefer_image {
+        if let Ok(Some(payload)) = read_arboard_image() {
+            return Ok(payload);
+        }
+        if let Ok(Some(payload)) = read_image_file_reference_payload() {
+            return Ok(payload);
         }
     }
     read_text().map(ClipboardPayload::Text)
@@ -253,6 +266,20 @@ pub fn read_payload(prefer_image: bool) -> Result<ClipboardPayload, ClipboardErr
 /// Returns [`ClipboardError`] if no supported read backend is available or the
 /// backend command fails.
 pub fn read_text() -> Result<String, ClipboardError> {
+    arboard_clipboard().map_or_else(
+        |_| read_text_command(),
+        |mut clipboard| {
+            clipboard
+                .get_text()
+                .map_err(|error| ClipboardError::BackendFailed {
+                    backend: "arboard".to_string(),
+                    message: error.to_string(),
+                })
+        },
+    )
+}
+
+fn read_text_command() -> Result<String, ClipboardError> {
     let (program, args): (&str, &[&str]) = match env::consts::OS {
         "macos" => ("pbpaste", &[]),
         "linux" if command_exists("wl-paste") => ("wl-paste", &["--no-newline"]),
@@ -265,17 +292,17 @@ pub fn read_text() -> Result<String, ClipboardError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|error| ClipboardError::BackendFailed {
+        .map_err(|error| ClipboardError::CommandFailed {
             program: program.to_string(),
             message: error.to_string(),
         })?;
     if !output.status.success() {
-        return Err(ClipboardError::BackendFailed {
+        return Err(ClipboardError::CommandFailed {
             program: program.to_string(),
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    String::from_utf8(output.stdout).map_err(|error| ClipboardError::BackendFailed {
+    String::from_utf8(output.stdout).map_err(|error| ClipboardError::CommandFailed {
         program: program.to_string(),
         message: error.to_string(),
     })
@@ -287,99 +314,153 @@ pub fn read_text() -> Result<String, ClipboardError> {
 ///
 /// Returns [`ClipboardError`] if image clipboard writes are unsupported or fail.
 pub fn copy_png_image(bytes: &[u8]) -> Result<(), ClipboardError> {
-    if env::consts::OS != "macos" || !command_exists("osascript") {
-        return Err(ClipboardError::BackendUnavailable {
-            os: env::consts::OS.to_string(),
-        });
-    }
-    let temp_path = env::temp_dir().join(format!("bmux-clipboard-{}.png", std::process::id()));
-    std::fs::write(&temp_path, bytes).map_err(|error| ClipboardError::BackendFailed {
-        program: "write-temp-png".to_string(),
+    let mut clipboard = arboard_clipboard()?;
+    let image = image::load_from_memory(bytes).map_err(|error| ClipboardError::BackendFailed {
+        backend: "image".to_string(),
         message: error.to_string(),
     })?;
-    let script = format!(
-        "set the clipboard to (read (POSIX file {}) as «class PNGf»)",
-        applescript_quote(&temp_path.to_string_lossy())
-    );
-    let result = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .status()
-        .map_err(|error| ClipboardError::BackendFailed {
-            program: "osascript".to_string(),
-            message: error.to_string(),
-        });
-    let _ = std::fs::remove_file(&temp_path);
-    let status = result?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(ClipboardError::BackendFailed {
-            program: "osascript".to_string(),
-            message: format!("exited with status {status}"),
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    clipboard
+        .set_image(arboard::ImageData {
+            width: usize::try_from(width).unwrap_or(usize::MAX),
+            height: usize::try_from(height).unwrap_or(usize::MAX),
+            bytes: rgba.into_raw().into(),
         })
+        .map_err(|error| ClipboardError::BackendFailed {
+            backend: "arboard".to_string(),
+            message: error.to_string(),
+        })
+}
+
+fn arboard_clipboard() -> Result<arboard::Clipboard, ClipboardError> {
+    arboard::Clipboard::new().map_err(|error| ClipboardError::BackendFailed {
+        backend: "arboard".to_string(),
+        message: error.to_string(),
+    })
+}
+
+fn read_arboard_image() -> Result<Option<ClipboardPayload>, ClipboardError> {
+    let mut clipboard = arboard_clipboard()?;
+    match clipboard.get_image() {
+        Ok(image) => {
+            encode_arboard_image_png(image).map(|bytes| Some(ClipboardPayload::ImagePng(bytes)))
+        }
+        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(error) => Err(ClipboardError::BackendFailed {
+            backend: "arboard".to_string(),
+            message: error.to_string(),
+        }),
     }
 }
 
-fn read_macos_png_clipboard() -> Result<Option<Vec<u8>>, ClipboardError> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg("try\n  the clipboard as «class PNGf»\non error\n  return \"\"\nend try")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+fn encode_arboard_image_png(image: arboard::ImageData<'_>) -> Result<Vec<u8>, ClipboardError> {
+    let width = u32::try_from(image.width).map_err(|error| ClipboardError::BackendFailed {
+        backend: "arboard".to_string(),
+        message: error.to_string(),
+    })?;
+    let height = u32::try_from(image.height).map_err(|error| ClipboardError::BackendFailed {
+        backend: "arboard".to_string(),
+        message: error.to_string(),
+    })?;
+    let rgba =
+        image::RgbaImage::from_raw(width, height, image.bytes.into_owned()).ok_or_else(|| {
+            ClipboardError::BackendFailed {
+                backend: "arboard".to_string(),
+                message: "invalid RGBA clipboard image buffer".to_string(),
+            }
+        })?;
+    let dynamic = image::DynamicImage::ImageRgba8(rgba);
+    let mut output = Cursor::new(Vec::new());
+    dynamic
+        .write_to(&mut output, image::ImageFormat::Png)
         .map_err(|error| ClipboardError::BackendFailed {
-            program: "osascript".to_string(),
+            backend: "image".to_string(),
             message: error.to_string(),
         })?;
-    if !output.status.success() {
-        return Err(ClipboardError::BackendFailed {
-            program: "osascript".to_string(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    Ok(output.into_inner())
+}
+
+fn read_image_file_reference_payload() -> Result<Option<ClipboardPayload>, ClipboardError> {
+    if let Some(path) = read_arboard_image_path_text()? {
+        return read_image_file_payload(&path);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(hex) = extract_applescript_data_hex(&stdout) else {
+    Ok(None)
+}
+
+fn read_arboard_image_path_text() -> Result<Option<PathBuf>, ClipboardError> {
+    let mut clipboard = arboard_clipboard()?;
+    let text = match clipboard.get_text() {
+        Ok(text) => text,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(error) => {
+            return Err(ClipboardError::BackendFailed {
+                backend: "arboard".to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let trimmed = text.trim();
+    if let Some(path) = trimmed.strip_prefix("file://") {
+        return Ok(Some(PathBuf::from(percent_decode_file_url_path(path))));
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() && path.is_file() {
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+fn read_image_file_payload(path: &Path) -> Result<Option<ClipboardPayload>, ClipboardError> {
+    let bytes = std::fs::read(path).map_err(|error| ClipboardError::BackendFailed {
+        backend: "file".to_string(),
+        message: error.to_string(),
+    })?;
+    if is_png(&bytes) {
+        return Ok(Some(ClipboardPayload::ImagePng(bytes)));
+    }
+    let Ok(image) = image::load_from_memory(&bytes) else {
         return Ok(None);
     };
-    decode_hex(hex)
-        .map(Some)
-        .map_err(|message| ClipboardError::BackendFailed {
-            program: "osascript".to_string(),
-            message,
-        })
+    let mut output = Cursor::new(Vec::new());
+    image
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|error| ClipboardError::BackendFailed {
+            backend: "image".to_string(),
+            message: error.to_string(),
+        })?;
+    Ok(Some(ClipboardPayload::ImagePng(output.into_inner())))
 }
 
-fn extract_applescript_data_hex(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    let start = trimmed.find("«data PNGf")? + "«data PNGf".len();
-    let end = trimmed[start..].find('»')? + start;
-    Some(trimmed[start..end].trim())
-}
-
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    let compact = hex
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>();
-    if compact.len() % 2 != 0 {
-        return Err("hex clipboard payload had odd length".to_string());
+fn percent_decode_file_url_path(path: &str) -> String {
+    let mut bytes = Vec::with_capacity(path.len());
+    let raw = path.as_bytes();
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%'
+            && index + 2 < raw.len()
+            && let Ok(value) = u8::from_str_radix(&path[index + 1..index + 3], 16)
+        {
+            bytes.push(value);
+            index += 3;
+            continue;
+        }
+        bytes.push(raw[index]);
+        index += 1;
     }
-    (0..compact.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&compact[index..index + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn applescript_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Clipboard, ClipboardCommand, ClipboardError, detect_backend};
+    use super::{
+        Clipboard, ClipboardCommand, ClipboardError, detect_backend, is_png,
+        percent_decode_file_url_path,
+    };
 
     #[test]
     fn detect_backend_prefers_wl_copy_on_linux() {
@@ -416,5 +497,19 @@ mod tests {
                 os: "linux".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn percent_decode_file_url_path_decodes_escaped_bytes() {
+        assert_eq!(
+            percent_decode_file_url_path("/tmp/image%20one%23.png"),
+            "/tmp/image one#.png"
+        );
+    }
+
+    #[test]
+    fn is_png_detects_png_magic() {
+        assert!(is_png(b"\x89PNG\r\n\x1a\nrest"));
+        assert!(!is_png(b"not png"));
     }
 }

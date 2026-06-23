@@ -11,6 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+arboard   = { workspace = true }
+image     = { workspace = true }
 thiserror = { workspace = true }
 
 [features]

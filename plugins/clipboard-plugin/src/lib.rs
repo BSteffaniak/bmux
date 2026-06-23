@@ -151,7 +151,8 @@ fn map_clipboard_error(error: ClipboardError) -> ServiceResponse {
         ClipboardError::BackendUnavailable { .. } => {
             ServiceResponse::error("backend_unavailable", "clipboard backend unavailable")
         }
-        ClipboardError::BackendFailed { message, .. } => ServiceResponse::error(
+        ClipboardError::BackendFailed { message, .. }
+        | ClipboardError::CommandFailed { message, .. } => ServiceResponse::error(
             "backend_failed",
             format!("clipboard operation failed: {message}"),
         ),
