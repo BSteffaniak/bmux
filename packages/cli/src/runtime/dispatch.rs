@@ -1,10 +1,10 @@
 use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand,
-    KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand,
-    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, RemoteTrustCommand,
-    SandboxCommand, SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg, ServerCommand,
-    SessionCommand, SlotCommand, TerminalCommand,
+    DiagnosticsCommand, KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand,
+    PlaybookCommand, RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand,
+    RemoteTrustCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg,
+    ServerCommand, SessionCommand, SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -19,12 +19,12 @@ use super::{
     run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
     run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
     run_config_scope_explain, run_config_set, run_config_show, run_connect, run_device_seal_broker,
-    run_doctor, run_external_plugin_command, run_follow, run_host, run_hosts, run_join,
-    run_keymap_doctor, run_keymap_explain, run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token,
-    run_kiosk_revoke_token, run_kiosk_ssh_print_config, run_kiosk_status, run_logs_level,
-    run_logs_path, run_logs_profiles_delete, run_logs_profiles_list, run_logs_profiles_rename,
-    run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off, run_perf_on,
-    run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
+    run_diagnostics_watch, run_doctor, run_external_plugin_command, run_follow, run_host,
+    run_hosts, run_join, run_keymap_doctor, run_keymap_explain, run_kiosk_attach, run_kiosk_init,
+    run_kiosk_issue_token, run_kiosk_revoke_token, run_kiosk_ssh_print_config, run_kiosk_status,
+    run_logs_level, run_logs_path, run_logs_profiles_delete, run_logs_profiles_list,
+    run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off,
+    run_perf_on, run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
     run_playbook_interactive, run_playbook_run, run_playbook_validate,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_trust_add,
@@ -131,6 +131,11 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
                 LogsProfilesCommand::Delete { .. } => BuiltInHandlerId::LogsProfilesDelete,
                 LogsProfilesCommand::Rename { .. } => BuiltInHandlerId::LogsProfilesRename,
             },
+        },
+        Command::Diagnostics { command } => match command {
+            DiagnosticsCommand::Watch { .. } | DiagnosticsCommand::View { .. } => {
+                BuiltInHandlerId::DiagnosticsWatch
+            }
         },
         Command::Config { command } => match command {
             ConfigCommand::Path { .. } => BuiltInHandlerId::ConfigPath,
@@ -817,6 +822,38 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_logs_watch(
+            *lines,
+            since.as_deref(),
+            profile.as_deref(),
+            include,
+            include_i,
+            exclude,
+            exclude_i,
+        ),
+        (
+            BuiltInHandlerId::DiagnosticsWatch,
+            Command::Diagnostics {
+                command:
+                    DiagnosticsCommand::Watch {
+                        lines,
+                        since,
+                        profile,
+                        include,
+                        include_i,
+                        exclude,
+                        exclude_i,
+                    }
+                    | DiagnosticsCommand::View {
+                        lines,
+                        since,
+                        profile,
+                        include,
+                        include_i,
+                        exclude,
+                        exclude_i,
+                    },
+            },
+        ) => run_diagnostics_watch(
             *lines,
             since.as_deref(),
             profile.as_deref(),

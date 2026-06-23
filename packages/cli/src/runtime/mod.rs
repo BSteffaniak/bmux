@@ -23,6 +23,7 @@ mod cli_parse;
 mod config_cli;
 mod device_seal_broker;
 mod diagnostics_layer;
+mod diagnostics_watch;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;
@@ -73,6 +74,7 @@ use config_cli::{
     run_config_profiles_switch, run_config_scope_explain, run_config_set, run_config_show,
 };
 use device_seal_broker::run_device_seal_broker;
+use diagnostics_watch::run_diagnostics_watch;
 use dispatch::run_command;
 use doctor_cli::run_doctor;
 use kiosk_cli::{

@@ -383,6 +383,11 @@ pub enum Command {
         #[command(subcommand)]
         command: LogsCommand,
     },
+    /// Structured diagnostics event viewer
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
+    },
     /// Configuration management and inspection
     Config {
         #[command(subcommand)]
@@ -1465,6 +1470,58 @@ pub enum KeymapCommand {
         /// Print output as JSON
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnosticsCommand {
+    /// Interactive structured diagnostics event viewer with dynamic filters
+    Watch {
+        /// Number of recent events to preload (defaults to saved profile value or 200)
+        #[arg(long)]
+        lines: Option<usize>,
+        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
+        #[arg(long)]
+        since: Option<String>,
+        /// State profile for saved watch filters (default: global `default`)
+        #[arg(long)]
+        profile: Option<String>,
+        /// Include regex filter (case-sensitive, repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Include regex filter (case-insensitive, repeatable)
+        #[arg(long = "include-i")]
+        include_i: Vec<String>,
+        /// Exclude regex filter (case-sensitive, repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Exclude regex filter (case-insensitive, repeatable)
+        #[arg(long = "exclude-i")]
+        exclude_i: Vec<String>,
+    },
+    /// Alias for watch
+    View {
+        /// Number of recent events to preload (defaults to saved profile value or 200)
+        #[arg(long)]
+        lines: Option<usize>,
+        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
+        #[arg(long)]
+        since: Option<String>,
+        /// State profile for saved watch filters (default: global `default`)
+        #[arg(long)]
+        profile: Option<String>,
+        /// Include regex filter (case-sensitive, repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Include regex filter (case-insensitive, repeatable)
+        #[arg(long = "include-i")]
+        include_i: Vec<String>,
+        /// Exclude regex filter (case-sensitive, repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Exclude regex filter (case-insensitive, repeatable)
+        #[arg(long = "exclude-i")]
+        exclude_i: Vec<String>,
     },
 }
 

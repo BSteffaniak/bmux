@@ -66,6 +66,8 @@ pub enum BuiltInHandlerId {
     LogsLevel,
     LogsTail,
     LogsWatch,
+    Diagnostics,
+    DiagnosticsWatch,
     LogsProfiles,
     LogsProfilesList,
     LogsProfilesShow,
@@ -486,6 +488,17 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             &["logs", "watch"],
             "Interactive log viewer with live filters",
         ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Diagnostics,
+            &["diagnostics"],
+            "Structured diagnostics event viewer",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::DiagnosticsWatch,
+            &["diagnostics", "watch"],
+            "Interactive structured diagnostics event viewer",
+        )
+        .with_alias(&["diagnostics", "view"]),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::LogsProfiles,
             &["logs", "profiles"],

@@ -6495,8 +6495,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34768839e8949f9a4a9e5ec4c561c4d7332e2112a61ac453145fbbffc79eaafb"
+source = "git+https://github.com/MoosicBox/MoosicBox?rev=4b3d808ecfc83a755b720db4b96eef0405b78549#4b3d808ecfc83a755b720db4b96eef0405b78549"
 dependencies = [
  "anyhow",
  "crossterm",

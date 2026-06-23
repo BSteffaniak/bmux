@@ -27,6 +27,8 @@ pub fn run_logs_watch(
 ) -> Result<u8> {
     moosicbox_log_watch::run_watch(moosicbox_log_watch::WatchRunConfig {
         title: BMUX_WATCH_TITLE.to_string(),
+        source: None,
+        input_format: moosicbox_log_watch::WatchInputFormat::PlainText,
         log_dir: active_log_watch_dir(),
         log_file_prefix: active_log_watch_prefix().to_string(),
         lines,
