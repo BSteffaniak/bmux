@@ -9,7 +9,7 @@ use crate::home_layout as layout;
 /// The landing page for bmux docs site.
 #[must_use]
 pub fn home() -> Containers {
-    layout::page(&container! {
+    container! {
         div
             #hero-wrap
             flex-grow=1
@@ -130,7 +130,7 @@ pub fn home() -> Containers {
                 ))
             }
         }
-    })
+    }
 }
 
 fn feature_card(index: u8, title: &str, description: &str) -> Containers {

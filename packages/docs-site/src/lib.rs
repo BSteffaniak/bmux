@@ -8,7 +8,7 @@
 use std::sync::LazyLock;
 
 use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
-use hyperchad_docs_site::DocsSite;
+use hyperchad_docs_site::{DocsSite, HeaderLink};
 use serde_json::json;
 
 /// Default viewport meta tag for responsive design.
@@ -31,11 +31,11 @@ static ASSETS_DIR: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
 
 #[cfg(feature = "assets")]
 static ASSETS: LazyLock<Vec<hyperchad::renderer::assets::StaticAssetRoute>> = LazyLock::new(|| {
-    vec![hyperchad::renderer::assets::StaticAssetRoute {
-        route: "public".to_string(),
-        target: ASSETS_DIR.clone().try_into().unwrap(),
-        not_found_behavior: None,
-    }]
+    vec![
+        #[cfg(feature = "vanilla-js")]
+        hyperchad_docs_site::assets::vanilla_js_route(),
+        hyperchad_docs_site::assets::public_dir_route("public", ASSETS_DIR.clone()),
+    ]
 });
 
 /// Documentation site model with routes and navigation derived from the central
@@ -47,6 +47,13 @@ pub static SITE: LazyLock<DocsSite> = LazyLock::new(|| {
         .sections(bmux_docs_site_ui::doc_pages::DOC_SECTIONS)
         .pages(bmux_docs_site_ui::doc_pages::DOC_PAGES)
         .home(bmux_docs_site_ui::pages::home::home)
+        .shell(bmux_docs_site_ui::home_layout::shell)
+        .brand(">_ bmux", "/")
+        .header_links([
+            HeaderLink::new("docs", "/docs"),
+            HeaderLink::external("github", "https://github.com/BSteffaniak/bmux"),
+        ])
+        .global_font(bmux_docs_site_ui::home_layout::MONO_FONT)
         .build()
 });
 

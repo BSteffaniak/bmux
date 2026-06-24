@@ -50,7 +50,7 @@ pub static DOC_PAGES: &[DocPage] = &[
     // Getting Started
     docs_generated_page! {
         route: "/docs",
-        title: "Overview",
+        title: None,
         section: GETTING_STARTED,
         nav_label: "Overview",
         generate: generate_overview,
@@ -108,9 +108,9 @@ pub static DOC_PAGES: &[DocPage] = &[
     docs_markdown_page! {
         source: "docs/images.md",
         route: "/docs/images",
-        title: "Images",
+        title: "Images & Compression",
         section: REFERENCE,
-        nav_label: "Images",
+        nav_label: "Images & Compression",
     },
     docs_generated_page! {
         route: "/docs/config",
@@ -123,9 +123,9 @@ pub static DOC_PAGES: &[DocPage] = &[
     docs_markdown_page! {
         source: "docs/plugins.md",
         route: "/docs/plugins",
-        title: "Plugins",
+        title: "Plugin Architecture",
         section: PLUGINS,
-        nav_label: "Plugins",
+        nav_label: "Plugin Architecture",
     },
     docs_markdown_page! {
         source: "docs/bpdl-spec.md",
@@ -144,31 +144,31 @@ pub static DOC_PAGES: &[DocPage] = &[
     docs_markdown_page! {
         source: "examples/native-plugin/README.md",
         route: "/docs/plugin-example",
-        title: "Native Plugin Example",
+        title: "Example Plugin",
         section: PLUGINS,
-        nav_label: "Native Plugin Example",
+        nav_label: "Example Plugin",
     },
     // Plugin Operations
     docs_markdown_page! {
         source: "docs/plugin-ops.md",
         route: "/docs/plugin-ops",
-        title: "Operations",
+        title: "Plugin Ops",
         section: PLUGIN_OPERATIONS,
-        nav_label: "Operations",
+        nav_label: "Plugin Ops",
     },
     docs_markdown_page! {
         source: "docs/plugin-triage-playbook.md",
         route: "/docs/plugin-triage-playbook",
-        title: "Triage Playbook",
+        title: "Plugin Triage",
         section: PLUGIN_OPERATIONS,
-        nav_label: "Triage Playbook",
+        nav_label: "Plugin Triage",
     },
     docs_markdown_page! {
         source: "docs/plugin-perf-troubleshooting.md",
         route: "/docs/plugin-perf-troubleshooting",
-        title: "Performance Troubleshooting",
+        title: "Perf Troubleshooting",
         section: PLUGIN_OPERATIONS,
-        nav_label: "Performance Troubleshooting",
+        nav_label: "Perf Troubleshooting",
     },
     // Development
     docs_markdown_page! {

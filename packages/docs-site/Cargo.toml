@@ -49,7 +49,7 @@ default          = ["actix", "html", "vanilla-js", "assets", "static-routes"]
 fail-on-warnings = ["bmux_docs_site_ui/fail-on-warnings"]
 
 actix = ["hyperchad/renderer-html-actix"]
-assets = ["hyperchad/renderer-assets"]
+assets = ["hyperchad/renderer-assets", "hyperchad_docs_site/assets"]
 html = ["hyperchad/renderer-html"]
 static-routes = ["hyperchad/router-static-routes"]
 vanilla-js = [
@@ -59,4 +59,5 @@ vanilla-js = [
     "hyperchad/renderer-vanilla-js-plugin-actions-click-outside",
     "hyperchad/renderer-vanilla-js-plugin-nav",
     "hyperchad/renderer-vanilla-js-plugin-routing",
+    "hyperchad_docs_site/vanilla-js",
 ]
