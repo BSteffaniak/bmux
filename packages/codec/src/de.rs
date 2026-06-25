@@ -1,7 +1,7 @@
 use crate::error::Error;
-use crate::ser::EncodingMode;
+use crate::ser::{EncodingMode, TypeTag};
 use crate::varint;
-use serde::de::{self, Deserialize, DeserializeSeed, Visitor};
+use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer, Visitor};
 
 /// A binary deserializer for the bmux wire protocol.
 ///
@@ -40,6 +40,48 @@ impl<'de> Deserializer<'de> {
     fn read_u8(&mut self) -> Result<u8, Error> {
         let bytes = self.consume(1)?;
         Ok(bytes[0])
+    }
+
+    fn read_tag(&mut self) -> Result<Option<TypeTag>, Error> {
+        if self.mode != EncodingMode::TypedStable {
+            return Ok(None);
+        }
+        let tag = match self.read_u8()? {
+            0 => TypeTag::Unit,
+            1 => TypeTag::Bool,
+            2 => TypeTag::I8,
+            3 => TypeTag::I16,
+            4 => TypeTag::I32,
+            5 => TypeTag::I64,
+            6 => TypeTag::U8,
+            7 => TypeTag::U16,
+            8 => TypeTag::U32,
+            9 => TypeTag::U64,
+            10 => TypeTag::F32,
+            11 => TypeTag::F64,
+            12 => TypeTag::Char,
+            13 => TypeTag::String,
+            14 => TypeTag::Bytes,
+            15 => TypeTag::None,
+            16 => TypeTag::Some,
+            17 => TypeTag::Seq,
+            18 => TypeTag::Map,
+            19 => TypeTag::Struct,
+            20 => TypeTag::Enum,
+            _ => return Err(Error::Message("invalid type tag".to_string())),
+        };
+        Ok(Some(tag))
+    }
+
+    fn expect_tag(&mut self, expected: TypeTag) -> Result<(), Error> {
+        if let Some(actual) = self.read_tag()?
+            && actual != expected
+        {
+            return Err(Error::Message(format!(
+                "unexpected type tag: expected {expected:?}, got {actual:?}"
+            )));
+        }
+        Ok(())
     }
 
     fn read_varint_u64(&mut self) -> Result<u64, Error> {
@@ -114,7 +156,16 @@ pub fn from_positional_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Resu
     from_bytes_with_mode(bytes, EncodingMode::Positional)
 }
 
-pub(crate) fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
+/// Deserialize a value from typed stable bytes.
+///
+/// # Errors
+///
+/// Returns an error if bytes cannot be decoded as `T`.
+pub fn from_typed_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
+    from_bytes_with_mode(bytes, EncodingMode::TypedStable)
+}
+
+fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
     bytes: &'de [u8],
     mode: EncodingMode,
 ) -> Result<T, Error> {
@@ -129,13 +180,89 @@ pub(crate) fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
 impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
-    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
-        Err(Error::UnsupportedType(
-            "deserialize_any (non-self-describing format)",
-        ))
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let Some(tag) = self.read_tag()? else {
+            return Err(Error::UnsupportedType(
+                "deserialize_any (non-self-describing format)",
+            ));
+        };
+        match tag {
+            TypeTag::Unit => visitor.visit_unit(),
+            TypeTag::Bool => match self.read_u8()? {
+                0 => visitor.visit_bool(false),
+                1 => visitor.visit_bool(true),
+                _ => Err(Error::InvalidBool),
+            },
+            TypeTag::I8 => {
+                let v = self.read_varint_i16()?;
+                visitor.visit_i8(
+                    i8::try_from(v).map_err(|_| Error::Message("i8 overflow".to_string()))?,
+                )
+            }
+            TypeTag::I16 => visitor.visit_i16(self.read_varint_i16()?),
+            TypeTag::I32 => visitor.visit_i32(self.read_varint_i32()?),
+            TypeTag::I64 => visitor.visit_i64(self.read_varint_i64()?),
+            TypeTag::U8 => visitor.visit_u8(self.read_u8()?),
+            TypeTag::U16 => visitor.visit_u16(self.read_varint_u16()?),
+            TypeTag::U32 => visitor.visit_u32(self.read_varint_u32()?),
+            TypeTag::U64 => visitor.visit_u64(self.read_varint_u64()?),
+            TypeTag::F32 => {
+                let bytes = self.consume(4)?;
+                visitor.visit_f32(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
+            TypeTag::F64 => {
+                let bytes = self.consume(8)?;
+                visitor.visit_f64(f64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]))
+            }
+            TypeTag::Char => {
+                let v = self.read_varint_u32()?;
+                let c = char::from_u32(v).ok_or(Error::InvalidChar)?;
+                visitor.visit_char(c)
+            }
+            TypeTag::String => visitor.visit_borrowed_str(self.read_str()?),
+            TypeTag::Bytes => visitor.visit_borrowed_bytes(self.read_bytes()?),
+            TypeTag::None => visitor.visit_none(),
+            TypeTag::Some => visitor.visit_some(self),
+            TypeTag::Seq => {
+                let len = self.read_varint_usize()?;
+                visitor.visit_seq(CountedAccess {
+                    de: self,
+                    remaining: len,
+                    raw_keys: false,
+                })
+            }
+            TypeTag::Map => {
+                let len = self.read_varint_usize()?;
+                visitor.visit_map(CountedAccess {
+                    de: self,
+                    remaining: len,
+                    raw_keys: false,
+                })
+            }
+            TypeTag::Struct => {
+                let len = self.read_varint_usize()?;
+                visitor.visit_map(CountedAccess {
+                    de: self,
+                    remaining: len,
+                    raw_keys: true,
+                })
+            }
+            TypeTag::Enum => {
+                let variant = self.read_str()?;
+                let len = self.read_varint_usize()?;
+                visitor.visit_enum(InternallyTaggedEnum {
+                    de: self,
+                    variant,
+                    remaining: len,
+                })
+            }
+        }
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Bool)?;
         match self.read_u8()? {
             0 => visitor.visit_bool(false),
             1 => visitor.visit_bool(true),
@@ -144,44 +271,54 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::I8)?;
         let v = self.read_varint_i16()?;
         visitor.visit_i8(i8::try_from(v).map_err(|_| Error::Message("i8 overflow".to_string()))?)
     }
 
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::I16)?;
         visitor.visit_i16(self.read_varint_i16()?)
     }
 
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::I32)?;
         visitor.visit_i32(self.read_varint_i32()?)
     }
 
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::I64)?;
         visitor.visit_i64(self.read_varint_i64()?)
     }
 
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::U8)?;
         visitor.visit_u8(self.read_u8()?)
     }
 
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::U16)?;
         visitor.visit_u16(self.read_varint_u16()?)
     }
 
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::U32)?;
         visitor.visit_u32(self.read_varint_u32()?)
     }
 
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::U64)?;
         visitor.visit_u64(self.read_varint_u64()?)
     }
 
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::F32)?;
         let bytes = self.consume(4)?;
         visitor.visit_f32(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::F64)?;
         let bytes = self.consume(8)?;
         visitor.visit_f64(f64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -189,28 +326,43 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Char)?;
         let v = self.read_varint_u32()?;
         let c = char::from_u32(v).ok_or(Error::InvalidChar)?;
         visitor.visit_char(c)
     }
 
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::String)?;
         visitor.visit_borrowed_str(self.read_str()?)
     }
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::String)?;
         visitor.visit_string(self.read_str()?.to_string())
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Bytes)?;
         visitor.visit_borrowed_bytes(self.read_bytes()?)
     }
 
     fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Bytes)?;
         visitor.visit_borrowed_bytes(self.read_bytes()?)
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        if self.mode == EncodingMode::TypedStable {
+            return match self.read_tag()? {
+                Some(TypeTag::None) => visitor.visit_none(),
+                Some(TypeTag::Some) => visitor.visit_some(self),
+                Some(actual) => Err(Error::Message(format!(
+                    "unexpected option type tag: {actual:?}"
+                ))),
+                None => unreachable!(),
+            };
+        }
         match self.read_u8()? {
             0 => visitor.visit_none(),
             1 => visitor.visit_some(self),
@@ -219,6 +371,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Unit)?;
         visitor.visit_unit()
     }
 
@@ -227,6 +380,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Unit)?;
         visitor.visit_unit()
     }
 
@@ -239,10 +393,12 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Seq)?;
         let len = self.read_varint_usize()?;
         visitor.visit_seq(CountedAccess {
             de: self,
             remaining: len,
+            raw_keys: false,
         })
     }
 
@@ -250,6 +406,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         visitor.visit_seq(CountedAccess {
             de: self,
             remaining: len,
+            raw_keys: false,
         })
     }
 
@@ -262,14 +419,17 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         visitor.visit_seq(CountedAccess {
             de: self,
             remaining: len,
+            raw_keys: false,
         })
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Map)?;
         let len = self.read_varint_usize()?;
         visitor.visit_map(CountedAccess {
             de: self,
             remaining: len,
+            raw_keys: false,
         })
     }
 
@@ -279,17 +439,20 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Struct)?;
         match self.mode {
-            EncodingMode::Stable => {
+            EncodingMode::Stable | EncodingMode::TypedStable => {
                 let len = self.read_varint_usize()?;
                 visitor.visit_map(CountedAccess {
                     de: self,
                     remaining: len,
+                    raw_keys: true,
                 })
             }
             EncodingMode::Positional => visitor.visit_seq(CountedAccess {
                 de: self,
                 remaining: fields.len(),
+                raw_keys: false,
             }),
         }
     }
@@ -300,12 +463,19 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Enum)?;
         visitor.visit_enum(self)
     }
 
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self.mode {
             EncodingMode::Stable => visitor.visit_borrowed_str(self.read_str()?),
+            EncodingMode::TypedStable => {
+                if self.remaining().first().copied() == Some(TypeTag::String as u8) {
+                    self.expect_tag(TypeTag::String)?;
+                }
+                visitor.visit_borrowed_str(self.read_str()?)
+            }
             EncodingMode::Positional => visitor.visit_u32(self.read_varint_u32()?),
         }
     }
@@ -343,6 +513,7 @@ impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
         visitor.visit_seq(CountedAccess {
             de: self,
             remaining: len,
+            raw_keys: false,
         })
     }
 
@@ -352,24 +523,78 @@ impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
         visitor: V,
     ) -> Result<V::Value, Error> {
         match self.mode {
-            EncodingMode::Stable => {
+            EncodingMode::Stable | EncodingMode::TypedStable => {
                 let len = self.read_varint_usize()?;
                 visitor.visit_map(CountedAccess {
                     de: self,
                     remaining: len,
+                    raw_keys: true,
                 })
             }
             EncodingMode::Positional => visitor.visit_seq(CountedAccess {
                 de: self,
                 remaining: fields.len(),
+                raw_keys: false,
             }),
         }
+    }
+}
+
+struct InternallyTaggedEnum<'a, 'de> {
+    de: &'a mut Deserializer<'de>,
+    variant: &'de str,
+    remaining: usize,
+}
+
+impl<'de, 'a> de::EnumAccess<'de> for InternallyTaggedEnum<'a, 'de> {
+    type Error = Error;
+    type Variant = Self;
+
+    fn variant_seed<V: DeserializeSeed<'de>>(
+        self,
+        seed: V,
+    ) -> Result<(V::Value, Self::Variant), Error> {
+        let variant = seed.deserialize(self.variant.into_deserializer())?;
+        Ok((variant, self))
+    }
+}
+
+impl<'de, 'a> de::VariantAccess<'de> for InternallyTaggedEnum<'a, 'de> {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
+        seed.deserialize(self.de)
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
+        visitor.visit_seq(CountedAccess {
+            de: self.de,
+            remaining: self.remaining,
+            raw_keys: false,
+        })
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        visitor.visit_map(CountedAccess {
+            de: self.de,
+            remaining: self.remaining,
+            raw_keys: true,
+        })
     }
 }
 
 struct CountedAccess<'a, 'de> {
     de: &'a mut Deserializer<'de>,
     remaining: usize,
+    raw_keys: bool,
 }
 
 impl<'de, 'a> de::SeqAccess<'de> for CountedAccess<'a, 'de> {
@@ -402,6 +627,10 @@ impl<'de, 'a> de::MapAccess<'de> for CountedAccess<'a, 'de> {
             return Ok(None);
         }
         self.remaining -= 1;
+        if self.raw_keys {
+            let key = self.de.read_str()?;
+            return seed.deserialize(key.into_deserializer()).map(Some);
+        }
         seed.deserialize(&mut *self.de).map(Some)
     }
 

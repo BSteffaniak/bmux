@@ -36,9 +36,9 @@ mod error;
 mod ser;
 pub mod varint;
 
-pub use de::{from_bytes, from_positional_bytes};
+pub use de::{from_bytes, from_positional_bytes, from_typed_bytes};
 pub use error::Error;
-pub use ser::{to_positional_vec, to_vec};
+pub use ser::{to_positional_vec, to_typed_vec, to_vec};
 
 /// Serde adapter for `Vec<u8>` fields that are semantically raw bytes.
 ///
@@ -500,6 +500,42 @@ mod tests {
         };
         let bytes = to_vec(&v).unwrap();
         assert_eq!(from_bytes::<ComplexStruct>(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn typed_stable_roundtrip_complex_struct() {
+        let mut meta = BTreeMap::new();
+        meta.insert("env".to_string(), "prod".to_string());
+        let v = ComplexStruct {
+            id: 42,
+            name: Some("test-session".into()),
+            tags: vec!["alpha".into(), "beta".into()],
+            metadata: meta,
+            active: true,
+            nested: SimpleStruct {
+                a: 7,
+                b: "inner".into(),
+                c: false,
+            },
+        };
+        let bytes = to_typed_vec(&v).unwrap();
+        assert_eq!(from_typed_bytes::<ComplexStruct>(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn typed_stable_supports_internally_tagged_enums() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Event {
+            Status { message: String },
+            Progress { percent: u8 },
+        }
+
+        let value = Event::Status {
+            message: "running".to_string(),
+        };
+        let bytes = to_typed_vec(&value).unwrap();
+        assert_eq!(from_typed_bytes::<Event>(&bytes).unwrap(), value);
     }
 
     // ── UUID support ─────────────────────────────────────────────────────────
