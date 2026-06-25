@@ -274,6 +274,10 @@ pub struct TablePolicy {
     pub auto_scroll_selected: bool,
     /// Separator between cells.
     pub cell_separator: &'static str,
+    /// Integrated vertical scrollbar mode.
+    pub vertical_scrollbar: ScrollAreaScrollbarMode,
+    /// Integrated vertical scrollbar policy.
+    pub vertical_scrollbar_policy: ScrollbarPolicy,
     /// Integrated horizontal scrollbar mode.
     pub horizontal_scrollbar: ScrollAreaScrollbarMode,
     /// Integrated horizontal scrollbar policy.
@@ -291,6 +295,8 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::disabled(),
             auto_scroll_selected: false,
             cell_separator: " ",
+            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
             horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
             horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
@@ -306,10 +312,26 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::button(),
             auto_scroll_selected: true,
             cell_separator: " ",
+            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
             horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
             horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
     }
+    /// Return policy with vertical scrollbar mode set.
+    #[must_use]
+    pub const fn vertical_scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
+        self.vertical_scrollbar = mode;
+        self
+    }
+
+    /// Return policy with vertical scrollbar rendering policy set.
+    #[must_use]
+    pub const fn vertical_scrollbar_policy(mut self, policy: ScrollbarPolicy) -> Self {
+        self.vertical_scrollbar_policy = policy;
+        self
+    }
+
     /// Return policy with horizontal scrollbar mode set.
     #[must_use]
     pub const fn horizontal_scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
@@ -394,6 +416,8 @@ pub struct TableLayout {
     pub header_separator: Option<Rect>,
     /// Body area.
     pub body: Rect,
+    /// Vertical scrollbar area if enabled.
+    pub vertical_scrollbar: Option<Rect>,
     /// Horizontal scrollbar area if enabled.
     pub horizontal_scrollbar: Option<Rect>,
 }
@@ -426,6 +450,8 @@ impl<'a> Table<'a> {
                 },
                 auto_scroll_selected: true,
                 cell_separator: " ",
+                vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+                vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
                 horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
                 horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
             },
@@ -483,14 +509,26 @@ impl<'a> Table<'a> {
             .y
             .saturating_add(header_rows)
             .saturating_add(separator_rows);
-        let horizontal_scrollbar = (!matches!(
+        let has_vertical_scrollbar = !matches!(
+            self.policy.vertical_scrollbar,
+            ScrollAreaScrollbarMode::Hidden
+        ) && area.height > header_rows.saturating_add(separator_rows);
+        let has_horizontal_scrollbar = !matches!(
             self.policy.horizontal_scrollbar,
             ScrollAreaScrollbarMode::Hidden
-        ) && area.height > header_rows.saturating_add(separator_rows))
-        .then_some(Rect::new(
+        ) && area.height
+            > header_rows.saturating_add(separator_rows);
+        let body_width = area.width.saturating_sub(u16::from(
+            has_vertical_scrollbar
+                && matches!(
+                    self.policy.vertical_scrollbar,
+                    ScrollAreaScrollbarMode::Gutter
+                ),
+        ));
+        let horizontal_scrollbar = has_horizontal_scrollbar.then_some(Rect::new(
             area.x,
             area.bottom().saturating_sub(1),
-            area.width,
+            body_width,
             1,
         ));
         let body_height = area
@@ -498,20 +536,28 @@ impl<'a> Table<'a> {
             .saturating_sub(header_rows)
             .saturating_sub(separator_rows)
             .saturating_sub(u16::from(
-                matches!(
-                    self.policy.horizontal_scrollbar,
-                    ScrollAreaScrollbarMode::Gutter
-                ) && horizontal_scrollbar.is_some(),
+                has_horizontal_scrollbar
+                    && matches!(
+                        self.policy.horizontal_scrollbar,
+                        ScrollAreaScrollbarMode::Gutter
+                    ),
             ));
+        let vertical_scrollbar = has_vertical_scrollbar.then_some(Rect::new(
+            area.right().saturating_sub(1),
+            body_y,
+            1,
+            body_height,
+        ));
         TableLayout {
             column_widths: resolve_column_widths(
                 self.columns,
-                area.width,
+                body_width,
                 self.policy.cell_separator,
             ),
             header,
             header_separator,
-            body: Rect::new(area.x, body_y, area.width, body_height),
+            body: Rect::new(area.x, body_y, body_width, body_height),
+            vertical_scrollbar,
             horizontal_scrollbar,
         }
     }
@@ -581,7 +627,24 @@ impl<'a> Table<'a> {
                 rendered = rendered.saturating_add(1);
             }
         }
+        self.render_vertical_scrollbar(&layout, state, frame);
         self.render_horizontal_scrollbar(&layout, state, frame);
+    }
+
+    fn render_vertical_scrollbar(
+        &self,
+        layout: &TableLayout,
+        state: &TableState,
+        frame: &mut Frame<'_>,
+    ) {
+        let Some(area) = layout.vertical_scrollbar else {
+            return;
+        };
+        let scrollbar_state = ScrollbarState::new(u16_saturating(self.rows.len()), area.height)
+            .offset(u16_saturating(state.scroll));
+        Scrollbar::new()
+            .policy(self.policy.vertical_scrollbar_policy)
+            .render(area, &scrollbar_state, frame);
     }
 
     fn render_horizontal_scrollbar(
@@ -634,6 +697,18 @@ impl<'a> Table<'a> {
 
     fn handle_mouse(&self, area: Rect, state: &mut TableState, mouse: MouseEvent) -> TableOutcome {
         let layout = self.layout(area);
+        if let Some(scrollbar_area) = layout.vertical_scrollbar {
+            let mut scrollbar_state =
+                ScrollbarState::new(u16_saturating(self.rows.len()), scrollbar_area.height)
+                    .offset(u16_saturating(state.scroll));
+            let outcome = Scrollbar::new()
+                .policy(self.policy.vertical_scrollbar_policy)
+                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse));
+            if let ScrollbarOutcome::Changed { offset } = outcome {
+                state.scroll = usize::from(offset).min(self.rows.len().saturating_sub(1));
+                return TableOutcome::Redraw;
+            }
+        }
         if let Some(scrollbar_area) = layout.horizontal_scrollbar {
             let mut scrollbar_state = ScrollbarState::new(
                 u16_saturating(self.preferred_content_width()),
@@ -1143,6 +1218,52 @@ mod tests {
         );
         assert_eq!(state.horizontal_scroll(), 3);
         assert_eq!(state.selected_column(), Some(1));
+    }
+
+    #[test]
+    fn renders_integrated_vertical_scrollbar() {
+        let columns = [TableColumn::new("Name").fixed(4)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::new(vec!["two"]),
+            TableRow::new(vec!["three"]),
+        ];
+        let mut state = TableState::new(None);
+        state.set_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(TablePolicy::bare().vertical_scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .render(Rect::new(0, 0, 6, 3), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("two  │"));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("thr… █"));
+    }
+
+    #[test]
+    fn vertical_scrollbar_mouse_updates_scroll() {
+        let columns = [TableColumn::new("Name").fixed(4)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::new(vec!["two"]),
+            TableRow::new(vec!["three"]),
+        ];
+        let mut state = TableState::new(None);
+
+        let outcome = Table::new(&columns, &rows)
+            .policy(TablePolicy::interactive().vertical_scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .handle_event(
+                Rect::new(0, 0, 6, 3),
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(5, 2),
+                )),
+            );
+
+        assert_eq!(outcome, TableOutcome::Redraw);
+        assert!(state.scroll() > 0);
     }
 
     #[test]
