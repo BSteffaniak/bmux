@@ -11,6 +11,8 @@ use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::hit_test::{HitRegion, hit_region_at};
+use crate::scroll_area::ScrollAreaScrollbarMode;
+use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 
 /// Horizontal cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,6 +274,10 @@ pub struct TablePolicy {
     pub auto_scroll_selected: bool,
     /// Separator between cells.
     pub cell_separator: &'static str,
+    /// Integrated horizontal scrollbar mode.
+    pub horizontal_scrollbar: ScrollAreaScrollbarMode,
+    /// Integrated horizontal scrollbar policy.
+    pub horizontal_scrollbar_policy: ScrollbarPolicy,
 }
 
 impl TablePolicy {
@@ -285,6 +291,8 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::disabled(),
             auto_scroll_selected: false,
             cell_separator: " ",
+            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
     }
 
@@ -298,7 +306,22 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::button(),
             auto_scroll_selected: true,
             cell_separator: " ",
+            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
+    }
+    /// Return policy with horizontal scrollbar mode set.
+    #[must_use]
+    pub const fn horizontal_scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
+        self.horizontal_scrollbar = mode;
+        self
+    }
+
+    /// Return policy with horizontal scrollbar rendering policy set.
+    #[must_use]
+    pub const fn horizontal_scrollbar_policy(mut self, policy: ScrollbarPolicy) -> Self {
+        self.horizontal_scrollbar_policy = policy;
+        self
     }
 }
 
@@ -371,6 +394,8 @@ pub struct TableLayout {
     pub header_separator: Option<Rect>,
     /// Body area.
     pub body: Rect,
+    /// Horizontal scrollbar area if enabled.
+    pub horizontal_scrollbar: Option<Rect>,
 }
 
 /// Generic table component.
@@ -401,6 +426,8 @@ impl<'a> Table<'a> {
                 },
                 auto_scroll_selected: true,
                 cell_separator: " ",
+                horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+                horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
             },
             styles: TableStyles {
                 header: Style::new(),
@@ -456,10 +483,26 @@ impl<'a> Table<'a> {
             .y
             .saturating_add(header_rows)
             .saturating_add(separator_rows);
+        let horizontal_scrollbar = (!matches!(
+            self.policy.horizontal_scrollbar,
+            ScrollAreaScrollbarMode::Hidden
+        ) && area.height > header_rows.saturating_add(separator_rows))
+        .then_some(Rect::new(
+            area.x,
+            area.bottom().saturating_sub(1),
+            area.width,
+            1,
+        ));
         let body_height = area
             .height
             .saturating_sub(header_rows)
-            .saturating_sub(separator_rows);
+            .saturating_sub(separator_rows)
+            .saturating_sub(u16::from(
+                matches!(
+                    self.policy.horizontal_scrollbar,
+                    ScrollAreaScrollbarMode::Gutter
+                ) && horizontal_scrollbar.is_some(),
+            ));
         TableLayout {
             column_widths: resolve_column_widths(
                 self.columns,
@@ -469,6 +512,7 @@ impl<'a> Table<'a> {
             header,
             header_separator,
             body: Rect::new(area.x, body_y, area.width, body_height),
+            horizontal_scrollbar,
         }
     }
 
@@ -514,7 +558,7 @@ impl<'a> Table<'a> {
             let row = &self.rows[source];
             for line_index in 0..row.height() {
                 if rendered >= usize::from(layout.body.height) {
-                    return;
+                    break;
                 }
                 let y = layout.body.y.saturating_add(u16_saturating(rendered));
                 let rect = Rect::new(layout.body.x, y, layout.body.width, 1);
@@ -537,6 +581,24 @@ impl<'a> Table<'a> {
                 rendered = rendered.saturating_add(1);
             }
         }
+        self.render_horizontal_scrollbar(&layout, state, frame);
+    }
+
+    fn render_horizontal_scrollbar(
+        &self,
+        layout: &TableLayout,
+        state: &TableState,
+        frame: &mut Frame<'_>,
+    ) {
+        let Some(area) = layout.horizontal_scrollbar else {
+            return;
+        };
+        let scrollbar_state =
+            ScrollbarState::new(u16_saturating(self.preferred_content_width()), area.width)
+                .offset(u16_saturating(state.horizontal_scroll));
+        Scrollbar::new()
+            .policy(self.policy.horizontal_scrollbar_policy)
+            .render(area, &scrollbar_state, frame);
     }
 
     /// Handle one event.
@@ -571,6 +633,21 @@ impl<'a> Table<'a> {
     }
 
     fn handle_mouse(&self, area: Rect, state: &mut TableState, mouse: MouseEvent) -> TableOutcome {
+        let layout = self.layout(area);
+        if let Some(scrollbar_area) = layout.horizontal_scrollbar {
+            let mut scrollbar_state = ScrollbarState::new(
+                u16_saturating(self.preferred_content_width()),
+                scrollbar_area.width,
+            )
+            .offset(u16_saturating(state.horizontal_scroll));
+            let outcome = Scrollbar::new()
+                .policy(self.policy.horizontal_scrollbar_policy)
+                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse));
+            if let ScrollbarOutcome::Changed { offset } = outcome {
+                state.horizontal_scroll = usize::from(offset);
+                return TableOutcome::Redraw;
+            }
+        }
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => {
                 let hovered = self.row_at(area, state, mouse.position);
@@ -632,6 +709,28 @@ impl<'a> Table<'a> {
 
     fn row_at(&self, area: Rect, state: &TableState, position: Point) -> Option<usize> {
         hit_region_at(&self.row_hit_regions(area, state), position).map(|region| region.key)
+    }
+
+    fn preferred_content_width(&self) -> usize {
+        let width = self
+            .columns
+            .iter()
+            .map(|column| match column.width {
+                TableWidth::Fixed(width)
+                | TableWidth::Min(width)
+                | TableWidth::Max(width)
+                | TableWidth::Flex(width) => usize::from(width.max(1)),
+                TableWidth::Percentage(percent) => usize::from(percent.max(1)),
+                TableWidth::Ratio(numerator, denominator) if denominator > 0 => {
+                    usize::from(numerator.max(1))
+                }
+                TableWidth::Ratio(_, _) => 1,
+            })
+            .sum::<usize>();
+        width.saturating_add(
+            display_width(self.policy.cell_separator)
+                .saturating_mul(self.columns.len().saturating_sub(1)),
+        )
     }
 
     fn move_selection(&self, state: &mut TableState, delta: i32) -> TableOutcome {
@@ -903,6 +1002,8 @@ mod tests {
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
+    use crate::scroll_area::ScrollAreaScrollbarMode;
+
     use super::{
         Table, TableAlign, TableColumn, TableOutcome, TablePolicy, TableRow, TableState,
         TableStyles, format_cell,
@@ -1042,6 +1143,44 @@ mod tests {
         );
         assert_eq!(state.horizontal_scroll(), 3);
         assert_eq!(state.selected_column(), Some(1));
+    }
+
+    #[test]
+    fn renders_integrated_horizontal_scrollbar() {
+        let columns = [TableColumn::new("Name").fixed(10)];
+        let rows = [TableRow::new(vec!["abcdefghi"])];
+        let state = TableState::new(Some(0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(TablePolicy::bare().horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .render(Rect::new(0, 0, 5, 2), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("██───"));
+    }
+
+    #[test]
+    fn horizontal_scrollbar_mouse_updates_scroll() {
+        let columns = [TableColumn::new("Name").fixed(10)];
+        let rows = [TableRow::new(vec!["abcdefghi"])];
+        let mut state = TableState::new(Some(0));
+
+        let outcome = Table::new(&columns, &rows)
+            .policy(
+                TablePolicy::interactive().horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+            )
+            .handle_event(
+                Rect::new(0, 0, 5, 2),
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(4, 1),
+                )),
+            );
+
+        assert_eq!(outcome, TableOutcome::Redraw);
+        assert!(state.horizontal_scroll() > 0);
     }
 
     #[test]
