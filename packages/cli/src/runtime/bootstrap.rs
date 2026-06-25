@@ -190,12 +190,13 @@ pub(super) async fn run_server_start(
     pane_shell_integration_override: Option<bool>,
     startup_recording: Option<ManualRecordingStartOptions>,
 ) -> Result<u8> {
+    let local_connection_context = ConnectionContext::new(Some("local"));
     cleanup_stale_pid_file().await?;
     let startup_recording = match startup_recording {
         Some(options) => Some(options),
         None => startup_recording_from_env()?,
     };
-    if server_is_running(ConnectionContext::default()).await? {
+    if server_is_running(local_connection_context).await? {
         println!("bmux server is already running");
         return Ok(1);
     }
@@ -282,7 +283,7 @@ pub(super) async fn run_server_start(
         write_server_pid_file(child.id())?;
         write_server_runtime_metadata(child.id())?;
 
-        if !wait_for_server_running(SERVER_START_TIMEOUT, ConnectionContext::default()).await? {
+        if !wait_for_server_running(SERVER_START_TIMEOUT, local_connection_context).await? {
             let _ = try_kill_pid(child.id());
             let _ = remove_server_pid_file();
             anyhow::bail!("background server did not become ready before timeout")

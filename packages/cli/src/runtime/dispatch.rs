@@ -237,7 +237,7 @@ pub(super) async fn dispatch_built_in_command(
                 mode,
             },
         ) => {
-            run_host(
+            Box::pin(run_host(
                 listen,
                 name.as_deref(),
                 *copy,
@@ -247,7 +247,7 @@ pub(super) async fn dispatch_built_in_command(
                 *restart,
                 *mode,
                 false,
-            )
+            ))
             .await
         }
         (BuiltInHandlerId::Join, Command::Join { link, session }) => {

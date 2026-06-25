@@ -204,7 +204,8 @@ pub(super) async fn cleanup_stale_pid_file() -> Result<()> {
         return Ok(());
     };
 
-    if !is_pid_running(pid)? && !probe_server_running(ConnectionContext::default()).await? {
+    if !is_pid_running(pid)? && !probe_server_running(ConnectionContext::new(Some("local"))).await?
+    {
         remove_server_pid_file()?;
     }
 
