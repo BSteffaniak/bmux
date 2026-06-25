@@ -6,6 +6,8 @@ use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 
+use crate::hit_test::HitRegion;
+
 /// Scrollbar orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollbarOrientation {
@@ -332,7 +334,9 @@ impl Scrollbar {
             return ScrollbarOutcome::Ignored;
         };
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if area.contains(mouse.position) => {
+            MouseEventKind::Down(MouseButton::Left)
+                if HitRegion::new((), area).contains(mouse.position) =>
+            {
                 state.dragging = true;
                 self.set_from_position(area, state, mouse.position)
             }
