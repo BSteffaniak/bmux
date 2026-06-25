@@ -13,6 +13,7 @@ use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::hit_test::{HitRegion, hit_region_at};
 use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
+use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
 /// Horizontal cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -420,6 +421,8 @@ pub struct TableLayout {
     pub vertical_scrollbar: Option<Rect>,
     /// Horizontal scrollbar area if enabled.
     pub horizontal_scrollbar: Option<Rect>,
+    /// Corner cell reserved when both gutter scrollbars are enabled.
+    pub scrollbar_corner: Option<Rect>,
 }
 
 /// Generic table component.
@@ -509,56 +512,32 @@ impl<'a> Table<'a> {
             .y
             .saturating_add(header_rows)
             .saturating_add(separator_rows);
-        let has_vertical_scrollbar = !matches!(
-            self.policy.vertical_scrollbar,
-            ScrollAreaScrollbarMode::Hidden
-        ) && area.height > header_rows.saturating_add(separator_rows);
-        let has_horizontal_scrollbar = !matches!(
-            self.policy.horizontal_scrollbar,
-            ScrollAreaScrollbarMode::Hidden
-        ) && area.height
-            > header_rows.saturating_add(separator_rows);
-        let body_width = area.width.saturating_sub(u16::from(
-            has_vertical_scrollbar
-                && matches!(
-                    self.policy.vertical_scrollbar,
-                    ScrollAreaScrollbarMode::Gutter
-                ),
-        ));
-        let horizontal_scrollbar = has_horizontal_scrollbar.then_some(Rect::new(
-            area.x,
-            area.bottom().saturating_sub(1),
-            body_width,
-            1,
-        ));
-        let body_height = area
-            .height
-            .saturating_sub(header_rows)
-            .saturating_sub(separator_rows)
-            .saturating_sub(u16::from(
-                has_horizontal_scrollbar
-                    && matches!(
-                        self.policy.horizontal_scrollbar,
-                        ScrollAreaScrollbarMode::Gutter
-                    ),
-            ));
-        let vertical_scrollbar = has_vertical_scrollbar.then_some(Rect::new(
-            area.right().saturating_sub(1),
-            body_y,
-            1,
-            body_height,
-        ));
+        let viewport = scrollbar_layout(
+            Rect::new(
+                area.x,
+                body_y,
+                area.width,
+                area.height
+                    .saturating_sub(header_rows)
+                    .saturating_sub(separator_rows),
+            ),
+            ScrollbarLayoutPolicy::new(
+                scrollbar_axis_mode(self.policy.vertical_scrollbar),
+                scrollbar_axis_mode(self.policy.horizontal_scrollbar),
+            ),
+        );
         TableLayout {
             column_widths: resolve_column_widths(
                 self.columns,
-                body_width,
+                viewport.content.width,
                 self.policy.cell_separator,
             ),
             header,
             header_separator,
-            body: Rect::new(area.x, body_y, body_width, body_height),
-            vertical_scrollbar,
-            horizontal_scrollbar,
+            body: viewport.content,
+            vertical_scrollbar: viewport.vertical_scrollbar,
+            horizontal_scrollbar: viewport.horizontal_scrollbar,
+            scrollbar_corner: viewport.corner,
         }
     }
 
@@ -629,6 +608,9 @@ impl<'a> Table<'a> {
         }
         self.render_vertical_scrollbar(&layout, state, frame);
         self.render_horizontal_scrollbar(&layout, state, frame);
+        if let Some(corner) = layout.scrollbar_corner {
+            frame.write_line(corner, &Line::from(" "));
+        }
     }
 
     fn render_vertical_scrollbar(
@@ -954,6 +936,14 @@ impl<'a> Table<'a> {
     }
 }
 
+const fn scrollbar_axis_mode(mode: ScrollAreaScrollbarMode) -> ScrollbarAxisLayoutMode {
+    match mode {
+        ScrollAreaScrollbarMode::Hidden => ScrollbarAxisLayoutMode::Hidden,
+        ScrollAreaScrollbarMode::Overlay => ScrollbarAxisLayoutMode::Overlay,
+        ScrollAreaScrollbarMode::Gutter => ScrollbarAxisLayoutMode::Gutter,
+    }
+}
+
 fn format_cell_line(line: &Line, width: u16, align: TableAlign, truncate: bool) -> Line {
     let width = usize::from(width);
     let line_width = line.width();
@@ -1218,6 +1208,31 @@ mod tests {
         );
         assert_eq!(state.horizontal_scroll(), 3);
         assert_eq!(state.selected_column(), Some(1));
+    }
+
+    #[test]
+    fn sticky_header_renders_with_scrollbar_gutters_and_corner() {
+        let columns = [TableColumn::new("Name").fixed(10)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::new(vec!["two"]),
+            TableRow::new(vec!["three"]),
+        ];
+        let mut state = TableState::new(None);
+        state.set_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(
+                TablePolicy::bare()
+                    .vertical_scrollbar(ScrollAreaScrollbarMode::Gutter)
+                    .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+            )
+            .render(Rect::new(0, 0, 6, 4), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Name  "));
+        assert_eq!(frame.buffer().row_symbols(3).as_deref(), Some("██─── "));
     }
 
     #[test]
