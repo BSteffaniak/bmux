@@ -7,7 +7,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
-use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::common::{ComponentMousePolicy, InteractionState, InteractionStyles};
 use crate::hit_test::HitRegion;
 
 /// Visual styles for a button.
@@ -231,17 +231,14 @@ impl<'a> Button<'a> {
     }
 
     const fn style_for(&self, state: ButtonState) -> Style {
-        if state.interaction.disabled {
-            self.styles.disabled
-        } else if state.interaction.pressed {
-            self.styles.pressed
-        } else if state.interaction.focused {
-            self.styles.focused
-        } else if state.interaction.hovered {
-            self.styles.hovered
-        } else {
-            self.styles.normal
-        }
+        InteractionStyles::new(
+            self.styles.normal,
+            self.styles.focused,
+            self.styles.hovered,
+            self.styles.pressed,
+            self.styles.disabled,
+        )
+        .resolve(state.interaction)
     }
 
     const fn handle_key(&self, state: ButtonState, stroke: KeyStroke) -> ButtonOutcome {

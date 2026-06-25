@@ -1,6 +1,7 @@
 //! Shared neutral primitives for higher-level TUI components.
 
 use bmux_tui::geometry::Point;
+use bmux_tui::style::Style;
 
 /// Runtime interaction flags common to interactive controls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,6 +41,59 @@ impl InteractionState {
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
+    }
+}
+
+/// Styles resolved from common interaction flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractionStyles {
+    /// Base/default style.
+    pub normal: Style,
+    /// Style for focused controls.
+    pub focused: Style,
+    /// Style for hovered controls.
+    pub hovered: Style,
+    /// Style for pressed controls.
+    pub pressed: Style,
+    /// Style for disabled controls.
+    pub disabled: Style,
+}
+
+impl InteractionStyles {
+    /// Create a style set.
+    #[must_use]
+    pub const fn new(
+        normal: Style,
+        focused: Style,
+        hovered: Style,
+        pressed: Style,
+        disabled: Style,
+    ) -> Self {
+        Self {
+            normal,
+            focused,
+            hovered,
+            pressed,
+            disabled,
+        }
+    }
+
+    /// Resolve style from interaction state.
+    ///
+    /// Precedence is disabled > pressed > focused > hovered > normal.
+    #[must_use]
+    pub const fn resolve(self, state: InteractionState) -> Style {
+        if state.disabled {
+            self.disabled
+        } else if state.pressed {
+            self.pressed
+        } else if state.focused {
+            self.focused
+        } else if state.hovered {
+            self.hovered
+        } else {
+            self.normal
+        }
     }
 }
 
@@ -197,8 +251,12 @@ impl ResizeBounds {
 #[cfg(test)]
 mod tests {
     use bmux_tui::geometry::{Point, Rect, Size};
+    use bmux_tui::style::{Color, Style};
 
-    use super::{ComponentHitRegion, HitRegionId, ResizeBounds, hit_region_at};
+    use super::{
+        ComponentHitRegion, HitRegionId, InteractionState, InteractionStyles, ResizeBounds,
+        hit_region_at,
+    };
 
     #[test]
     fn hit_region_at_returns_first_containing_region() {
@@ -216,6 +274,38 @@ mod tests {
             Some(HitRegionId(2))
         );
         assert_eq!(hit_region_at(&regions, Point::new(9, 9)), None);
+    }
+
+    #[test]
+    fn interaction_styles_apply_explicit_precedence() {
+        let styles = InteractionStyles::new(
+            Style::new().fg(Color::White),
+            Style::new().fg(Color::Green),
+            Style::new().fg(Color::Yellow),
+            Style::new().fg(Color::Blue),
+            Style::new().fg(Color::Red),
+        );
+
+        assert_eq!(
+            styles.resolve(InteractionState::new().focused(true)),
+            Style::new().fg(Color::Green)
+        );
+        assert_eq!(
+            styles.resolve(InteractionState {
+                hovered: true,
+                pressed: true,
+                ..InteractionState::new()
+            }),
+            Style::new().fg(Color::Blue)
+        );
+        assert_eq!(
+            styles.resolve(InteractionState {
+                focused: true,
+                disabled: true,
+                ..InteractionState::new()
+            }),
+            Style::new().fg(Color::Red)
+        );
     }
 
     #[test]
