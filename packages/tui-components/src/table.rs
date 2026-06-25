@@ -44,6 +44,15 @@ pub enum TableWidth {
     Flex(u16),
 }
 
+/// Sort indicator direction for caller-owned table sorting state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSortDirection {
+    /// Column is sorted ascending.
+    Ascending,
+    /// Column is sorted descending.
+    Descending,
+}
+
 /// One table column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableColumn<'a> {
@@ -55,6 +64,8 @@ pub struct TableColumn<'a> {
     pub align: TableAlign,
     /// Whether cell content truncates to column width.
     pub truncate: bool,
+    /// Optional caller-provided sort indicator state.
+    pub sort: Option<TableSortDirection>,
 }
 
 impl<'a> TableColumn<'a> {
@@ -66,6 +77,7 @@ impl<'a> TableColumn<'a> {
             width: TableWidth::Flex(1),
             align: TableAlign::Left,
             truncate: true,
+            sort: None,
         }
     }
 
@@ -115,6 +127,12 @@ impl<'a> TableColumn<'a> {
     #[must_use]
     pub const fn align(mut self, align: TableAlign) -> Self {
         self.align = align;
+        self
+    }
+    /// Return this column with sort indicator state.
+    #[must_use]
+    pub const fn sort(mut self, sort: Option<TableSortDirection>) -> Self {
+        self.sort = sort;
         self
     }
 }
@@ -275,6 +293,10 @@ pub struct TablePolicy {
     pub auto_scroll_selected: bool,
     /// Separator between cells.
     pub cell_separator: &'static str,
+    /// Ascending sort indicator symbol.
+    pub sort_ascending_symbol: &'static str,
+    /// Descending sort indicator symbol.
+    pub sort_descending_symbol: &'static str,
     /// Integrated vertical scrollbar mode.
     pub vertical_scrollbar: ScrollAreaScrollbarMode,
     /// Integrated vertical scrollbar policy.
@@ -296,6 +318,8 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::disabled(),
             auto_scroll_selected: false,
             cell_separator: " ",
+            sort_ascending_symbol: "↑",
+            sort_descending_symbol: "↓",
             vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
             vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
             horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -313,12 +337,22 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::button(),
             auto_scroll_selected: true,
             cell_separator: " ",
+            sort_ascending_symbol: "↑",
+            sort_descending_symbol: "↓",
             vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
             vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
             horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
             horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
     }
+    /// Return policy with sort indicator symbols set.
+    #[must_use]
+    pub const fn sort_symbols(mut self, ascending: &'static str, descending: &'static str) -> Self {
+        self.sort_ascending_symbol = ascending;
+        self.sort_descending_symbol = descending;
+        self
+    }
+
     /// Return policy with vertical scrollbar mode set.
     #[must_use]
     pub const fn vertical_scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
@@ -453,6 +487,8 @@ impl<'a> Table<'a> {
                 },
                 auto_scroll_selected: true,
                 cell_separator: " ",
+                sort_ascending_symbol: "↑",
+                sort_descending_symbol: "↓",
                 vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
                 vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
                 horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -550,7 +586,9 @@ impl<'a> Table<'a> {
         if let Some(header) = layout.header {
             let line = self.row_line(
                 &layout.column_widths,
-                self.columns.iter().map(|column| Line::from(column.title)),
+                self.columns
+                    .iter()
+                    .map(|column| self.header_cell_line(column)),
                 true,
                 None,
                 state,
@@ -872,6 +910,17 @@ impl<'a> Table<'a> {
         }
     }
 
+    fn header_cell_line(&self, column: &TableColumn<'_>) -> Line {
+        let Some(sort) = column.sort else {
+            return Line::from(column.title);
+        };
+        let symbol = match sort {
+            TableSortDirection::Ascending => self.policy.sort_ascending_symbol,
+            TableSortDirection::Descending => self.policy.sort_descending_symbol,
+        };
+        Line::from(format!("{} {}", column.title, symbol))
+    }
+
     fn row_style(&self, index: usize, row: &TableRow, state: &TableState) -> Style {
         if row.disabled {
             self.styles.disabled
@@ -1070,8 +1119,8 @@ mod tests {
     use crate::scroll_area::ScrollAreaScrollbarMode;
 
     use super::{
-        Table, TableAlign, TableColumn, TableOutcome, TablePolicy, TableRow, TableState,
-        TableStyles, format_cell,
+        Table, TableAlign, TableColumn, TableOutcome, TablePolicy, TableRow, TableSortDirection,
+        TableState, TableStyles, format_cell,
     };
 
     #[test]
@@ -1317,6 +1366,29 @@ mod tests {
 
         assert_eq!(outcome, TableOutcome::Redraw);
         assert!(state.horizontal_scroll() > 0);
+    }
+
+    #[test]
+    fn renders_sort_indicators_with_fixed_and_flex_columns_and_truncation() {
+        let columns = [
+            TableColumn::new("LongName")
+                .fixed(6)
+                .sort(Some(TableSortDirection::Ascending)),
+            TableColumn::new("Count").sort(Some(TableSortDirection::Descending)),
+        ];
+        let rows = [TableRow::new(vec!["alpha", "1"])];
+        let state = TableState::new(None);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(TablePolicy::bare().sort_symbols("A", "D"))
+            .render(Rect::new(0, 0, 12, 2), &state, &mut frame);
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("LongN… Coun…")
+        );
     }
 
     #[test]
