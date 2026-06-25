@@ -10,6 +10,7 @@ use bmux_tui::text::{line_viewport, truncate_line_to_display_width};
 use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::hit_test::{HitRegion, hit_region_at};
 
 /// Horizontal cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -603,21 +604,34 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn row_at(&self, area: Rect, state: &TableState, position: Point) -> Option<usize> {
+    fn row_hit_regions(&self, area: Rect, state: &TableState) -> Vec<HitRegion<usize>> {
         let layout = self.layout(area);
-        if !layout.body.contains(position) {
-            return None;
-        }
-        let visible = usize::from(position.y.saturating_sub(layout.body.y));
-        let mut rendered = 0usize;
+        let mut rendered = 0u16;
+        let mut regions = Vec::new();
         for source in self.effective_scroll(state, layout.body.height)..self.rows.len() {
-            let height = self.rows[source].height();
-            if visible < rendered.saturating_add(height) {
-                return Some(source);
+            if rendered >= layout.body.height {
+                break;
             }
-            rendered = rendered.saturating_add(height);
+            let height = u16_saturating(self.rows[source].height())
+                .min(layout.body.height.saturating_sub(rendered));
+            if height > 0 {
+                regions.push(HitRegion::new(
+                    source,
+                    Rect::new(
+                        layout.body.x,
+                        layout.body.y.saturating_add(rendered),
+                        layout.body.width,
+                        height,
+                    ),
+                ));
+                rendered = rendered.saturating_add(height);
+            }
         }
-        None
+        regions
+    }
+
+    fn row_at(&self, area: Rect, state: &TableState, position: Point) -> Option<usize> {
+        hit_region_at(&self.row_hit_regions(area, state), position).map(|region| region.key)
     }
 
     fn move_selection(&self, state: &mut TableState, delta: i32) -> TableOutcome {

@@ -8,6 +8,7 @@ use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 
 use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::hit_test::{HitRegion, hit_region_at, vertical_hit_regions};
 
 /// One tree item in caller-provided preorder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,12 +458,12 @@ impl<'a> TreeView<'a> {
         }
     }
 
+    fn visible_hit_regions(&self, area: Rect, state: &TreeViewState) -> Vec<HitRegion<usize>> {
+        vertical_hit_regions(area, 0, self.visible_indices(state).iter().map(|_| 1))
+    }
+
     fn visible_at(&self, area: Rect, state: &TreeViewState, position: Point) -> Option<usize> {
-        if !area.contains(position) {
-            return None;
-        }
-        let visible = usize::from(position.y.saturating_sub(area.y));
-        (visible < self.visible_indices(state).len()).then_some(visible)
+        hit_region_at(&self.visible_hit_regions(area, state), position).map(|region| region.key)
     }
 
     fn move_selection(&self, state: &mut TreeViewState, delta: i32) -> TreeViewOutcome {
