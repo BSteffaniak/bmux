@@ -39,14 +39,19 @@ pub(super) async fn run_default_server_attach(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     tracing::info!("attach.bootstrap.default_start");
-    ensure_server_running_for_default_attach(connection_context, None).await?;
+    let attach_connection_context = connection_context
+        .target_override
+        .map_or(ConnectionContext::new(Some("local")), |target| {
+            ConnectionContext::new(Some(target))
+        });
+    ensure_server_running_for_default_attach(attach_connection_context, None).await?;
     tracing::info!("attach.bootstrap.server_ready");
 
     tracing::info!("attach.bootstrap.connect_start");
     let mut client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-default-attach",
-        connection_context,
+        attach_connection_context,
     )
     .await?;
     tracing::info!("attach.bootstrap.connect_done");
