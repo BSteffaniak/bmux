@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std"], optional = true }
 
 [dev-dependencies]
 proptest   = { workspace = true }
@@ -21,7 +21,11 @@ uuid       = { workspace = true, features = ["serde", "std", "v4"] }
 
 [features]
 # Default features
-default = []
+default      = ["serde", "stable", "positional", "typed-stable"]
+positional   = []
+serde        = ["dep:serde"]
+stable       = []
+typed-stable = []
 
 # Development features
 fail-on-warnings = []

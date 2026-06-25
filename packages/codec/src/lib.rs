@@ -1,179 +1,30 @@
 //! `bmux_codec` — Custom binary serialization codec for the bmux IPC protocol.
 //!
-//! This crate implements a serde-based binary serializer and deserializer
-//! designed for the bmux wire protocol. It uses LEB128 varints for positional
-//! integer encoding and length-prefixed containers. The default representation
-//! is stable: structs are encoded as field-name maps and enum variants are
-//! encoded by variant name. Legacy positional encoding is available through
-//! [`to_positional_vec`] and [`from_positional_bytes`] for transient, space-sensitive
-//! payloads.
-//!
-//! # Stable wire format
-//!
-//! | Element          | Encoding                             |
-//! |-----------------|--------------------------------------|
-//! | `bool`          | 1 byte (0 or 1)                      |
-//! | `u8`            | 1 byte raw                           |
-//! | `u16`..`u64`    | LEB128 unsigned varint               |
-//! | `i8`..`i64`     | ZigZag + LEB128                      |
-//! | `f32`           | 4 bytes little-endian IEEE 754       |
-//! | `f64`           | 8 bytes little-endian IEEE 754       |
-//! | `char`          | u32 varint (Unicode scalar)          |
-//! | `String`/`str`  | varint length + UTF-8 bytes          |
-//! | `Vec<u8>`/bytes | varint length + raw bytes            |
-//! | `Vec<T>`        | varint length + elements             |
-//! | `Option<T>`     | 1 byte tag (0=None, 1=Some) + value  |
-//! | `Map<K,V>`      | varint length + key-value pairs      |
-//! | struct          | varint field count + field-name/value pairs |
-//! | enum            | variant name + variant data            |
-//! | positional struct  | fields in declaration order, no names   |
-//! | positional enum    | varint variant index + variant data     |
-//! | newtype         | transparent (inner value only)        |
-//! | `Box<T>`        | transparent (same as T)              |
+//! This crate provides bmux wire-format primitives and optional serde adapters.
+//! With default features enabled, stable, positional, and typed-stable serde
+//! APIs are exported for compatibility with existing users.
 
-mod de;
 mod error;
-mod ser;
+pub mod mode;
+#[cfg(feature = "serde")]
+mod serde_adapter;
+pub mod tag;
 pub mod varint;
+pub mod wire;
 
-pub use de::{from_bytes, from_positional_bytes, from_typed_bytes};
 pub use error::Error;
-pub use ser::{to_positional_vec, to_typed_vec, to_vec};
 
-/// Serde adapter for `Vec<u8>` fields that are semantically raw bytes.
-///
-/// The bmux codec's sequence-of-`u8` and byte-buffer encodings are identical
-/// (`varint length + raw bytes`). Using this adapter lets those fields decode
-/// through `deserialize_byte_buf`, avoiding per-byte `SeqAccess` dispatch while
-/// keeping the wire format unchanged.
-pub mod serde_bytes_vec {
-    use serde::{Deserializer, Serializer, de::Visitor, ser::Serialize};
-    use std::fmt;
+#[cfg(all(feature = "serde", feature = "stable"))]
+pub use serde_adapter::stable::{from_bytes, to_vec};
 
-    /// Serialize a byte vector as codec bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns any serializer error from the underlying format.
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(bytes)
-    }
+#[cfg(all(feature = "serde", feature = "positional"))]
+pub use serde_adapter::positional::{from_positional_bytes, to_positional_vec};
 
-    /// Deserialize a byte vector through the format's byte-buffer path.
-    ///
-    /// # Errors
-    ///
-    /// Returns any deserializer error from the underlying format.
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_byte_buf(ByteVecVisitor)
-    }
+#[cfg(all(feature = "serde", feature = "typed-stable"))]
+pub use serde_adapter::typed_stable::{from_typed_bytes, to_typed_vec};
 
-    struct ByteVecVisitor;
-
-    impl<'de> Visitor<'de> for ByteVecVisitor {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a byte buffer")
-        }
-
-        fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value.to_vec())
-        }
-
-        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value.to_vec())
-        }
-
-        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value)
-        }
-    }
-
-    struct ByteSlice<'a>(&'a [u8]);
-
-    impl Serialize for ByteSlice<'_> {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            serializer.serialize_bytes(self.0)
-        }
-    }
-
-    /// Serde adapter for `Option<Vec<u8>>` fields that are semantically raw bytes.
-    pub mod option {
-        use super::{ByteSlice, ByteVecVisitor};
-        use serde::{Deserializer, Serializer, de::Visitor};
-        use std::fmt;
-
-        /// Serialize an optional byte vector as codec bytes when present.
-        ///
-        /// # Errors
-        ///
-        /// Returns any serializer error from the underlying format.
-        pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            match bytes {
-                Some(bytes) => serializer.serialize_some(&ByteSlice(bytes)),
-                None => serializer.serialize_none(),
-            }
-        }
-
-        /// Deserialize optional codec bytes into a byte vector when present.
-        ///
-        /// # Errors
-        ///
-        /// Returns any deserializer error from the underlying format.
-        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            deserializer.deserialize_option(OptionByteVecVisitor)
-        }
-
-        struct OptionByteVecVisitor;
-
-        impl<'de> Visitor<'de> for OptionByteVecVisitor {
-            type Value = Option<Vec<u8>>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an optional byte buffer")
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(None)
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                deserializer.deserialize_byte_buf(ByteVecVisitor).map(Some)
-            }
-        }
-    }
-}
+#[cfg(feature = "serde")]
+pub use serde_adapter::serde_bytes_vec;
 
 #[cfg(test)]
 mod tests {

@@ -1,39 +1,7 @@
-use crate::error::Error;
-use crate::varint;
+use crate::mode::EncodingMode;
+use crate::tag::TypeTag;
+use crate::{error::Error, varint};
 use serde::ser::{self, Serialize};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EncodingMode {
-    Stable,
-    TypedStable,
-    Positional,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum TypeTag {
-    Unit = 0,
-    Bool = 1,
-    I8 = 2,
-    I16 = 3,
-    I32 = 4,
-    I64 = 5,
-    U8 = 6,
-    U16 = 7,
-    U32 = 8,
-    U64 = 9,
-    F32 = 10,
-    F64 = 11,
-    Char = 12,
-    String = 13,
-    Bytes = 14,
-    None = 15,
-    Some = 16,
-    Seq = 17,
-    Map = 18,
-    Struct = 19,
-    Enum = 20,
-}
 
 /// A binary serializer for the bmux wire protocol.
 ///
@@ -72,41 +40,6 @@ impl Serializer {
             self.output.push(tag as u8);
         }
     }
-}
-
-/// Serialize a value to a stable byte vector.
-///
-/// # Errors
-///
-/// Returns an error if the value fails to serialize.
-pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    to_vec_with_mode(value, EncodingMode::Stable)
-}
-
-/// Serialize a value to a typed stable byte vector.
-///
-/// Typed stable encoding writes struct fields and enum variants by name like
-/// [`to_vec`], and prefixes each value with a compact type tag so serde
-/// visitors that require `deserialize_any` can decode dynamically shaped data.
-///
-/// # Errors
-///
-/// Returns an error if the value fails to serialize.
-pub fn to_typed_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    to_vec_with_mode(value, EncodingMode::TypedStable)
-}
-
-/// Serialize a value to a positional byte vector.
-///
-/// Positional encoding writes struct fields in declaration order and enum variants
-/// by declaration index. Prefer [`to_vec`] unless the payload is transient and
-/// space/performance sensitive.
-///
-/// # Errors
-///
-/// Returns an error if the value fails to serialize.
-pub fn to_positional_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    to_vec_with_mode(value, EncodingMode::Positional)
 }
 
 pub(crate) fn to_vec_with_mode<T: Serialize>(

@@ -1,6 +1,6 @@
-use crate::error::Error;
-use crate::ser::{EncodingMode, TypeTag};
-use crate::varint;
+use crate::mode::EncodingMode;
+use crate::tag::TypeTag;
+use crate::{error::Error, varint};
 use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer, Visitor};
 
 /// A binary deserializer for the bmux wire protocol.
@@ -138,34 +138,7 @@ impl<'de> Deserializer<'de> {
     }
 }
 
-/// Deserialize a value from stable bytes.
-///
-/// # Errors
-///
-/// Returns an error if the bytes cannot be deserialized into the target type.
-pub fn from_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
-    from_bytes_with_mode(bytes, EncodingMode::Stable)
-}
-
-/// Deserialize a value from positional bytes.
-///
-/// # Errors
-///
-/// Returns an error if the bytes cannot be deserialized into the target type.
-pub fn from_positional_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
-    from_bytes_with_mode(bytes, EncodingMode::Positional)
-}
-
-/// Deserialize a value from typed stable bytes.
-///
-/// # Errors
-///
-/// Returns an error if bytes cannot be decoded as `T`.
-pub fn from_typed_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
-    from_bytes_with_mode(bytes, EncodingMode::TypedStable)
-}
-
-fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
+pub(crate) fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
     bytes: &'de [u8],
     mode: EncodingMode,
 ) -> Result<T, Error> {
