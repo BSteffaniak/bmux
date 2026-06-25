@@ -184,6 +184,9 @@ impl ser::Serializer for &mut Serializer {
         match self.mode {
             EncodingMode::Stable | EncodingMode::TypedStable => {
                 self.write_str(variant);
+                if self.mode == EncodingMode::TypedStable {
+                    varint::encode_usize(&mut self.output, 0);
+                }
                 Ok(())
             }
             EncodingMode::Positional => {
@@ -212,6 +215,9 @@ impl ser::Serializer for &mut Serializer {
         match self.mode {
             EncodingMode::Stable | EncodingMode::TypedStable => {
                 self.write_str(variant);
+                if self.mode == EncodingMode::TypedStable {
+                    varint::encode_usize(&mut self.output, 1);
+                }
             }
             EncodingMode::Positional => varint::encode_u32(&mut self.output, variant_index),
         }

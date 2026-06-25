@@ -13,6 +13,7 @@ pub struct Deserializer<'de> {
     input: &'de [u8],
     pos: usize,
     mode: EncodingMode,
+    tagged_identifier: bool,
 }
 
 impl<'de> Deserializer<'de> {
@@ -21,6 +22,7 @@ impl<'de> Deserializer<'de> {
             input,
             pos: 0,
             mode,
+            tagged_identifier: false,
         }
     }
 
@@ -456,7 +458,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         match self.mode {
             EncodingMode::Stable => visitor.visit_borrowed_str(self.read_str()?),
             EncodingMode::TypedStable => {
-                if self.remaining().first().copied() == Some(TypeTag::String as u8) {
+                if self.tagged_identifier {
                     self.expect_tag(TypeTag::String)?;
                 }
                 visitor.visit_borrowed_str(self.read_str()?)
@@ -487,10 +489,26 @@ impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<(), Error> {
+        if self.mode == EncodingMode::TypedStable {
+            let remaining = self.read_varint_usize()?;
+            if remaining != 0 {
+                return Err(Error::Message(format!(
+                    "unit variant expected 0 fields, found {remaining}"
+                )));
+            }
+        }
         Ok(())
     }
 
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
+        if self.mode == EncodingMode::TypedStable {
+            let remaining = self.read_varint_usize()?;
+            if remaining != 1 {
+                return Err(Error::Message(format!(
+                    "newtype variant expected 1 field, found {remaining}"
+                )));
+            }
+        }
         seed.deserialize(self)
     }
 
@@ -621,11 +639,21 @@ impl<'de, 'a> de::MapAccess<'de> for CountedAccess<'a, 'de> {
             let key = self.de.read_str()?;
             return seed.deserialize(key.into_deserializer()).map(Some);
         }
-        seed.deserialize(&mut *self.de).map(Some)
+        let previous = self.de.tagged_identifier;
+        self.de.tagged_identifier = true;
+        let result = seed.deserialize(&mut *self.de);
+        self.de.tagged_identifier = previous;
+        result.map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        seed.deserialize(&mut *self.de)
+        let previous = self.de.tagged_identifier;
+        if self.raw_keys && self.de.remaining().first().copied() == Some(TypeTag::String as u8) {
+            self.de.tagged_identifier = true;
+        }
+        let result = seed.deserialize(&mut *self.de);
+        self.de.tagged_identifier = previous;
+        result
     }
 
     fn size_hint(&self) -> Option<usize> {

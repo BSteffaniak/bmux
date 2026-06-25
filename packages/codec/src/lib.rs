@@ -456,6 +456,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_stable_supports_nested_newtype_enum_with_struct_payload() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Outer {
+            Ok(Inner),
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Inner {
+            Struct { value: Nested },
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Nested {
+            Unit,
+        }
+
+        let value = Outer::Ok(Inner::Struct {
+            value: Nested::Unit,
+        });
+        let bytes = to_typed_vec(&value).unwrap();
+        assert_eq!(from_typed_bytes::<Outer>(&bytes).unwrap(), value);
+    }
+
+    #[test]
+    fn typed_stable_supports_nested_struct_enum_payloads_with_options() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Response {
+            Ok(Payload),
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Payload {
+            List { models: Vec<Model> },
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Model {
+            id: String,
+            pricing: Option<Pricing>,
+            visibility: Visibility,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Pricing {
+            currency: String,
+            unit: Unit,
+            input: Option<TokenPrice>,
+            cached_input: Option<TokenPrice>,
+            cache_write_input: Option<TokenPrice>,
+            output: Option<TokenPrice>,
+            source: Source,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct TokenPrice {
+            micros: u64,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Unit {
+            PerMillionTokens,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Source {
+            PatternMatch,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Visibility {
+            Visible,
+        }
+
+        let value = Response::Ok(Payload::List {
+            models: vec![Model {
+                id: "test".to_string(),
+                pricing: Some(Pricing {
+                    currency: "USD".to_string(),
+                    unit: Unit::PerMillionTokens,
+                    input: Some(TokenPrice { micros: 1_250_000 }),
+                    cached_input: Some(TokenPrice { micros: 125_000 }),
+                    cache_write_input: None,
+                    output: Some(TokenPrice { micros: 10_000_000 }),
+                    source: Source::PatternMatch,
+                }),
+                visibility: Visibility::Visible,
+            }],
+        });
+        let bytes = to_typed_vec(&value).unwrap();
+        assert_eq!(from_typed_bytes::<Response>(&bytes).unwrap(), value);
+    }
+
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct TupleStruct(u32, String, bool);
 
