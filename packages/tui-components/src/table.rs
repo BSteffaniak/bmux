@@ -427,6 +427,17 @@ impl Default for TableStyles {
     }
 }
 
+/// Table hit-test target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableHit {
+    /// Header cell was hit.
+    Header { column: usize },
+    /// Body cell was hit.
+    Cell { row: usize, column: usize },
+    /// Body row outside any visible cell was hit.
+    Row { row: usize },
+}
+
 /// Table input outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableOutcome {
@@ -684,6 +695,24 @@ impl<'a> Table<'a> {
             .render(area, &scrollbar_state, frame);
     }
 
+    /// Hit-test a point against visible table regions.
+    #[must_use]
+    pub fn hit_test(&self, area: Rect, state: &TableState, position: Point) -> Option<TableHit> {
+        let layout = self.layout(area);
+        if let Some(header) = layout.header
+            && header.contains(position)
+        {
+            return self
+                .column_at(&layout, header, state, position)
+                .map(|column| TableHit::Header { column });
+        }
+        let row = self.row_at(area, state, position)?;
+        self.column_at(&layout, layout.body, state, position)
+            .map_or(Some(TableHit::Row { row }), |column| {
+                Some(TableHit::Cell { row, column })
+            })
+    }
+
     /// Handle one event.
     pub fn handle_event(&self, area: Rect, state: &mut TableState, event: &Event) -> TableOutcome {
         if state.interaction.disabled {
@@ -774,6 +803,30 @@ impl<'a> Table<'a> {
             | MouseEventKind::Drag(_)
             | MouseEventKind::Move => TableOutcome::Ignored,
         }
+    }
+
+    fn column_at(
+        &self,
+        layout: &TableLayout,
+        area: Rect,
+        state: &TableState,
+        position: Point,
+    ) -> Option<usize> {
+        if !area.contains(position) {
+            return None;
+        }
+        let content_x =
+            usize::from(position.x.saturating_sub(area.x)).saturating_add(state.horizontal_scroll);
+        let separator_width = display_width(self.policy.cell_separator);
+        let mut start = 0usize;
+        for (index, width) in layout.column_widths.iter().copied().enumerate() {
+            let end = start.saturating_add(usize::from(width));
+            if content_x >= start && content_x < end {
+                return Some(index);
+            }
+            start = end.saturating_add(separator_width);
+        }
+        None
     }
 
     fn row_hit_regions(&self, area: Rect, state: &TableState) -> Vec<HitRegion<usize>> {
@@ -1119,8 +1172,8 @@ mod tests {
     use crate::scroll_area::ScrollAreaScrollbarMode;
 
     use super::{
-        Table, TableAlign, TableColumn, TableOutcome, TablePolicy, TableRow, TableSortDirection,
-        TableState, TableStyles, format_cell,
+        Table, TableAlign, TableColumn, TableHit, TableOutcome, TablePolicy, TableRow,
+        TableSortDirection, TableState, TableStyles, format_cell,
     };
 
     #[test]
@@ -1366,6 +1419,86 @@ mod tests {
 
         assert_eq!(outcome, TableOutcome::Redraw);
         assert!(state.horizontal_scroll() > 0);
+    }
+
+    #[test]
+    fn hit_tests_row_column_cell_and_header() {
+        let columns = [
+            TableColumn::new("A").fixed(4),
+            TableColumn::new("B").fixed(4),
+        ];
+        let rows = [
+            TableRow::new(vec!["abcd", "efgh"]),
+            TableRow::new(vec!["ijkl", "mnop"]),
+        ];
+        let state = TableState::new(None);
+        let table = Table::new(&columns, &rows).policy(TablePolicy::bare());
+        let area = Rect::new(0, 0, 9, 3);
+
+        assert_eq!(
+            table.hit_test(area, &state, Point::new(5, 0)),
+            Some(TableHit::Header { column: 1 })
+        );
+        assert_eq!(
+            table.hit_test(area, &state, Point::new(1, 1)),
+            Some(TableHit::Cell { row: 0, column: 0 })
+        );
+        assert_eq!(
+            table.hit_test(area, &state, Point::new(8, 2)),
+            Some(TableHit::Cell { row: 1, column: 1 })
+        );
+    }
+
+    #[test]
+    fn hit_tests_visible_cells_after_horizontal_scroll() {
+        let columns = [
+            TableColumn::new("A").fixed(4),
+            TableColumn::new("B").fixed(4),
+        ];
+        let rows = [TableRow::new(vec!["abcd", "efgh"])];
+        let mut state = TableState::new(None);
+        state.set_horizontal_scroll(5);
+        let table = Table::new(&columns, &rows).policy(TablePolicy::bare());
+
+        assert_eq!(
+            table.hit_test(Rect::new(0, 0, 4, 2), &state, Point::new(0, 1)),
+            Some(TableHit::Cell { row: 0, column: 1 })
+        );
+    }
+
+    #[test]
+    fn hit_tests_multiline_row_height() {
+        let columns = [TableColumn::new("A").fixed(4)];
+        let rows = [TableRow::multiline(vec![vec![
+            Line::from("one"),
+            Line::from("two"),
+        ]])];
+        let table = Table::new(&columns, &rows).policy(TablePolicy::bare());
+
+        assert_eq!(
+            table.hit_test(
+                Rect::new(0, 0, 4, 3),
+                &TableState::new(None),
+                Point::new(1, 2)
+            ),
+            Some(TableHit::Cell { row: 0, column: 0 })
+        );
+    }
+
+    #[test]
+    fn hit_tests_sortable_header_cell() {
+        let columns = [TableColumn::new("A").sort(Some(TableSortDirection::Ascending))];
+        let rows = [TableRow::new(vec!["one"])];
+        let table = Table::new(&columns, &rows).policy(TablePolicy::bare());
+
+        assert_eq!(
+            table.hit_test(
+                Rect::new(0, 0, 4, 2),
+                &TableState::new(None),
+                Point::new(2, 0)
+            ),
+            Some(TableHit::Header { column: 0 })
+        );
     }
 
     #[test]
