@@ -403,9 +403,15 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Seq)?;
+        let remaining = if self.mode == EncodingMode::TypedStable {
+            self.read_varint_usize()?
+        } else {
+            len
+        };
         visitor.visit_seq(CountedAccess {
             de: self,
-            remaining: len,
+            remaining,
             raw_keys: false,
         })
     }
@@ -416,9 +422,15 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         len: usize,
         visitor: V,
     ) -> Result<V::Value, Error> {
+        self.expect_tag(TypeTag::Seq)?;
+        let remaining = if self.mode == EncodingMode::TypedStable {
+            self.read_varint_usize()?
+        } else {
+            len
+        };
         visitor.visit_seq(CountedAccess {
             de: self,
-            remaining: len,
+            remaining,
             raw_keys: false,
         })
     }
@@ -510,9 +522,14 @@ impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, Error> {
+        let remaining = if self.mode == EncodingMode::TypedStable {
+            self.read_varint_usize()?
+        } else {
+            len
+        };
         visitor.visit_seq(CountedAccess {
             de: self,
-            remaining: len,
+            remaining,
             raw_keys: false,
         })
     }

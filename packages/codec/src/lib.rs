@@ -178,6 +178,7 @@ pub mod serde_bytes_vec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
@@ -531,11 +532,237 @@ mod tests {
             Progress { percent: u8 },
         }
 
-        let value = Event::Status {
-            message: "running".to_string(),
-        };
-        let bytes = to_typed_vec(&value).unwrap();
-        assert_eq!(from_typed_bytes::<Event>(&bytes).unwrap(), value);
+        for value in [
+            Event::Status {
+                message: "running".to_string(),
+            },
+            Event::Progress { percent: 42 },
+        ] {
+            let bytes = to_typed_vec(&value).unwrap();
+            assert_eq!(from_typed_bytes::<Event>(&bytes).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn typed_stable_supports_externally_tagged_enums() {
+        let values = [
+            TestEnum::Unit,
+            TestEnum::Newtype(42),
+            TestEnum::Tuple(99, "hello".into()),
+            TestEnum::Struct {
+                x: -7,
+                y: "world".into(),
+            },
+        ];
+
+        for value in values {
+            let bytes = to_typed_vec(&value).unwrap();
+            assert_eq!(from_typed_bytes::<TestEnum>(&bytes).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn typed_stable_supports_adjacently_tagged_enums() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+        enum Event {
+            Status { message: String },
+            Progress(u8),
+            Done,
+        }
+
+        for value in [
+            Event::Status {
+                message: "running".to_string(),
+            },
+            Event::Progress(42),
+            Event::Done,
+        ] {
+            let bytes = to_typed_vec(&value).unwrap();
+            assert_eq!(from_typed_bytes::<Event>(&bytes).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn typed_stable_supports_untagged_enums() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Text(String),
+            Count(u64),
+            Named { name: String },
+        }
+
+        for value in [
+            Value::Text("hello".to_string()),
+            Value::Count(42),
+            Value::Named {
+                name: "bmux".to_string(),
+            },
+        ] {
+            let bytes = to_typed_vec(&value).unwrap();
+            assert_eq!(from_typed_bytes::<Value>(&bytes).unwrap(), value);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct TupleStruct(u32, String, bool);
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct NewtypeStruct(String);
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct UnitStruct;
+
+    #[test]
+    fn typed_stable_supports_tuple_and_unit_struct_forms() {
+        let tuple = (42_u32, "hello".to_string(), true);
+        let bytes = to_typed_vec(&tuple).unwrap();
+        assert_eq!(
+            from_typed_bytes::<(u32, String, bool)>(&bytes).unwrap(),
+            tuple
+        );
+
+        let tuple_struct = TupleStruct(7, "tuple".to_string(), false);
+        let bytes = to_typed_vec(&tuple_struct).unwrap();
+        assert_eq!(
+            from_typed_bytes::<TupleStruct>(&bytes).unwrap(),
+            tuple_struct
+        );
+
+        let newtype = NewtypeStruct("newtype".to_string());
+        let bytes = to_typed_vec(&newtype).unwrap();
+        assert_eq!(from_typed_bytes::<NewtypeStruct>(&bytes).unwrap(), newtype);
+
+        let unit = UnitStruct;
+        let bytes = to_typed_vec(&unit).unwrap();
+        assert_eq!(from_typed_bytes::<UnitStruct>(&bytes).unwrap(), unit);
+    }
+
+    fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|value| serde_json::Value::Number(value.into())),
+            any::<u64>().prop_map(|value| serde_json::Value::Number(value.into())),
+            ".{0,64}".prop_map(serde_json::Value::String),
+        ];
+
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..8).prop_map(serde_json::Value::Array),
+                prop::collection::btree_map(".{0,32}", inner, 0..8)
+                    .prop_map(|map| serde_json::Value::Object(map.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn roundtrip_typed_stable<T>(value: &T) -> Result<T, Error>
+    where
+        T: Serialize,
+        for<'de> T: Deserialize<'de>,
+    {
+        let bytes = to_typed_vec(value)?;
+        from_typed_bytes(&bytes)
+    }
+
+    proptest! {
+        #[test]
+        fn typed_stable_roundtrips_scalars(
+            boolean in any::<bool>(),
+            signed in any::<i64>(),
+            unsigned in any::<u64>(),
+            text in ".{0,256}",
+            bytes in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            prop_assert_eq!(roundtrip_typed_stable(&boolean).unwrap(), boolean);
+            prop_assert_eq!(roundtrip_typed_stable(&signed).unwrap(), signed);
+            prop_assert_eq!(roundtrip_typed_stable(&unsigned).unwrap(), unsigned);
+            prop_assert_eq!(roundtrip_typed_stable(&text).unwrap(), text);
+            prop_assert_eq!(roundtrip_typed_stable(&bytes).unwrap(), bytes);
+        }
+
+        #[test]
+        fn typed_stable_roundtrips_nested_dynamic_json(value in arb_json_value()) {
+            let bytes = to_typed_vec(&value).unwrap();
+            let decoded: serde_json::Value = from_typed_bytes(&bytes).unwrap();
+            prop_assert_eq!(decoded, value);
+        }
+
+        #[test]
+        fn typed_stable_roundtrips_nested_codec_value(value in arb_codec_value()) {
+            let bytes = to_typed_vec(&value).unwrap();
+            let decoded: CodecValue = from_typed_bytes(&bytes).unwrap();
+            prop_assert_eq!(decoded, value);
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum CodecValue {
+        Unit,
+        Bool(bool),
+        I64(i64),
+        U64(u64),
+        String(String),
+        Bytes(#[serde(with = "crate::serde_bytes_vec")] Vec<u8>),
+        List(Vec<CodecValue>),
+        Map(BTreeMap<String, CodecValue>),
+    }
+
+    fn arb_codec_value() -> impl Strategy<Value = CodecValue> {
+        let leaf = prop_oneof![
+            Just(CodecValue::Unit),
+            any::<bool>().prop_map(CodecValue::Bool),
+            any::<i64>().prop_map(CodecValue::I64),
+            any::<u64>().prop_map(CodecValue::U64),
+            ".{0,64}".prop_map(CodecValue::String),
+            prop::collection::vec(any::<u8>(), 0..64).prop_map(CodecValue::Bytes),
+        ];
+
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..8).prop_map(CodecValue::List),
+                prop::collection::btree_map(".{0,32}", inner, 0..8).prop_map(CodecValue::Map),
+            ]
+        })
+    }
+
+    #[test]
+    fn typed_stable_rejects_invalid_type_tag() {
+        let err = from_typed_bytes::<bool>(&[u8::MAX]).unwrap_err();
+        assert!(matches!(err, Error::Message(message) if message == "invalid type tag"));
+    }
+
+    #[test]
+    fn typed_stable_rejects_mismatched_type_tag() {
+        let bytes = to_typed_vec(&true).unwrap();
+        let err = from_typed_bytes::<String>(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Message(message) if message.contains("unexpected type tag")));
+    }
+
+    #[test]
+    fn typed_stable_rejects_truncated_payload() {
+        let mut bytes = to_typed_vec(&"hello".to_string()).unwrap();
+        bytes.pop();
+        let err = from_typed_bytes::<String>(&bytes).unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn typed_stable_rejects_trailing_bytes() {
+        let mut bytes = to_typed_vec(&42_u32).unwrap();
+        bytes.push(0);
+        let err = from_typed_bytes::<u32>(&bytes).unwrap_err();
+        assert!(matches!(err, Error::TrailingBytes));
+    }
+
+    #[test]
+    fn typed_stable_and_stable_wire_formats_are_isolated() {
+        let typed = to_typed_vec(&42_u32).unwrap();
+        assert!(from_bytes::<u32>(&typed).is_err());
+
+        let stable = to_vec(&42_u32).unwrap();
+        assert!(from_typed_bytes::<u32>(&stable).is_err());
     }
 
     // ── UUID support ─────────────────────────────────────────────────────────

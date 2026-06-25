@@ -294,15 +294,23 @@ impl ser::Serializer for &mut Serializer {
         Ok(self)
     }
 
-    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Error> {
+    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Error> {
+        self.write_tag(TypeTag::Seq);
+        if self.mode == EncodingMode::TypedStable {
+            varint::encode_usize(&mut self.output, len);
+        }
         Ok(self)
     }
 
     fn serialize_tuple_struct(
         self,
         _name: &'static str,
-        _len: usize,
+        len: usize,
     ) -> Result<Self::SerializeTupleStruct, Error> {
+        self.write_tag(TypeTag::Seq);
+        if self.mode == EncodingMode::TypedStable {
+            varint::encode_usize(&mut self.output, len);
+        }
         Ok(self)
     }
 
@@ -317,6 +325,9 @@ impl ser::Serializer for &mut Serializer {
         match self.mode {
             EncodingMode::Stable | EncodingMode::TypedStable => {
                 self.write_str(variant);
+                if self.mode == EncodingMode::TypedStable {
+                    varint::encode_usize(&mut self.output, _len);
+                }
             }
             EncodingMode::Positional => varint::encode_u32(&mut self.output, variant_index),
         }
