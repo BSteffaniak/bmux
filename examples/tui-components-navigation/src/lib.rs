@@ -139,7 +139,10 @@ impl NavigationDemo {
         match Menu::new(&menu_items).handle_event(Rect::new(30, 1, 18, 2), &mut self.menu, event) {
             MenuOutcome::Activated { id, .. } => self.message = format!("Menu action: {id}"),
             MenuOutcome::Cancelled => self.message = "Menu cancelled".to_string(),
-            MenuOutcome::Ignored | MenuOutcome::Redraw | MenuOutcome::Focused(_) => {}
+            MenuOutcome::Ignored
+            | MenuOutcome::Redraw
+            | MenuOutcome::Focused(_)
+            | MenuOutcome::Typeahead(_) => {}
         }
 
         let lines = scroll_lines();

@@ -4,7 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::prelude::{Line, Style};
+use bmux_tui::prelude::{Line, Span, Style};
 
 use crate::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListPolicy,
@@ -16,8 +16,12 @@ use crate::selectable_list::{
 pub struct MenuItem {
     /// Stable item id chosen by the caller.
     pub id: String,
-    /// Visible item label.
-    pub label: String,
+    /// Visible rich item content lines.
+    pub lines: Vec<Line>,
+    /// Whether this menu item has a submenu affordance.
+    pub submenu: bool,
+    /// Whether this menu item is a non-activating section/header row.
+    pub section: bool,
     /// Whether this menu item is disabled independently from the whole menu.
     pub disabled: bool,
 }
@@ -28,9 +32,37 @@ impl MenuItem {
     pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            label: label.into(),
+            lines: vec![Line::from(label.into())],
+            submenu: false,
+            section: false,
             disabled: false,
         }
+    }
+
+    /// Create an enabled menu item with rich line content.
+    #[must_use]
+    pub fn rich(id: impl Into<String>, line: impl Into<Line>) -> Self {
+        Self {
+            id: id.into(),
+            lines: vec![line.into()],
+            submenu: false,
+            section: false,
+            disabled: false,
+        }
+    }
+
+    /// Return this menu item with submenu affordance state set.
+    #[must_use]
+    pub const fn submenu(mut self, submenu: bool) -> Self {
+        self.submenu = submenu;
+        self
+    }
+
+    /// Return this menu item with non-activating section/header state set.
+    #[must_use]
+    pub const fn section(mut self, section: bool) -> Self {
+        self.section = section;
+        self
     }
 
     /// Return this menu item with disabled state set.
@@ -51,6 +83,10 @@ pub struct MenuPolicy {
     pub list: SelectableListPolicy,
     /// Whether Escape cancels/dismisses the menu.
     pub escape_cancels: bool,
+    /// Whether printable character keys are reported as typeahead requests.
+    pub typeahead: bool,
+    /// Submenu affordance suffix.
+    pub submenu_indicator: &'static str,
 }
 
 impl MenuPolicy {
@@ -60,6 +96,8 @@ impl MenuPolicy {
         Self {
             list: SelectableListPolicy::interactive(),
             escape_cancels: true,
+            typeahead: false,
+            submenu_indicator: "›",
         }
     }
 }
@@ -115,6 +153,8 @@ pub enum MenuOutcome {
     Focused(usize),
     /// Menu item was activated.
     Activated { index: usize, id: String },
+    /// Character was requested for caller-owned typeahead/search handling.
+    Typeahead(char),
     /// Menu was cancelled/dismissed.
     Cancelled,
 }
@@ -187,8 +227,19 @@ impl<'a> Menu<'a> {
         if matches!(event, Event::Key(stroke) if Self::is_activation_key(*stroke)) {
             return state
                 .focused()
-                .filter(|index| self.items.get(*index).is_some_and(|item| !item.disabled))
+                .filter(|index| {
+                    self.items
+                        .get(*index)
+                        .is_some_and(Self::is_activatable_item)
+                })
                 .map_or(MenuOutcome::Ignored, |index| self.activate(index));
+        }
+        if let Event::Key(stroke) = event
+            && self.policy.typeahead
+            && stroke.modifiers.is_empty()
+            && let KeyCode::Char(ch) = stroke.key
+        {
+            return MenuOutcome::Typeahead(ch);
         }
         let items = self.list_items();
         match SelectableList::new(&items)
@@ -206,10 +257,15 @@ impl<'a> Menu<'a> {
     fn activate(&self, index: usize) -> MenuOutcome {
         self.items
             .get(index)
+            .filter(|item| Self::is_activatable_item(item))
             .map_or(MenuOutcome::Ignored, |item| MenuOutcome::Activated {
                 index,
                 id: item.id.clone(),
             })
+    }
+
+    const fn is_activatable_item(item: &MenuItem) -> bool {
+        !item.disabled && !item.section
     }
 
     fn is_cancel_key(&self, stroke: KeyStroke) -> bool {
@@ -227,10 +283,18 @@ impl<'a> Menu<'a> {
     fn list_items(&self) -> Vec<SelectableListItem> {
         self.items
             .iter()
-            .map(|item| SelectableListItem {
-                id: item.id.clone(),
-                lines: vec![Line::from(item.label.clone())],
-                disabled: item.disabled,
+            .map(|item| {
+                let mut lines = item.lines.clone();
+                if item.submenu
+                    && let Some(line) = lines.first_mut()
+                {
+                    line.push_span(Span::raw(format!(" {}", self.policy.submenu_indicator)));
+                }
+                SelectableListItem {
+                    id: item.id.clone(),
+                    lines,
+                    disabled: item.disabled || item.section,
+                }
             })
             .collect()
     }
@@ -243,8 +307,10 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::prelude::{Line, Span};
+    use bmux_tui::style::{Color, Style};
 
-    use super::{Menu, MenuItem, MenuOutcome, MenuState};
+    use super::{Menu, MenuItem, MenuOutcome, MenuPolicy, MenuState, SelectableListStyles};
 
     #[test]
     fn renders_menu_items() {
@@ -331,6 +397,88 @@ mod tests {
                 index: 1,
                 id: "close".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn rich_labels_preserve_styles_and_submenu_affordance_renders() {
+        let accent = Style::new().fg(Color::Yellow);
+        let items = [
+            MenuItem::rich("new", Line::from_spans([Span::styled("New", accent)])).submenu(true),
+        ];
+        let menu = Menu::new(&items).policy(MenuPolicy {
+            submenu_indicator: ">",
+            ..MenuPolicy::default()
+        });
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        menu.render(Rect::new(0, 0, 10, 1), &MenuState::new(Some(0)), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("> New >   "));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(2, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Yellow))
+        );
+    }
+
+    #[test]
+    fn section_items_are_not_activated() {
+        let items = [MenuItem::new("section", "File").section(true)];
+        let menu = Menu::new(&items);
+        let mut state = MenuState::new(Some(0));
+
+        let outcome = menu.handle_event(
+            Rect::new(0, 0, 12, 1),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+        );
+
+        assert_eq!(outcome, MenuOutcome::Ignored);
+    }
+
+    #[test]
+    fn typeahead_reports_printable_character_without_owning_search_state() {
+        let items = items();
+        let menu = Menu::new(&items).policy(MenuPolicy {
+            typeahead: true,
+            ..MenuPolicy::default()
+        });
+        let mut state = MenuState::new(Some(0));
+
+        let outcome = menu.handle_event(
+            Rect::new(0, 0, 12, 2),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Char('o'))),
+        );
+
+        assert_eq!(outcome, MenuOutcome::Typeahead('o'));
+    }
+
+    #[test]
+    fn disabled_focused_and_hovered_style_precedence_comes_from_selectable_list() {
+        let items = [MenuItem::new("disabled", "Disabled").disabled(true)];
+        let styles = SelectableListStyles {
+            disabled: Style::new().fg(Color::Red),
+            focused: Style::new().fg(Color::Green),
+            hovered: Style::new().fg(Color::Blue),
+            ..SelectableListStyles::default()
+        };
+        let menu = Menu::new(&items).styles(styles);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        menu.render(Rect::new(0, 0, 12, 1), &MenuState::new(Some(0)), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(2, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Red))
         );
     }
 
