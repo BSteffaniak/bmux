@@ -235,6 +235,17 @@ pub fn demonstrate_form_submit() -> FormOutcome {
     form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Enter)))
 }
 
+pub fn demonstrate_form_validation_errors() -> FormOutcome {
+    let fields = [
+        FormFieldItem::new("name").required(true),
+        FormFieldItem::new("email").required(true),
+    ];
+    let values = [Some("Ada"), Some("   ")];
+    let form = Form::new(&fields, &values);
+    let mut state = FormState::new(Some(0));
+    form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Enter)))
+}
+
 pub fn demonstrate_click_checkbox_toggles_from_text_focus() -> bool {
     let mut demo = InputsDemo::new();
     let position = Point::new(CHECKBOX_AREA.x, CHECKBOX_AREA.y);
@@ -330,7 +341,7 @@ mod tests {
     use super::{
         demonstrate_click_checkbox_toggles_from_text_focus,
         demonstrate_click_radio_selects_and_focuses, demonstrate_click_text_focuses,
-        demonstrate_form_submit, demonstrate_text_input_edit,
+        demonstrate_form_submit, demonstrate_form_validation_errors, demonstrate_text_input_edit,
         demonstrate_text_input_uppercase_edit, render_inputs, rows,
     };
 
@@ -353,6 +364,10 @@ mod tests {
     #[test]
     fn form_submit_validates_values() {
         assert_eq!(demonstrate_form_submit(), FormOutcome::Submitted);
+        assert_eq!(
+            demonstrate_form_validation_errors(),
+            FormOutcome::ValidationFailed(vec![1])
+        );
     }
 
     #[test]

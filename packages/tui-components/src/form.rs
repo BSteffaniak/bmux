@@ -194,6 +194,15 @@ impl<'a> Form<'a> {
             .collect()
     }
 
+    /// Return invalid required field ids.
+    #[must_use]
+    pub fn validate_ids(&self) -> Vec<&'a str> {
+        self.validate()
+            .into_iter()
+            .filter_map(|index| self.fields.get(index).map(|field| field.id.as_str()))
+            .collect()
+    }
+
     /// Handle one input event.
     pub fn handle_event(&self, state: &mut FormState, event: &Event) -> FormOutcome {
         self.normalize_state(state);
@@ -356,6 +365,61 @@ mod tests {
 
         assert_eq!(outcome, FormOutcome::Focused(2));
         assert_eq!(state.focused(), Some(2));
+    }
+
+    #[test]
+    fn backtab_moves_focus_to_previous_enabled_field() {
+        let fields = vec![
+            FormFieldItem::new("name"),
+            FormFieldItem::new("internal").disabled(true),
+            FormFieldItem::new("email"),
+        ];
+        let values = vec![Some("Ada"), None, Some("ada@example.test")];
+        let form = Form::new(&fields, &values);
+        let mut state = FormState::new(Some(2));
+
+        let outcome = form.handle_event(
+            &mut state,
+            &Event::Key(KeyStroke {
+                key: KeyCode::Tab,
+                modifiers: bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                },
+            }),
+        );
+
+        assert_eq!(outcome, FormOutcome::Focused(0));
+        assert_eq!(state.focused(), Some(0));
+    }
+
+    #[test]
+    fn focus_normalizes_when_current_field_becomes_disabled() {
+        let fields = vec![
+            FormFieldItem::new("name"),
+            FormFieldItem::new("email").disabled(true),
+        ];
+        let values = vec![Some("Ada"), Some("ada@example.test")];
+        let form = Form::new(&fields, &values);
+        let mut state = FormState::new(Some(1));
+
+        let outcome = form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Tab)));
+
+        assert_eq!(outcome, FormOutcome::Ignored);
+        assert_eq!(state.focused(), Some(0));
+    }
+
+    #[test]
+    fn validation_exposes_invalid_field_ids() {
+        let fields = vec![
+            FormFieldItem::new("name").required(true),
+            FormFieldItem::new("email").required(true),
+            FormFieldItem::new("internal").required(true).disabled(true),
+        ];
+        let values = vec![Some("Ada"), Some("   "), None];
+        let form = Form::new(&fields, &values);
+
+        assert_eq!(form.validate_ids(), vec!["email"]);
     }
 
     #[test]
