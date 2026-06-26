@@ -450,6 +450,35 @@ impl<'a> SelectableList<'a> {
             .render(area, &scrollbar_state, frame);
     }
 
+    /// Return visible hit regions keyed by stable item id for tests/semantics.
+    #[must_use]
+    pub fn visible_semantic_regions(
+        &self,
+        area: Rect,
+        state: &SelectableListState,
+    ) -> Vec<HitRegion<&'a str>> {
+        self.visible_hit_regions(self.content_area(area), state)
+            .into_iter()
+            .filter_map(|region| {
+                self.items
+                    .get(region.key)
+                    .map(|item| HitRegion::new(item.id.as_str(), region.rect))
+            })
+            .collect()
+    }
+
+    /// Return stable item id at a point, if any visible item contains it.
+    #[must_use]
+    pub fn semantic_id_at(
+        &self,
+        area: Rect,
+        state: &SelectableListState,
+        point: bmux_tui::geometry::Point,
+    ) -> Option<&'a str> {
+        let regions = self.visible_semantic_regions(area, state);
+        hit_region_at(&regions, point).map(|region| region.key)
+    }
+
     /// Handle one input event.
     pub fn handle_event(
         &self,
@@ -1000,6 +1029,27 @@ mod tests {
             SelectableListOutcome::Redraw
         );
         assert_eq!(state.vertical_scroll(), 1);
+    }
+
+    #[test]
+    fn exposes_visible_semantic_regions_by_stable_item_id() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::multiline("two", [Line::from("Two"), Line::from("Details")]),
+        ];
+        let list = SelectableList::new(&items);
+        let state = SelectableListState::new(Some(0));
+
+        let regions = list.visible_semantic_regions(Rect::new(2, 3, 10, 3), &state);
+
+        assert_eq!(regions[0].key, "one");
+        assert_eq!(regions[0].rect, Rect::new(2, 3, 10, 1));
+        assert_eq!(regions[1].key, "two");
+        assert_eq!(regions[1].rect, Rect::new(2, 4, 10, 2));
+        assert_eq!(
+            list.semantic_id_at(Rect::new(2, 3, 10, 3), &state, Point::new(3, 5)),
+            Some("two")
+        );
     }
 
     #[test]
