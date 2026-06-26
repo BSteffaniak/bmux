@@ -4,6 +4,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span, display_width};
 use bmux_tui::style::{Color, Style};
+use bmux_tui::text_width::truncate_to_display_width;
 
 /// One chart point.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -512,6 +513,7 @@ fn render_even_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style:
         return;
     }
     let last = labels.len().saturating_sub(1);
+    let mut next_free_x = area.x;
     for (index, label) in labels.iter().enumerate() {
         let x_offset = if last == 0 {
             0
@@ -523,15 +525,21 @@ fn render_even_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style:
             )
             .unwrap_or(u16::MAX)
         };
+        let x = area.x.saturating_add(x_offset);
+        if x < next_free_x {
+            continue;
+        }
+        let available = usize::from(area.right().saturating_sub(x));
+        let label = truncate_to_display_width(label, available);
+        let width = u16::try_from(display_width(&label)).unwrap_or(u16::MAX);
+        if width == 0 {
+            continue;
+        }
         frame.write_line(
-            Rect::new(
-                area.x.saturating_add(x_offset),
-                area.y,
-                area.width.saturating_sub(x_offset),
-                1,
-            ),
-            &Line::from_spans([Span::styled(*label, style)]),
+            Rect::new(x, area.y, area.right().saturating_sub(x), 1),
+            &Line::from_spans([Span::styled(label, style)]),
         );
+        next_free_x = x.saturating_add(width).saturating_add(1);
     }
 }
 
@@ -540,6 +548,7 @@ fn render_vertical_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], st
         return;
     }
     let last = labels.len().saturating_sub(1);
+    let mut last_y = None;
     for (index, label) in labels.iter().enumerate() {
         let y_offset = if last == 0 {
             0
@@ -551,9 +560,15 @@ fn render_vertical_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], st
             )
             .unwrap_or(u16::MAX)
         };
+        let y = area.y.saturating_add(y_offset);
+        if last_y == Some(y) {
+            continue;
+        }
+        last_y = Some(y);
+        let label = truncate_to_display_width(label, usize::from(area.width));
         frame.write_line(
-            Rect::new(area.x, area.y.saturating_add(y_offset), area.width, 1),
-            &Line::from_spans([Span::styled(*label, style)]),
+            Rect::new(area.x, y, area.width, 1),
+            &Line::from_spans([Span::styled(label, style)]),
         );
     }
 }
@@ -701,7 +716,8 @@ mod tests {
 
     use super::{
         Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartClipping, ChartDataset,
-        ChartInterpolation, ChartLegendPlacement, ChartPoint, ChartPolicy,
+        ChartInterpolation, ChartLegendPlacement, ChartPoint, ChartPolicy, render_even_labels,
+        render_vertical_labels,
     };
 
     #[test]
@@ -1005,6 +1021,37 @@ mod tests {
                 .map(|cell| cell.symbol.as_str()),
             Some("○")
         );
+    }
+
+    #[test]
+    fn axis_labels_do_not_collide_in_small_widths() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        render_even_labels(
+            &mut frame,
+            Rect::new(0, 0, 8, 1),
+            &["first", "second", "third"],
+            Style::new(),
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("first  …"));
+    }
+
+    #[test]
+    fn vertical_axis_labels_skip_duplicate_rows_and_truncate() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        render_vertical_labels(
+            &mut frame,
+            Rect::new(0, 0, 4, 2),
+            &["long", "skip", "tail"],
+            Style::new(),
+        );
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("long"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("tail"));
     }
 
     #[test]

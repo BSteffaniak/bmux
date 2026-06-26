@@ -312,6 +312,15 @@ mod tests {
     use super::{Sparkline, SparklineDirection, SparklinePolicy, SparklineStyles};
 
     #[test]
+    fn tiny_area_does_not_panic() {
+        let samples = [1, 2, 3];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        let mut frame = Frame::new(&mut buffer);
+
+        Sparkline::new(&samples).render(Rect::new(0, 0, 0, 0), &mut frame);
+    }
+
+    #[test]
     fn maps_empty_samples_to_empty_message() {
         let samples = [];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
