@@ -861,7 +861,9 @@ impl<'a> Table<'a> {
         None
     }
 
-    fn row_hit_regions(&self, area: Rect, state: &TableState) -> Vec<HitRegion<usize>> {
+    /// Return visible body-row hit regions for tests and semantic inspection.
+    #[must_use]
+    pub fn row_hit_regions(&self, area: Rect, state: &TableState) -> Vec<HitRegion<usize>> {
         let layout = self.layout(area);
         let mut rendered = 0u16;
         let mut regions = Vec::new();
@@ -887,7 +889,9 @@ impl<'a> Table<'a> {
         regions
     }
 
-    fn row_at(&self, area: Rect, state: &TableState, position: Point) -> Option<usize> {
+    /// Return visible body-row index at a point, if any.
+    #[must_use]
+    pub fn row_at(&self, area: Rect, state: &TableState, position: Point) -> Option<usize> {
         hit_region_at(&self.row_hit_regions(area, state), position).map(|region| region.key)
     }
 
@@ -1295,6 +1299,28 @@ mod tests {
         assert_eq!(
             frame.buffer().get(Point::new(1, 1)).map(|cell| cell.style),
             Some(TableStyles::default().row.patch(cell_style))
+        );
+    }
+
+    #[test]
+    fn exposes_row_hit_regions_without_rendering() {
+        let columns = [TableColumn::new("Name").fixed(8)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::multiline(vec![vec![Line::from("two"), Line::from("details")]]),
+        ];
+        let table = Table::new(&columns, &rows);
+        let state = TableState::new(Some(0));
+
+        let regions = table.row_hit_regions(Rect::new(1, 2, 8, 4), &state);
+
+        assert_eq!(regions[0].key, 0);
+        assert_eq!(regions[0].rect, Rect::new(1, 3, 8, 1));
+        assert_eq!(regions[1].key, 1);
+        assert_eq!(regions[1].rect, Rect::new(1, 4, 8, 2));
+        assert_eq!(
+            table.row_at(Rect::new(1, 2, 8, 4), &state, Point::new(2, 5)),
+            Some(1)
         );
     }
 
