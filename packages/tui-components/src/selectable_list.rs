@@ -480,20 +480,22 @@ impl<'a> SelectableList<'a> {
         }
         match stroke.key {
             KeyCode::Up if self.policy.keyboard.arrows_move_focus => {
-                self.move_focus(state, Direction::Previous)
+                self.move_focus(area, state, Direction::Previous)
             }
             KeyCode::Down if self.policy.keyboard.arrows_move_focus => {
-                self.move_focus(state, Direction::Next)
+                self.move_focus(area, state, Direction::Next)
             }
             KeyCode::Home if self.policy.keyboard.home_end_move_focus => {
-                self.focus_edge(state, true)
+                self.focus_edge(area, state, true)
             }
             KeyCode::End if self.policy.keyboard.home_end_move_focus => {
-                self.focus_edge(state, false)
+                self.focus_edge(area, state, false)
             }
-            KeyCode::Enter if self.policy.keyboard.enter_selects => self.select_focused(state),
+            KeyCode::Enter if self.policy.keyboard.enter_selects => {
+                self.select_focused(area, state)
+            }
             KeyCode::Space | KeyCode::Char(' ') if self.policy.keyboard.space_selects => {
-                self.select_focused(state)
+                self.select_focused(area, state)
             }
             KeyCode::PageUp => self.scroll_by(area, state, -i32::from(area.height.max(1))),
             KeyCode::PageDown => self.scroll_by(area, state, i32::from(area.height.max(1))),
@@ -531,7 +533,7 @@ impl<'a> SelectableList<'a> {
                 Self::press(state, hit)
             }
             MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                self.release(state, hit)
+                self.release(area, state, hit)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.policy.mouse.click => {
                 Self::drag(state, hit)
@@ -568,13 +570,14 @@ impl<'a> SelectableList<'a> {
 
     fn release(
         &self,
+        area: Rect,
         state: &mut SelectableListState,
         hit: Option<usize>,
     ) -> SelectableListOutcome {
         let was_pressed = state.pressed;
         state.pressed = None;
         if let Some(index) = hit.filter(|hit_index| was_pressed == Some(*hit_index)) {
-            return self.select_index(state, index);
+            return self.select_index(area, state, index);
         }
         if was_pressed.is_some() {
             SelectableListOutcome::Redraw
@@ -622,6 +625,7 @@ impl<'a> SelectableList<'a> {
 
     fn move_focus(
         &self,
+        area: Rect,
         state: &mut SelectableListState,
         direction: Direction,
     ) -> SelectableListOutcome {
@@ -635,10 +639,16 @@ impl<'a> SelectableList<'a> {
             return SelectableListOutcome::Ignored;
         }
         state.set_focused(Some(next));
+        self.ensure_visible(area, state, next);
         SelectableListOutcome::Focused(next)
     }
 
-    fn focus_edge(&self, state: &mut SelectableListState, first: bool) -> SelectableListOutcome {
+    fn focus_edge(
+        &self,
+        area: Rect,
+        state: &mut SelectableListState,
+        first: bool,
+    ) -> SelectableListOutcome {
         let next = if first {
             self.items.iter().position(|item| !item.disabled)
         } else {
@@ -651,24 +661,50 @@ impl<'a> SelectableList<'a> {
             SelectableListOutcome::Ignored
         } else {
             state.set_focused(Some(index));
+            self.ensure_visible(area, state, index);
             SelectableListOutcome::Focused(index)
         }
     }
 
-    fn select_focused(&self, state: &mut SelectableListState) -> SelectableListOutcome {
+    fn select_focused(&self, area: Rect, state: &mut SelectableListState) -> SelectableListOutcome {
         let Some(index) = state.focused else {
             return SelectableListOutcome::Ignored;
         };
-        self.select_index(state, index)
+        self.select_index(area, state, index)
     }
 
-    fn select_index(&self, state: &mut SelectableListState, index: usize) -> SelectableListOutcome {
+    fn select_index(
+        &self,
+        area: Rect,
+        state: &mut SelectableListState,
+        index: usize,
+    ) -> SelectableListOutcome {
         if !self.is_enabled_item(index) || state.selected == Some(index) {
             return SelectableListOutcome::Ignored;
         }
         state.selected = Some(index);
         state.set_focused(Some(index));
+        self.ensure_visible(area, state, index);
         SelectableListOutcome::Selected(index)
+    }
+
+    fn ensure_visible(&self, area: Rect, state: &mut SelectableListState, index: usize) {
+        if area.height == 0 {
+            return;
+        }
+        let before = self.items[..index]
+            .iter()
+            .map(SelectableListItem::height)
+            .sum::<usize>();
+        let item_height = self.items[index].height();
+        let after = before.saturating_add(item_height);
+        let viewport_height = usize::from(area.height);
+        if before < state.vertical_scroll {
+            state.vertical_scroll = before;
+        } else if after > state.vertical_scroll.saturating_add(viewport_height) {
+            state.vertical_scroll = after.saturating_sub(viewport_height);
+        }
+        state.vertical_scroll = state.vertical_scroll.min(self.max_vertical_scroll(area));
     }
 
     fn next_enabled(&self, current: usize, direction: Direction) -> Option<usize> {
@@ -950,6 +986,75 @@ mod tests {
             frame.buffer().row_symbols(1).as_deref(),
             Some("» Published   ")
         );
+    }
+
+    #[test]
+    fn keyboard_navigation_keeps_focused_item_visible() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(Some(0));
+
+        assert_eq!(
+            list.handle_event(
+                Rect::new(0, 0, 12, 1),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Down)),
+            ),
+            SelectableListOutcome::Focused(1)
+        );
+        assert_eq!(state.vertical_scroll(), 1);
+
+        assert_eq!(
+            list.handle_event(
+                Rect::new(0, 0, 12, 1),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Up)),
+            ),
+            SelectableListOutcome::Focused(0)
+        );
+        assert_eq!(state.vertical_scroll(), 0);
+    }
+
+    #[test]
+    fn selection_visibility_respects_multiline_item_heights() {
+        let items = [
+            SelectableListItem::multiline("one", [Line::from("one-a"), Line::from("one-b")]),
+            SelectableListItem::multiline("two", [Line::from("two-a"), Line::from("two-b")]),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(Some(0));
+
+        assert_eq!(
+            list.handle_event(
+                Rect::new(0, 0, 12, 2),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Down)),
+            ),
+            SelectableListOutcome::Focused(1)
+        );
+        assert_eq!(state.vertical_scroll(), 2);
+    }
+
+    #[test]
+    fn scroll_clamps_when_item_count_shrinks() {
+        let many = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let few = [SelectableListItem::new("one", "One")];
+        let mut state = SelectableListState::new(Some(0));
+        state.set_vertical_scroll(2);
+
+        SelectableList::new(&many).clamp_state(Rect::new(0, 0, 12, 1), &mut state);
+        assert_eq!(state.vertical_scroll(), 2);
+        SelectableList::new(&few).clamp_state(Rect::new(0, 0, 12, 1), &mut state);
+
+        assert_eq!(state.vertical_scroll(), 0);
     }
 
     #[test]
