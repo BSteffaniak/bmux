@@ -209,6 +209,8 @@ pub enum ChartInterpolation {
     PointsOnly,
     /// Connect line datasets with straight segments.
     Straight,
+    /// Connect line datasets with horizontal-then-vertical step segments.
+    Step,
 }
 
 /// Chart clipping policy.
@@ -436,15 +438,51 @@ impl<'a> Chart<'a> {
             } else {
                 dataset.style
             };
-            if matches!(dataset.kind, ChartDatasetKind::Line)
-                && matches!(self.policy.interpolation, ChartInterpolation::Straight)
-            {
-                for pair in dataset.points.windows(2) {
-                    if let (Some((x0, y0)), Some((x1, y1))) = (
-                        self.map_point(plot_area, pair[0]),
-                        self.map_point(plot_area, pair[1]),
-                    ) {
-                        draw_line(frame, plot_area, (x0, y0), (x1, y1), dataset.marker, style);
+            if matches!(dataset.kind, ChartDatasetKind::Line) {
+                match self.policy.interpolation {
+                    ChartInterpolation::PointsOnly => {}
+                    ChartInterpolation::Straight => {
+                        for pair in dataset.points.windows(2) {
+                            if let (Some((x0, y0)), Some((x1, y1))) = (
+                                self.map_point(plot_area, pair[0]),
+                                self.map_point(plot_area, pair[1]),
+                            ) {
+                                draw_line(
+                                    frame,
+                                    plot_area,
+                                    (x0, y0),
+                                    (x1, y1),
+                                    dataset.marker,
+                                    style,
+                                );
+                            }
+                        }
+                    }
+                    ChartInterpolation::Step => {
+                        for pair in dataset.points.windows(2) {
+                            if let (Some((x0, y0)), Some((x1, y1))) = (
+                                self.map_point(plot_area, pair[0]),
+                                self.map_point(plot_area, pair[1]),
+                            ) {
+                                let corner = (x1, y0);
+                                draw_line(
+                                    frame,
+                                    plot_area,
+                                    (x0, y0),
+                                    corner,
+                                    dataset.marker,
+                                    style,
+                                );
+                                draw_line(
+                                    frame,
+                                    plot_area,
+                                    corner,
+                                    (x1, y1),
+                                    dataset.marker,
+                                    style,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -951,6 +989,47 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(3).as_deref(),
             Some("x axis      ")
+        );
+    }
+
+    #[test]
+    fn renders_step_interpolation_segments() {
+        let points = [ChartPoint::new(0.0, 0.0), ChartPoint::new(2.0, 2.0)];
+        let datasets = [ChartDataset::line("step", &points).marker("s")];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 2.0, 0.0, 2.0))
+            .policy(ChartPolicy::compact().interpolation(ChartInterpolation::Step))
+            .render(Rect::new(0, 0, 3, 3), &mut frame);
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(0, 2))
+                .map(|cell| cell.symbol.as_str()),
+            Some("s")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(2, 2))
+                .map(|cell| cell.symbol.as_str()),
+            Some("s")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(2, 0))
+                .map(|cell| cell.symbol.as_str()),
+            Some("s")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(1, 1))
+                .map(|cell| cell.symbol.as_str()),
+            Some(" ")
         );
     }
 
