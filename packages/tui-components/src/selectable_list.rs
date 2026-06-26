@@ -10,6 +10,8 @@ use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::hit_test::{HitRegion, hit_region_at};
+use crate::scroll_area::ScrollAreaScrollbarMode;
+use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 
 /// One selectable list item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +181,10 @@ pub struct SelectableListPolicy {
     pub keyboard: SelectableListKeyboardPolicy,
     /// Highlight symbol behavior.
     pub highlight: SelectableListHighlightPolicy,
+    /// Optional integrated vertical scrollbar mode.
+    pub scrollbar: ScrollAreaScrollbarMode,
+    /// Integrated scrollbar rendering/interaction policy.
+    pub scrollbar_policy: ScrollbarPolicy,
 }
 
 impl SelectableListPolicy {
@@ -189,7 +195,22 @@ impl SelectableListPolicy {
             mouse: ComponentMousePolicy::button(),
             keyboard: SelectableListKeyboardPolicy::interactive(),
             highlight: SelectableListHighlightPolicy::new(">", true),
+            scrollbar: ScrollAreaScrollbarMode::Hidden,
+            scrollbar_policy: ScrollbarPolicy::vertical(),
         }
+    }
+    /// Return policy with integrated vertical scrollbar mode set.
+    #[must_use]
+    pub const fn scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
+        self.scrollbar = mode;
+        self
+    }
+
+    /// Return policy with integrated vertical scrollbar policy set.
+    #[must_use]
+    pub const fn scrollbar_policy(mut self, policy: ScrollbarPolicy) -> Self {
+        self.scrollbar_policy = policy;
+        self
     }
 }
 
@@ -345,10 +366,34 @@ impl<'a> SelectableList<'a> {
         )
     }
 
+    fn content_area(&self, area: Rect) -> Rect {
+        let reserve_scrollbar =
+            matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Gutter) && area.width > 0;
+        Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(u16::from(reserve_scrollbar)),
+            area.height,
+        )
+    }
+
+    const fn scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        if matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Hidden) || area.width == 0 {
+            return None;
+        }
+        Some(Rect::new(
+            area.right().saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        ))
+    }
+
     /// Return maximum vertical scroll offset for this area.
     #[must_use]
     pub fn max_vertical_scroll(&self, area: Rect) -> usize {
-        self.total_height().saturating_sub(usize::from(area.height))
+        self.total_height()
+            .saturating_sub(usize::from(self.content_area(area).height))
     }
 
     /// Clamp caller-owned state to valid scroll bounds for this area.
@@ -369,6 +414,7 @@ impl<'a> SelectableList<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
+        let content_area = self.content_area(area);
         let mut skipped_rows = state.vertical_scroll;
         let mut rendered_row = 0u16;
         for (index, item) in self.items.iter().enumerate() {
@@ -377,18 +423,31 @@ impl<'a> SelectableList<'a> {
                     skipped_rows = skipped_rows.saturating_sub(1);
                     continue;
                 }
-                if rendered_row >= area.height {
+                if rendered_row >= content_area.height {
+                    self.render_scrollbar(area, state, frame);
                     return;
                 }
-                let row = area.y.saturating_add(rendered_row);
+                let row = content_area.y.saturating_add(rendered_row);
                 frame.write_line_with_fallback_style(
-                    Rect::new(area.x, row, area.width, 1),
+                    Rect::new(content_area.x, row, content_area.width, 1),
                     &self.line(index, item, line_index, *state),
                     fallback,
                 );
                 rendered_row = rendered_row.saturating_add(1);
             }
         }
+        self.render_scrollbar(area, state, frame);
+    }
+
+    fn render_scrollbar(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
+        let Some(area) = self.scrollbar_area(area) else {
+            return;
+        };
+        let scrollbar_state = ScrollbarState::new(u16_saturating(self.total_height()), area.height)
+            .offset(u16_saturating(state.vertical_scroll));
+        Scrollbar::new()
+            .policy(self.policy.scrollbar_policy)
+            .render(area, &scrollbar_state, frame);
     }
 
     /// Handle one input event.
@@ -526,7 +585,20 @@ impl<'a> SelectableList<'a> {
         if !self.policy.mouse.enabled {
             return SelectableListOutcome::Ignored;
         }
-        let hit = self.hit_index(area, state, mouse);
+        if let Some(scrollbar_area) = self.scrollbar_area(area) {
+            let mut scrollbar_state =
+                ScrollbarState::new(u16_saturating(self.total_height()), scrollbar_area.height)
+                    .offset(u16_saturating(state.vertical_scroll));
+            let outcome = Scrollbar::new()
+                .policy(self.policy.scrollbar_policy)
+                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse));
+            if let ScrollbarOutcome::Changed { offset } = outcome {
+                state.vertical_scroll = usize::from(offset).min(self.max_vertical_scroll(area));
+                return SelectableListOutcome::Redraw;
+            }
+        }
+        let content_area = self.content_area(area);
+        let hit = self.hit_index(content_area, state, mouse);
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => Self::hover(state, hit),
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
@@ -810,6 +882,10 @@ impl<'a> SelectableList<'a> {
     }
 }
 
+fn u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Previous,
@@ -824,6 +900,8 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::prelude::{Line, Span, Style};
+
+    use crate::scroll_area::ScrollAreaScrollbarMode;
 
     use super::{
         SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListOutcome,
@@ -922,6 +1000,49 @@ mod tests {
             SelectableListOutcome::Redraw
         );
         assert_eq!(state.vertical_scroll(), 1);
+    }
+
+    #[test]
+    fn renders_integrated_scrollbar() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let list = SelectableList::new(&items)
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter));
+        let mut state = SelectableListState::new(Some(0));
+        state.set_vertical_scroll(1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        list.render(Rect::new(0, 0, 6, 2), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  Thr█"));
+    }
+
+    #[test]
+    fn scrollbar_mouse_updates_vertical_scroll() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let list = SelectableList::new(&items)
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter));
+        let mut state = SelectableListState::new(Some(0));
+
+        let outcome = list.handle_event(
+            Rect::new(0, 0, 6, 2),
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(5, 1),
+            )),
+        );
+
+        assert_eq!(outcome, SelectableListOutcome::Redraw);
+        assert!(state.vertical_scroll() > 0);
     }
 
     #[test]
