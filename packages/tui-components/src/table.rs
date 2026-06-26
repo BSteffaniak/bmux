@@ -293,6 +293,8 @@ pub struct TablePolicy {
     pub auto_scroll_selected: bool,
     /// Separator between cells.
     pub cell_separator: &'static str,
+    /// Number of left columns kept visible while horizontally scrolling.
+    pub sticky_left_columns: usize,
     /// Ascending sort indicator symbol.
     pub sort_ascending_symbol: &'static str,
     /// Descending sort indicator symbol.
@@ -318,6 +320,7 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::disabled(),
             auto_scroll_selected: false,
             cell_separator: " ",
+            sticky_left_columns: 0,
             sort_ascending_symbol: "↑",
             sort_descending_symbol: "↓",
             vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -337,6 +340,7 @@ impl TablePolicy {
             mouse: ComponentMousePolicy::button(),
             auto_scroll_selected: true,
             cell_separator: " ",
+            sticky_left_columns: 0,
             sort_ascending_symbol: "↑",
             sort_descending_symbol: "↓",
             vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -345,6 +349,13 @@ impl TablePolicy {
             horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
     }
+    /// Return policy with sticky left column count set.
+    #[must_use]
+    pub const fn sticky_left_columns(mut self, columns: usize) -> Self {
+        self.sticky_left_columns = columns;
+        self
+    }
+
     /// Return policy with sort indicator symbols set.
     #[must_use]
     pub const fn sort_symbols(mut self, ascending: &'static str, descending: &'static str) -> Self {
@@ -498,6 +509,7 @@ impl<'a> Table<'a> {
                 },
                 auto_scroll_selected: true,
                 cell_separator: " ",
+                sticky_left_columns: 0,
                 sort_ascending_symbol: "↑",
                 sort_descending_symbol: "↓",
                 vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
@@ -606,7 +618,7 @@ impl<'a> Table<'a> {
             );
             frame.write_line_with_fallback_style(
                 header,
-                &line_viewport(&line, state.horizontal_scroll, usize::from(header.width)),
+                &self.visible_line(&line, &layout.column_widths, state, header.width),
                 self.styles.header,
             );
         }
@@ -614,7 +626,7 @@ impl<'a> Table<'a> {
             let line = self.separator_line(&layout.column_widths);
             frame.write_line_with_fallback_style(
                 separator,
-                &line_viewport(&line, state.horizontal_scroll, usize::from(separator.width)),
+                &self.visible_line(&line, &layout.column_widths, state, separator.width),
                 self.styles.separator,
             );
         }
@@ -649,7 +661,7 @@ impl<'a> Table<'a> {
                 );
                 frame.write_line_with_fallback_style(
                     rect,
-                    &line_viewport(&line, state.horizontal_scroll, usize::from(rect.width)),
+                    &self.visible_line(&line, &layout.column_widths, state, rect.width),
                     self.row_style(source, row, state),
                 );
                 rendered = rendered.saturating_add(1);
@@ -815,9 +827,29 @@ impl<'a> Table<'a> {
         if !area.contains(position) {
             return None;
         }
-        let content_x =
-            usize::from(position.x.saturating_sub(area.x)).saturating_add(state.horizontal_scroll);
         let separator_width = display_width(self.policy.cell_separator);
+        let sticky = self
+            .policy
+            .sticky_left_columns
+            .min(layout.column_widths.len());
+        let sticky_width = layout
+            .column_widths
+            .iter()
+            .take(sticky)
+            .map(|width| usize::from(*width))
+            .sum::<usize>()
+            .saturating_add(separator_width.saturating_mul(sticky.saturating_sub(1)));
+        let local_x = usize::from(position.x.saturating_sub(area.x));
+        let content_x = if sticky > 0 && local_x < sticky_width {
+            local_x
+        } else if sticky > 0 {
+            local_x
+                .saturating_add(state.horizontal_scroll)
+                .saturating_add(sticky_width)
+                .saturating_add(separator_width)
+        } else {
+            local_x.saturating_add(state.horizontal_scroll)
+        };
         let mut start = 0usize;
         for (index, width) in layout.column_widths.iter().copied().enumerate() {
             let end = start.saturating_add(usize::from(width));
@@ -961,6 +993,34 @@ impl<'a> Table<'a> {
         } else {
             state.scroll
         }
+    }
+
+    fn visible_line(&self, line: &Line, widths: &[u16], state: &TableState, width: u16) -> Line {
+        let sticky = self.policy.sticky_left_columns.min(widths.len());
+        if sticky == 0 {
+            return line_viewport(line, state.horizontal_scroll, usize::from(width));
+        }
+        let separator_width = display_width(self.policy.cell_separator);
+        let sticky_width = widths
+            .iter()
+            .take(sticky)
+            .map(|width| usize::from(*width))
+            .sum::<usize>()
+            .saturating_add(separator_width.saturating_mul(sticky.saturating_sub(1)))
+            .min(usize::from(width));
+        let mut left = line_viewport(line, 0, sticky_width);
+        let remaining = usize::from(width).saturating_sub(sticky_width);
+        if remaining > 0 {
+            let mut right = line_viewport(
+                line,
+                sticky_width
+                    .saturating_add(separator_width)
+                    .saturating_add(state.horizontal_scroll),
+                remaining,
+            );
+            left.spans.append(&mut right.spans);
+        }
+        left
     }
 
     fn header_cell_line(&self, column: &TableColumn<'_>) -> Line {
@@ -1419,6 +1479,48 @@ mod tests {
 
         assert_eq!(outcome, TableOutcome::Redraw);
         assert!(state.horizontal_scroll() > 0);
+    }
+
+    #[test]
+    fn sticky_left_column_stays_visible_while_horizontally_scrolling() {
+        let columns = [
+            TableColumn::new("ID").fixed(2),
+            TableColumn::new("Name").fixed(6),
+            TableColumn::new("State").fixed(6),
+        ];
+        let rows = [TableRow::new(vec!["01", "abcdef", "ready"])];
+        let mut state = TableState::new(None);
+        state.set_horizontal_scroll(4);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Table::new(&columns, &rows)
+            .policy(TablePolicy::bare().sticky_left_columns(1))
+            .render(Rect::new(0, 0, 10, 2), &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("01ef ready"));
+    }
+
+    #[test]
+    fn hit_tests_sticky_left_column_and_scrolled_columns() {
+        let columns = [
+            TableColumn::new("ID").fixed(2),
+            TableColumn::new("Name").fixed(6),
+            TableColumn::new("State").fixed(6),
+        ];
+        let rows = [TableRow::new(vec!["01", "abcdef", "ready"])];
+        let mut state = TableState::new(None);
+        state.set_horizontal_scroll(4);
+        let table = Table::new(&columns, &rows).policy(TablePolicy::bare().sticky_left_columns(1));
+
+        assert_eq!(
+            table.hit_test(Rect::new(0, 0, 10, 2), &state, Point::new(1, 1)),
+            Some(TableHit::Cell { row: 0, column: 0 })
+        );
+        assert_eq!(
+            table.hit_test(Rect::new(0, 0, 10, 2), &state, Point::new(3, 1)),
+            Some(TableHit::Cell { row: 0, column: 2 })
+        );
     }
 
     #[test]
