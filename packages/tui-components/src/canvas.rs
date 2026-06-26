@@ -1,4 +1,13 @@
 //! Lightweight deterministic canvas component.
+//!
+//! Composition is intentionally simple and deterministic. Rasterized geometry is
+//! applied in component order: lines, rectangles, circles, then points when
+//! [`CanvasExplicitMarkers::Rasterize`] is selected. Overlapping rasterized
+//! sub-cells keep the combined coverage mask, while the most recently written
+//! shape style becomes the cell style. With the default
+//! [`CanvasExplicitMarkers::Preserve`] policy, point markers are terminal-cell
+//! overlays written after rasterized geometry, so the point marker and style win
+//! for that cell.
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
@@ -763,6 +772,49 @@ mod tests {
             Some((10, 10))
         );
         assert_eq!(canvas.map_point(Rect::new(0, 0, 11, 11), -1.0, 0.0), None);
+    }
+
+    #[test]
+    fn rasterized_overlaps_use_last_shape_style_and_combined_mask() {
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().fg(Color::Blue);
+        let lines = [
+            CanvasLine::new(0.0, 1.0, 0.0, 1.0, "ignored").style(red),
+            CanvasLine::new(1.0, 1.0, 1.0, 1.0, "ignored").style(blue),
+        ];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .lines(&lines)
+            .policy(CanvasPolicy::auto().rasterized_points())
+            .render(Rect::new(0, 0, 1, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("⠉"));
+        assert_eq!(
+            frame.buffer().get(Point::new(0, 0)).map(|cell| cell.style),
+            Some(blue)
+        );
+    }
+
+    #[test]
+    fn explicit_point_marker_overlays_rasterized_geometry() {
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().fg(Color::Blue);
+        let points = [CanvasPoint::new(0.0, 1.0, "p").style(blue)];
+        let rects = [CanvasRect::new(0.0, 1.0, 0.0, 1.0, "ignored").style(red)];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        Canvas::new(&points, CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
+            .rects(&rects)
+            .render(Rect::new(0, 0, 1, 1), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("p"));
+        assert_eq!(
+            frame.buffer().get(Point::new(0, 0)).map(|cell| cell.style),
+            Some(blue)
+        );
     }
 
     #[test]
