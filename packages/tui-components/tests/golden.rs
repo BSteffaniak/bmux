@@ -5,9 +5,16 @@ use bmux_tui::prelude::{Line, Span, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::badge::Badge;
 use bmux_tui_components::breadcrumbs::{BreadcrumbItem, Breadcrumbs, BreadcrumbsState};
+use bmux_tui_components::chart::{
+    Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
+};
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar};
+use bmux_tui_components::menu::{Menu, MenuItem, MenuPolicy};
 use bmux_tui_components::scroll_area::{
     ScrollArea, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
+};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListItem, SelectableListPolicy, SelectableListState,
 };
 use bmux_tui_components::status_bar::{StatusBar, StatusSegment, StatusSeverity};
 use bmux_tui_components::tab_bar::{TabBar, TabBarPolicy, TabBarState};
@@ -152,4 +159,56 @@ fn golden_table_rich_truncation_and_text_view_wrapping() {
             &mut text_frame,
         );
     assert_eq!(buffer_rows(text_frame.buffer()), vec!["one ", "two "]);
+}
+
+#[test]
+fn golden_recent_list_menu_and_chart_polish() {
+    let list_items = [
+        SelectableListItem::new("one", "One"),
+        SelectableListItem::new("two", "Two"),
+        SelectableListItem::new("three", "Three"),
+    ];
+    let mut list_state = SelectableListState::new(Some(0));
+    list_state.set_vertical_scroll(1);
+    let mut list_buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+    let mut list_frame = Frame::new(&mut list_buffer);
+    SelectableList::new(&list_items)
+        .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter))
+        .render(Rect::new(0, 0, 6, 2), &list_state, &mut list_frame);
+    assert_eq!(buffer_rows(list_frame.buffer()), vec!["  Two│", "  Thr█"]);
+
+    let menu_items = [MenuItem::rich(
+        "new",
+        Line::from_spans([Span::styled("New", Style::new().fg(Color::Yellow))]),
+    )
+    .submenu(true)];
+    let mut menu_buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+    let mut menu_frame = Frame::new(&mut menu_buffer);
+    Menu::new(&menu_items)
+        .policy(MenuPolicy {
+            submenu_indicator: ">",
+            ..MenuPolicy::default()
+        })
+        .render(
+            Rect::new(0, 0, 10, 1),
+            &bmux_tui_components::menu::MenuState::new(Some(0)),
+            &mut menu_frame,
+        );
+    assert_eq!(buffer_rows(menu_frame.buffer()), vec!["> New >   "]);
+
+    let points_a = [ChartPoint::new(0.0, 0.0)];
+    let points_b = [ChartPoint::new(1.0, 1.0)];
+    let datasets = [
+        ChartDataset::scatter("alpha", &points_a),
+        ChartDataset::scatter("beta", &points_b),
+    ];
+    let mut chart_buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+    let mut chart_frame = Frame::new(&mut chart_buffer);
+    Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+        .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
+        .render(Rect::new(0, 0, 8, 2), &mut chart_frame);
+    assert_eq!(
+        buffer_rows(chart_frame.buffer()),
+        vec!["alpha b…", "•       "]
+    );
 }
