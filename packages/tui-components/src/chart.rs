@@ -4,6 +4,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span, display_width};
 use bmux_tui::style::{Color, Style};
+use bmux_tui::text::truncate_line_to_display_width;
 use bmux_tui::text_width::truncate_to_display_width;
 
 /// One chart point.
@@ -582,15 +583,22 @@ fn render_legend(
     axis_visibility: ChartAxisVisibility,
     style: Style,
 ) {
-    let names = datasets
-        .iter()
-        .filter(|dataset| !dataset.name.is_empty())
-        .map(|dataset| dataset.name)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if names.is_empty() {
+    let mut spans = Vec::new();
+    for dataset in datasets.iter().filter(|dataset| !dataset.name.is_empty()) {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" ", style));
+        }
+        let dataset_style = if dataset.style == Style::new() {
+            style
+        } else {
+            dataset.style
+        };
+        spans.push(Span::styled(dataset.name, dataset_style));
+    }
+    if spans.is_empty() {
         return;
     }
+    let line = Line::from_spans(spans);
     let y = match placement {
         ChartLegendPlacement::Hidden => return,
         ChartLegendPlacement::TopRight => area.y.saturating_add(u16::from(
@@ -603,12 +611,11 @@ fn render_legend(
             ))
         }
     };
-    let width = u16::try_from(display_width(&names)).unwrap_or(u16::MAX);
+    let width = u16::try_from(display_width(&line.plain_text())).unwrap_or(u16::MAX);
     let x = area.right().saturating_sub(width).max(area.x);
-    frame.write_line(
-        Rect::new(x, y, area.right().saturating_sub(x), 1),
-        &Line::from_spans([Span::styled(names, style)]),
-    );
+    let available = usize::from(area.right().saturating_sub(x));
+    let line = truncate_line_to_display_width(&line, available);
+    frame.write_line(Rect::new(x, y, area.right().saturating_sub(x), 1), &line);
 }
 
 impl ChartAxis<'_> {
@@ -957,6 +964,42 @@ mod tests {
             .render(Rect::new(0, 0, 8, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("No data "));
+    }
+
+    #[test]
+    fn legend_truncates_to_area_and_preserves_dataset_styles() {
+        let points_a = [ChartPoint::new(0.0, 0.0)];
+        let points_b = [ChartPoint::new(1.0, 1.0)];
+        let datasets = [
+            ChartDataset::scatter("alpha", &points_a).style(Style::new().fg(Color::Red)),
+            ChartDataset::scatter("beta", &points_b),
+        ];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+            .styles(super::ChartStyles {
+                dataset: Style::new().fg(Color::Blue),
+                empty: Style::new(),
+            })
+            .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
+            .render(Rect::new(0, 0, 8, 2), &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("alpha b…"));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(0, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Red))
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(6, 0))
+                .map(|cell| cell.style.fg),
+            Some(Some(Color::Blue))
+        );
     }
 
     #[test]
