@@ -1180,6 +1180,7 @@ pub fn call_service_raw(
             .cloned(),
         plugin_settings_map: plugin_settings_map.clone(),
         caller_client_id,
+        cancellation: bmux_plugin_sdk::CancellationToken::default(),
         host_kernel_bridge,
     })?;
 
@@ -3239,6 +3240,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         }
     }
@@ -4156,6 +4158,7 @@ minimum = "1.0"
                 toml::toml! { mode = "service" }.into(),
             )]),
             caller_client_id: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         };
 

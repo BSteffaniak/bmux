@@ -17,8 +17,8 @@
 //! | **Advanced** | `plugin_search_roots`, `settings`, `plugin_settings_map` |
 
 use crate::{
-    HostConnectionInfo, HostMetadata, PluginError, RegisteredService, Result, ServiceRequest,
-    decode_service_message, encode_service_message,
+    CancellationToken, HostConnectionInfo, HostMetadata, PluginError, RegisteredService, Result,
+    ServiceRequest, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -85,6 +85,9 @@ mod toml_value_map {
             .collect()
     }
 }
+
+/// Standard service error code for cancellation.
+pub const SERVICE_ERROR_CANCELLED: &str = "cancelled";
 
 /// Serializable summary of a registered plugin, carried through command and
 /// lifecycle contexts so plugins can introspect the full plugin registry
@@ -294,6 +297,9 @@ pub struct NativeServiceContext {
     /// associated (e.g. CLI subcommands without an attached session).
     #[serde(default)]
     pub caller_client_id: Option<uuid::Uuid>,
+    /// Cancellation state for this service invocation.
+    #[serde(default)]
+    pub cancellation: CancellationToken,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,

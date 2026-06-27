@@ -1,4 +1,4 @@
-use crate::{CapabilityId, HostScope, InterfaceId, PluginError, Result};
+use crate::{CapabilityId, HostScope, InterfaceId, PluginError, PluginInvocationId, Result};
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
@@ -162,6 +162,8 @@ pub enum ServiceEnvelopeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEnvelope {
     pub version: ServiceProtocolVersion,
+    #[serde(default)]
+    pub invocation_id: PluginInvocationId,
     pub request_id: u64,
     pub kind: ServiceEnvelopeKind,
     #[serde(with = "bmux_codec::serde_bytes_vec")]
@@ -170,9 +172,10 @@ pub struct ServiceEnvelope {
 
 impl ServiceEnvelope {
     #[must_use]
-    pub const fn new(request_id: u64, kind: ServiceEnvelopeKind, payload: Vec<u8>) -> Self {
+    pub fn new(request_id: u64, kind: ServiceEnvelopeKind, payload: Vec<u8>) -> Self {
         Self {
             version: ServiceProtocolVersion::current(),
+            invocation_id: PluginInvocationId::new(),
             request_id,
             kind,
             payload,
@@ -340,7 +343,33 @@ pub fn decode_service_envelope<T>(
 where
     T: DeserializeOwned,
 {
-    let envelope: ServiceEnvelope = decode_service_message(payload)?;
+    let envelope = match decode_service_message::<ServiceEnvelope>(payload) {
+        Ok(envelope) => envelope,
+        Err(current_error) => {
+            #[derive(Deserialize)]
+            struct LegacyServiceEnvelope {
+                version: ServiceProtocolVersion,
+                request_id: u64,
+                kind: ServiceEnvelopeKind,
+                #[serde(with = "bmux_codec::serde_bytes_vec")]
+                payload: Vec<u8>,
+            }
+
+            let legacy: LegacyServiceEnvelope = bmux_codec::from_positional_bytes(payload)
+                .map_err(|legacy_error| PluginError::ServiceProtocol {
+                    details: format!(
+                        "current envelope decode failed: {current_error}; legacy envelope decode failed: {legacy_error}",
+                    ),
+                })?;
+            ServiceEnvelope {
+                version: legacy.version,
+                invocation_id: PluginInvocationId::new(),
+                request_id: legacy.request_id,
+                kind: legacy.kind,
+                payload: legacy.payload,
+            }
+        }
+    };
     if envelope.version != ServiceProtocolVersion::current() {
         return Err(PluginError::ServiceProtocol {
             details: format!(

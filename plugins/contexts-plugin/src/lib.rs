@@ -1453,6 +1453,7 @@ mod tests {
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: Some(caller_client_id),
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         }
     }

@@ -482,6 +482,7 @@ fn queue_cut_service_context_from_command(context: &NativeCommandContext) -> Nat
         settings: context.settings.clone(),
         plugin_settings_map: context.plugin_settings_map.clone(),
         caller_client_id: context.caller_client_id,
+        cancellation: bmux_plugin_sdk::CancellationToken::default(),
         host_kernel_bridge: context.host_kernel_bridge,
     }
 }

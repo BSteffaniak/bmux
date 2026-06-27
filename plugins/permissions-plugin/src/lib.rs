@@ -1507,6 +1507,7 @@ mod tests {
             settings: None,
             plugin_settings_map: std::collections::BTreeMap::new(),
             caller_client_id: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
         }
     }

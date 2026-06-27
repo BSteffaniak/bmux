@@ -38,6 +38,7 @@
 //! ```
 
 pub mod action_dispatch;
+mod cancellation;
 mod capability;
 mod command;
 mod context;
@@ -59,6 +60,9 @@ mod wire_event_sink;
 
 pub use bmux_codec as codec;
 pub use bmux_perf_telemetry as perf_telemetry;
+pub use cancellation::{
+    CancellationToken, PluginCancellationToken, PluginInvocationId, ServiceCancellation,
+};
 pub use capability::{HostScope, PluginFeature};
 pub use command::{
     CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
@@ -71,7 +75,7 @@ pub use context::{
     HostKernelBridgeResponse, NativeCommandContext, NativeCommandInvocationSource,
     NativeLifecycleContext, NativeServiceContext, PLUGIN_CLI_BRIDGE_MAGIC_V1,
     PluginCliCommandRequest, PluginCliCommandResponse, RegisteredPluginInfo,
-    decode_host_kernel_bridge_cli_command_payload,
+    SERVICE_ERROR_CANCELLED, decode_host_kernel_bridge_cli_command_payload,
     decode_host_kernel_bridge_plugin_command_payload,
     encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload,

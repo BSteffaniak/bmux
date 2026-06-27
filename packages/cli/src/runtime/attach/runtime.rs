@@ -5884,6 +5884,7 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         settings: None,
         plugin_settings_map: std::collections::BTreeMap::new(),
         caller_client_id: None,
+        cancellation: bmux_plugin_sdk::CancellationToken::default(),
         host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
             host_kernel_bridge,
         )),

@@ -773,6 +773,7 @@ pub(super) fn register_plugin_service_handlers(
                                 .cloned(),
                             plugin_settings_map: config.plugins.settings.clone(),
                             caller_client_id: Some(invoke_context.client_id().0),
+                            cancellation: bmux_plugin_sdk::CancellationToken::default(),
                             host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
                                 host_kernel_bridge,
                             )),

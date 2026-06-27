@@ -2428,6 +2428,7 @@ fn invoke_performance_get_settings(loaded: &bmux_plugin::LoadedPlugin) -> Result
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         })
         .map_err(|error| format!("noop service invocation failed: {error}"))?;
