@@ -1029,12 +1029,17 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
 }
 
 fn configure_device_seal_broker_env(command: &mut CommandBuilder) {
-    if let Ok(exe) = std::env::current_exe() {
-        command.env(
-            "SSHENV_DEVICE_SEAL_COMMAND",
-            format!("{} device-seal-broker", exe.display()),
-        );
+    if std::env::var("BMUX_DEVICE_SEAL_SCOPE").as_deref() == Ok("client") {
+        if let Ok(exe) = std::env::current_exe() {
+            command.env(
+                "SSHENV_DEVICE_SEAL_COMMAND",
+                format!("{} device-seal-broker", exe.display()),
+            );
+        }
+        return;
     }
+
+    command.env("SSHENV_DEVICE_SEAL_COMMAND", "");
 }
 
 fn configure_shell_integration_command(
