@@ -223,7 +223,11 @@ impl ServiceResponse {
     }
 }
 
-/// Serialize a service message using the bmux binary codec.
+/// Serialize a service message using canonical typed-stable `bmux_codec` bytes.
+///
+/// Legacy positional bytes are accepted by [`decode_service_message`] for
+/// migration compatibility, but new service messages are always encoded with
+/// the typed-stable codec.
 ///
 /// # Errors
 ///
@@ -234,17 +238,20 @@ where
 {
     let timing_enabled = PhaseChannel::Service.enabled();
     let started_at = timing_enabled.then(Instant::now);
-    let result =
-        bmux_codec::to_positional_vec(message).map_err(|error| PluginError::ServiceProtocol {
-            details: error.to_string(),
-        });
+    let result = bmux_codec::to_typed_vec(message).map_err(|error| PluginError::ServiceProtocol {
+        details: error.to_string(),
+    });
     if let Some(started_at) = started_at {
         emit_service_codec_timing::<T>("typed_service.message_encode", started_at, &result);
     }
     result
 }
 
-/// Deserialize a service message from binary codec bytes.
+/// Deserialize a service message from canonical typed-stable `bmux_codec` bytes.
+///
+/// Legacy positional `bmux_codec` bytes are decoded as a migration
+/// compatibility fallback so old in-repo fixtures and plugins can be migrated
+/// without a second public transport API.
 ///
 /// # Errors
 ///
@@ -255,10 +262,16 @@ where
 {
     let timing_enabled = PhaseChannel::Service.enabled();
     let started_at = timing_enabled.then(Instant::now);
-    let result =
-        bmux_codec::from_positional_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
-            details: error.to_string(),
-        });
+    let result = match bmux_codec::from_typed_bytes(payload) {
+        Ok(message) => Ok(message),
+        Err(typed_error) => bmux_codec::from_positional_bytes(payload).map_err(|positional_error| {
+            PluginError::ServiceProtocol {
+                details: format!(
+                    "typed-stable decode failed: {typed_error}; legacy positional decode failed: {positional_error}",
+                ),
+            }
+        }),
+    };
     if let Some(started_at) = started_at {
         let total_us = started_at.elapsed().as_micros();
         let payload = PhasePayload::new("typed_service.message_decode")
@@ -364,9 +377,19 @@ mod tests {
     fn service_message_roundtrip() {
         let response = ServiceResponse::ok(vec![1, 2, 3]);
         let bytes = encode_service_message(&response).expect("service response should encode");
+        bmux_codec::from_typed_bytes::<ServiceResponse>(&bytes)
+            .expect("service response should use typed-stable encoding");
         let decoded: ServiceResponse =
             decode_service_message(&bytes).expect("service response should decode");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn legacy_positional_response_message_still_decodes() {
+        let legacy_bytes = [3, 1, 2, 3, 0];
+        let decoded: ServiceResponse = decode_service_message(&legacy_bytes)
+            .expect("legacy positional service response should decode");
+        assert_eq!(decoded, ServiceResponse::ok(vec![1, 2, 3]));
     }
 
     #[test]
@@ -374,11 +397,10 @@ mod tests {
         let request = ServiceRequest {
             caller_plugin_id: "example.native".to_string(),
             service: RegisteredService {
-                capability: HostScope::new("bmux.permissions.read")
-                    .expect("capability should parse"),
+                capability: HostScope::new("bmux.storage.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "permissions-state".to_string(),
-                provider: ProviderId::Plugin("bmux.permissions".to_string()),
+                interface_id: "storage-state".to_string(),
+                provider: ProviderId::Plugin("bmux.storage".to_string()),
             },
             operation: "list".to_string(),
             payload: vec![4, 5, 6],
@@ -472,6 +494,16 @@ mod tests {
                 .expect("response envelope should decode");
         assert_eq!(request_id, 99);
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn legacy_positional_response_envelope_still_decodes() {
+        let legacy_bytes = [1, 99, 1, 5, 3, 7, 8, 9, 0];
+        let (request_id, decoded): (u64, ServiceResponse) =
+            decode_service_envelope(&legacy_bytes, ServiceEnvelopeKind::Response)
+                .expect("legacy positional response envelope should decode");
+        assert_eq!(request_id, 99);
+        assert_eq!(decoded, ServiceResponse::ok(vec![7, 8, 9]));
     }
 
     #[test]

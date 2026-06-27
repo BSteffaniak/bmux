@@ -354,11 +354,13 @@ impl HostKernelBridge {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKernelBridgeRequest {
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKernelBridgeResponse {
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
 }
 
@@ -555,12 +557,56 @@ pub fn decode_host_kernel_bridge_plugin_command_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE_CLI_BRIDGE_PROTOCOL_V1, CoreCliCommandRequest, PluginCliCommandRequest,
+        CORE_CLI_BRIDGE_PROTOCOL_V1, CoreCliCommandRequest, HostKernelBridgeRequest,
+        HostKernelBridgeResponse, PluginCliCommandRequest,
         decode_host_kernel_bridge_cli_command_payload,
         decode_host_kernel_bridge_plugin_command_payload,
         encode_host_kernel_bridge_cli_command_payload,
         encode_host_kernel_bridge_plugin_command_payload,
     };
+
+    #[test]
+    fn host_kernel_bridge_request_preserves_raw_payload_bytes() {
+        let request = HostKernelBridgeRequest {
+            payload: vec![0, 1, 2, 13, 14, 17, 255],
+        };
+        let encoded = super::encode_service_message(&request).expect("request should encode");
+        let decoded: HostKernelBridgeRequest =
+            super::decode_service_message(&encoded).expect("request should decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn host_kernel_bridge_response_preserves_raw_payload_bytes() {
+        let response = HostKernelBridgeResponse {
+            payload: vec![0, 1, 2, 13, 14, 17, 255],
+        };
+        let encoded = super::encode_service_message(&response).expect("response should encode");
+        let decoded: HostKernelBridgeResponse =
+            super::decode_service_message(&encoded).expect("response should decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn host_kernel_bridge_cli_request_nested_payload_round_trip() {
+        let command = CoreCliCommandRequest::new(
+            vec!["playbook".to_string(), "validate".to_string()],
+            vec!["--json".to_string(), "fixture.dsl".to_string()],
+        );
+        let command_payload = encode_host_kernel_bridge_cli_command_payload(&command)
+            .expect("command payload should encode");
+        let bridge_request = HostKernelBridgeRequest {
+            payload: command_payload,
+        };
+        let encoded =
+            super::encode_service_message(&bridge_request).expect("bridge request should encode");
+        let decoded: HostKernelBridgeRequest =
+            super::decode_service_message(&encoded).expect("bridge request should decode");
+        let decoded_command = decode_host_kernel_bridge_cli_command_payload(&decoded.payload)
+            .expect("nested command payload should decode")
+            .expect("nested command payload should be recognized");
+        assert_eq!(decoded_command, command);
+    }
 
     #[test]
     fn cli_bridge_payload_round_trip_preserves_request() {

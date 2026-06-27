@@ -1588,7 +1588,7 @@ where
     Req: serde::Serialize + Sync,
     Resp: serde::de::DeserializeOwned,
 {
-    let payload = bmux_codec::to_positional_vec(args)
+    let payload = bmux_plugin_sdk::encode_service_message(args)
         .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
     let response_bytes = client
         .invoke_service_raw(
@@ -1600,7 +1600,7 @@ where
         )
         .await
         .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
-    bmux_codec::from_positional_bytes::<Resp>(&response_bytes)
+    bmux_plugin_sdk::decode_service_message::<Resp>(&response_bytes)
         .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
 }
 
@@ -1772,7 +1772,7 @@ where
     Req: serde::Serialize + Sync,
     Resp: serde::de::DeserializeOwned,
 {
-    let payload = bmux_codec::to_positional_vec(args)
+    let payload = bmux_plugin_sdk::encode_service_message(args)
         .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
     let response_bytes = client
         .invoke_service_raw(
@@ -1784,7 +1784,7 @@ where
         )
         .await
         .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
-    bmux_codec::from_positional_bytes::<Resp>(&response_bytes)
+    bmux_plugin_sdk::decode_service_message::<Resp>(&response_bytes)
         .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
 }
 

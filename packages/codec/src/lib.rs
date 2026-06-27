@@ -735,6 +735,14 @@ mod tests {
         assert_eq!(decoded, id);
     }
 
+    #[test]
+    fn roundtrip_uuid_typed_stable() {
+        let id = uuid::Uuid::new_v4();
+        let bytes = to_typed_vec(&id).unwrap();
+        let decoded: uuid::Uuid = from_typed_bytes(&bytes).unwrap();
+        assert_eq!(decoded, id);
+    }
+
     // ── Tuple types ──────────────────────────────────────────────────────────
 
     #[test]

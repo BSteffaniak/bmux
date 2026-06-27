@@ -155,6 +155,10 @@ pub(crate) fn from_bytes_with_mode<'de, T: Deserialize<'de>>(
 impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let Some(tag) = self.read_tag()? else {
             return Err(Error::UnsupportedType(

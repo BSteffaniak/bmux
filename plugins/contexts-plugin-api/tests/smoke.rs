@@ -9,7 +9,9 @@ use bmux_contexts_plugin_api::{
     contexts_state::{self, ContextSelector, ContextSummary},
 };
 use bmux_ipc::InvokeServiceKind;
-use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientResult};
+use bmux_plugin_sdk::{
+    TypedDispatchClient, TypedDispatchClientResult, decode_service_message, encode_service_message,
+};
 
 struct FakeClient {
     response: Vec<u8>,
@@ -23,7 +25,7 @@ struct FakeClient {
 impl FakeClient {
     fn new<Resp: serde::Serialize>(response: &Resp) -> Self {
         Self {
-            response: bmux_ipc::encode(response).expect("response should encode"),
+            response: encode_service_message(response).expect("response should encode"),
             last_capability: None,
             last_kind: None,
             last_interface: None,
@@ -258,7 +260,7 @@ fn typed_client_create_context_encodes_args_and_decodes_ack() {
         attributes: std::collections::BTreeMap<String, String>,
     }
     let payload = client.last_payload.expect("payload should be captured");
-    let args: CreateArgs = bmux_ipc::decode(&payload).expect("payload should decode");
+    let args: CreateArgs = decode_service_message(&payload).expect("payload should decode");
     assert_eq!(args.name.as_deref(), Some("work"));
     assert_eq!(
         args.attributes.get("project").map(String::as_str),

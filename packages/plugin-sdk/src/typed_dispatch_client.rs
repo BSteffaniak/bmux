@@ -164,10 +164,11 @@ where
 {
     let operation_id = E::OPERATION;
     let operation = operation_id.as_str();
-    let payload = bmux_ipc::encode(request).map_err(|err| TypedServiceClientError::Encode {
-        op: operation.to_string(),
-        details: err.to_string(),
-    })?;
+    let payload =
+        crate::encode_service_message(request).map_err(|err| TypedServiceClientError::Encode {
+            op: operation.to_string(),
+            details: err.to_string(),
+        })?;
     let response = client
         .invoke_service_raw(
             E::CAPABILITY.as_str(),
@@ -177,7 +178,7 @@ where
             payload,
         )
         .await?;
-    bmux_ipc::decode(&response).map_err(|err| TypedServiceClientError::Decode {
+    crate::decode_service_message(&response).map_err(|err| TypedServiceClientError::Decode {
         op: operation.to_string(),
         details: err.to_string(),
     })

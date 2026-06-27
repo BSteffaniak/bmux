@@ -47,6 +47,7 @@ pub struct AttachOpenArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachInputArgs {
     pub session_id: Uuid,
+    #[serde(with = "bmux_plugin_sdk::codec::serde_bytes_vec")]
     pub data: Vec<u8>,
 }
 
@@ -63,7 +64,9 @@ pub struct AttachSetViewportArgs {
     pub rows: u16,
     pub status_top_inset: u16,
     pub status_bottom_inset: u16,
+    #[serde(alias = "cell_pixel_w")]
     pub cell_pixel_width: u16,
+    #[serde(alias = "cell_pixel_h")]
     pub cell_pixel_height: u16,
 }
 
@@ -76,7 +79,9 @@ pub struct AttachRetargetContextArgs {
     pub rows: u16,
     pub status_top_inset: u16,
     pub status_bottom_inset: u16,
+    #[serde(alias = "cell_pixel_w")]
     pub cell_pixel_width: u16,
+    #[serde(alias = "cell_pixel_h")]
     pub cell_pixel_height: u16,
 }
 

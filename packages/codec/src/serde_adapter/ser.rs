@@ -63,6 +63,10 @@ impl ser::Serializer for &mut Serializer {
     type SerializeStruct = Self;
     type SerializeStructVariant = Self;
 
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+
     fn serialize_bool(self, v: bool) -> Result<(), Error> {
         self.write_tag(TypeTag::Bool);
         self.output.push(if v { 1 } else { 0 });
