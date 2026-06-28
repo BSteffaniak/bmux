@@ -18,8 +18,12 @@ use bmux_tui_component_protocol::value::ComponentValue;
 use crate::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
 use crate::button::{Button, ButtonState};
 use crate::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
+use crate::empty_state::EmptyState;
+use crate::form_field::FormField;
+use crate::progress_bar::{ProgressBar, ProgressBarValue};
 use crate::protocol::{ProtocolBindings, ProtocolComponentBinding};
 use crate::radio_group::{RadioGroup, RadioGroupOutcome, RadioGroupState, RadioOption};
+use crate::text_view::{TextView, TextViewState};
 
 /// Open component type id for `action_row`.
 pub const ACTION_ROW_TYPE_ID: &str = "bmux.action_row";
@@ -181,7 +185,11 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
             ACTION_ROW_TYPE_ID => render_action_row(props, area, frame),
             BUTTON_TYPE_ID => render_button(props, area, frame),
             CHECKBOX_TYPE_ID => render_checkbox(props, state, node, area, frame),
+            EMPTY_STATE_TYPE_ID => render_empty_state(props, area, frame),
+            FORM_FIELD_TYPE_ID => render_form_field(props, area, frame),
+            PROGRESS_BAR_TYPE_ID => render_progress_bar(props, area, frame),
             RADIO_GROUP_TYPE_ID => render_radio_group(props, state, node, area, frame),
+            TEXT_VIEW_TYPE_ID => render_text_view(props, area, frame),
             type_id => render_unsupported(type_id, area, frame),
         }
     }
@@ -255,6 +263,60 @@ fn render_radio_group(
     RadioGroup::new(&options).render(area, &group_state, frame);
 }
 
+fn render_empty_state(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+    let title = string_prop(props, "title").unwrap_or("Empty");
+    let body = lines_prop(props, "body")
+        .or_else(|| string_prop(props, "message").map(|message| vec![Line::from(message)]))
+        .unwrap_or_default();
+    let actions = lines_prop(props, "actions").unwrap_or_default();
+    let mut empty = EmptyState::new(title).body(&body).actions(&actions);
+    if let Some(icon) = string_prop(props, "icon") {
+        empty = empty.icon(icon);
+    }
+    empty.render(area, frame);
+}
+
+fn render_form_field(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+    let label = string_prop(props, "label").unwrap_or("Field");
+    let mut field = FormField::new(label).required(bool_prop(props, "required").unwrap_or(false));
+    if let Some(help) = string_prop(props, "help") {
+        field = field.help(help);
+    }
+    if let Some(error) = string_prop(props, "error") {
+        field = field.error(error);
+    }
+    let _control = field.render(area, frame);
+}
+
+fn render_progress_bar(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+    let value = number_prop(props, "value").unwrap_or(0);
+    let total = number_prop(props, "total")
+        .or_else(|| number_prop(props, "max"))
+        .unwrap_or(100);
+    let progress = if bool_prop(props, "indeterminate").unwrap_or(false) {
+        ProgressBar::new(ProgressBarValue::indeterminate(
+            u16::try_from(value).unwrap_or(u16::MAX),
+        ))
+    } else {
+        ProgressBar::new(ProgressBarValue::determinate(value, total))
+    };
+    if let Some(label) = string_prop(props, "label") {
+        progress.label(label).render(area, frame);
+    } else {
+        progress.render(area, frame);
+    }
+}
+
+fn render_text_view(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+    let lines = lines_prop(props, "lines")
+        .or_else(|| string_prop(props, "text").map(|text| text.lines().map(Line::from).collect()))
+        .unwrap_or_default();
+    let mut state = TextViewState::new();
+    if let Some(scroll) = number_prop(props, "vertical_scroll") {
+        state.set_vertical_scroll(usize::try_from(scroll).unwrap_or(usize::MAX));
+    }
+    TextView::new(&lines).render(area, &state, frame);
+}
 fn render_unsupported(type_id: &str, area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         area,
@@ -438,6 +500,28 @@ fn bool_prop(value: &ComponentValue, key: &str) -> Option<bool> {
         | ComponentValue::List(_)
         | ComponentValue::Map(_) => None,
     }
+}
+
+fn number_prop(value: &ComponentValue, key: &str) -> Option<u64> {
+    match value.as_map()?.get(key)? {
+        ComponentValue::U64(value) => Some(*value),
+        ComponentValue::I64(value) => u64::try_from(*value).ok(),
+        ComponentValue::Null
+        | ComponentValue::Bool(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::String(_)
+        | ComponentValue::List(_)
+        | ComponentValue::Map(_) => None,
+    }
+}
+
+fn lines_prop(value: &ComponentValue, key: &str) -> Option<Vec<Line>> {
+    list_prop(value, key).map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(Line::from))
+            .collect()
+    })
 }
 
 fn list_prop<'a>(value: &'a ComponentValue, key: &str) -> Option<&'a [ComponentValue]> {
