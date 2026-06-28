@@ -4308,6 +4308,7 @@ minimum = "1.0"
                 homepage: None,
                 provider_priority: 0,
                 execution_class: crate::PluginExecutionClass::NativeStandard,
+                concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
                 owns_namespaces: BTreeSet::new(),
                 owns_paths: BTreeSet::new(),
                 required_capabilities: BTreeSet::new(),

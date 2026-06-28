@@ -122,6 +122,8 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub execution_class: PluginExecutionClass,
     #[serde(default)]
+    pub concurrency: bmux_plugin_runtime::PluginConcurrencyConfig,
+    #[serde(default)]
     pub owns_namespaces: BTreeSet<String>,
     #[serde(default)]
     pub owns_paths: BTreeSet<PluginOwnedPath>,
@@ -374,6 +376,7 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: super::PluginExecutionClass::NativeStandard,
+            concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: BTreeSet::new(),
             owns_paths: BTreeSet::new(),
             required_capabilities: BTreeSet::new(),
@@ -433,6 +436,7 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: super::PluginExecutionClass::NativeStandard,
+            concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: BTreeSet::new(),
             owns_paths: BTreeSet::new(),
             required_capabilities,
@@ -475,6 +479,7 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: super::PluginExecutionClass::NativeStandard,
+            concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: BTreeSet::new(),
             owns_paths: BTreeSet::new(),
             required_capabilities: BTreeSet::new(),

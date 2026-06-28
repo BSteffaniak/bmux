@@ -31,6 +31,9 @@ pub mod test_support;
 mod typed_dispatch_bridge;
 mod typed_service_caller;
 
+pub use bmux_plugin_runtime::{
+    ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,
+};
 pub use bmux_plugin_sdk::PluginEventKind;
 pub use declaration::{
     NativePlugin, PluginDeclaration, PluginDependency, PluginEntrypoint, PluginExecutionClass,

@@ -35,6 +35,7 @@ members = [
     "packages/performance-state",
     "packages/perf-telemetry",
     "packages/plugin",
+    "packages/plugin-runtime",
     "packages/plugin-schema",
     "packages/plugin-schema-macros",
     "packages/plugin-sdk",
@@ -176,6 +177,7 @@ bmux_pane_runtime_state = { version = "0.0.1-alpha.1", default-features = false,
 bmux_perf_telemetry = { version = "0.0.1-alpha.1", default-features = false, path = "packages/perf-telemetry" }
 bmux_performance_state = { version = "0.0.1-alpha.1", default-features = false, path = "packages/performance-state" }
 bmux_plugin = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin" }
+bmux_plugin_runtime = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-runtime" }
 bmux_plugin_schema = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema" }
 bmux_plugin_schema_macros = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-sdk" }

@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub use bmux_plugin_runtime::PluginConcurrencyConfig;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -73,6 +75,8 @@ pub struct PluginManifest {
     pub provider_priority: i32,
     #[serde(default)]
     pub execution_class: PluginExecutionClass,
+    #[serde(default)]
+    pub concurrency: PluginConcurrencyConfig,
     #[serde(default)]
     pub owns_namespaces: BTreeSet<String>,
     #[serde(default)]
@@ -191,6 +195,7 @@ impl PluginManifest {
             homepage: self.homepage.clone(),
             provider_priority: self.provider_priority,
             execution_class: self.execution_class,
+            concurrency: self.concurrency,
             owns_namespaces: self.owns_namespaces.clone(),
             owns_paths: self.owns_paths.clone(),
             required_capabilities: self.required_capabilities.clone(),

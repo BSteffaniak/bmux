@@ -2856,6 +2856,7 @@ allow_hyphen_values=true
             homepage: None,
             provider_priority: 0,
             execution_class: bmux_plugin::PluginExecutionClass::NativeStandard,
+            concurrency: bmux_plugin::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: std::collections::BTreeSet::new(),
             owns_paths: std::collections::BTreeSet::new(),
             required_capabilities: std::collections::BTreeSet::from([
@@ -2984,6 +2985,7 @@ allow_hyphen_values=true
             homepage: None,
             provider_priority: 0,
             execution_class: bmux_plugin::PluginExecutionClass::NativeStandard,
+            concurrency: bmux_plugin::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: std::collections::BTreeSet::new(),
             owns_paths: std::collections::BTreeSet::new(),
             required_capabilities: std::collections::BTreeSet::from([

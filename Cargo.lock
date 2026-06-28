@@ -1863,6 +1863,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_ipc",
  "bmux_perf_telemetry",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "libloading",
  "semver",
@@ -1885,6 +1886,14 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bmux_plugin_runtime"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

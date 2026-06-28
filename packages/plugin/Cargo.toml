@@ -14,6 +14,7 @@ version     = { workspace = true }
 # SDK crate (re-exported for backward compatibility)
 bmux_plugin_sdk = { workspace = true }
 
+bmux_plugin_runtime = { workspace = true }
 # External dependencies (host-side only)
 bmux_ipc            = { workspace = true }
 bmux_perf_telemetry = { workspace = true }
