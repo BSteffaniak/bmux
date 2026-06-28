@@ -880,6 +880,229 @@ pub fn invoke_streaming_service_export<P: RustPlugin>(
     SERVICE_STATUS_OK
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod concurrent_tests {
+    use super::{
+        ConcurrentRustPlugin, NativeLifecycleContext, NativeServiceContext,
+        NativeStreamingServiceContext, ServiceEnvelopeKind, ServiceResponse,
+    };
+    use crate::{
+        ApiVersion, CancellationToken, HostConnectionInfo, HostMetadata, HostScope,
+        NoPluginContract, PluginInvocationId, ProviderId, RegisteredService, ServiceKind,
+        ServiceRequest, decode_service_envelope_with_invocation_id,
+        encode_service_envelope_with_invocation_id,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, OnceLock};
+    use std::thread;
+
+    #[derive(Default)]
+    struct TestConcurrentPlugin {
+        active_calls: AtomicUsize,
+        max_active_calls: AtomicUsize,
+        activations: AtomicUsize,
+        deactivations: AtomicUsize,
+    }
+
+    impl ConcurrentRustPlugin for TestConcurrentPlugin {
+        type Contract = NoPluginContract;
+
+        fn activate_concurrent(
+            &self,
+            _context: NativeLifecycleContext,
+        ) -> Result<i32, crate::PluginCommandError> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::EXIT_OK)
+        }
+
+        fn deactivate_concurrent(
+            &self,
+            _context: NativeLifecycleContext,
+        ) -> Result<i32, crate::PluginCommandError> {
+            self.deactivations.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::EXIT_OK)
+        }
+
+        fn invoke_service_concurrent(&self, _context: NativeServiceContext) -> ServiceResponse {
+            let current = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_calls.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            self.active_calls.fetch_sub(1, Ordering::SeqCst);
+            ServiceResponse::ok(vec![1])
+        }
+
+        fn invoke_streaming_service_concurrent(
+            &self,
+            context: NativeStreamingServiceContext,
+        ) -> ServiceResponse {
+            let mut payload = context.service.request.payload;
+            payload.push(2);
+            ServiceResponse::ok(payload)
+        }
+    }
+
+    fn service_context(payload: Vec<u8>) -> NativeServiceContext {
+        NativeServiceContext {
+            plugin_id: "test.concurrent".to_string(),
+            request: ServiceRequest {
+                caller_plugin_id: "test.caller".to_string(),
+                service: RegisteredService {
+                    capability: HostScope::new("test.service").expect("scope should parse"),
+                    kind: ServiceKind::Command,
+                    interface_id: "test-service".to_string(),
+                    provider: ProviderId::Plugin("test.concurrent".to_string()),
+                },
+                operation: "run".to_string(),
+                payload,
+            },
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux-test".to_string(),
+                product_version: "0.0.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            cancellation: CancellationToken::new(),
+            host_kernel_bridge: None,
+        }
+    }
+
+    fn lifecycle_context() -> NativeLifecycleContext {
+        NativeLifecycleContext {
+            plugin_id: "test.concurrent".to_string(),
+            host: HostMetadata {
+                product_name: "bmux-test".to_string(),
+                product_version: "0.0.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_plugin_handles_parallel_calls() {
+        let plugin = Arc::new(TestConcurrentPlugin::default());
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let plugin = plugin.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                assert_eq!(
+                    plugin
+                        .invoke_service_concurrent(service_context(Vec::new()))
+                        .payload,
+                    vec![1]
+                );
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker should finish");
+        }
+        assert!(plugin.max_active_calls.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn concurrent_plugin_streaming_works() {
+        let plugin = TestConcurrentPlugin::default();
+        let response = plugin.invoke_streaming_service_concurrent(NativeStreamingServiceContext {
+            service: service_context(vec![1]),
+            events: crate::ServiceEventSinkHandle::noop(),
+        });
+        assert_eq!(response.payload, vec![1, 2]);
+    }
+
+    #[test]
+    fn concurrent_plugin_activation_deactivation_exports_work() {
+        static INSTANCE: OnceLock<Arc<TestConcurrentPlugin>> = OnceLock::new();
+        let plugin = crate::__private::concurrent_plugin_instance(&INSTANCE);
+        let payload = crate::encode_service_message(&lifecycle_context())
+            .expect("lifecycle context should encode");
+        assert_eq!(
+            super::activate_concurrent_export(plugin, payload.as_ptr(), payload.len()),
+            crate::EXIT_OK
+        );
+        assert_eq!(
+            super::deactivate_concurrent_export(plugin, payload.as_ptr(), payload.len()),
+            crate::EXIT_OK
+        );
+        assert_eq!(plugin.activations.load(Ordering::SeqCst), 1);
+        assert_eq!(plugin.deactivations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_service_export_preserves_response_semantics() {
+        static INSTANCE: OnceLock<Arc<TestConcurrentPlugin>> = OnceLock::new();
+        let plugin = crate::__private::concurrent_plugin_instance(&INSTANCE);
+        let invocation_id = PluginInvocationId::new();
+        let request = encode_service_envelope_with_invocation_id(
+            invocation_id.clone(),
+            7,
+            ServiceEnvelopeKind::Request,
+            &service_context(Vec::new()),
+        )
+        .expect("request should encode");
+        let mut output = vec![0_u8; 4096];
+        let mut output_len = 0_usize;
+        assert_eq!(
+            super::invoke_service_concurrent_export(
+                plugin,
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+            ),
+            super::SERVICE_STATUS_OK
+        );
+        output.truncate(output_len);
+        let (decoded_invocation_id, request_id, response): (
+            PluginInvocationId,
+            u64,
+            ServiceResponse,
+        ) = decode_service_envelope_with_invocation_id(&output, ServiceEnvelopeKind::Response)
+            .expect("response should decode");
+        assert_eq!(decoded_invocation_id, invocation_id);
+        assert_eq!(request_id, 7);
+        assert_eq!(response.payload, vec![1]);
+    }
+}
+
 fn parse_binary_input<T>(
     input_ptr: *const u8,
     input_len: usize,

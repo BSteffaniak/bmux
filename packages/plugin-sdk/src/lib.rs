@@ -462,6 +462,90 @@ macro_rules! export_plugin {
 }
 
 #[macro_export]
+macro_rules! export_concurrent_plugin {
+    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {
+        /// When the `static-bundled` feature is active the plugin is compiled
+        /// into the host binary and the [`bundled_concurrent_plugin_vtable!`]
+        /// macro provides the symbols instead.
+        #[cfg(not(feature = "static-bundled"))]
+        const _: () = {
+            fn __bmux_plugin_instance() -> &'static ::std::sync::Arc<$plugin_ty> {
+                static INSTANCE: ::std::sync::OnceLock<::std::sync::Arc<$plugin_ty>> =
+                    ::std::sync::OnceLock::new();
+                $crate::__private::concurrent_plugin_instance(&INSTANCE)
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_entry_v1() -> *const ::std::ffi::c_char {
+                static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
+                    ::std::sync::OnceLock::new();
+                $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_activate_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+            ) -> i32 {
+                $crate::__private::activate_concurrent_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_deactivate_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+            ) -> i32 {
+                $crate::__private::deactivate_concurrent_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_invoke_service_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::invoke_service_concurrent_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_invoke_streaming_service_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::invoke_streaming_service_concurrent_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            }
+        };
+    };
+}
+
+#[macro_export]
 macro_rules! bundled_concurrent_plugin_vtable {
     ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {{
         fn __instance() -> &'static ::std::sync::Arc<$plugin_ty> {
