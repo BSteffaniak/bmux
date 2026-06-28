@@ -5,6 +5,7 @@
 //! runtime rather than plugin API contracts or product-domain plugins.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -21,6 +22,53 @@ pub enum PluginConcurrencyConfig {
     Exclusive,
     /// At most `max` concurrent invocations.
     Limited { max: NonZeroUsize },
+}
+
+/// Generic scheduler invocation class for host metrics and policy decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInvocationClass {
+    Command,
+    Service,
+    Lifecycle,
+    Event,
+}
+
+/// Generic scheduler scope used by resource limiters.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "id")]
+pub enum PluginInvocationScope {
+    Global,
+    Plugin(String),
+    Service(String),
+    Custom(String),
+}
+
+/// Snapshot of generic host executor status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ExecutorStatusMetrics {
+    pub active_invocations: usize,
+    pub queued_invocations: usize,
+    pub completed_invocations: u64,
+    pub cancelled_invocations: u64,
+    pub failed_invocations: u64,
+    pub queue_capacity: Option<usize>,
+}
+
+/// Generic scoped resource limiter configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScopedResourceLimiterConfig {
+    #[serde(default)]
+    pub limits: BTreeMap<PluginInvocationScope, NonZeroUsize>,
+}
+
+/// Generic event queue backpressure policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EventQueueBackpressurePolicy {
+    #[default]
+    FailInvocation,
+    CancelInvocation,
 }
 
 impl PluginConcurrencyConfig {
@@ -169,7 +217,11 @@ impl Drop for ConcurrencyPermit {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig};
+    use super::{
+        ConcurrencyGate, EffectiveConcurrencyPolicy, EventQueueBackpressurePolicy,
+        ExecutorStatusMetrics, PluginConcurrencyConfig, PluginInvocationClass,
+        PluginInvocationScope, ScopedResourceLimiterConfig,
+    };
     use std::num::NonZeroUsize;
     use std::sync::{
         Arc, Barrier,
@@ -210,6 +262,59 @@ mod tests {
             handle.join().expect("worker should finish");
         }
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_does_not_serialize_independent_calls() {
+        let gate = ConcurrencyGate::new(PluginConcurrencyConfig::Concurrent);
+        let first = gate.acquire().expect("first permit");
+        let second = gate.acquire().expect("second permit");
+        assert_eq!(gate.policy(), PluginConcurrencyConfig::Concurrent);
+        drop(second);
+        drop(first);
+    }
+
+    #[test]
+    fn generic_executor_metadata_shapes_roundtrip() {
+        let class = PluginInvocationClass::Service;
+        let class_bytes = serde_json::to_vec(&class).expect("class should encode");
+        assert_eq!(
+            serde_json::from_slice::<PluginInvocationClass>(&class_bytes)
+                .expect("class should decode"),
+            class
+        );
+
+        let mut limiter = ScopedResourceLimiterConfig::default();
+        limiter.limits.insert(
+            PluginInvocationScope::Plugin("example.plugin".to_string()),
+            NonZeroUsize::new(3).expect("nonzero"),
+        );
+        assert_eq!(
+            limiter
+                .limits
+                .get(&PluginInvocationScope::Plugin("example.plugin".to_string()))
+                .copied(),
+            NonZeroUsize::new(3)
+        );
+
+        let metrics = ExecutorStatusMetrics {
+            active_invocations: 1,
+            queued_invocations: 2,
+            completed_invocations: 3,
+            cancelled_invocations: 4,
+            failed_invocations: 5,
+            queue_capacity: Some(6),
+        };
+        let metrics_bytes = serde_json::to_vec(&metrics).expect("metrics should encode");
+        assert_eq!(
+            serde_json::from_slice::<ExecutorStatusMetrics>(&metrics_bytes)
+                .expect("metrics should decode"),
+            metrics
+        );
+        assert_eq!(
+            EventQueueBackpressurePolicy::default(),
+            EventQueueBackpressurePolicy::FailInvocation
+        );
     }
 
     #[test]
