@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Serializable declarative TUI component protocol for BMUX surfaces"
+edition     = { workspace = true }
+keywords    = ["bmux", "component", "protocol", "tui"]
+license     = { workspace = true }
+name        = "bmux_tui_component_protocol"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_codec = { workspace = true, optional = true }
+serde      = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+bmux-codec       = ["serde", "dep:bmux_codec"]
+default          = []
+fail-on-warnings = []
+serde            = ["dep:serde"]
+serde-json       = ["serde", "dep:serde_json"]
+
+[package.metadata.cargo-machete]
+# Optional serialization dependencies are exposed through feature-gated modules
+# and cfg_attr derives, which cargo-machete may not observe in all feature sets.
+ignored = ["serde", "serde_json", "bmux_codec"]

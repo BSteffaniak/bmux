@@ -57,6 +57,7 @@ members = [
     "packages/keyboard",
     "packages/text-edit",
     "packages/tui",
+    "packages/tui-component-protocol",
     "packages/tui-components",
     "packages/mobile-core",
     "packages/mobile-ffi",
@@ -193,6 +194,7 @@ bmux_terminal_grid = { version = "0.0.1-alpha.1", default-features = false, path
 bmux_terminal_protocol = { version = "0.0.1-alpha.1", default-features = false, path = "packages/terminal_protocol" }
 bmux_text_edit = { version = "0.0.1-alpha.1", default-features = false, path = "packages/text-edit" }
 bmux_tui = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui" }
+bmux_tui_component_protocol = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-component-protocol" }
 bmux_tui_components = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-components" }
 hyperchad_docs_config = { version = "0.3.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_docs_config_derive = { version = "0.3.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }

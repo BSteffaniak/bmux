@@ -2265,6 +2265,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_tui_component_protocol"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_codec",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
 dependencies = [
