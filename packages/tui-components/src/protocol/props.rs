@@ -5,10 +5,7 @@ use std::collections::BTreeMap;
 use bmux_tui_component_protocol::ids::ActionId;
 use bmux_tui_component_protocol::value::ComponentValue;
 
-use crate::protocol::{ProtocolComponentDefinition, ProtocolComponentError};
-
-/// Open component type id for [`crate::button::Button`].
-pub const BUTTON_TYPE_ID: &str = "bmux.button";
+use crate::protocol::{BUTTON_TYPE_ID, ProtocolComponentDefinition, ProtocolComponentError};
 
 /// Protocol props for [`crate::button::Button`].
 #[derive(Debug, Clone, PartialEq, Eq)]

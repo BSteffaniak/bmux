@@ -5,13 +5,15 @@
 //! allow hosts to register extension bindings.
 
 mod bindings;
+mod bmux;
 mod convert;
 mod error;
 mod props;
 mod render;
 
 pub use bindings::{ProtocolBindings, ProtocolComponentBinding, ProtocolComponentDefinition};
+pub use bmux::*;
 pub use convert::FromProtocolComponent;
 pub use error::ProtocolComponentError;
-pub use props::{BUTTON_TYPE_ID, ButtonDefinition, ButtonProps};
+pub use props::{ButtonDefinition, ButtonProps};
 pub use render::{ProtocolComponent, ProtocolTree};
