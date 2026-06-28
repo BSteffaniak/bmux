@@ -38,6 +38,7 @@
 //! ```
 
 pub mod action_dispatch;
+mod bcode_compat;
 mod cancellation;
 mod capability;
 mod command;
@@ -59,6 +60,7 @@ mod typed_dispatch_client;
 mod version;
 mod wire_event_sink;
 
+pub use bcode_compat::resolve_replacements as resolve_bcode_contribution_replacements;
 pub use bmux_codec as codec;
 pub use bmux_perf_telemetry as perf_telemetry;
 pub use cancellation::{

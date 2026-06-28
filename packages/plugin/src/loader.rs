@@ -1717,7 +1717,7 @@ impl LoadedPlugin {
     /// Returns when a plugin contribution hook fails or returns invalid transport data.
     pub fn collect_activation_contributions(
         &self,
-    ) -> Result<Vec<bmux_plugin_sdk::PluginContribution>> {
+    ) -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
         match &self.backend {
             PluginBackend::Static(vtable) => (vtable.register_contributions)(),
             PluginBackend::Dynamic(library) => {
@@ -1749,12 +1749,22 @@ impl LoadedPlugin {
         for contribution in self.manifest_contributions() {
             registrar
                 .register(contribution)
-                .map_err(|details| PluginError::ServiceProtocol { details })?;
+                .map_err(|details| PluginError::ServiceProtocol {
+                    details: format!(
+                        "plugin '{}' contribution registration failed: {details}",
+                        self.declaration.id.as_str()
+                    ),
+                })?;
         }
         for contribution in self.collect_activation_contributions()? {
             registrar
                 .register(contribution)
-                .map_err(|details| PluginError::ServiceProtocol { details })?;
+                .map_err(|details| PluginError::ServiceProtocol {
+                    details: format!(
+                        "plugin '{}' contribution registration failed: {details}",
+                        self.declaration.id.as_str()
+                    ),
+                })?;
         }
         Ok(registrar.into_contributions())
     }
@@ -3327,6 +3337,22 @@ minimum = "1.0"
         bmux_plugin_sdk::TypedServiceRegistry::new()
     }
 
+    #[allow(clippy::unnecessary_wraps)]
+    fn test_static_plugin_activation_contributions()
+    -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
+        Ok(vec![bmux_plugin_sdk::PluginContribution::command(
+            bmux_plugin_sdk::PluginCommand::new("activation", "activation contribution"),
+        )])
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn test_static_plugin_duplicate_contributions()
+    -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginContribution>> {
+        Ok(vec![bmux_plugin_sdk::PluginContribution::command(
+            bmux_plugin_sdk::PluginCommand::new("hello", "duplicate contribution"),
+        )])
+    }
+
     fn loaded_static_test_plugin() -> LoadedPlugin {
         let manifest = PluginManifest::from_toml_str(
             r#"
@@ -3364,7 +3390,7 @@ minimum = "1.0"
             invoke_streaming_service: test_static_plugin_service,
             register_typed_services: test_static_plugin_typed_services,
             declared_services: || Ok(Vec::new()),
-            register_contributions: || Ok(Vec::new()),
+            register_contributions: test_static_plugin_activation_contributions,
         };
 
         LoadedPlugin {
@@ -3424,6 +3450,34 @@ minimum = "1.0"
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         }
+    }
+
+    #[test]
+    fn activation_time_command_contribution_registers() {
+        let loaded = loaded_static_test_plugin();
+        let contributions = loaded
+            .collect_contributions()
+            .expect("contributions should collect");
+        let ids: Vec<&str> = contributions
+            .iter()
+            .map(bmux_plugin_sdk::PluginContribution::id)
+            .collect();
+        assert!(ids.contains(&"command:hello"));
+        assert!(ids.contains(&"command:activation"));
+    }
+
+    #[test]
+    fn contribution_registration_failure_reports_plugin_and_contribution() {
+        let mut loaded = loaded_static_test_plugin();
+        if let PluginBackend::Static(vtable) = &mut loaded.backend {
+            vtable.register_contributions = test_static_plugin_duplicate_contributions;
+        }
+        let error = loaded
+            .collect_contributions()
+            .expect_err("duplicate contribution should fail");
+        let message = error.to_string();
+        assert!(message.contains("test.plugin"));
+        assert!(message.contains("command:hello"));
     }
 
     #[test]
