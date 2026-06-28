@@ -2872,6 +2872,7 @@ allow_hyphen_values=true
                     .expect("capability should parse"),
                 kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "provider-command/v1".to_string(),
+                concurrency: None,
             }],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -3006,12 +3007,14 @@ allow_hyphen_values=true
                         .expect("capability should parse"),
                     kind: bmux_plugin_sdk::ServiceKind::Query,
                     interface_id: "provider-query/v1".to_string(),
+                    concurrency: None,
                 },
                 bmux_plugin_sdk::PluginService {
                     capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
                         .expect("capability should parse"),
                     kind: bmux_plugin_sdk::ServiceKind::Command,
                     interface_id: "provider-command/v1".to_string(),
+                    concurrency: None,
                 },
             ],
             commands: Vec::new(),

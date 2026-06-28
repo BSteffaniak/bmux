@@ -1,5 +1,6 @@
 use crate::{CapabilityId, HostScope, InterfaceId, PluginError, PluginInvocationId, Result};
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
+pub use bmux_plugin_runtime::PluginConcurrencyConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,8 @@ pub struct PluginService {
     pub capability: HostScope,
     pub kind: ServiceKind,
     pub interface_id: String,
+    #[serde(default)]
+    pub concurrency: Option<PluginConcurrencyConfig>,
 }
 
 /// BPDL-generated descriptor for an interface-level service endpoint.
@@ -72,6 +75,7 @@ impl ServiceInterfaceDescriptor {
             capability: HostScope::new(self.capability.as_str())?,
             kind: self.kind,
             interface_id: self.interface_id.as_str().to_string(),
+            concurrency: None,
         })
     }
 }

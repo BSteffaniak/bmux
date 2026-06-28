@@ -1926,6 +1926,7 @@ dependencies = [
  "bmux_codec",
  "bmux_ipc",
  "bmux_perf_telemetry",
+ "bmux_plugin_runtime",
  "nanoid",
  "serde",
  "serde_json",

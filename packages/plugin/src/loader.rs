@@ -11,6 +11,7 @@ use bmux_ipc::{
     ResponsePayload as IpcResponsePayload,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
+use bmux_plugin_runtime::{ConcurrencyGate, EffectiveConcurrencyPolicy};
 use bmux_plugin_sdk::{
     CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
     CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
@@ -1681,6 +1682,7 @@ pub struct LoadedPlugin {
     pub declaration: PluginDeclaration,
     backend: PluginBackend,
     native_service_buffers: NativeServiceBufferConfig,
+    concurrency_gate: ConcurrencyGate,
 }
 
 impl LoadedPlugin {
@@ -1690,6 +1692,11 @@ impl LoadedPlugin {
             PluginBackend::Dynamic(_) => "dynamic",
             PluginBackend::Process(_) => "process",
         }
+    }
+
+    #[must_use]
+    pub const fn effective_concurrency_policy(&self) -> EffectiveConcurrencyPolicy {
+        EffectiveConcurrencyPolicy::new(self.declaration.concurrency)
     }
 
     /// Collect the typed service registrations exposed by this plugin.
@@ -2094,6 +2101,12 @@ impl LoadedPlugin {
     /// Panics if the resolved dynamic library symbol is unexpectedly `None`
     /// for a `Dynamic` backend (should not happen in practice).
     pub fn invoke_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
+        let _permit =
+            self.concurrency_gate
+                .acquire()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: error.to_string(),
+                })?;
         if let PluginBackend::Process(runtime) = &self.backend {
             return self.invoke_process_service(runtime, context);
         }
@@ -2108,6 +2121,12 @@ impl LoadedPlugin {
         &self,
         context: &NativeStreamingServiceContext,
     ) -> Result<ServiceResponse> {
+        let _permit =
+            self.concurrency_gate
+                .acquire()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: error.to_string(),
+                })?;
         if let PluginBackend::Process(runtime) = &self.backend {
             return self.invoke_process_service(runtime, &context.service);
         }
@@ -2566,6 +2585,7 @@ impl NativePluginLoader {
                     metrics: Arc::new(ProcessRuntimeMetrics::default()),
                 }),
                 native_service_buffers: self.native_service_buffers,
+                concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
             });
         }
 
@@ -2601,9 +2621,10 @@ impl NativePluginLoader {
 
         Ok(LoadedPlugin {
             registered: registered_plugin.clone(),
-            declaration,
+            declaration: declaration.clone(),
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: self.native_service_buffers,
+            concurrency_gate: concurrency_gate_for(&declaration),
         })
     }
 }
@@ -2706,9 +2727,10 @@ pub fn load_static_plugin_with_native_service_buffer_config(
 
     Ok(LoadedPlugin {
         registered: registered_plugin.clone(),
-        declaration,
+        declaration: declaration.clone(),
         backend: PluginBackend::Static(vtable),
         native_service_buffers,
+        concurrency_gate: concurrency_gate_for(&declaration),
     })
 }
 
@@ -2753,7 +2775,12 @@ pub fn load_trusted_static_plugin_with_native_service_buffer_config(
         declaration: registered_plugin.declaration.clone(),
         backend: PluginBackend::Static(vtable),
         native_service_buffers,
+        concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
     })
+}
+
+fn concurrency_gate_for(declaration: &PluginDeclaration) -> ConcurrencyGate {
+    ConcurrencyGate::new(declaration.concurrency)
 }
 
 fn load_native_declaration(
@@ -2923,7 +2950,7 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadedPlugin, NativeServiceBufferConfig, PluginBackend};
+    use super::{ConcurrencyGate, LoadedPlugin, NativeServiceBufferConfig, PluginBackend};
     use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
@@ -3192,6 +3219,9 @@ minimum = "1.0"
                 .expect("declaration should build"),
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            concurrency_gate: ConcurrencyGate::new(
+                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
+            ),
         };
 
         assert_eq!(loaded.commands().len(), 1);
@@ -3287,6 +3317,9 @@ minimum = "1.0"
                 .expect("declaration should build"),
             backend: PluginBackend::Static(vtable),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            concurrency_gate: ConcurrencyGate::new(
+                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
+            ),
         }
     }
 
@@ -4326,6 +4359,9 @@ minimum = "1.0"
             },
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            concurrency_gate: ConcurrencyGate::new(
+                bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
+            ),
         };
 
         assert!(loaded.receives_event(&PluginEvent {

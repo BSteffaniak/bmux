@@ -9,7 +9,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Plugin or service concurrency policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum PluginConcurrencyConfig {
     /// No scheduler-imposed concurrency limit.

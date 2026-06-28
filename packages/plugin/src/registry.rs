@@ -830,6 +830,7 @@ minimum = "1.0"
             capability: HostScope::new("bmux.recording.write").expect("scope should parse"),
             kind: ServiceKind::Command,
             interface_id: "recording-commands".to_string(),
+            concurrency: None,
         };
         let mut registry = PluginRegistry::new();
         registry
