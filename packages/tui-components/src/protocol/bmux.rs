@@ -22,7 +22,10 @@ use crate::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
 use crate::empty_state::EmptyState;
 use crate::form_field::FormField;
 use crate::progress_bar::{ProgressBar, ProgressBarValue};
-use crate::protocol::{ProtocolBindings, ProtocolComponentBinding, ProtocolRenderContext};
+use crate::protocol::{
+    ProtocolBindings, ProtocolComponentBinding, ProtocolLocalStateKey, ProtocolRenderContext,
+    ProtocolRuntime,
+};
 use crate::radio_group::{RadioGroup, RadioGroupOutcome, RadioGroupState, RadioOption};
 use crate::select_dropdown::{
     SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption,
@@ -189,6 +192,10 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
         match self.type_id.as_str() {
             FORM_FIELD_TYPE_ID => render_form_field_with_child(node, props, area, context),
             FORM_TYPE_ID => render_form(node, area, context),
+            TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => {
+                let (runtime, frame) = context.runtime_and_frame();
+                render_text_input_with_runtime(props, runtime, node, area, frame);
+            }
             _ => {
                 let state = context.state().clone();
                 self.render(node, &state, area, context.frame());
@@ -217,6 +224,22 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
             }
             TEXT_VIEW_TYPE_ID => render_text_view(props, area, frame),
             type_id => render_unsupported(type_id, area, frame),
+        }
+    }
+
+    fn handle_event_with_context(
+        &self,
+        node: &ComponentNode,
+        area: Rect,
+        event: &Event,
+        context: &mut crate::protocol::ProtocolEventContext<'_>,
+    ) -> Vec<ComponentEvent> {
+        let props = component_props(node);
+        match self.type_id.as_str() {
+            TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => {
+                handle_text_input_with_runtime(props, node, context.runtime(), area, event)
+            }
+            _ => self.handle_event(node, context.state(), area, event),
         }
     }
 
@@ -386,6 +409,26 @@ fn render_progress_bar(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>
     }
 }
 
+fn render_text_input_with_runtime(
+    props: &ComponentValue,
+    runtime: &mut ProtocolRuntime,
+    node: &ComponentNode,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let type_id =
+        node_type_id(node).unwrap_or_else(|| ComponentTypeId::new(TEXT_INPUT_BOX_TYPE_ID));
+    let value = node_value_string(runtime.state(), node)
+        .or_else(|| string_prop(props, "value"))
+        .unwrap_or_default()
+        .to_owned();
+    let state_key = local_state_key(node, type_id);
+    let input_state = runtime.local_state_or_insert_with(&state_key, || {
+        TextInputState::new(TextEditBuffer::from_text(&value))
+    });
+    text_input_box(props).render(area, input_state, frame);
+}
+
 fn render_text_input(
     props: &ComponentValue,
     state: &ComponentRuntimeState,
@@ -393,11 +436,8 @@ fn render_text_input(
     area: Rect,
     frame: &mut Frame<'_>,
 ) {
-    let value = node_value_string(state, node)
-        .or_else(|| string_prop(props, "value"))
-        .unwrap_or_default();
-    let mut input_state = TextInputState::new(TextEditBuffer::from_text(value));
-    text_input_box(props).render(area, &mut input_state, frame);
+    let mut runtime = ProtocolRuntime::from_state(state.clone());
+    render_text_input_with_runtime(props, &mut runtime, node, area, frame);
 }
 fn render_text_view(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
     let lines = lines_prop(props, "lines")
@@ -490,23 +530,29 @@ fn handle_radio_group(
     }
 }
 
-fn handle_text_input(
+fn handle_text_input_with_runtime(
     props: &ComponentValue,
     node: &ComponentNode,
-    state: &mut ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     area: Rect,
     event: &Event,
 ) -> Vec<ComponentEvent> {
-    let value = node_value_string(state, node)
+    let type_id =
+        node_type_id(node).unwrap_or_else(|| ComponentTypeId::new(TEXT_INPUT_BOX_TYPE_ID));
+    let value = node_value_string(runtime.state(), node)
         .or_else(|| string_prop(props, "value"))
-        .unwrap_or_default();
-    let mut input_state = TextInputState::new(TextEditBuffer::from_text(value));
-    match text_input_box(props).handle_event(area, &mut input_state, event) {
-        TextInputBoxOutcome::Edited => value_changed_event(
-            node,
-            state,
-            ComponentValue::String(input_state.buffer().text().to_owned()),
-        ),
+        .unwrap_or_default()
+        .to_owned();
+    let state_key = local_state_key(node, type_id);
+    let input_state = runtime.local_state_or_insert_with(&state_key, || {
+        TextInputState::new(TextEditBuffer::from_text(&value))
+    });
+    let outcome = text_input_box(props).handle_event(area, input_state, event);
+    let text = input_state.buffer().text().to_owned();
+    match outcome {
+        TextInputBoxOutcome::Edited => {
+            value_changed_event(node, runtime.state_mut(), ComponentValue::String(text))
+        }
         TextInputBoxOutcome::Submitted => vec![ComponentEvent::new(
             node.id.clone(),
             ComponentEventKind::Submit,
@@ -516,6 +562,19 @@ fn handle_text_input(
         | TextInputBoxOutcome::EdgeUp
         | TextInputBoxOutcome::EdgeDown => Vec::new(),
     }
+}
+
+fn handle_text_input(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    state: &mut ComponentRuntimeState,
+    area: Rect,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    let mut runtime = ProtocolRuntime::from_state(std::mem::take(state));
+    let events = handle_text_input_with_runtime(props, node, &mut runtime, area, event);
+    *state = runtime.into_state();
+    events
 }
 fn handle_select_dropdown(
     props: &ComponentValue,
@@ -601,6 +660,26 @@ fn selected_option_index(
 ) -> Option<usize> {
     let selected = node_value_string(state, node).or_else(|| string_prop(props, "selected"));
     selected.and_then(|selected| options.iter().position(|option| option.id == selected))
+}
+
+fn local_state_key(node: &ComponentNode, type_id: ComponentTypeId) -> ProtocolLocalStateKey {
+    let component_id = node
+        .id
+        .clone()
+        .unwrap_or_else(|| bmux_tui_component_protocol::ids::ComponentId::new(type_id.as_str()));
+    ProtocolLocalStateKey::new(component_id, type_id)
+}
+
+fn node_type_id(node: &ComponentNode) -> Option<ComponentTypeId> {
+    match &node.kind {
+        bmux_tui_component_protocol::model::ComponentKind::Component { type_id, .. } => {
+            Some(type_id.clone())
+        }
+        bmux_tui_component_protocol::model::ComponentKind::Extension { kind, .. } => {
+            Some(ComponentTypeId::new(kind.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn text_input_box(props: &ComponentValue) -> TextInputBox<'_> {

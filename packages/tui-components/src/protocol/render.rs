@@ -16,8 +16,8 @@ use bmux_tui_component_protocol::value::ComponentValue;
 
 use crate::button::{Button, ButtonOutcome, ButtonState, ButtonStyles};
 use crate::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
-use crate::protocol::ProtocolBindings;
 use crate::protocol::convert::radio_options;
+use crate::protocol::{ProtocolBindings, ProtocolRuntime};
 use crate::radio_group::{RadioGroup, RadioGroupOutcome, RadioGroupState};
 
 /// Renderable view over a protocol component tree.
@@ -45,9 +45,26 @@ impl<'a> ProtocolTree<'a> {
         }
     }
 
+    /// Render the tree with host-local component UI state.
+    pub fn render_runtime(&self, area: Rect, runtime: &mut ProtocolRuntime, frame: &mut Frame<'_>) {
+        ProtocolComponent::new(&self.tree.root, self.bindings).render_runtime(area, runtime, frame);
+    }
+
     /// Render the tree.
     pub fn render(&self, area: Rect, state: &ComponentRuntimeState, frame: &mut Frame<'_>) {
-        ProtocolComponent::new(&self.tree.root, self.bindings).render(area, state, frame);
+        let mut runtime = ProtocolRuntime::from_state(state.clone());
+        self.render_runtime(area, &mut runtime, frame);
+    }
+
+    /// Handle one input event for the tree with host-local component UI state.
+    pub fn handle_event_runtime(
+        &self,
+        area: Rect,
+        runtime: &mut ProtocolRuntime,
+        event: &Event,
+    ) -> Vec<ComponentEvent> {
+        ProtocolComponent::new(&self.tree.root, self.bindings)
+            .handle_event_runtime(area, runtime, event)
     }
 
     /// Handle one input event for the tree.
@@ -57,7 +74,10 @@ impl<'a> ProtocolTree<'a> {
         state: &mut ComponentRuntimeState,
         event: &Event,
     ) -> Vec<ComponentEvent> {
-        ProtocolComponent::new(&self.tree.root, self.bindings).handle_event(area, state, event)
+        let mut runtime = ProtocolRuntime::from_state(std::mem::take(state));
+        let events = self.handle_event_runtime(area, &mut runtime, event);
+        *state = runtime.into_state();
+        events
     }
 }
 
@@ -74,9 +94,25 @@ impl<'a> ProtocolComponent<'a> {
         Self { node, bindings }
     }
 
+    /// Render this node with host-local component UI state.
+    pub fn render_runtime(&self, area: Rect, runtime: &mut ProtocolRuntime, frame: &mut Frame<'_>) {
+        render_node(self.node, self.bindings, area, runtime, frame);
+    }
+
     /// Render this node.
     pub fn render(&self, area: Rect, state: &ComponentRuntimeState, frame: &mut Frame<'_>) {
-        render_node(self.node, self.bindings, area, state, frame);
+        let mut runtime = ProtocolRuntime::from_state(state.clone());
+        self.render_runtime(area, &mut runtime, frame);
+    }
+
+    /// Handle one input event for this node with host-local component UI state.
+    pub fn handle_event_runtime(
+        &self,
+        area: Rect,
+        runtime: &mut ProtocolRuntime,
+        event: &Event,
+    ) -> Vec<ComponentEvent> {
+        handle_node_event(self.node, self.bindings, area, runtime, event)
     }
 
     /// Handle one input event for this node.
@@ -86,7 +122,10 @@ impl<'a> ProtocolComponent<'a> {
         state: &mut ComponentRuntimeState,
         event: &Event,
     ) -> Vec<ComponentEvent> {
-        handle_node_event(self.node, self.bindings, area, state, event)
+        let mut runtime = ProtocolRuntime::from_state(std::mem::take(state));
+        let events = self.handle_event_runtime(area, &mut runtime, event);
+        *state = runtime.into_state();
+        events
     }
 }
 
@@ -95,7 +134,7 @@ pub(super) fn render_node(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     frame: &mut Frame<'_>,
 ) {
     match &node.kind {
@@ -103,14 +142,14 @@ pub(super) fn render_node(
             frame.write_line(area, &Line::from(text.clone()));
         }
         ComponentKind::Stack { direction, gap } => {
-            render_stack(node, bindings, area, state, frame, *direction, *gap);
+            render_stack(node, bindings, area, runtime, frame, *direction, *gap);
         }
         ComponentKind::Panel { title, chrome } => {
             render_panel(
                 node,
                 bindings,
                 area,
-                state,
+                runtime,
                 frame,
                 title.as_deref(),
                 *chrome,
@@ -129,7 +168,7 @@ pub(super) fn render_node(
             let button = Button::new(label).styles(button_styles(*role));
             let mut button_state = ButtonState::new();
             button_state.set_disabled(*disabled);
-            button_state.set_focused(is_focused(node, state));
+            button_state.set_focused(is_focused(node, runtime.state()));
             button.render(area, &button_state, frame);
         }
         ComponentKind::TextInput {
@@ -145,7 +184,7 @@ pub(super) fn render_node(
             ..
         } => render_input_like(
             node,
-            state,
+            runtime.state(),
             area,
             frame,
             value,
@@ -163,7 +202,7 @@ pub(super) fn render_node(
                 .as_ref()
                 .and_then(|selected| options.iter().position(|option| &option.id == selected));
             let mut group_state = RadioGroupState::new(selected);
-            group_state.interaction.focused = is_focused(node, state);
+            group_state.interaction.focused = is_focused(node, runtime.state());
             group_state.interaction.disabled = *disabled;
             RadioGroup::new(&options).render(area, &group_state, frame);
         }
@@ -177,7 +216,7 @@ pub(super) fn render_node(
                 let checkbox = Checkbox::new(option.option.label.as_str());
                 let mut checkbox_state = CheckboxState::new(option.checked);
                 checkbox_state.set_disabled(*disabled || option.option.disabled);
-                checkbox_state.set_focused(is_focused(node, state) && index == 0);
+                checkbox_state.set_focused(is_focused(node, runtime.state()) && index == 0);
                 checkbox.render(
                     Rect::new(area.x, row, area.width, 1),
                     &checkbox_state,
@@ -195,7 +234,7 @@ pub(super) fn render_node(
             frame.write_line(area, &Line::from(format!("[ {label} ]")));
         }
         ComponentKind::Form { .. } => {
-            render_children_vertical(node, bindings, area, state, frame, 0);
+            render_children_vertical(node, bindings, area, runtime, frame, 0);
         }
         ComponentKind::Status { level, message } => {
             frame.write_line(
@@ -206,7 +245,7 @@ pub(super) fn render_node(
         ComponentKind::Component { type_id, .. } => {
             if let Some(binding) = bindings.and_then(|bindings| bindings.component(type_id)) {
                 let mut context =
-                    crate::protocol::ProtocolRenderContext::new(bindings, state, frame);
+                    crate::protocol::ProtocolRenderContext::new(bindings, runtime, frame);
                 binding.render_with_context(node, area, &mut context);
             } else {
                 frame.write_line(
@@ -218,7 +257,7 @@ pub(super) fn render_node(
         ComponentKind::Extension { kind, .. } => {
             if let Some(binding) = bindings.and_then(|bindings| bindings.extension(kind)) {
                 let mut context =
-                    crate::protocol::ProtocolRenderContext::new(bindings, state, frame);
+                    crate::protocol::ProtocolRenderContext::new(bindings, runtime, frame);
                 binding.render_with_context(node, area, &mut context);
             } else {
                 frame.write_line(area, &Line::from(format!("unsupported component: {kind}")));
@@ -232,7 +271,7 @@ pub(super) fn handle_node_event(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &mut ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     event: &Event,
 ) -> Vec<ComponentEvent> {
     match &node.kind {
@@ -245,7 +284,7 @@ pub(super) fn handle_node_event(
             let button = Button::new(label).styles(button_styles(*role));
             let mut button_state = ButtonState::new();
             button_state.set_disabled(*disabled);
-            button_state.set_focused(is_focused(node, state));
+            button_state.set_focused(is_focused(node, runtime.state()));
             if matches!(
                 button.handle_event(area, &mut button_state, event),
                 ButtonOutcome::Pressed
@@ -261,9 +300,9 @@ pub(super) fn handle_node_event(
         }
         ComponentKind::RadioGroup { options, .. } => {
             let radio_options = radio_options(options);
-            let selected = selected_radio_index(node, state, &radio_options);
+            let selected = selected_radio_index(node, runtime.state(), &radio_options);
             let mut group_state = RadioGroupState::new(selected);
-            group_state.interaction.focused = is_focused(node, state);
+            group_state.interaction.focused = is_focused(node, runtime.state());
             let outcome =
                 RadioGroup::new(&radio_options).handle_event(area, &mut group_state, event);
             if matches!(outcome, RadioGroupOutcome::Selected(_))
@@ -272,7 +311,11 @@ pub(super) fn handle_node_event(
                     .and_then(|index| radio_options.get(index))
                     .map(|option| option.id.clone())
             {
-                set_node_value(node, state, ComponentValue::String(selected.clone()));
+                set_node_value(
+                    node,
+                    runtime.state_mut(),
+                    ComponentValue::String(selected.clone()),
+                );
                 return vec![ComponentEvent::new(
                     node.id.clone(),
                     ComponentEventKind::ValueChanged {
@@ -290,7 +333,7 @@ pub(super) fn handle_node_event(
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
                 let option_area = Rect::new(area.x, row, area.width, 1);
                 let mut checkbox_state = CheckboxState::new(option.checked);
-                checkbox_state.set_focused(is_focused(node, state) && index == 0);
+                checkbox_state.set_focused(is_focused(node, runtime.state()) && index == 0);
                 if matches!(
                     Checkbox::new(option.option.label.as_str()).handle_event(
                         option_area,
@@ -324,23 +367,23 @@ pub(super) fn handle_node_event(
                         },
                     )]
                 }),
-                _ => children_events(node, bindings, area, state, event),
+                _ => children_events(node, bindings, area, runtime, event),
             },
-            _ => children_events(node, bindings, area, state, event),
+            _ => children_events(node, bindings, area, runtime, event),
         },
         ComponentKind::Component { type_id, .. } => bindings
             .and_then(|bindings| bindings.component(type_id))
             .map_or_else(Vec::new, |binding| {
-                let mut context = crate::protocol::ProtocolEventContext::new(bindings, state);
+                let mut context = crate::protocol::ProtocolEventContext::new(bindings, runtime);
                 binding.handle_event_with_context(node, area, event, &mut context)
             }),
         ComponentKind::Extension { kind, .. } => bindings
             .and_then(|bindings| bindings.extension(kind))
             .map_or_else(Vec::new, |binding| {
-                let mut context = crate::protocol::ProtocolEventContext::new(bindings, state);
+                let mut context = crate::protocol::ProtocolEventContext::new(bindings, runtime);
                 binding.handle_event_with_context(node, area, event, &mut context)
             }),
-        _ => children_events(node, bindings, area, state, event),
+        _ => children_events(node, bindings, area, runtime, event),
     }
 }
 
@@ -348,17 +391,17 @@ fn render_stack(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     frame: &mut Frame<'_>,
     direction: StackDirection,
     gap: u16,
 ) {
     match direction {
         StackDirection::Vertical => {
-            render_children_vertical(node, bindings, area, state, frame, gap);
+            render_children_vertical(node, bindings, area, runtime, frame, gap);
         }
         StackDirection::Horizontal => {
-            render_children_horizontal(node, bindings, area, state, frame, gap);
+            render_children_horizontal(node, bindings, area, runtime, frame, gap);
         }
     }
 }
@@ -367,7 +410,7 @@ fn render_panel(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     frame: &mut Frame<'_>,
     title: Option<&str>,
     chrome: PanelChrome,
@@ -401,7 +444,7 @@ fn render_panel(
             node,
             bindings,
             area.inset(Insets::new(1, 1, 1, 1)),
-            state,
+            runtime,
             frame,
             0,
         );
@@ -409,7 +452,7 @@ fn render_panel(
         if let Some(title) = title {
             frame.write_line(area, &Line::from(title));
         }
-        render_children_vertical(node, bindings, area, state, frame, 0);
+        render_children_vertical(node, bindings, area, runtime, frame, 0);
     }
 }
 
@@ -417,7 +460,7 @@ fn render_children_vertical(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     frame: &mut Frame<'_>,
     gap: u16,
 ) {
@@ -431,7 +474,7 @@ fn render_children_vertical(
             child,
             bindings,
             Rect::new(area.x, y, area.width, height),
-            state,
+            runtime,
             frame,
         );
         y = y.saturating_add(height).saturating_add(gap);
@@ -442,7 +485,7 @@ fn render_children_horizontal(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     frame: &mut Frame<'_>,
     gap: u16,
 ) {
@@ -462,7 +505,7 @@ fn render_children_horizontal(
             child,
             bindings,
             Rect::new(x, area.y, width, area.height),
-            state,
+            runtime,
             frame,
         );
         x = x.saturating_add(width).saturating_add(gap);
@@ -473,7 +516,7 @@ fn children_events(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
-    state: &mut ComponentRuntimeState,
+    runtime: &mut ProtocolRuntime,
     event: &Event,
 ) -> Vec<ComponentEvent> {
     let mut output = Vec::new();
@@ -484,7 +527,7 @@ fn children_events(
             child,
             bindings,
             Rect::new(area.x, y, area.width, height),
-            state,
+            runtime,
             event,
         ));
         y = y.saturating_add(height);

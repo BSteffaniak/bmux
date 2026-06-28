@@ -1,12 +1,13 @@
 //! Open component binding registry for protocol components.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui_component_protocol::event::ComponentEvent;
-use bmux_tui_component_protocol::ids::ComponentTypeId;
+use bmux_tui_component_protocol::ids::{ComponentId, ComponentTypeId};
 use bmux_tui_component_protocol::model::ComponentNode;
 use bmux_tui_component_protocol::state::ComponentRuntimeState;
 use bmux_tui_component_protocol::value::ComponentValue;
@@ -32,10 +33,95 @@ pub trait ProtocolComponentDefinition {
     fn props_to_value(props: Self::Props) -> ComponentValue;
 }
 
+/// Key for host-local, component-private protocol UI state.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProtocolLocalStateKey {
+    component_id: ComponentId,
+    type_id: ComponentTypeId,
+}
+
+impl ProtocolLocalStateKey {
+    /// Create a local-state key.
+    #[must_use]
+    pub const fn new(component_id: ComponentId, type_id: ComponentTypeId) -> Self {
+        Self {
+            component_id,
+            type_id,
+        }
+    }
+}
+
+/// Host-owned runtime for a protocol tree.
+///
+/// `state` is the serializable semantic protocol state. `local_state` stores
+/// component-private UI state such as text-input cursors, selection, viewport,
+/// hover/press state, and scrollbar drags.
+#[derive(Default)]
+pub struct ProtocolRuntime {
+    state: ComponentRuntimeState,
+    local_state: BTreeMap<ProtocolLocalStateKey, Box<dyn Any>>,
+}
+
+impl ProtocolRuntime {
+    /// Create empty protocol runtime state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a protocol runtime around existing semantic state.
+    #[must_use]
+    pub fn from_state(state: ComponentRuntimeState) -> Self {
+        Self {
+            state,
+            local_state: BTreeMap::new(),
+        }
+    }
+
+    /// Return serializable semantic state.
+    #[must_use]
+    pub const fn state(&self) -> &ComponentRuntimeState {
+        &self.state
+    }
+
+    /// Return mutable serializable semantic state.
+    pub const fn state_mut(&mut self) -> &mut ComponentRuntimeState {
+        &mut self.state
+    }
+
+    /// Consume this runtime and return the serializable semantic state.
+    #[must_use]
+    pub fn into_state(self) -> ComponentRuntimeState {
+        self.state
+    }
+
+    /// Return typed local state for the component, inserting it when absent or stale.
+    pub fn local_state_or_insert_with<T: Any>(
+        &mut self,
+        key: &ProtocolLocalStateKey,
+        init: impl FnOnce() -> T,
+    ) -> &mut T {
+        let replace = self
+            .local_state
+            .get(key)
+            .is_none_or(|state| !state.is::<T>());
+        if replace {
+            self.local_state.insert(key.clone(), Box::new(init()));
+        }
+        let state = self
+            .local_state
+            .get_mut(key)
+            .unwrap_or_else(|| unreachable!("local state inserted"));
+        state
+            .downcast_mut::<T>()
+            .unwrap_or_else(|| unreachable!("local state type checked before insertion"))
+    }
+}
+
 /// Rendering context passed to native protocol adapters.
 pub struct ProtocolRenderContext<'a, 'frame> {
     bindings: Option<&'a ProtocolBindings>,
-    state: &'a ComponentRuntimeState,
+    runtime: &'a mut ProtocolRuntime,
     frame: &'a mut Frame<'frame>,
 }
 
@@ -43,25 +129,35 @@ impl<'a, 'frame> ProtocolRenderContext<'a, 'frame> {
     /// Create a render context.
     pub(super) const fn new(
         bindings: Option<&'a ProtocolBindings>,
-        state: &'a ComponentRuntimeState,
+        runtime: &'a mut ProtocolRuntime,
         frame: &'a mut Frame<'frame>,
     ) -> Self {
         Self {
             bindings,
-            state,
+            runtime,
             frame,
         }
     }
 
     /// Render a protocol child node into an explicit area.
     pub fn render_child(&mut self, child: &ComponentNode, area: Rect) {
-        crate::protocol::render::render_node(child, self.bindings, area, self.state, self.frame);
+        crate::protocol::render::render_node(child, self.bindings, area, self.runtime, self.frame);
     }
 
-    /// Return the current protocol runtime state.
+    /// Return the current serializable protocol state.
     #[must_use]
     pub const fn state(&self) -> &ComponentRuntimeState {
-        self.state
+        self.runtime.state()
+    }
+
+    /// Return mutable protocol runtime.
+    pub const fn runtime(&mut self) -> &mut ProtocolRuntime {
+        self.runtime
+    }
+
+    /// Return mutable runtime and frame as disjoint references.
+    pub const fn runtime_and_frame(&mut self) -> (&mut ProtocolRuntime, &mut Frame<'frame>) {
+        (self.runtime, self.frame)
     }
 
     /// Return the underlying frame for native component rendering.
@@ -73,16 +169,16 @@ impl<'a, 'frame> ProtocolRenderContext<'a, 'frame> {
 /// Event context passed to native protocol adapters.
 pub struct ProtocolEventContext<'a> {
     bindings: Option<&'a ProtocolBindings>,
-    state: &'a mut ComponentRuntimeState,
+    runtime: &'a mut ProtocolRuntime,
 }
 
 impl<'a> ProtocolEventContext<'a> {
     /// Create an event context.
     pub(super) const fn new(
         bindings: Option<&'a ProtocolBindings>,
-        state: &'a mut ComponentRuntimeState,
+        runtime: &'a mut ProtocolRuntime,
     ) -> Self {
-        Self { bindings, state }
+        Self { bindings, runtime }
     }
 
     /// Dispatch one event to a protocol child node.
@@ -92,12 +188,17 @@ impl<'a> ProtocolEventContext<'a> {
         area: Rect,
         event: &Event,
     ) -> Vec<ComponentEvent> {
-        crate::protocol::render::handle_node_event(child, self.bindings, area, self.state, event)
+        crate::protocol::render::handle_node_event(child, self.bindings, area, self.runtime, event)
     }
 
-    /// Return mutable protocol runtime state.
+    /// Return mutable protocol runtime.
+    pub const fn runtime(&mut self) -> &mut ProtocolRuntime {
+        self.runtime
+    }
+
+    /// Return mutable serializable protocol state.
     pub const fn state(&mut self) -> &mut ComponentRuntimeState {
-        self.state
+        self.runtime.state_mut()
     }
 }
 

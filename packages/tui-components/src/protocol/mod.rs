@@ -13,7 +13,7 @@ mod render;
 
 pub use bindings::{
     ProtocolBindings, ProtocolComponentBinding, ProtocolComponentDefinition, ProtocolEventContext,
-    ProtocolRenderContext,
+    ProtocolLocalStateKey, ProtocolRenderContext, ProtocolRuntime,
 };
 pub use bmux::*;
 pub use convert::FromProtocolComponent;
