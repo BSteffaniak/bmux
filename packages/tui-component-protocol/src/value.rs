@@ -46,8 +46,33 @@ impl ComponentValue {
             | Self::Map(_) => None,
         }
     }
+    /// Return this value as a map when it is a map.
+    #[must_use]
+    pub const fn as_map(&self) -> Option<&BTreeMap<String, Self>> {
+        match self {
+            Self::Map(value) => Some(value),
+            Self::Null
+            | Self::Bool(_)
+            | Self::I64(_)
+            | Self::U64(_)
+            | Self::F64(_)
+            | Self::String(_)
+            | Self::List(_) => None,
+        }
+    }
 }
 
+impl From<BTreeMap<String, Self>> for ComponentValue {
+    fn from(value: BTreeMap<String, Self>) -> Self {
+        Self::Map(value)
+    }
+}
+
+impl From<Vec<Self>> for ComponentValue {
+    fn from(value: Vec<Self>) -> Self {
+        Self::List(value)
+    }
+}
 impl From<bool> for ComponentValue {
     fn from(value: bool) -> Self {
         Self::Bool(value)

@@ -1,6 +1,6 @@
 //! Declarative component tree model.
 
-use crate::ids::{ActionId, ComponentId};
+use crate::ids::{ActionId, ComponentId, ComponentTypeId};
 use crate::value::ComponentValue;
 
 /// Current protocol version for newly-created component trees.
@@ -60,6 +60,34 @@ impl ComponentNode {
             kind,
             children,
         }
+    }
+
+    /// Create a leaf open component node.
+    #[must_use]
+    pub fn component(
+        type_id: impl Into<ComponentTypeId>,
+        props: impl Into<ComponentValue>,
+    ) -> Self {
+        Self::leaf(ComponentKind::Component {
+            type_id: type_id.into(),
+            props: props.into(),
+        })
+    }
+
+    /// Create a container open component node.
+    #[must_use]
+    pub fn component_container(
+        type_id: impl Into<ComponentTypeId>,
+        props: impl Into<ComponentValue>,
+        children: Vec<Self>,
+    ) -> Self {
+        Self::container(
+            ComponentKind::Component {
+                type_id: type_id.into(),
+                props: props.into(),
+            },
+            children,
+        )
     }
 
     /// Return this node with a stable component id.
@@ -189,6 +217,13 @@ pub enum ComponentKind {
         level: StatusLevel,
         /// Message text.
         message: String,
+    },
+    /// Open component definition provided by a component library or plugin.
+    Component {
+        /// Globally namespaced component type identifier.
+        type_id: ComponentTypeId,
+        /// Serialization-neutral component properties.
+        props: ComponentValue,
     },
     /// Host-defined extension component.
     Extension {

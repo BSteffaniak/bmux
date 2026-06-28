@@ -203,6 +203,16 @@ fn render_node(
                 &Line::from_spans(vec![Span::styled(message, status_style(*level))]),
             );
         }
+        ComponentKind::Component { type_id, .. } => {
+            if let Some(binding) = bindings.and_then(|bindings| bindings.component(type_id)) {
+                binding.render(node, state, area, frame);
+            } else {
+                frame.write_line(
+                    area,
+                    &Line::from(format!("unsupported component: {}", type_id.as_str())),
+                );
+            }
+        }
         ComponentKind::Extension { kind, .. } => {
             if let Some(binding) = bindings.and_then(|bindings| bindings.extension(kind)) {
                 binding.render(node, state, area, frame);
@@ -314,6 +324,11 @@ fn handle_node_event(
             },
             _ => children_events(node, bindings, area, state, event),
         },
+        ComponentKind::Component { type_id, .. } => bindings
+            .and_then(|bindings| bindings.component(type_id))
+            .map_or_else(Vec::new, |binding| {
+                binding.handle_event(node, state, area, event)
+            }),
         ComponentKind::Extension { kind, .. } => bindings
             .and_then(|bindings| bindings.extension(kind))
             .map_or_else(Vec::new, |binding| {

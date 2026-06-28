@@ -13,9 +13,12 @@ pub enum ProtocolComponentError {
         actual: &'static str,
     },
     /// An extension component had no registered binding.
-    MissingExtensionBinding {
-        /// Extension kind.
-        kind: String,
+    /// Component props could not be decoded by a binding.
+    InvalidProps {
+        /// Component type id.
+        type_id: String,
+        /// Human-readable error message.
+        message: String,
     },
 }
 
@@ -48,6 +51,7 @@ pub const fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::Select { .. } => "select",
         ComponentKind::Form { .. } => "form",
         ComponentKind::Status { .. } => "status",
+        ComponentKind::Component { .. } => "component",
         ComponentKind::Extension { .. } => "extension",
     }
 }

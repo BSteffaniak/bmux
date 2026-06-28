@@ -7,9 +7,11 @@
 mod bindings;
 mod convert;
 mod error;
+mod props;
 mod render;
 
-pub use bindings::{ProtocolBindings, ProtocolComponentBinding};
+pub use bindings::{ProtocolBindings, ProtocolComponentBinding, ProtocolComponentDefinition};
 pub use convert::FromProtocolComponent;
 pub use error::ProtocolComponentError;
+pub use props::{BUTTON_TYPE_ID, ButtonDefinition, ButtonProps};
 pub use render::{ProtocolComponent, ProtocolTree};
