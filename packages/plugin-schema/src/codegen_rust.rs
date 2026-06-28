@@ -661,7 +661,17 @@ fn emit_transport_endpoint(
         "            const OPERATION: ::bmux_plugin_sdk::OperationId = super::{};",
         operation_const_name(&op.name)
     );
-    out.push_str("        }\n\n");
+    out.push_str("        }\n");
+    if let Some(emits) = &op.emits {
+        let event_ty = rust_type(emits, imports, own_types);
+        let _ = writeln!(
+            out,
+            "        impl ::bmux_plugin_sdk::StreamingTypedServiceEndpoint for {endpoint_name} {{"
+        );
+        let _ = writeln!(out, "            type Event = {event_ty};");
+        out.push_str("        }\n");
+    }
+    out.push('\n');
 }
 
 fn emit_transport_client_function(
@@ -715,9 +725,14 @@ fn emit_transport_client_function(
         "        pub async fn {name}<C: ::bmux_plugin_sdk::TypedDispatchClient>(client: &mut C{sep}{params}) -> ::bmux_plugin_sdk::TypedServiceClientResult<{returns}> {{"
     );
     let _ = writeln!(out, "            let request = {request_expr};");
+    let invoke_fn = if op.emits.is_some() {
+        "invoke_typed_streaming_service"
+    } else {
+        "invoke_typed_service"
+    };
     let _ = writeln!(
         out,
-        "            ::bmux_plugin_sdk::invoke_typed_service::<C, {endpoint_name}>(client, &request).await"
+        "            ::bmux_plugin_sdk::{invoke_fn}::<C, {endpoint_name}>(client, &request).await"
     );
     out.push_str("        }\n\n");
 }
@@ -966,6 +981,14 @@ mod tests {
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
         assert!(rust.contains("pub type StartTurnEvent = TurnEvent;"));
+        assert!(rust.contains(
+            "impl ::bmux_plugin_sdk::StreamingTypedServiceEndpoint for StartTurnEndpoint"
+        ));
+        assert!(
+            rust.contains(
+                "::bmux_plugin_sdk::invoke_typed_streaming_service::<C, StartTurnEndpoint>"
+            )
+        );
         assert!(rust.contains("Request-scoped event sink"));
         assert!(rust.contains("zero or more typed event frames"));
     }

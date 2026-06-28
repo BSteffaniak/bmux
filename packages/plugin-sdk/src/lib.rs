@@ -141,8 +141,9 @@ pub use typed_dispatch::{
     TypedServiceKey, TypedServiceRegistry,
 };
 pub use typed_dispatch_client::{
-    TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult,
-    TypedServiceClientError, TypedServiceClientResult, TypedServiceEndpoint, invoke_typed_service,
+    StreamingTypedServiceEndpoint, TypedDispatchClient, TypedDispatchClientError,
+    TypedDispatchClientResult, TypedServiceClientError, TypedServiceClientResult,
+    TypedServiceEndpoint, invoke_typed_service, invoke_typed_streaming_service,
 };
 pub use version::{ApiVersion, VersionRange};
 pub use wire_event_sink::{

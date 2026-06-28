@@ -149,6 +149,34 @@ pub trait TypedServiceEndpoint {
     }
 }
 
+/// Compile-time description of one request-scoped streaming typed endpoint.
+pub trait StreamingTypedServiceEndpoint: TypedServiceEndpoint {
+    /// Typed event frame emitted zero or more times before the final response.
+    type Event: DeserializeOwned;
+}
+
+/// Invoke a generated request-scoped streaming endpoint.
+///
+/// The transport owns invocation-id cancellation/control frames and applies
+/// bounded backpressure to emitted event frames. This helper currently returns
+/// the final response through the canonical typed-dispatch path; generated
+/// streaming clients use endpoint metadata to wire event-frame sinks when the
+/// host transport supports them.
+///
+/// # Errors
+///
+/// Returns transport, request encoding, or response decoding failures.
+pub async fn invoke_typed_streaming_service<C, E>(
+    client: &mut C,
+    request: &E::Request,
+) -> TypedServiceClientResult<E::Response>
+where
+    C: TypedDispatchClient,
+    E: StreamingTypedServiceEndpoint,
+{
+    invoke_typed_service::<C, E>(client, request).await
+}
+
 /// Invoke a generated typed service endpoint.
 ///
 /// # Errors
