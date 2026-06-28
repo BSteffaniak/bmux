@@ -5,6 +5,7 @@
 //! delegated to the existing components.
 
 use bmux_keyboard::KeyCode;
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -21,8 +22,13 @@ use crate::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
 use crate::empty_state::EmptyState;
 use crate::form_field::FormField;
 use crate::progress_bar::{ProgressBar, ProgressBarValue};
-use crate::protocol::{ProtocolBindings, ProtocolComponentBinding};
+use crate::protocol::{ProtocolBindings, ProtocolComponentBinding, ProtocolRenderContext};
 use crate::radio_group::{RadioGroup, RadioGroupOutcome, RadioGroupState, RadioOption};
+use crate::select_dropdown::{
+    SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption,
+};
+use crate::text_input::{TextInputPolicy, TextInputState};
+use crate::text_input_box::{TextInputBox, TextInputBoxOutcome};
 use crate::text_view::{TextView, TextViewState};
 
 /// Open component type id for `action_row`.
@@ -173,6 +179,23 @@ impl BmuxComponentBinding {
 }
 
 impl ProtocolComponentBinding for BmuxComponentBinding {
+    fn render_with_context(
+        &self,
+        node: &ComponentNode,
+        area: Rect,
+        context: &mut ProtocolRenderContext<'_, '_>,
+    ) {
+        let props = component_props(node);
+        match self.type_id.as_str() {
+            FORM_FIELD_TYPE_ID => render_form_field_with_child(node, props, area, context),
+            FORM_TYPE_ID => render_form(node, area, context),
+            _ => {
+                let state = context.state().clone();
+                self.render(node, &state, area, context.frame());
+            }
+        }
+    }
+
     fn render(
         &self,
         node: &ComponentNode,
@@ -186,9 +209,12 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
             BUTTON_TYPE_ID => render_button(props, area, frame),
             CHECKBOX_TYPE_ID => render_checkbox(props, state, node, area, frame),
             EMPTY_STATE_TYPE_ID => render_empty_state(props, area, frame),
-            FORM_FIELD_TYPE_ID => render_form_field(props, area, frame),
             PROGRESS_BAR_TYPE_ID => render_progress_bar(props, area, frame),
             RADIO_GROUP_TYPE_ID => render_radio_group(props, state, node, area, frame),
+            SELECT_DROPDOWN_TYPE_ID => render_select_dropdown(props, state, node, area, frame),
+            TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => {
+                render_text_input(props, state, node, area, frame);
+            }
             TEXT_VIEW_TYPE_ID => render_text_view(props, area, frame),
             type_id => render_unsupported(type_id, area, frame),
         }
@@ -207,6 +233,10 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
             BUTTON_TYPE_ID => handle_button(props, node, event),
             CHECKBOX_TYPE_ID => handle_checkbox(props, node, state, area, event),
             RADIO_GROUP_TYPE_ID => handle_radio_group(props, node, state, area, event),
+            SELECT_DROPDOWN_TYPE_ID => handle_select_dropdown(props, node, state, area, event),
+            TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => {
+                handle_text_input(props, node, state, area, event)
+            }
             _ => Vec::new(),
         }
     }
@@ -263,6 +293,22 @@ fn render_radio_group(
     RadioGroup::new(&options).render(area, &group_state, frame);
 }
 
+fn render_select_dropdown(
+    props: &ComponentValue,
+    state: &ComponentRuntimeState,
+    node: &ComponentNode,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let options = select_options(props);
+    let selected = selected_select_index(props, state, node, &options);
+    let mut select_state = SelectDropdownState::new(selected);
+    select_state.set_open(bool_prop(props, "open").unwrap_or(false));
+    select_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
+    let select = SelectDropdown::new(&options)
+        .placeholder(string_prop(props, "placeholder").unwrap_or("Select..."));
+    select.render(area, &select_state, frame);
+}
 fn render_empty_state(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
     let title = string_prop(props, "title").unwrap_or("Empty");
     let body = lines_prop(props, "body")
@@ -276,7 +322,40 @@ fn render_empty_state(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>)
     empty.render(area, frame);
 }
 
-fn render_form_field(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+fn render_form_field_with_child(
+    node: &ComponentNode,
+    props: &ComponentValue,
+    area: Rect,
+    context: &mut ProtocolRenderContext<'_, '_>,
+) {
+    let control = render_form_field_chrome(props, area, context.frame());
+    if let Some(child) = node.children.first() {
+        context.render_child(child, control);
+    }
+}
+
+fn render_form(node: &ComponentNode, area: Rect, context: &mut ProtocolRenderContext<'_, '_>) {
+    let child_count = u16::try_from(node.children.len())
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let row_height = area.height.saturating_div(child_count).max(1);
+    for (index, child) in node.children.iter().enumerate() {
+        let row = u16::try_from(index).unwrap_or(u16::MAX);
+        let y = area.y.saturating_add(row.saturating_mul(row_height));
+        let remaining = area.bottom().saturating_sub(y);
+        if remaining == 0 {
+            break;
+        }
+        let height = if index + 1 == node.children.len() {
+            remaining
+        } else {
+            row_height.min(remaining)
+        };
+        context.render_child(child, Rect::new(area.x, y, area.width, height));
+    }
+}
+
+fn render_form_field_chrome(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) -> Rect {
     let label = string_prop(props, "label").unwrap_or("Field");
     let mut field = FormField::new(label).required(bool_prop(props, "required").unwrap_or(false));
     if let Some(help) = string_prop(props, "help") {
@@ -285,7 +364,7 @@ fn render_form_field(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) 
     if let Some(error) = string_prop(props, "error") {
         field = field.error(error);
     }
-    let _control = field.render(area, frame);
+    field.render(area, frame)
 }
 
 fn render_progress_bar(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
@@ -307,6 +386,19 @@ fn render_progress_bar(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>
     }
 }
 
+fn render_text_input(
+    props: &ComponentValue,
+    state: &ComponentRuntimeState,
+    node: &ComponentNode,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let value = node_value_string(state, node)
+        .or_else(|| string_prop(props, "value"))
+        .unwrap_or_default();
+    let mut input_state = TextInputState::new(TextEditBuffer::from_text(value));
+    text_input_box(props).render(area, &mut input_state, frame);
+}
 fn render_text_view(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
     let lines = lines_prop(props, "lines")
         .or_else(|| string_prop(props, "text").map(|text| text.lines().map(Line::from).collect()))
@@ -398,6 +490,60 @@ fn handle_radio_group(
     }
 }
 
+fn handle_text_input(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    state: &mut ComponentRuntimeState,
+    area: Rect,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    let value = node_value_string(state, node)
+        .or_else(|| string_prop(props, "value"))
+        .unwrap_or_default();
+    let mut input_state = TextInputState::new(TextEditBuffer::from_text(value));
+    match text_input_box(props).handle_event(area, &mut input_state, event) {
+        TextInputBoxOutcome::Edited => value_changed_event(
+            node,
+            state,
+            ComponentValue::String(input_state.buffer().text().to_owned()),
+        ),
+        TextInputBoxOutcome::Submitted => vec![ComponentEvent::new(
+            node.id.clone(),
+            ComponentEventKind::Submit,
+        )],
+        TextInputBoxOutcome::Ignored
+        | TextInputBoxOutcome::Redraw
+        | TextInputBoxOutcome::EdgeUp
+        | TextInputBoxOutcome::EdgeDown => Vec::new(),
+    }
+}
+fn handle_select_dropdown(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    state: &mut ComponentRuntimeState,
+    area: Rect,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    let options = select_options(props);
+    let selected = selected_select_index(props, state, node, &options);
+    let mut select_state = SelectDropdownState::new(selected);
+    select_state.set_open(bool_prop(props, "open").unwrap_or(false));
+    select_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
+    let select = SelectDropdown::new(&options)
+        .placeholder(string_prop(props, "placeholder").unwrap_or("Select..."));
+    match select.handle_event(area, &mut select_state, event) {
+        SelectDropdownOutcome::Selected(index) => {
+            options.get(index).map_or_else(Vec::new, |option| {
+                value_changed_event(node, state, ComponentValue::String(option.id.clone()))
+            })
+        }
+        SelectDropdownOutcome::Ignored
+        | SelectDropdownOutcome::Redraw
+        | SelectDropdownOutcome::Opened
+        | SelectDropdownOutcome::Closed
+        | SelectDropdownOutcome::Focused(_) => Vec::new(),
+    }
+}
 fn action_event(node: &ComponentNode, action: ActionId) -> Vec<ComponentEvent> {
     vec![ComponentEvent::new(
         node.id.clone(),
@@ -452,6 +598,47 @@ fn selected_option_index(
     state: &ComponentRuntimeState,
     node: &ComponentNode,
     options: &[RadioOption],
+) -> Option<usize> {
+    let selected = node_value_string(state, node).or_else(|| string_prop(props, "selected"));
+    selected.and_then(|selected| options.iter().position(|option| option.id == selected))
+}
+
+fn text_input_box(props: &ComponentValue) -> TextInputBox<'_> {
+    let mut input = TextInputBox::new(TextInputPolicy::chat_composer());
+    if let Some(label) = string_prop(props, "label") {
+        input = input.label(label);
+    }
+    if let Some(placeholder) = string_prop(props, "placeholder") {
+        input = input.placeholder(placeholder);
+    }
+    if let Some(help) = string_prop(props, "help") {
+        input = input.help(help);
+    }
+    if let Some(error) = string_prop(props, "error") {
+        input = input.error(error);
+    }
+    input.required(bool_prop(props, "required").unwrap_or(false))
+}
+
+fn select_options(props: &ComponentValue) -> Vec<SelectOption> {
+    list_prop(props, "options").map_or_else(Vec::new, |items| {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let id = item_id(item).unwrap_or_else(|| index.to_string());
+                let label = item_label(item).unwrap_or_else(|| id.clone());
+                SelectOption::new(id, label).disabled(item_bool(item, "disabled").unwrap_or(false))
+            })
+            .collect()
+    })
+}
+
+fn selected_select_index(
+    props: &ComponentValue,
+    state: &ComponentRuntimeState,
+    node: &ComponentNode,
+    options: &[SelectOption],
 ) -> Option<usize> {
     let selected = node_value_string(state, node).or_else(|| string_prop(props, "selected"));
     selected.and_then(|selected| options.iter().position(|option| option.id == selected))

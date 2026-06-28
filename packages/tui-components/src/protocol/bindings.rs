@@ -32,8 +32,88 @@ pub trait ProtocolComponentDefinition {
     fn props_to_value(props: Self::Props) -> ComponentValue;
 }
 
+/// Rendering context passed to native protocol adapters.
+pub struct ProtocolRenderContext<'a, 'frame> {
+    bindings: Option<&'a ProtocolBindings>,
+    state: &'a ComponentRuntimeState,
+    frame: &'a mut Frame<'frame>,
+}
+
+impl<'a, 'frame> ProtocolRenderContext<'a, 'frame> {
+    /// Create a render context.
+    pub(super) const fn new(
+        bindings: Option<&'a ProtocolBindings>,
+        state: &'a ComponentRuntimeState,
+        frame: &'a mut Frame<'frame>,
+    ) -> Self {
+        Self {
+            bindings,
+            state,
+            frame,
+        }
+    }
+
+    /// Render a protocol child node into an explicit area.
+    pub fn render_child(&mut self, child: &ComponentNode, area: Rect) {
+        crate::protocol::render::render_node(child, self.bindings, area, self.state, self.frame);
+    }
+
+    /// Return the current protocol runtime state.
+    #[must_use]
+    pub const fn state(&self) -> &ComponentRuntimeState {
+        self.state
+    }
+
+    /// Return the underlying frame for native component rendering.
+    pub const fn frame(&mut self) -> &mut Frame<'frame> {
+        self.frame
+    }
+}
+
+/// Event context passed to native protocol adapters.
+pub struct ProtocolEventContext<'a> {
+    bindings: Option<&'a ProtocolBindings>,
+    state: &'a mut ComponentRuntimeState,
+}
+
+impl<'a> ProtocolEventContext<'a> {
+    /// Create an event context.
+    pub(super) const fn new(
+        bindings: Option<&'a ProtocolBindings>,
+        state: &'a mut ComponentRuntimeState,
+    ) -> Self {
+        Self { bindings, state }
+    }
+
+    /// Dispatch one event to a protocol child node.
+    pub fn handle_child_event(
+        &mut self,
+        child: &ComponentNode,
+        area: Rect,
+        event: &Event,
+    ) -> Vec<ComponentEvent> {
+        crate::protocol::render::handle_node_event(child, self.bindings, area, self.state, event)
+    }
+
+    /// Return mutable protocol runtime state.
+    pub const fn state(&mut self) -> &mut ComponentRuntimeState {
+        self.state
+    }
+}
+
 /// Custom binding for an open protocol component.
 pub trait ProtocolComponentBinding {
+    /// Render a component node using the richer context-aware API.
+    fn render_with_context(
+        &self,
+        node: &ComponentNode,
+        area: Rect,
+        context: &mut ProtocolRenderContext<'_, '_>,
+    ) {
+        let state = context.state().clone();
+        self.render(node, &state, area, context.frame());
+    }
+
     /// Render a component node.
     fn render(
         &self,
@@ -42,6 +122,17 @@ pub trait ProtocolComponentBinding {
         area: Rect,
         frame: &mut Frame<'_>,
     );
+
+    /// Handle one input event using the richer context-aware API.
+    fn handle_event_with_context(
+        &self,
+        node: &ComponentNode,
+        area: Rect,
+        event: &Event,
+        context: &mut ProtocolEventContext<'_>,
+    ) -> Vec<ComponentEvent> {
+        self.handle_event(node, context.state(), area, event)
+    }
 
     /// Handle one input event for a component node.
     fn handle_event(
@@ -78,10 +169,6 @@ impl ProtocolBindings {
     }
 
     /// Register a binding for an extension kind.
-    ///
-    /// This is retained as a compatibility alias for callers that still build
-    /// [`ComponentKind::Extension`](bmux_tui_component_protocol::model::ComponentKind::Extension)
-    /// nodes.
     pub fn register_extension(
         &mut self,
         kind: impl Into<String>,

@@ -20,5 +20,5 @@ unicode-segmentation        = { workspace = true, optional = true }
 [features]
 default          = []
 fail-on-warnings = []
-protocol         = ["dep:bmux_tui_component_protocol"]
+protocol         = ["dep:bmux_tui_component_protocol", "text-input"]
 text-input       = ["dep:bmux_text_edit", "dep:unicode-segmentation"]

@@ -91,7 +91,7 @@ impl<'a> ProtocolComponent<'a> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_node(
+pub(super) fn render_node(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
@@ -205,7 +205,9 @@ fn render_node(
         }
         ComponentKind::Component { type_id, .. } => {
             if let Some(binding) = bindings.and_then(|bindings| bindings.component(type_id)) {
-                binding.render(node, state, area, frame);
+                let mut context =
+                    crate::protocol::ProtocolRenderContext::new(bindings, state, frame);
+                binding.render_with_context(node, area, &mut context);
             } else {
                 frame.write_line(
                     area,
@@ -215,7 +217,9 @@ fn render_node(
         }
         ComponentKind::Extension { kind, .. } => {
             if let Some(binding) = bindings.and_then(|bindings| bindings.extension(kind)) {
-                binding.render(node, state, area, frame);
+                let mut context =
+                    crate::protocol::ProtocolRenderContext::new(bindings, state, frame);
+                binding.render_with_context(node, area, &mut context);
             } else {
                 frame.write_line(area, &Line::from(format!("unsupported component: {kind}")));
             }
@@ -224,7 +228,7 @@ fn render_node(
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_node_event(
+pub(super) fn handle_node_event(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
@@ -327,12 +331,14 @@ fn handle_node_event(
         ComponentKind::Component { type_id, .. } => bindings
             .and_then(|bindings| bindings.component(type_id))
             .map_or_else(Vec::new, |binding| {
-                binding.handle_event(node, state, area, event)
+                let mut context = crate::protocol::ProtocolEventContext::new(bindings, state);
+                binding.handle_event_with_context(node, area, event, &mut context)
             }),
         ComponentKind::Extension { kind, .. } => bindings
             .and_then(|bindings| bindings.extension(kind))
             .map_or_else(Vec::new, |binding| {
-                binding.handle_event(node, state, area, event)
+                let mut context = crate::protocol::ProtocolEventContext::new(bindings, state);
+                binding.handle_event_with_context(node, area, event, &mut context)
             }),
         _ => children_events(node, bindings, area, state, event),
     }

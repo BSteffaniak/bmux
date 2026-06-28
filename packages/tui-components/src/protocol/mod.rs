@@ -11,7 +11,10 @@ mod error;
 mod props;
 mod render;
 
-pub use bindings::{ProtocolBindings, ProtocolComponentBinding, ProtocolComponentDefinition};
+pub use bindings::{
+    ProtocolBindings, ProtocolComponentBinding, ProtocolComponentDefinition, ProtocolEventContext,
+    ProtocolRenderContext,
+};
 pub use bmux::*;
 pub use convert::FromProtocolComponent;
 pub use error::ProtocolComponentError;
