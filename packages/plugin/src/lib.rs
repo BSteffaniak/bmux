@@ -14,6 +14,7 @@
 //! in the host-side dependencies.
 
 pub mod action_dispatch;
+pub mod bcode_compat;
 mod declaration;
 mod discovery;
 mod event_bus;
@@ -56,7 +57,8 @@ pub use loader::{
     load_trusted_static_plugin_with_native_service_buffer_config,
 };
 pub use manifest::{
-    PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,
+    PluginManifest, PluginManifestCompatibility, PluginManifestExtension,
+    PluginManifestKeybindings, PluginRuntime,
 };
 pub use plugin_state::PluginStateRegistry;
 pub use plugin_state::global_registry as global_plugin_state_registry;

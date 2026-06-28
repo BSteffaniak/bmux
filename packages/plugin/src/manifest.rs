@@ -63,6 +63,15 @@ impl PluginManifestCompatibility {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginManifestExtension {
+    /// Namespaced and versioned extension point, e.g. `bcode.tui_surface/v1`.
+    pub extension_point: String,
+    /// Typed-stable payload bytes owned by the extension adapter.
+    #[serde(default)]
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
     pub name: String,
@@ -115,6 +124,13 @@ pub struct PluginManifest {
     /// stay intra-process.
     #[serde(default)]
     pub event_publications: Vec<PluginEventPublication>,
+    /// Generic extension payloads for app-specific contributions.
+    ///
+    /// The core manifest validates only the extension shape: extension point
+    /// IDs must be namespaced/versioned (`namespace.name/v1`) and payloads are
+    /// opaque typed-stable bytes. App adapters own payload schema validation.
+    #[serde(default)]
+    pub extensions: Vec<PluginManifestExtension>,
     #[serde(default)]
     pub dependencies: Vec<PluginManifestDependency>,
     #[serde(default)]
@@ -154,6 +170,7 @@ impl PluginManifest {
     /// Returns an error when the manifest cannot be converted into a checked
     /// declaration.
     pub fn to_declaration(&self) -> Result<PluginDeclaration> {
+        self.validate_extensions()?;
         let declaration = PluginDeclaration {
             id: PluginId::new(self.id.clone())?,
             display_name: self.name.clone(),
@@ -232,6 +249,33 @@ impl PluginManifest {
             Some(base_dir.join(entry))
         }
     }
+
+    fn validate_extensions(&self) -> Result<()> {
+        for extension in &self.extensions {
+            if !extension_point_id_is_valid(&extension.extension_point) {
+                return Err(PluginError::ServiceProtocol {
+                    details: format!(
+                        "plugin '{}' declares invalid extension point '{}'; expected namespace.name/vN",
+                        self.id, extension.extension_point
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn extension_point_id_is_valid(value: &str) -> bool {
+    let Some((namespace, version)) = value.rsplit_once('/') else {
+        return false;
+    };
+    namespace.contains('.')
+        && namespace
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        && version.strip_prefix('v').is_some_and(|digits| {
+            !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+        })
 }
 
 fn default_entry_symbol() -> String {
@@ -251,6 +295,51 @@ mod tests {
     use super::{PluginManifest, PluginRuntime};
     use crate::{PluginEntrypoint, PluginExecutionClass};
     use bmux_plugin_sdk::{HostScope, PluginError};
+
+    #[test]
+    fn parses_generic_extension_payloads_without_app_specific_fields() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.extension"
+name = "Extension"
+version = "0.1.0"
+
+[[extensions]]
+extension_point = "bcode.tui_surface/v1"
+payload = [1, 2, 3]
+"#,
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest.extensions.len(), 1);
+        assert_eq!(
+            manifest.extensions[0].extension_point,
+            "bcode.tui_surface/v1"
+        );
+        assert_eq!(manifest.extensions[0].payload, vec![1, 2, 3]);
+        manifest
+            .to_declaration()
+            .expect("valid extension point should validate");
+    }
+
+    #[test]
+    fn rejects_invalid_extension_point_shape() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.extension"
+name = "Extension"
+version = "0.1.0"
+
+[[extensions]]
+extension_point = "tui_surface"
+payload = []
+"#,
+        )
+        .expect("manifest should parse");
+        let error = manifest
+            .to_declaration()
+            .expect_err("invalid extension point should fail");
+        assert!(error.to_string().contains("expected namespace.name/vN"));
+    }
 
     #[test]
     fn parses_native_plugin_manifest() {
