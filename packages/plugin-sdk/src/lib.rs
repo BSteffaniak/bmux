@@ -106,8 +106,8 @@ macro_rules! storage_key {
     }};
 }
 pub use native_exports::{
-    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle, PluginCommandError,
-    RustPlugin, TypedServiceRegistrationContext, take_last_command_error,
+    ConcurrentRustPlugin, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle,
+    PluginCommandError, RustPlugin, TypedServiceRegistrationContext, take_last_command_error,
 };
 pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
@@ -306,6 +306,8 @@ pub mod prelude {
     pub use crate::{
         // Action dispatch
         ActionDispatchRequest,
+        // Core trait
+        ConcurrentRustPlugin,
         // Exit codes
         EXIT_ERROR,
         EXIT_OK,
@@ -334,7 +336,6 @@ pub mod prelude {
         PromptValidation,
         PromptValue,
         PromptWidth,
-        // Core trait
         RustPlugin,
         // Service types
         ServiceKind,
@@ -350,8 +351,11 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::native_exports::{
-        activate_export, activate_with_async_bundled, deactivate_export, declared_services_bundled,
-        handle_event_export, invoke_service_export, invoke_streaming_service_export,
+        activate_concurrent_export, activate_export, activate_with_async_bundled,
+        concurrent_plugin_instance, deactivate_concurrent_export, deactivate_export,
+        declared_services_bundled, declared_services_concurrent_bundled, handle_event_export,
+        invoke_service_concurrent_export, invoke_service_export,
+        invoke_streaming_service_concurrent_export, invoke_streaming_service_export,
         manifest_toml_ptr, plugin_instance, register_typed_services_bundled, run_command_export,
     };
 }
@@ -455,6 +459,88 @@ macro_rules! export_plugin {
             }
         };
     };
+}
+
+#[macro_export]
+macro_rules! bundled_concurrent_plugin_vtable {
+    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {{
+        fn __instance() -> &'static ::std::sync::Arc<$plugin_ty> {
+            static INSTANCE: ::std::sync::OnceLock<::std::sync::Arc<$plugin_ty>> =
+                ::std::sync::OnceLock::new();
+            $crate::__private::concurrent_plugin_instance(&INSTANCE)
+        }
+
+        fn __entry() -> *const ::std::ffi::c_char {
+            static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
+                ::std::sync::OnceLock::new();
+            $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
+        }
+
+        fn __activate(input_ptr: *const u8, input_len: usize) -> i32 {
+            $crate::__private::activate_concurrent_export(__instance(), input_ptr, input_len)
+        }
+
+        fn __deactivate(input_ptr: *const u8, input_len: usize) -> i32 {
+            $crate::__private::deactivate_concurrent_export(__instance(), input_ptr, input_len)
+        }
+
+        fn __invoke_service(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            $crate::__private::invoke_service_concurrent_export(
+                __instance(),
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+
+        fn __invoke_streaming_service(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            $crate::__private::invoke_streaming_service_concurrent_export(
+                __instance(),
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+
+        fn __register_typed_services(
+            _context: $crate::TypedServiceRegistrationContext<'_>,
+        ) -> $crate::TypedServiceRegistry {
+            $crate::TypedServiceRegistry::new()
+        }
+
+        fn __declared_services() -> $crate::Result<Vec<$crate::PluginService>> {
+            $crate::__private::declared_services_concurrent_bundled::<$plugin_ty>()
+        }
+
+        $crate::StaticPluginVtable {
+            entry: __entry,
+            run_command_with_context: |_input_ptr, _input_len| $crate::EXIT_USAGE,
+            activate: __activate,
+            activate_with_async: |_context, _async_handle| $crate::EXIT_OK,
+            deactivate: __deactivate,
+            handle_event: |_input_ptr, _input_len| $crate::EXIT_OK,
+            invoke_service: __invoke_service,
+            invoke_streaming_service: __invoke_streaming_service,
+            register_typed_services: __register_typed_services,
+            declared_services: __declared_services,
+        }
+    }};
 }
 
 /// Build a [`StaticPluginVtable`] for a [`RustPlugin`] type.

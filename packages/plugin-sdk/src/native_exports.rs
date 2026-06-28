@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::ffi::{CString, c_char};
 use std::future::Future;
 use std::ptr;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 const PLUGIN_LOCK_LATENCY_BUDGET: Duration = Duration::from_millis(10);
@@ -210,6 +210,72 @@ const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 /// Service handlers return [`ServiceResponse`] directly — a structured RPC
 /// response with an optional error payload.  Use [`handle_service`](crate::handle_service)
 /// or [`route_service!`](crate::route_service) to reduce boilerplate.
+/// Thread-safe Rust plugin trait for hot-path in-process plugins.
+///
+/// Implement this when service/lifecycle methods can run through shared
+/// references. The SDK stores concurrent plugin instances in `Arc<P>` and does
+/// not create a per-plugin async runtime; scheduling remains host-owned.
+pub trait ConcurrentRustPlugin: Default + Send + Sync + 'static {
+    /// BPDL-generated contract this plugin implements.
+    type Contract: crate::PluginContract;
+
+    /// Called when the plugin is activated by the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] if activation fails.
+    fn activate_concurrent(
+        &self,
+        _context: NativeLifecycleContext,
+    ) -> Result<i32, PluginCommandError> {
+        Ok(EXIT_OK)
+    }
+
+    /// Called when the plugin is deactivated by the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] if deactivation fails.
+    fn deactivate_concurrent(
+        &self,
+        _context: NativeLifecycleContext,
+    ) -> Result<i32, PluginCommandError> {
+        Ok(EXIT_OK)
+    }
+
+    /// Handle a service call without requiring a plugin-instance mutex.
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        ServiceResponse::error(
+            "unsupported_service",
+            format!(
+                "plugin '{}' does not implement service '{}:{}'",
+                context.plugin_id, context.request.service.interface_id, context.request.operation,
+            ),
+        )
+    }
+
+    /// Handle a streaming service call without requiring a plugin-instance mutex.
+    fn invoke_streaming_service_concurrent(
+        &self,
+        context: NativeStreamingServiceContext,
+    ) -> ServiceResponse {
+        self.invoke_service_concurrent(context.service)
+    }
+
+    /// Return BPDL-generated services this plugin provides.
+    ///
+    /// # Errors
+    ///
+    /// Returns when generated descriptors cannot be converted into host service
+    /// declarations.
+    fn declared_services() -> crate::Result<Vec<PluginService>>
+    where
+        Self: Sized,
+    {
+        <Self::Contract as crate::PluginContract>::service_declarations()
+    }
+}
+
 pub trait RustPlugin: Default + Send + 'static {
     /// BPDL-generated contract this plugin implements.
     ///
@@ -446,6 +512,13 @@ pub fn plugin_instance<P: RustPlugin>(
     instance.get_or_init(|| RwLock::new(P::default()))
 }
 
+#[doc(hidden)]
+pub fn concurrent_plugin_instance<P: ConcurrentRustPlugin>(
+    instance: &'static OnceLock<Arc<P>>,
+) -> &'static Arc<P> {
+    instance.get_or_init(|| Arc::new(P::default()))
+}
+
 /// Invoke a bundled plugin's [`RustPlugin::register_typed_services`] hook
 /// and return the populated registry. Called from the
 /// [`bundled_plugin_vtable!`] macro.
@@ -540,6 +613,119 @@ pub fn deactivate_export<P: RustPlugin>(
             })
         },
     )
+}
+
+#[doc(hidden)]
+pub fn activate_concurrent_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+) -> i32 {
+    parse_binary_input::<NativeLifecycleContext>(input_ptr, input_len, 2, 3).map_or_else(
+        |code| code,
+        |payload| result_to_exit_code(instance.activate_concurrent(payload)),
+    )
+}
+
+#[doc(hidden)]
+pub fn deactivate_concurrent_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+) -> i32 {
+    parse_binary_input::<NativeLifecycleContext>(input_ptr, input_len, 2, 3).map_or_else(
+        |code| code,
+        |payload| result_to_exit_code(instance.deactivate_concurrent(payload)),
+    )
+}
+
+#[doc(hidden)]
+pub fn declared_services_concurrent_bundled<P: ConcurrentRustPlugin>()
+-> crate::Result<Vec<PluginService>> {
+    P::declared_services()
+}
+
+#[doc(hidden)]
+pub fn invoke_service_concurrent_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let Ok((invocation_id, request_id, context)) = decode_service_envelope_with_invocation_id::<
+        NativeServiceContext,
+    >(input, ServiceEnvelopeKind::Request) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
+    let response = instance.invoke_service_concurrent(context);
+    let Ok(encoded) = encode_service_envelope_with_invocation_id(
+        invocation_id,
+        request_id,
+        ServiceEnvelopeKind::Response,
+        &response,
+    ) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    SERVICE_STATUS_OK
+}
+
+#[doc(hidden)]
+pub fn invoke_streaming_service_concurrent_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let Ok((invocation_id, request_id, service)) = decode_service_envelope_with_invocation_id::<
+        NativeServiceContext,
+    >(input, ServiceEnvelopeKind::Request) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
+    let response = instance.invoke_streaming_service_concurrent(NativeStreamingServiceContext {
+        service,
+        events: crate::ServiceEventSinkHandle::noop(),
+    });
+    let Ok(encoded) = encode_service_envelope_with_invocation_id(
+        invocation_id,
+        request_id,
+        ServiceEnvelopeKind::Response,
+        &response,
+    ) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    SERVICE_STATUS_OK
 }
 
 #[doc(hidden)]
