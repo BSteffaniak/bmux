@@ -2,7 +2,7 @@
 //!
 //! The grammar uses a small set of tokens: keywords (`plugin`, `version`,
 //! `interface`, `import`, `record`, `variant`, `enum`,
-//! `query`, `command`, `events`, `list`, `map`, `result`, `unit`), identifiers, integer
+//! `query`, `command`, `emits`, `events`, `list`, `map`, `result`, `unit`), identifiers, integer
 //! literals, and punctuation (`{ } ( ) , ; : ? < > . = @ ->`).
 
 use crate::{Error, Span};
@@ -25,6 +25,7 @@ pub enum TokenKind {
     Enum,
     Query,
     Command,
+    Emits,
     Events,
     List,
     Map,
@@ -235,6 +236,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                     "enum" => TokenKind::Enum,
                     "query" => TokenKind::Query,
                     "command" => TokenKind::Command,
+                    "emits" => TokenKind::Emits,
                     "events" => TokenKind::Events,
                     "list" => TokenKind::List,
                     "map" => TokenKind::Map,

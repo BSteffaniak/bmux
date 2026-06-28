@@ -602,6 +602,25 @@ fn emit_transport_endpoint(
     let endpoint_name = format!("{}Endpoint", pascal_case(&op.name));
     let request_ty = transport_request_type(op);
     let returns = rust_type(&op.returns, imports, own_types);
+    if let Some(emits) = &op.emits {
+        let event_ty = rust_type(emits, imports, own_types);
+        let event_sink_name = format!("{}EventSink", pascal_case(&op.name));
+        out.push_str("        /// Request-scoped event sink for streaming operation frames.\n");
+        let _ = writeln!(
+            out,
+            "        pub type {event_sink_name} = ::bmux_plugin_sdk::ServiceEventSinkHandle;"
+        );
+        let _ = writeln!(
+            out,
+            "        /// Event payload type emitted by `{}`.",
+            op.name
+        );
+        let _ = writeln!(
+            out,
+            "        pub type {}Event = {event_ty};",
+            pascal_case(&op.name)
+        );
+    }
     if !op.params.is_empty() {
         let request_name = request_ty.clone();
         out.push_str("        #[derive(Debug, Clone, Serialize, Deserialize)]\n");
@@ -667,6 +686,14 @@ fn emit_transport_client_function(
         .join(", ");
     let sep = if params.is_empty() { "" } else { ", " };
     let returns = rust_type(&op.returns, imports, own_types);
+    if op.emits.is_some() {
+        let _ = writeln!(
+            out,
+            "        /// Invoke `{}` as a request-scoped streaming operation.",
+            op.name
+        );
+        out.push_str("        /// The provider may emit zero or more typed event frames before the final response; cancellation and bounded backpressure are carried by the invocation transport.\n");
+    }
     let request_expr = if op.params.is_empty() {
         "()".to_string()
     } else {
@@ -923,6 +950,24 @@ mod tests {
         assert!(rust.contains("pub id: ::uuid::Uuid"));
         assert!(rust.contains("pub name: Option<String>"));
         assert!(rust.contains("pub count: u32"));
+    }
+
+    #[test]
+    fn emits_request_scoped_streaming_operation_metadata() {
+        let src = "plugin p version 1;\n\
+                   capability I_RUN = bmux.i.run;\n\
+                   @capability(I_RUN)\n\
+                   interface i {\n\
+                     record start { prompt: string }\n\
+                     record finish { text: string }\n\
+                     variant turn-event { delta { text: string }, done }\n\
+                     command start-turn(request: start) -> finish emits turn-event;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(rust.contains("pub type StartTurnEvent = TurnEvent;"));
+        assert!(rust.contains("Request-scoped event sink"));
+        assert!(rust.contains("zero or more typed event frames"));
     }
 
     #[test]

@@ -246,11 +246,18 @@ impl Parser<'_> {
         self.expect(&TokenKind::RParen, "expected `)` closing params")?;
         self.expect(&TokenKind::Arrow, "expected `->` before return type")?;
         let returns = self.parse_type()?;
+        let emits = if self.check(&TokenKind::Emits) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Semicolon, "expected `;` ending operation")?;
         Ok(Operation {
             name,
             params,
             returns,
+            emits,
             span,
         })
     }
@@ -732,6 +739,40 @@ mod tests {
         assert!(!en.cases[0].is_default);
         assert!(en.cases[1].is_default);
         assert!(!en.cases[2].is_default);
+    }
+
+    #[test]
+    fn parses_request_scoped_streaming_command() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             interface i {\n\
+               record start { prompt: string }\n\
+               record finish { text: string }\n\
+               variant turn-event { delta { text: string }, done }\n\
+               command start-turn(request: start) -> finish emits turn-event;\n\
+             }",
+        );
+        let InterfaceItem::Command(op) = &schema.interfaces[0].items[3] else {
+            panic!("expected command");
+        };
+        assert_eq!(op.name, "start-turn");
+        assert!(matches!(op.emits, Some(TypeRef::Named(ref name)) if name == "turn-event"));
+    }
+
+    #[test]
+    fn rejects_unknown_streaming_event_type() {
+        let tokens = tokenize(
+            "plugin p version 1;\n\
+             interface i {\n\
+               record start { prompt: string }\n\
+               record finish { text: string }\n\
+               command start-turn(request: start) -> finish emits missing-event;\n\
+             }",
+        )
+        .expect("lex");
+        let schema = parse(&tokens).expect("parse");
+        let err = crate::validator::validate(&schema).unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }));
     }
 
     #[test]

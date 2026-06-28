@@ -156,12 +156,20 @@ pub struct EnumCase {
     pub span: Span,
 }
 
-/// A `query` or `command` declaration.
+/// A `query`, `command`, or request-scoped streaming `command ... emits ...`
+/// declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
     pub name: String,
     pub params: Vec<Field>,
     pub returns: TypeRef,
+    /// Event frame type emitted by a request-scoped streaming operation.
+    ///
+    /// This is distinct from [`InterfaceItem::Events`], which models ambient
+    /// interface event streams. `emits` belongs to the invocation that started
+    /// the operation and must produce zero or more typed event frames followed
+    /// by exactly one final response frame.
+    pub emits: Option<TypeRef>,
     pub span: Span,
 }
 

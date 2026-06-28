@@ -397,6 +397,16 @@ fn resolve_type_references(
                     imports,
                     schema_type_names,
                 )?;
+                if let Some(emits) = &op.emits {
+                    check_type(
+                        emits,
+                        type_names,
+                        &iface.name,
+                        declared_aliases,
+                        imports,
+                        schema_type_names,
+                    )?;
+                }
             }
             InterfaceItem::Events(decl) => {
                 check_type(
