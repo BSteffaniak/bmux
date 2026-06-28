@@ -2280,6 +2280,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
+ "bmux_tui_component_protocol",
  "unicode-segmentation",
 ]
 

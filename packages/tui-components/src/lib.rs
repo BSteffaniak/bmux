@@ -32,6 +32,8 @@ pub mod pane;
 pub mod panel_group;
 pub mod picker_frame;
 pub mod progress_bar;
+#[cfg(feature = "protocol")]
+pub mod protocol;
 pub mod radio_group;
 pub mod scroll_area;
 pub mod scrollbar;
