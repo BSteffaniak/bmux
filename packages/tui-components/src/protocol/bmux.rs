@@ -190,8 +190,20 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
     ) {
         let props = component_props(node);
         match self.type_id.as_str() {
+            ACTION_ROW_TYPE_ID => {
+                let (runtime, frame) = context.runtime_and_frame();
+                render_action_row_with_runtime(props, runtime, node, area, frame);
+            }
             FORM_FIELD_TYPE_ID => render_form_field_with_child(node, props, area, context),
             FORM_TYPE_ID => render_form(node, area, context),
+            RADIO_GROUP_TYPE_ID => {
+                let (runtime, frame) = context.runtime_and_frame();
+                render_radio_group_with_runtime(props, runtime, node, area, frame);
+            }
+            SELECT_DROPDOWN_TYPE_ID => {
+                let (runtime, frame) = context.runtime_and_frame();
+                render_select_dropdown_with_runtime(props, runtime, node, area, frame);
+            }
             TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => {
                 let (runtime, frame) = context.runtime_and_frame();
                 render_text_input_with_runtime(props, runtime, node, area, frame);
@@ -236,6 +248,15 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
     ) -> Vec<ComponentEvent> {
         let props = component_props(node);
         match self.type_id.as_str() {
+            ACTION_ROW_TYPE_ID => {
+                handle_action_row_with_runtime(props, node, context.runtime(), area, event)
+            }
+            RADIO_GROUP_TYPE_ID => {
+                handle_radio_group_with_runtime(props, node, context.runtime(), area, event)
+            }
+            SELECT_DROPDOWN_TYPE_ID => {
+                handle_select_dropdown_with_runtime(props, node, context.runtime(), area, event)
+            }
             TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => {
                 handle_text_input_with_runtime(props, node, context.runtime(), area, event)
             }
@@ -271,6 +292,22 @@ const fn component_props(node: &ComponentNode) -> &ComponentValue {
         bmux_tui_component_protocol::model::ComponentKind::Extension { payload, .. } => payload,
         _ => &ComponentValue::Null,
     }
+}
+
+fn render_action_row_with_runtime(
+    props: &ComponentValue,
+    runtime: &mut ProtocolRuntime,
+    node: &ComponentNode,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let actions = action_buttons(props);
+    let state_key = local_state_key(node, ComponentTypeId::new(ACTION_ROW_TYPE_ID));
+    let row_state = runtime.local_state_or_insert_with(&state_key, ActionRowState::new);
+    if row_state.focused().is_none() && !actions.is_empty() {
+        row_state.set_focused(Some(0));
+    }
+    ActionRow::new(&actions).render_state(area, row_state, frame);
 }
 
 fn render_action_row(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
@@ -316,6 +353,26 @@ fn render_radio_group(
     RadioGroup::new(&options).render(area, &group_state, frame);
 }
 
+fn render_select_dropdown_with_runtime(
+    props: &ComponentValue,
+    runtime: &mut ProtocolRuntime,
+    node: &ComponentNode,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let options = select_options(props);
+    let selected = selected_select_index(props, runtime.state(), node, &options);
+    let state_key = local_state_key(node, ComponentTypeId::new(SELECT_DROPDOWN_TYPE_ID));
+    let select_state =
+        runtime.local_state_or_insert_with(&state_key, || SelectDropdownState::new(selected));
+    if selected != select_state.selected() {
+        select_state.set_selected(selected);
+    }
+    select_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
+    let select = SelectDropdown::new(&options)
+        .placeholder(string_prop(props, "placeholder").unwrap_or("Select..."));
+    select.render(area, select_state, frame);
+}
 fn render_select_dropdown(
     props: &ComponentValue,
     state: &ComponentRuntimeState,
@@ -331,6 +388,24 @@ fn render_select_dropdown(
     let select = SelectDropdown::new(&options)
         .placeholder(string_prop(props, "placeholder").unwrap_or("Select..."));
     select.render(area, &select_state, frame);
+}
+fn render_radio_group_with_runtime(
+    props: &ComponentValue,
+    runtime: &mut ProtocolRuntime,
+    node: &ComponentNode,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let options = radio_options(props);
+    let selected = selected_option_index(props, runtime.state(), node, &options);
+    let state_key = local_state_key(node, ComponentTypeId::new(RADIO_GROUP_TYPE_ID));
+    let group_state =
+        runtime.local_state_or_insert_with(&state_key, || RadioGroupState::new(selected));
+    if selected != group_state.selected() {
+        group_state.set_selected(selected);
+    }
+    group_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
+    RadioGroup::new(&options).render(area, group_state, frame);
 }
 fn render_empty_state(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
     let title = string_prop(props, "title").unwrap_or("Empty");
@@ -456,6 +531,47 @@ fn render_unsupported(type_id: &str, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
+fn should_handle_focused_event(
+    state: &ComponentRuntimeState,
+    node: &ComponentNode,
+    event: &Event,
+) -> bool {
+    if !matches!(event, Event::Key(_)) {
+        return true;
+    }
+    state
+        .focus
+        .focused
+        .as_ref()
+        .is_none_or(|focused| node.id.as_ref() == Some(focused))
+}
+
+fn handle_action_row_with_runtime(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    runtime: &mut ProtocolRuntime,
+    area: Rect,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    if !should_handle_focused_event(runtime.state(), node, event) {
+        return Vec::new();
+    }
+    let actions = action_buttons(props);
+    let state_key = local_state_key(node, ComponentTypeId::new(ACTION_ROW_TYPE_ID));
+    let row_state = runtime.local_state_or_insert_with(&state_key, ActionRowState::new);
+    if row_state.focused().is_none() && !actions.is_empty() {
+        row_state.set_focused(Some(0));
+    }
+    match ActionRow::new(&actions).handle_event(area, row_state, event) {
+        ActionRowOutcome::Activated { id, .. } => action_event(node, ActionId::new(id)),
+        ActionRowOutcome::Ignored
+        | ActionRowOutcome::Handled
+        | ActionRowOutcome::Redraw
+        | ActionRowOutcome::FocusRequested { .. }
+        | ActionRowOutcome::FocusMoved { .. } => Vec::new(),
+    }
+}
+
 fn handle_action_row(
     props: &ComponentValue,
     node: &ComponentNode,
@@ -530,6 +646,39 @@ fn handle_radio_group(
     }
 }
 
+fn handle_radio_group_with_runtime(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    runtime: &mut ProtocolRuntime,
+    area: Rect,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    if !should_handle_focused_event(runtime.state(), node, event) {
+        return Vec::new();
+    }
+    let options = radio_options(props);
+    let selected = selected_option_index(props, runtime.state(), node, &options);
+    let state_key = local_state_key(node, ComponentTypeId::new(RADIO_GROUP_TYPE_ID));
+    let group_state =
+        runtime.local_state_or_insert_with(&state_key, || RadioGroupState::new(selected));
+    if selected != group_state.selected() {
+        group_state.set_selected(selected);
+    }
+    group_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
+    match RadioGroup::new(&options).handle_event(area, group_state, event) {
+        RadioGroupOutcome::Selected(index) => options.get(index).map_or_else(Vec::new, |option| {
+            value_changed_event(
+                node,
+                runtime.state_mut(),
+                ComponentValue::String(option.id.clone()),
+            )
+        }),
+        RadioGroupOutcome::Ignored | RadioGroupOutcome::Redraw | RadioGroupOutcome::Focused(_) => {
+            Vec::new()
+        }
+    }
+}
+
 fn handle_text_input_with_runtime(
     props: &ComponentValue,
     node: &ComponentNode,
@@ -537,6 +686,9 @@ fn handle_text_input_with_runtime(
     area: Rect,
     event: &Event,
 ) -> Vec<ComponentEvent> {
+    if !should_handle_focused_event(runtime.state(), node, event) {
+        return Vec::new();
+    }
     let type_id =
         node_type_id(node).unwrap_or_else(|| ComponentTypeId::new(TEXT_INPUT_BOX_TYPE_ID));
     let value = node_value_string(runtime.state(), node)
@@ -576,6 +728,45 @@ fn handle_text_input(
     *state = runtime.into_state();
     events
 }
+fn handle_select_dropdown_with_runtime(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    runtime: &mut ProtocolRuntime,
+    area: Rect,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    if !should_handle_focused_event(runtime.state(), node, event) {
+        return Vec::new();
+    }
+    let options = select_options(props);
+    let selected = selected_select_index(props, runtime.state(), node, &options);
+    let state_key = local_state_key(node, ComponentTypeId::new(SELECT_DROPDOWN_TYPE_ID));
+    let select_state =
+        runtime.local_state_or_insert_with(&state_key, || SelectDropdownState::new(selected));
+    if selected != select_state.selected() {
+        select_state.set_selected(selected);
+    }
+    select_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
+    let select = SelectDropdown::new(&options)
+        .placeholder(string_prop(props, "placeholder").unwrap_or("Select..."));
+    match select.handle_event(area, select_state, event) {
+        SelectDropdownOutcome::Selected(index) => {
+            options.get(index).map_or_else(Vec::new, |option| {
+                value_changed_event(
+                    node,
+                    runtime.state_mut(),
+                    ComponentValue::String(option.id.clone()),
+                )
+            })
+        }
+        SelectDropdownOutcome::Ignored
+        | SelectDropdownOutcome::Redraw
+        | SelectDropdownOutcome::Opened
+        | SelectDropdownOutcome::Closed
+        | SelectDropdownOutcome::Focused(_) => Vec::new(),
+    }
+}
+
 fn handle_select_dropdown(
     props: &ComponentValue,
     node: &ComponentNode,

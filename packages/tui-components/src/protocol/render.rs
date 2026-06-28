@@ -274,6 +274,9 @@ pub(super) fn handle_node_event(
     runtime: &mut ProtocolRuntime,
     event: &Event,
 ) -> Vec<ComponentEvent> {
+    if handle_focus_traversal(node, runtime, event) {
+        return Vec::new();
+    }
     match &node.kind {
         ComponentKind::Button {
             action,
@@ -385,6 +388,115 @@ pub(super) fn handle_node_event(
             }),
         _ => children_events(node, bindings, area, runtime, event),
     }
+}
+
+fn handle_focus_traversal(
+    root: &ComponentNode,
+    runtime: &mut ProtocolRuntime,
+    event: &Event,
+) -> bool {
+    let Event::Key(stroke) = event else {
+        return false;
+    };
+    if stroke.key != bmux_keyboard::KeyCode::Tab || stroke.modifiers.ctrl || stroke.modifiers.alt {
+        return false;
+    }
+    let mut order = Vec::new();
+    collect_focusable(root, &mut order);
+    runtime.state_mut().focus.traversal_order.clone_from(&order);
+    if order.is_empty() {
+        runtime.state_mut().focus.focused = None;
+        return true;
+    }
+    let current = runtime.state().focus.focused.as_ref();
+    let current_index = current.and_then(|focused| order.iter().position(|id| id == focused));
+    let next_index = if stroke.modifiers.shift {
+        current_index.map_or_else(
+            || order.len().saturating_sub(1),
+            |index| {
+                if index == 0 {
+                    order.len().saturating_sub(1)
+                } else {
+                    index.saturating_sub(1)
+                }
+            },
+        )
+    } else {
+        current_index.map_or(0, |index| (index + 1) % order.len())
+    };
+    runtime.state_mut().focus.focused = order.get(next_index).cloned();
+    true
+}
+
+fn collect_focusable(node: &ComponentNode, output: &mut Vec<ComponentId>) {
+    if let Some(id) = &node.id
+        && is_focusable(node)
+    {
+        output.push(id.clone());
+    }
+    for child in &node.children {
+        collect_focusable(child, output);
+    }
+}
+
+fn is_focusable(node: &ComponentNode) -> bool {
+    match &node.kind {
+        ComponentKind::Select { disabled, .. }
+        | ComponentKind::Button { disabled, .. }
+        | ComponentKind::TextInput { disabled, .. }
+        | ComponentKind::TextArea { disabled, .. }
+        | ComponentKind::RadioGroup { disabled, .. }
+        | ComponentKind::CheckboxGroup { disabled, .. } => !disabled,
+        ComponentKind::Component { type_id, props } => {
+            matches!(
+                type_id.as_str(),
+                "bmux.action_row"
+                    | "bmux.button"
+                    | "bmux.checkbox"
+                    | "bmux.radio_group"
+                    | "bmux.select_dropdown"
+                    | "bmux.text_input"
+                    | "bmux.text_input_box"
+            ) && !component_disabled(props)
+        }
+        ComponentKind::Extension { kind, payload } => {
+            matches!(
+                kind.as_str(),
+                "bmux.action_row"
+                    | "bmux.button"
+                    | "bmux.checkbox"
+                    | "bmux.radio_group"
+                    | "bmux.select_dropdown"
+                    | "bmux.text_input"
+                    | "bmux.text_input_box"
+            ) && !component_disabled(payload)
+        }
+        ComponentKind::Text { .. }
+        | ComponentKind::Markdown { .. }
+        | ComponentKind::Stack { .. }
+        | ComponentKind::Panel { .. }
+        | ComponentKind::Divider
+        | ComponentKind::Spacer { .. }
+        | ComponentKind::Form { .. }
+        | ComponentKind::Status { .. } => false,
+    }
+}
+
+fn component_disabled(props: &ComponentValue) -> bool {
+    props
+        .as_map()
+        .and_then(|map| map.get("disabled"))
+        .and_then(|value| match value {
+            ComponentValue::Bool(value) => Some(*value),
+            ComponentValue::Null
+            | ComponentValue::I64(_)
+            | ComponentValue::U64(_)
+            | ComponentValue::F64(_)
+            | ComponentValue::String(_)
+            | ComponentValue::List(_)
+            | ComponentValue::Map(_) => None,
+        })
+        .unwrap_or(false)
 }
 
 fn render_stack(
