@@ -123,8 +123,10 @@ pub use service::{
     RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceEvent,
     ServiceEventSink, ServiceEventSinkHandle, ServiceInterfaceDescriptor, ServiceKind,
     ServiceProtocolVersion, ServiceRequest, ServiceResponse, decode_service_envelope,
-    decode_service_envelope_with_invocation_id, decode_service_message, encode_service_envelope,
+    decode_service_envelope_with_invocation_id, decode_service_message,
+    decode_service_stream_envelopes, encode_service_envelope,
     encode_service_envelope_with_invocation_id, encode_service_message,
+    encode_service_stream_envelopes,
 };
 pub use stateful_plugin::{
     StatefulPlugin, StatefulPluginError, StatefulPluginHandle, StatefulPluginResult,

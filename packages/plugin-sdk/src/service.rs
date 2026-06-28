@@ -5,6 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub const SERVICE_STREAM_MAGIC_V1: &[u8] = b"BMUXSTR1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceKind {
@@ -509,12 +511,79 @@ where
     ))
 }
 
+/// Encode service stream frames as versioned length-prefixed typed-stable envelopes.
+///
+/// The stream format is `BMUXSTR1` followed by repeated `u32` big-endian frame
+/// lengths and typed-stable [`ServiceEnvelope`] bytes. Each event frame uses
+/// [`ServiceEnvelopeKind::Event`]; exactly one final frame should use
+/// [`ServiceEnvelopeKind::Response`].
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if any envelope cannot be encoded or
+/// a frame exceeds `u32::MAX` bytes.
+pub fn encode_service_stream_envelopes(envelopes: &[ServiceEnvelope]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(SERVICE_STREAM_MAGIC_V1);
+    for envelope in envelopes {
+        let frame = encode_service_message(envelope)?;
+        let frame_len = u32::try_from(frame.len()).map_err(|_| PluginError::ServiceProtocol {
+            details: "service stream frame too large".to_string(),
+        })?;
+        output.extend_from_slice(&frame_len.to_be_bytes());
+        output.extend_from_slice(&frame);
+    }
+    Ok(output)
+}
+
+/// Decode versioned length-prefixed typed-stable service stream envelopes.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] when the stream prefix, frame length,
+/// or envelope bytes are invalid.
+pub fn decode_service_stream_envelopes(bytes: &[u8]) -> Result<Vec<ServiceEnvelope>> {
+    if !bytes.starts_with(SERVICE_STREAM_MAGIC_V1) {
+        return Err(PluginError::ServiceProtocol {
+            details: "service stream output missing BMUXSTR1 frame prefix".to_string(),
+        });
+    }
+
+    let mut offset = SERVICE_STREAM_MAGIC_V1.len();
+    let mut envelopes = Vec::new();
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < 4 {
+            return Err(PluginError::ServiceProtocol {
+                details: "service stream output truncated frame length".to_string(),
+            });
+        }
+        let mut len_buf = [0_u8; 4];
+        len_buf.copy_from_slice(&bytes[offset..offset + 4]);
+        offset += 4;
+        let frame_len = usize::try_from(u32::from_be_bytes(len_buf)).map_err(|_| {
+            PluginError::ServiceProtocol {
+                details: "service stream frame length conversion failed".to_string(),
+            }
+        })?;
+        if bytes.len() < offset + frame_len {
+            return Err(PluginError::ServiceProtocol {
+                details: "service stream output truncated frame payload".to_string(),
+            });
+        }
+        envelopes.push(decode_service_message(&bytes[offset..offset + frame_len])?);
+        offset += frame_len;
+    }
+    Ok(envelopes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderId, RegisteredService, ServiceEnvelopeKind, ServiceError, ServiceKind,
-        ServiceRequest, ServiceResponse, decode_service_envelope, decode_service_message,
-        encode_service_envelope, encode_service_message,
+        ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError,
+        ServiceEvent, ServiceKind, ServiceRequest, ServiceResponse, decode_service_envelope,
+        decode_service_message, decode_service_stream_envelopes, encode_service_envelope,
+        encode_service_message, encode_service_stream_envelopes,
     };
     use crate::HostScope;
 
@@ -674,6 +743,36 @@ mod tests {
                 .expect("legacy positional response envelope should decode");
         assert_eq!(request_id, 99);
         assert_eq!(decoded, ServiceResponse::ok(vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn service_stream_envelopes_are_length_prefixed_and_ordered() {
+        let invocation_id = crate::PluginInvocationId::new();
+        let event = ServiceEnvelope::with_invocation_id(
+            invocation_id.clone(),
+            7,
+            ServiceEnvelopeKind::Event,
+            encode_service_message(&ServiceEvent {
+                invocation_id: invocation_id.clone(),
+                payload: vec![1, 2, 3],
+            })
+            .expect("event should encode"),
+        );
+        let response = ServiceEnvelope::with_invocation_id(
+            invocation_id.clone(),
+            7,
+            ServiceEnvelopeKind::Response,
+            encode_service_message(&ServiceResponse::ok(vec![4, 5, 6]))
+                .expect("response should encode"),
+        );
+        let stream = encode_service_stream_envelopes(&[event.clone(), response.clone()])
+            .expect("stream should encode");
+        let decoded = decode_service_stream_envelopes(&stream).expect("stream should decode");
+        assert_eq!(decoded, vec![event, response]);
+        assert!(matches!(decoded[0].kind, ServiceEnvelopeKind::Event));
+        assert!(matches!(decoded[1].kind, ServiceEnvelopeKind::Response));
+        assert_eq!(decoded[0].invocation_id, invocation_id);
+        assert_eq!(decoded[1].invocation_id, invocation_id);
     }
 
     #[test]
