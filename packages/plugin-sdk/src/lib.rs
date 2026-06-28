@@ -42,6 +42,7 @@ mod cancellation;
 mod capability;
 mod command;
 mod context;
+mod contribution;
 mod error;
 mod event;
 mod host;
@@ -80,6 +81,7 @@ pub use context::{
     encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload,
 };
+pub use contribution::{ContributionRegistrar, PluginContribution};
 pub use error::{CapabilityAccessDeniedHint, PluginError, Result};
 pub use event::{
     PluginEvent, PluginEventDelivery, PluginEventPayload, PluginEventPublication,
@@ -306,8 +308,8 @@ pub mod prelude {
     pub use crate::{
         // Action dispatch
         ActionDispatchRequest,
-        // Core trait
         ConcurrentRustPlugin,
+        ContributionRegistrar,
         // Exit codes
         EXIT_ERROR,
         EXIT_OK,
@@ -320,6 +322,7 @@ pub mod prelude {
         NativeServiceContext,
         // Error type
         PluginCommandError,
+        PluginContribution,
         // Events
         PluginEvent,
         PromptEvent,
@@ -356,7 +359,9 @@ pub mod __private {
         declared_services_bundled, declared_services_concurrent_bundled, handle_event_export,
         invoke_service_concurrent_export, invoke_service_export,
         invoke_streaming_service_concurrent_export, invoke_streaming_service_export,
-        manifest_toml_ptr, plugin_instance, register_typed_services_bundled, run_command_export,
+        manifest_toml_ptr, plugin_instance, register_contributions_bundled,
+        register_contributions_concurrent_bundled, register_typed_services_bundled,
+        run_command_export,
     };
 }
 
@@ -612,6 +617,10 @@ macro_rules! bundled_concurrent_plugin_vtable {
             $crate::__private::declared_services_concurrent_bundled::<$plugin_ty>()
         }
 
+        fn __register_contributions() -> $crate::Result<Vec<$crate::PluginContribution>> {
+            $crate::__private::register_contributions_concurrent_bundled(__instance())
+        }
+
         $crate::StaticPluginVtable {
             entry: __entry,
             run_command_with_context: |_input_ptr, _input_len| $crate::EXIT_USAGE,
@@ -623,6 +632,7 @@ macro_rules! bundled_concurrent_plugin_vtable {
             invoke_streaming_service: __invoke_streaming_service,
             register_typed_services: __register_typed_services,
             declared_services: __declared_services,
+            register_contributions: __register_contributions,
         }
     }};
 }
@@ -723,6 +733,10 @@ macro_rules! bundled_plugin_vtable {
             $crate::__private::declared_services_bundled::<$plugin_ty>()
         }
 
+        fn __register_contributions() -> $crate::Result<Vec<$crate::PluginContribution>> {
+            $crate::__private::register_contributions_bundled(__instance())
+        }
+
         $crate::StaticPluginVtable {
             entry: __entry,
             run_command_with_context: __run_command_with_context,
@@ -734,6 +748,7 @@ macro_rules! bundled_plugin_vtable {
             invoke_streaming_service: __invoke_streaming_service,
             register_typed_services: __register_typed_services,
             declared_services: __declared_services,
+            register_contributions: __register_contributions,
         }
     }};
 }
@@ -752,6 +767,7 @@ pub struct StaticPluginVtable {
     pub register_typed_services:
         fn(context: TypedServiceRegistrationContext<'_>) -> TypedServiceRegistry,
     pub declared_services: fn() -> Result<Vec<PluginService>>,
+    pub register_contributions: fn() -> Result<Vec<PluginContribution>>,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {

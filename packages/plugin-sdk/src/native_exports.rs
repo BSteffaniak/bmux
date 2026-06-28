@@ -274,6 +274,18 @@ pub trait ConcurrentRustPlugin: Default + Send + Sync + 'static {
     {
         <Self::Contract as crate::PluginContract>::service_declarations()
     }
+
+    /// Register activation-time contributions.
+    ///
+    /// # Errors
+    ///
+    /// Returns when contribution registration fails.
+    fn register_contributions(
+        &self,
+        _registrar: &mut crate::ContributionRegistrar,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 pub trait RustPlugin: Default + Send + 'static {
@@ -408,6 +420,18 @@ pub trait RustPlugin: Default + Send + 'static {
         Self: Sized,
     {
         <Self::Contract as crate::PluginContract>::service_declarations()
+    }
+
+    /// Register activation-time contributions.
+    ///
+    /// # Errors
+    ///
+    /// Returns when contribution registration fails.
+    fn register_contributions(
+        &self,
+        _registrar: &mut crate::ContributionRegistrar,
+    ) -> crate::Result<()> {
+        Ok(())
     }
 }
 
@@ -550,6 +574,30 @@ pub fn activate_with_async_bundled<P: RustPlugin>(
 #[doc(hidden)]
 pub fn declared_services_bundled<P: RustPlugin>() -> crate::Result<Vec<PluginService>> {
     P::declared_services()
+}
+
+#[doc(hidden)]
+pub fn register_contributions_bundled<P: RustPlugin>(
+    instance: &'static RwLock<P>,
+) -> crate::Result<Vec<crate::PluginContribution>> {
+    let plugin = instance
+        .read()
+        .map_err(|_| crate::PluginError::ServiceProtocol {
+            details: "plugin contribution read lock poisoned".to_string(),
+        })?;
+    let mut registrar = crate::ContributionRegistrar::new();
+    plugin.register_contributions(&mut registrar)?;
+    drop(plugin);
+    Ok(registrar.into_contributions())
+}
+
+#[doc(hidden)]
+pub fn register_contributions_concurrent_bundled<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+) -> crate::Result<Vec<crate::PluginContribution>> {
+    let mut registrar = crate::ContributionRegistrar::new();
+    instance.register_contributions(&mut registrar)?;
+    Ok(registrar.into_contributions())
 }
 
 #[doc(hidden)]

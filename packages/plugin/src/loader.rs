@@ -3304,6 +3304,7 @@ minimum = "1.0"
             invoke_streaming_service: test_static_plugin_service,
             register_typed_services: test_static_plugin_typed_services,
             declared_services: || Ok(Vec::new()),
+            register_contributions: || Ok(Vec::new()),
         };
 
         LoadedPlugin {
