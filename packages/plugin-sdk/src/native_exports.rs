@@ -1,7 +1,7 @@
 use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent, PluginService,
-    ServiceEnvelopeKind, ServiceResponse, TypedServiceRegistry, decode_service_envelope,
-    encode_service_envelope,
+    ServiceEnvelopeKind, ServiceResponse, TypedServiceRegistry,
+    decode_service_envelope_with_invocation_id, encode_service_envelope_with_invocation_id,
 };
 use std::cell::RefCell;
 use std::ffi::{CString, c_char};
@@ -563,9 +563,9 @@ pub fn invoke_service_export<P: RustPlugin>(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok((request_id, context)) =
-        decode_service_envelope::<NativeServiceContext>(input, ServiceEnvelopeKind::Request)
-    else {
+    let Ok((invocation_id, request_id, context)) = decode_service_envelope_with_invocation_id::<
+        NativeServiceContext,
+    >(input, ServiceEnvelopeKind::Request) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
 
@@ -605,8 +605,12 @@ pub fn invoke_service_export<P: RustPlugin>(
         response
     };
 
-    let Ok(encoded) = encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response)
-    else {
+    let Ok(encoded) = encode_service_envelope_with_invocation_id(
+        invocation_id,
+        request_id,
+        ServiceEnvelopeKind::Response,
+        &response,
+    ) else {
         return SERVICE_STATUS_ENCODE_FAILED;
     };
 

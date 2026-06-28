@@ -151,3 +151,51 @@ impl PluginCancellationToken {
 
 /// Backward-compatible name for serializable plugin cancellation metadata.
 pub type CancellationToken = PluginCancellationToken;
+
+#[cfg(test)]
+mod tests {
+    use super::{PluginCancellationToken, PluginInvocationId, ServiceCancellation};
+    use std::time::Duration;
+
+    #[test]
+    fn invocation_ids_are_nanoid_shaped_and_unique() {
+        let first = PluginInvocationId::new();
+        let second = PluginInvocationId::new();
+        assert_eq!(first.as_str().len(), 21);
+        assert_ne!(first, second);
+        assert!(
+            first
+                .as_str()
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        );
+    }
+
+    #[test]
+    fn shared_service_cancellation_updates_all_clones() {
+        let cancellation = ServiceCancellation::new();
+        let cloned = cancellation.clone();
+        assert!(!cancellation.is_cancelled());
+        cloned.cancel();
+        assert!(cancellation.is_cancelled());
+        assert!(cloned.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_token_defaults_to_active_with_invocation_id() {
+        let token = PluginCancellationToken::default();
+        assert!(!token.is_cancelled());
+        assert_eq!(token.invocation_id.as_str().len(), 21);
+        assert_eq!(token.deadline_ms, None);
+    }
+
+    #[test]
+    fn cancellation_token_carries_cancelled_and_deadline_metadata() {
+        let cancelled = PluginCancellationToken::cancelled();
+        assert!(cancelled.is_cancelled());
+
+        let deadline = PluginCancellationToken::with_deadline(Duration::from_millis(42));
+        assert!(!deadline.is_cancelled());
+        assert_eq!(deadline.deadline_ms, Some(42));
+    }
+}

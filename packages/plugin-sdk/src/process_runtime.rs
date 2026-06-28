@@ -1,7 +1,7 @@
 use crate::{
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginCommandOutcome,
-    PluginError, PluginEvent, Result, ServiceResponse, decode_service_message,
-    encode_service_message,
+    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginCancellationToken,
+    PluginCommandOutcome, PluginError, PluginEvent, PluginInvocationId, Result, ServiceResponse,
+    decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,7 @@ pub const PROCESS_RUNTIME_TRANSPORT_STDIO_V1: &str = "stdio-v1";
 pub enum ProcessInvocationRequest {
     Command {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         plugin_id: String,
         command_name: String,
         arguments: Vec<String>,
@@ -23,17 +24,21 @@ pub enum ProcessInvocationRequest {
     },
     Lifecycle {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         plugin_id: String,
         symbol: String,
         context: NativeLifecycleContext,
     },
     Event {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         plugin_id: String,
         event: PluginEvent,
     },
     Service {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
+        cancellation: PluginCancellationToken,
         plugin_id: String,
         context: NativeServiceContext,
     },
@@ -43,23 +48,28 @@ pub enum ProcessInvocationRequest {
 pub enum ProcessInvocationResponse {
     Command {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         status: i32,
         outcome: Option<PluginCommandOutcome>,
     },
     Lifecycle {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         status: i32,
     },
     Event {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         status: Option<i32>,
     },
     Service {
         protocol_version: u16,
+        invocation_id: PluginInvocationId,
         response: ServiceResponse,
     },
     Error {
         protocol_version: u16,
+        invocation_id: Option<PluginInvocationId>,
         details: String,
         status: Option<i32>,
     },
@@ -123,16 +133,104 @@ pub fn encode_process_invocation_request(request: &ProcessInvocationRequest) -> 
 
 /// # Errors
 ///
+/// Returns an error when framing or encoding fails.
+pub fn encode_process_invocation_response(response: &ProcessInvocationResponse) -> Result<Vec<u8>> {
+    let payload = encode_service_message(response)?;
+    encode_process_runtime_frame(&payload)
+}
+
+/// # Errors
+///
 /// Returns an error when framing or decoding fails.
 pub fn decode_process_invocation_response(bytes: &[u8]) -> Result<ProcessInvocationResponse> {
     let payload = decode_process_runtime_frame(bytes)?;
-    decode_service_message(payload)
+    decode_service_message(payload).or_else(|current_error| {
+        #[derive(Deserialize)]
+        enum LegacyProcessInvocationResponse {
+            Command {
+                protocol_version: u16,
+                status: i32,
+                outcome: Option<PluginCommandOutcome>,
+            },
+            Lifecycle {
+                protocol_version: u16,
+                status: i32,
+            },
+            Event {
+                protocol_version: u16,
+                status: Option<i32>,
+            },
+            Service {
+                protocol_version: u16,
+                response: ServiceResponse,
+            },
+            Error {
+                protocol_version: u16,
+                details: String,
+                status: Option<i32>,
+            },
+        }
+
+        let legacy: LegacyProcessInvocationResponse = decode_service_message(payload).map_err(|legacy_error| {
+            PluginError::ServiceProtocol {
+                details: format!(
+                    "current process response decode failed: {current_error}; legacy process response decode failed: {legacy_error}",
+                ),
+            }
+        })?;
+        Ok(match legacy {
+            LegacyProcessInvocationResponse::Command {
+                protocol_version,
+                status,
+                outcome,
+            } => ProcessInvocationResponse::Command {
+                protocol_version,
+                invocation_id: PluginInvocationId::new(),
+                status,
+                outcome,
+            },
+            LegacyProcessInvocationResponse::Lifecycle {
+                protocol_version,
+                status,
+            } => ProcessInvocationResponse::Lifecycle {
+                protocol_version,
+                invocation_id: PluginInvocationId::new(),
+                status,
+            },
+            LegacyProcessInvocationResponse::Event {
+                protocol_version,
+                status,
+            } => ProcessInvocationResponse::Event {
+                protocol_version,
+                invocation_id: PluginInvocationId::new(),
+                status,
+            },
+            LegacyProcessInvocationResponse::Service {
+                protocol_version,
+                response,
+            } => ProcessInvocationResponse::Service {
+                protocol_version,
+                invocation_id: PluginInvocationId::new(),
+                response,
+            },
+            LegacyProcessInvocationResponse::Error {
+                protocol_version,
+                details,
+                status,
+            } => ProcessInvocationResponse::Error {
+                protocol_version,
+                invocation_id: None,
+                details,
+                status,
+            },
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessInvocationResponse, decode_process_invocation_response,
+        ProcessInvocationRequest, ProcessInvocationResponse, decode_process_invocation_response,
         decode_process_runtime_frame, encode_process_runtime_frame,
     };
 
@@ -185,9 +283,78 @@ mod tests {
     }
 
     #[test]
+    fn process_invocation_request_service_carries_invocation_metadata() {
+        let cancellation =
+            crate::PluginCancellationToken::with_deadline(std::time::Duration::from_millis(5));
+        let request = ProcessInvocationRequest::Service {
+            protocol_version: 1,
+            invocation_id: cancellation.invocation_id.clone(),
+            cancellation: cancellation.clone(),
+            plugin_id: "test.plugin".to_string(),
+            context: crate::NativeServiceContext {
+                plugin_id: "test.plugin".to_string(),
+                request: crate::ServiceRequest {
+                    caller_plugin_id: "caller.plugin".to_string(),
+                    service: crate::RegisteredService {
+                        capability: crate::HostScope::new("bmux.test")
+                            .expect("capability should parse"),
+                        kind: crate::ServiceKind::Query,
+                        interface_id: "test/v1".to_string(),
+                        provider: crate::ProviderId::Plugin("test.plugin".to_string()),
+                    },
+                    operation: "ping".to_string(),
+                    payload: Vec::new(),
+                },
+                required_capabilities: Vec::new(),
+                provided_capabilities: Vec::new(),
+                services: Vec::new(),
+                available_capabilities: Vec::new(),
+                enabled_plugins: Vec::new(),
+                plugin_search_roots: Vec::new(),
+                host: crate::HostMetadata {
+                    product_name: "bmux".to_string(),
+                    product_version: "0.1.0".to_string(),
+                    plugin_api_version: crate::ApiVersion::new(1, 0),
+                    plugin_abi_version: crate::ApiVersion::new(1, 0),
+                },
+                connection: crate::HostConnectionInfo {
+                    config_dir: String::new(),
+                    config_dir_candidates: Vec::new(),
+                    runtime_dir: String::new(),
+                    data_dir: String::new(),
+                    state_dir: String::new(),
+                },
+                settings: None,
+                plugin_settings_map: std::collections::BTreeMap::new(),
+                caller_client_id: None,
+                cancellation: cancellation.clone(),
+                host_kernel_bridge: None,
+            },
+        };
+        let bytes = crate::encode_process_invocation_request(&request)
+            .expect("process request should encode");
+        let payload = decode_process_runtime_frame(&bytes).expect("frame should decode");
+        let decoded: ProcessInvocationRequest =
+            crate::decode_service_message(payload).expect("request should decode");
+        let ProcessInvocationRequest::Service {
+            invocation_id,
+            cancellation: decoded_cancellation,
+            context,
+            ..
+        } = decoded
+        else {
+            panic!("expected service request");
+        };
+        assert_eq!(invocation_id, cancellation.invocation_id);
+        assert_eq!(decoded_cancellation, cancellation);
+        assert_eq!(context.cancellation, cancellation);
+    }
+
+    #[test]
     fn process_invocation_response_decodes_valid_message() {
         let payload = crate::encode_service_message(&ProcessInvocationResponse::Event {
             protocol_version: 1,
+            invocation_id: crate::PluginInvocationId::new(),
             status: Some(0),
         })
         .expect("encoding should succeed");
@@ -198,7 +365,8 @@ mod tests {
             response,
             ProcessInvocationResponse::Event {
                 protocol_version: 1,
-                status: Some(0)
+                status: Some(0),
+                ..
             }
         ));
     }

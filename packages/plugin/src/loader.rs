@@ -19,12 +19,12 @@ use bmux_plugin_sdk::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
     PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
     PluginCliCommandRequest, PluginCliCommandResponse, PluginError, PluginEvent,
-    ProcessInvocationRequest, ProcessInvocationResponse, RegisteredService, Result,
-    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, StaticPluginVtable,
-    decode_process_invocation_response, decode_service_envelope, decode_service_message,
-    encode_host_kernel_bridge_cli_command_payload,
+    PluginInvocationId, ProcessInvocationRequest, ProcessInvocationResponse, RegisteredService,
+    Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, StaticPluginVtable,
+    decode_process_invocation_response, decode_service_envelope_with_invocation_id,
+    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
-    encode_service_envelope, encode_service_message,
+    encode_service_envelope_with_invocation_id, encode_service_message,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -2044,6 +2044,7 @@ impl LoadedPlugin {
             PluginBackend::Process(runtime) => {
                 let request = ProcessInvocationRequest::Event {
                     protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+                    invocation_id: PluginInvocationId::new(),
                     plugin_id: self.declaration.id.as_str().to_string(),
                     event: event.clone(),
                 };
@@ -2054,6 +2055,7 @@ impl LoadedPlugin {
                     Some(ProcessInvocationResponse::Event {
                         protocol_version,
                         status,
+                        ..
                     }) => {
                         Self::ensure_process_protocol_version("event", protocol_version)?;
                         return Ok(status);
@@ -2062,6 +2064,7 @@ impl LoadedPlugin {
                         protocol_version,
                         details,
                         status,
+                        ..
                     }) => {
                         Self::ensure_process_protocol_version("error", protocol_version)?;
                         if let Some(status) = status {
@@ -2101,8 +2104,11 @@ impl LoadedPlugin {
         runtime: &ProcessPluginRuntime,
         context: &NativeServiceContext,
     ) -> Result<ServiceResponse> {
+        let invocation_id = context.cancellation.invocation_id.clone();
         let request = ProcessInvocationRequest::Service {
             protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+            invocation_id: invocation_id.clone(),
+            cancellation: context.cancellation.clone(),
             plugin_id: self.declaration.id.as_str().to_string(),
             context: context.clone(),
         };
@@ -2111,15 +2117,24 @@ impl LoadedPlugin {
         match response {
             Some(ProcessInvocationResponse::Service {
                 protocol_version,
+                invocation_id: response_invocation_id,
                 response,
             }) => {
                 Self::ensure_process_protocol_version("service", protocol_version)?;
+                if response_invocation_id != invocation_id {
+                    return Err(PluginError::ServiceProtocol {
+                        details: format!(
+                            "process service response invocation id mismatch: expected {invocation_id}, got {response_invocation_id}",
+                        ),
+                    });
+                }
                 Ok(response)
             }
             Some(ProcessInvocationResponse::Error {
                 protocol_version,
                 details,
                 status: _,
+                ..
             }) => {
                 Self::process_error_to_result("service", protocol_version, details)?;
                 unreachable!("process_error_to_result always returns Err")
@@ -2132,6 +2147,7 @@ impl LoadedPlugin {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn invoke_native_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
         let total_started = Instant::now();
         let backend = match &self.backend {
@@ -2140,7 +2156,13 @@ impl LoadedPlugin {
             PluginBackend::Process(_) => "process",
         };
         let encode_started = Instant::now();
-        let payload = encode_service_envelope(0, ServiceEnvelopeKind::Request, context)?;
+        let invocation_id = context.cancellation.invocation_id.clone();
+        let payload = encode_service_envelope_with_invocation_id(
+            invocation_id.clone(),
+            0,
+            ServiceEnvelopeKind::Request,
+            context,
+        )?;
         let encode_us = encode_started.elapsed().as_micros();
 
         let resolved_symbol = match &self.backend {
@@ -2207,8 +2229,18 @@ impl LoadedPlugin {
         }
 
         let decode_started = Instant::now();
-        let (_, response) =
-            decode_service_envelope::<ServiceResponse>(&output, ServiceEnvelopeKind::Response)?;
+        let (response_invocation_id, _, response) = decode_service_envelope_with_invocation_id::<
+            ServiceResponse,
+        >(
+            &output, ServiceEnvelopeKind::Response
+        )?;
+        if response_invocation_id != invocation_id {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "native service response invocation id mismatch: expected {invocation_id}, got {response_invocation_id}",
+                ),
+            });
+        }
         let decode_us = decode_started.elapsed().as_micros();
         emit_phase_timing(
             PhaseChannel::Service,
@@ -2272,8 +2304,10 @@ impl LoadedPlugin {
                 unsafe { lifecycle_symbol(payload.as_ptr(), payload.len()) }
             }
             PluginBackend::Process(runtime) => {
+                let invocation_id = PluginInvocationId::new();
                 let request = ProcessInvocationRequest::Lifecycle {
                     protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+                    invocation_id,
                     plugin_id: self.declaration.id.as_str().to_string(),
                     symbol: symbol.to_string(),
                     context: context.clone(),
@@ -2284,6 +2318,7 @@ impl LoadedPlugin {
                     Some(ProcessInvocationResponse::Lifecycle {
                         protocol_version,
                         status,
+                        ..
                     }) => {
                         Self::ensure_process_protocol_version("lifecycle", protocol_version)?;
                         status
@@ -2292,6 +2327,7 @@ impl LoadedPlugin {
                         protocol_version,
                         details,
                         status,
+                        ..
                     }) => {
                         Self::ensure_process_protocol_version("error", protocol_version)?;
                         if let Some(status) = status {
@@ -2340,6 +2376,7 @@ impl LoadedPlugin {
 
         let request = ProcessInvocationRequest::Command {
             protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+            invocation_id: PluginInvocationId::new(),
             plugin_id: self.declaration.id.as_str().to_string(),
             command_name: command_name.to_string(),
             arguments: arguments.to_vec(),
@@ -2356,6 +2393,7 @@ impl LoadedPlugin {
                     protocol_version,
                     status,
                     outcome,
+                    ..
                 } => {
                     Self::ensure_process_protocol_version("command", protocol_version)?;
                     Ok((status, outcome.unwrap_or_default()))
@@ -2364,6 +2402,7 @@ impl LoadedPlugin {
                     protocol_version,
                     details,
                     status: _,
+                    ..
                 } => {
                     Self::process_error_to_result("command", protocol_version, details)?;
                     unreachable!("process_error_to_result always returns Err")
@@ -2850,8 +2889,10 @@ mod tests {
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
         NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,
-        ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, decode_service_message,
-        encode_service_envelope, encode_service_message,
+        ServiceEnvelopeKind, ServiceResponse, decode_service_envelope,
+        decode_service_envelope_with_invocation_id, decode_service_message,
+        encode_service_envelope, encode_service_envelope_with_invocation_id,
+        encode_service_message,
     };
     use libloading::Library;
     use std::cell::{Cell, RefCell};
@@ -2924,9 +2965,10 @@ sleep 60
         output_len: *mut usize,
     ) -> i32 {
         let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let (request_id, context) =
-            decode_service_envelope::<NativeServiceContext>(input, ServiceEnvelopeKind::Request)
-                .expect("service request should decode");
+        let (invocation_id, request_id, context) = decode_service_envelope_with_invocation_id::<
+            NativeServiceContext,
+        >(input, ServiceEnvelopeKind::Request)
+        .expect("service request should decode");
         let mut response_payload = context.request.payload;
         if GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(Cell::get) {
             let invocation = NATIVE_SERVICE_INVOCATION_COUNT.with(|count| {
@@ -2939,8 +2981,13 @@ sleep 60
             }
         }
         let response = ServiceResponse::ok(response_payload);
-        let encoded = encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response)
-            .expect("service response should encode");
+        let encoded = encode_service_envelope_with_invocation_id(
+            invocation_id,
+            request_id,
+            ServiceEnvelopeKind::Response,
+            &response,
+        )
+        .expect("service response should encode");
         unsafe {
             *output_len = encoded.len();
         }

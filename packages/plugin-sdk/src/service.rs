@@ -173,9 +173,19 @@ pub struct ServiceEnvelope {
 impl ServiceEnvelope {
     #[must_use]
     pub fn new(request_id: u64, kind: ServiceEnvelopeKind, payload: Vec<u8>) -> Self {
+        Self::with_invocation_id(PluginInvocationId::new(), request_id, kind, payload)
+    }
+
+    #[must_use]
+    pub const fn with_invocation_id(
+        invocation_id: PluginInvocationId,
+        request_id: u64,
+        kind: ServiceEnvelopeKind,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
             version: ServiceProtocolVersion::current(),
-            invocation_id: PluginInvocationId::new(),
+            invocation_id,
             request_id,
             kind,
             payload,
@@ -319,7 +329,26 @@ pub fn encode_service_envelope<T>(
 where
     T: Serialize,
 {
-    encode_service_message(&ServiceEnvelope::new(
+    encode_service_envelope_with_invocation_id(PluginInvocationId::new(), request_id, kind, message)
+}
+
+/// Encode a typed message into a service envelope with an explicit invocation ID.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if serialization of the message
+/// or the envelope fails.
+pub fn encode_service_envelope_with_invocation_id<T>(
+    invocation_id: PluginInvocationId,
+    request_id: u64,
+    kind: ServiceEnvelopeKind,
+    message: &T,
+) -> Result<Vec<u8>>
+where
+    T: Serialize,
+{
+    encode_service_message(&ServiceEnvelope::with_invocation_id(
+        invocation_id,
         request_id,
         kind,
         encode_service_message(message)?,
@@ -340,6 +369,25 @@ pub fn decode_service_envelope<T>(
     payload: &[u8],
     expected_kind: ServiceEnvelopeKind,
 ) -> Result<(u64, T)>
+where
+    T: DeserializeOwned,
+{
+    let (_invocation_id, request_id, message) =
+        decode_service_envelope_with_invocation_id(payload, expected_kind)?;
+    Ok((request_id, message))
+}
+
+/// Decode a service envelope and extract its invocation ID and typed payload.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if the envelope cannot be
+/// deserialized, the protocol version is unsupported, the envelope kind
+/// does not match `expected_kind`, or the inner payload fails to deserialize.
+pub fn decode_service_envelope_with_invocation_id<T>(
+    payload: &[u8],
+    expected_kind: ServiceEnvelopeKind,
+) -> Result<(PluginInvocationId, u64, T)>
 where
     T: DeserializeOwned,
 {
@@ -388,6 +436,7 @@ where
         });
     }
     Ok((
+        envelope.invocation_id,
         envelope.request_id,
         decode_service_message::<T>(&envelope.payload)?,
     ))
@@ -511,6 +560,31 @@ mod tests {
                 decode_service_message(&bytes).expect("envelope kind should decode");
             assert_eq!(&decoded, kind);
         }
+    }
+
+    #[test]
+    fn service_envelope_preserves_explicit_invocation_id() {
+        let invocation_id = crate::PluginInvocationId::new();
+        let response = ServiceResponse::ok(vec![7, 8, 9]);
+        let bytes = crate::encode_service_envelope_with_invocation_id(
+            invocation_id.clone(),
+            99,
+            ServiceEnvelopeKind::Response,
+            &response,
+        )
+        .expect("response envelope should encode");
+        let (decoded_invocation_id, request_id, decoded): (
+            crate::PluginInvocationId,
+            u64,
+            ServiceResponse,
+        ) = crate::decode_service_envelope_with_invocation_id(
+            &bytes,
+            ServiceEnvelopeKind::Response,
+        )
+        .expect("response envelope should decode");
+        assert_eq!(decoded_invocation_id, invocation_id);
+        assert_eq!(request_id, 99);
+        assert_eq!(decoded, response);
     }
 
     #[test]

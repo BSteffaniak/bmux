@@ -114,14 +114,16 @@ pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_MAGIC_V1, PROCESS_RUNTIME_PROTOCOL_V1,
     PROCESS_RUNTIME_TRANSPORT_STDIO_V1, ProcessInvocationRequest, ProcessInvocationResponse,
     decode_process_invocation_response, decode_process_runtime_frame,
-    encode_process_invocation_request, encode_process_runtime_frame,
+    encode_process_invocation_request, encode_process_invocation_response,
+    encode_process_runtime_frame,
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{
     CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract, PluginService, ProviderId,
     RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError,
     ServiceInterfaceDescriptor, ServiceKind, ServiceProtocolVersion, ServiceRequest,
-    ServiceResponse, decode_service_envelope, decode_service_message, encode_service_envelope,
+    ServiceResponse, decode_service_envelope, decode_service_envelope_with_invocation_id,
+    decode_service_message, encode_service_envelope, encode_service_envelope_with_invocation_id,
     encode_service_message,
 };
 pub use stateful_plugin::{
