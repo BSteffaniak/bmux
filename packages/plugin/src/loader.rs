@@ -1,10 +1,10 @@
 use crate::{
     CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
-    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, PluginDeclaration, PluginEntrypoint, PluginRegistry,
-    RegisteredPlugin, ServiceCaller, discover_registered_plugins_in_roots,
-    test_support::test_service_router,
+    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL,
+    DEFAULT_NATIVE_SERVICE_SYMBOL, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, PluginDeclaration,
+    PluginEntrypoint, PluginRegistry, RegisteredPlugin, ServiceCaller,
+    discover_registered_plugins_in_roots, test_support::test_service_router,
 };
 use bmux_ipc::{
     InvokeServiceKind, Request as IpcRequest, Response as IpcResponse,
@@ -54,6 +54,7 @@ type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *con
 type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeLifecycleFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeEventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
+type NativeRegisterContributionsFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
 type NativeInvokeServiceFn =
     unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 
@@ -1697,6 +1698,65 @@ impl LoadedPlugin {
     #[must_use]
     pub const fn effective_concurrency_policy(&self) -> EffectiveConcurrencyPolicy {
         EffectiveConcurrencyPolicy::new(self.declaration.concurrency)
+    }
+
+    #[must_use]
+    pub fn manifest_contributions(&self) -> Vec<bmux_plugin_sdk::PluginContribution> {
+        self.declaration
+            .commands
+            .iter()
+            .cloned()
+            .map(bmux_plugin_sdk::PluginContribution::command)
+            .collect()
+    }
+
+    /// Collect activation-time contributions without running cheap manifest discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns when a plugin contribution hook fails or returns invalid transport data.
+    pub fn collect_activation_contributions(
+        &self,
+    ) -> Result<Vec<bmux_plugin_sdk::PluginContribution>> {
+        match &self.backend {
+            PluginBackend::Static(vtable) => (vtable.register_contributions)(),
+            PluginBackend::Dynamic(library) => {
+                let sym: std::result::Result<Symbol<'_, NativeRegisterContributionsFn>, _> =
+                    unsafe { library.get(DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL.as_bytes()) };
+                let Ok(symbol) = sym else {
+                    return Ok(Vec::new());
+                };
+                let (bytes, _) = invoke_native_service_resizing_output(
+                    self.declaration.id.as_str(),
+                    self.native_service_buffers,
+                    |output, output_len| unsafe {
+                        symbol(output.as_mut_ptr(), output.len(), output_len)
+                    },
+                )?;
+                decode_service_message(&bytes)
+            }
+            PluginBackend::Process(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Collect manifest and activation-time contributions, rejecting duplicates deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns when contribution registration fails or duplicate contribution IDs are found.
+    pub fn collect_contributions(&self) -> Result<Vec<bmux_plugin_sdk::PluginContribution>> {
+        let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
+        for contribution in self.manifest_contributions() {
+            registrar
+                .register(contribution)
+                .map_err(|details| PluginError::ServiceProtocol { details })?;
+        }
+        for contribution in self.collect_activation_contributions()? {
+            registrar
+                .register(contribution)
+                .map_err(|details| PluginError::ServiceProtocol { details })?;
+        }
+        Ok(registrar.into_contributions())
     }
 
     /// Collect the typed service registrations exposed by this plugin.

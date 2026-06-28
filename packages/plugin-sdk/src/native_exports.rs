@@ -2,7 +2,7 @@ use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
     NativeStreamingServiceContext, PluginEvent, PluginService, ServiceEnvelopeKind,
     ServiceResponse, TypedServiceRegistry, decode_service_envelope_with_invocation_id,
-    encode_service_envelope_with_invocation_id,
+    encode_service_envelope_with_invocation_id, encode_service_message,
 };
 use std::cell::RefCell;
 use std::ffi::{CString, c_char};
@@ -598,6 +598,59 @@ pub fn register_contributions_concurrent_bundled<P: ConcurrentRustPlugin>(
     let mut registrar = crate::ContributionRegistrar::new();
     instance.register_contributions(&mut registrar)?;
     Ok(registrar.into_contributions())
+}
+
+#[doc(hidden)]
+pub fn register_contributions_export<P: RustPlugin>(
+    instance: &'static RwLock<P>,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+    let Ok(contributions) = register_contributions_bundled(instance) else {
+        return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+    };
+    write_encoded_contributions(&contributions, output_ptr, output_capacity, output_len)
+}
+
+#[doc(hidden)]
+pub fn register_contributions_concurrent_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+    let Ok(contributions) = register_contributions_concurrent_bundled(instance) else {
+        return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+    };
+    write_encoded_contributions(&contributions, output_ptr, output_capacity, output_len)
+}
+
+fn write_encoded_contributions(
+    contributions: &[crate::PluginContribution],
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    let Ok(encoded) = encode_service_message(&contributions.to_vec()) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    SERVICE_STATUS_OK
 }
 
 #[doc(hidden)]

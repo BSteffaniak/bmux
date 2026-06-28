@@ -104,6 +104,10 @@ pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bmux_plugin_deactivate_v1";
 /// Default exported symbol used to deliver plugin events.
 pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
 
+/// Default exported symbol used to register activation-time plugin contributions.
+pub const DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL: &str =
+    "bmux_plugin_register_contributions_v1";
+
 /// Default exported symbol used to invoke a plugin-provided service.
 pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_service_v1";
 

@@ -360,8 +360,8 @@ pub mod __private {
         invoke_service_concurrent_export, invoke_service_export,
         invoke_streaming_service_concurrent_export, invoke_streaming_service_export,
         manifest_toml_ptr, plugin_instance, register_contributions_bundled,
-        register_contributions_concurrent_bundled, register_typed_services_bundled,
-        run_command_export,
+        register_contributions_concurrent_bundled, register_contributions_concurrent_export,
+        register_contributions_export, register_typed_services_bundled, run_command_export,
     };
 }
 
@@ -424,6 +424,20 @@ macro_rules! export_plugin {
                     __bmux_plugin_instance(),
                     input_ptr,
                     input_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_register_contributions_v1(
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::register_contributions_export(
+                    __bmux_plugin_instance(),
+                    output_ptr,
+                    output_capacity,
+                    output_len,
                 )
             }
 
@@ -508,6 +522,20 @@ macro_rules! export_concurrent_plugin {
                     __bmux_plugin_instance(),
                     input_ptr,
                     input_len,
+                )
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_register_contributions_v1(
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::register_contributions_concurrent_export(
+                    __bmux_plugin_instance(),
+                    output_ptr,
+                    output_capacity,
+                    output_len,
                 )
             }
 
