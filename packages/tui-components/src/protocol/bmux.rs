@@ -1,4 +1,8 @@
 //! Built-in open protocol bindings for components exported by this crate.
+//!
+//! This module is intentionally adapter glue: protocol props are decoded into
+//! `bmux_tui_components` data/state types and rendering/event handling is
+//! delegated to the existing components.
 
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
@@ -132,7 +136,10 @@ const ALL_TYPE_IDS: &[&str] = &[
     TREE_VIEW_TYPE_ID,
 ];
 
-/// Register built-in open bindings for every component module exported by this crate.
+/// Register built-in open bindings for every component type id exported by this crate.
+///
+/// Type ids without a native adapter render an explicit unsupported message rather than
+/// reimplementing component drawing in protocol glue.
 pub fn register_bmux_components(bindings: &mut ProtocolBindings) {
     for type_id in ALL_TYPE_IDS {
         bindings.register_component(*type_id, BmuxComponentBinding::new(*type_id));
@@ -171,42 +178,11 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
     ) {
         let props = component_props(node);
         match self.type_id.as_str() {
-            BUTTON_TYPE_ID => render_button(props, area, frame),
             ACTION_ROW_TYPE_ID => render_action_row(props, area, frame),
-            BADGE_TYPE_ID => render_badge(props, area, frame),
-            BAR_CHART_TYPE_ID => render_chart_like(props, area, frame, "bars"),
-            BREADCRUMBS_TYPE_ID => render_joined_list(props, area, frame, "items", " / "),
+            BUTTON_TYPE_ID => render_button(props, area, frame),
             CHECKBOX_TYPE_ID => render_checkbox(props, state, node, area, frame),
-            DIALOG_TYPE_ID | MODAL_FRAME_TYPE_ID | PANE_TYPE_ID | PICKER_FRAME_TYPE_ID => {
-                render_titled_container(props, node, area, frame);
-            }
-            EMPTY_STATE_TYPE_ID => render_title_message(props, area, frame),
-            FILTERED_LIST_TYPE_ID | MENU_TYPE_ID | SELECTABLE_LIST_TYPE_ID => {
-                render_vertical_items(props, area, frame, "items");
-            }
-            FORM_TYPE_ID | FORM_FIELD_TYPE_ID | PANEL_GROUP_TYPE_ID | SCROLL_AREA_TYPE_ID => {
-                render_children_or_title(props, node, area, frame);
-            }
-            KEY_HINT_BAR_TYPE_ID | STATUS_BAR_TYPE_ID | TAB_BAR_TYPE_ID => {
-                render_joined_list(props, area, frame, "items", "  ");
-            }
-            LABELED_DETAILS_TYPE_ID | TABLE_TYPE_ID => render_table_like(props, area, frame),
-            PROGRESS_BAR_TYPE_ID => render_progress(props, area, frame),
-            RADIO_GROUP_TYPE_ID | SELECT_DROPDOWN_TYPE_ID => {
-                render_radio_group(props, state, node, area, frame);
-            }
-            SCROLLBAR_TYPE_ID | SCROLLBAR_LAYOUT_TYPE_ID => {
-                render_scalar(props, area, frame, "scroll");
-            }
-            STEPPER_TYPE_ID => render_joined_list(props, area, frame, "steps", " > "),
-            TEXT_INPUT_TYPE_ID | TEXT_INPUT_BOX_TYPE_ID => render_input(props, area, frame),
-            TEXT_VIEW_TYPE_ID => render_text(props, area, frame),
-            TOAST_STACK_TYPE_ID => render_vertical_items(props, area, frame, "toasts"),
-            TREE_VIEW_TYPE_ID => render_vertical_items(props, area, frame, "nodes"),
-            CANVAS_TYPE_ID | CHART_TYPE_ID | SPARKLINE_TYPE_ID => {
-                render_chart_like(props, area, frame, "points");
-            }
-            _ => render_children_or_title(props, node, area, frame),
+            RADIO_GROUP_TYPE_ID => render_radio_group(props, state, node, area, frame),
+            type_id => render_unsupported(type_id, area, frame),
         }
     }
 
@@ -220,21 +196,10 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
         let props = component_props(node);
         match self.type_id.as_str() {
             ACTION_ROW_TYPE_ID => handle_action_row(props, node, area, event),
+            BUTTON_TYPE_ID => handle_button(props, node, event),
             CHECKBOX_TYPE_ID => handle_checkbox(props, node, state, area, event),
-            RADIO_GROUP_TYPE_ID | SELECT_DROPDOWN_TYPE_ID => {
-                handle_radio_group(props, node, state, area, event)
-            }
-            _ => {
-                if !is_activation(event) {
-                    return Vec::new();
-                }
-                action(props).map_or_else(Vec::new, |action| {
-                    vec![ComponentEvent::new(
-                        node.id.clone(),
-                        ComponentEventKind::Action { action },
-                    )]
-                })
-            }
+            RADIO_GROUP_TYPE_ID => handle_radio_group(props, node, state, area, event),
+            _ => Vec::new(),
         }
     }
 }
@@ -247,22 +212,16 @@ const fn component_props(node: &ComponentNode) -> &ComponentValue {
     }
 }
 
-fn render_button(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
-    let label = string_prop(props, "label").unwrap_or("button");
-    let button = Button::new(label);
-    let state = ButtonState::new();
-    button.render(area, &state, frame);
-}
-
 fn render_action_row(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
     let actions = action_buttons(props);
     let mut state = ActionRowState::new();
     state.set_focused(Some(0));
     ActionRow::new(&actions).render_state(area, &state, frame);
 }
-fn render_badge(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
-    let label = string_prop(props, "label").unwrap_or("badge");
-    frame.write_line(area, &Line::from(format!("[ {label} ]")));
+
+fn render_button(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+    let label = string_prop(props, "label").unwrap_or("button");
+    Button::new(label).render(area, &ButtonState::new(), frame);
 }
 
 fn render_checkbox(
@@ -296,133 +255,11 @@ fn render_radio_group(
     RadioGroup::new(&options).render(area, &group_state, frame);
 }
 
-fn render_input(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
-    let value = string_prop(props, "value")
-        .or_else(|| string_prop(props, "placeholder"))
-        .unwrap_or_default();
-    frame.write_line(area, &Line::from(format!(" {value}")));
-}
-
-fn render_text(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
+fn render_unsupported(type_id: &str, area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         area,
-        &Line::from(string_prop(props, "text").unwrap_or_default()),
+        &Line::from(format!("unsupported protocol component: {type_id}")),
     );
-}
-
-fn render_title_message(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
-    let title = string_prop(props, "title").unwrap_or_default();
-    let message = string_prop(props, "message").unwrap_or_default();
-    frame.write_line(area, &Line::from(format!("{title} {message}")));
-}
-
-fn render_titled_container(
-    props: &ComponentValue,
-    node: &ComponentNode,
-    area: Rect,
-    frame: &mut Frame<'_>,
-) {
-    frame.write_line(
-        area,
-        &Line::from(string_prop(props, "title").unwrap_or_default()),
-    );
-    render_child_labels(
-        node,
-        Rect::new(
-            area.x,
-            area.y.saturating_add(1),
-            area.width,
-            area.height.saturating_sub(1),
-        ),
-        frame,
-    );
-}
-
-fn render_children_or_title(
-    props: &ComponentValue,
-    node: &ComponentNode,
-    area: Rect,
-    frame: &mut Frame<'_>,
-) {
-    if node.children.is_empty() {
-        frame.write_line(
-            area,
-            &Line::from(string_prop(props, "title").unwrap_or_default()),
-        );
-    } else {
-        render_child_labels(node, area, frame);
-    }
-}
-
-fn render_child_labels(node: &ComponentNode, area: Rect, frame: &mut Frame<'_>) {
-    for (index, child) in node
-        .children
-        .iter()
-        .take(usize::from(area.height))
-        .enumerate()
-    {
-        let row = area
-            .y
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-        frame.write_line(
-            Rect::new(area.x, row, area.width, 1),
-            &Line::from(child.id.as_ref().map_or("component", |id| id.as_str())),
-        );
-    }
-}
-
-fn render_joined_list(
-    props: &ComponentValue,
-    area: Rect,
-    frame: &mut Frame<'_>,
-    key: &str,
-    separator: &str,
-) {
-    let text = list_prop(props, key)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(item_label)
-                .collect::<Vec<_>>()
-                .join(separator)
-        })
-        .unwrap_or_default();
-    frame.write_line(area, &Line::from(text));
-}
-
-fn render_vertical_items(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>, key: &str) {
-    if let Some(items) = list_prop(props, key) {
-        for (index, item) in items.iter().take(usize::from(area.height)).enumerate() {
-            let row = area
-                .y
-                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            frame.write_line(
-                Rect::new(area.x, row, area.width, 1),
-                &Line::from(item_label(item).unwrap_or_default()),
-            );
-        }
-    }
-}
-
-fn render_table_like(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
-    render_vertical_items(props, area, frame, "rows");
-}
-
-fn render_chart_like(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>, key: &str) {
-    let count = list_prop(props, key).map_or(0, <[_]>::len);
-    let label = string_prop(props, "label").unwrap_or("chart");
-    frame.write_line(area, &Line::from(format!("{label}: {count} items")));
-}
-
-fn render_scalar(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>, label: &str) {
-    let value = number_prop(props, "value").unwrap_or_default();
-    frame.write_line(area, &Line::from(format!("{label}: {value}")));
-}
-
-fn render_progress(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) {
-    let value = number_prop(props, "value").unwrap_or_default();
-    let max = number_prop(props, "max").unwrap_or(100);
-    frame.write_line(area, &Line::from(format!("[{value}/{max}]")));
 }
 
 fn handle_action_row(
@@ -435,17 +272,24 @@ fn handle_action_row(
     let mut state = ActionRowState::new();
     state.set_focused(Some(0));
     match ActionRow::new(&actions).handle_event(area, &mut state, event) {
-        ActionRowOutcome::Activated { id, .. } => vec![ComponentEvent::new(
-            node.id.clone(),
-            ComponentEventKind::Action {
-                action: ActionId::new(id),
-            },
-        )],
+        ActionRowOutcome::Activated { id, .. } => action_event(node, ActionId::new(id)),
         ActionRowOutcome::Ignored
         | ActionRowOutcome::Handled
         | ActionRowOutcome::Redraw
         | ActionRowOutcome::FocusRequested { .. }
         | ActionRowOutcome::FocusMoved { .. } => Vec::new(),
+    }
+}
+
+fn handle_button(
+    props: &ComponentValue,
+    node: &ComponentNode,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    if is_activation(event) {
+        action(props).map_or_else(Vec::new, |action| action_event(node, action))
+    } else {
+        Vec::new()
     }
 }
 
@@ -464,13 +308,7 @@ fn handle_checkbox(
     checkbox_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
     match Checkbox::new(label).handle_event(area, &mut checkbox_state, event) {
         CheckboxOutcome::Toggled(value) => {
-            set_node_value(node, state, ComponentValue::Bool(value));
-            vec![ComponentEvent::new(
-                node.id.clone(),
-                ComponentEventKind::ValueChanged {
-                    value: ComponentValue::Bool(value),
-                },
-            )]
+            value_changed_event(node, state, ComponentValue::Bool(value))
         }
         CheckboxOutcome::Ignored | CheckboxOutcome::Redraw => Vec::new(),
     }
@@ -490,18 +328,35 @@ fn handle_radio_group(
     group_state.set_disabled(bool_prop(props, "disabled").unwrap_or(false));
     match RadioGroup::new(&options).handle_event(area, &mut group_state, event) {
         RadioGroupOutcome::Selected(index) => options.get(index).map_or_else(Vec::new, |option| {
-            let value = ComponentValue::String(option.id.clone());
-            set_node_value(node, state, value.clone());
-            vec![ComponentEvent::new(
-                node.id.clone(),
-                ComponentEventKind::ValueChanged { value },
-            )]
+            value_changed_event(node, state, ComponentValue::String(option.id.clone()))
         }),
         RadioGroupOutcome::Ignored | RadioGroupOutcome::Redraw | RadioGroupOutcome::Focused(_) => {
             Vec::new()
         }
     }
 }
+
+fn action_event(node: &ComponentNode, action: ActionId) -> Vec<ComponentEvent> {
+    vec![ComponentEvent::new(
+        node.id.clone(),
+        ComponentEventKind::Action { action },
+    )]
+}
+
+fn value_changed_event(
+    node: &ComponentNode,
+    state: &mut ComponentRuntimeState,
+    value: ComponentValue,
+) -> Vec<ComponentEvent> {
+    if let Some(id) = &node.id {
+        state.values.insert(id.clone(), value.clone());
+    }
+    vec![ComponentEvent::new(
+        node.id.clone(),
+        ComponentEventKind::ValueChanged { value },
+    )]
+}
+
 fn action_buttons(props: &ComponentValue) -> Vec<ActionButton> {
     list_prop(props, "actions").map_or_else(Vec::new, |items| {
         items
@@ -544,7 +399,13 @@ fn node_value_bool(state: &ComponentRuntimeState, node: &ComponentNode) -> Optio
     let id = node.id.as_ref()?;
     match state.values.get(id)? {
         ComponentValue::Bool(value) => Some(*value),
-        _ => None,
+        ComponentValue::Null
+        | ComponentValue::I64(_)
+        | ComponentValue::U64(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::String(_)
+        | ComponentValue::List(_)
+        | ComponentValue::Map(_) => None,
     }
 }
 
@@ -554,12 +415,6 @@ fn node_value_string<'a>(
 ) -> Option<&'a str> {
     let id = node.id.as_ref()?;
     state.values.get(id)?.as_str()
-}
-
-fn set_node_value(node: &ComponentNode, state: &mut ComponentRuntimeState, value: ComponentValue) {
-    if let Some(id) = &node.id {
-        state.values.insert(id.clone(), value);
-    }
 }
 
 fn is_focused(state: &ComponentRuntimeState, node: &ComponentNode) -> bool {
@@ -575,22 +430,26 @@ fn string_prop<'a>(value: &'a ComponentValue, key: &str) -> Option<&'a str> {
 fn bool_prop(value: &ComponentValue, key: &str) -> Option<bool> {
     match value.as_map()?.get(key)? {
         ComponentValue::Bool(value) => Some(*value),
-        _ => None,
-    }
-}
-
-fn number_prop(value: &ComponentValue, key: &str) -> Option<u64> {
-    match value.as_map()?.get(key)? {
-        ComponentValue::U64(value) => Some(*value),
-        ComponentValue::I64(value) => u64::try_from(*value).ok(),
-        _ => None,
+        ComponentValue::Null
+        | ComponentValue::I64(_)
+        | ComponentValue::U64(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::String(_)
+        | ComponentValue::List(_)
+        | ComponentValue::Map(_) => None,
     }
 }
 
 fn list_prop<'a>(value: &'a ComponentValue, key: &str) -> Option<&'a [ComponentValue]> {
     match value.as_map()?.get(key)? {
         ComponentValue::List(items) => Some(items),
-        _ => None,
+        ComponentValue::Null
+        | ComponentValue::Bool(_)
+        | ComponentValue::I64(_)
+        | ComponentValue::U64(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::String(_)
+        | ComponentValue::Map(_) => None,
     }
 }
 
@@ -603,7 +462,12 @@ fn item_label(value: &ComponentValue) -> Option<String> {
             .or_else(|| map.get("title").and_then(ComponentValue::as_str))
             .or_else(|| map.get("id").and_then(ComponentValue::as_str))
             .map(str::to_owned),
-        _ => None,
+        ComponentValue::Null
+        | ComponentValue::Bool(_)
+        | ComponentValue::I64(_)
+        | ComponentValue::U64(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::List(_) => None,
     }
 }
 
@@ -615,7 +479,12 @@ fn item_id(value: &ComponentValue) -> Option<String> {
             .and_then(ComponentValue::as_str)
             .or_else(|| map.get("action").and_then(ComponentValue::as_str))
             .map(str::to_owned),
-        _ => None,
+        ComponentValue::Null
+        | ComponentValue::Bool(_)
+        | ComponentValue::I64(_)
+        | ComponentValue::U64(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::List(_) => None,
     }
 }
 
@@ -623,9 +492,21 @@ fn item_bool(value: &ComponentValue, key: &str) -> Option<bool> {
     match value {
         ComponentValue::Map(map) => match map.get(key)? {
             ComponentValue::Bool(value) => Some(*value),
-            _ => None,
+            ComponentValue::Null
+            | ComponentValue::I64(_)
+            | ComponentValue::U64(_)
+            | ComponentValue::F64(_)
+            | ComponentValue::String(_)
+            | ComponentValue::List(_)
+            | ComponentValue::Map(_) => None,
         },
-        _ => None,
+        ComponentValue::Null
+        | ComponentValue::Bool(_)
+        | ComponentValue::I64(_)
+        | ComponentValue::U64(_)
+        | ComponentValue::F64(_)
+        | ComponentValue::String(_)
+        | ComponentValue::List(_) => None,
     }
 }
 
