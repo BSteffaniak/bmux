@@ -2,6 +2,7 @@ use crate::{CapabilityId, HostScope, InterfaceId, PluginError, PluginInvocationI
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -213,6 +214,72 @@ pub struct ServiceResponse {
     #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
     pub error: Option<ServiceError>,
+}
+
+/// Typed-stable service event frame emitted during a streaming invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceEvent {
+    pub invocation_id: PluginInvocationId,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    pub payload: Vec<u8>,
+}
+
+/// Sink for request-scoped service event frames.
+pub trait ServiceEventSink: Send + Sync {
+    /// Emit one event frame for the current service invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::ServiceProtocol`] when the host cannot accept the event.
+    fn emit_event(&self, event: ServiceEvent) -> Result<()>;
+}
+
+/// Shared service event sink handle.
+#[derive(Clone)]
+pub struct ServiceEventSinkHandle(Arc<dyn ServiceEventSink>);
+
+impl ServiceEventSinkHandle {
+    #[must_use]
+    pub fn new<S: ServiceEventSink + 'static>(sink: S) -> Self {
+        Self(Arc::new(sink))
+    }
+
+    #[must_use]
+    pub fn from_arc(sink: Arc<dyn ServiceEventSink>) -> Self {
+        Self(sink)
+    }
+
+    #[must_use]
+    pub fn noop() -> Self {
+        Self::new(NoopServiceEventSink)
+    }
+
+    /// Emit one event frame for the current service invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::ServiceProtocol`] when the host cannot accept the event.
+    pub fn emit_event(&self, event: ServiceEvent) -> Result<()> {
+        self.0.emit_event(event)
+    }
+}
+
+impl std::fmt::Debug for ServiceEventSinkHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceEventSinkHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+/// No-op service event sink used by non-streaming fallback paths.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopServiceEventSink;
+
+impl ServiceEventSink for NoopServiceEventSink {
+    fn emit_event(&self, _event: ServiceEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl ServiceResponse {

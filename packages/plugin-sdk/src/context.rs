@@ -305,6 +305,16 @@ pub struct NativeServiceContext {
     pub host_kernel_bridge: Option<HostKernelBridge>,
 }
 
+/// Context passed to streaming service handlers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeStreamingServiceContext {
+    /// Base service invocation context.
+    pub service: NativeServiceContext,
+    /// Sink used by streaming handlers to emit request-scoped event frames.
+    #[serde(skip, default = "crate::ServiceEventSinkHandle::noop")]
+    pub events: crate::ServiceEventSinkHandle,
+}
+
 // ── Host kernel bridge (opaque FFI handle) ───────────────────────────────────
 
 type HostKernelBridgeFn = unsafe extern "C" fn(

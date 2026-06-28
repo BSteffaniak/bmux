@@ -73,9 +73,9 @@ pub use context::{
     CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
     CoreCliCommandRequest, CoreCliCommandResponse, HostKernelBridge, HostKernelBridgeRequest,
     HostKernelBridgeResponse, NativeCommandContext, NativeCommandInvocationSource,
-    NativeLifecycleContext, NativeServiceContext, PLUGIN_CLI_BRIDGE_MAGIC_V1,
-    PluginCliCommandRequest, PluginCliCommandResponse, RegisteredPluginInfo,
-    SERVICE_ERROR_CANCELLED, decode_host_kernel_bridge_cli_command_payload,
+    NativeLifecycleContext, NativeServiceContext, NativeStreamingServiceContext,
+    PLUGIN_CLI_BRIDGE_MAGIC_V1, PluginCliCommandRequest, PluginCliCommandResponse,
+    RegisteredPluginInfo, SERVICE_ERROR_CANCELLED, decode_host_kernel_bridge_cli_command_payload,
     decode_host_kernel_bridge_plugin_command_payload,
     encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload,
@@ -120,11 +120,11 @@ pub use process_runtime::{
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{
     CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract, PluginService, ProviderId,
-    RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError,
-    ServiceInterfaceDescriptor, ServiceKind, ServiceProtocolVersion, ServiceRequest,
-    ServiceResponse, decode_service_envelope, decode_service_envelope_with_invocation_id,
-    decode_service_message, encode_service_envelope, encode_service_envelope_with_invocation_id,
-    encode_service_message,
+    RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceEvent,
+    ServiceEventSink, ServiceEventSinkHandle, ServiceInterfaceDescriptor, ServiceKind,
+    ServiceProtocolVersion, ServiceRequest, ServiceResponse, decode_service_envelope,
+    decode_service_envelope_with_invocation_id, decode_service_message, encode_service_envelope,
+    encode_service_envelope_with_invocation_id, encode_service_message,
 };
 pub use stateful_plugin::{
     StatefulPlugin, StatefulPluginError, StatefulPluginHandle, StatefulPluginResult,
@@ -349,8 +349,8 @@ pub mod prelude {
 pub mod __private {
     pub use crate::native_exports::{
         activate_export, activate_with_async_bundled, deactivate_export, declared_services_bundled,
-        handle_event_export, invoke_service_export, manifest_toml_ptr, plugin_instance,
-        register_typed_services_bundled, run_command_export,
+        handle_event_export, invoke_service_export, invoke_streaming_service_export,
+        manifest_toml_ptr, plugin_instance, register_typed_services_bundled, run_command_export,
     };
 }
 
@@ -433,6 +433,24 @@ macro_rules! export_plugin {
                     output_len,
                 )
             }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_invoke_streaming_service_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::invoke_streaming_service_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            }
         };
     };
 }
@@ -506,6 +524,23 @@ macro_rules! bundled_plugin_vtable {
             )
         }
 
+        fn __invoke_streaming_service(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            $crate::__private::invoke_streaming_service_export(
+                __instance(),
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+
         fn __register_typed_services(
             context: $crate::TypedServiceRegistrationContext<'_>,
         ) -> $crate::TypedServiceRegistry {
@@ -524,6 +559,7 @@ macro_rules! bundled_plugin_vtable {
             deactivate: __deactivate,
             handle_event: __handle_event,
             invoke_service: __invoke_service,
+            invoke_streaming_service: __invoke_streaming_service,
             register_typed_services: __register_typed_services,
             declared_services: __declared_services,
         }
@@ -540,6 +576,7 @@ pub struct StaticPluginVtable {
     pub deactivate: fn(*const u8, usize) -> i32,
     pub handle_event: fn(*const u8, usize) -> i32,
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
+    pub invoke_streaming_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
     pub register_typed_services:
         fn(context: TypedServiceRegistrationContext<'_>) -> TypedServiceRegistry,
     pub declared_services: fn() -> Result<Vec<PluginService>>,

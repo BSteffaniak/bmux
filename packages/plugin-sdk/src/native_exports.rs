@@ -1,7 +1,8 @@
 use crate::{
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent, PluginService,
-    ServiceEnvelopeKind, ServiceResponse, TypedServiceRegistry,
-    decode_service_envelope_with_invocation_id, encode_service_envelope_with_invocation_id,
+    NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
+    NativeStreamingServiceContext, PluginEvent, PluginService, ServiceEnvelopeKind,
+    ServiceResponse, TypedServiceRegistry, decode_service_envelope_with_invocation_id,
+    encode_service_envelope_with_invocation_id,
 };
 use std::cell::RefCell;
 use std::ffi::{CString, c_char};
@@ -292,6 +293,14 @@ pub trait RustPlugin: Default + Send + 'static {
                 context.plugin_id, context.request.service.interface_id, context.request.operation,
             ),
         )
+    }
+
+    /// Handle a streaming service call.
+    ///
+    /// The default delegates to [`Self::invoke_service`], preserving existing
+    /// non-streaming behavior for plugins that do not emit request-scoped events.
+    fn invoke_streaming_service(&self, context: NativeStreamingServiceContext) -> ServiceResponse {
+        self.invoke_service(context.service)
     }
 
     /// Populate a [`TypedServiceRegistry`] with this plugin's typed
@@ -603,6 +612,62 @@ pub fn invoke_service_export<P: RustPlugin>(
             );
         }
         response
+    };
+
+    let Ok(encoded) = encode_service_envelope_with_invocation_id(
+        invocation_id,
+        request_id,
+        ServiceEnvelopeKind::Response,
+        &response,
+    ) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+
+    unsafe {
+        *output_len = encoded.len();
+    }
+
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+
+    SERVICE_STATUS_OK
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn invoke_streaming_service_export<P: RustPlugin>(
+    instance: &'static RwLock<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let Ok((invocation_id, request_id, service)) = decode_service_envelope_with_invocation_id::<
+        NativeServiceContext,
+    >(input, ServiceEnvelopeKind::Request) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
+
+    let context = NativeStreamingServiceContext {
+        service,
+        events: crate::ServiceEventSinkHandle::noop(),
+    };
+    let response = {
+        let Ok(plugin) = instance.read() else {
+            return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+        };
+        plugin.invoke_streaming_service(context)
     };
 
     let Ok(encoded) = encode_service_envelope_with_invocation_id(

@@ -103,3 +103,6 @@ pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
 
 /// Default exported symbol used to invoke a plugin-provided service.
 pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_service_v1";
+
+/// Default exported symbol used to invoke a plugin-provided streaming service.
+pub const DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_streaming_service_v1";

@@ -1,9 +1,10 @@
 use crate::{
     CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, PluginDeclaration,
-    PluginEntrypoint, PluginRegistry, RegisteredPlugin, ServiceCaller,
-    discover_registered_plugins_in_roots, test_support::test_service_router,
+    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
+    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, PluginDeclaration, PluginEntrypoint, PluginRegistry,
+    RegisteredPlugin, ServiceCaller, discover_registered_plugins_in_roots,
+    test_support::test_service_router,
 };
 use bmux_ipc::{
     InvokeServiceKind, Request as IpcRequest, Response as IpcResponse,
@@ -16,13 +17,14 @@ use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, HostConnectionInfo, HostKernelBridge,
     HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope, LogWriteLevel,
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
-    PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
-    PluginCliCommandRequest, PluginCliCommandResponse, PluginError, PluginEvent,
-    PluginInvocationId, ProcessInvocationRequest, ProcessInvocationResponse, RegisteredService,
-    Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, StaticPluginVtable,
-    decode_process_invocation_response, decode_service_envelope_with_invocation_id,
-    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
+    NativeStreamingServiceContext, PROCESS_RUNTIME_ENV_PERSISTENT_WORKER,
+    PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1,
+    PROCESS_RUNTIME_TRANSPORT_STDIO_V1, PluginCliCommandRequest, PluginCliCommandResponse,
+    PluginError, PluginEvent, PluginInvocationId, ProcessInvocationRequest,
+    ProcessInvocationResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
+    ServiceRequest, ServiceResponse, StaticPluginVtable, decode_process_invocation_response,
+    decode_service_envelope_with_invocation_id, decode_service_message,
+    encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
     encode_service_envelope_with_invocation_id, encode_service_message,
 };
@@ -2096,7 +2098,21 @@ impl LoadedPlugin {
             return self.invoke_process_service(runtime, context);
         }
 
-        self.invoke_native_service(context)
+        self.invoke_native_service(context, false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when streaming or fallback service invocation fails.
+    pub fn invoke_streaming_service(
+        &self,
+        context: &NativeStreamingServiceContext,
+    ) -> Result<ServiceResponse> {
+        if let PluginBackend::Process(runtime) = &self.backend {
+            return self.invoke_process_service(runtime, &context.service);
+        }
+
+        self.invoke_native_service(&context.service, true)
     }
 
     fn invoke_process_service(
@@ -2148,7 +2164,11 @@ impl LoadedPlugin {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn invoke_native_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
+    fn invoke_native_service(
+        &self,
+        context: &NativeServiceContext,
+        streaming: bool,
+    ) -> Result<ServiceResponse> {
         let total_started = Instant::now();
         let backend = match &self.backend {
             PluginBackend::Static(_) => "static",
@@ -2167,14 +2187,25 @@ impl LoadedPlugin {
 
         let resolved_symbol = match &self.backend {
             PluginBackend::Dynamic(library) => {
+                let symbol = if streaming {
+                    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL
+                } else {
+                    DEFAULT_NATIVE_SERVICE_SYMBOL
+                };
                 let sym: Symbol<'_, NativeInvokeServiceFn> =
-                    unsafe { library.get(DEFAULT_NATIVE_SERVICE_SYMBOL.as_bytes()) }.map_err(
-                        |error| PluginError::NativeServiceSymbol {
+                    unsafe { library.get(symbol.as_bytes()) }
+                        .or_else(|error| {
+                            if streaming {
+                                unsafe { library.get(DEFAULT_NATIVE_SERVICE_SYMBOL.as_bytes()) }
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .map_err(|error| PluginError::NativeServiceSymbol {
                             plugin_id: self.declaration.id.as_str().to_string(),
-                            symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
+                            symbol: symbol.to_string(),
                             details: error.to_string(),
-                        },
-                    )?;
+                        })?;
                 Some(sym)
             }
             PluginBackend::Static(_) | PluginBackend::Process(_) => None,
@@ -2182,13 +2213,20 @@ impl LoadedPlugin {
 
         let call_service = |payload: &[u8], output: &mut [u8], output_len: &mut usize| -> i32 {
             match &self.backend {
-                PluginBackend::Static(vtable) => (vtable.invoke_service)(
-                    payload.as_ptr(),
-                    payload.len(),
-                    output.as_mut_ptr(),
-                    output.len(),
-                    output_len,
-                ),
+                PluginBackend::Static(vtable) => {
+                    let invoke = if streaming {
+                        vtable.invoke_streaming_service
+                    } else {
+                        vtable.invoke_service
+                    };
+                    invoke(
+                        payload.as_ptr(),
+                        payload.len(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                        output_len,
+                    )
+                }
                 PluginBackend::Dynamic(_) => {
                     let service_fn = resolved_symbol
                         .as_ref()
@@ -2247,6 +2285,7 @@ impl LoadedPlugin {
             &PhasePayload::new("plugin.native_service_invoke")
                 .field("plugin_id", self.declaration.id.as_str())
                 .field("backend", backend)
+                .field("streaming", streaming)
                 .service_fields(
                     context.request.service.capability.as_str(),
                     format!("{:?}", context.request.service.kind),
@@ -3232,6 +3271,7 @@ minimum = "1.0"
             deactivate: test_static_plugin_lifecycle,
             handle_event: test_static_plugin_event,
             invoke_service: test_static_plugin_service,
+            invoke_streaming_service: test_static_plugin_service,
             register_typed_services: test_static_plugin_typed_services,
             declared_services: || Ok(Vec::new()),
         };
