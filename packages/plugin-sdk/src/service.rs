@@ -2,7 +2,7 @@ use crate::{CapabilityId, HostScope, InterfaceId, PluginError, PluginInvocationI
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const SERVICE_STREAM_MAGIC_V1: &[u8] = b"BMUXSTR1";
@@ -284,6 +284,61 @@ impl ServiceEventSink for NoopServiceEventSink {
     }
 }
 
+/// Bounded in-memory event sink for host streaming dispatch.
+#[derive(Debug, Clone)]
+pub struct BoundedServiceEventSink {
+    capacity: usize,
+    events: Arc<Mutex<Vec<ServiceEvent>>>,
+}
+
+impl BoundedServiceEventSink {
+    /// Create a bounded sink that accepts at most `capacity` events.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Drain accepted events in emission order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::ServiceProtocol`] if the internal event queue lock is poisoned.
+    pub fn drain(&self) -> Result<Vec<ServiceEvent>> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: "service event queue lock poisoned".to_string(),
+            })?;
+        Ok(std::mem::take(&mut *events))
+    }
+}
+
+impl ServiceEventSink for BoundedServiceEventSink {
+    fn emit_event(&self, event: ServiceEvent) -> Result<()> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: "service event queue lock poisoned".to_string(),
+            })?;
+        if events.len() >= self.capacity {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "service event queue overflow: capacity {} exceeded",
+                    self.capacity
+                ),
+            });
+        }
+        events.push(event);
+        drop(events);
+        Ok(())
+    }
+}
+
 impl ServiceResponse {
     #[must_use]
     pub const fn ok(payload: Vec<u8>) -> Self {
@@ -536,6 +591,9 @@ pub fn encode_service_stream_envelopes(envelopes: &[ServiceEnvelope]) -> Result<
     Ok(output)
 }
 
+/// Maximum encoded streaming response frame size accepted by canonical helpers.
+pub const SERVICE_STREAM_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// Decode versioned length-prefixed typed-stable service stream envelopes.
 ///
 /// # Errors
@@ -566,6 +624,13 @@ pub fn decode_service_stream_envelopes(bytes: &[u8]) -> Result<Vec<ServiceEnvelo
                 details: "service stream frame length conversion failed".to_string(),
             }
         })?;
+        if frame_len > SERVICE_STREAM_MAX_FRAME_BYTES {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "service stream frame too large: {frame_len} bytes exceeds {SERVICE_STREAM_MAX_FRAME_BYTES}"
+                ),
+            });
+        }
         if bytes.len() < offset + frame_len {
             return Err(PluginError::ServiceProtocol {
                 details: "service stream output truncated frame payload".to_string(),
@@ -580,10 +645,11 @@ pub fn decode_service_stream_envelopes(bytes: &[u8]) -> Result<Vec<ServiceEnvelo
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError,
-        ServiceEvent, ServiceKind, ServiceRequest, ServiceResponse, decode_service_envelope,
-        decode_service_message, decode_service_stream_envelopes, encode_service_envelope,
-        encode_service_message, encode_service_stream_envelopes,
+        BoundedServiceEventSink, ProviderId, RegisteredService, SERVICE_STREAM_MAGIC_V1,
+        SERVICE_STREAM_MAX_FRAME_BYTES, ServiceEnvelope, ServiceEnvelopeKind, ServiceError,
+        ServiceEvent, ServiceEventSink, ServiceKind, ServiceRequest, ServiceResponse,
+        decode_service_envelope, decode_service_message, decode_service_stream_envelopes,
+        encode_service_envelope, encode_service_message, encode_service_stream_envelopes,
     };
     use crate::HostScope;
 
@@ -773,6 +839,45 @@ mod tests {
         assert!(matches!(decoded[1].kind, ServiceEnvelopeKind::Response));
         assert_eq!(decoded[0].invocation_id, invocation_id);
         assert_eq!(decoded[1].invocation_id, invocation_id);
+    }
+
+    #[test]
+    fn bounded_service_event_sink_preserves_order_and_rejects_overflow() {
+        let invocation_id = crate::PluginInvocationId::new();
+        let sink = BoundedServiceEventSink::new(2);
+        sink.emit_event(ServiceEvent {
+            invocation_id: invocation_id.clone(),
+            payload: vec![1],
+        })
+        .expect("first event should fit");
+        sink.emit_event(ServiceEvent {
+            invocation_id: invocation_id.clone(),
+            payload: vec![2],
+        })
+        .expect("second event should fit");
+        let error = sink
+            .emit_event(ServiceEvent {
+                invocation_id,
+                payload: vec![3],
+            })
+            .expect_err("third event should overflow");
+        assert!(error.to_string().contains("service event queue overflow"));
+        let drained = sink.drain().expect("events should drain");
+        assert_eq!(drained[0].payload, vec![1]);
+        assert_eq!(drained[1].payload, vec![2]);
+    }
+
+    #[test]
+    fn service_stream_rejects_oversized_frame_length() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(SERVICE_STREAM_MAGIC_V1);
+        stream.extend_from_slice(
+            &u32::try_from(SERVICE_STREAM_MAX_FRAME_BYTES + 1)
+                .expect("limit fits u32")
+                .to_be_bytes(),
+        );
+        let error = decode_service_stream_envelopes(&stream).expect_err("oversized frame fails");
+        assert!(error.to_string().contains("service stream frame too large"));
     }
 
     #[test]

@@ -119,12 +119,12 @@ pub use process_runtime::{
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{
-    CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract, PluginService, ProviderId,
-    RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceEvent,
-    ServiceEventSink, ServiceEventSinkHandle, ServiceInterfaceDescriptor, ServiceKind,
-    ServiceProtocolVersion, ServiceRequest, ServiceResponse, decode_service_envelope,
-    decode_service_envelope_with_invocation_id, decode_service_message,
-    decode_service_stream_envelopes, encode_service_envelope,
+    BoundedServiceEventSink, CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract,
+    PluginService, ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind,
+    ServiceError, ServiceEvent, ServiceEventSink, ServiceEventSinkHandle,
+    ServiceInterfaceDescriptor, ServiceKind, ServiceProtocolVersion, ServiceRequest,
+    ServiceResponse, decode_service_envelope, decode_service_envelope_with_invocation_id,
+    decode_service_message, decode_service_stream_envelopes, encode_service_envelope,
     encode_service_envelope_with_invocation_id, encode_service_message,
     encode_service_stream_envelopes,
 };
