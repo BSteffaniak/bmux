@@ -188,7 +188,13 @@ impl<'a> ProtocolEventContext<'a> {
         area: Rect,
         event: &Event,
     ) -> Vec<ComponentEvent> {
-        crate::protocol::render::handle_node_event(child, self.bindings, area, self.runtime, event)
+        crate::protocol::render::handle_node_event_child(
+            child,
+            self.bindings,
+            area,
+            self.runtime,
+            event,
+        )
     }
 
     /// Return mutable protocol runtime.

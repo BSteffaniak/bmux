@@ -19,7 +19,7 @@ pub use bmux::*;
 pub use convert::FromProtocolComponent;
 pub use error::ProtocolComponentError;
 pub use props::{
-    ButtonDefinition, ButtonProps, CheckboxProps, ChoiceOptionProps, FormFieldProps,
-    QuestionFormBuilder, RadioGroupProps, SelectDropdownProps, TextInputProps,
+    ButtonDefinition, ButtonProps, CheckboxGroupProps, CheckboxProps, ChoiceOptionProps,
+    FormBuilder, FormFieldProps, RadioGroupProps, SelectDropdownProps, TextInputProps,
 };
 pub use render::{ProtocolComponent, ProtocolTree};

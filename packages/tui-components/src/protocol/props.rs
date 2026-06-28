@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use bmux_tui_component_protocol::ids::{ActionId, ComponentId};
 use bmux_tui_component_protocol::model::{
-    ComponentKind, ComponentNode, ComponentTree, StackDirection,
+    CheckboxOption, ComponentKind, ComponentNode, ComponentTree, OptionItem, StackDirection,
 };
 use bmux_tui_component_protocol::value::ComponentValue;
 
 use crate::protocol::{
-    ACTION_ROW_TYPE_ID, BUTTON_TYPE_ID, CHECKBOX_TYPE_ID, FORM_FIELD_TYPE_ID, FORM_TYPE_ID,
+    BUTTON_TYPE_ID, CHECKBOX_TYPE_ID, FORM_FIELD_TYPE_ID, FORM_TYPE_ID,
     ProtocolComponentDefinition, ProtocolComponentError, RADIO_GROUP_TYPE_ID,
     SELECT_DROPDOWN_TYPE_ID, TEXT_INPUT_BOX_TYPE_ID, TEXT_INPUT_TYPE_ID,
 };
@@ -225,6 +225,65 @@ impl RadioGroupProps {
     }
 }
 
+/// Protocol props for an intrinsic checkbox group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckboxGroupProps {
+    /// Available options.
+    pub options: Vec<ChoiceOptionProps>,
+    /// Selected option ids.
+    pub selected: Vec<String>,
+    /// Required marker.
+    pub required: bool,
+    /// Disabled state.
+    pub disabled: bool,
+}
+
+impl CheckboxGroupProps {
+    /// Create checkbox-group props.
+    #[must_use]
+    pub const fn new(options: Vec<ChoiceOptionProps>) -> Self {
+        Self {
+            options,
+            selected: Vec::new(),
+            required: false,
+            disabled: false,
+        }
+    }
+
+    /// Set selected option ids.
+    #[must_use]
+    pub fn selected(mut self, selected: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.selected = selected.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Build a protocol node.
+    #[must_use]
+    pub fn into_node(self, id: impl Into<ComponentId>) -> ComponentNode {
+        let selected = self
+            .selected
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let options = self
+            .options
+            .into_iter()
+            .map(|option| {
+                let checked = selected.contains(&option.id);
+                let mut checkbox_option =
+                    CheckboxOption::new(OptionItem::new(option.id, option.label));
+                checkbox_option.checked = checked;
+                checkbox_option
+            })
+            .collect();
+        ComponentNode::leaf(ComponentKind::CheckboxGroup {
+            options,
+            required: self.required,
+            disabled: self.disabled,
+        })
+        .with_id(id)
+    }
+}
+
 /// Checkbox protocol props.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckboxProps {
@@ -291,26 +350,35 @@ impl FormFieldProps {
     }
 }
 
-/// Ergonomic builder for question forms.
+/// Generic vertical form builder for protocol component trees.
 #[derive(Debug, Clone, PartialEq)]
-pub struct QuestionFormBuilder {
+pub struct FormBuilder {
     id: ComponentId,
     children: Vec<ComponentNode>,
+    gap: u16,
 }
 
-impl QuestionFormBuilder {
-    /// Create a question form builder.
+impl FormBuilder {
+    /// Create a generic form builder.
     #[must_use]
     pub fn new(id: impl Into<ComponentId>) -> Self {
         Self {
             id: id.into(),
             children: Vec::new(),
+            gap: 1,
         }
     }
 
-    /// Add prompt/body text.
+    /// Set vertical gap between children.
     #[must_use]
-    pub fn prompt(mut self, text: impl Into<String>) -> Self {
+    pub const fn gap(mut self, gap: u16) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// Add plain text.
+    #[must_use]
+    pub fn text(mut self, text: impl Into<String>) -> Self {
         self.children.push(ComponentNode::leaf(ComponentKind::Text {
             text: text.into(),
             align: None,
@@ -325,45 +393,6 @@ impl QuestionFormBuilder {
         self
     }
 
-    /// Add a text input.
-    #[must_use]
-    pub fn text_input(self, id: impl Into<ComponentId>, props: TextInputProps) -> Self {
-        self.child(props.into_box_node(id))
-    }
-
-    /// Add a radio group.
-    #[must_use]
-    pub fn radio_group(self, id: impl Into<ComponentId>, props: RadioGroupProps) -> Self {
-        self.child(props.into_node(id))
-    }
-
-    /// Add a select dropdown.
-    #[must_use]
-    pub fn select_dropdown(self, id: impl Into<ComponentId>, props: SelectDropdownProps) -> Self {
-        self.child(props.into_node(id))
-    }
-
-    /// Add a checkbox.
-    #[must_use]
-    pub fn checkbox(self, id: impl Into<ComponentId>, props: CheckboxProps) -> Self {
-        self.child(props.into_node(id))
-    }
-
-    /// Add submit/cancel actions.
-    #[must_use]
-    pub fn actions(self, submit_label: impl Into<String>, cancel_label: impl Into<String>) -> Self {
-        let actions = vec![
-            action_value("submit", submit_label.into()),
-            action_value("cancel", cancel_label.into()),
-        ];
-        let mut map = BTreeMap::new();
-        map.insert("actions".to_owned(), ComponentValue::List(actions));
-        self.child(
-            ComponentNode::component(ACTION_ROW_TYPE_ID, ComponentValue::Map(map))
-                .with_id("actions"),
-        )
-    }
-
     /// Build the component tree.
     #[must_use]
     pub fn build(self) -> ComponentTree {
@@ -374,7 +403,7 @@ impl QuestionFormBuilder {
                 vec![ComponentNode::container(
                     ComponentKind::Stack {
                         direction: StackDirection::Vertical,
-                        gap: 1,
+                        gap: self.gap,
                     },
                     self.children,
                 )],
@@ -427,13 +456,6 @@ fn option_value(option: ChoiceOptionProps) -> ComponentValue {
     map.insert("id".to_owned(), ComponentValue::String(option.id));
     map.insert("label".to_owned(), ComponentValue::String(option.label));
     map.insert("disabled".to_owned(), ComponentValue::Bool(option.disabled));
-    ComponentValue::Map(map)
-}
-
-fn action_value(id: impl Into<String>, label: impl Into<String>) -> ComponentValue {
-    let mut map = BTreeMap::new();
-    map.insert("id".to_owned(), ComponentValue::String(id.into()));
-    map.insert("label".to_owned(), ComponentValue::String(label.into()));
     ComponentValue::Map(map)
 }
 

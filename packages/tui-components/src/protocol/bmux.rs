@@ -31,7 +31,7 @@ use crate::select_dropdown::{
     SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption,
 };
 use crate::text_input::{TextInputPolicy, TextInputState};
-use crate::text_input_box::{TextInputBox, TextInputBoxOutcome};
+use crate::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
 use crate::text_view::{TextView, TextViewState};
 
 /// Open component type id for `action_row`.
@@ -50,6 +50,8 @@ pub const CANVAS_TYPE_ID: &str = "bmux.canvas";
 pub const CHART_TYPE_ID: &str = "bmux.chart";
 /// Open component type id for `checkbox`.
 pub const CHECKBOX_TYPE_ID: &str = "bmux.checkbox";
+/// Open component type id for `checkbox_group`.
+pub const CHECKBOX_GROUP_TYPE_ID: &str = "bmux.checkbox_group";
 /// Open component type id for `dialog`.
 pub const DIALOG_TYPE_ID: &str = "bmux.dialog";
 /// Open component type id for `empty_state`.
@@ -118,6 +120,7 @@ const ALL_TYPE_IDS: &[&str] = &[
     CANVAS_TYPE_ID,
     CHART_TYPE_ID,
     CHECKBOX_TYPE_ID,
+    CHECKBOX_GROUP_TYPE_ID,
     DIALOG_TYPE_ID,
     EMPTY_STATE_TYPE_ID,
     FILTERED_LIST_TYPE_ID,
@@ -251,6 +254,8 @@ impl ProtocolComponentBinding for BmuxComponentBinding {
             ACTION_ROW_TYPE_ID => {
                 handle_action_row_with_runtime(props, node, context.runtime(), area, event)
             }
+            FORM_FIELD_TYPE_ID => handle_form_field_with_context(node, props, area, event, context),
+            FORM_TYPE_ID => handle_form_with_context(node, area, event, context),
             RADIO_GROUP_TYPE_ID => {
                 handle_radio_group_with_runtime(props, node, context.runtime(), area, event)
             }
@@ -453,6 +458,59 @@ fn render_form(node: &ComponentNode, area: Rect, context: &mut ProtocolRenderCon
     }
 }
 
+fn handle_form_with_context(
+    node: &ComponentNode,
+    area: Rect,
+    event: &Event,
+    context: &mut crate::protocol::ProtocolEventContext<'_>,
+) -> Vec<ComponentEvent> {
+    let child_count = u16::try_from(node.children.len())
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let row_height = area.height.saturating_div(child_count).max(1);
+    let mut output = Vec::new();
+    for (index, child) in node.children.iter().enumerate() {
+        let row = u16::try_from(index).unwrap_or(u16::MAX);
+        let y = area.y.saturating_add(row.saturating_mul(row_height));
+        let remaining = area.bottom().saturating_sub(y);
+        if remaining == 0 {
+            break;
+        }
+        let height = if index + 1 == node.children.len() {
+            remaining
+        } else {
+            row_height.min(remaining)
+        };
+        output.extend(context.handle_child_event(
+            child,
+            Rect::new(area.x, y, area.width, height),
+            event,
+        ));
+    }
+    output
+}
+
+fn handle_form_field_with_context(
+    node: &ComponentNode,
+    props: &ComponentValue,
+    area: Rect,
+    event: &Event,
+    context: &mut crate::protocol::ProtocolEventContext<'_>,
+) -> Vec<ComponentEvent> {
+    let label = string_prop(props, "label").unwrap_or("Field");
+    let mut field = FormField::new(label).required(bool_prop(props, "required").unwrap_or(false));
+    if let Some(help) = string_prop(props, "help") {
+        field = field.help(help);
+    }
+    if let Some(error) = string_prop(props, "error") {
+        field = field.error(error);
+    }
+    let control = field.layout(area).control;
+    node.children.first().map_or_else(Vec::new, |child| {
+        context.handle_child_event(child, control, event)
+    })
+}
+
 fn render_form_field_chrome(props: &ComponentValue, area: Rect, frame: &mut Frame<'_>) -> Rect {
     let label = string_prop(props, "label").unwrap_or("Field");
     let mut field = FormField::new(label).required(bool_prop(props, "required").unwrap_or(false));
@@ -498,10 +556,11 @@ fn render_text_input_with_runtime(
         .unwrap_or_default()
         .to_owned();
     let state_key = local_state_key(node, type_id);
+    let focused = is_focused(runtime.state(), node);
     let input_state = runtime.local_state_or_insert_with(&state_key, || {
         TextInputState::new(TextEditBuffer::from_text(&value))
     });
-    text_input_box(props).render(area, input_state, frame);
+    text_input_box(props, focused).render(area, input_state, frame);
 }
 
 fn render_text_input(
@@ -696,10 +755,11 @@ fn handle_text_input_with_runtime(
         .unwrap_or_default()
         .to_owned();
     let state_key = local_state_key(node, type_id);
+    let focused = is_focused(runtime.state(), node);
     let input_state = runtime.local_state_or_insert_with(&state_key, || {
         TextInputState::new(TextEditBuffer::from_text(&value))
     });
-    let outcome = text_input_box(props).handle_event(area, input_state, event);
+    let outcome = text_input_box(props, focused).handle_event(area, input_state, event);
     let text = input_state.buffer().text().to_owned();
     match outcome {
         TextInputBoxOutcome::Edited => {
@@ -873,8 +933,13 @@ fn node_type_id(node: &ComponentNode) -> Option<ComponentTypeId> {
     }
 }
 
-fn text_input_box(props: &ComponentValue) -> TextInputBox<'_> {
-    let mut input = TextInputBox::new(TextInputPolicy::chat_composer());
+fn text_input_box(props: &ComponentValue, focused: bool) -> TextInputBox<'_> {
+    let disabled = bool_prop(props, "disabled").unwrap_or(false);
+    let mut input = TextInputBox::new(TextInputPolicy::chat_composer()).policy(
+        TextInputBoxPolicy::field()
+            .focused(focused)
+            .disabled(disabled),
+    );
     if let Some(label) = string_prop(props, "label") {
         input = input.label(label);
     }

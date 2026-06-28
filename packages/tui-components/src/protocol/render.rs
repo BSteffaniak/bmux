@@ -6,18 +6,18 @@ use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_component_protocol::event::{ComponentEvent, ComponentEventKind};
-use bmux_tui_component_protocol::ids::ComponentId;
+use bmux_tui_component_protocol::ids::{ComponentId, ComponentTypeId};
 use bmux_tui_component_protocol::model::{
-    ButtonRole, ComponentKind, ComponentNode, ComponentTree, PanelChrome, StackDirection,
-    StatusLevel,
+    ButtonRole, CheckboxOption, ComponentKind, ComponentNode, ComponentTree, PanelChrome,
+    StackDirection, StatusLevel,
 };
 use bmux_tui_component_protocol::state::ComponentRuntimeState;
 use bmux_tui_component_protocol::value::ComponentValue;
 
 use crate::button::{Button, ButtonOutcome, ButtonState, ButtonStyles};
-use crate::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
+use crate::checkbox::{Checkbox, CheckboxState};
 use crate::protocol::convert::radio_options;
-use crate::protocol::{ProtocolBindings, ProtocolRuntime};
+use crate::protocol::{ProtocolBindings, ProtocolLocalStateKey, ProtocolRuntime};
 use crate::radio_group::{RadioGroup, RadioGroupOutcome, RadioGroupState};
 
 /// Renderable view over a protocol component tree.
@@ -47,6 +47,7 @@ impl<'a> ProtocolTree<'a> {
 
     /// Render the tree with host-local component UI state.
     pub fn render_runtime(&self, area: Rect, runtime: &mut ProtocolRuntime, frame: &mut Frame<'_>) {
+        ensure_initial_focus(&self.tree.root, runtime);
         ProtocolComponent::new(&self.tree.root, self.bindings).render_runtime(area, runtime, frame);
     }
 
@@ -63,6 +64,7 @@ impl<'a> ProtocolTree<'a> {
         runtime: &mut ProtocolRuntime,
         event: &Event,
     ) -> Vec<ComponentEvent> {
+        ensure_initial_focus(&self.tree.root, runtime);
         ProtocolComponent::new(&self.tree.root, self.bindings)
             .handle_event_runtime(area, runtime, event)
     }
@@ -96,6 +98,7 @@ impl<'a> ProtocolComponent<'a> {
 
     /// Render this node with host-local component UI state.
     pub fn render_runtime(&self, area: Rect, runtime: &mut ProtocolRuntime, frame: &mut Frame<'_>) {
+        ensure_initial_focus(self.node, runtime);
         render_node(self.node, self.bindings, area, runtime, frame);
     }
 
@@ -112,7 +115,8 @@ impl<'a> ProtocolComponent<'a> {
         runtime: &mut ProtocolRuntime,
         event: &Event,
     ) -> Vec<ComponentEvent> {
-        handle_node_event(self.node, self.bindings, area, runtime, event)
+        ensure_initial_focus(self.node, runtime);
+        handle_node_event_root(self.node, self.bindings, area, runtime, event)
     }
 
     /// Handle one input event for this node.
@@ -127,6 +131,11 @@ impl<'a> ProtocolComponent<'a> {
         *state = runtime.into_state();
         events
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CheckboxGroupLocalState {
+    focused: usize,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -209,14 +218,21 @@ pub(super) fn render_node(
         ComponentKind::CheckboxGroup {
             options, disabled, ..
         } => {
+            let selected_values = checkbox_group_selected(node, runtime.state(), options);
+            let focused_index = checkbox_group_local_state(node, runtime).focused;
             for (index, option) in options.iter().take(usize::from(area.height)).enumerate() {
                 let row = area
                     .y
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
                 let checkbox = Checkbox::new(option.option.label.as_str());
-                let mut checkbox_state = CheckboxState::new(option.checked);
+                let mut checkbox_state = CheckboxState::new(
+                    selected_values.as_ref().map_or(option.checked, |selected| {
+                        selected.contains(&option.option.id)
+                    }),
+                );
                 checkbox_state.set_disabled(*disabled || option.option.disabled);
-                checkbox_state.set_focused(is_focused(node, runtime.state()) && index == 0);
+                checkbox_state
+                    .set_focused(is_focused(node, runtime.state()) && index == focused_index);
                 checkbox.render(
                     Rect::new(area.x, row, area.width, 1),
                     &checkbox_state,
@@ -267,14 +283,36 @@ pub(super) fn render_node(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn handle_node_event(
+pub(super) fn handle_node_event_root(
     node: &ComponentNode,
     bindings: Option<&ProtocolBindings>,
     area: Rect,
     runtime: &mut ProtocolRuntime,
     event: &Event,
 ) -> Vec<ComponentEvent> {
-    if handle_focus_traversal(node, runtime, event) {
+    handle_node_event(node, bindings, area, runtime, event, true)
+}
+
+pub(super) fn handle_node_event_child(
+    node: &ComponentNode,
+    bindings: Option<&ProtocolBindings>,
+    area: Rect,
+    runtime: &mut ProtocolRuntime,
+    event: &Event,
+) -> Vec<ComponentEvent> {
+    handle_node_event(node, bindings, area, runtime, event, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_node_event(
+    node: &ComponentNode,
+    bindings: Option<&ProtocolBindings>,
+    area: Rect,
+    runtime: &mut ProtocolRuntime,
+    event: &Event,
+    allow_focus_traversal: bool,
+) -> Vec<ComponentEvent> {
+    if allow_focus_traversal && handle_focus_traversal(node, runtime, event) {
         return Vec::new();
     }
     match &node.kind {
@@ -329,30 +367,51 @@ pub(super) fn handle_node_event(
             Vec::new()
         }
         ComponentKind::CheckboxGroup { options, .. } => {
-            let mut events = Vec::new();
-            for (index, option) in options.iter().take(usize::from(area.height)).enumerate() {
-                let row = area
-                    .y
-                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-                let option_area = Rect::new(area.x, row, area.width, 1);
-                let mut checkbox_state = CheckboxState::new(option.checked);
-                checkbox_state.set_focused(is_focused(node, runtime.state()) && index == 0);
-                if matches!(
-                    Checkbox::new(option.option.label.as_str()).handle_event(
-                        option_area,
-                        &mut checkbox_state,
-                        event,
-                    ),
-                    CheckboxOutcome::Toggled(_)
-                ) {
-                    let value = ComponentValue::String(option.option.id.clone());
-                    events.push(ComponentEvent::new(
-                        node.id.clone(),
-                        ComponentEventKind::ValueChanged { value },
-                    ));
-                }
+            let Event::Key(stroke) = event else {
+                return Vec::new();
+            };
+            if stroke.modifiers.ctrl || stroke.modifiers.alt || !is_focused(node, runtime.state()) {
+                return Vec::new();
             }
-            events
+            match stroke.key {
+                bmux_keyboard::KeyCode::Up | bmux_keyboard::KeyCode::Left => {
+                    move_checkbox_group_focus(node, runtime, options, Direction::Previous);
+                    return Vec::new();
+                }
+                bmux_keyboard::KeyCode::Down | bmux_keyboard::KeyCode::Right => {
+                    move_checkbox_group_focus(node, runtime, options, Direction::Next);
+                    return Vec::new();
+                }
+                _ => {}
+            }
+            let Some(target_index) =
+                checkbox_group_target_index(node, runtime, options, stroke.key)
+            else {
+                return Vec::new();
+            };
+            let Some(target) = options.get(target_index) else {
+                return Vec::new();
+            };
+            if target.option.disabled {
+                return Vec::new();
+            }
+            let mut selected = checkbox_group_selected(node, runtime.state(), options)
+                .unwrap_or_else(|| checkbox_group_initial_selected(options));
+            if !selected.insert(target.option.id.clone()) {
+                selected.remove(&target.option.id);
+            }
+            let value = ComponentValue::List(
+                selected
+                    .iter()
+                    .cloned()
+                    .map(ComponentValue::String)
+                    .collect(),
+            );
+            set_node_value(node, runtime.state_mut(), value.clone());
+            vec![ComponentEvent::new(
+                node.id.clone(),
+                ComponentEventKind::ValueChanged { value },
+            )]
         }
         ComponentKind::Form { submit, cancel } => match event {
             Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
@@ -426,6 +485,16 @@ fn handle_focus_traversal(
     };
     runtime.state_mut().focus.focused = order.get(next_index).cloned();
     true
+}
+
+fn ensure_initial_focus(root: &ComponentNode, runtime: &mut ProtocolRuntime) {
+    if runtime.state().focus.focused.is_some() {
+        return;
+    }
+    let mut order = Vec::new();
+    collect_focusable(root, &mut order);
+    runtime.state_mut().focus.traversal_order.clone_from(&order);
+    runtime.state_mut().focus.focused = order.first().cloned();
 }
 
 fn collect_focusable(node: &ComponentNode, output: &mut Vec<ComponentId>) {
@@ -631,9 +700,43 @@ fn children_events(
     runtime: &mut ProtocolRuntime,
     event: &Event,
 ) -> Vec<ComponentEvent> {
+    match &node.kind {
+        ComponentKind::Stack {
+            direction: StackDirection::Vertical,
+            gap,
+        } => children_events_vertical(node, bindings, area, runtime, event, *gap),
+        ComponentKind::Stack {
+            direction: StackDirection::Horizontal,
+            gap,
+        } => children_events_horizontal(node, bindings, area, runtime, event, *gap),
+        ComponentKind::Panel { chrome, .. } if *chrome == PanelChrome::Border => {
+            children_events_vertical(
+                node,
+                bindings,
+                area.inset(Insets::new(1, 1, 1, 1)),
+                runtime,
+                event,
+                0,
+            )
+        }
+        _ => children_events_vertical(node, bindings, area, runtime, event, 0),
+    }
+}
+
+fn children_events_vertical(
+    node: &ComponentNode,
+    bindings: Option<&ProtocolBindings>,
+    area: Rect,
+    runtime: &mut ProtocolRuntime,
+    event: &Event,
+    gap: u16,
+) -> Vec<ComponentEvent> {
     let mut output = Vec::new();
     let mut y = area.y;
     for child in &node.children {
+        if y >= area.bottom() {
+            break;
+        }
         let height = node_height(child).min(area.bottom().saturating_sub(y));
         output.extend(handle_node_event(
             child,
@@ -641,10 +744,66 @@ fn children_events(
             Rect::new(area.x, y, area.width, height),
             runtime,
             event,
+            false,
         ));
-        y = y.saturating_add(height);
+        y = y.saturating_add(height).saturating_add(gap);
     }
     output
+}
+
+fn children_events_horizontal(
+    node: &ComponentNode,
+    bindings: Option<&ProtocolBindings>,
+    area: Rect,
+    runtime: &mut ProtocolRuntime,
+    event: &Event,
+    gap: u16,
+) -> Vec<ComponentEvent> {
+    let count = u16::try_from(node.children.len())
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let width = area
+        .width
+        .saturating_sub(gap.saturating_mul(count.saturating_sub(1)))
+        / count;
+    let mut output = Vec::new();
+    let mut x = area.x;
+    for child in &node.children {
+        if x >= area.right() {
+            break;
+        }
+        output.extend(handle_node_event(
+            child,
+            bindings,
+            Rect::new(x, area.y, width, area.height),
+            runtime,
+            event,
+            false,
+        ));
+        x = x.saturating_add(width).saturating_add(gap);
+    }
+    output
+}
+
+fn component_node_height(type_id: &ComponentTypeId, node: &ComponentNode) -> u16 {
+    match type_id.as_str() {
+        "bmux.text_input_box" => 3,
+        "bmux.radio_group" | "bmux.checkbox_group" => match &node.kind {
+            ComponentKind::Component { props, .. }
+            | ComponentKind::Extension { payload: props, .. } => props
+                .as_map()
+                .and_then(|props| props.get("options"))
+                .and_then(|value| match value {
+                    ComponentValue::List(values) => Some(values.as_slice()),
+                    _ => None,
+                })
+                .map_or(1, |options| {
+                    u16::try_from(options.len()).unwrap_or(u16::MAX)
+                }),
+            _ => 1,
+        },
+        _ => node.children.iter().map(node_height).sum::<u16>().max(1),
+    }
 }
 
 fn node_height(node: &ComponentNode) -> u16 {
@@ -675,6 +834,10 @@ fn node_height(node: &ComponentNode) -> u16 {
         ComponentKind::TextArea { rows, .. } => *rows,
         ComponentKind::Form { .. } => node.children.iter().map(node_height).sum(),
         ComponentKind::Spacer { size } => *size,
+        ComponentKind::Component { type_id, .. } => component_node_height(type_id, node),
+        ComponentKind::Extension { kind, .. } => {
+            component_node_height(&ComponentTypeId::new(kind.clone()), node)
+        }
         _ => 1,
     }
 }
@@ -745,6 +908,127 @@ fn selected_radio_index(
         return None;
     };
     options.iter().position(|option| &option.id == selected)
+}
+
+fn checkbox_group_selected(
+    node: &ComponentNode,
+    state: &ComponentRuntimeState,
+    options: &[CheckboxOption],
+) -> Option<std::collections::BTreeSet<String>> {
+    let id = node.id.as_ref()?;
+    let ComponentValue::List(selected) = state.values.get(id)? else {
+        return None;
+    };
+    let allowed = options
+        .iter()
+        .map(|option| option.option.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    Some(
+        selected
+            .iter()
+            .filter_map(|value| match value {
+                ComponentValue::String(value) if allowed.contains(value.as_str()) => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+fn checkbox_group_initial_selected(
+    options: &[CheckboxOption],
+) -> std::collections::BTreeSet<String> {
+    options
+        .iter()
+        .filter(|option| option.checked)
+        .map(|option| option.option.id.clone())
+        .collect()
+}
+
+fn checkbox_group_target_index(
+    node: &ComponentNode,
+    runtime: &mut ProtocolRuntime,
+    options: &[CheckboxOption],
+    key: bmux_keyboard::KeyCode,
+) -> Option<usize> {
+    match key {
+        bmux_keyboard::KeyCode::Char(' ') | bmux_keyboard::KeyCode::Enter => {
+            let focused = checkbox_group_local_state(node, runtime).focused;
+            (focused < options.len())
+                .then_some(focused)
+                .or_else(|| options.iter().position(|option| !option.option.disabled))
+        }
+        bmux_keyboard::KeyCode::Char(value) if value.is_ascii_digit() => value
+            .to_digit(10)
+            .and_then(|digit| usize::try_from(digit).ok())
+            .and_then(|digit| digit.checked_sub(1))
+            .filter(|index| *index < options.len()),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Previous,
+    Next,
+}
+
+fn move_checkbox_group_focus(
+    node: &ComponentNode,
+    runtime: &mut ProtocolRuntime,
+    options: &[CheckboxOption],
+    direction: Direction,
+) {
+    if options.is_empty() {
+        checkbox_group_local_state(node, runtime).focused = 0;
+        return;
+    }
+    let current = checkbox_group_local_state(node, runtime)
+        .focused
+        .min(options.len().saturating_sub(1));
+    let next = next_enabled_checkbox_index(options, current, direction).unwrap_or(current);
+    checkbox_group_local_state(node, runtime).focused = next;
+}
+
+fn next_enabled_checkbox_index(
+    options: &[CheckboxOption],
+    current: usize,
+    direction: Direction,
+) -> Option<usize> {
+    if options.iter().all(|option| option.option.disabled) {
+        return None;
+    }
+    let mut index = current;
+    for _ in 0..options.len() {
+        index = match direction {
+            Direction::Previous => {
+                if index == 0 {
+                    options.len().saturating_sub(1)
+                } else {
+                    index.saturating_sub(1)
+                }
+            }
+            Direction::Next => (index + 1) % options.len(),
+        };
+        if !options[index].option.disabled {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn checkbox_group_local_state<'a>(
+    node: &ComponentNode,
+    runtime: &'a mut ProtocolRuntime,
+) -> &'a mut CheckboxGroupLocalState {
+    let key = ProtocolLocalStateKey::new(
+        node.id
+            .clone()
+            .unwrap_or_else(|| ComponentId::new("anonymous-checkbox-group")),
+        ComponentTypeId::new("bmux.checkbox_group"),
+    );
+    runtime.local_state_or_insert_with(&key, CheckboxGroupLocalState::default)
 }
 
 fn set_node_value(node: &ComponentNode, state: &mut ComponentRuntimeState, value: ComponentValue) {
