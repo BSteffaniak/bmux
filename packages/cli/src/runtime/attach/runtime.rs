@@ -4,8 +4,8 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
 use bmux_attach_layout_protocol::{
-    AttachFocusTarget, AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding,
-    AttachMouseProtocolMode, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+    AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding, AttachMouseProtocolMode, AttachRect,
+    AttachScene, AttachSurface, AttachSurfaceKind,
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
@@ -12198,50 +12198,12 @@ fn attach_scene_pane_is_floating(view_state: &AttachViewState, pane_id: Uuid) ->
         })
 }
 
-fn attach_pane_is_authoritatively_focused(view_state: &AttachViewState, pane_id: Uuid) -> bool {
-    focused_attach_pane_id(view_state) == Some(pane_id)
-}
-
-fn optimistically_focus_attach_pane(view_state: &mut AttachViewState, pane_id: Uuid) {
-    let previous_focus = focused_attach_pane_id(view_state);
-    view_state.mouse.last_focused_pane_id = Some(pane_id);
-
-    if let Some(layout_state) = view_state.cached_layout_state.as_mut() {
-        layout_state.focused_pane_id = pane_id;
-        layout_state.scene.focus = AttachFocusTarget::Pane { pane_id };
-        for pane in &mut layout_state.panes {
-            pane.focused = pane.id == pane_id;
-        }
-    }
-
-    if let Some(layout_state) = view_state.cached_layout_state.clone() {
-        if let Some(previous_pane_id) = previous_focus {
-            mark_pane_surface_dirty(
-                &mut view_state.dirty,
-                &layout_state,
-                previous_pane_id,
-                AttachDirtySource::FocusChanged,
-            );
-        }
-        mark_pane_surface_dirty(
-            &mut view_state.dirty,
-            &layout_state,
-            pane_id,
-            AttachDirtySource::FocusChanged,
-        );
-    }
-    view_state
-        .dirty
-        .mark_layout_refresh_and_status_dirty(AttachDirtySource::FocusChanged);
-}
-
 pub async fn focus_attach_pane(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     pane_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
-    if attach_pane_is_authoritatively_focused(view_state, pane_id) {
-        view_state.mouse.last_focused_pane_id = Some(pane_id);
+    if view_state.mouse.last_focused_pane_id == Some(pane_id) {
         return Ok(());
     }
 
@@ -12268,7 +12230,27 @@ pub async fn focus_attach_pane(
         .await?;
     }
 
-    optimistically_focus_attach_pane(view_state, pane_id);
+    let previous_focus = focused_attach_pane_id(view_state);
+    view_state.mouse.last_focused_pane_id = Some(pane_id);
+    if let Some(layout_state) = view_state.cached_layout_state.clone() {
+        if let Some(previous_pane_id) = previous_focus {
+            mark_pane_surface_dirty(
+                &mut view_state.dirty,
+                &layout_state,
+                previous_pane_id,
+                AttachDirtySource::FocusChanged,
+            );
+        }
+        mark_pane_surface_dirty(
+            &mut view_state.dirty,
+            &layout_state,
+            pane_id,
+            AttachDirtySource::FocusChanged,
+        );
+    }
+    view_state
+        .dirty
+        .mark_layout_refresh_and_status_dirty(AttachDirtySource::FocusChanged);
 
     Ok(())
 }
@@ -12837,100 +12819,6 @@ mod tests {
 
         assert_eq!(caps.cell_pixel_width, 8);
         assert_eq!(caps.cell_pixel_height, 16);
-    }
-
-    fn attach_view_state_with_two_panes(
-        focused_pane_id: Uuid,
-        other_pane_id: Uuid,
-    ) -> AttachViewState {
-        let session_id = Uuid::new_v4();
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
-            context_id: None,
-            session_id,
-            can_write: true,
-        });
-        view_state.cached_layout_state = Some(AttachLayoutState {
-            context_id: None,
-            session_id,
-            focused_pane_id,
-            panes: vec![
-                PaneSummary {
-                    id: focused_pane_id,
-                    index: 0,
-                    name: None,
-                    focused: true,
-                    state: PaneState::Running,
-                    state_reason: None,
-                },
-                PaneSummary {
-                    id: other_pane_id,
-                    index: 1,
-                    name: None,
-                    focused: false,
-                    state: PaneState::Running,
-                    state_reason: None,
-                },
-            ],
-            layout_root: PaneLayoutNode::Leaf {
-                pane_id: focused_pane_id,
-            },
-            scene: AttachScene {
-                session_id,
-                focus: AttachFocusTarget::Pane {
-                    pane_id: focused_pane_id,
-                },
-                surfaces: Vec::new(),
-            },
-            zoomed: false,
-        });
-        view_state
-    }
-
-    #[test]
-    fn authoritative_focus_ignores_stale_last_focused_pane_id() {
-        let focused = Uuid::new_v4();
-        let stale_last_focused = Uuid::new_v4();
-        let mut view_state = attach_view_state_with_two_panes(focused, stale_last_focused);
-        view_state.mouse.last_focused_pane_id = Some(stale_last_focused);
-
-        assert!(!attach_pane_is_authoritatively_focused(
-            &view_state,
-            stale_last_focused
-        ));
-        assert!(attach_pane_is_authoritatively_focused(&view_state, focused));
-    }
-
-    #[test]
-    fn optimistic_focus_updates_cached_layout_focus() {
-        let focused = Uuid::new_v4();
-        let focus_target = Uuid::new_v4();
-        let mut view_state = attach_view_state_with_two_panes(focused, focus_target);
-
-        optimistically_focus_attach_pane(&mut view_state, focus_target);
-
-        assert_eq!(focused_attach_pane_id(&view_state), Some(focus_target));
-        assert_eq!(view_state.mouse.last_focused_pane_id, Some(focus_target));
-        let layout_state = view_state.cached_layout_state.as_ref().expect("layout");
-        assert_eq!(
-            layout_state.scene.focus,
-            AttachFocusTarget::Pane {
-                pane_id: focus_target
-            }
-        );
-        assert!(
-            layout_state
-                .panes
-                .iter()
-                .find(|pane| pane.id == focus_target)
-                .is_some_and(|pane| pane.focused)
-        );
-        assert!(
-            layout_state
-                .panes
-                .iter()
-                .find(|pane| pane.id == focused)
-                .is_some_and(|pane| !pane.focused)
-        );
     }
 
     #[test]
