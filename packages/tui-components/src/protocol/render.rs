@@ -45,6 +45,12 @@ impl<'a> ProtocolTree<'a> {
         }
     }
 
+    /// Estimate rendered height for this tree in terminal rows.
+    #[must_use]
+    pub fn measure_height(&self, _width: u16) -> u16 {
+        node_height(&self.tree.root)
+    }
+
     /// Render the tree with host-local component UI state.
     pub fn render_runtime(&self, area: Rect, runtime: &mut ProtocolRuntime, frame: &mut Frame<'_>) {
         ensure_initial_focus(&self.tree.root, runtime);

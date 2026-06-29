@@ -59,7 +59,7 @@ impl ProtocolLocalStateKey {
 #[derive(Default)]
 pub struct ProtocolRuntime {
     state: ComponentRuntimeState,
-    local_state: BTreeMap<ProtocolLocalStateKey, Box<dyn Any>>,
+    local_state: BTreeMap<ProtocolLocalStateKey, Box<dyn Any + Send>>,
 }
 
 impl ProtocolRuntime {
@@ -96,7 +96,7 @@ impl ProtocolRuntime {
     }
 
     /// Return typed local state for the component, inserting it when absent or stale.
-    pub fn local_state_or_insert_with<T: Any>(
+    pub fn local_state_or_insert_with<T: Any + Send>(
         &mut self,
         key: &ProtocolLocalStateKey,
         init: impl FnOnce() -> T,
@@ -209,7 +209,7 @@ impl<'a> ProtocolEventContext<'a> {
 }
 
 /// Custom binding for an open protocol component.
-pub trait ProtocolComponentBinding {
+pub trait ProtocolComponentBinding: Send {
     /// Render a component node using the richer context-aware API.
     fn render_with_context(
         &self,
@@ -254,7 +254,7 @@ pub trait ProtocolComponentBinding {
 /// Registry of optional open component bindings.
 #[derive(Default)]
 pub struct ProtocolBindings {
-    components: BTreeMap<ComponentTypeId, Box<dyn ProtocolComponentBinding>>,
+    components: BTreeMap<ComponentTypeId, Box<dyn ProtocolComponentBinding + Send>>,
 }
 
 impl ProtocolBindings {
@@ -286,13 +286,16 @@ impl ProtocolBindings {
 
     /// Return the registered binding for an open component type id.
     #[must_use]
-    pub fn component(&self, type_id: &ComponentTypeId) -> Option<&dyn ProtocolComponentBinding> {
+    pub fn component(
+        &self,
+        type_id: &ComponentTypeId,
+    ) -> Option<&(dyn ProtocolComponentBinding + Send)> {
         self.components.get(type_id).map(Box::as_ref)
     }
 
     /// Return the registered binding for an extension kind.
     #[must_use]
-    pub fn extension(&self, kind: &str) -> Option<&dyn ProtocolComponentBinding> {
+    pub fn extension(&self, kind: &str) -> Option<&(dyn ProtocolComponentBinding + Send)> {
         self.component(&ComponentTypeId::new(kind))
     }
 }
