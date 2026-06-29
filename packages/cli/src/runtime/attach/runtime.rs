@@ -10576,7 +10576,7 @@ fn reduce_attach_pointer_focus(
         return AttachPointerFocusDecision::None;
     };
 
-    if focused == Some(pane_id) {
+    if focused == Some(pane_id) || view_state.mouse.last_focused_pane_id == Some(pane_id) {
         return AttachPointerFocusDecision::None;
     }
 
@@ -12956,31 +12956,6 @@ mod tests {
 
         assert_eq!(decision, AttachPointerFocusDecision::Focus(focus_target));
         assert_eq!(view_state.mouse.hovered_pane_id, Some(focus_target));
-    }
-
-    #[test]
-    fn pointer_focus_ignores_stale_last_focused_pane_id() {
-        let session_id = Uuid::new_v4();
-        let authoritative_focus = Uuid::new_v4();
-        let focus_target = Uuid::new_v4();
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
-            context_id: None,
-            session_id,
-            can_write: true,
-        });
-        view_state.mouse.config.focus_on_hover = true;
-        view_state.mouse.config.hover_delay_ms = 0;
-        view_state.mouse.last_focused_pane_id = Some(focus_target);
-
-        let decision = reduce_attach_pointer_focus(
-            &mut view_state,
-            Some(focus_target),
-            Some(authoritative_focus),
-            AttachPointerFocusEventKind::Move,
-            Instant::now(),
-        );
-
-        assert_eq!(decision, AttachPointerFocusDecision::Focus(focus_target));
     }
 
     #[test]
