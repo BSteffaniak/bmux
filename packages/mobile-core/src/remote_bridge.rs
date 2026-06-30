@@ -1368,7 +1368,7 @@ async fn handle_session_mouse_event(
                 index: None,
             },
         };
-        let encoded = bmux_codec::to_positional_vec(&args).map_err(|error| {
+        let encoded = bmux_plugin_sdk::encode_service_message(&args).map_err(|error| {
             MobileCoreError::TerminalBackendFailure(format!(
                 "encoding focus-pane-by-selector args: {error}"
             ))

@@ -731,11 +731,12 @@ where
     Req: serde::Serialize + Sync,
     Resp: serde::de::DeserializeOwned,
 {
-    let payload =
-        bmux_codec::to_positional_vec(args).map_err(|error| ClientError::ServerError {
+    let payload = bmux_plugin_sdk::encode_service_message(args).map_err(|error| {
+        ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("encoding {operation}: {error}"),
-        })?;
+        }
+    })?;
     let response_bytes = client
         .invoke_service_raw(
             windows_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
@@ -745,7 +746,7 @@ where
             payload,
         )
         .await?;
-    bmux_codec::from_positional_bytes::<Resp>(&response_bytes).map_err(|error| {
+    bmux_plugin_sdk::decode_service_message::<Resp>(&response_bytes).map_err(|error| {
         ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("decoding {operation} response: {error}"),
