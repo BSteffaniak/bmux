@@ -10656,6 +10656,27 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
+    if view_state.can_write {
+        let target_context =
+            attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
+        if pane_mouse_protocol_reports_event(
+            view_state,
+            target_context.focus_target,
+            mouse_event.kind,
+        ) && maybe_forward_attach_mouse_event(
+            client,
+            view_state,
+            mouse_event,
+            target_context.focus_target,
+            target_context.in_focused,
+            true,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+
     if try_handle_attach_input_hook_mouse(client, view_state, mouse_event, now, true).await? {
         return Ok(());
     }
@@ -10846,7 +10867,17 @@ async fn handle_attach_mouse_event_at(
 
                 match view_state.mouse.config.effective_click_propagation() {
                     bmux_config::MouseClickPropagation::FocusOnly => {
-                        if let Some(pane_id) = target {
+                        if pane_mouse_protocol_reports_event(view_state, target, mouse_event.kind) {
+                            let _ = maybe_forward_attach_mouse_event(
+                                client,
+                                view_state,
+                                mouse_event,
+                                target,
+                                target_context.in_focused,
+                                false,
+                            )
+                            .await?;
+                        } else if let Some(pane_id) = target {
                             focus_attach_pane(client, view_state, pane_id).await?;
                         }
                     }
@@ -10876,7 +10907,11 @@ async fn handle_attach_mouse_event_at(
             }
         }
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
-            if should_forward_click_like_mouse(view_state) {
+            if should_forward_click_like_mouse_event(
+                view_state,
+                target_context.focus_target,
+                mouse_event.kind,
+            ) {
                 let _ = maybe_forward_attach_mouse_event(
                     client,
                     view_state,
@@ -11155,6 +11190,15 @@ pub const fn should_forward_click_like_mouse(view_state: &AttachViewState) -> bo
         view_state.mouse.config.effective_click_propagation(),
         bmux_config::MouseClickPropagation::FocusOnly
     )
+}
+
+pub fn should_forward_click_like_mouse_event(
+    view_state: &AttachViewState,
+    focus_target: Option<Uuid>,
+    kind: MouseEventKind,
+) -> bool {
+    should_forward_click_like_mouse(view_state)
+        || pane_mouse_protocol_reports_event(view_state, focus_target, kind)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14461,6 +14505,31 @@ mod tests {
         view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
 
         assert!(!should_forward_click_like_mouse(&view_state));
+    }
+
+    #[test]
+    fn click_forwarding_policy_respects_pane_mouse_protocol() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
+
+        assert!(!should_forward_click_like_mouse_event(
+            &view_state,
+            Some(pane_id),
+            MouseEventKind::Down(MouseButton::Left),
+        ));
+
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
+
+        assert!(should_forward_click_like_mouse_event(
+            &view_state,
+            Some(pane_id),
+            MouseEventKind::Down(MouseButton::Left),
+        ));
     }
 
     #[test]

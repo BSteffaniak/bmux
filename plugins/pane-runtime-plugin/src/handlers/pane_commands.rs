@@ -19,6 +19,7 @@ use bmux_pane_runtime_state::{
 use bmux_session_models::{ClientId, SessionId};
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 // ── Wire-format argument structs ─────────────────────────────────
@@ -804,20 +805,27 @@ pub fn pane_direct_input(
     let client_id = ctx
         .caller_client_id
         .map(bmux_session_models::ClientId)
-        .ok_or_else(|| failed_command("pane direct input requires a caller client id"))?;
+        .ok_or_else(|| {
+            warn!(session_id = %req.session_id, pane_id = %req.pane_id, "pane direct input rejected: missing caller client id");
+            failed_command("pane direct input requires a caller client id")
+        })?;
     if !handle.0.client_can_write(session_id, client_id) {
+        warn!(session_id = %req.session_id, pane_id = %req.pane_id, client_id = %client_id.0, "pane direct input rejected: client lacks write permission");
         return Err(PaneCommandError::Denied {
             reason: "client does not have write permission for this attach stream".to_string(),
         });
     }
     match handle
         .0
-        .write_input_to_pane(session_id, req.pane_id, req.data)
+        .write_input_to_pane(session_id, client_id, req.pane_id, req.data)
     {
         Ok(_) => {}
         Err(SessionRuntimeError::Closed)
             if handle.0.pane_state(session_id, req.pane_id) == Some(PaneState::Exited) => {}
-        Err(error) => return Err(failed_command(error.to_string())),
+        Err(error) => {
+            warn!(session_id = %req.session_id, pane_id = %req.pane_id, client_id = %client_id.0, %error, "pane direct input failed");
+            return Err(failed_command(error.to_string()));
+        }
     }
     Ok(PaneAck {
         session_id: req.session_id,
