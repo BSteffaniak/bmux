@@ -591,6 +591,19 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
     }
 }
 
+fn one_way_typed_service_request<E>(payload: Vec<u8>) -> bmux_ipc::Request
+where
+    E: bmux_plugin_sdk::TypedServiceEndpoint,
+{
+    bmux_ipc::Request::InvokeService {
+        capability: E::CAPABILITY.as_str().to_string(),
+        kind: E::KIND,
+        interface_id: E::INTERFACE_ID.as_str().to_string(),
+        operation: E::OPERATION.as_str().to_string(),
+        payload,
+    }
+}
+
 #[allow(dead_code)]
 pub trait StreamingAttachInputExt {
     fn send_one_way_attach_input(
@@ -614,24 +627,19 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         session_id: Uuid,
         data: Vec<u8>,
     ) -> ClientResult<()> {
-        #[derive(serde::Serialize)]
-        struct AttachInputArgs {
-            session_id: Uuid,
-            data: Vec<u8>,
-        }
-
         let typed_payload =
-            bmux_ipc::encode(&AttachInputArgs { session_id, data }).map_err(ClientError::from)?;
-        self.send_one_way(bmux_ipc::Request::InvokeService {
-            capability: bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE
-                .as_str()
-                .to_string(),
-            kind: bmux_ipc::InvokeServiceKind::Command,
-            interface_id: AttachCommands::INTERFACE_ID.as_str().to_string(),
-            operation: "attach-input".to_string(),
-            payload: typed_payload,
-        })
-        .await
+            bmux_plugin_sdk::encode_service_message(&AttachCommands::client::AttachInputRequest {
+                session_id,
+                data,
+            })
+            .map_err(|error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("encoding attach-input payload: {error}"),
+            })?;
+        self.send_one_way(one_way_typed_service_request::<
+            AttachCommands::client::AttachInputEndpoint,
+        >(typed_payload))
+            .await
     }
 
     async fn send_one_way_pane_direct_input(
@@ -640,29 +648,21 @@ impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> ClientResult<()> {
-        #[derive(serde::Serialize)]
-        struct PaneDirectInputArgs {
-            session_id: Uuid,
-            pane_id: Uuid,
-            data: Vec<u8>,
-        }
-
-        let typed_payload = bmux_ipc::encode(&PaneDirectInputArgs {
-            session_id,
-            pane_id,
-            data,
-        })
-        .map_err(ClientError::from)?;
-        self.send_one_way(bmux_ipc::Request::InvokeService {
-            capability: bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE
-                .as_str()
-                .to_string(),
-            kind: bmux_ipc::InvokeServiceKind::Command,
-            interface_id: PaneCommands::INTERFACE_ID.as_str().to_string(),
-            operation: "pane-direct-input".to_string(),
-            payload: typed_payload,
-        })
-        .await
+        let typed_payload = bmux_plugin_sdk::encode_service_message(
+            &PaneCommands::client::PaneDirectInputRequest {
+                session_id,
+                pane_id,
+                data,
+            },
+        )
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding pane-direct-input payload: {error}"),
+        })?;
+        self.send_one_way(one_way_typed_service_request::<
+            PaneCommands::client::PaneDirectInputEndpoint,
+        >(typed_payload))
+            .await
     }
 }
 

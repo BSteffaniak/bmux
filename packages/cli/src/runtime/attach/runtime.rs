@@ -10656,6 +10656,32 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
+    // Terminal applications that explicitly enable mouse reporting own pointer
+    // semantics inside their pane content. Forward those events before bmux UI
+    // hooks, focus policies, selection, or pane-drag handlers can consume
+    // button down/up events while still letting normal shell panes use bmux UI
+    // behavior.
+    if view_state.can_write {
+        let target_context =
+            attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
+        if pane_mouse_protocol_reports_event(
+            view_state,
+            target_context.focus_target,
+            mouse_event.kind,
+        ) && maybe_forward_attach_mouse_event(
+            client,
+            view_state,
+            mouse_event,
+            target_context.focus_target,
+            target_context.in_focused,
+            true,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+
     if try_handle_attach_input_hook_mouse(client, view_state, mouse_event, now, true).await? {
         return Ok(());
     }
@@ -14461,6 +14487,31 @@ mod tests {
         view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
 
         assert!(!should_forward_click_like_mouse(&view_state));
+    }
+
+    #[test]
+    fn pane_mouse_protocol_reporting_overrides_attach_ui_precedence() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
+
+        assert!(!pane_mouse_protocol_reports_event(
+            &view_state,
+            Some(pane_id),
+            MouseEventKind::Down(MouseButton::Left),
+        ));
+
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
+
+        assert!(pane_mouse_protocol_reports_event(
+            &view_state,
+            Some(pane_id),
+            MouseEventKind::Down(MouseButton::Left),
+        ));
     }
 
     #[test]
