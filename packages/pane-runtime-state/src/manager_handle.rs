@@ -344,7 +344,6 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     fn write_input_to_pane(
         &self,
         session_id: SessionId,
-        client_id: ClientId,
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError>;
@@ -809,7 +808,6 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
     fn write_input_to_pane(
         &self,
         _session_id: SessionId,
-        _client_id: ClientId,
         _pane_id: Uuid,
         _data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {

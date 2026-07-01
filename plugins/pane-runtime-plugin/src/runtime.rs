@@ -4819,16 +4819,7 @@ impl SessionRuntimeManager {
         }
 
         let bytes = data.len();
-        pane.send_input(data.clone())?;
-        record_to_all_runtimes(
-            RecordingEventKind::PaneInputRaw,
-            RecordingPayload::Bytes { data },
-            RecordMeta {
-                session_id: Some(owner_session_id.0),
-                pane_id: Some(focused_pane_id),
-                client_id: Some(client_id.0),
-            },
-        );
+        pane.send_input(data)?;
         Ok((bytes, focused_pane_id))
     }
 
@@ -5389,53 +5380,28 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     fn write_input_to_pane(
         &self,
         session_id: SessionId,
-        client_id: ClientId,
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
         let lookup_started = std::time::Instant::now();
-        let owner_session_id = self
-            .with_lock_read(|m| {
-                let scene = m
-                    .build_attach_scene_for_client(session_id, client_id)
-                    .ok()?;
-                let visible_target = scene.surfaces.iter().any(|surface| {
-                    surface.visible && surface.accepts_input && surface.pane_id == Some(pane_id)
-                });
-                visible_target.then(|| m.pane_session_for_attach(session_id, pane_id))?
-            })
-            .flatten()
-            .ok_or(SessionRuntimeError::NotFound)?;
         let pane = self
             .pane_input_index
             .read()
             .ok()
             .and_then(|index| index.get(&pane_id).cloned())
-            .filter(|handle| handle.session_id == owner_session_id)
+            .filter(|handle| handle.session_id == session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
         let lookup = lookup_started.elapsed();
         if lookup > Duration::from_millis(2) {
-            warn!(attach_session_id = %session_id.0, owner_session_id = %owner_session_id.0, %pane_id, lookup_us = lookup.as_micros(), "pane direct input lookup exceeded hot-path budget");
+            warn!(session_id = %session_id.0, %pane_id, lookup_us = lookup.as_micros(), "pane direct input lookup exceeded hot-path budget");
         }
 
         let bytes = data.len();
-        let recorded_data = data.clone();
         let send_started = std::time::Instant::now();
         pane.send_input(data)?;
-        record_to_all_runtimes(
-            RecordingEventKind::PaneInputRaw,
-            RecordingPayload::Bytes {
-                data: recorded_data,
-            },
-            RecordMeta {
-                session_id: Some(owner_session_id.0),
-                pane_id: Some(pane_id),
-                client_id: Some(client_id.0),
-            },
-        );
         let send = send_started.elapsed();
         if send > Duration::from_millis(2) {
-            warn!(attach_session_id = %session_id.0, owner_session_id = %owner_session_id.0, %pane_id, send_us = send.as_micros(), "pane direct input send exceeded hot-path budget");
+            warn!(session_id = %session_id.0, %pane_id, send_us = send.as_micros(), "pane direct input send exceeded hot-path budget");
         }
         Ok(bytes)
     }
@@ -6832,64 +6798,6 @@ mod tests {
                     }],
                 },
             }],
-        }
-    }
-
-    #[tokio::test]
-    async fn pane_direct_input_resolves_visible_cross_session_owner() {
-        let attach_session_id = SessionId(Uuid::new_v4());
-        let owner_session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let attach_pane_id = Uuid::new_v4();
-        let owner_pane_id = Uuid::new_v4();
-
-        let mut attach_runtime = runtime_with_panes(&[attach_pane_id]);
-        attach_runtime.attached_clients.insert(client_id);
-        let mut owner_runtime = runtime_with_panes(&[owner_pane_id]);
-        owner_runtime.floating_surfaces.push(floating_surface(
-            owner_pane_id,
-            FloatingPaneScope::ServerGlobal,
-        ));
-
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-        let pane_input_index = Arc::new(RwLock::new(BTreeMap::from([(
-            owner_pane_id,
-            PaneInputHandle {
-                session_id: owner_session_id,
-                input_tx,
-                exited: Arc::new(AtomicBool::new(false)),
-            },
-        )])));
-        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
-        let manager = SessionRuntimeManager {
-            runtimes: BTreeMap::from([
-                (attach_session_id, attach_runtime),
-                (owner_session_id, owner_runtime),
-            ]),
-            pane_input_index,
-            client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            shell: "sh".to_string(),
-            pane_term: "xterm-256color".to_string(),
-            protocol_profile: ProtocolProfile::Bmux,
-            shell_integration_root: None,
-            pane_exit_tx,
-        };
-        let adapter = adapter_for_manager(manager);
-
-        let written = bmux_pane_runtime_state::SessionRuntimeManagerApi::write_input_to_pane(
-            &adapter,
-            attach_session_id,
-            client_id,
-            owner_pane_id,
-            b"click".to_vec(),
-        )
-        .expect("visible cross-session pane direct input should resolve owner");
-
-        assert_eq!(written, 5);
-        match input_rx.try_recv() {
-            Ok(PaneRuntimeCommand::Input(bytes)) => assert_eq!(bytes, b"click"),
-            Ok(_) => panic!("expected direct pane input command, got another command"),
-            Err(error) => panic!("expected direct pane input command: {error}"),
         }
     }
 
