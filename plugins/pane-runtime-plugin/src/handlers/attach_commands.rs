@@ -600,7 +600,7 @@ pub fn attach_retarget_context(
             let context = contexts
                 .0
                 .select_for_client(client_id, &PrimitiveContextSelector::ById(req.context_id))
-                .map_err(|m| failed(m.to_string()))?;
+                .map_err(|_| AttachCommandError::ContextNotFound)?;
             let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
                 return Err(failed("context has no attached runtime"));
             };

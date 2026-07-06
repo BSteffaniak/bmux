@@ -347,6 +347,7 @@ interface attach-runtime-commands {
         expired-grant,
         denied { reason: string },
         failed { reason: string },
+        context-not-found,
     }
 
     command attach-session(
