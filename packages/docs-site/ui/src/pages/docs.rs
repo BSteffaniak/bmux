@@ -670,6 +670,16 @@ mod tests {
                     let list_prefix = format!("{full_key}.{index_placeholder}");
                     collect_field_patterns(item_fields, &list_prefix, out);
                 }
+                Some(bmux_config_doc::NestedFieldDoc::MapValue {
+                    key_placeholder, ..
+                }) => {
+                    out.insert(format!("{full_key}.{key_placeholder}"));
+                }
+                Some(bmux_config_doc::NestedFieldDoc::ListValue {
+                    index_placeholder, ..
+                }) => {
+                    out.insert(format!("{full_key}.{index_placeholder}"));
+                }
                 None => {
                     out.insert(full_key);
                 }
