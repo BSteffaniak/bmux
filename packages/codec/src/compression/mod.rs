@@ -6,6 +6,16 @@
 
 use crate::Error;
 
+#[cfg(feature = "compression-lz4")]
+pub mod lz4;
+#[cfg(feature = "compression-zstd")]
+pub mod zstd;
+
+#[cfg(feature = "compression-lz4")]
+pub use lz4::Lz4Compression;
+#[cfg(feature = "compression-zstd")]
+pub use zstd::ZstdCompression;
+
 /// Stable wire id for LZ4 compression.
 pub const LZ4_WIRE_ID: u8 = 1;
 /// Stable wire id for Zstandard compression.
@@ -165,70 +175,6 @@ pub trait CompressionCodec {
     fn decompress(&self, input: &[u8], expected_len: usize) -> Result<Vec<u8>, Error>;
 }
 
-/// LZ4 compression codec.
-#[cfg(feature = "compression-lz4")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Lz4Compression;
-
-#[cfg(feature = "compression-lz4")]
-impl CompressionCodec for Lz4Compression {
-    fn algorithm(&self) -> CompressionAlgorithm {
-        CompressionAlgorithm::Lz4
-    }
-
-    fn compress(&self, input: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(lz4_flex::block::compress(input))
-    }
-
-    fn decompress(&self, input: &[u8], expected_len: usize) -> Result<Vec<u8>, Error> {
-        lz4_flex::block::decompress(input, expected_len)
-            .map_err(|error| Error::DecompressionFailed(error.to_string()))
-            .and_then(|bytes| validate_decompressed_len(bytes, expected_len))
-    }
-}
-
-/// Zstandard compression codec.
-#[cfg(feature = "compression-zstd")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZstdCompression {
-    /// Zstandard compression level.
-    pub level: i32,
-}
-
-#[cfg(feature = "compression-zstd")]
-impl ZstdCompression {
-    /// Create a Zstandard codec at a compression level.
-    #[must_use]
-    pub const fn new(level: i32) -> Self {
-        Self { level }
-    }
-}
-
-#[cfg(feature = "compression-zstd")]
-impl Default for ZstdCompression {
-    fn default() -> Self {
-        Self { level: 1 }
-    }
-}
-
-#[cfg(feature = "compression-zstd")]
-impl CompressionCodec for ZstdCompression {
-    fn algorithm(&self) -> CompressionAlgorithm {
-        CompressionAlgorithm::Zstd
-    }
-
-    fn compress(&self, input: &[u8]) -> Result<Vec<u8>, Error> {
-        zstd::bulk::compress(input, self.level)
-            .map_err(|error| Error::CompressionFailed(error.to_string()))
-    }
-
-    fn decompress(&self, input: &[u8], expected_len: usize) -> Result<Vec<u8>, Error> {
-        zstd::bulk::decompress(input, expected_len)
-            .map_err(|error| Error::DecompressionFailed(error.to_string()))
-            .and_then(|bytes| validate_decompressed_len(bytes, expected_len))
-    }
-}
-
 /// Maybe compress bytes according to a policy.
 ///
 /// # Errors
@@ -360,7 +306,10 @@ where
     crate::from_positional_bytes(&decompress_bytes(algorithm, bytes, expected_len)?)
 }
 
-fn validate_decompressed_len(bytes: Vec<u8>, expected_len: usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn validate_decompressed_len(
+    bytes: Vec<u8>,
+    expected_len: usize,
+) -> Result<Vec<u8>, Error> {
     if bytes.len() == expected_len {
         Ok(bytes)
     } else {
