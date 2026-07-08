@@ -4,6 +4,8 @@
 //! With default features enabled, stable, positional, and typed-stable serde
 //! APIs are exported for compatibility with existing users.
 
+#[cfg(feature = "compression")]
+pub mod compression;
 mod error;
 pub mod mode;
 #[cfg(feature = "serde")]

@@ -23,6 +23,16 @@ pub enum Error {
     InvalidChar,
     /// Type not supported by this format.
     UnsupportedType(&'static str),
+    /// Compression failed.
+    CompressionFailed(String),
+    /// Decompression failed.
+    DecompressionFailed(String),
+    /// Compression algorithm is not available in this build.
+    CompressionAlgorithmUnavailable(&'static str),
+    /// Unknown compression algorithm wire id.
+    UnknownCompressionAlgorithm(u8),
+    /// Decompressed payload length did not match the expected length.
+    DecompressedLengthMismatch { expected: usize, actual: usize },
 }
 
 impl fmt::Display for Error {
@@ -38,6 +48,18 @@ impl fmt::Display for Error {
             Error::InvalidBool => write!(f, "invalid boolean value"),
             Error::InvalidChar => write!(f, "invalid char value"),
             Error::UnsupportedType(ty) => write!(f, "unsupported type: {ty}"),
+            Error::CompressionFailed(msg) => write!(f, "compression failed: {msg}"),
+            Error::DecompressionFailed(msg) => write!(f, "decompression failed: {msg}"),
+            Error::CompressionAlgorithmUnavailable(algorithm) => {
+                write!(f, "compression algorithm unavailable: {algorithm}")
+            }
+            Error::UnknownCompressionAlgorithm(id) => {
+                write!(f, "unknown compression algorithm wire id: {id}")
+            }
+            Error::DecompressedLengthMismatch { expected, actual } => write!(
+                f,
+                "decompressed length mismatch: expected {expected} bytes, got {actual} bytes"
+            ),
         }
     }
 }

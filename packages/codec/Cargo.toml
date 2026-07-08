@@ -11,7 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde = { workspace = true, features = ["std"], optional = true }
+lz4_flex = { workspace = true, optional = true, features = ["std"] }
+serde    = { workspace = true, features = ["std"], optional = true }
+zstd     = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest   = { workspace = true }
@@ -26,6 +28,11 @@ positional   = []
 serde        = ["dep:serde"]
 stable       = []
 typed-stable = []
+
+# Compression features
+compression      = []
+compression-lz4  = ["compression", "dep:lz4_flex"]
+compression-zstd = ["compression", "dep:zstd"]
 
 # Development features
 fail-on-warnings = []

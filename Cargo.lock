@@ -1368,10 +1368,12 @@ dependencies = [
 name = "bmux_codec"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "lz4_flex",
  "proptest",
  "serde",
  "serde_json",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
