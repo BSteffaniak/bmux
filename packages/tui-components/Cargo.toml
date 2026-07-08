@@ -11,14 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard               = { workspace = true }
-bmux_text_edit              = { workspace = true, features = ["keyboard"], optional = true }
-bmux_tui                    = { workspace = true }
-bmux_tui_component_protocol = { workspace = true, optional = true }
-unicode-segmentation        = { workspace = true, optional = true }
+bmux_keyboard        = { workspace = true }
+bmux_text_edit       = { workspace = true, features = ["keyboard"], optional = true }
+bmux_tui             = { workspace = true }
+unicode-segmentation = { workspace = true, optional = true }
 
 [features]
 default          = []
 fail-on-warnings = []
-protocol         = ["dep:bmux_tui_component_protocol", "text-input"]
 text-input       = ["dep:bmux_text_edit", "dep:unicode-segmentation"]
