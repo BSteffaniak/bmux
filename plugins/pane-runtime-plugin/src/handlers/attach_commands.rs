@@ -607,20 +607,23 @@ pub fn attach_retarget_context(
             (context.id, selected_session_id, false)
         };
 
+    // Validate the session exists in the manager.
+    if !manager.0.contains(next_session_id) {
+        return Err(AttachCommandError::SessionNotFound);
+    }
+
+    // Track previous session for client migration if switching.
+    let previous_session = selected_target.and_then(|(_, session_id)| session_id);
+    if let Some(prev) = previous_session
+        && prev != next_session_id
+    {
+        manager.0.remove_client(prev, &client_id);
+    }
+
+    // Ensure client is registered with the target session.
+    manager.0.add_client(next_session_id, client_id);
+
     if !selection_already_applied {
-        let previous_session = selected_target.and_then(|(_, session_id)| session_id);
-        if let Some(prev) = previous_session
-            && prev != next_session_id
-        {
-            manager.0.remove_client(prev, &client_id);
-        }
-
-        if !manager.0.contains(next_session_id) {
-            let _ = contexts.0.remove_contexts_for_session(next_session_id);
-            return Err(AttachCommandError::SessionNotFound);
-        }
-
-        manager.0.add_client(next_session_id, client_id);
         follow
             .0
             .set_selected_target(client_id, Some(context_id), Some(next_session_id));

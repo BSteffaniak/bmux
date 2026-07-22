@@ -700,7 +700,7 @@ fn select_context_local(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
 
-    let (context, session_after_select) = mutate_state_select(client_id, &context_selector)?;
+    let (context, mut session_after_select) = mutate_state_select(client_id, &context_selector)?;
 
     tracing::Span::current().record("context_id", tracing::field::display(context.id));
     if let Some(session_id) = session_after_select {
@@ -709,9 +709,35 @@ fn select_context_local(
 
     // If the newly-selected context is bound to a session, ask the
     // sessions plugin to make it the caller's selected session so the
-    // attach view retargets properly.
+    // attach view retargets properly. Older persisted context state may
+    // point at sessions that no longer exist; repair that non-destructively
+    // by creating a replacement runtime session and rebinding the existing
+    // context id instead of deleting the tab.
     if let Some(session_id) = session_after_select {
-        let _ = select_session_via_sessions_plugin(caller, session_id);
+        match try_select_session_via_sessions_plugin(caller, session_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                let replacement_session_id =
+                    create_session_for_select_repair(caller, context.name.clone())?;
+                bind_context_session_for_select_repair(context.id, replacement_session_id)?;
+                try_select_session_via_sessions_plugin(caller, replacement_session_id)
+                    .map_err(|reason| SelectContextError::Denied { reason })?;
+                session_after_select = Some(replacement_session_id);
+                tracing::Span::current().record(
+                    "session_id",
+                    tracing::field::display(replacement_session_id.0),
+                );
+                let _ = caller.log_write(&bmux_plugin_sdk::LogWriteRequest {
+                    level: bmux_plugin_sdk::LogWriteLevel::Warn,
+                    message: format!(
+                        "contexts.select_context: repaired stale session binding (context_id={} old_session_id={} new_session_id={})",
+                        context.id, session_id.0, replacement_session_id.0,
+                    ),
+                    target: Some("bmux.contexts".to_string()),
+                });
+            }
+            Err(reason) => return Err(SelectContextError::Denied { reason }),
+        }
     }
 
     let _ = global_event_bus().emit(
@@ -1072,10 +1098,10 @@ fn kill_session_via_sessions_plugin(
     }
 }
 
-fn select_session_via_sessions_plugin(
+fn try_select_session_via_sessions_plugin(
     caller: &(impl ServiceCaller + Sync),
     session_id: SessionId,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     use bmux_sessions_plugin_api::sessions_commands::{self, SelectSessionError};
     use bmux_sessions_plugin_api::sessions_state::SessionSelector;
 
@@ -1089,9 +1115,54 @@ fn select_session_via_sessions_plugin(
     ))
     .map_err(|err| format!("sessions-commands:select-session failed: {err}"))?;
     match result {
-        Ok(_) | Err(SelectSessionError::NotFound) => Ok(()),
+        Ok(_) => Ok(true),
+        Err(SelectSessionError::NotFound) => Ok(false),
         Err(SelectSessionError::Denied { reason }) => Err(reason),
     }
+}
+
+fn create_session_for_select_repair(
+    caller: &(impl ServiceCaller + Sync),
+    name: Option<String>,
+) -> Result<SessionId, SelectContextError> {
+    use bmux_sessions_plugin_api::sessions_commands::{self, NewSessionError};
+
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(sessions_commands::client::new_session(
+        &mut client,
+        name,
+    ))
+    .map_err(|err| SelectContextError::Denied {
+        reason: format!("sessions-commands:new-session repair failed: {err}"),
+    })?;
+    match result {
+        Ok(ack) => Ok(SessionId(ack.id)),
+        Err(NewSessionError::InvalidName { reason } | NewSessionError::Failed { reason }) => {
+            Err(SelectContextError::Denied { reason })
+        }
+    }
+}
+
+fn bind_context_session_for_select_repair(
+    context_id: Uuid,
+    session_id: SessionId,
+) -> Result<(), SelectContextError> {
+    let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+    let mut guard = state.write().map_err(|_| SelectContextError::Denied {
+        reason: "context state lock poisoned".to_string(),
+    })?;
+    guard
+        .bind_session(context_id, session_id)
+        .map_err(|reason| SelectContextError::Denied {
+            reason: reason.to_string(),
+        })
+}
+
+fn select_session_via_sessions_plugin(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: SessionId,
+) -> Result<(), String> {
+    try_select_session_via_sessions_plugin(caller, session_id).map(|_| ())
 }
 
 // ── Typed state handle (consumed by other plugins) ───────────────────
