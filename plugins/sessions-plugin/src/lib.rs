@@ -612,23 +612,10 @@ fn kill_session_via_ipc(
     }
 }
 
-fn pane_runtime_session_selector(
+#[derive(Serialize, Deserialize)]
+struct AttachSessionArgs {
     selector: PrimitiveSessionSelector,
-) -> bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector {
-    match selector {
-        PrimitiveSessionSelector::ById(id) => {
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector {
-                id: Some(id),
-                name: None,
-            }
-        }
-        PrimitiveSessionSelector::ByName(name) => {
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector {
-                id: None,
-                name: Some(name),
-            }
-        }
-    }
+    can_write: bool,
 }
 
 fn validate_rename_name(name: &str) -> Result<String, String> {
@@ -683,21 +670,8 @@ fn rename_session_local(
     Ok(SessionAck { id: session_id.0 })
 }
 
-fn map_attach_session_error(
-    error: bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError,
-) -> SelectSessionError {
-    match error {
-        bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError::SessionNotFound => {
-            SelectSessionError::NotFound
-        }
-        error => SelectSessionError::Denied {
-            reason: format!("{error:?}"),
-        },
-    }
-}
-
 fn select_session_via_ipc(
-    caller: &(impl ServiceCaller + Sync),
+    caller: &impl ServiceCaller,
     selector: &WireSelector,
 ) -> Result<SessionAck, SelectSessionError> {
     let Some(session_selector) = selector.to_selector() else {
@@ -705,13 +679,18 @@ fn select_session_via_ipc(
             reason: "selector must specify either id or name".to_string(),
         });
     };
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
-    let result = bmux_plugin::block_on_typed_dispatch(
-        bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_session(
-            &mut client,
-            pane_runtime_session_selector(session_selector),
-            true,
-        ),
+    let result = caller.call_service::<AttachSessionArgs, Result<
+        bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachGrant,
+        bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError,
+    >>(
+        bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE.as_str(),
+        ServiceKind::Command,
+        bmux_pane_runtime_plugin_api::attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-session",
+        &AttachSessionArgs {
+            selector: session_selector,
+            can_write: true,
+        },
     );
     match result {
         Ok(Ok(grant)) => {
@@ -725,7 +704,9 @@ fn select_session_via_ipc(
                 id: grant.session_id,
             })
         }
-        Ok(Err(err)) => Err(map_attach_session_error(err)),
+        Ok(Err(err)) => Err(SelectSessionError::Denied {
+            reason: format!("{err:?}"),
+        }),
         Err(err) => Err(SelectSessionError::Denied {
             reason: err.to_string(),
         }),
@@ -888,69 +869,3 @@ fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
 }
 
 bmux_plugin_sdk::export_plugin!(SessionsPlugin, include_str!("../plugin.toml"));
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_attach_session_maps_to_select_not_found() {
-        let error = map_attach_session_error(
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError::SessionNotFound,
-        );
-
-        assert!(matches!(error, SelectSessionError::NotFound));
-    }
-
-    #[test]
-    fn attach_session_denial_remains_select_denial() {
-        let error = map_attach_session_error(
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError::Denied {
-                reason: "blocked".to_string(),
-            },
-        );
-
-        assert!(matches!(
-            error,
-            SelectSessionError::Denied { reason } if reason.contains("blocked")
-        ));
-    }
-
-    #[test]
-    fn pane_runtime_session_selector_converts_id_to_bpdl_record_shape() {
-        let id = uuid::Uuid::new_v4();
-        let selector = pane_runtime_session_selector(PrimitiveSessionSelector::ById(id));
-
-        assert_eq!(selector.id, Some(id));
-        assert_eq!(selector.name, None);
-    }
-
-    #[test]
-    fn pane_runtime_session_selector_converts_name_to_bpdl_record_shape() {
-        let selector =
-            pane_runtime_session_selector(PrimitiveSessionSelector::ByName("target".to_string()));
-
-        assert_eq!(selector.id, None);
-        assert_eq!(selector.name.as_deref(), Some("target"));
-    }
-
-    #[test]
-    fn attach_session_request_uses_generated_bpdl_struct_shape() {
-        let id = uuid::Uuid::new_v4();
-        let request =
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::client::AttachSessionRequest {
-                selector: pane_runtime_session_selector(PrimitiveSessionSelector::ById(id)),
-                can_write: true,
-            };
-
-        let encoded = bmux_plugin_sdk::encode_service_message(&request)
-            .expect("generated attach-session request should encode");
-        let decoded: bmux_pane_runtime_plugin_api::attach_runtime_commands::client::AttachSessionRequest =
-            bmux_plugin_sdk::decode_service_message(&encoded)
-                .expect("generated attach-session request should decode");
-
-        assert_eq!(decoded.selector.id, Some(id));
-        assert_eq!(decoded.selector.name, None);
-        assert!(decoded.can_write);
-    }
-}

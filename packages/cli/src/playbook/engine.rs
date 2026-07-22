@@ -1846,7 +1846,7 @@ async fn retarget_attach_to_context_playbook(
         .map_err(|e| anyhow::anyhow!("attach context retarget failed: {e}"))?;
     let retarget_service_us = total_started.elapsed().as_micros();
     runtime.state.attached_id = attach_info.session_id;
-    runtime.state.attached_context_id = attach_info.context_id.or(Some(context_id));
+    runtime.state.attached_context_id = attach_info.context_id;
     emit_attach_phase_timing(&serde_json::json!({
         "phase": "attach.retarget_context",
         "plugin_id": plugin_id,

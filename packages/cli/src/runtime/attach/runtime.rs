@@ -10656,23 +10656,11 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
-    if handle_attach_status_tab_mouse_event_at(
-        client,
-        view_state,
-        mouse_event,
-        kernel_client_factory,
-        now,
-        geometry,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-
     // Terminal applications that explicitly enable mouse reporting own pointer
-    // semantics inside their pane content. Forward those events after bmux
-    // chrome hit-testing so status/tab clicks are never swallowed by pane mouse
-    // reporting.
+    // semantics inside their pane content. Forward those events before bmux UI
+    // hooks, focus policies, selection, or pane-drag handlers can consume
+    // button down/up events while still letting normal shell panes use bmux UI
+    // behavior.
     if view_state.can_write {
         let target_context =
             attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
@@ -13179,33 +13167,6 @@ mod tests {
     }
 
     #[test]
-    fn status_tab_reducer_emits_switch_on_plain_click() {
-        let mut view_state = tab_reducer_view_state();
-        let second = Uuid::from_u128(2);
-
-        let down = reduce_attach_status_tab_mouse_event(
-            &mut view_state,
-            tab_mouse_event(TerminalMousePhase::Down, 9, 23),
-            tab_reducer_geometry(),
-        );
-        assert!(down.consumed);
-        assert!(down.effects.is_empty());
-
-        let up = reduce_attach_status_tab_mouse_event(
-            &mut view_state,
-            tab_mouse_event(TerminalMousePhase::Up, 9, 23),
-            tab_reducer_geometry(),
-        );
-        assert_eq!(
-            up.effects,
-            vec![AttachUiEffect::SwitchWindow {
-                target_context_id: second,
-            }]
-        );
-        assert!(view_state.mouse.tab_drag.is_none());
-    }
-
-    #[test]
     fn status_tab_reducer_emits_move_after_motion() {
         let mut view_state = tab_reducer_view_state();
         let first = Uuid::from_u128(1);
@@ -14529,7 +14490,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_mouse_protocol_reports_clicks_even_when_click_propagation_is_focus_only() {
+    fn pane_mouse_protocol_reporting_overrides_attach_ui_precedence() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
         let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");

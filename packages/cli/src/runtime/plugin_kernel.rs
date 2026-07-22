@@ -639,7 +639,6 @@ pub(super) fn register_plugin_service_handlers(
         build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
     let mut loaded_provider_cache: BTreeMap<String, Arc<bmux_plugin::LoadedPlugin>> =
         BTreeMap::new();
-    let command_connection_info = connection_info.clone();
 
     server.register_service_handler_with_metadata(
         CORE_CLI_COMMAND_CAPABILITY,
@@ -648,10 +647,7 @@ pub(super) fn register_plugin_service_handlers(
         CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
         move |_route, invoke_context, payload| {
             let command_state = command_state.clone();
-            let connection = command_connection_info.clone();
             async move {
-                let _kernel_context_guard = enter_service_kernel_context(invoke_context.clone());
-                let _host_kernel_connection_guard = enter_host_kernel_connection(connection);
                 let request: PluginCliCommandRequest = decode_service_message(&payload)?;
                 let execution = run_plugin_bridge_command_execution_with_state(
                     &command_state,
