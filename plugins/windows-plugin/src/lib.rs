@@ -1160,6 +1160,11 @@ impl RustPlugin for WindowsPlugin {
                     .map(|_| PaneAck { ok: true, pane_id: None })
                     .map_err(|e| ServiceResponse::error("resize_failed", e))
             },
+            "windows-commands", "move-floating-pane" => |req: MoveFloatingPaneArgs, ctx| {
+                move_floating_pane(ctx, req.session.as_ref(), &req.target, req.x, req.y)
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("move_floating_failed", e))
+            },
             "windows-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
                 zoom_pane(ctx, req.session.as_ref())
                     .map(|ack| PaneZoomAck { pane_id: ack.pane_id, zoomed: true })
@@ -3935,6 +3940,15 @@ const fn default_resize_cells() -> u16 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MoveFloatingPaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    target: Selector,
+    x: u16,
+    y: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ZoomPaneArgs {
     #[serde(default)]
     session: Option<Selector>,
@@ -5456,6 +5470,22 @@ mod tests {
 
         let response = plugin.invoke_service(context);
         let error = response.error.expect("expected service error");
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn invoke_service_move_floating_pane_is_wired() {
+        let plugin = WindowsPlugin::default();
+        let context = service_test_context(
+            "windows-commands",
+            "move-floating-pane",
+            vec![1, 2, 3],
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected invalid request");
         assert_eq!(error.code, "invalid_request");
     }
 

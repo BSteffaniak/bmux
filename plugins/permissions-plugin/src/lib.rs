@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_pane_runtime_plugin_api::{capabilities::PANE_RUNTIME_WRITE, pane_runtime_commands};
+use bmux_pane_runtime_plugin_api::pane_runtime_commands;
 use bmux_permissions_plugin_api::permissions_commands::CommandAck;
 use bmux_permissions_plugin_api::permissions_commands::client::{GrantRequest, RevokeRequest};
 use bmux_permissions_plugin_api::permissions_state::PermissionEntry;
@@ -1026,37 +1026,31 @@ fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result
     Ok(())
 }
 
-#[derive(Serialize)]
-struct SetClientWritePermissionRequest {
-    session_id: Uuid,
-    client_id: Uuid,
-    allowed: bool,
-}
-
 fn sync_pane_runtime_write_permission(
     caller: &(impl HostRuntimeApi + Sync),
     update: &PermissionCacheUpdate,
 ) -> Result<(), String> {
-    let request = SetClientWritePermissionRequest {
-        session_id: update.session_id,
-        client_id: update.client_id,
-        allowed: update.allowed,
-    };
-    caller
-        .call_service::<_, u8>(
-            PANE_RUNTIME_WRITE.as_str(),
-            ServiceKind::Command,
-            pane_runtime_commands::INTERFACE_ID.as_str(),
-            "set-client-write-permission",
-            &request,
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        pane_runtime_commands::client::set_client_write_permission(
+            &mut client,
+            update.session_id,
+            update.client_id,
+            update.allowed,
+        ),
+    )
+    .map_err(|error| {
+        format!(
+            "failed syncing pane-runtime write permission cache for session {} client {} allowed={}: {error}",
+            update.session_id, update.client_id, update.allowed
         )
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "failed syncing pane-runtime write permission cache for session {} client {} allowed={}: {error}",
-                update.session_id, update.client_id, update.allowed
-            )
-        })
+    })?;
+    result.map(|_| ()).map_err(|error| {
+        format!(
+            "failed syncing pane-runtime write permission cache for session {} client {} allowed={}: {error:?}",
+            update.session_id, update.client_id, update.allowed
+        )
+    })
 }
 
 fn apply_permission_cache_mutation(
@@ -1398,7 +1392,9 @@ mod tests {
                         encode_service_message(&())
                     }
                     ("pane-runtime-commands", "set-client-write-permission") => {
-                        encode_service_message(&0_u8)
+                        encode_service_message(&Ok::<_, pane_runtime_commands::PaneCommandError>(
+                            0_u8,
+                        ))
                     }
                     _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                         operation: "test_router",

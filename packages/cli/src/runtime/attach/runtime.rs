@@ -386,9 +386,9 @@ use super::render::{
 use super::state::{
     AttachDirtyFlags, AttachDirtySource, AttachEventAction, AttachExitReason,
     AttachInputHookCapture, AttachMouseFloatingDrag, AttachMouseResizeAxisDrag,
-    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachScrollbackCursor,
-    AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget, AttachUiEffect,
-    AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
+    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachPointerOwner,
+    AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
+    AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
@@ -3079,6 +3079,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             prompt_request = prompt_host_rx.recv() => {
                 if let Some(prompt_request) = prompt_request {
                     perf_window.record_wake(AttachWakeSource::Prompt);
+                    view_state.mouse.clear_pointer_gestures();
                     view_state.prompt.enqueue_external(prompt_request);
                     view_state
                         .dirty
@@ -5443,6 +5444,7 @@ fn enqueue_final_pane_action_prompt(
     pane_id: Uuid,
     session_id: Uuid,
 ) {
+    view_state.mouse.clear_pointer_gestures();
     view_state.prompt.enqueue_internal(
         PromptRequest::single_select(
             "Final pane action",
@@ -5553,6 +5555,7 @@ pub fn handle_attach_ui_action_at(
                 );
                 return;
             }
+            view_state.mouse.clear_pointer_gestures();
             view_state.prompt.enqueue_internal(
                 PromptRequest::confirm("Quit session and all panes?")
                     .message("This will terminate the attached session and every pane.")
@@ -5589,6 +5592,7 @@ pub fn handle_attach_ui_action_at(
                 .as_ref()
                 .map_or(0, |layout| layout.panes.len());
             if pane_count > 1 {
+                view_state.mouse.clear_pointer_gestures();
                 view_state.prompt.enqueue_internal(
                     PromptRequest::confirm("Close focused pane?")
                         .message("This will stop the pane process.")
@@ -5599,6 +5603,7 @@ pub fn handle_attach_ui_action_at(
                     AttachInternalPromptAction::ClosePane { pane_id },
                 );
             } else if let Some(fallback) = next_close_fallback(view_state) {
+                view_state.mouse.clear_pointer_gestures();
                 view_state.prompt.enqueue_internal(
                     PromptRequest::confirm(format!(
                         "Close this pane and switch to {}?",
@@ -6411,6 +6416,7 @@ fn apply_attach_profile_switch_with_path(
         };
         view_state.mouse.config = resolved_config.attach_mouse_config();
         view_state.mouse.tab_drag_enabled = status_tab_drag_enabled(&resolved_config.status_bar);
+        view_state.mouse.clear_pointer_gestures();
         sync_attach_active_mode_from_processor(
             view_state,
             attach_input_processor.keymap(),
@@ -9440,6 +9446,9 @@ pub async fn handle_attach_terminal_event(
             maybe_sync_remote_clipboard(client, view_state, ClipboardSyncTrigger::FocusGained, now)
                 .await;
         }
+        Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
+            view_state.mouse.clear_pointer_gestures();
+        }
         Some(
             TerminalInputEvent::Key(_)
             | TerminalInputEvent::Mouse(_)
@@ -9686,7 +9695,9 @@ pub async fn handle_attach_terminal_event(
                 }
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
-                    if !view_state.help_overlay_open {
+                    if view_state.help_overlay_open {
+                        view_state.mouse.clear_pointer_gestures();
+                    } else {
                         view_state.help_overlay_scroll = 0;
                     }
                     view_state
@@ -10250,15 +10261,31 @@ fn apply_attach_input_result(
             .dirty
             .mark_status_dirty(AttachDirtySource::UserAction);
     }
+    if result.dirty {
+        view_state
+            .dirty
+            .mark_layout_frame_and_status_dirty(AttachDirtySource::PluginCommand);
+    }
     if result.release_capture {
         view_state.mouse.input_capture = None;
         return;
     }
     if result.capture_pointer || !result.capture_keyboard.is_empty() {
+        let existing = view_state
+            .mouse
+            .input_capture
+            .as_ref()
+            .filter(|capture| capture.hook.id == hook.id);
+        let pointer = result.capture_pointer || existing.is_some_and(|capture| capture.pointer);
+        let keyboard_keys = if result.capture_keyboard.is_empty() {
+            existing.map_or_else(Vec::new, |capture| capture.keyboard_keys.clone())
+        } else {
+            result.capture_keyboard.clone()
+        };
         view_state.mouse.input_capture = Some(AttachInputHookCapture {
             hook,
-            pointer: result.capture_pointer,
-            keyboard_keys: result.capture_keyboard.clone(),
+            pointer,
+            keyboard_keys,
         });
     }
 }
@@ -10381,21 +10408,19 @@ fn hook_matches_key(hook: &AttachInputHook, key: &str) -> bool {
     hook.filter.keys.iter().any(|item| item == key)
 }
 
+fn hook_dispatch_allowed(last: Option<Instant>, min_interval: Duration, now: Instant) -> bool {
+    min_interval.is_zero()
+        || last.is_none_or(|last| now.saturating_duration_since(last) >= min_interval)
+}
+
 fn hook_throttled(view_state: &mut AttachViewState, hook: &AttachInputHook, now: Instant) -> bool {
     let min_interval = Duration::from_millis(u64::from(hook.filter.min_interval_ms));
-    if min_interval.is_zero() {
-        view_state
-            .mouse
-            .input_hook_last_dispatched_at
-            .insert(hook.id.clone(), now);
-        return false;
-    }
-    if view_state
+    let last = view_state
         .mouse
         .input_hook_last_dispatched_at
         .get(&hook.id)
-        .is_some_and(|last| now.duration_since(*last) < min_interval)
-    {
+        .copied();
+    if !hook_dispatch_allowed(last, min_interval, now) {
         return true;
     }
     view_state
@@ -10405,37 +10430,101 @@ fn hook_throttled(view_state: &mut AttachViewState, hook: &AttachInputHook, now:
     false
 }
 
-async fn try_handle_attach_input_hook_mouse(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachHookThrottleDisposition {
+    Dispatch,
+    ConsumeOwned,
+    SkipUnowned,
+}
+
+const fn attach_hook_throttle_disposition(
+    throttled: bool,
+    captured: bool,
+) -> AttachHookThrottleDisposition {
+    match (throttled, captured) {
+        (false, _) => AttachHookThrottleDisposition::Dispatch,
+        (true, true) => AttachHookThrottleDisposition::ConsumeOwned,
+        (true, false) => AttachHookThrottleDisposition::SkipUnowned,
+    }
+}
+
+async fn try_handle_captured_attach_input_hook_mouse(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
     now: Instant,
-    capture_only: bool,
+) -> std::result::Result<bool, ClientError> {
+    let Some(capture) = view_state
+        .mouse
+        .input_capture
+        .clone()
+        .filter(|capture| capture.pointer)
+    else {
+        return Ok(false);
+    };
+    let (phase, button) = attach_input_mouse_phase(mouse_event.kind);
+    let throttled =
+        matches!(phase, "drag" | "move") && hook_throttled(view_state, &capture.hook, now);
+    if matches!(
+        attach_hook_throttle_disposition(throttled, true),
+        AttachHookThrottleDisposition::ConsumeOwned
+    ) {
+        return Ok(true);
+    }
+
+    let event = AttachInputEvent {
+        hook_id: capture.hook.id.clone(),
+        event_kind: "mouse".to_string(),
+        phase: phase.to_string(),
+        button: button.map(str::to_string),
+        key: None,
+        col: Some(mouse_event.column),
+        row: Some(mouse_event.row),
+        modifiers: attach_input_event_modifiers(mouse_event.modifiers),
+        focused_pane: attach_input_focused_context(view_state),
+        hovered_pane: attach_input_hovered_pane_context(
+            view_state,
+            mouse_event.column,
+            mouse_event.row,
+        ),
+    };
+    let result = match invoke_attach_input_hook(client, &capture.hook, event).await {
+        Ok(result) => result,
+        Err(error) => {
+            if phase == "up" {
+                view_state.mouse.clear_plugin_pointer_capture();
+            }
+            return Err(error);
+        }
+    };
+    apply_attach_input_result(view_state, capture.hook, &result);
+    if phase == "up" {
+        view_state.mouse.clear_plugin_pointer_capture();
+    }
+    Ok(true)
+}
+
+async fn try_handle_uncaptured_attach_input_hook_mouse(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+    now: Instant,
 ) -> std::result::Result<bool, ClientError> {
     let (phase, button) = attach_input_mouse_phase(mouse_event.kind);
     let focused = attach_input_focused_context(view_state);
     let hovered =
         attach_input_hovered_pane_context(view_state, mouse_event.column, mouse_event.row);
-    let hooks = if let Some(capture) = view_state.mouse.input_capture.clone() {
-        if capture.pointer {
-            vec![capture.hook]
-        } else if capture_only {
-            return Ok(false);
-        } else {
-            attach_input_hooks()
-        }
-    } else if capture_only {
-        return Ok(false);
-    } else {
-        attach_input_hooks()
-    };
 
-    for hook in hooks {
-        if !capture_only && !hook_matches_mouse(&hook, phase, focused.as_ref(), hovered.as_ref()) {
+    for hook in attach_input_hooks() {
+        if !hook_matches_mouse(&hook, phase, focused.as_ref(), hovered.as_ref()) {
             continue;
         }
-        if matches!(phase, "drag" | "move") && hook_throttled(view_state, &hook, now) {
-            return Ok(true);
+        let throttled = matches!(phase, "drag" | "move") && hook_throttled(view_state, &hook, now);
+        if matches!(
+            attach_hook_throttle_disposition(throttled, false),
+            AttachHookThrottleDisposition::SkipUnowned
+        ) {
+            continue;
         }
         let event = AttachInputEvent {
             hook_id: hook.id.clone(),
@@ -10450,15 +10539,11 @@ async fn try_handle_attach_input_hook_mouse(
             hovered_pane: hovered.clone(),
         };
         let result = invoke_attach_input_hook(client, &hook, event).await?;
-        apply_attach_input_result(view_state, hook, &result);
-        if phase == "up"
-            && let Some(capture) = view_state.mouse.input_capture.as_mut()
-        {
-            capture.pointer = false;
-            if capture.keyboard_keys.is_empty() {
-                view_state.mouse.input_capture = None;
-            }
+        if result.capture_pointer {
+            view_state.mouse.prepare_pointer_owner_acquisition();
         }
+        apply_attach_input_result(view_state, hook, &result);
+        view_state.mouse.debug_assert_single_pointer_owner();
         if result.consumed || result.capture_pointer {
             return Ok(true);
         }
@@ -10630,6 +10715,83 @@ async fn execute_attach_pointer_focus_decision(
     Ok(true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachPointerContinuation {
+    Unowned,
+    Owned(AttachUiReduction),
+}
+
+pub fn continue_attach_builtin_pointer_owner(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    now: Instant,
+    geometry: TerminalGeometry,
+) -> AttachPointerContinuation {
+    let Some(owner) = view_state.mouse.normalize_pointer_owner() else {
+        return AttachPointerContinuation::Unowned;
+    };
+
+    let reduction = match owner {
+        AttachPointerOwner::Plugin => return AttachPointerContinuation::Unowned,
+        AttachPointerOwner::StatusTab => {
+            if matches!(
+                (mouse_event.phase, mouse_event.button),
+                (TerminalMousePhase::Drag | TerminalMousePhase::Move, _)
+                    | (TerminalMousePhase::Up, Some(TerminalMouseButton::Left))
+            ) {
+                reduce_attach_status_tab_mouse_event(view_state, mouse_event, geometry)
+            } else {
+                AttachUiReduction::consumed()
+            }
+        }
+        AttachPointerOwner::Resize => {
+            if matches!(
+                (mouse_event.phase, mouse_event.button),
+                (
+                    TerminalMousePhase::Drag | TerminalMousePhase::Up,
+                    Some(TerminalMouseButton::Left)
+                )
+            ) {
+                reduce_attach_mouse_resize_event(view_state, mouse_event, now)
+            } else {
+                AttachUiReduction::consumed()
+            }
+        }
+        AttachPointerOwner::Floating => {
+            if matches!(
+                (mouse_event.phase, mouse_event.button),
+                (
+                    TerminalMousePhase::Drag | TerminalMousePhase::Up,
+                    Some(TerminalMouseButton::Left)
+                )
+            ) {
+                reduce_attach_mouse_floating_drag_event(view_state, mouse_event)
+            } else {
+                AttachUiReduction::consumed()
+            }
+        }
+        AttachPointerOwner::Selection => {
+            if matches!(
+                (mouse_event.phase, mouse_event.button),
+                (
+                    TerminalMousePhase::Drag | TerminalMousePhase::Up,
+                    Some(TerminalMouseButton::Left)
+                )
+            ) && let Some(mouse_event) = mouse_event.to_crossterm()
+            {
+                let _ = handle_attach_mouse_selection_drag_at(view_state, mouse_event, now);
+            }
+            AttachUiReduction::consumed()
+        }
+    };
+
+    view_state.mouse.debug_assert_single_pointer_owner();
+    AttachPointerContinuation::Owned(AttachUiReduction {
+        consumed: true,
+        effects: reduction.effects,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_attach_mouse_event_at(
     client: &mut StreamingBmuxClient,
@@ -10642,18 +10804,45 @@ async fn handle_attach_mouse_event_at(
     record_attach_mouse_event(mouse_event, view_state, now);
 
     if !view_state.mouse.config.enabled {
-        view_state.mouse.resize_drag = None;
-        view_state.mouse.floating_drag = None;
-        view_state.mouse.tab_drag = None;
-        view_state.mouse.input_capture = None;
+        view_state.mouse.clear_pointer_gestures();
         return Ok(());
     }
     if view_state.help_overlay_open || view_state.prompt.is_active() {
-        view_state.mouse.resize_drag = None;
-        view_state.mouse.floating_drag = None;
-        view_state.mouse.tab_drag = None;
-        view_state.mouse.input_capture = None;
+        view_state.mouse.clear_pointer_gestures();
         return Ok(());
+    }
+    if !view_state.can_write {
+        view_state.mouse.clear_mutation_pointer_gestures();
+    }
+
+    match view_state.mouse.normalize_pointer_owner() {
+        Some(AttachPointerOwner::Plugin) => {
+            let _ =
+                try_handle_captured_attach_input_hook_mouse(client, view_state, mouse_event, now)
+                    .await?;
+            return Ok(());
+        }
+        Some(_) => {
+            if let AttachPointerContinuation::Owned(reduction) =
+                continue_attach_builtin_pointer_owner(
+                    view_state,
+                    TerminalMouseEvent::from(mouse_event),
+                    now,
+                    geometry,
+                )
+            {
+                execute_attach_ui_effects(
+                    client,
+                    view_state,
+                    reduction.effects,
+                    kernel_client_factory,
+                    now,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        None => {}
     }
 
     if handle_attach_status_tab_mouse_event_at(
@@ -10666,6 +10855,7 @@ async fn handle_attach_mouse_event_at(
     )
     .await?
     {
+        view_state.mouse.debug_assert_single_pointer_owner();
         return Ok(());
     }
 
@@ -10694,51 +10884,42 @@ async fn handle_attach_mouse_event_at(
         }
     }
 
-    if try_handle_attach_input_hook_mouse(client, view_state, mouse_event, now, true).await? {
-        return Ok(());
+    if view_state.can_write {
+        // Shared tiled separators are bmux chrome, not plugin decoration input.
+        // Acquire resize before uncaptured hooks so a decoration drawn on either
+        // adjacent pane frame cannot steal the initiating Down. Active plugin
+        // captures still continue above, and hooks still own non-shared frames.
+        let resize_reduction = reduce_attach_mouse_resize_acquisition_before_uncaptured_hook(
+            view_state,
+            TerminalMouseEvent::from(mouse_event),
+            now,
+        );
+        if resize_reduction.consumed {
+            view_state.mouse.debug_assert_single_pointer_owner();
+            execute_attach_ui_effects(
+                client,
+                view_state,
+                resize_reduction.effects,
+                kernel_client_factory,
+                now,
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
-    if handle_attach_status_tab_mouse_event_at(
-        client,
-        view_state,
-        mouse_event,
-        kernel_client_factory,
-        now,
-        geometry,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-
-    if try_handle_attach_input_hook_mouse(client, view_state, mouse_event, now, false).await? {
+    if try_handle_uncaptured_attach_input_hook_mouse(client, view_state, mouse_event, now).await? {
         return Ok(());
     }
 
     if !view_state.can_write {
-        view_state.mouse.resize_drag = None;
-        view_state.mouse.floating_drag = None;
-        view_state.mouse.tab_drag = None;
-        return Ok(());
-    }
-
-    let resize_reduction =
-        reduce_attach_mouse_resize_event(view_state, TerminalMouseEvent::from(mouse_event), now);
-    if resize_reduction.consumed {
-        execute_attach_ui_effects(
-            client,
-            view_state,
-            resize_reduction.effects,
-            kernel_client_factory,
-            now,
-        )
-        .await?;
         return Ok(());
     }
 
     let floating_reduction =
         reduce_attach_mouse_floating_drag_event(view_state, TerminalMouseEvent::from(mouse_event));
     if floating_reduction.consumed {
+        view_state.mouse.debug_assert_single_pointer_owner();
         execute_attach_ui_effects(
             client,
             view_state,
@@ -10752,14 +10933,6 @@ async fn handle_attach_mouse_event_at(
 
     let mut target_context =
         attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
-
-    if matches!(
-        mouse_event.kind,
-        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-    ) && handle_attach_mouse_selection_drag_at(view_state, mouse_event, now)
-    {
-        return Ok(());
-    }
 
     if matches!(mouse_event.kind, MouseEventKind::ScrollUp)
         && handle_attach_mouse_gesture_action(
@@ -10984,7 +11157,7 @@ pub fn reduce_attach_mouse_floating_drag_event(
             let Some(pane_id) = surface.pane_id else {
                 return AttachUiReduction::ignored();
             };
-            view_state.mouse.selection_drag = None;
+            view_state.mouse.prepare_pointer_owner_acquisition();
             let (scene_max_x, scene_max_y) =
                 attach_scene_bounds(view_state).unwrap_or((u16::MAX, u16::MAX));
             view_state.mouse.floating_drag = Some(AttachMouseFloatingDrag {
@@ -11052,6 +11225,21 @@ fn floating_drag_move_effect(
     })
 }
 
+fn reduce_attach_mouse_resize_acquisition_before_uncaptured_hook(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    now: Instant,
+) -> AttachUiReduction {
+    if matches!(
+        (mouse_event.phase, mouse_event.button),
+        (TerminalMousePhase::Down, Some(TerminalMouseButton::Left))
+    ) {
+        reduce_attach_mouse_resize_event(view_state, mouse_event, now)
+    } else {
+        AttachUiReduction::ignored()
+    }
+}
+
 pub fn reduce_attach_mouse_resize_event(
     view_state: &mut AttachViewState,
     mouse_event: TerminalMouseEvent,
@@ -11069,6 +11257,7 @@ pub fn reduce_attach_mouse_resize_event(
             else {
                 return AttachUiReduction::ignored();
             };
+            view_state.mouse.prepare_pointer_owner_acquisition();
             let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
             drag.last_applied_at = now.checked_sub(throttle).unwrap_or(now);
             view_state.mouse.resize_drag = Some(drag);
@@ -11491,6 +11680,7 @@ pub fn reduce_attach_status_tab_mouse_event(
                 });
             }
 
+            view_state.mouse.prepare_pointer_owner_acquisition();
             let drop_target = view_state
                 .cached_status_line
                 .as_ref()
@@ -12017,6 +12207,7 @@ pub fn maybe_begin_attach_mouse_selection_drag(
         return false;
     };
 
+    view_state.mouse.prepare_pointer_owner_acquisition();
     view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
         pane_id: focus_target,
         anchor,
@@ -12831,6 +13022,7 @@ mod tests {
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
+    use bmux_plugin::{AttachInputEndpoint, AttachInputHook, AttachInputHookFilter};
 
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
@@ -12839,6 +13031,185 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    fn test_attach_input_hook() -> AttachInputHook {
+        AttachInputHook {
+            id: "test-hook".to_string(),
+            owner_plugin_id: "test-plugin".to_string(),
+            priority: 0,
+            endpoint: AttachInputEndpoint {
+                capability: "test".to_string(),
+                interface_id: "test".to_string(),
+                operation: "test".to_string(),
+            },
+            filter: AttachInputHookFilter {
+                mouse_phases: vec!["drag".to_string()],
+                keys: Vec::new(),
+                scope: "global".to_string(),
+                min_interval_ms: 10,
+            },
+        }
+    }
+
+    #[test]
+    fn prompt_acquisition_cancels_pointer_owner() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(1),
+            can_write: true,
+        });
+        view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
+            pane_id: Uuid::from_u128(2),
+            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            active: false,
+        });
+
+        handle_attach_ui_action_at(&RuntimeAction::Quit, &mut view_state, Instant::now());
+
+        assert!(view_state.prompt.is_active());
+        assert_eq!(view_state.mouse.pointer_owner(), None);
+    }
+
+    #[test]
+    fn input_result_updates_capture_without_dropping_existing_modes() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(1),
+            can_write: true,
+        });
+        let hook = test_attach_input_hook();
+        apply_attach_input_result(
+            &mut view_state,
+            hook.clone(),
+            &AttachInputResult {
+                capture_pointer: true,
+                capture_keyboard: vec!["esc".to_string()],
+                ..AttachInputResult::default()
+            },
+        );
+        apply_attach_input_result(
+            &mut view_state,
+            hook,
+            &AttachInputResult {
+                capture_pointer: true,
+                ..AttachInputResult::default()
+            },
+        );
+
+        let capture = view_state
+            .mouse
+            .input_capture
+            .as_ref()
+            .expect("capture should remain");
+        assert!(capture.pointer);
+        assert_eq!(capture.keyboard_keys, ["esc"]);
+        view_state.mouse.clear_plugin_pointer_capture();
+        let capture = view_state
+            .mouse
+            .input_capture
+            .as_ref()
+            .expect("keyboard capture should remain after pointer release");
+        assert!(!capture.pointer);
+        assert_eq!(capture.keyboard_keys, ["esc"]);
+    }
+
+    #[test]
+    fn builtin_owner_ignores_nonmatching_pointer_events() {
+        let now = Instant::now();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(1),
+            can_write: true,
+        });
+        view_state.mouse.resize_drag = Some(AttachMouseResizeDrag {
+            horizontal: None,
+            vertical: None,
+            last_column: 1,
+            last_row: 1,
+            latest_column: 1,
+            latest_row: 1,
+            last_applied_at: now,
+        });
+        let right_up = TerminalMouseEvent {
+            phase: TerminalMousePhase::Up,
+            button: Some(TerminalMouseButton::Right),
+            col: 2,
+            row: 2,
+            modifiers: TerminalModifiers::default(),
+        };
+
+        assert!(matches!(
+            continue_attach_builtin_pointer_owner(
+                &mut view_state,
+                right_up,
+                now,
+                TerminalGeometry { cols: 80, rows: 24 }
+            ),
+            AttachPointerContinuation::Owned(_)
+        ));
+        assert_eq!(
+            view_state.mouse.pointer_owner(),
+            Some(AttachPointerOwner::Resize)
+        );
+    }
+
+    #[test]
+    fn hook_dispatch_eligibility_observes_interval_boundaries() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(10);
+
+        assert!(hook_dispatch_allowed(None, interval, now));
+        assert!(hook_dispatch_allowed(Some(now), Duration::ZERO, now));
+        assert!(!hook_dispatch_allowed(
+            Some(now),
+            interval,
+            now + Duration::from_millis(9)
+        ));
+        assert!(hook_dispatch_allowed(Some(now), interval, now + interval));
+    }
+
+    #[test]
+    fn hook_throttle_disposition_distinguishes_owner_policy() {
+        assert_eq!(
+            attach_hook_throttle_disposition(false, false),
+            AttachHookThrottleDisposition::Dispatch
+        );
+        assert_eq!(
+            attach_hook_throttle_disposition(true, true),
+            AttachHookThrottleDisposition::ConsumeOwned
+        );
+        assert_eq!(
+            attach_hook_throttle_disposition(true, false),
+            AttachHookThrottleDisposition::SkipUnowned
+        );
+    }
+
+    #[test]
+    fn throttled_hook_does_not_advance_dispatch_timestamp() {
+        let now = Instant::now();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(1),
+            can_write: true,
+        });
+        let hook = test_attach_input_hook();
+
+        assert!(!hook_throttled(&mut view_state, &hook, now));
+        assert!(hook_throttled(
+            &mut view_state,
+            &hook,
+            now + Duration::from_millis(9)
+        ));
+        assert_eq!(
+            view_state.mouse.input_hook_last_dispatched_at.get(&hook.id),
+            Some(&now)
+        );
+        assert!(!hook_throttled(
+            &mut view_state,
+            &hook,
+            now + Duration::from_millis(10)
+        ));
+    }
 
     #[cfg(any(
         feature = "image-sixel",
@@ -15730,6 +16101,45 @@ mod tests {
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
         );
         assert!(attach_scene_resize_separator_at(&view_state, 4, 3, now).is_none());
+
+        let reduction = reduce_attach_mouse_resize_acquisition_before_uncaptured_hook(
+            &mut view_state,
+            TerminalMouseEvent {
+                phase: TerminalMousePhase::Down,
+                button: Some(TerminalMouseButton::Left),
+                col: 9,
+                row: 3,
+                modifiers: TerminalModifiers::default(),
+            },
+            now,
+        );
+        assert!(reduction.consumed);
+        assert_eq!(
+            view_state.mouse.pointer_owner(),
+            Some(AttachPointerOwner::Resize)
+        );
+    }
+
+    #[test]
+    fn resize_acquisition_precedence_ignores_non_down_events() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        let reduction = reduce_attach_mouse_resize_acquisition_before_uncaptured_hook(
+            &mut view_state,
+            TerminalMouseEvent {
+                phase: TerminalMousePhase::Drag,
+                button: Some(TerminalMouseButton::Left),
+                col: 9,
+                row: 3,
+                modifiers: TerminalModifiers::default(),
+            },
+            Instant::now(),
+        );
+        assert!(!reduction.consumed);
+        assert_eq!(view_state.mouse.pointer_owner(), None);
     }
 
     #[test]
@@ -16946,6 +17356,11 @@ server_timeout = 1234
             can_write: true,
         });
         let original_mode = processor.active_mode_id().map(ToString::to_string);
+        view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
+            pane_id: Uuid::from_u128(2),
+            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            active: false,
+        });
 
         let error = apply_attach_profile_switch_with_path(
             "missing_profile",
@@ -16959,5 +17374,48 @@ server_timeout = 1234
         let after = std::fs::read_to_string(&temp_path).expect("read temp config");
         assert_eq!(after, initial_config);
         assert_eq!(processor.active_mode_id(), original_mode.as_deref());
+        assert_eq!(
+            view_state.mouse.pointer_owner(),
+            Some(AttachPointerOwner::Selection)
+        );
+    }
+
+    #[test]
+    fn apply_attach_profile_switch_cancels_pointer_owner_on_success() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "bmux-switch-profile-success-{}-{}.toml",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let config = r#"
+[composition]
+active_profile = "one"
+layer_order = ["defaults", "profile:active", "config"]
+
+[composition.profiles.one.patch.general]
+server_timeout = 1234
+
+[composition.profiles.two.patch.general]
+server_timeout = 2345
+"#;
+        std::fs::write(&temp_path, config).expect("write temp config");
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
+            pane_id: Uuid::from_u128(2),
+            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            active: false,
+        });
+
+        apply_attach_profile_switch_with_path("two", &mut processor, &mut view_state, &temp_path)
+            .expect("profile switch should succeed");
+
+        assert_eq!(view_state.mouse.pointer_owner(), None);
+        let _ = std::fs::remove_file(temp_path);
     }
 }

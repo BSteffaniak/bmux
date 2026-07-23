@@ -339,6 +339,15 @@ pub struct ClipboardSyncState {
     pub payload_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachPointerOwner {
+    Plugin,
+    StatusTab,
+    Resize,
+    Floating,
+    Selection,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
@@ -355,6 +364,110 @@ pub struct AttachMouseState {
     pub tab_drag: Option<AttachMouseTabDrag>,
     pub input_capture: Option<AttachInputHookCapture>,
     pub input_hook_last_dispatched_at: BTreeMap<String, Instant>,
+}
+
+impl AttachMouseState {
+    #[must_use]
+    pub(crate) fn pointer_owner(&self) -> Option<AttachPointerOwner> {
+        if self
+            .input_capture
+            .as_ref()
+            .is_some_and(|capture| capture.pointer)
+        {
+            Some(AttachPointerOwner::Plugin)
+        } else if self.tab_drag.is_some() {
+            Some(AttachPointerOwner::StatusTab)
+        } else if self.resize_drag.is_some() {
+            Some(AttachPointerOwner::Resize)
+        } else if self.floating_drag.is_some() {
+            Some(AttachPointerOwner::Floating)
+        } else if self.selection_drag.is_some() {
+            Some(AttachPointerOwner::Selection)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn pointer_owner_count(&self) -> usize {
+        usize::from(
+            self.input_capture
+                .as_ref()
+                .is_some_and(|capture| capture.pointer),
+        ) + usize::from(self.tab_drag.is_some())
+            + usize::from(self.resize_drag.is_some())
+            + usize::from(self.floating_drag.is_some())
+            + usize::from(self.selection_drag.is_some())
+    }
+
+    #[must_use]
+    pub(crate) fn has_single_pointer_owner(&self) -> bool {
+        self.pointer_owner_count() <= 1
+    }
+
+    pub(crate) fn clear_plugin_pointer_capture(&mut self) {
+        if let Some(capture) = self.input_capture.as_mut() {
+            capture.pointer = false;
+            if capture.keyboard_keys.is_empty() {
+                self.input_capture = None;
+            }
+        }
+    }
+
+    pub(crate) fn clear_pointer_gestures(&mut self) {
+        self.clear_plugin_pointer_capture();
+        self.tab_drag = None;
+        self.resize_drag = None;
+        self.floating_drag = None;
+        self.selection_drag = None;
+        debug_assert!(self.has_single_pointer_owner());
+    }
+
+    pub(crate) fn clear_mutation_pointer_gestures(&mut self) {
+        self.resize_drag = None;
+        self.floating_drag = None;
+        debug_assert!(self.has_single_pointer_owner());
+    }
+
+    pub(crate) fn prepare_pointer_owner_acquisition(&mut self) {
+        self.clear_pointer_gestures();
+        debug_assert!(self.pointer_owner().is_none());
+    }
+
+    pub(crate) fn debug_assert_single_pointer_owner(&self) {
+        debug_assert!(self.has_single_pointer_owner());
+    }
+
+    pub(crate) fn normalize_pointer_owner(&mut self) -> Option<AttachPointerOwner> {
+        let owner = self.pointer_owner();
+        if self.has_single_pointer_owner() {
+            return owner;
+        }
+
+        match owner {
+            Some(AttachPointerOwner::Plugin) => {
+                self.tab_drag = None;
+                self.resize_drag = None;
+                self.floating_drag = None;
+                self.selection_drag = None;
+            }
+            Some(AttachPointerOwner::StatusTab) => {
+                self.resize_drag = None;
+                self.floating_drag = None;
+                self.selection_drag = None;
+            }
+            Some(AttachPointerOwner::Resize) => {
+                self.floating_drag = None;
+                self.selection_drag = None;
+            }
+            Some(AttachPointerOwner::Floating) => {
+                self.selection_drag = None;
+            }
+            Some(AttachPointerOwner::Selection) | None => {}
+        }
+        debug_assert!(self.has_single_pointer_owner());
+        owner
+    }
 }
 
 impl Default for AttachMouseState {
@@ -642,6 +755,177 @@ impl AttachViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_plugin::{AttachInputEndpoint, AttachInputHookFilter};
+
+    fn test_input_hook() -> AttachInputHook {
+        AttachInputHook {
+            id: "test-hook".to_string(),
+            owner_plugin_id: "test-plugin".to_string(),
+            priority: 0,
+            endpoint: AttachInputEndpoint {
+                capability: "test".to_string(),
+                interface_id: "test".to_string(),
+                operation: "test".to_string(),
+            },
+            filter: AttachInputHookFilter {
+                mouse_phases: Vec::new(),
+                keys: Vec::new(),
+                scope: "global".to_string(),
+                min_interval_ms: 0,
+            },
+        }
+    }
+
+    fn test_tab_drag() -> AttachMouseTabDrag {
+        AttachMouseTabDrag {
+            source_context_id: Uuid::from_u128(2),
+            started_col: 1,
+            started_row: 1,
+            active: false,
+            drop_target: None,
+        }
+    }
+
+    fn test_floating_drag() -> AttachMouseFloatingDrag {
+        AttachMouseFloatingDrag {
+            pane_id: Uuid::from_u128(3),
+            start_x: 0,
+            start_y: 0,
+            width: 10,
+            height: 5,
+            scene_max_x: 80,
+            scene_max_y: 24,
+            last_x: 0,
+            last_y: 0,
+            start_column: 0,
+            start_row: 0,
+        }
+    }
+
+    fn test_resize_drag() -> AttachMouseResizeDrag {
+        AttachMouseResizeDrag {
+            horizontal: None,
+            vertical: None,
+            last_column: 0,
+            last_row: 0,
+            latest_column: 0,
+            latest_row: 0,
+            last_applied_at: Instant::now(),
+        }
+    }
+
+    fn test_selection_drag() -> AttachMouseSelectionDrag {
+        AttachMouseSelectionDrag {
+            pane_id: Uuid::from_u128(4),
+            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            active: false,
+        }
+    }
+
+    #[test]
+    fn pointer_owner_derivation_covers_every_owner() {
+        let mut mouse = AttachMouseState::default();
+        assert_eq!(mouse.pointer_owner(), None);
+
+        mouse.selection_drag = Some(test_selection_drag());
+        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Selection));
+        mouse.selection_drag = None;
+
+        mouse.floating_drag = Some(test_floating_drag());
+        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Floating));
+        mouse.floating_drag = None;
+
+        mouse.resize_drag = Some(test_resize_drag());
+        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Resize));
+        mouse.resize_drag = None;
+
+        mouse.tab_drag = Some(test_tab_drag());
+        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::StatusTab));
+        mouse.tab_drag = None;
+
+        mouse.input_capture = Some(AttachInputHookCapture {
+            hook: test_input_hook(),
+            pointer: true,
+            keyboard_keys: Vec::new(),
+        });
+        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Plugin));
+    }
+
+    #[test]
+    fn malformed_pointer_owners_are_normalized_by_precedence() {
+        let mut mouse = AttachMouseState {
+            tab_drag: Some(test_tab_drag()),
+            resize_drag: Some(test_resize_drag()),
+            floating_drag: Some(test_floating_drag()),
+            selection_drag: Some(test_selection_drag()),
+            ..AttachMouseState::default()
+        };
+        assert_eq!(mouse.pointer_owner_count(), 4);
+        assert_eq!(
+            mouse.normalize_pointer_owner(),
+            Some(AttachPointerOwner::StatusTab)
+        );
+        assert!(mouse.has_single_pointer_owner());
+        assert!(mouse.tab_drag.is_some());
+
+        mouse.input_capture = Some(AttachInputHookCapture {
+            hook: test_input_hook(),
+            pointer: true,
+            keyboard_keys: vec!["esc".to_string()],
+        });
+        mouse.tab_drag = Some(test_tab_drag());
+        mouse.resize_drag = Some(test_resize_drag());
+        mouse.floating_drag = Some(test_floating_drag());
+        mouse.selection_drag = Some(test_selection_drag());
+        assert_eq!(
+            mouse.normalize_pointer_owner(),
+            Some(AttachPointerOwner::Plugin)
+        );
+        assert!(mouse.has_single_pointer_owner());
+        assert!(mouse.input_capture.is_some());
+        assert!(mouse.tab_drag.is_none());
+        assert!(mouse.resize_drag.is_none());
+        assert!(mouse.floating_drag.is_none());
+        assert!(mouse.selection_drag.is_none());
+    }
+
+    #[test]
+    fn pointer_cancellation_preserves_keyboard_capture() {
+        let mut mouse = AttachMouseState {
+            tab_drag: Some(test_tab_drag()),
+            resize_drag: Some(test_resize_drag()),
+            floating_drag: Some(test_floating_drag()),
+            selection_drag: Some(test_selection_drag()),
+            input_capture: Some(AttachInputHookCapture {
+                hook: test_input_hook(),
+                pointer: true,
+                keyboard_keys: vec!["esc".to_string()],
+            }),
+            ..AttachMouseState::default()
+        };
+
+        mouse.clear_pointer_gestures();
+
+        assert_eq!(mouse.pointer_owner(), None);
+        let capture = mouse.input_capture.expect("keyboard capture should remain");
+        assert!(!capture.pointer);
+        assert_eq!(capture.keyboard_keys, ["esc"]);
+    }
+
+    #[test]
+    fn mutation_cancellation_preserves_nonmutation_owners() {
+        let mut mouse = AttachMouseState {
+            resize_drag: Some(test_resize_drag()),
+            floating_drag: Some(test_floating_drag()),
+            ..AttachMouseState::default()
+        };
+        mouse.clear_mutation_pointer_gestures();
+        assert_eq!(mouse.pointer_owner(), None);
+
+        mouse.selection_drag = Some(test_selection_drag());
+        mouse.clear_mutation_pointer_gestures();
+        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Selection));
+    }
 
     #[test]
     fn pane_scoped_appearance_overrides_fallback_deterministically() {

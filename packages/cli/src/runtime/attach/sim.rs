@@ -2,12 +2,16 @@ use super::adapters::{AttachClock, FixedAttachClock};
 use super::input::{TerminalGeometry, TerminalMouseEvent};
 use super::prompt_ui::PromptKeyDisposition;
 use super::runtime::{
-    attach_key_event_actions, attach_tab_drop_marker_col, build_attach_help_lines,
+    AttachPointerContinuation, attach_key_event_actions, attach_mouse_forward_bytes_for_target,
+    attach_tab_drop_marker_col, build_attach_help_lines, continue_attach_builtin_pointer_owner,
     handle_attach_ui_action_at, handle_help_overlay_key_event,
-    reduce_attach_mouse_floating_drag_event, reduce_attach_mouse_resize_event,
-    reduce_attach_status_tab_mouse_event, status_row_for_position,
+    maybe_begin_attach_mouse_selection_drag, reduce_attach_mouse_floating_drag_event,
+    reduce_attach_mouse_resize_event, reduce_attach_status_tab_mouse_event,
+    status_row_for_position,
 };
-use super::state::{AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer};
+use super::state::{
+    AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer,
+};
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Result, bail};
@@ -175,14 +179,58 @@ impl AttachSimHarness {
     }
 
     pub fn send_mouse(&mut self, event: TerminalMouseEvent) {
-        let mut reduction =
-            reduce_attach_status_tab_mouse_event(&mut self.view_state, event, self.geometry);
+        if !self.view_state.mouse.config.enabled
+            || self.view_state.help_overlay_open
+            || self.view_state.prompt.is_active()
+        {
+            self.view_state.mouse.clear_pointer_gestures();
+            return;
+        }
+        if !self.view_state.can_write {
+            self.view_state.mouse.clear_mutation_pointer_gestures();
+        }
+
+        let mut reduction = match self.view_state.mouse.pointer_owner() {
+            Some(AttachPointerOwner::Plugin) => return,
+            _ => match continue_attach_builtin_pointer_owner(
+                &mut self.view_state,
+                event,
+                self.clock.now(),
+                self.geometry,
+            ) {
+                AttachPointerContinuation::Owned(reduction) => reduction,
+                AttachPointerContinuation::Unowned => {
+                    reduce_attach_status_tab_mouse_event(&mut self.view_state, event, self.geometry)
+                }
+            },
+        };
         if !reduction.consumed {
+            if self.try_forward_mouse(event) {
+                return;
+            }
+            if !self.view_state.can_write {
+                return;
+            }
             reduction =
                 reduce_attach_mouse_resize_event(&mut self.view_state, event, self.clock.now());
         }
         if !reduction.consumed {
             reduction = reduce_attach_mouse_floating_drag_event(&mut self.view_state, event);
+        }
+        if !reduction.consumed
+            && matches!(
+                (event.phase, event.button),
+                (
+                    super::input::TerminalMousePhase::Down,
+                    Some(super::input::TerminalMouseButton::Left)
+                )
+            )
+            && let Some(mouse_event) = event.to_crossterm()
+        {
+            let target = self.mouse_content_target(event);
+            if maybe_begin_attach_mouse_selection_drag(&mut self.view_state, target, mouse_event) {
+                reduction = super::state::AttachUiReduction::consumed();
+            }
         }
         if !reduction.consumed {
             return;
@@ -191,6 +239,108 @@ impl AttachSimHarness {
             self.apply_effect(effect);
         }
         self.render();
+    }
+
+    fn mouse_content_target(&self, event: TerminalMouseEvent) -> Option<Uuid> {
+        self.view_state
+            .cached_layout_state
+            .as_ref()
+            .and_then(|layout| {
+                layout
+                    .scene
+                    .surfaces
+                    .iter()
+                    .rev()
+                    .find(|surface| {
+                        surface.visible
+                            && surface.accepts_input
+                            && event.col >= surface.rect.x
+                            && event.col < surface.rect.x.saturating_add(surface.rect.w)
+                            && event.row >= surface.rect.y
+                            && event.row < surface.rect.y.saturating_add(surface.rect.h)
+                    })
+                    .filter(|surface| {
+                        event.col >= surface.content_rect.x
+                            && event.col
+                                < surface
+                                    .content_rect
+                                    .x
+                                    .saturating_add(surface.content_rect.w)
+                            && event.row >= surface.content_rect.y
+                            && event.row
+                                < surface
+                                    .content_rect
+                                    .y
+                                    .saturating_add(surface.content_rect.h)
+                    })
+                    .and_then(|surface| surface.pane_id)
+            })
+    }
+
+    fn try_forward_mouse(&mut self, event: TerminalMouseEvent) -> bool {
+        if self.view_state.mouse.pointer_owner().is_some() {
+            return false;
+        }
+        let Some(mouse_event) = event.to_crossterm() else {
+            return false;
+        };
+        let target = self.mouse_content_target(event);
+        let Some(bytes) = attach_mouse_forward_bytes_for_target(
+            &self.view_state,
+            mouse_event,
+            target,
+            target.is_some(),
+        ) else {
+            return false;
+        };
+        self.forwarded_bytes.push(bytes);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn pointer_owner(&self) -> Option<AttachPointerOwner> {
+        self.view_state.mouse.pointer_owner()
+    }
+
+    #[cfg(test)]
+    pub fn forwarded_mouse_bytes(&self) -> &[Vec<u8>] {
+        &self.forwarded_bytes
+    }
+
+    #[cfg(test)]
+    pub fn open_help_overlay(&mut self) {
+        self.view_state.help_overlay_open = true;
+        self.view_state.mouse.clear_pointer_gestures();
+    }
+
+    #[cfg(test)]
+    pub fn set_can_write(&mut self, can_write: bool) {
+        self.view_state.can_write = can_write;
+        if !can_write {
+            self.view_state.mouse.clear_mutation_pointer_gestures();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn disable_mouse(&mut self) {
+        self.view_state.mouse.config.enabled = false;
+        self.view_state.mouse.clear_pointer_gestures();
+    }
+
+    #[cfg(test)]
+    pub fn enable_pane_mouse_reporting(&mut self) {
+        let Some(layout) = self.view_state.cached_layout_state.as_ref() else {
+            return;
+        };
+        for pane in &layout.panes {
+            self.view_state.pane_mouse_protocol_hints.insert(
+                pane.id,
+                bmux_attach_layout_protocol::AttachMouseProtocolState {
+                    mode: bmux_attach_layout_protocol::AttachMouseProtocolMode::AnyMotion,
+                    encoding: bmux_attach_layout_protocol::AttachMouseProtocolEncoding::Sgr,
+                },
+            );
+        }
     }
 
     pub fn seed_vertical_split_panes(&mut self) {
@@ -544,7 +694,9 @@ impl AttachSimHarness {
     fn apply_ui_action(&mut self, ui_action: &RuntimeAction) {
         if matches!(ui_action, RuntimeAction::ShowHelp) {
             self.view_state.help_overlay_open = !self.view_state.help_overlay_open;
-            if !self.view_state.help_overlay_open {
+            if self.view_state.help_overlay_open {
+                self.view_state.mouse.clear_pointer_gestures();
+            } else {
                 self.view_state.help_overlay_scroll = 0;
             }
         } else {
@@ -793,7 +945,9 @@ mod tests {
     use crate::runtime::attach::input::{
         TerminalModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMousePhase,
     };
-    use crate::runtime::attach::state::{AttachTabDropPlacement, AttachUiEffect};
+    use crate::runtime::attach::state::{
+        AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect,
+    };
     use bmux_config::StatusPosition;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -918,6 +1072,72 @@ mod tests {
     }
 
     #[test]
+    fn attach_sim_status_tab_drag_remains_owned_outside_status_row() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+        sim.seed_vertical_split_panes();
+        sim.enable_pane_mouse_reporting();
+        let one = sim.locate_text("1:one").expect("one tab");
+
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            one.center_col,
+            one.row,
+        ));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::StatusTab));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 3, 3));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::StatusTab));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 3, 3));
+
+        assert!(sim.forwarded_mouse_bytes().is_empty());
+        assert_eq!(sim.pointer_owner(), None);
+    }
+
+    #[test]
+    fn attach_sim_mouse_selection_remains_owned_outside_initial_content() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_pane_lines(&["abc", "def"], 1, 1);
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 1, 1));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::Selection));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 50, 20));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::Selection));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 50, 20));
+
+        assert!(sim.selection_active());
+        assert_eq!(sim.pointer_owner(), None);
+    }
+
+    #[test]
+    fn attach_sim_cancellation_policies_clear_resize_owner() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 9, 3));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::Resize));
+        sim.open_help_overlay();
+        assert_eq!(sim.pointer_owner(), None);
+
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 9, 3));
+        sim.disable_mouse();
+        assert_eq!(sim.pointer_owner(), None);
+
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 9, 3));
+        sim.set_can_write(false);
+        assert_eq!(sim.pointer_owner(), None);
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 12, 3));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 12, 3));
+        assert!(
+            !sim.effects()
+                .iter()
+                .any(|effect| matches!(effect, AttachUiEffect::ResizePane { .. }))
+        );
+    }
+
+    #[test]
     fn attach_sim_mouse_resize_emits_resize_pane_effect() {
         let mut sim = AttachSimHarness::new(100, 24);
         sim.seed_vertical_split_panes();
@@ -937,6 +1157,64 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn attach_sim_mouse_resize_retains_owner_inside_mouse_aware_pane() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.enable_pane_mouse_reporting();
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 9, 3));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::Resize));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 12, 3));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 12, 3));
+
+        assert!(sim.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                AttachUiEffect::ResizePane {
+                    direction:
+                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
+                    cells: 3,
+                    ..
+                }
+            )
+        }));
+        assert!(sim.forwarded_mouse_bytes().is_empty());
+        assert_eq!(sim.pointer_owner(), None);
+    }
+
+    #[test]
+    fn attach_sim_unowned_mouse_aware_pane_event_still_forwards() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.enable_pane_mouse_reporting();
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 3, 3));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 4, 3));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 4, 3));
+
+        assert_eq!(sim.pointer_owner(), None);
+        assert_eq!(sim.forwarded_mouse_bytes().len(), 3);
+    }
+
+    #[test]
+    fn attach_sim_mouse_floating_drag_remains_owned_across_pane_content() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_floating_pane_layout();
+        sim.enable_pane_mouse_reporting();
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 2, 2));
+        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::Floating));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 15, 8));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 15, 8));
+
+        assert!(sim.effects().iter().any(|effect| {
+            matches!(effect, AttachUiEffect::MoveFloatingPane { pane_id, .. } if *pane_id == Uuid::from_u128(32))
+        }));
+        assert!(sim.forwarded_mouse_bytes().is_empty());
+        assert_eq!(sim.pointer_owner(), None);
     }
 
     #[test]
