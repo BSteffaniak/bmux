@@ -167,6 +167,8 @@ pub struct AttachInputModeState {
     pub application_cursor: bool,
     #[serde(default)]
     pub application_keypad: bool,
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -252,4 +254,31 @@ bmux_plugin_schema_macros::schema! {
             crate_path: ::bmux_scene_protocol,
         },
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AttachInputModeState;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct LegacyAttachInputModeState {
+        application_cursor: bool,
+        application_keypad: bool,
+    }
+
+    #[test]
+    fn attach_input_mode_decodes_legacy_payload_without_bracketed_paste() {
+        let bytes = bmux_codec::to_vec(&LegacyAttachInputModeState {
+            application_cursor: true,
+            application_keypad: false,
+        })
+        .expect("legacy input mode should encode");
+        let decoded: AttachInputModeState =
+            bmux_codec::from_bytes(&bytes).expect("legacy input mode should decode");
+
+        assert!(decoded.application_cursor);
+        assert!(!decoded.application_keypad);
+        assert!(!decoded.bracketed_paste);
+    }
 }

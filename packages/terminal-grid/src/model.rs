@@ -95,6 +95,8 @@ pub struct ProtocolState {
     pub application_cursor: bool,
     #[serde(default)]
     pub application_keypad: bool,
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 impl ProtocolState {
@@ -675,6 +677,13 @@ impl TerminalGrid {
     pub(crate) fn set_application_keypad(&mut self, enabled: bool) {
         if self.protocol.application_keypad != enabled {
             self.protocol.application_keypad = enabled;
+            self.bump_revision();
+        }
+    }
+
+    pub(crate) fn set_bracketed_paste(&mut self, enabled: bool) {
+        if self.protocol.bracketed_paste != enabled {
+            self.protocol.bracketed_paste = enabled;
             self.bump_revision();
         }
     }

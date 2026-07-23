@@ -28,6 +28,12 @@ bmux_plugin_schema_macros::schema! {
 pub struct PaneRuntimePluginConfig {
     pub shell: String,
     pub pane_term: String,
+    #[serde(default = "default_true")]
+    pub bracketed_paste: bool,
     #[serde(default)]
     pub shell_integration_root: Option<std::path::PathBuf>,
+}
+
+const fn default_true() -> bool {
+    true
 }

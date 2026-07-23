@@ -95,6 +95,8 @@ pub struct TerminalProtocolEngine {
     profile: ProtocolProfile,
     pane_id: Option<u16>,
     trace: Option<SharedProtocolTraceBuffer>,
+    bracketed_paste: bool,
+    bracketed_paste_supported: bool,
     /// Stack of kitty keyboard enhancement flags pushed by the inner program.
     #[cfg(feature = "kitty-keyboard")]
     keyboard_flag_stack: Vec<u32>,
@@ -111,9 +113,17 @@ impl TerminalProtocolEngine {
             profile,
             pane_id: None,
             trace: None,
+            bracketed_paste: false,
+            bracketed_paste_supported: true,
             #[cfg(feature = "kitty-keyboard")]
             keyboard_flag_stack: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_bracketed_paste_support(mut self, supported: bool) -> Self {
+        self.bracketed_paste_supported = supported;
+        self
     }
 
     #[must_use]
@@ -186,9 +196,14 @@ impl TerminalProtocolEngine {
                             continue;
                         }
 
-                        if let Some((name, reply)) =
-                            csi_query_reply(&self.csi_buffer, cursor_pos, self.profile)
-                        {
+                        self.update_private_modes();
+                        if let Some((name, reply)) = csi_query_reply(
+                            &self.csi_buffer,
+                            cursor_pos,
+                            self.profile,
+                            self.bracketed_paste,
+                            self.bracketed_paste_supported,
+                        ) {
                             self.trace_event(
                                 "csi",
                                 name,
@@ -285,6 +300,27 @@ impl TerminalProtocolEngine {
         }
 
         replies
+    }
+
+    fn update_private_modes(&mut self) {
+        let Some((&final_byte, params)) = self.csi_buffer.split_last() else {
+            return;
+        };
+        let enabled = match final_byte {
+            b'h' => true,
+            b'l' => false,
+            _ => return,
+        };
+        let Some(params) = params.strip_prefix(b"?") else {
+            return;
+        };
+        if self.bracketed_paste_supported
+            && params
+                .split(|byte| *byte == b';')
+                .any(|mode| mode == b"2004")
+        {
+            self.bracketed_paste = enabled;
+        }
     }
 
     fn trace_event(&self, family: &str, name: &str, direction: ProtocolDirection, bytes: &[u8]) {
@@ -424,6 +460,8 @@ fn csi_query_reply(
     sequence: &[u8],
     cursor_pos: (u16, u16),
     profile: ProtocolProfile,
+    bracketed_paste: bool,
+    bracketed_paste_supported: bool,
 ) -> Option<(&'static str, Vec<u8>)> {
     match sequence {
         b"c" | b"0c" => Some(("csi_primary_da", primary_da_response(profile).to_vec())),
@@ -435,19 +473,38 @@ fn csi_query_reply(
             "csi_dec_dsr_cursor_position",
             dec_dsr_cursor_response(cursor_pos),
         )),
-        _ if sequence.starts_with(b"?") && sequence.ends_with(b"$p") => {
-            dec_mode_report_response(sequence, profile).map(|reply| ("csi_dec_mode_report", reply))
-        }
+        _ if sequence.starts_with(b"?") && sequence.ends_with(b"$p") => dec_mode_report_response(
+            sequence,
+            profile,
+            bracketed_paste,
+            bracketed_paste_supported,
+        )
+        .map(|reply| ("csi_dec_mode_report", reply)),
         _ => None,
     }
 }
 
-fn dec_mode_report_response(sequence: &[u8], profile: ProtocolProfile) -> Option<Vec<u8>> {
+fn dec_mode_report_response(
+    sequence: &[u8],
+    profile: ProtocolProfile,
+    bracketed_paste: bool,
+    bracketed_paste_supported: bool,
+) -> Option<Vec<u8>> {
     let mode_bytes = &sequence[1..sequence.len().saturating_sub(2)];
     let modes = parse_mode_list(mode_bytes)?;
     let mut out = Vec::new();
     for mode in modes {
-        let status = dec_mode_status(profile, mode);
+        let status = if mode == 2004 {
+            if !bracketed_paste_supported {
+                0
+            } else if bracketed_paste {
+                1
+            } else {
+                2
+            }
+        } else {
+            dec_mode_status(profile, mode)
+        };
         out.extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
     }
     (!out.is_empty()).then_some(out)
@@ -762,5 +819,33 @@ mod tests {
         assert!(names.contains(&"csi_kitty_keyboard_query"));
         assert!(names.contains(&"csi_kitty_keyboard_push"));
         assert!(names.contains(&"csi_kitty_keyboard_pop"));
+    }
+    #[test]
+    fn dec_mode_2004_query_tracks_live_state() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        assert_eq!(
+            engine.process_output(b"\x1b[?2004$p", (0, 0)),
+            b"\x1b[?2004;2$y"
+        );
+        assert!(engine.process_output(b"\x1b[?2004h", (0, 0)).is_empty());
+        assert_eq!(
+            engine.process_output(b"\x1b[?2004$p", (0, 0)),
+            b"\x1b[?2004;1$y"
+        );
+        assert!(engine.process_output(b"\x1b[?2004l", (0, 0)).is_empty());
+        assert_eq!(
+            engine.process_output(b"\x1b[?2004$p", (0, 0)),
+            b"\x1b[?2004;2$y"
+        );
+    }
+    #[test]
+    fn dec_mode_2004_is_unknown_when_support_is_disabled() {
+        let mut engine =
+            TerminalProtocolEngine::new(ProtocolProfile::Bmux).with_bracketed_paste_support(false);
+        assert!(engine.process_output(b"\x1b[?2004h", (0, 0)).is_empty());
+        assert_eq!(
+            engine.process_output(b"\x1b[?2004$p", (0, 0)),
+            b"\x1b[?2004;0$y"
+        );
     }
 }

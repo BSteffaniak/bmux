@@ -555,6 +555,9 @@ fn register_pane_runtime_plugin_config(
     let plugin_config = PaneRuntimePluginConfig {
         shell: resolve_pane_runtime_shell(config),
         pane_term: resolve_pane_runtime_term(config),
+        bracketed_paste: super::attach::runtime::bracketed_paste_enabled(
+            config.behavior.bracketed_paste,
+        ),
         shell_integration_root: pane_shell_integration_override
             .unwrap_or(config.behavior.pane_shell_integration)
             .then(|| paths.state_dir().join("runtime").join("shell-integration")),

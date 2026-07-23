@@ -4,7 +4,9 @@ use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall}
 use std::io::{self, IsTerminal};
 use std::process::Command as ProcessCommand;
 
-use super::attach::runtime::{describe_timeout, effective_attach_keybindings};
+use super::attach::runtime::{
+    bracketed_paste_enabled, describe_timeout, effective_attach_keybindings,
+};
 use super::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, TerminalProfile,
     effective_enabled_plugins, primary_da_for_profile, protocol_profile_name,
@@ -59,6 +61,19 @@ pub(super) fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Resu
     }
 }
 
+pub(super) const fn bracketed_paste_status(config_enabled: bool) -> (&'static str, bool, bool) {
+    let available = cfg!(feature = "bracketed-paste");
+    let effective = bracketed_paste_enabled(config_enabled);
+    let status = if effective {
+        "enabled"
+    } else if available {
+        "disabled"
+    } else {
+        "unavailable"
+    };
+    (status, available, effective)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_terminal_doctor(
     as_json: bool,
@@ -77,6 +92,8 @@ pub(super) fn run_terminal_doctor(
         }
     };
 
+    let (bracketed_paste_status, bracketed_paste_available, bracketed_paste_effective) =
+        bracketed_paste_status(config.behavior.bracketed_paste);
     let configured_term = config.behavior.pane_term.clone();
     let effective = resolve_pane_term(&configured_term);
     let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
@@ -98,6 +115,11 @@ pub(super) fn run_terminal_doctor(
             "primary_da_reply": String::from_utf8_lossy(primary_da_for_profile(protocol_profile)),
             "secondary_da_reply": String::from_utf8_lossy(secondary_da_for_profile(protocol_profile)),
             "supported_queries": supported_query_names(),
+            "bracketed_paste": {
+                "compiled": bracketed_paste_available,
+                "configured": config.behavior.bracketed_paste,
+                "effective": bracketed_paste_effective,
+            },
             "fallback_chain": effective.fallback_chain,
             "terminfo_check": {
                 "attempted": effective.terminfo_checked,
@@ -167,6 +189,20 @@ pub(super) fn run_terminal_doctor(
         println!("last declined terminfo prompt (epoch secs): {epoch}");
     }
     println!("supported queries: {}", supported_query_names().join(", "));
+    println!(
+        "bracketed paste: {} (compiled: {}, configured: {})",
+        bracketed_paste_status,
+        if bracketed_paste_available {
+            "yes"
+        } else {
+            "no"
+        },
+        if config.behavior.bracketed_paste {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("fallback chain: {}", effective.fallback_chain.join(" -> "));
     if effective.terminfo_checked {
         println!(
@@ -762,6 +798,28 @@ pub(super) fn run_keymap_explain(key: &str, mode: Option<&str>, as_json: bool) -
 mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
+
+    #[test]
+    fn bracketed_paste_status_reports_build_and_config_capability() {
+        let (disabled_status, available, disabled_effective) = bracketed_paste_status(false);
+        assert!(!disabled_effective);
+        assert_eq!(
+            disabled_status,
+            if available { "disabled" } else { "unavailable" }
+        );
+
+        let (enabled_status, enabled_available, enabled_effective) = bracketed_paste_status(true);
+        assert_eq!(enabled_available, cfg!(feature = "bracketed-paste"));
+        assert_eq!(enabled_effective, cfg!(feature = "bracketed-paste"));
+        assert_eq!(
+            enabled_status,
+            if enabled_available {
+                "enabled"
+            } else {
+                "unavailable"
+            }
+        );
+    }
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {

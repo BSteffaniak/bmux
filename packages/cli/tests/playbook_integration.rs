@@ -259,6 +259,24 @@ fn playbook_run_interactive_step_controls() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
+fn playbook_real_attach_bracketed_paste_reaches_pty_with_exact_mode_encoding() {
+    let (json, pass) = run_playbook_fixture("bracketed_paste_real_attach.dsl");
+    assert!(
+        pass,
+        "real attach bracketed paste playbook should pass: {json:#}"
+    );
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let paste_steps = steps
+        .iter()
+        .filter(|step| step["action"] == "paste-attach")
+        .collect::<Vec<_>>();
+    assert_eq!(paste_steps.len(), 2, "expected both paste modes: {json:#}");
+    assert!(paste_steps.iter().all(|step| step["status"] == "pass"));
+}
+
+#[test]
 fn playbook_echo_hello() {
     let (json, pass) = run_playbook_fixture("echo_hello.dsl");
     assert!(pass, "playbook should pass: {json:#}");

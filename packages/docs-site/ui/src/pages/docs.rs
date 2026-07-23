@@ -178,6 +178,16 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
+    fn config_reference_includes_bracketed_paste_default_and_safety_docs() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("bracketed_paste"));
+        assert!(doc.contains("`bracketed-paste` Cargo feature"));
+        assert!(doc.contains("defaults to true"));
+        assert!(doc.contains("indistinguishable from typed terminal input"));
+    }
+
+    #[test]
     fn config_reference_includes_connections_nested_dotted_keys() {
         let doc = generate_config_reference();
 

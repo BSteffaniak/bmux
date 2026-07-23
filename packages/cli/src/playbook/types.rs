@@ -222,6 +222,8 @@ pub enum Action {
     ResizeViewport { cols: u16, rows: u16 },
     /// Send key chord(s) through the attach keybinding runtime.
     SendAttach { key: String },
+    /// Send a semantic paste event through the real attach runtime.
+    PasteAttach { text: String },
     /// Send the prefix key combo + a key character.
     PrefixKey { key: char },
     /// Wait for a server event.
@@ -656,6 +658,7 @@ impl Action {
             Self::AssertCursor { .. } => "assert-cursor",
             Self::ResizeViewport { .. } => "resize-viewport",
             Self::SendAttach { .. } => "send-attach",
+            Self::PasteAttach { .. } => "paste-attach",
             Self::PrefixKey { .. } => "prefix-key",
             Self::WaitForEvent { .. } => "wait-for-event",
             Self::InvokeService { .. } => "invoke-service",
@@ -784,6 +787,9 @@ impl Action {
             }
             Self::SendAttach { key } => {
                 format!("send-attach key='{}'", escape_single_quote(key))
+            }
+            Self::PasteAttach { text } => {
+                format!("paste-attach text='{}'", escape_single_quote(text))
             }
             Self::PrefixKey { key } => format!("prefix-key key={key}"),
             Self::WaitForEvent { event, timeout } => {

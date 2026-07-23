@@ -13,7 +13,7 @@ pub enum TerminalInputEvent {
     Resize { cols: u16, rows: u16 },
     FocusGained,
     FocusLost,
-    Bytes(Vec<u8>),
+    Paste(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,7 +117,7 @@ impl TerminalInputEvent {
                 Some(Self::Mouse(TerminalMouseEvent::from(mouse)))
             }
             crossterm::event::Event::Resize(cols, rows) => Some(Self::Resize { cols, rows }),
-            crossterm::event::Event::Paste(text) => Some(Self::Bytes(text.into_bytes())),
+            crossterm::event::Event::Paste(text) => Some(Self::Paste(text)),
             crossterm::event::Event::FocusGained => Some(Self::FocusGained),
             crossterm::event::Event::FocusLost => Some(Self::FocusLost),
         }
@@ -415,6 +415,14 @@ mod tests {
         });
         assert_eq!(scroll.phase, TerminalMousePhase::ScrollDown);
         assert!(scroll.modifiers.alt);
+    }
+
+    #[test]
+    fn maps_crossterm_paste_as_semantic_event() {
+        assert_eq!(
+            TerminalInputEvent::from_crossterm_event(Event::Paste("hello\nworld".to_string())),
+            Some(TerminalInputEvent::Paste("hello\nworld".to_string()))
+        );
     }
 
     #[test]

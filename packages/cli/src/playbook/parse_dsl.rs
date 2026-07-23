@@ -340,6 +340,10 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
             let key = require_arg(&args, "key", "send-attach")?;
             Ok(Action::SendAttach { key })
         }
+        "paste-attach" => {
+            let text = require_arg(&args, "text", "paste-attach")?;
+            Ok(Action::PasteAttach { text })
+        }
         "prefix-key" => {
             let key_str = require_arg(&args, "key", "prefix-key")?;
             let key = key_str.chars().next().context("empty key")?;

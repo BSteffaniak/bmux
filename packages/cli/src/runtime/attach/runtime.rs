@@ -47,8 +47,8 @@ use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::queue;
 use crossterm::style::Print;
@@ -70,6 +70,11 @@ use uuid::Uuid;
 pub type AttachTerminalEventFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<Event>>> + Send + 'a>>;
 
+#[must_use]
+pub const fn bracketed_paste_enabled(config_enabled: bool) -> bool {
+    cfg!(feature = "bracketed-paste") && config_enabled
+}
+
 pub trait AttachTerminal: Write {
     fn geometry(&self) -> TerminalGeometry;
 
@@ -77,6 +82,7 @@ pub trait AttachTerminal: Write {
         &mut self,
         kitty_keyboard_enabled: bool,
         mouse_capture_enabled: bool,
+        bracketed_paste_enabled: bool,
     ) -> Result<bool>;
 
     fn next_event(&mut self) -> AttachTerminalEventFuture<'_>;
@@ -225,6 +231,7 @@ impl AttachTerminal for HeadlessAttachTerminal {
         &mut self,
         _kitty_keyboard_enabled: bool,
         _mouse_capture_enabled: bool,
+        _bracketed_paste_enabled: bool,
     ) -> Result<bool> {
         Ok(false)
     }
@@ -288,9 +295,14 @@ impl AttachTerminal for RealAttachTerminal {
         &mut self,
         kitty_keyboard_enabled: bool,
         mouse_capture_enabled: bool,
+        bracketed_paste_enabled: bool,
     ) -> Result<bool> {
-        let guard = RawModeGuard::enable(kitty_keyboard_enabled, mouse_capture_enabled)
-            .context("failed to enable raw mode for attach")?;
+        let guard = RawModeGuard::enable(
+            kitty_keyboard_enabled,
+            mouse_capture_enabled,
+            bracketed_paste_enabled,
+        )
+        .context("failed to enable raw mode for attach")?;
         let keyboard_enhanced = guard.keyboard_enhanced;
         self.raw_mode_guard = Some(guard);
         self.event_stream = Some(crossterm::event::EventStream::new());
@@ -2770,6 +2782,8 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     let mut view_state = AttachViewState::new(attach_info);
     view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
+    view_state.bracketed_paste_enabled =
+        bracketed_paste_enabled(attach_config.behavior.bracketed_paste);
     view_state.mouse.tab_drag_enabled = status_tab_drag_enabled(&attach_config.status_bar);
     view_state.status_position = if attach_config.status_bar.enabled {
         attach_config.appearance.status_position
@@ -2870,6 +2884,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     let keyboard_enhanced = terminal.enter_attach_mode(
         attach_config.behavior.kitty_keyboard,
         attach_config.attach_mouse_config().enabled,
+        view_state.bracketed_paste_enabled,
     )?;
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8187,13 +8202,50 @@ pub fn describe_timeout(timeout: &ResolvedTimeout) -> String {
     }
 }
 
+fn queue_attach_input_modes<W: Write>(
+    writer: &mut W,
+    mouse_capture_enabled: bool,
+    bracketed_paste_enabled: bool,
+) -> io::Result<()> {
+    if mouse_capture_enabled {
+        queue!(writer, EnableMouseCapture)?;
+    }
+    if bracketed_paste_enabled {
+        queue!(writer, EnableBracketedPaste)?;
+    }
+    Ok(())
+}
+
+fn queue_active_attach_input_mode_restore<W: Write>(
+    writer: &mut W,
+    mouse_capture_enabled: bool,
+    bracketed_paste_enabled: bool,
+) -> io::Result<()> {
+    if mouse_capture_enabled {
+        queue!(writer, DisableMouseCapture)?;
+    }
+    if bracketed_paste_enabled {
+        queue!(writer, DisableBracketedPaste)?;
+    }
+    Ok(())
+}
+
+fn queue_attach_input_mode_restore<W: Write>(writer: &mut W) -> io::Result<()> {
+    queue!(writer, DisableMouseCapture, DisableBracketedPaste)
+}
+
 pub struct RawModeGuard {
     keyboard_enhanced: bool,
     mouse_capture_enabled: bool,
+    bracketed_paste_enabled: bool,
 }
 
 impl RawModeGuard {
-    fn enable(kitty_keyboard_enabled: bool, mouse_capture_enabled: bool) -> Result<Self> {
+    fn enable(
+        kitty_keyboard_enabled: bool,
+        mouse_capture_enabled: bool,
+        bracketed_paste_enabled: bool,
+    ) -> Result<Self> {
         enable_raw_mode().context("failed enabling raw mode")?;
 
         #[cfg(feature = "kitty-keyboard")]
@@ -8204,6 +8256,11 @@ impl RawModeGuard {
 
         let _ = kitty_keyboard_enabled; // suppress unused warning when feature is disabled
 
+        let mut guard = Self {
+            keyboard_enhanced: false,
+            mouse_capture_enabled: false,
+            bracketed_paste_enabled: false,
+        };
         let mut stdout = io::stdout();
         if keyboard_enhanced {
             use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
@@ -8215,32 +8272,35 @@ impl RawModeGuard {
                 )
             )
             .context("failed to push keyboard enhancement flags")?;
+            guard.keyboard_enhanced = true;
             stdout
                 .flush()
                 .context("failed to flush after pushing keyboard flags")?;
         }
 
-        if mouse_capture_enabled {
-            queue!(stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
+        queue_attach_input_modes(&mut stdout, mouse_capture_enabled, bracketed_paste_enabled)
+            .context("failed to enable terminal input modes")?;
+        guard.mouse_capture_enabled = mouse_capture_enabled;
+        guard.bracketed_paste_enabled = bracketed_paste_enabled;
+        if mouse_capture_enabled || bracketed_paste_enabled {
             stdout
                 .flush()
-                .context("failed to flush after enabling mouse capture")?;
+                .context("failed to flush terminal input modes")?;
         }
 
-        Ok(Self {
-            keyboard_enhanced,
-            mouse_capture_enabled,
-        })
+        Ok(guard)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        if self.mouse_capture_enabled {
-            let mut stdout = io::stdout();
-            let _ = queue!(stdout, DisableMouseCapture);
-            let _ = stdout.flush();
-        }
+        let mut stdout = io::stdout();
+        let _ = queue_active_attach_input_mode_restore(
+            &mut stdout,
+            self.mouse_capture_enabled,
+            self.bracketed_paste_enabled,
+        );
+        let _ = stdout.flush();
         if self.keyboard_enhanced {
             use crossterm::event::PopKeyboardEnhancementFlags;
             let mut stdout = io::stdout();
@@ -9452,7 +9512,7 @@ pub async fn handle_attach_terminal_event(
         Some(
             TerminalInputEvent::Key(_)
             | TerminalInputEvent::Mouse(_)
-            | TerminalInputEvent::Bytes(_),
+            | TerminalInputEvent::Paste(_),
         ) => {
             if view_state
                 .clipboard_sync_state
@@ -9497,9 +9557,9 @@ pub async fn handle_attach_terminal_event(
             {
                 Some(view_state.prompt.handle_terminal_key_event(key))
             }
+            Some(TerminalInputEvent::Paste(text)) => Some(view_state.prompt.handle_paste(text)),
             Some(
                 TerminalInputEvent::Key(_)
-                | TerminalInputEvent::Bytes(_)
                 | TerminalInputEvent::FocusGained
                 | TerminalInputEvent::FocusLost,
             ) => Some(PromptKeyDisposition::NotActive),
@@ -9512,7 +9572,8 @@ pub async fn handle_attach_terminal_event(
                 Event::Key(key) if prompt_accepts_key_kind(key.kind) => {
                     Some(view_state.prompt.handle_key_event(key))
                 }
-                Event::Key(_) | Event::Paste(_) => Some(PromptKeyDisposition::NotActive),
+                Event::Paste(text) => Some(view_state.prompt.handle_paste(text)),
+                Event::Key(_) => Some(PromptKeyDisposition::NotActive),
                 Event::Mouse(mouse) => Some(view_state.prompt.handle_mouse_event(*mouse, geometry)),
                 _ => None,
             },
@@ -9589,6 +9650,21 @@ pub async fn handle_attach_terminal_event(
         match attach_action {
             AttachEventAction::Detach => {
                 return try_detach_or_continue_at(client, view_state, now).await;
+            }
+            AttachEventAction::Paste(text) => {
+                if view_state.help_overlay_open
+                    || view_state.prompt.is_active()
+                    || !view_state.bracketed_paste_enabled
+                    || !view_state.can_write
+                {
+                    continue;
+                }
+                let mode = focused_attach_pane_input_mode(view_state);
+                let bytes = encode_bracketed_paste(&text, mode.bracketed_paste);
+                if let Err(error) = send_attach_bytes_to_focused(client, view_state, bytes).await {
+                    return Err(map_attach_client_error(error));
+                }
+                display_capture.record_activity(DisplayActivityKind::Input);
             }
             AttachEventAction::Send(bytes) => {
                 if view_state.help_overlay_open || view_state.prompt.is_active() {
@@ -10176,7 +10252,7 @@ async fn handle_attach_action_dispatch(
                 .dirty
                 .mark_layout_frame_and_status_dirty(AttachDirtySource::ManualRedraw);
         }
-        AttachEventAction::Mouse(_) | AttachEventAction::Ignore => {}
+        AttachEventAction::Paste(_) | AttachEventAction::Mouse(_) | AttachEventAction::Ignore => {}
     }
 
     Ok(AttachLoopControl::Continue)
@@ -11394,6 +11470,7 @@ pub struct AttachPaneMouseProtocol {
 pub struct AttachPaneInputMode {
     pub application_cursor: bool,
     pub application_keypad: bool,
+    pub bracketed_paste: bool,
 }
 
 pub fn attach_pane_mouse_protocol(
@@ -11420,6 +11497,7 @@ pub fn attach_pane_input_mode(
         AttachPaneInputMode {
             application_cursor: protocol.application_cursor,
             application_keypad: protocol.application_keypad,
+            bracketed_paste: protocol.bracketed_paste,
         }
     });
 
@@ -11430,17 +11508,34 @@ pub fn attach_pane_input_mode(
             .map(|hint| AttachPaneInputMode {
                 application_cursor: hint.application_cursor,
                 application_keypad: hint.application_keypad,
+                bracketed_paste: hint.bracketed_paste,
             });
 
     match (structured_mode, hint_mode) {
         (Some(structured), Some(hint)) => Some(AttachPaneInputMode {
             application_cursor: structured.application_cursor || hint.application_cursor,
             application_keypad: structured.application_keypad || hint.application_keypad,
+            // Snapshot/output hints are authoritative when present. The
+            // attach pipeline replaces them after every parsed output chunk,
+            // including mode resets.
+            bracketed_paste: hint.bracketed_paste,
         }),
         (Some(structured), None) => Some(structured),
         (None, Some(hint)) => Some(hint),
         (None, None) => None,
     }
+}
+
+#[must_use]
+pub fn encode_bracketed_paste(text: &str, pane_mode_enabled: bool) -> Vec<u8> {
+    if !pane_mode_enabled {
+        return text.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(text.len().saturating_add(12));
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 pub fn focused_attach_pane_input_mode(view_state: &AttachViewState) -> AttachPaneInputMode {
@@ -12074,6 +12169,7 @@ pub async fn handle_attach_mouse_gesture_action(
         AttachEventAction::Ignore => Ok(true),
         AttachEventAction::Detach
         | AttachEventAction::Send(_)
+        | AttachEventAction::Paste(_)
         | AttachEventAction::Mouse(_)
         | AttachEventAction::Redraw => Ok(false),
     }
@@ -12756,7 +12852,7 @@ pub fn restore_terminal_after_attach_ui() -> Result<()> {
     // Safety net: restore terminal input flags in case the drop guard didn't run.
     #[cfg(feature = "kitty-keyboard")]
     let _ = queue!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
-    let _ = queue!(stdout, DisableMouseCapture);
+    let _ = queue_attach_input_mode_restore(&mut stdout);
     queue!(
         stdout,
         Show,
@@ -12780,9 +12876,8 @@ pub fn attach_event_actions(
         Event::Key(key) => attach_key_event_actions(key, attach_input_processor, ui_mode),
         Event::Mouse(mouse) => Ok(vec![AttachEventAction::Mouse(*mouse)]),
         Event::Resize(_, _) => Ok(vec![AttachEventAction::Redraw]),
-        Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
-            Ok(vec![AttachEventAction::Ignore])
-        }
+        Event::Paste(text) => Ok(vec![AttachEventAction::Paste(text.clone())]),
+        Event::FocusGained | Event::FocusLost => Ok(vec![AttachEventAction::Ignore]),
     }
 }
 
@@ -12802,7 +12897,7 @@ fn attach_terminal_input_event_actions(
         TerminalInputEvent::Resize { .. }
         | TerminalInputEvent::FocusGained
         | TerminalInputEvent::FocusLost => Ok(vec![AttachEventAction::Redraw]),
-        TerminalInputEvent::Bytes(_) => Ok(vec![AttachEventAction::Ignore]),
+        TerminalInputEvent::Paste(text) => Ok(vec![AttachEventAction::Paste(text.clone())]),
     }
 }
 
@@ -13031,6 +13126,52 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    #[test]
+    fn attach_input_mode_lifecycle_sequences_cover_enabled_and_disabled_modes() {
+        let mut enabled = Vec::new();
+        queue_attach_input_modes(&mut enabled, false, true).expect("enable paste mode");
+        assert_eq!(enabled, b"\x1b[?2004h");
+
+        let mut disabled = Vec::new();
+        queue_attach_input_modes(&mut disabled, false, false).expect("leave modes disabled");
+        assert!(disabled.is_empty());
+
+        let mut active_restored = Vec::new();
+        queue_active_attach_input_mode_restore(&mut active_restored, false, true)
+            .expect("restore active paste mode after detach or error");
+        assert_eq!(active_restored, b"\x1b[?2004l");
+
+        let mut inactive_restored = Vec::new();
+        queue_active_attach_input_mode_restore(&mut inactive_restored, false, false)
+            .expect("skip inactive mode restoration");
+        assert!(inactive_restored.is_empty());
+
+        let mut restored = Vec::new();
+        queue_attach_input_mode_restore(&mut restored).expect("restore input modes");
+        assert!(restored.ends_with(b"\x1b[?2004l"));
+    }
+
+    #[test]
+    fn bracketed_paste_capability_follows_build_feature_and_config() {
+        assert!(!bracketed_paste_enabled(false));
+        assert_eq!(
+            bracketed_paste_enabled(true),
+            cfg!(feature = "bracketed-paste")
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_encoder_wraps_only_when_pane_requests_it() {
+        let text = "hello\n世界\x1b[200~";
+        assert_eq!(encode_bracketed_paste(text, false), text.as_bytes());
+
+        let mut expected = b"\x1b[200~".to_vec();
+        expected.extend_from_slice(text.as_bytes());
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(encode_bracketed_paste(text, true), expected);
+        assert_eq!(encode_bracketed_paste("", true), b"\x1b[200~\x1b[201~");
+    }
 
     fn test_attach_input_hook() -> AttachInputHook {
         AttachInputHook {
@@ -14767,7 +14908,7 @@ mod tests {
                 ..
             } => command_accepts_repeat(plugin_id, command_name),
             AttachEventAction::Ui(action) => super::action_supports_repeat(action),
-            AttachEventAction::Send(_) => true,
+            AttachEventAction::Send(_) | AttachEventAction::Paste(_) => true,
             AttachEventAction::Detach
             | AttachEventAction::Redraw
             | AttachEventAction::Ignore
@@ -14801,6 +14942,21 @@ mod tests {
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], AttachEventAction::Send(ref bytes) if bytes == b"x"));
+    }
+
+    #[test]
+    fn attach_event_actions_maps_paste_without_keymap_processing() {
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let event = CrosstermEvent::Paste("ctrl+b detach".to_string());
+
+        let actions = attach_event_actions(&event, &mut processor, AttachUiMode::Normal)
+            .expect("paste event should map");
+
+        assert!(matches!(
+            actions.as_slice(),
+            [AttachEventAction::Paste(text)] if text == "ctrl+b detach"
+        ));
     }
 
     #[test]
@@ -15151,11 +15307,26 @@ mod tests {
             .pane_buffers
             .get_mut(&pane_id)
             .expect("pane render buffer");
-        append_pane_output(buffer, b"\x1b[?1h\x1b=");
+        append_pane_output(buffer, b"\x1b[?1h\x1b[?2004h\x1b=");
 
         let mode = attach_pane_input_mode(&view_state, pane_id).expect("pane mode");
         assert!(mode.application_cursor);
         assert!(mode.application_keypad);
+        assert!(mode.bracketed_paste);
+
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?2004l");
+        update_protocol_hints_from_state(
+            &mut view_state.pane_mouse_protocol_hints,
+            &mut view_state.pane_input_mode_hints,
+            pane_id,
+            buffer.protocol_tracker.protocol_state(),
+        );
+        let mode = attach_pane_input_mode(&view_state, pane_id).expect("pane mode after reset");
+        assert!(!mode.bracketed_paste);
     }
 
     #[test]
@@ -15168,12 +15339,14 @@ mod tests {
             AttachInputModeState {
                 application_cursor: true,
                 application_keypad: true,
+                bracketed_paste: true,
             },
         );
 
         let mode = attach_pane_input_mode(&view_state, pane_id).expect("pane mode");
         assert!(mode.application_cursor);
         assert!(mode.application_keypad);
+        assert!(mode.bracketed_paste);
     }
 
     #[test]

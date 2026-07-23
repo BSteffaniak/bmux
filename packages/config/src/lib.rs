@@ -2016,6 +2016,15 @@ pub struct BehaviorConfig {
     /// terminal, allowing modified special keys like Ctrl+Enter to be
     /// correctly forwarded to pane programs.
     pub kitty_keyboard: bool,
+    /// Enable semantic bracketed-paste handling. When enabled, bmux asks the
+    /// outer terminal to report paste events separately and forwards them to
+    /// pane applications using DEC mode 2004 when requested.
+    ///
+    /// This defaults to true and requires a binary built with the default
+    /// `bracketed-paste` Cargo feature. Disabling it makes pasted input
+    /// indistinguishable from typed terminal input, so terminal input handling
+    /// outside bmux's semantic paste path may interpret pasted control bytes.
+    pub bracketed_paste: bool,
     /// How to restore pane content when hidden panes become visible again
     /// (e.g. after exiting zoom). SNAPSHOT re-fetches from the server for
     /// guaranteed accuracy. RETAIN keeps parsers in memory for instant restore.
@@ -2055,6 +2064,7 @@ impl Default for BehaviorConfig {
             terminfo_prompt_cooldown_days: 7,
             stale_build_action: StaleBuildAction::Ignore,
             kitty_keyboard: true,
+            bracketed_paste: true,
             pane_restore_method: PaneRestoreMethod::Snapshot,
             mouse: MouseBehaviorConfig::default(),
             damage: DamageBehaviorConfig::default(),
@@ -4531,6 +4541,20 @@ server_timeout = 1234
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn bracketed_paste_behavior_defaults_enabled_and_parses_explicit_values() {
+        let omitted: BmuxConfig = toml::from_str("").expect("default config should parse");
+        assert!(omitted.behavior.bracketed_paste);
+
+        let enabled: BmuxConfig = toml::from_str("[behavior]\nbracketed_paste = true\n")
+            .expect("enabled bracketed paste should parse");
+        assert!(enabled.behavior.bracketed_paste);
+
+        let disabled: BmuxConfig = toml::from_str("[behavior]\nbracketed_paste = false\n")
+            .expect("disabled bracketed paste should parse");
+        assert!(!disabled.behavior.bracketed_paste);
     }
 
     #[test]

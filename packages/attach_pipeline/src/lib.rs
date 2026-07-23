@@ -111,6 +111,7 @@ pub fn update_protocol_hints_from_state(
         AttachInputModeState {
             application_cursor: protocol.application_cursor,
             application_keypad: protocol.application_keypad,
+            bracketed_paste: protocol.bracketed_paste,
         },
     );
 }

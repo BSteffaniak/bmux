@@ -196,6 +196,10 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
             let key = step.key.context("send-attach requires 'key'")?;
             Ok(Action::SendAttach { key })
         }
+        "paste-attach" => {
+            let text = step.text.context("paste-attach requires 'text'")?;
+            Ok(Action::PasteAttach { text })
+        }
         "seed-pane-text" => {
             let lines = step.lines.context("seed-pane-text requires 'lines'")?;
             let cursor_row = step
@@ -409,6 +413,7 @@ struct RawStep {
     keys: Option<String>,
     hex: Option<String>,
     key: Option<String>,
+    text: Option<String>,
     pane: Option<u32>,
     lines: Option<Vec<String>>,
     cursor_row: Option<u16>,

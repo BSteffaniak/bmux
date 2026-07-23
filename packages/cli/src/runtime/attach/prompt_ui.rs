@@ -248,6 +248,59 @@ impl AttachPromptState {
         });
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> PromptKeyDisposition {
+        let Some(active) = self.active.as_mut() else {
+            return PromptKeyDisposition::NotActive;
+        };
+
+        match (&active.envelope.request.field, &mut active.state) {
+            (PromptField::TextInput { .. }, PromptWidgetState::TextInput { buffer, error }) => {
+                buffer.paste(text);
+                *error = None;
+            }
+            (
+                PromptField::SearchSelect { options, .. },
+                PromptWidgetState::SearchSelect {
+                    query,
+                    selected,
+                    scroll,
+                },
+            ) => {
+                query.paste(text);
+                let len = filtered_option_indices(options, query.text()).len();
+                *selected = (*selected).min(len.saturating_sub(1));
+                *scroll = (*scroll).min(*selected);
+            }
+            (
+                PromptField::Form {
+                    sections,
+                    live_preview,
+                },
+                PromptWidgetState::Form {
+                    cursor,
+                    values,
+                    editors,
+                    errors,
+                    ..
+                },
+            ) => {
+                let fields = flatten_form_fields(sections);
+                if let Some(field) = fields.get(*cursor)
+                    && !field.disabled
+                    && paste_form_text(field, values, editors, text)
+                {
+                    errors.remove(&field.id);
+                    if *live_preview {
+                        emit_form_changed(&active.envelope, field, values);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        PromptKeyDisposition::Consumed
+    }
+
     #[allow(clippy::too_many_lines)] // Prompt key handling is a compact state machine.
     pub fn handle_key_event(&mut self, key: &KeyEvent) -> PromptKeyDisposition {
         if self.active.is_none() {
@@ -1187,6 +1240,27 @@ fn edit_form_text(
     }
 }
 
+fn paste_form_text(
+    field: &PromptFormField,
+    values: &mut BTreeMap<String, PromptFormValue>,
+    editors: &mut BTreeMap<String, TextEditBuffer>,
+    text: &str,
+) -> bool {
+    match (&field.kind, values.get_mut(&field.id)) {
+        (PromptFormFieldKind::Text { .. }, Some(PromptFormValue::Text(value)))
+        | (PromptFormFieldKind::Number { .. }, Some(PromptFormValue::Number(value))) => {
+            let editor = editors
+                .entry(field.id.clone())
+                .or_insert_with(|| TextEditBuffer::from_text(value.clone()));
+            editor.paste(text);
+            value.clear();
+            value.push_str(editor.text());
+            true
+        }
+        _ => false,
+    }
+}
+
 fn apply_form_edit_action(editor: &mut TextEditBuffer, action: FormEditAction) {
     match action {
         FormEditAction::Insert(ch) => editor.insert_char(ch),
@@ -1966,6 +2040,50 @@ mod tests {
     }
 
     #[test]
+    fn text_input_prompt_accepts_multiline_unicode_paste() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::text_input("Value"),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        assert!(matches!(
+            state.handle_paste("hello\r\n世界"),
+            PromptKeyDisposition::Consumed
+        ));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Text("hello\n世界".to_string()))
+        );
+    }
+
+    #[test]
+    fn confirm_prompt_consumes_paste_without_changing_selection() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::confirm("Continue?").confirm_default(true),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        assert!(matches!(
+            state.handle_paste("n"),
+            PromptKeyDisposition::Consumed
+        ));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Confirm(true))
+        );
+    }
+
+    #[test]
     fn text_input_prompt_accepts_typing_and_backspace() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
@@ -2076,6 +2194,68 @@ mod tests {
             completion.response,
             PromptResponse::Submitted(PromptValue::Single("commit".to_string()))
         );
+    }
+
+    #[test]
+    fn form_text_paste_preserves_multiline_content() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Settings",
+                vec![PromptFormSection::new(
+                    "general",
+                    "General",
+                    vec![PromptFormField::new(
+                        "notes",
+                        "Notes",
+                        PromptFormFieldKind::Text {
+                            initial_value: String::new(),
+                            placeholder: None,
+                            validation: None,
+                        },
+                    )],
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        assert!(matches!(
+            state.handle_paste("one\r\ntwo\rthree"),
+            PromptKeyDisposition::Consumed
+        ));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        let PromptResponse::Submitted(PromptValue::Form(values)) = completion.response else {
+            panic!("expected form response");
+        };
+        assert_eq!(
+            values.get("notes"),
+            Some(&PromptFormValue::Text("one\ntwo\nthree".to_string()))
+        );
+    }
+
+    #[test]
+    fn pasted_text_reflows_cursor_and_prompt_render() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::text_input("Value"),
+            AttachInternalPromptAction::QuitSession,
+        );
+        assert!(matches!(
+            state.handle_paste("abcdefghij"),
+            PromptKeyDisposition::Consumed
+        ));
+
+        let active = state.active.as_mut().expect("prompt should be active");
+        let narrow = render_prompt_body(active, 6, 2);
+        assert_eq!(narrow.cursor, Some((0, 5)));
+        assert!(narrow.lines[0].contains("hij"));
+
+        let wide = render_prompt_body(active, 14, 2);
+        assert_eq!(wide.cursor, Some((0, 12)));
+        assert!(wide.lines[0].contains("abcdefghij"));
     }
 
     #[test]

@@ -60,6 +60,7 @@ impl RustPlugin for PaneRuntimePlugin {
                         if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string()
                     }),
                 pane_term: "xterm-256color".to_string(),
+                bracketed_paste: true,
                 shell_integration_root: None,
             });
         runtime::activate_pane_runtime(config);

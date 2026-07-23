@@ -26,6 +26,7 @@ use super::prompt_ui::AttachPromptState;
 
 pub enum AttachEventAction {
     Send(Vec<u8>),
+    Paste(String),
     PluginCommand {
         plugin_id: String,
         command_name: String,
@@ -254,6 +255,7 @@ pub struct AttachViewState {
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,
     pub can_write: bool,
+    pub bracketed_paste_enabled: bool,
     pub ui_mode: AttachUiMode,
     pub active_mode_id: String,
     pub active_mode_label: String,
@@ -623,6 +625,7 @@ impl AttachViewState {
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,
             can_write: attach_info.can_write,
+            bracketed_paste_enabled: false,
             ui_mode: AttachUiMode::Normal,
             active_mode_id: "normal".to_string(),
             active_mode_label: "NORMAL".to_string(),

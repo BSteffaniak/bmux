@@ -645,6 +645,13 @@ pub(super) struct RealAttachPlaybookRuntime {
 }
 
 impl RealAttachPlaybookRuntime {
+    async fn send_paste(&self, text: &str) -> Result<()> {
+        self.terminal
+            .send_event(CrosstermEvent::Paste(text.to_string()))?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        Ok(())
+    }
+
     async fn send_chord(&self, chord: &str) -> Result<()> {
         let strokes = crate::input::parse_key_chord(chord)
             .map_err(|error| anyhow::anyhow!("invalid attach key chord '{chord}': {error}"))?;
@@ -4065,6 +4072,16 @@ pub(super) async fn execute_step(
                 let _ = dt.record_resize(*cols, *rows);
             }
             Ok(None)
+        }
+
+        Action::PasteAttach { text } => {
+            let real_attach =
+                real_attach_runtime.context("paste-attach requires @driver real-attach")?;
+            real_attach
+                .send_paste(text)
+                .await
+                .map_err(|error| anyhow::anyhow!("paste-attach failed: {error}"))?;
+            Ok(Some(format!("pasted_bytes={}", text.len())))
         }
 
         Action::SendAttach { key } => {

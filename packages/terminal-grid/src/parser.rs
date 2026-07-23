@@ -293,6 +293,7 @@ impl Perform for ProtocolPerformer<'_> {
                 1005 => self.set_mouse_encoding(MouseProtocolEncoding::Utf8, enabled),
                 1006 => self.set_mouse_encoding(MouseProtocolEncoding::Sgr, enabled),
                 1015 => self.protocol.mouse_urxvt = enabled,
+                2004 => self.protocol.bracketed_paste = enabled,
                 _ => {}
             }
         }
@@ -457,6 +458,7 @@ impl Perform for GridPerformer<'_> {
                             .grid
                             .set_mouse_encoding(MouseProtocolEncoding::Sgr, enabled),
                         1015 => self.grid.set_mouse_urxvt_encoding(enabled),
+                        2004 => self.grid.set_bracketed_paste(enabled),
                         _ => {}
                     }
                 }
@@ -576,7 +578,7 @@ mod tests {
     #[test]
     fn protocol_tracker_tracks_hints_without_rows() {
         let mut tracker = crate::TerminalProtocolTracker::new();
-        let outcome = tracker.process(b"text\x1b[?1000h\x1b[?1006h\x1b[?1049h\x1b=");
+        let outcome = tracker.process(b"text\x1b[?1000h\x1b[?1006h\x1b[?1049h\x1b[?2004h\x1b=");
 
         assert!(outcome.toggled_alternate);
         assert!(tracker.alternate_screen());
@@ -590,8 +592,9 @@ mod tests {
             crate::model::MouseProtocolEncoding::Sgr
         );
         assert!(protocol.application_keypad);
+        assert!(protocol.bracketed_paste);
 
-        let outcome = tracker.process(b"\x1b[?1049l\x1b[?1000l\x1b[?1006l\x1b>");
+        let outcome = tracker.process(b"\x1b[?1049l\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b>");
         assert!(outcome.toggled_alternate);
         assert!(!tracker.alternate_screen());
         let protocol = tracker.protocol_state();
@@ -601,6 +604,7 @@ mod tests {
             crate::model::MouseProtocolEncoding::Default
         );
         assert!(!protocol.application_keypad);
+        assert!(!protocol.bracketed_paste);
     }
 
     #[test]
@@ -738,7 +742,7 @@ mod tests {
     #[test]
     fn protocol_state_tracks_mouse_and_input_modes() {
         let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
-        stream.process(b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b=");
+        stream.process(b"\x1b[?1000h\x1b[?1006h\x1b[?1;2004h\x1b=");
 
         let protocol = stream.grid().protocol_state();
         assert_eq!(
@@ -751,8 +755,9 @@ mod tests {
         );
         assert!(protocol.application_cursor);
         assert!(protocol.application_keypad);
+        assert!(protocol.bracketed_paste);
 
-        stream.process(b"\x1b[?1000l\x1b[?1006l\x1b[?1l\x1b>");
+        stream.process(b"\x1b[?1000l\x1b[?1006l\x1b[?1;2004l\x1b>");
         let protocol = stream.grid().protocol_state();
         assert_eq!(protocol.mouse_mode(), crate::model::MouseProtocolMode::None);
         assert_eq!(
@@ -761,13 +766,14 @@ mod tests {
         );
         assert!(!protocol.application_cursor);
         assert!(!protocol.application_keypad);
+        assert!(!protocol.bracketed_paste);
     }
 
     #[test]
     fn snapshot_and_delta_preserve_protocol_state() {
         let mut producer = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
         let delta = producer
-            .process_delta(b"\x1b[?1003h\x1b[?1006h\x1b=")
+            .process_delta(b"\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b=")
             .expect("protocol-only change should produce a delta");
         let mut consumer = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
         consumer
@@ -784,6 +790,15 @@ mod tests {
             crate::model::MouseProtocolEncoding::Sgr
         );
         assert!(protocol.application_keypad);
+        assert!(protocol.bracketed_paste);
+
+        let snapshot = producer.snapshot(0, 24);
+        let restored = TerminalGridStream::from_snapshot(&snapshot, GridLimits::default())
+            .expect("protocol snapshot should hydrate");
+        assert!(restored.grid().protocol_state().bracketed_paste);
+
+        producer.process(b"\x1bc");
+        assert!(!producer.grid().protocol_state().bracketed_paste);
     }
 
     #[test]

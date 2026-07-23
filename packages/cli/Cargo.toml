@@ -178,6 +178,7 @@ windows-sys = { workspace = true, features = [
 default = [
     "bundled-fonts",
     "bundled-plugins",
+    "bracketed-paste",
     "compression",
     "kitty-keyboard",
     "image-protocols",
@@ -220,6 +221,9 @@ fail-on-warnings = [
     "bmux_decoration_plugin?/fail-on-warnings",
     "bmux_decoration_plugin_renderer?/fail-on-warnings",
 ]
+
+# Semantic bracketed-paste capture and pane forwarding
+bracketed-paste = []
 
 # Kitty keyboard protocol support (CSI u encoding/decoding + inner program negotiation)
 kitty-keyboard = [

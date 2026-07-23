@@ -1,18 +1,22 @@
 use super::adapters::{AttachClock, FixedAttachClock};
 use super::input::{TerminalGeometry, TerminalMouseEvent};
+#[cfg(test)]
+use super::prompt_ui::AttachInternalPromptAction;
 use super::prompt_ui::PromptKeyDisposition;
 use super::runtime::{
     AttachPointerContinuation, attach_key_event_actions, attach_mouse_forward_bytes_for_target,
     attach_tab_drop_marker_col, build_attach_help_lines, continue_attach_builtin_pointer_owner,
-    handle_attach_ui_action_at, handle_help_overlay_key_event,
-    maybe_begin_attach_mouse_selection_drag, reduce_attach_mouse_floating_drag_event,
-    reduce_attach_mouse_resize_event, reduce_attach_status_tab_mouse_event,
-    status_row_for_position,
+    encode_bracketed_paste, focused_attach_pane_input_mode, handle_attach_ui_action_at,
+    handle_help_overlay_key_event, maybe_begin_attach_mouse_selection_drag,
+    reduce_attach_mouse_floating_drag_event, reduce_attach_mouse_resize_event,
+    reduce_attach_status_tab_mouse_event, status_row_for_position,
 };
 use super::state::{
     AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer,
 };
 use crate::input::{InputProcessor, RuntimeAction};
+#[cfg(test)]
+use crate::runtime::prompt::PromptRequest;
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Result, bail};
 use bmux_appearance::RuntimeAppearance;
@@ -303,8 +307,68 @@ impl AttachSimHarness {
     }
 
     #[cfg(test)]
+    pub const fn set_bracketed_paste_enabled(&mut self, enabled: bool) {
+        self.view_state.bracketed_paste_enabled = enabled;
+    }
+
+    #[cfg(test)]
+    pub fn set_pane_bracketed_paste(&mut self, pane_id: Uuid, enabled: bool) {
+        self.view_state.pane_input_mode_hints.insert(
+            pane_id,
+            bmux_attach_layout_protocol::AttachInputModeState {
+                bracketed_paste: enabled,
+                ..bmux_attach_layout_protocol::AttachInputModeState::default()
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub fn focus_pane(&mut self, pane_id: Uuid) {
+        self.apply_effect(AttachUiEffect::FocusPane { pane_id });
+    }
+
+    #[cfg(test)]
+    pub fn send_paste(&mut self, text: &str) -> bool {
+        if !self.view_state.bracketed_paste_enabled
+            || !self.view_state.can_write
+            || self.view_state.help_overlay_open
+            || self.view_state.prompt.is_active()
+        {
+            return false;
+        }
+        let mode = focused_attach_pane_input_mode(&self.view_state);
+        self.forwarded_bytes
+            .push(encode_bracketed_paste(text, mode.bracketed_paste));
+        true
+    }
+
+    #[cfg(test)]
     pub fn forwarded_mouse_bytes(&self) -> &[Vec<u8>] {
         &self.forwarded_bytes
+    }
+
+    #[cfg(test)]
+    pub fn open_text_prompt(&mut self) {
+        self.view_state.prompt.enqueue_internal(
+            PromptRequest::text_input("Value"),
+            AttachInternalPromptAction::QuitSession,
+        );
+    }
+
+    #[cfg(test)]
+    pub fn paste_into_prompt(&mut self, text: &str) -> PromptKeyDisposition {
+        let disposition = self.view_state.prompt.handle_paste(text);
+        if matches!(disposition, PromptKeyDisposition::Consumed) {
+            self.view_state
+                .dirty
+                .mark_overlay_dirty(super::state::AttachDirtySource::PromptOverlay);
+        }
+        disposition
+    }
+
+    #[cfg(test)]
+    pub const fn prompt_overlay_dirty(&self) -> bool {
+        self.view_state.dirty.overlay_needs_redraw
     }
 
     #[cfg(test)]
@@ -670,6 +734,12 @@ impl AttachSimHarness {
                 emitted.push("send".to_string());
                 self.forwarded_bytes.push(bytes);
             }
+            super::state::AttachEventAction::Paste(text) => {
+                emitted.push("paste".to_string());
+                let mode = focused_attach_pane_input_mode(&self.view_state);
+                self.forwarded_bytes
+                    .push(encode_bracketed_paste(&text, mode.bracketed_paste));
+            }
             super::state::AttachEventAction::Ignore => {
                 emitted.push("ignore".to_string());
             }
@@ -948,6 +1018,7 @@ mod tests {
     use crate::runtime::attach::state::{
         AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect,
     };
+    use bmux_attach_layout_protocol::AttachFocusTarget;
     use bmux_config::StatusPosition;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -966,6 +1037,108 @@ mod tests {
                 hyper: false,
                 meta: false,
             },
+        }
+    }
+
+    #[test]
+    fn attach_sim_active_prompt_consumes_paste_and_marks_redraw() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.set_bracketed_paste_enabled(true);
+        sim.open_text_prompt();
+
+        assert!(matches!(
+            sim.paste_into_prompt("prompt text"),
+            crate::runtime::attach::prompt_ui::PromptKeyDisposition::Consumed
+        ));
+        assert!(sim.prompt_overlay_dirty());
+        assert!(!sim.send_paste("must not reach pane"));
+        assert!(sim.forwarded_mouse_bytes().is_empty());
+    }
+
+    #[test]
+    fn attach_sim_routes_paste_by_focused_pane_mode_and_transitions() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.set_bracketed_paste_enabled(true);
+        let layout = sim
+            .view_state
+            .cached_layout_state
+            .as_ref()
+            .expect("split layout");
+        let left = layout.panes[0].id;
+        let right = layout.panes[1].id;
+        sim.set_pane_bracketed_paste(left, false);
+        sim.set_pane_bracketed_paste(right, true);
+
+        assert!(sim.send_paste("left"));
+        sim.focus_pane(right);
+        assert!(sim.send_paste("right"));
+        sim.set_pane_bracketed_paste(right, false);
+        assert!(sim.send_paste("reset"));
+
+        assert_eq!(
+            sim.forwarded_mouse_bytes(),
+            &[
+                b"left".to_vec(),
+                b"\x1b[200~right\x1b[201~".to_vec(),
+                b"reset".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_sim_paste_respects_capability_permissions_and_overlays() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.set_bracketed_paste_enabled(false);
+        assert!(!sim.send_paste("disabled"));
+
+        sim.set_bracketed_paste_enabled(true);
+        sim.set_can_write(false);
+        assert!(!sim.send_paste("read-only"));
+
+        sim.set_can_write(true);
+        assert!(sim.send_paste("writable-again"));
+        sim.open_help_overlay();
+        assert!(!sim.send_paste("overlay"));
+        assert_eq!(sim.forwarded_mouse_bytes(), &[b"writable-again".to_vec()]);
+    }
+
+    #[test]
+    fn attach_sim_paste_payload_is_opaque_for_edge_cases() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+        sim.set_bracketed_paste_enabled(true);
+        let pane = match sim
+            .view_state
+            .cached_layout_state
+            .as_ref()
+            .expect("split layout")
+            .scene
+            .focus
+        {
+            AttachFocusTarget::Pane { pane_id } => pane_id,
+            AttachFocusTarget::Surface { .. } | AttachFocusTarget::None => {
+                panic!("expected pane focus")
+            }
+        };
+        sim.set_pane_bracketed_paste(pane, true);
+        let large = "x".repeat(128 * 1024);
+        let payloads = [
+            String::new(),
+            "one\ntwo\r\n世界\0\x03".to_string(),
+            "\x1b[200~nested\x1b[201~".to_string(),
+            large,
+        ];
+
+        for payload in &payloads {
+            assert!(sim.send_paste(payload));
+        }
+        for (sent, payload) in sim.forwarded_mouse_bytes().iter().zip(&payloads) {
+            assert!(sent.starts_with(b"\x1b[200~"));
+            assert!(sent.ends_with(b"\x1b[201~"));
+            assert_eq!(&sent[6..sent.len() - 6], payload.as_bytes());
         }
     }
 

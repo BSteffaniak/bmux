@@ -223,6 +223,7 @@ struct SessionRuntimeManager {
     shell: String,
     pane_term: String,
     protocol_profile: ProtocolProfile,
+    bracketed_paste_supported: bool,
     shell_integration_root: Option<std::path::PathBuf>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
 }
@@ -371,6 +372,7 @@ struct PaneTerminalModeTracker {
     sgr_encoding: bool,
     application_cursor: bool,
     application_keypad: bool,
+    bracketed_paste: bool,
     /// DEC mode 2026: the inner application has begun a synchronized
     /// update (`\x1b[?2026h`) but has not yet ended it (`\x1b[?2026l`).
     sync_update: bool,
@@ -389,6 +391,7 @@ impl Default for PaneTerminalModeTracker {
             sgr_encoding: false,
             application_cursor: false,
             application_keypad: false,
+            bracketed_paste: false,
             sync_update: false,
         }
     }
@@ -469,6 +472,7 @@ impl PaneTerminalModeTracker {
         AttachInputModeState {
             application_cursor: self.application_cursor,
             application_keypad: self.application_keypad,
+            bracketed_paste: self.bracketed_paste,
         }
     }
 
@@ -483,6 +487,7 @@ impl PaneTerminalModeTracker {
         self.sgr_encoding = false;
         self.application_cursor = false;
         self.application_keypad = false;
+        self.bracketed_paste = false;
         self.sync_update = false;
     }
 
@@ -523,6 +528,7 @@ impl PaneTerminalModeTracker {
             1003 => self.any_motion_mode = enable,
             1005 => self.utf8_encoding = enable,
             1006 => self.sgr_encoding = enable,
+            2004 => self.bracketed_paste = enable,
             2026 => self.sync_update = enable,
             _ => {}
         }
@@ -2720,6 +2726,7 @@ impl SessionRuntimeManager {
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
+        bracketed_paste_supported: bool,
         shell_integration_root: Option<std::path::PathBuf>,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
     ) -> Self {
@@ -2730,6 +2737,7 @@ impl SessionRuntimeManager {
             shell,
             pane_term,
             protocol_profile,
+            bracketed_paste_supported,
             shell_integration_root,
             pane_exit_tx,
         }
@@ -2894,6 +2902,7 @@ impl SessionRuntimeManager {
         let launch = pane_meta.launch.clone();
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
+        let bracketed_paste_supported = self.bracketed_paste_supported;
         let pane_id = pane_meta.id;
         let replay_command = pane_meta.resurrection.active_command.clone();
         let initial_cwd = pane_meta.resurrection.last_known_cwd.clone();
@@ -3138,7 +3147,8 @@ impl SessionRuntimeManager {
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "reader");
                     let mut buffer = [0_u8; 8192];
-                    let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
+                    let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
+                        .with_bracketed_paste_support(bracketed_paste_supported);
                     let (initial_rows, initial_cols) = last_requested_size_for_reader
                         .lock()
                         .map_or((24, 80), |size| *size);
@@ -6609,6 +6619,7 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig) {
         config.shell,
         config.pane_term.clone(),
         protocol_profile_for_term(&config.pane_term),
+        config.bracketed_paste,
         config.shell_integration_root,
         pane_exit_tx,
     )));
@@ -6765,6 +6776,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         }
@@ -6886,6 +6898,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7224,6 +7237,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7279,6 +7293,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7326,6 +7341,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7362,6 +7378,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7405,6 +7422,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7440,6 +7458,7 @@ mod tests {
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
+            bracketed_paste_supported: true,
             shell_integration_root: None,
             pane_exit_tx,
         };
@@ -7503,16 +7522,17 @@ mod tests {
             AttachInputModeState::default()
         );
 
-        tracker.process(b"\x1b[?1h\x1b=");
+        tracker.process(b"\x1b[?1;2004h\x1b=");
         assert_eq!(
             tracker.current_input_modes(),
             AttachInputModeState {
                 application_cursor: true,
                 application_keypad: true,
+                bracketed_paste: true,
             }
         );
 
-        tracker.process(b"\x1b[?1l\x1b>");
+        tracker.process(b"\x1b[?1;2004l\x1b>");
         assert_eq!(
             tracker.current_input_modes(),
             AttachInputModeState::default()
