@@ -104,6 +104,14 @@ bmux host
 # Optional runtime instance selection (for parallel local runtimes)
 bmux --runtime dev server start --daemon
 bmux --runtime dev host
+
+# Native per-user login autostart (launchd, systemd user service, or Task Scheduler)
+bmux server autostart install
+bmux server autostart status
+bmux server autostart print      # side-effect-free declaration output
+bmux server autostart uninstall
+# Named runtimes receive isolated native service identities:
+bmux --runtime dev server autostart install
 # Ephemeral sandbox run (fully isolated config/runtime/data/state/logs)
 bmux sandbox run -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
@@ -210,6 +218,10 @@ Logging defaults:
 Environment overrides:
 
 - `BMUX_LOG_LEVEL`: effective runtime log level
+
+A native autostart service runs foreground `bmux server start` so the operating system owns supervision; it does not use `--daemon`. Installation is explicit and starts immediately unless `--no-start` is passed. Existing `[server.gateway]` configuration is loaded normally, so an enabled gateway also starts at login.
+
+Imperative installation refuses symlinked, read-only, conflicting, or externally managed declarations. Nix/Home Manager users should define `${pkgs.bmux}/bin/bmux server start` through `systemd.user.services` or `launchd.agents` and let Nix own the declaration; bmux never mutates `bmux.toml`. Linux autostart begins at login and does not enable lingering automatically.
 
 Runtime selection vs sandbox isolation:
 

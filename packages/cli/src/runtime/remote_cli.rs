@@ -4,7 +4,7 @@ use crate::ssh_access::{
     iroh_target_url, parse_iroh_target as parse_iroh_target_parts,
 };
 use anyhow::{Context, Result};
-use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
+use bmux_cli_schema::{Cli, Command, ServerAutostartCommand, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths, TlsTrustMode};
 use bmux_ipc::InvokeServiceKind;
@@ -989,7 +989,12 @@ pub(super) async fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     };
     if matches!(
         command,
-        Command::Connect { .. } | Command::Remote { .. } | Command::Access { .. }
+        Command::Connect { .. }
+            | Command::Remote { .. }
+            | Command::Access { .. }
+            | Command::Server {
+                command: ServerCommand::Autostart { .. },
+            }
     ) {
         return Ok(false);
     }
@@ -1033,6 +1038,12 @@ const fn command_requires_remote_server(command: Option<&Command>) -> bool {
         Some(Command::Server {
             command: ServerCommand::Start { .. }
                 | ServerCommand::Status { .. }
+                | ServerCommand::Autostart {
+                    command: ServerAutostartCommand::Install { .. }
+                        | ServerAutostartCommand::Uninstall
+                        | ServerAutostartCommand::Status { .. }
+                        | ServerAutostartCommand::Print { .. },
+                }
                 | ServerCommand::Gateway { .. }
                 | ServerCommand::Bridge { .. }
         })
@@ -9439,6 +9450,16 @@ mod tests {
                 no_rolling_capture_protocol_replies: false,
                 rolling_capture_images: false,
                 no_rolling_capture_images: false,
+            },
+        };
+        assert!(!command_requires_remote_server(Some(&command)));
+    }
+
+    #[test]
+    fn command_requires_remote_server_skips_server_autostart() {
+        let command = Command::Server {
+            command: ServerCommand::Autostart {
+                command: ServerAutostartCommand::Status { json: false },
             },
         };
         assert!(!command_requires_remote_server(Some(&command)));

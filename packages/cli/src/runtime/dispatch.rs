@@ -4,7 +4,7 @@ use bmux_cli_schema::{
     DiagnosticsCommand, KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand,
     PlaybookCommand, RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand,
     RemoteTrustCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg,
-    ServerCommand, SessionCommand, SlotCommand, TerminalCommand,
+    ServerAutostartCommand, ServerCommand, SessionCommand, SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -37,6 +37,10 @@ use super::{
     run_session_detach, run_session_kill, run_session_kill_all, run_session_list, run_session_new,
     run_setup, run_share, run_terminal_doctor, run_terminal_install_terminfo, run_unfollow,
     run_unshare,
+    server_autostart::{
+        run_server_autostart_install, run_server_autostart_print, run_server_autostart_status,
+        run_server_autostart_uninstall,
+    },
 };
 
 pub(super) async fn run_command(
@@ -117,6 +121,12 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ServerCommand::Save => BuiltInHandlerId::ServerSave,
             ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
+            ServerCommand::Autostart { command } => match command {
+                ServerAutostartCommand::Install { .. } => BuiltInHandlerId::ServerAutostartInstall,
+                ServerAutostartCommand::Uninstall => BuiltInHandlerId::ServerAutostartUninstall,
+                ServerAutostartCommand::Status { .. } => BuiltInHandlerId::ServerAutostartStatus,
+                ServerAutostartCommand::Print { .. } => BuiltInHandlerId::ServerAutostartPrint,
+            },
             ServerCommand::Gateway { .. } => BuiltInHandlerId::ServerGateway,
             ServerCommand::Bridge { .. } => BuiltInHandlerId::ServerBridge,
         },
@@ -752,6 +762,48 @@ pub(super) async fn dispatch_built_in_command(
                 command: ServerCommand::Stop,
             },
         ) => run_server_stop(connection_context).await,
+        (
+            BuiltInHandlerId::ServerAutostartInstall,
+            Command::Server {
+                command:
+                    ServerCommand::Autostart {
+                        command:
+                            ServerAutostartCommand::Install {
+                                no_start,
+                                executable,
+                            },
+                    },
+            },
+        ) => {
+            run_server_autostart_install(*no_start, executable.as_deref(), connection_context).await
+        }
+        (
+            BuiltInHandlerId::ServerAutostartUninstall,
+            Command::Server {
+                command:
+                    ServerCommand::Autostart {
+                        command: ServerAutostartCommand::Uninstall,
+                    },
+            },
+        ) => run_server_autostart_uninstall(connection_context),
+        (
+            BuiltInHandlerId::ServerAutostartStatus,
+            Command::Server {
+                command:
+                    ServerCommand::Autostart {
+                        command: ServerAutostartCommand::Status { json },
+                    },
+            },
+        ) => run_server_autostart_status(*json, connection_context).await,
+        (
+            BuiltInHandlerId::ServerAutostartPrint,
+            Command::Server {
+                command:
+                    ServerCommand::Autostart {
+                        command: ServerAutostartCommand::Print { executable },
+                    },
+            },
+        ) => run_server_autostart_print(executable.as_deref(), connection_context),
         (
             BuiltInHandlerId::ServerGateway,
             Command::Server {

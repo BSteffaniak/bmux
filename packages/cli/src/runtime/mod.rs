@@ -40,6 +40,7 @@ mod plugin_runtime;
 mod prompt;
 mod remote_cli;
 mod sandbox_cli;
+mod server_autostart;
 mod server_commands;
 mod server_runtime;
 mod session_cli;

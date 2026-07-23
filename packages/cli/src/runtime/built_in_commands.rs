@@ -59,6 +59,10 @@ pub enum BuiltInHandlerId {
     ServerSave,
     ServerRestore,
     ServerStop,
+    ServerAutostartInstall,
+    ServerAutostartUninstall,
+    ServerAutostartStatus,
+    ServerAutostartPrint,
     ServerGateway,
     ServerBridge,
     Logs,
@@ -452,6 +456,26 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerStop,
             &["server", "stop"],
             "Stop the server",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerAutostartInstall,
+            &["server", "autostart", "install"],
+            "Install native per-user server login autostart",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerAutostartUninstall,
+            &["server", "autostart", "uninstall"],
+            "Remove bmux-managed server login autostart",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerAutostartStatus,
+            &["server", "autostart", "status"],
+            "Show native server autostart status",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerAutostartPrint,
+            &["server", "autostart", "print"],
+            "Print the native server autostart declaration",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ServerGateway,
@@ -909,6 +933,31 @@ mod tests {
             command.canonical_path,
             vec!["keymap".to_string(), "explain".to_string()]
         );
+    }
+
+    #[test]
+    fn autostart_handlers_have_distinct_registered_paths() {
+        for (handler, path) in [
+            (
+                BuiltInHandlerId::ServerAutostartInstall,
+                vec!["server", "autostart", "install"],
+            ),
+            (
+                BuiltInHandlerId::ServerAutostartUninstall,
+                vec!["server", "autostart", "uninstall"],
+            ),
+            (
+                BuiltInHandlerId::ServerAutostartStatus,
+                vec!["server", "autostart", "status"],
+            ),
+            (
+                BuiltInHandlerId::ServerAutostartPrint,
+                vec!["server", "autostart", "print"],
+            ),
+        ] {
+            let command = built_in_command_by_handler(handler);
+            assert_eq!(command.canonical_path, path);
+        }
     }
 
     #[test]

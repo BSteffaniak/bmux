@@ -21,7 +21,7 @@ use super::plugin_kernel::RuntimeLoggingHandle;
 use super::server_commands::prepare_configured_gateway;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
-    SERVER_START_TIMEOUT, activate_loaded_plugins, append_runtime_arg, cleanup_stale_pid_file,
+    SERVER_START_TIMEOUT, activate_loaded_plugins, active_runtime_name, cleanup_stale_pid_file,
     connect_with_context, deactivate_loaded_plugins, dispatch_loaded_plugin_event,
     load_enabled_plugins, map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
     register_plugin_service_handlers, remove_server_pid_file, resolve_log_level,
@@ -187,6 +187,26 @@ pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
     }
 }
 
+fn server_start_child_arguments(
+    rolling_enabled_override: Option<bool>,
+    rolling_options: &RecordingRollingStartOptions,
+    pane_shell_integration_override: Option<bool>,
+) -> Vec<String> {
+    let mut arguments = vec![
+        "--runtime".to_string(),
+        active_runtime_name(),
+        "server".to_string(),
+        "start".to_string(),
+        "--foreground-internal".to_string(),
+    ];
+    arguments.extend(rolling_start_override_args(
+        rolling_enabled_override,
+        rolling_options,
+        pane_shell_integration_override,
+    ));
+    arguments
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn run_server_start(
     daemon: bool,
@@ -262,13 +282,9 @@ pub(super) async fn run_server_start(
         let executable =
             std::env::current_exe().context("failed to resolve bmux executable path")?;
         let mut child = ProcessCommand::new(executable);
-        append_runtime_arg(&mut child);
         let log_level = EFFECTIVE_LOG_LEVEL.get().copied().unwrap_or(Level::INFO);
         child
-            .arg("server")
-            .arg("start")
-            .arg("--foreground-internal")
-            .args(rolling_start_override_args(
+            .args(server_start_child_arguments(
                 rolling_enabled_override,
                 &rolling_options,
                 pane_shell_integration_override,
@@ -956,6 +972,24 @@ mod tests {
     use bmux_config::BmuxConfig;
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
+
+    #[test]
+    fn manual_daemon_child_arguments_preserve_foreground_internal_contract() {
+        let arguments =
+            server_start_child_arguments(None, &RecordingRollingStartOptions::default(), None);
+        let runtime = active_runtime_name();
+        assert_eq!(
+            arguments,
+            [
+                "--runtime",
+                runtime.as_str(),
+                "server",
+                "start",
+                "--foreground-internal",
+            ]
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--daemon"));
+    }
 
     #[test]
     fn map_attach_client_error_formats_busy_session() {

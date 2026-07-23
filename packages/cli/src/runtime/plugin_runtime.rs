@@ -539,6 +539,9 @@ pub(super) fn bundled_plugin_root() -> Option<PathBuf> {
 }
 
 pub(super) fn workspace_bundled_plugin_root() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent()?.parent()?;
     let plugins = root.join("plugins");
@@ -2181,6 +2184,14 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn workspace_plugin_discovery_is_debug_only() {
+        assert_eq!(
+            workspace_bundled_plugin_root().is_some(),
+            cfg!(debug_assertions)
+        );
+    }
 
     fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {
         plugin_manifest_with_commands(id, entry, "")

@@ -3831,6 +3831,7 @@ fn handle_device_seal_broker_request(payload: &[u8]) -> (bool, Vec<u8>, Option<S
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)] // The broker callback is currently consumed only by macOS attach flows.
 fn store_device_seal_keychain_secret(
     _service: &str,
     _account: &str,

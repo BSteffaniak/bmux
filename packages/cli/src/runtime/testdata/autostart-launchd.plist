@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by bmux server autostart; schema=1; platform=macos; runtime=work; service=dev.bmux.server.work -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.bmux.server.work</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/bmux</string>
+    <string>--runtime</string>
+    <string>work</string>
+    <string>server</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>Crashed</key>
+    <true/>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>WorkingDirectory</key>
+  <string>/home/test</string>
+  <key>StandardOutPath</key>
+  <string>/home/test/Library/Logs/bmux/autostart-work-out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/home/test/Library/Logs/bmux/autostart-work-err.log</string>
+</dict>
+</plist>

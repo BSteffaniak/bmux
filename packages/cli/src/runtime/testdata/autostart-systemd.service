@@ -1,0 +1,14 @@
+# Managed by bmux server autostart; schema=1; platform=linux; runtime=work; service=bmux-server-work.service
+[Unit]
+Description=bmux server (work)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart="/opt/bmux" "--runtime" "work" "server" "start"
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=default.target

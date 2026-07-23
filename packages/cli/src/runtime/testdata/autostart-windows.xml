@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<RegistrationInfo><Description>Managed by bmux server autostart; schema=1; platform=windows; runtime=work; service=bmux-server-work</Description></RegistrationInfo>
+<Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+<Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings>
+<Actions Context="Author"><Exec><Command>C:\bmux.exe</Command><Arguments>--runtime work server start</Arguments></Exec></Actions>
+</Task>

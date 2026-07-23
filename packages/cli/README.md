@@ -22,6 +22,48 @@ Default launch behavior:
 - If the server is not running, bmux starts it in daemon mode.
 - If no session exists, bmux creates `tab-1` (or the next available `tab-N`) and attaches.
 
+The native autostart service runs `bmux server start` in the foreground so launchd, systemd, or Task Scheduler owns supervision and restart behavior; it deliberately does not use `--daemon`. `install` starts the service immediately unless `--no-start` is passed. Rerun `install` after moving or upgrading a non-stable executable path. If `[server.gateway]` is enabled, the gateway starts normally with the managed server—there is no separate gateway setting for autostart.
+
+On Linux, autostart targets the user manager's `default.target` and therefore starts at login. bmux does not enable lingering; users who explicitly need startup before login can separately configure `loginctl enable-linger`.
+
+`autostart install` safely refuses declarations owned by Nix, Home Manager, another tool, or the user. `autostart print` is side-effect-free and can be used by declarative tooling.
+
+### Nix/Home Manager
+
+Declarative users should have Nix own the native service and should not run imperative `autostart install`. For Home Manager on Linux:
+
+```nix
+systemd.user.services.bmux-server = {
+  Unit.Description = "bmux server";
+  Service = {
+    Type = "simple";
+    ExecStart = "${pkgs.bmux}/bin/bmux server start";
+    Restart = "on-failure";
+    RestartSec = 1;
+  };
+  Install.WantedBy = [ "default.target" ];
+};
+```
+
+For Home Manager/nix-darwin on macOS:
+
+```nix
+launchd.agents.bmux-server = {
+  enable = true;
+  config = {
+    ProgramArguments = [ "${pkgs.bmux}/bin/bmux" "server" "start" ];
+    RunAtLoad = true;
+    KeepAlive = {
+      Crashed = true;
+      SuccessfulExit = false;
+    };
+    ProcessType = "Background";
+  };
+};
+```
+
+These immutable package paths update and roll back with the owning Nix generation. A read-only Nix-generated `bmux.toml` is supported because autostart only reads normal bmux configuration and never modifies it.
+
 ## Server Commands
 
 ```bash
@@ -29,6 +71,17 @@ Default launch behavior:
 bmux server start
 
 # background daemon mode
+# The native service manager supervises foreground `bmux server start`.
+bmux server autostart install
+bmux server autostart status
+bmux server autostart status --json
+bmux server autostart print
+bmux server autostart uninstall
+
+# `--runtime work` creates an isolated runtime-qualified native service.
+bmux --runtime work server autostart install
+
+# Existing manual daemon startup remains available:
 bmux server start --daemon
 
 # status and graceful shutdown

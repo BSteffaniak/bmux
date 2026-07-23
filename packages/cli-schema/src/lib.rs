@@ -1410,6 +1410,11 @@ pub enum ServerCommand {
     },
     /// Request graceful server shutdown
     Stop,
+    /// Manage native per-user server login autostart
+    Autostart {
+        #[command(subcommand)]
+        command: ServerAutostartCommand,
+    },
     /// Run a TLS gateway that exposes bmux over TCP/TLS
     Gateway {
         /// Listen address (host:port)
@@ -1443,6 +1448,33 @@ pub enum ServerCommand {
         /// Validate bridge stdio cleanliness and readiness
         #[arg(long, hide = true)]
         preflight: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerAutostartCommand {
+    /// Install or update native per-user login autostart
+    Install {
+        /// Enable autostart without starting the service immediately
+        #[arg(long)]
+        no_start: bool,
+        /// Executable path to persist in the native service declaration
+        #[arg(long, value_name = "PATH")]
+        executable: Option<String>,
+    },
+    /// Remove bmux-managed native per-user login autostart
+    Uninstall,
+    /// Show native autostart declaration, manager, and server status
+    Status {
+        /// Print status as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the native service declaration without installing it
+    Print {
+        /// Executable path to render in the native service declaration
+        #[arg(long, value_name = "PATH")]
+        executable: Option<String>,
     },
 }
 
@@ -1806,7 +1838,8 @@ mod tests {
         GatewayHostMode, HostedModeArg, KeymapCommand, KioskCommand, LogsCommand,
         LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand, RecordingEventKindArg,
         RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
-        SandboxStatusArg, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        SandboxStatusArg, ServerAutostartCommand, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -2742,6 +2775,66 @@ mod tests {
             panic!("expected server subcommand");
         };
         assert!(matches!(command, ServerCommand::Stop));
+    }
+
+    #[test]
+    fn parses_server_autostart_commands() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "autostart",
+            "install",
+            "--no-start",
+            "--executable",
+            "/opt/bmux bin/bmux",
+        ])
+        .expect("valid autostart install args");
+        let Some(Command::Server {
+            command: ServerCommand::Autostart { command },
+        }) = cli.command
+        else {
+            panic!("expected server autostart subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerAutostartCommand::Install {
+                no_start: true,
+                executable: Some(path),
+            } if path == "/opt/bmux bin/bmux"
+        ));
+
+        let cli = Cli::try_parse_from(["bmux", "server", "autostart", "status", "--json"])
+            .expect("valid autostart status args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Server {
+                command: ServerCommand::Autostart {
+                    command: ServerAutostartCommand::Status { json: true },
+                },
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["bmux", "server", "autostart", "uninstall"])
+            .expect("valid autostart uninstall args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Server {
+                command: ServerCommand::Autostart {
+                    command: ServerAutostartCommand::Uninstall,
+                },
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["bmux", "server", "autostart", "print"])
+            .expect("valid autostart print args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Server {
+                command: ServerCommand::Autostart {
+                    command: ServerAutostartCommand::Print { executable: None },
+                },
+            })
+        ));
     }
 
     #[test]
