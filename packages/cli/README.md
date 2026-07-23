@@ -118,6 +118,12 @@ bmux unshare my-host
 # run an internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick
 
+# Or add this to bmux.toml to start it with the local server:
+# [server.gateway]
+# enabled = true
+# listen = "0.0.0.0:7443"
+# quick = true
+
 # or force reverse-SSH hosting helper instead of iroh
 bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
 
@@ -155,6 +161,17 @@ function __bmux_targets
   bmux remote complete targets 2>/dev/null
 end
 ```
+
+A TLS gateway can be declared in `bmux.toml` and started automatically with the local server:
+
+```toml
+[server.gateway]
+enabled = true
+listen = "0.0.0.0:7443"
+quick = true
+```
+
+For production TLS material, omit `quick` and configure both `cert_file` and `key_file` instead. Gateway changes require a server restart. Binding `0.0.0.0` exposes the listener to reachable networks, so use appropriate firewall and access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway --host ...` commands.
 
 Target precedence for command routing:
 

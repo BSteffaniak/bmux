@@ -18,6 +18,7 @@ use uuid::Uuid;
 const BOOTSTRAP_RECORDING_START_ENV: &str = "BMUX_BOOTSTRAP_RECORDING_START";
 
 use super::plugin_kernel::RuntimeLoggingHandle;
+use super::server_commands::prepare_configured_gateway;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
     SERVER_START_TIMEOUT, activate_loaded_plugins, append_runtime_arg, cleanup_stale_pid_file,
@@ -207,6 +208,11 @@ pub(super) async fn run_server_start(
     }
 
     let config = BmuxConfig::load()?;
+    let configured_gateway = if foreground_internal || !daemon {
+        prepare_configured_gateway(&config.server.gateway).await?
+    } else {
+        None
+    };
     if let Some(window_secs) = rolling_options.window_secs
         && window_secs == 0
     {
@@ -423,8 +429,19 @@ pub(super) async fn run_server_start(
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_started"))?;
+    let gateway_loop = async move {
+        match configured_gateway {
+            Some(gateway) => gateway.run().await,
+            None => std::future::pending::<Result<()>>().await,
+        }
+    };
+    tokio::pin!(gateway_loop);
     let run_result = if loaded_plugins.is_empty() {
-        server.run().await
+        tokio::select! {
+            biased;
+            result = server.run() => result,
+            result = &mut gateway_loop => result,
+        }
     } else {
         let (plugin_bridge_shutdown_tx, plugin_bridge_shutdown_rx) =
             tokio::sync::watch::channel(false);
@@ -439,6 +456,10 @@ pub(super) async fn run_server_start(
                 let _ = plugin_bridge_shutdown_tx.send(true);
                 result?;
                 Ok(())
+            }
+            result = &mut gateway_loop => {
+                let _ = plugin_bridge_shutdown_tx.send(true);
+                result
             }
         }
     };

@@ -145,6 +145,13 @@ bmux join bmux://my-host
 bmux server gateway --listen 0.0.0.0:7443 --quick
 bmux connect tls-prod app
 
+# Or start the TLS gateway automatically with the local server by adding:
+# [server.gateway]
+# enabled = true
+# listen = "0.0.0.0:7443"
+# quick = true
+# Restart the bmux server after changing gateway settings.
+
 # Reverse-SSH hosted helper (prints public URL in ssh output)
 bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
 bmux connect https://your-public-url app
@@ -165,6 +172,27 @@ bmux logs watch --exclude "bmux server listening"
 bmux logs watch --profile incident-db
 bmux logs profiles list
 ```
+
+A TLS gateway can also start automatically with the local server:
+
+```toml
+[server.gateway]
+enabled = true
+listen = "0.0.0.0:7443"
+quick = true
+```
+
+For a production certificate, disable quick mode by omitting `quick` and provide both PEM files:
+
+```toml
+[server.gateway]
+enabled = true
+listen = "0.0.0.0:7443"
+cert_file = "/etc/bmux/gateway-cert.pem"
+key_file = "/etc/bmux/gateway-key.pem"
+```
+
+Restart the bmux server after changing gateway settings. Listening on `0.0.0.0` exposes the gateway to reachable networks; apply appropriate firewall and access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway --host ...` command flows.
 
 `bmux logs watch` uses a ratatui interface and supports Vim-style navigation (`j`/`k`, `g`/`G`, `Ctrl-u`/`Ctrl-d`).
 

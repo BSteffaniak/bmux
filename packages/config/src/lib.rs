@@ -959,6 +959,9 @@ pub struct BmuxConfig {
     /// Core session defaults: shell, scrollback depth, and server connection settings
     #[config_doc(nested)]
     pub general: GeneralConfig,
+    /// Local server process and gateway listener settings
+    #[config_doc(nested)]
+    pub server: ServerConfig,
     /// Visual styling: pane borders, status bar placement, and window titles
     #[config_doc(nested)]
     pub appearance: AppearanceConfig,
@@ -1896,6 +1899,44 @@ impl Default for GeneralConfig {
     }
 }
 
+/// Local server process and gateway listener settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "server")]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Optional TCP/TLS gateway started with the local server.
+    #[config_doc(nested)]
+    pub gateway: ServerGatewayConfig,
+}
+
+/// TCP/TLS gateway automatically started with the local server.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct ServerGatewayConfig {
+    /// Start the gateway whenever the local server starts.
+    pub enabled: bool,
+    /// Socket address on which the gateway listens.
+    pub listen: String,
+    /// Generate and reuse a self-signed certificate in the bmux data directory.
+    pub quick: bool,
+    /// PEM-encoded certificate chain used when quick mode is disabled.
+    pub cert_file: Option<String>,
+    /// PEM-encoded PKCS8 private key used when quick mode is disabled.
+    pub key_file: Option<String>,
+}
+
+impl Default for ServerGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:7443".to_string(),
+            quick: false,
+            cert_file: None,
+            key_file: None,
+        }
+    }
+}
+
 /// Visual styling: pane borders, status bar placement, and window titles
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "appearance")]
@@ -2063,6 +2104,37 @@ impl Default for EventCoalescingBehaviorConfig {
             max_events_per_frame: 64,
         }
     }
+}
+
+fn validate_server_gateway_config(gateway: &ServerGatewayConfig) -> Result<()> {
+    // Validate declarations even while disabled so enabling an existing gateway
+    // cannot reveal a latent startup error.
+    gateway
+        .listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| ConfigError::InvalidValue {
+            field: "server.gateway.listen".to_string(),
+            value: format!("{} ({error})", gateway.listen),
+        })?;
+    if gateway.quick && (gateway.cert_file.is_some() || gateway.key_file.is_some()) {
+        return Err(ConfigError::InvalidValue {
+            field: "server.gateway".to_string(),
+            value: "quick cannot be combined with cert_file or key_file".to_string(),
+        });
+    }
+    if gateway.cert_file.is_some() != gateway.key_file.is_some() {
+        return Err(ConfigError::InvalidValue {
+            field: "server.gateway".to_string(),
+            value: "cert_file and key_file must be configured together".to_string(),
+        });
+    }
+    if gateway.enabled && !gateway.quick && gateway.cert_file.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field: "server.gateway".to_string(),
+            value: "enabled gateway requires quick = true or cert_file and key_file".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_status_bar_config(status_bar: &StatusBarConfig) -> Result<()> {
@@ -3480,6 +3552,8 @@ impl BmuxConfig {
             });
         }
 
+        validate_server_gateway_config(&self.server.gateway)?;
+
         if let Err(error) = self.keybindings.resolve_timeout() {
             return Err(ConfigError::InvalidValue {
                 field: "keybindings".to_string(),
@@ -3874,6 +3948,11 @@ mod tests {
         let config = BmuxConfig::default();
         assert!(config.validate().is_ok());
         assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Ignore);
+        assert!(!config.server.gateway.enabled);
+        assert_eq!(config.server.gateway.listen, "127.0.0.1:7443");
+        assert!(!config.server.gateway.quick);
+        assert!(config.server.gateway.cert_file.is_none());
+        assert!(config.server.gateway.key_file.is_none());
         assert!(config.plugins.enabled.is_empty());
         assert!(config.plugins.disabled.is_empty());
         assert!(config.plugins.routing.required_namespaces.is_empty());
@@ -3892,6 +3971,56 @@ mod tests {
             64 * 1024 * 1024
         );
         assert_eq!(config.plugins.native_service.buffer_resize_attempts, 8);
+    }
+
+    #[test]
+    fn server_gateway_config_deserializes_and_validates() {
+        let quick: BmuxConfig = toml::from_str(
+            r#"
+[server.gateway]
+enabled = true
+listen = "0.0.0.0:7443"
+quick = true
+"#,
+        )
+        .expect("quick gateway config should deserialize");
+        assert!(quick.validate().is_ok());
+        assert!(quick.server.gateway.enabled);
+        assert_eq!(quick.server.gateway.listen, "0.0.0.0:7443");
+        assert!(quick.server.gateway.quick);
+
+        let certificates: BmuxConfig = toml::from_str(
+            r#"
+[server.gateway]
+enabled = true
+listen = "127.0.0.1:8443"
+cert_file = "/tmp/gateway-cert.pem"
+key_file = "/tmp/gateway-key.pem"
+"#,
+        )
+        .expect("certificate gateway config should deserialize");
+        assert!(certificates.validate().is_ok());
+    }
+
+    #[test]
+    fn server_gateway_config_rejects_invalid_declarations() {
+        let mut config = BmuxConfig::default();
+        config.server.gateway.listen = "localhost:7443".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = BmuxConfig::default();
+        config.server.gateway.quick = true;
+        config.server.gateway.cert_file = Some("cert.pem".to_string());
+        config.server.gateway.key_file = Some("key.pem".to_string());
+        assert!(config.validate().is_err());
+
+        let mut config = BmuxConfig::default();
+        config.server.gateway.cert_file = Some("cert.pem".to_string());
+        assert!(config.validate().is_err());
+
+        let mut config = BmuxConfig::default();
+        config.server.gateway.enabled = true;
+        assert!(config.validate().is_err());
     }
 
     #[test]

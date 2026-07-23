@@ -4,7 +4,7 @@ use crate::ssh_access::{
 };
 use anyhow::{Context, Result};
 use bmux_cli_schema::GatewayHostMode;
-use bmux_config::ConfigPaths;
+use bmux_config::{ConfigPaths, ServerGatewayConfig};
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::LocalIpcStream;
 use bmux_snapshot_plugin_api::{snapshot_commands, snapshot_state, snapshot_types};
@@ -520,6 +520,70 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
     Ok(0)
 }
 
+pub(super) struct PreparedGateway {
+    listen: String,
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl PreparedGateway {
+    pub(super) async fn run(self) -> Result<()> {
+        println!("bmux TLS gateway listening on {}", self.listen);
+        loop {
+            let (tcp_stream, peer_addr) = self
+                .listener
+                .accept()
+                .await
+                .context("failed accepting TLS gateway connection")?;
+            let acceptor = self.acceptor.clone();
+            tokio::spawn(async move {
+                if let Err(error) = handle_gateway_connection(acceptor, tcp_stream).await {
+                    eprintln!("gateway connection from {peer_addr} failed: {error:#}");
+                }
+            });
+        }
+    }
+}
+
+pub(super) async fn prepare_configured_gateway(
+    config: &ServerGatewayConfig,
+) -> Result<Option<PreparedGateway>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    prepare_gateway(
+        &config.listen,
+        config.quick,
+        config.cert_file.as_deref(),
+        config.key_file.as_deref(),
+    )
+    .await
+    .map(Some)
+}
+
+async fn prepare_gateway(
+    listen: &str,
+    quick: bool,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<PreparedGateway> {
+    let (cert_file, key_file) = resolve_gateway_tls_files(quick, cert_file, key_file)?;
+    let cert_chain = load_cert_chain(&cert_file)?;
+    let private_key = load_private_key(&key_file)?;
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .context("failed building TLS server config")?;
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed binding TLS gateway on {listen}"))?;
+    Ok(PreparedGateway {
+        listen: listen.to_string(),
+        listener,
+        acceptor: TlsAcceptor::from(Arc::new(tls_config)),
+    })
+}
+
 pub(super) async fn run_server_gateway(
     listen: &str,
     host: bool,
@@ -533,19 +597,8 @@ pub(super) async fn run_server_gateway(
         return run_server_gateway_iroh().await;
     }
 
-    let (cert_file, key_file) = resolve_gateway_tls_files(quick, cert_file, key_file)?;
-    let cert_chain = load_cert_chain(&cert_file)?;
-    let private_key = load_private_key(&key_file)?;
-    let tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, private_key)
-        .context("failed building TLS server config")?;
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("failed binding TLS gateway on {listen}"))?;
+    let gateway = prepare_gateway(listen, quick, cert_file, key_file).await?;
 
-    println!("bmux TLS gateway listening on {listen}");
     if host {
         let tunnel_target = format!("80:127.0.0.1:{}", parse_listen_port(listen)?);
         println!("starting hosted reverse tunnel via '{host_relay}' (target: {tunnel_target})");
@@ -554,18 +607,8 @@ pub(super) async fn run_server_gateway(
             "when tunnel is ready, your public URL will be shown by ssh output. use that URL with 'bmux connect <url>'"
         );
     }
-    loop {
-        let (tcp_stream, peer_addr) = listener
-            .accept()
-            .await
-            .context("failed accepting TLS gateway connection")?;
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_gateway_connection(acceptor, tcp_stream).await {
-                tracing::warn!(peer = %peer_addr, ?error, "tls gateway connection failed");
-            }
-        });
-    }
+    gateway.run().await?;
+    Ok(0)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -921,5 +964,116 @@ fn local_endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
     #[cfg(windows)]
     {
         IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prepare_configured_gateway, prepare_gateway};
+    use bmux_config::ServerGatewayConfig;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestCertificate {
+        directory: PathBuf,
+        cert_file: String,
+        key_file: String,
+    }
+
+    impl TestCertificate {
+        fn create() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should follow epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("bmux-gateway-test-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("create test certificate directory");
+            let cert_file = directory.join("cert.pem");
+            let key_file = directory.join("key.pem");
+            let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("generate test certificate");
+            std::fs::write(&cert_file, certificate.cert.pem()).expect("write test certificate");
+            std::fs::write(&key_file, certificate.signing_key.serialize_pem())
+                .expect("write test private key");
+            Self {
+                directory,
+                cert_file: cert_file.to_string_lossy().into_owned(),
+                key_file: key_file.to_string_lossy().into_owned(),
+            }
+        }
+    }
+
+    impl Drop for TestCertificate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_config_does_not_prepare_gateway() {
+        let gateway = prepare_configured_gateway(&ServerGatewayConfig::default())
+            .await
+            .expect("disabled gateway should not fail");
+        assert!(gateway.is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_config_prepares_gateway_from_typed_options() {
+        let certificate = TestCertificate::create();
+        let config = ServerGatewayConfig {
+            enabled: true,
+            listen: "127.0.0.1:0".to_string(),
+            quick: false,
+            cert_file: Some(certificate.cert_file.clone()),
+            key_file: Some(certificate.key_file.clone()),
+        };
+        let gateway = prepare_configured_gateway(&config)
+            .await
+            .expect("enabled gateway should prepare")
+            .expect("enabled gateway should return runtime");
+        assert!(gateway.listener.local_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn configured_gateway_binds_and_releases_listener_when_cancelled() {
+        let certificate = TestCertificate::create();
+        let gateway = prepare_gateway(
+            "127.0.0.1:0",
+            false,
+            Some(&certificate.cert_file),
+            Some(&certificate.key_file),
+        )
+        .await
+        .expect("prepare gateway");
+        let address = gateway
+            .listener
+            .local_addr()
+            .expect("gateway local address");
+        let task = tokio::spawn(gateway.run());
+        tokio::task::yield_now().await;
+        assert!(tokio::net::TcpListener::bind(address).await.is_err());
+        task.abort();
+        let _ = task.await;
+        tokio::net::TcpListener::bind(address)
+            .await
+            .expect("aborting gateway should release listener");
+    }
+
+    #[tokio::test]
+    async fn configured_gateway_rejects_occupied_listener() {
+        let certificate = TestCertificate::create();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied test listener");
+        let address = occupied.local_addr().expect("occupied local address");
+        let result = prepare_gateway(
+            &address.to_string(),
+            false,
+            Some(&certificate.cert_file),
+            Some(&certificate.key_file),
+        )
+        .await;
+        assert!(result.is_err());
     }
 }
