@@ -90,11 +90,28 @@ impl Parser<'_> {
     }
 
     fn parse_interface(&mut self) -> Result<Interface, Error> {
-        let capability = if self.check(&TokenKind::At) {
-            Some(self.consume_interface_capability_annotation()?)
-        } else {
-            None
-        };
+        let mut capability = None;
+        let mut interface_version = None;
+        while self.check(&TokenKind::At) {
+            match self.consume_interface_annotation()? {
+                InterfaceAnnotation::Capability(value) => {
+                    if capability.replace(value).is_some() {
+                        return Err(Error::Parse {
+                            span: self.peek().map_or(Span::new(0, 0), |token| token.span),
+                            message: "duplicate `@capability` interface annotation".to_string(),
+                        });
+                    }
+                }
+                InterfaceAnnotation::Version(value) => {
+                    if interface_version.replace(value).is_some() {
+                        return Err(Error::Parse {
+                            span: self.peek().map_or(Span::new(0, 0), |token| token.span),
+                            message: "duplicate `@interface-version` annotation".to_string(),
+                        });
+                    }
+                }
+            }
+        }
         let span = self.expect(&TokenKind::Interface, "expected `interface` keyword")?;
         let name = self.expect_identifier("expected interface name")?;
         self.expect(&TokenKind::LBrace, "expected `{` opening interface body")?;
@@ -105,6 +122,7 @@ impl Parser<'_> {
         self.expect(&TokenKind::RBrace, "expected `}` closing interface body")?;
         Ok(Interface {
             name,
+            interface_version,
             capability,
             items,
             span,
@@ -224,7 +242,7 @@ impl Parser<'_> {
             },
             "expected operation keyword",
         )?;
-        let name = self.expect_identifier("expected operation name")?;
+        let name = self.expect_contextual_name("expected operation name")?;
         self.expect(&TokenKind::LParen, "expected `(` opening params")?;
         let mut params = Vec::new();
         while !self.check(&TokenKind::RParen) {
@@ -307,8 +325,8 @@ impl Parser<'_> {
         }
     }
 
-    /// Consume an interface-level `@capability(NAME)` annotation.
-    fn consume_interface_capability_annotation(&mut self) -> Result<String, Error> {
+    /// Consume one interface-level annotation.
+    fn consume_interface_annotation(&mut self) -> Result<InterfaceAnnotation, Error> {
         let at_span = self.expect(&TokenKind::At, "expected `@`")?;
         let (name, span) = match self.advance().cloned() {
             Some(Token {
@@ -328,25 +346,46 @@ impl Parser<'_> {
                 });
             }
         };
-        if name != "capability" {
-            return Err(Error::Parse {
+        match name.as_str() {
+            "capability" => {
+                self.expect(&TokenKind::LParen, "expected `(` after `@capability`")?;
+                let capability = self.expect_identifier("expected capability constant name")?;
+                self.expect(&TokenKind::RParen, "expected `)` after capability name")?;
+                Ok(InterfaceAnnotation::Capability(capability))
+            }
+            "interface-version" => {
+                self.expect(
+                    &TokenKind::LParen,
+                    "expected `(` after `@interface-version`",
+                )?;
+                let version = self.expect_int("expected interface version integer")?;
+                self.expect(&TokenKind::RParen, "expected `)` after interface version")?;
+                let version = u32::try_from(version).map_err(|_| Error::Parse {
+                    span,
+                    message: "interface version must fit in u32".to_string(),
+                })?;
+                if version == 0 {
+                    return Err(Error::Parse {
+                        span,
+                        message: "interface version must be greater than zero".to_string(),
+                    });
+                }
+                Ok(InterfaceAnnotation::Version(version))
+            }
+            other => Err(Error::Parse {
                 span,
                 message: format!(
-                    "unknown interface annotation `@{name}`; only `@capability(NAME)` is recognised"
+                    "unknown interface annotation `@{other}`; expected `@capability(NAME)` or `@interface-version(N)`"
                 ),
-            });
+            }),
         }
-        self.expect(&TokenKind::LParen, "expected `(` after `@capability`")?;
-        let capability = self.expect_identifier("expected capability constant name")?;
-        self.expect(&TokenKind::RParen, "expected `)` after capability name")?;
-        Ok(capability)
     }
 
     fn parse_fields(&mut self) -> Result<Vec<Field>, Error> {
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) {
             let span = self.peek().map_or(Span::new(0, 0), |t| t.span);
-            let name = self.expect_identifier("expected field name")?;
+            let name = self.expect_contextual_name("expected field name")?;
             self.expect(&TokenKind::Colon, "expected `:` after field name")?;
             let ty = self.parse_type()?;
             fields.push(Field { name, ty, span });
@@ -517,6 +556,29 @@ impl Parser<'_> {
         }
     }
 
+    fn expect_contextual_name(&mut self, message: &str) -> Result<String, Error> {
+        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
+            span: Span::new(0, 0),
+            message: format!("{message} (unexpected end of input)"),
+        })?;
+        let name = match tok.kind {
+            TokenKind::Identifier(name) => name,
+            TokenKind::List => "list".to_string(),
+            TokenKind::Map => "map".to_string(),
+            TokenKind::Result => "result".to_string(),
+            TokenKind::Unit => "unit".to_string(),
+            TokenKind::Events => "events".to_string(),
+            other => {
+                return Err(Error::Parse {
+                    span: tok.span,
+                    message: format!("{message} (got {other:?})"),
+                });
+            }
+        };
+        self.advance();
+        Ok(name)
+    }
+
     fn expect_identifier(&mut self, message: &str) -> Result<String, Error> {
         let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
             span: Span::new(0, 0),
@@ -548,6 +610,11 @@ impl Parser<'_> {
             })
         }
     }
+}
+
+enum InterfaceAnnotation {
+    Capability(String),
+    Version(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -607,6 +674,62 @@ mod tests {
         assert_eq!(var.cases.len(), 2);
         assert_eq!(var.cases[0].payload.len(), 0);
         assert_eq!(var.cases[1].payload.len(), 1);
+    }
+
+    #[test]
+    fn parses_type_keywords_as_contextual_operation_and_field_names() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             interface state {\n\
+               record event-list { events: list<string> }\n\
+               query list() -> event-list;\n\
+             }",
+        );
+        let InterfaceItem::Record(record) = &schema.interfaces[0].items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(record.fields[0].name, "events");
+        let InterfaceItem::Query(operation) = &schema.interfaces[0].items[1] else {
+            panic!("expected query");
+        };
+        assert_eq!(operation.name, "list");
+    }
+
+    #[test]
+    fn parses_versioned_interface_annotations_in_either_order() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             capability READ = p.read;\n\
+             @interface-version(2)\n\
+             @capability(READ)\n\
+             interface state { query get() -> bool; }",
+        );
+        let interface = &schema.interfaces[0];
+        assert_eq!(interface.name, "state");
+        assert_eq!(interface.interface_version, Some(2));
+        assert_eq!(interface.capability.as_deref(), Some("READ"));
+    }
+
+    #[test]
+    fn rejects_zero_interface_version() {
+        let tokens = tokenize(
+            "plugin p version 1;\n\
+             @interface-version(0) interface state {}",
+        )
+        .expect("lex");
+        let error = parse(&tokens).expect_err("zero interface version should fail");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn rejects_duplicate_interface_version() {
+        let tokens = tokenize(
+            "plugin p version 1;\n\
+             @interface-version(1) @interface-version(2) interface state {}",
+        )
+        .expect("lex");
+        let error = parse(&tokens).expect_err("duplicate interface version should fail");
+        assert!(error.to_string().contains("duplicate `@interface-version`"));
     }
 
     #[test]

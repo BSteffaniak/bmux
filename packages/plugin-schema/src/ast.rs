@@ -53,6 +53,10 @@ pub struct CapabilityDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interface {
     pub name: String,
+    /// Optional wire-version suffix for the generated service identifier.
+    /// `@interface-version(1) interface foo` produces `foo/v1` while
+    /// retaining `foo` as the source/module name.
+    pub interface_version: Option<u32>,
     /// Capability constant required to invoke this service interface.
     /// Present only for query-only or command-only interfaces.
     pub capability: Option<String>,

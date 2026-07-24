@@ -144,9 +144,10 @@ impl<'de> Deserialize<'de> for PluginEventKind {
 /// Canonical identifier for a BPDL interface.
 ///
 /// Each BPDL-declared `interface <name>` block emits a generated
-/// `pub const INTERFACE_ID: InterfaceId = InterfaceId::from_static("<name>")`
-/// in its plugin-api crate. Consumers and providers both reference that
-/// const when registering/resolving typed services.
+/// `INTERFACE_ID`. By default it is `<name>`; an
+/// `@interface-version(N)` annotation emits `<name>/vN` while retaining
+/// `<name>` for generated Rust module and trait names. Consumers and providers
+/// both reference that constant when registering/resolving typed services.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct InterfaceId(Cow<'static, str>);
 

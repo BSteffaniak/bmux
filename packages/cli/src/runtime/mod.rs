@@ -109,9 +109,8 @@ pub use prompt::{
     PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
 };
 use remote_cli::{
-    SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel,
-    maybe_run_cluster_plugin_command_via_gateway, reconnect_backoff_ms, run_auth_login,
-    run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
+    SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel, reconnect_backoff_ms,
+    run_auth_login, run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_trust_add,
     run_remote_trust_list, run_remote_trust_remove, run_remote_upgrade, run_setup, run_share,
@@ -371,12 +370,6 @@ pub async fn run() -> Result<u8> {
             let _logging_guard =
                 init_logging(false, Some(log_level), false, LogProcessScope::Command);
             tracing::info!(plugin_id, command_name, "runtime.cli.plugin_start");
-            if let Some(status) =
-                maybe_run_cluster_plugin_command_via_gateway(&plugin_id, &command_name, &arguments)
-                    .await?
-            {
-                return Ok(status);
-            }
             if let Some(command_state) = command_state.as_ref() {
                 run_plugin_command_with_state(command_state, &plugin_id, &command_name, &arguments)
                     .await

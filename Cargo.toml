@@ -69,6 +69,8 @@ members = [
     "plugins/clipboard-plugin",
     "plugins/cluster-plugin",
     "plugins/cluster-plugin-api",
+    "plugins/connections-plugin",
+    "plugins/connections-plugin-api",
     "plugins/command-palette-plugin",
     "plugins/contexts-plugin",
     "plugins/contexts-plugin-api",
@@ -208,6 +210,8 @@ bmux_clipboard_plugin                = { version = "0.0.1-alpha.1", default-feat
 bmux_cluster_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin" }
 bmux_cluster_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-api" }
 bmux_command_palette_plugin          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/command-palette-plugin" }
+bmux_connections_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin" }
+bmux_connections_plugin_api          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin-api" }
 bmux_contexts_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/contexts-plugin" }
 bmux_contexts_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/contexts-plugin-api" }
 bmux_control_catalog_plugin          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/control-catalog-plugin" }

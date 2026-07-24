@@ -70,18 +70,20 @@ interface cluster-types {
     }
 
     record cluster-connection-event-list {
-        entries: list<cluster-connection-event>,
+        events: list<cluster-connection-event>,
     }
 }
 
 @capability(CLUSTER_READ)
-interface cluster-query-v1 {
+@interface-version(1)
+interface cluster-query {
     query list_clusters() -> cluster-types.cluster-list-result;
     query status(selector: string?, doctor: bool?) -> cluster-types.cluster-status-result;
 }
 
 @capability(CLUSTER_WRITE)
-interface cluster-command-v1 {
+@interface-version(1)
+interface cluster-command {
     command up(cluster: string, hosts: list<string>) -> cluster-types.cluster-up-result;
     command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
     command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;
@@ -89,6 +91,7 @@ interface cluster-command-v1 {
 }
 
 @capability(CLUSTER_READ)
-interface cluster-connection-events-v1 {
-    query list_events() -> cluster-types.cluster-connection-event-list;
+@interface-version(1)
+interface cluster-connection-events {
+    query list() -> cluster-types.cluster-connection-event-list;
 }

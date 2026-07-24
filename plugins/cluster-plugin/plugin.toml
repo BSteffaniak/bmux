@@ -30,6 +30,7 @@ required_capabilities = [
     "bmux.attach_runtime.write",
     "bmux.clients.read",
     "bmux.commands",
+    "bmux.connections.invoke",
     "bmux.contexts.read",
     "bmux.contexts.write",
     "bmux.pane_runtime.read",
@@ -43,17 +44,17 @@ version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.server_clusters.read"
-interface_id = "cluster-query-v1"
+interface_id = "cluster-query/v1"
 kind         = "query"
 
 [[services]]
 capability   = "bmux.server_clusters.write"
-interface_id = "cluster-command-v1"
+interface_id = "cluster-command/v1"
 kind         = "command"
 
 [[services]]
 capability   = "bmux.server_clusters.read"
-interface_id = "cluster-connection-events-v1"
+interface_id = "cluster-connection-events/v1"
 kind         = "query"
 
 [[commands]]

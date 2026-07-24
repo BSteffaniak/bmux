@@ -1,7 +1,7 @@
 //! Smoke tests for the BPDL-generated cluster plugin contract.
 
 use bmux_cluster_plugin_api::{
-    cluster_command_v1, cluster_connection_events_v1, cluster_query_v1,
+    cluster_command, cluster_connection_events, cluster_query,
     cluster_types::{
         ClusterConnectionEvent, ClusterConnectionState, ClusterHostState, ClusterHostStatus,
         ClusterLaunchStatus, ClusterPaneMutationResult, ClusterUpResult,
@@ -74,15 +74,15 @@ fn cluster_connection_event_round_trips() {
 
 #[test]
 fn interface_ids_and_operations_match_schema() {
-    assert_eq!(cluster_query_v1::INTERFACE_ID, "cluster-query-v1");
-    assert_eq!(cluster_command_v1::INTERFACE_ID, "cluster-command-v1");
+    assert_eq!(cluster_query::INTERFACE_ID, "cluster-query/v1");
+    assert_eq!(cluster_command::INTERFACE_ID, "cluster-command/v1");
     assert_eq!(
-        cluster_connection_events_v1::INTERFACE_ID,
-        "cluster-connection-events-v1"
+        cluster_connection_events::INTERFACE_ID,
+        "cluster-connection-events/v1"
     );
-    assert_eq!(cluster_query_v1::OP_LIST_CLUSTERS, "list_clusters");
-    assert_eq!(cluster_command_v1::OP_PANE_MOVE, "pane_move");
-    assert_eq!(cluster_connection_events_v1::OP_LIST_EVENTS, "list_events");
+    assert_eq!(cluster_query::OP_LIST_CLUSTERS, "list_clusters");
+    assert_eq!(cluster_command::OP_PANE_MOVE, "pane_move");
+    assert_eq!(cluster_connection_events::OP_LIST, "list");
 }
 
 #[test]

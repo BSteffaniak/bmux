@@ -47,9 +47,9 @@ fn assert_no_cluster_domain_markers(source: &str, context: &str) {
     let denied = [
         "bmux.cluster",
         "bmux.server_clusters",
-        "cluster-query-v1",
-        "cluster-command-v1",
-        "cluster-connection-events-v1",
+        "cluster-query/v1",
+        "cluster-command/v1",
+        "cluster-connection-events/v1",
         "ClusterId",
         "NodeId",
         "WorkspaceId",
@@ -148,6 +148,7 @@ fn runtime_production_code_is_domain_agnostic() {
     for (path, source) in runtime_sources() {
         let source = production_section(source);
         assert_no_domain_markers(source, path);
+        assert_no_cluster_domain_markers(source, path);
         assert!(
             !source.contains("bmux_clipboard::"),
             "{path} should not directly reference clipboard backend crate APIs",

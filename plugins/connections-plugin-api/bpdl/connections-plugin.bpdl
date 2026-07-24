@@ -1,0 +1,57 @@
+// Stable transport-neutral endpoint resolution and invocation contract.
+
+plugin bmux.connections version 1;
+
+capability CONNECTIONS_READ = bmux.connections.read;
+capability CONNECTIONS_INVOKE = bmux.connections.invoke;
+
+interface connection-types {
+    enum connection-transport {
+        local,
+        ssh,
+        tls,
+        iroh,
+    }
+
+    enum service-invoke-kind {
+        invoke-query,
+        invoke-command,
+    }
+
+    record resolved-endpoint {
+        reference: string,
+        label: string,
+        transport: connection-transport,
+        address: string,
+        server_name: string?,
+        connect_timeout_ms: u64,
+    }
+
+    variant connection-error {
+        target-not-found { target: string },
+        invalid-target { target: string, reason: string },
+        unsupported-transport { target: string, transport: string },
+        authentication-failed { target: string, reason: string },
+        trust-failed { target: string, reason: string },
+        connection-failed { target: string, reason: string },
+        service-failed { target: string, reason: string },
+    }
+}
+
+@capability(CONNECTIONS_READ)
+interface connections-state {
+    query resolve(target: string) -> result<connection-types.resolved-endpoint, connection-types.connection-error>;
+    query list-targets() -> list<connection-types.resolved-endpoint>;
+}
+
+@capability(CONNECTIONS_INVOKE)
+interface connections-commands {
+    command invoke-service(
+        target: string,
+        capability: string,
+        kind: connection-types.service-invoke-kind,
+        interface_id: string,
+        operation: string,
+        payload: bytes,
+    ) -> result<bytes, connection-types.connection-error>;
+}

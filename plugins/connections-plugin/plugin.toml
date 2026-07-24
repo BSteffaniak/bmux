@@ -1,0 +1,17 @@
+execution_class       = "native_standard"
+id                    = "bmux.connections"
+name                  = "bmux Connections"
+provided_capabilities = ["bmux.connections.read", "bmux.connections.invoke"]
+provided_features     = ["bmux.connections"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.connections.read"
+interface_id = "connections-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.connections.invoke"
+interface_id = "connections-commands"
+kind         = "command"

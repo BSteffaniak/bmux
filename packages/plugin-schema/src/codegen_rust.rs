@@ -412,11 +412,15 @@ fn emit_service_trait(
 ) {
     let trait_name = format!("{}Service", pascal_case(&iface.name));
     // Canonical interface identifier used to look up a typed service via
-    // the plugin host registry. Matches the BPDL `interface <name>` name.
+    // the plugin host registry. `@interface-version(N)` appends `/vN` to
+    // the source name without changing the generated Rust module name.
+    let interface_id = iface.interface_version.map_or_else(
+        || iface.name.clone(),
+        |version| format!("{}/v{version}", iface.name),
+    );
     let _ = writeln!(
         out,
-        "    /// Canonical identifier for this interface. Matches the `interface`\n    /// name in the BPDL source exactly; used to look up a provider via\n    /// the plugin host registry.\n    pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"{}\");\n",
-        iface.name
+        "    /// Canonical identifier for this interface; used to look up a provider via\n    /// the plugin host registry.\n    pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"{interface_id}\");\n",
     );
     emit_operation_constants(iface, out);
     out.push_str("    /// Service trait for this interface.\n");
@@ -1205,6 +1209,29 @@ mod tests {
         assert!(
             rust.contains("pub const OP_FOCUS_PANE: ::bmux_plugin_sdk::OperationId = ::bmux_plugin_sdk::OperationId::from_static(\"focus-pane\");"),
             "codegen must emit command operation id constants; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_versioned_interface_id_without_changing_module_name() {
+        let src = "plugin p version 1;\n\
+                   capability CLUSTER_READ = bmux.server_clusters.read;\n\
+                   @capability(CLUSTER_READ)\n\
+                   @interface-version(1)\n\
+                   interface cluster-query {\n\
+                      query ping() -> bool;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains("pub mod cluster_query"),
+            "source name should continue to define the Rust module; got: {rust}"
+        );
+        assert!(
+            rust.contains(
+                "pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"cluster-query/v1\");"
+            ),
+            "codegen must append the declared wire version; got: {rust}"
         );
     }
 

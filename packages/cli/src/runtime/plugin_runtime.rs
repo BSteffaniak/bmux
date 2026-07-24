@@ -139,6 +139,11 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
     plugin_type = bmux_cluster_plugin::ClusterPlugin;
 
+    feature = "bundled-plugin-connections",
+    id = "bmux.connections",
+    manifest = include_str!("../../../../plugins/connections-plugin/plugin.toml"),
+    plugin_type = bmux_connections_plugin::ConnectionsPlugin;
+
     feature = "bundled-plugin-command-palette",
     id = "bmux.command_palette",
     manifest = include_str!("../../../../plugins/command-palette-plugin/plugin.toml"),
@@ -373,6 +378,8 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         "clipboard-plugin",
         #[cfg(feature = "bundled-plugin-cluster")]
         "cluster-plugin",
+        #[cfg(feature = "bundled-plugin-connections")]
+        "connections-plugin",
         #[cfg(feature = "bundled-plugin-command-palette")]
         "command-palette-plugin",
         #[cfg(feature = "bundled-plugin-contexts")]

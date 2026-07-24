@@ -1178,6 +1178,7 @@ dependencies = [
  "bmux_codec",
  "bmux_command_palette_plugin",
  "bmux_config",
+ "bmux_connections_plugin",
  "bmux_context_state",
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
@@ -1351,17 +1352,22 @@ dependencies = [
 name = "bmux_cluster_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "anyhow",
  "bmux_clients_plugin_api",
  "bmux_cluster_plugin_api",
  "bmux_config",
+ "bmux_connections_plugin_api",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
  "serde",
  "serde_json",
+ "serial_test",
+ "tempfile",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
  "uuid",
 ]
 
@@ -1429,6 +1435,46 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "bmux_connections_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "bmux_client",
+ "bmux_config",
+ "bmux_connections_plugin_api",
+ "bmux_ipc",
+ "bmux_plugin_sdk",
+ "bmux_server",
+ "git_sshripped_ssh_agent",
+ "iroh",
+ "reqwest 0.13.4",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml 1.1.2+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_connections_plugin_api"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

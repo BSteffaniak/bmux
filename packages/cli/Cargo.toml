@@ -69,6 +69,9 @@ bmux_cluster_plugin = { workspace = true, optional = true, features = [
 bmux_command_palette_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_connections_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_contexts_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -194,6 +197,7 @@ fail-on-warnings = [
     "bmux_clients_plugin?/fail-on-warnings",
     "bmux_clipboard_plugin?/fail-on-warnings",
     "bmux_cluster_plugin?/fail-on-warnings",
+    "bmux_connections_plugin?/fail-on-warnings",
     "bmux_command_palette_plugin?/fail-on-warnings",
     "bmux_config/fail-on-warnings",
     "bmux_diagnostic_log/fail-on-warnings",
@@ -236,6 +240,7 @@ bundled-plugins = [
     "bundled-plugin-clients",
     "bundled-plugin-clipboard",
     "bundled-plugin-cluster",
+    "bundled-plugin-connections",
     "bundled-plugin-command-palette",
     "bundled-plugin-contexts",
     "bundled-plugin-control-catalog",
@@ -259,6 +264,7 @@ bundled-plugin-clients = ["dep:bmux_clients_plugin"]
 bundled-plugin-clipboard = ["dep:bmux_clipboard_plugin"]
 bundled-plugin-cluster = ["dep:bmux_cluster_plugin"]
 bundled-plugin-command-palette = ["dep:bmux_command_palette_plugin"]
+bundled-plugin-connections = ["dep:bmux_connections_plugin"]
 bundled-plugin-contexts = ["dep:bmux_contexts_plugin"]
 bundled-plugin-control-catalog = ["dep:bmux_control_catalog_plugin"]
 bundled-plugin-decoration = [

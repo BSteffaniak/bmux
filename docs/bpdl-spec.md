@@ -28,11 +28,15 @@ interface windows-events {
 ## Grammar (informal)
 
 ```
-schema     := plugin_header import* interface*
+schema     := plugin_header import* capability* interface*
 plugin_header
            := "plugin" dotted_ident "version" integer ";"
 import     := "import" ident "=" dotted_ident ";"
-interface  := "interface" ident "{" interface_item* "}"
+capability := "capability" ident "=" dotted_ident ";"
+interface  := interface_annotation* "interface" ident "{" interface_item* "}"
+interface_annotation
+           := "@capability" "(" ident ")"
+            | "@interface-version" "(" integer ")"
 
 interface_item
            := record | variant | enum | query | command | events
@@ -74,6 +78,22 @@ integer        := [0-9]+
 Identifiers use `kebab-case` (`pane-state`) or `snake_case`
 (`pane_state`). The Rust codegen normalizes `kebab-case` → `snake_case`
 for field/module names and to `PascalCase` for type/trait names.
+
+An interface's wire identifier defaults to its source name. Add
+`@interface-version(N)` when a stable service uses a slash-versioned wire ID:
+
+```bpdl
+@capability(CLUSTER_READ)
+@interface-version(1)
+interface cluster-query {
+    query list-clusters() -> list<string>;
+}
+```
+
+This generates the Rust module `cluster_query` and wire identifier
+`cluster-query/v1`. Versions must be positive `u32` integers. An interface may
+have at most one `@capability` and one `@interface-version` annotation; their
+order is not significant.
 
 ## Types
 

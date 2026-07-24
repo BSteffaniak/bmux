@@ -6,8 +6,10 @@ The crate contains BPDL schemas, generated service/client modules, stable wire t
 
 ## Interfaces
 
-- `cluster-query-v1` — cluster inventory and health queries
-- `cluster-command-v1` — current cluster startup and pane mutation commands
-- `cluster-connection-events-v1` — persisted connection lifecycle event queries
+- `cluster-query/v1` — cluster inventory and health queries
+- `cluster-command/v1` — current cluster startup and pane mutation commands
+- `cluster-connection-events/v1` — persisted connection lifecycle event queries
 
-The `-v1` suffix is part of the BPDL interface identifier. The cluster implementation temporarily accepts the legacy pre-BPDL `/v1` interface aliases during migration, but generated consumers use these canonical identifiers.
+The source interface names produce idiomatic generated modules while the BPDL
+`@interface-version(1)` annotation preserves the existing slash-versioned wire
+identifiers.

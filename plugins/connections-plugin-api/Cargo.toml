@@ -1,0 +1,33 @@
+[package]
+authors     = { workspace = true }
+categories  = ["network-programming", "development-tools"]
+description = "Typed public API of the bmux connections plugin (BPDL-generated bindings)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "api", "connections", "transport"]
+license     = { workspace = true }
+name        = "bmux_connections_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_codec                = { workspace = true }
+bmux_ipc                  = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+uuid                      = { workspace = true, features = ["serde", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[package.metadata.cargo-machete]
+# Referenced by BPDL-generated code hidden behind the schema proc macro.
+ignored = ["bmux_codec", "bmux_ipc", "bmux_plugin_sdk", "serde", "uuid"]
+
+[features]
+default = []
+fail-on-warnings = [
+    "bmux_ipc/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
