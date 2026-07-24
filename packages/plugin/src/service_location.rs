@@ -1,55 +1,111 @@
-//! Per-process map of plugin service locality.
+//! Per-process routing map for plugin services.
 //!
-//! Typed service calls between plugins need to resolve to the
-//! *activated* provider instance, which lives in whichever process ran
-//! that plugin's `activate` callback. In the canonical deployment the
-//! server process is the one that activates plugins. Other processes
-//! — an attach client, a standalone `bmux <command>` invocation — load
-//! the same plugin crates in order to dispatch commands locally, but
-//! they never call `activate`. If one of those processes invokes a
-//! plugin's typed service handler in-process, the handler finds no
-//! registered state and either returns an error or (in the worst case)
-//! panics.
+//! Typed service calls between plugins must resolve to the activated provider
+//! instance. A provider may be activated in this process or reachable through
+//! a domain-neutral endpoint. The compatibility endpoint is the current host
+//! kernel bridge used by attach and standalone CLI processes.
 //!
-//! The [`ServiceLocationMap`] records, for each plugin id, whether the
-//! current process holds the activated provider (`Local`) or must
-//! forward typed service calls elsewhere (`Remote`). Providers that
-//! are not registered at all are treated as unreachable; typed
-//! dispatch returns a structured error rather than synthesizing a
-//! local no-op provider.
-//!
-//! # Lifecycle
-//!
-//! 1. Server bootstrap calls [`ServiceLocationMap::mark_local`] for
-//!    every plugin it successfully activates.
-//! 2. Client-side bootstraps (attach / standalone CLI) call
-//!    [`ServiceLocationMap::mark_remote`] for every plugin that will
-//!    be reachable over IPC (typically every enabled plugin, since
-//!    the server activates all of them).
-//! 3. `loader::call_service_raw` consults the map before dispatching
-//!    a typed plugin-to-plugin call: `Local` stays in-process,
-//!    `Remote` forwards via the host kernel bridge as
-//!    `Request::InvokeService`, and absence yields
-//!    `PluginError::ServiceProviderUnreachable`.
-//!
-//! The map is keyed by plugin id string rather than `TypeId` so it can
-//! be populated from information available at load time, before any
-//! typed state structs exist.
+//! Providers that are not registered are left to the loader's legacy local
+//! fallback for pre-bootstrap and test paths.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 
-/// Where a plugin's service handlers actually live.
+/// Stable identifier for an endpoint capable of receiving typed service calls.
+///
+/// Endpoint IDs are opaque to the plugin runtime. The connections service owns
+/// target resolution and transport details.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServiceEndpoint(Arc<str>);
+
+impl ServiceEndpoint {
+    /// Identifier for the existing one-server host kernel bridge route.
+    pub const HOST_KERNEL_ID: &'static str = "host-kernel";
+
+    /// Construct an endpoint identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceEndpointError`] when `value` is empty, has surrounding
+    /// whitespace, or contains control characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, ServiceEndpointError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ServiceEndpointError::Empty);
+        }
+        if value.trim() != value {
+            return Err(ServiceEndpointError::SurroundingWhitespace);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ServiceEndpointError::ControlCharacter);
+        }
+        Ok(Self(Arc::from(value)))
+    }
+
+    /// The endpoint used by the existing host kernel bridge path.
+    #[must_use]
+    pub fn host_kernel() -> Self {
+        Self(Arc::from(Self::HOST_KERNEL_ID))
+    }
+
+    /// Borrow the opaque endpoint identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this is the compatibility host kernel bridge endpoint.
+    #[must_use]
+    pub fn is_host_kernel(&self) -> bool {
+        self.as_str() == Self::HOST_KERNEL_ID
+    }
+}
+
+impl fmt::Display for ServiceEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Why a service endpoint identifier was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceEndpointError {
+    /// Endpoint identifiers must not be empty.
+    Empty,
+    /// Endpoint identifiers are exact and cannot have surrounding whitespace.
+    SurroundingWhitespace,
+    /// Endpoint identifiers cannot contain control characters.
+    ControlCharacter,
+}
+
+impl fmt::Display for ServiceEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "service endpoint id cannot be empty",
+            Self::SurroundingWhitespace => {
+                "service endpoint id cannot contain surrounding whitespace"
+            }
+            Self::ControlCharacter => "service endpoint id cannot contain control characters",
+        })
+    }
+}
+
+impl std::error::Error for ServiceEndpointError {}
+
+/// Where a plugin's service handlers live.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceLocation {
     /// The current process activated this plugin; dispatch in-process.
     Local,
-    /// Another process activated this plugin; forward calls via the
-    /// host kernel bridge.
-    Remote,
+    /// Another endpoint activated this plugin; route calls to that endpoint.
+    Remote {
+        /// Opaque endpoint identity understood by connection plumbing.
+        endpoint: ServiceEndpoint,
+    },
 }
 
-/// Process-wide map of plugin id → [`ServiceLocation`].
+/// Process-wide map of plugin id to its service route.
 #[derive(Default, Debug)]
 pub struct ServiceLocationMap {
     entries: RwLock<HashMap<String, ServiceLocation>>,
@@ -77,40 +133,51 @@ impl ServiceLocationMap {
         guard.insert(plugin_id.to_string(), ServiceLocation::Local);
     }
 
-    /// Record that `plugin_id` lives in a different process and that
-    /// typed calls should be forwarded via the host kernel bridge.
+    /// Record that `plugin_id` is reachable through the compatibility host
+    /// kernel bridge endpoint.
     ///
-    /// Does not replace an existing `Local` entry — once a plugin is
-    /// known to be activated locally, it stays local. This lets
-    /// bootstraps mark a batch of plugins as remote without clobbering
-    /// the self-registration performed by the local activate path.
+    /// Does not replace an existing local route.
     ///
     /// # Panics
     ///
     /// Panics if the internal lock is poisoned.
     pub fn mark_remote(&self, plugin_id: &str) {
+        self.mark_remote_endpoint(plugin_id, ServiceEndpoint::host_kernel());
+    }
+
+    /// Record that `plugin_id` is reachable through `endpoint`.
+    ///
+    /// Replaces an existing remote route, allowing endpoint selection to be
+    /// updated, but never replaces an activated local provider.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn mark_remote_endpoint(&self, plugin_id: &str, endpoint: ServiceEndpoint) {
         let mut guard = self
             .entries
             .write()
             .expect("service location map lock poisoned");
-        guard
-            .entry(plugin_id.to_string())
-            .or_insert(ServiceLocation::Remote);
+        match guard.get(plugin_id) {
+            Some(ServiceLocation::Local) => {}
+            Some(ServiceLocation::Remote { .. }) | None => {
+                guard.insert(plugin_id.to_string(), ServiceLocation::Remote { endpoint });
+            }
+        }
     }
 
-    /// Look up the recorded location of `plugin_id`. Returns `None`
-    /// when no entry has been registered.
+    /// Look up the recorded route for `plugin_id`.
     ///
     /// # Panics
     ///
     /// Panics if the internal lock is poisoned.
     #[must_use]
     pub fn get(&self, plugin_id: &str) -> Option<ServiceLocation> {
-        let guard = self
-            .entries
+        self.entries
             .read()
-            .expect("service location map lock poisoned");
-        guard.get(plugin_id).copied()
+            .expect("service location map lock poisoned")
+            .get(plugin_id)
+            .cloned()
     }
 
     /// Remove every recorded entry. Test-only helper.
@@ -119,11 +186,10 @@ impl ServiceLocationMap {
     ///
     /// Panics if the internal lock is poisoned.
     pub fn clear(&self) {
-        let mut guard = self
-            .entries
+        self.entries
             .write()
-            .expect("service location map lock poisoned");
-        guard.clear();
+            .expect("service location map lock poisoned")
+            .clear();
     }
 
     /// Number of recorded entries.
@@ -151,10 +217,6 @@ impl ServiceLocationMap {
 }
 
 /// Process-wide shared [`ServiceLocationMap`] instance.
-///
-/// Typed service dispatch, server bootstrap, and client bootstrap all
-/// reference the same singleton so locality decisions stay consistent
-/// across crates.
 #[must_use]
 pub fn global_service_locations() -> Arc<ServiceLocationMap> {
     static GLOBAL: OnceLock<Arc<ServiceLocationMap>> = OnceLock::new();
@@ -165,8 +227,27 @@ pub fn global_service_locations() -> Arc<ServiceLocationMap> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceLocation, ServiceLocationMap, global_service_locations};
+    use super::{
+        ServiceEndpoint, ServiceEndpointError, ServiceLocation, ServiceLocationMap,
+        global_service_locations,
+    };
     use std::sync::Arc;
+
+    #[test]
+    fn endpoint_validation_preserves_opaque_identity() {
+        let endpoint = ServiceEndpoint::new("region-a/server-2").unwrap();
+        assert_eq!(endpoint.as_str(), "region-a/server-2");
+        assert!(!endpoint.is_host_kernel());
+        assert_eq!(ServiceEndpoint::new(""), Err(ServiceEndpointError::Empty));
+        assert_eq!(
+            ServiceEndpoint::new(" endpoint "),
+            Err(ServiceEndpointError::SurroundingWhitespace)
+        );
+        assert_eq!(
+            ServiceEndpoint::new("endpoint\n"),
+            Err(ServiceEndpointError::SurroundingWhitespace)
+        );
+    }
 
     #[test]
     fn mark_local_records_local_location() {
@@ -176,17 +257,35 @@ mod tests {
     }
 
     #[test]
-    fn mark_remote_records_remote_location_when_absent() {
+    fn mark_remote_uses_host_kernel_compatibility_endpoint() {
         let map = ServiceLocationMap::new();
         map.mark_remote("bmux.contexts");
-        assert_eq!(map.get("bmux.contexts"), Some(ServiceLocation::Remote));
+        assert_eq!(
+            map.get("bmux.contexts"),
+            Some(ServiceLocation::Remote {
+                endpoint: ServiceEndpoint::host_kernel()
+            })
+        );
     }
 
     #[test]
-    fn mark_remote_does_not_override_local() {
+    fn explicit_remote_endpoint_can_be_reselected() {
+        let map = ServiceLocationMap::new();
+        map.mark_remote_endpoint("bmux.contexts", ServiceEndpoint::new("endpoint-a").unwrap());
+        map.mark_remote_endpoint("bmux.contexts", ServiceEndpoint::new("endpoint-b").unwrap());
+        assert_eq!(
+            map.get("bmux.contexts"),
+            Some(ServiceLocation::Remote {
+                endpoint: ServiceEndpoint::new("endpoint-b").unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn remote_routes_do_not_override_local() {
         let map = ServiceLocationMap::new();
         map.mark_local("bmux.contexts");
-        map.mark_remote("bmux.contexts");
+        map.mark_remote_endpoint("bmux.contexts", ServiceEndpoint::new("endpoint-a").unwrap());
         assert_eq!(map.get("bmux.contexts"), Some(ServiceLocation::Local));
     }
 
@@ -214,7 +313,7 @@ mod tests {
             let map = Arc::clone(&map);
             handles.push(thread::spawn(move || {
                 for j in 0..500 {
-                    let id = format!("plugin-{}-{}", i, j % 16);
+                    let id = format!("plugin-{i}-{}", j % 16);
                     if j % 2 == 0 {
                         map.mark_local(&id);
                     } else {
@@ -224,8 +323,8 @@ mod tests {
                 }
             }));
         }
-        for h in handles {
-            h.join().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
         }
         assert!(!map.is_empty());
     }

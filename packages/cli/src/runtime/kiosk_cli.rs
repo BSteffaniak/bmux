@@ -783,10 +783,12 @@ mod tests {
             AttachRunOutcome {
                 status_code: 1,
                 exit_reason: AttachExitReason::StreamClosed,
+                resume: None,
             },
             AttachRunOutcome {
                 status_code: 0,
                 exit_reason: AttachExitReason::Detached,
+                resume: None,
             },
         ]);
 
@@ -810,6 +812,7 @@ mod tests {
         let mut runner = MockKioskAttachRunner::with_outcomes(vec![AttachRunOutcome {
             status_code: 7,
             exit_reason: AttachExitReason::StreamClosed,
+            resume: None,
         }]);
 
         let status = run_kiosk_attach_with_reconnect_loop(&mut runner, None, true, None)

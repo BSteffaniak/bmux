@@ -370,8 +370,24 @@ impl HostKernelBridge {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKernelBridgeRequest {
+    /// Opaque invocation identity used to replay an oversized response without
+    /// re-executing a side-effecting host operation.
+    #[serde(default)]
+    pub invocation_id: u64,
     #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
+}
+
+impl HostKernelBridgeRequest {
+    #[must_use]
+    pub fn new(payload: Vec<u8>) -> Self {
+        static NEXT_INVOCATION_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        Self {
+            invocation_id: NEXT_INVOCATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            payload,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,13 +599,36 @@ mod tests {
 
     #[test]
     fn host_kernel_bridge_request_preserves_raw_payload_bytes() {
-        let request = HostKernelBridgeRequest {
-            payload: vec![0, 1, 2, 13, 14, 17, 255],
-        };
+        let request = HostKernelBridgeRequest::new(vec![0, 1, 2, 13, 14, 17, 255]);
         let encoded = super::encode_service_message(&request).expect("request should encode");
         let decoded: HostKernelBridgeRequest =
             super::decode_service_message(&encoded).expect("request should decode");
+        assert_ne!(request.invocation_id, 0);
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn host_kernel_bridge_request_decodes_legacy_envelope_without_invocation_id() {
+        #[derive(serde::Serialize)]
+        struct LegacyRequest {
+            #[serde(with = "bmux_codec::serde_bytes_vec")]
+            payload: Vec<u8>,
+        }
+        let encoded = super::encode_service_message(&LegacyRequest {
+            payload: vec![1, 2, 3],
+        })
+        .expect("legacy request should encode");
+        let decoded: HostKernelBridgeRequest =
+            super::decode_service_message(&encoded).expect("legacy request should decode");
+        assert_eq!(decoded.invocation_id, 0);
+        assert_eq!(decoded.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn host_kernel_bridge_request_ids_are_unique() {
+        let first = HostKernelBridgeRequest::new(Vec::new());
+        let second = HostKernelBridgeRequest::new(Vec::new());
+        assert_ne!(first.invocation_id, second.invocation_id);
     }
 
     #[test]
@@ -611,9 +650,7 @@ mod tests {
         );
         let command_payload = encode_host_kernel_bridge_cli_command_payload(&command)
             .expect("command payload should encode");
-        let bridge_request = HostKernelBridgeRequest {
-            payload: command_payload,
-        };
+        let bridge_request = HostKernelBridgeRequest::new(command_payload);
         let encoded =
             super::encode_service_message(&bridge_request).expect("bridge request should encode");
         let decoded: HostKernelBridgeRequest =

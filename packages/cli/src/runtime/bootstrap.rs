@@ -744,6 +744,15 @@ pub(super) async fn run_session_attach(
         global,
         "attach.bootstrap.explicit_start"
     );
+    let provider = super::attach::provider::resolve(target)?;
+    if !provider.requires_fallback_client() {
+        let session = provider.open(None, None).await?;
+        return super::attach::runtime::run_session_attach_with_provider_session(
+            session, target, follow, global, None,
+        )
+        .await
+        .map(|outcome| outcome.status_code);
+    }
     let client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-attach",

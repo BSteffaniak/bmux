@@ -2210,6 +2210,15 @@ mod tests {
     use std::fs;
     use uuid::Uuid;
 
+    #[cfg(not(feature = "bundled-plugin-cluster"))]
+    #[test]
+    fn no_cluster_build_keeps_baseline_plugins_without_cluster_registration() {
+        let dirs = static_bundled_workspace_plugin_dirs();
+        assert!(!dirs.contains(&"cluster-plugin"));
+        assert!(dirs.contains(&"sessions-plugin"));
+        assert!(dirs.contains(&"pane-runtime-plugin"));
+    }
+
     #[test]
     fn workspace_plugin_discovery_is_debug_only() {
         assert_eq!(

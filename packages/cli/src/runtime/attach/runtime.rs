@@ -21,7 +21,11 @@ use bmux_attach_pipeline::{
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
-    AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
+    AttachContinuityValidator, AttachControlValidator, AttachInputPayload, AttachLayoutState,
+    AttachMouseButton as ProviderMouseButton, AttachMouseInput as ProviderMouseInput,
+    AttachMousePhase as ProviderMousePhase, AttachPaneSnapshotState, AttachProviderBackend,
+    AttachProviderChange, AttachProviderEvent, AttachProviderInput, AttachProviderSnapshot,
+    AttachProviderViewport, AttachSession, AttachSnapshotState, AttachStreamCursor, ClientError,
     StreamingBmuxClient,
 };
 use bmux_config::{
@@ -2550,16 +2554,385 @@ pub async fn run_session_attach_with_client(
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
 ) -> Result<AttachRunOutcome> {
-    let mut terminal = RealAttachTerminal::new();
-    run_session_attach_with_terminal(
-        client,
-        target,
-        follow,
-        global,
-        kernel_client_factory,
-        &mut terminal,
-    )
-    .await
+    let provider = super::provider::resolve(target)?;
+    let session = provider.open(None, Some(client)).await?;
+    run_session_attach_with_provider_session(session, target, follow, global, kernel_client_factory)
+        .await
+}
+
+pub async fn run_session_attach_with_provider_session(
+    session: bmux_client::AttachProviderSession,
+    original_target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+) -> Result<AttachRunOutcome> {
+    let effective_target = session.target.as_deref().or(original_target);
+    match session.backend {
+        AttachProviderBackend::Legacy(client) => {
+            let mut terminal = RealAttachTerminal::new();
+            run_session_attach_with_terminal(
+                client,
+                effective_target,
+                follow,
+                global,
+                kernel_client_factory,
+                &mut terminal,
+            )
+            .await
+        }
+        AttachProviderBackend::Session(provider_session) => {
+            let mut terminal = RealAttachTerminal::new();
+            run_native_attach_session_with_terminal(provider_session, &mut terminal).await
+        }
+    }
+}
+
+pub async fn run_native_attach_session_with_terminal<T: AttachTerminal + ?Sized>(
+    mut session: Box<dyn AttachSession>,
+    terminal: &mut T,
+) -> Result<AttachRunOutcome> {
+    let mut continuity = AttachContinuityValidator::default();
+    let mut controls = AttachControlValidator::default();
+    let snapshot = session
+        .initial_snapshot()
+        .await
+        .map_err(|error| anyhow::anyhow!("attach provider snapshot failed: {error}"))?;
+    continuity
+        .apply_snapshot(&snapshot)
+        .map_err(|error| anyhow::anyhow!("invalid attach provider snapshot: {error}"))?;
+
+    let keyboard_enhanced = terminal.enter_attach_mode(true, true, true)?;
+    let mut focused_stream = focused_provider_stream(&snapshot);
+    write_provider_snapshot(terminal, &snapshot)?;
+    let geometry = terminal.geometry();
+    let mut command_sequence = 1_u64;
+    let viewport = AttachProviderViewport {
+        command_sequence,
+        columns: geometry.cols,
+        rows: geometry.rows,
+        pixel_width: None,
+        pixel_height: None,
+    };
+    controls
+        .validate_viewport(&viewport)
+        .map_err(|error| anyhow::anyhow!("invalid initial viewport: {error}"))?;
+    let ack = session
+        .update_viewport(viewport)
+        .await
+        .map_err(|error| anyhow::anyhow!("attach provider viewport failed: {error}"))?;
+    ensure_provider_ack("viewport", &ack)?;
+
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            event = session.next_event() => {
+                let event = event.map_err(|error| anyhow::anyhow!("attach provider event failed: {error}"))?;
+                if let Some(event_outcome) = handle_native_provider_event(
+                    terminal,
+                    &mut continuity,
+                    &mut focused_stream,
+                    event,
+                )? {
+                    break event_outcome;
+                }
+            }
+            event = terminal.next_event() => {
+                let Some(event) = event? else {
+                    break AttachRunOutcome {
+                        status_code: 0,
+                        exit_reason: AttachExitReason::Quit,
+                        resume: None,
+                    };
+                };
+                command_sequence = command_sequence.saturating_add(1);
+                handle_native_provider_terminal_event(
+                    session.as_mut(),
+                    &continuity,
+                    &mut controls,
+                    focused_stream.as_ref(),
+                    command_sequence,
+                    keyboard_enhanced,
+                    event,
+                ).await?;
+            }
+        }
+    };
+
+    let detach_result = session.detach().await;
+    let _ = controls.detach();
+    terminal.restore_after_attach_ui()?;
+    if let Err(error) = detach_result
+        && outcome.exit_reason != AttachExitReason::StreamClosed
+    {
+        return Err(anyhow::anyhow!("attach provider detach failed: {error}"));
+    }
+    Ok(outcome)
+}
+
+fn handle_native_provider_event(
+    terminal: &mut (impl AttachTerminal + ?Sized),
+    continuity: &mut AttachContinuityValidator,
+    focused_stream: &mut Option<AttachStreamCursor>,
+    event: AttachProviderEvent,
+) -> Result<Option<AttachRunOutcome>> {
+    match event {
+        AttachProviderEvent::Delta(delta) => {
+            continuity
+                .apply_delta(&delta)
+                .map_err(|error| anyhow::anyhow!("invalid attach provider delta: {error}"))?;
+            apply_provider_delta(terminal, &delta)?;
+            if let Some(scene) = delta.changes.iter().find_map(|change| {
+                if let AttachProviderChange::Scene(scene) = change {
+                    Some(scene)
+                } else {
+                    None
+                }
+            }) {
+                *focused_stream =
+                    focused_provider_stream_for_scene(scene, &continuity.resume_state().streams);
+            }
+            Ok(None)
+        }
+        AttachProviderEvent::Disconnected(disconnect) => {
+            let resume = if disconnect.recoverable {
+                let validated = continuity.resume_state();
+                if let Some(candidate) = disconnect.resume {
+                    if candidate != validated {
+                        anyhow::bail!(
+                            "attach provider disconnect resume state did not match validated state"
+                        );
+                    }
+                    Some(candidate)
+                } else {
+                    Some(validated)
+                }
+            } else {
+                None
+            };
+            Ok(Some(AttachRunOutcome {
+                status_code: u8::from(!disconnect.recoverable),
+                exit_reason: AttachExitReason::StreamClosed,
+                resume,
+            }))
+        }
+        AttachProviderEvent::Detached => Ok(Some(AttachRunOutcome {
+            status_code: 0,
+            exit_reason: AttachExitReason::Detached,
+            resume: None,
+        })),
+    }
+}
+
+fn write_provider_snapshot(
+    terminal: &mut (impl AttachTerminal + ?Sized),
+    snapshot: &AttachProviderSnapshot,
+) -> Result<()> {
+    for stream in &snapshot.streams {
+        terminal.write_all(&stream.snapshot)?;
+    }
+    terminal.flush()?;
+    Ok(())
+}
+
+fn apply_provider_delta(
+    terminal: &mut (impl AttachTerminal + ?Sized),
+    delta: &bmux_client::AttachProviderDelta,
+) -> Result<()> {
+    for change in &delta.changes {
+        match change {
+            AttachProviderChange::StreamAppend { bytes, .. } => terminal.write_all(bytes)?,
+            AttachProviderChange::StreamRepair(snapshot) => {
+                terminal.write_all(&snapshot.snapshot)?;
+            }
+            AttachProviderChange::Status { message } => {
+                writeln!(terminal, "\r\n{message}")?;
+            }
+            AttachProviderChange::Scene(_) | AttachProviderChange::StreamRemoved { .. } => {}
+        }
+    }
+    terminal.flush()?;
+    Ok(())
+}
+
+fn focused_provider_stream(snapshot: &AttachProviderSnapshot) -> Option<AttachStreamCursor> {
+    focused_provider_stream_for_scene(&snapshot.scene, &snapshot.resume.streams)
+}
+
+fn focused_provider_stream_for_scene(
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    streams: &[AttachStreamCursor],
+) -> Option<AttachStreamCursor> {
+    let surface_id = match scene.focus {
+        bmux_attach_layout_protocol::AttachFocusTarget::Pane { pane_id } => pane_id,
+        bmux_attach_layout_protocol::AttachFocusTarget::Surface { surface_id } => surface_id,
+        bmux_attach_layout_protocol::AttachFocusTarget::None => return None,
+    };
+    streams
+        .iter()
+        .find(|cursor| cursor.surface_id == surface_id)
+        .cloned()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_native_provider_terminal_event(
+    session: &mut dyn AttachSession,
+    continuity: &AttachContinuityValidator,
+    controls: &mut AttachControlValidator,
+    focused_stream: Option<&AttachStreamCursor>,
+    command_sequence: u64,
+    keyboard_enhanced: bool,
+    event: Event,
+) -> Result<()> {
+    match event {
+        Event::Resize(columns, rows) => {
+            let viewport = AttachProviderViewport {
+                command_sequence,
+                columns,
+                rows,
+                pixel_width: None,
+                pixel_height: None,
+            };
+            controls
+                .validate_viewport(&viewport)
+                .map_err(anyhow::Error::from)?;
+            let ack = session
+                .update_viewport(viewport)
+                .await
+                .map_err(anyhow::Error::from)?;
+            ensure_provider_ack("viewport", &ack)?;
+        }
+        Event::Paste(text) => {
+            send_native_provider_input(
+                session,
+                continuity,
+                controls,
+                focused_stream,
+                command_sequence,
+                AttachInputPayload::Paste(text.into_bytes()),
+            )
+            .await?;
+        }
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            if let Some(stroke) = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&key)
+                && let Some(bytes) = bmux_keyboard::encode::encode_key(&stroke, keyboard_enhanced)
+            {
+                send_native_provider_input(
+                    session,
+                    continuity,
+                    controls,
+                    focused_stream,
+                    command_sequence,
+                    AttachInputPayload::Bytes(bytes),
+                )
+                .await?;
+            }
+        }
+        Event::Mouse(mouse) => {
+            let (button, phase) = provider_mouse_event(mouse.kind);
+            send_native_provider_input(
+                session,
+                continuity,
+                controls,
+                focused_stream,
+                command_sequence,
+                AttachInputPayload::Mouse(ProviderMouseInput {
+                    x: mouse.column,
+                    y: mouse.row,
+                    button,
+                    phase,
+                    modifiers: provider_modifier_bits(mouse.modifiers),
+                }),
+            )
+            .await?;
+        }
+        Event::FocusGained | Event::FocusLost | Event::Key(_) => {}
+    }
+    Ok(())
+}
+
+async fn send_native_provider_input(
+    session: &mut dyn AttachSession,
+    continuity: &AttachContinuityValidator,
+    controls: &mut AttachControlValidator,
+    focused_stream: Option<&AttachStreamCursor>,
+    command_sequence: u64,
+    payload: AttachInputPayload,
+) -> Result<()> {
+    let stream =
+        focused_stream.ok_or_else(|| anyhow::anyhow!("attach provider has no focused stream"))?;
+    let input = AttachProviderInput {
+        command_sequence,
+        stream_id: stream.stream_id.clone(),
+        generation: stream.generation,
+        payload,
+    };
+    controls
+        .validate_input(&input, continuity)
+        .map_err(anyhow::Error::from)?;
+    let ack = session
+        .send_input(input)
+        .await
+        .map_err(anyhow::Error::from)?;
+    ensure_provider_ack("input", &ack)
+}
+
+#[cfg(test)]
+pub async fn execute_native_provider_action(
+    session: &mut dyn AttachSession,
+    controls: &mut AttachControlValidator,
+    action: bmux_client::AttachProviderAction,
+) -> Result<()> {
+    controls
+        .validate_action(&action)
+        .map_err(anyhow::Error::from)?;
+    let ack = session
+        .execute_action(action)
+        .await
+        .map_err(anyhow::Error::from)?;
+    ensure_provider_ack("action", &ack)
+}
+
+fn ensure_provider_ack(operation: &str, ack: &bmux_client::AttachProviderAck) -> Result<()> {
+    if ack.accepted {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "attach provider rejected {operation}: {}",
+            ack.message.as_deref().unwrap_or("no reason provided")
+        )
+    }
+}
+
+const fn provider_mouse_event(kind: MouseEventKind) -> (ProviderMouseButton, ProviderMousePhase) {
+    match kind {
+        MouseEventKind::Down(button) => (provider_mouse_button(button), ProviderMousePhase::Press),
+        MouseEventKind::Up(button) => (provider_mouse_button(button), ProviderMousePhase::Release),
+        MouseEventKind::Drag(button) => (provider_mouse_button(button), ProviderMousePhase::Drag),
+        MouseEventKind::Moved => (ProviderMouseButton::None, ProviderMousePhase::Move),
+        MouseEventKind::ScrollUp => (ProviderMouseButton::WheelUp, ProviderMousePhase::Scroll),
+        MouseEventKind::ScrollDown => (ProviderMouseButton::WheelDown, ProviderMousePhase::Scroll),
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+            (ProviderMouseButton::None, ProviderMousePhase::Scroll)
+        }
+    }
+}
+
+const fn provider_mouse_button(button: MouseButton) -> ProviderMouseButton {
+    match button {
+        MouseButton::Left => ProviderMouseButton::Left,
+        MouseButton::Middle => ProviderMouseButton::Middle,
+        MouseButton::Right => ProviderMouseButton::Right,
+    }
+}
+
+const fn provider_modifier_bits(modifiers: KeyModifiers) -> u8 {
+    (modifiers.contains(KeyModifiers::SHIFT) as u8)
+        | ((modifiers.contains(KeyModifiers::CONTROL) as u8) << 1)
+        | ((modifiers.contains(KeyModifiers::ALT) as u8) << 2)
+        | ((modifiers.contains(KeyModifiers::SUPER) as u8) << 3)
+        | ((modifiers.contains(KeyModifiers::HYPER) as u8) << 4)
+        | ((modifiers.contains(KeyModifiers::META) as u8) << 5)
 }
 
 #[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
@@ -3822,6 +4195,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     Ok(AttachRunOutcome {
         status_code: 0,
         exit_reason,
+        resume: None,
     })
 }
 
@@ -4429,10 +4803,11 @@ const fn plugin_attach_view_component(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachRunOutcome {
     pub status_code: u8,
     pub exit_reason: AttachExitReason,
+    pub resume: Option<bmux_client::AttachResumeState>,
 }
 
 /// Apply a plugin-command outcome against the attach view state.

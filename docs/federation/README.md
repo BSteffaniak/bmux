@@ -4,28 +4,28 @@ This directory contains the accepted architecture decisions for native bmux serv
 
 ## Decision set
 
-| ADR | Subject | Status |
-|---|---|---|
-| [ADR-0001](adr-0001-federated-workspace-model.md) | Federated workspace and user-visible model | Accepted |
-| [ADR-0002](adr-0002-consistency-quorum-leases.md) | Consistency, quorum, leader forwarding, leases, and fencing | Accepted |
-| [ADR-0003](adr-0003-logical-execution-identity.md) | Logical/execution identity, generations, and idempotency | Accepted |
-| [ADR-0004](adr-0004-worker-loss-and-restart.md) | Worker loss, recovery, replacement, and restart policy | Accepted |
-| [ADR-0005](adr-0005-attach-resume-and-output-repair.md) | Attach resume, output cursors, and snapshot repair | Accepted |
-| [ADR-0006](adr-0006-trusted-domain-security.md) | Trusted-domain membership, delegation, and authorization | Accepted |
-| [ADR-0007](adr-0007-protocol-compatibility-and-upgrades.md) | Protocol compatibility and rolling upgrades | Accepted |
-| [ADR-0008](adr-0008-reliability-and-performance-budgets.md) | Reliability and performance budgets | Accepted |
+| ADR                                                         | Subject                                                     | Status   |
+| ----------------------------------------------------------- | ----------------------------------------------------------- | -------- |
+| [ADR-0001](adr-0001-federated-workspace-model.md)           | Federated workspace and user-visible model                  | Accepted |
+| [ADR-0002](adr-0002-consistency-quorum-leases.md)           | Consistency, quorum, leader forwarding, leases, and fencing | Accepted |
+| [ADR-0003](adr-0003-logical-execution-identity.md)          | Logical/execution identity, generations, and idempotency    | Accepted |
+| [ADR-0004](adr-0004-worker-loss-and-restart.md)             | Worker loss, recovery, replacement, and restart policy      | Accepted |
+| [ADR-0005](adr-0005-attach-resume-and-output-repair.md)     | Attach resume, output cursors, and snapshot repair          | Accepted |
+| [ADR-0006](adr-0006-trusted-domain-security.md)             | Trusted-domain membership, delegation, and authorization    | Accepted |
+| [ADR-0007](adr-0007-protocol-compatibility-and-upgrades.md) | Protocol compatibility and rolling upgrades                 | Accepted |
+| [ADR-0008](adr-0008-reliability-and-performance-budgets.md) | Reliability and performance budgets                         | Accepted |
 
 ## Global invariants
 
-1. A federated workspace is one logical workspace even when its pane executions are distributed across workers.
-2. Logical identity is independent of ingress, leader, worker, and worker-local runtime identity.
-3. Control metadata is quorum replicated; terminal input/output and full terminal state are not written to the consensus log.
-4. A minority partition cannot commit control mutations.
-5. Gateway or leader loss does not imply worker process loss.
-6. A worker accepts mutations only for the current execution generation and valid fencing authority.
-7. Duplicate delivery of the same command ID has one logical outcome.
-8. Worker loss degrades safely; replacement is explicit or allowed by durable pane policy.
-9. Existing local sessions enter federation only through explicit promotion.
+01. A federated workspace is one logical workspace even when its pane executions are distributed across workers.
+02. Logical identity is independent of ingress, leader, worker, and worker-local runtime identity.
+03. Control metadata is quorum replicated; terminal input/output and full terminal state are not written to the consensus log.
+04. A minority partition cannot commit control mutations.
+05. Gateway or leader loss does not imply worker process loss.
+06. A worker accepts mutations only for the current execution generation and valid fencing authority.
+07. Duplicate delivery of the same command ID has one logical outcome.
+08. Worker loss degrades safely; replacement is explicit or allowed by durable pane policy.
+09. Existing local sessions enter federation only through explicit promotion.
 10. Local single-server behavior remains available when federation is absent or disabled.
 11. Cluster-domain behavior remains in cluster plugins. Core crates expose generic transport, typed-dispatch, attach-provider, and protocol primitives only.
 

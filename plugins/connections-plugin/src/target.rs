@@ -391,6 +391,24 @@ fn invalid(target: &str, reason: &str) -> ConnectionError {
     }
 }
 
+fn file_identity(path: Option<&std::path::Path>) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    match std::fs::read(path) {
+        Ok(contents) => format!("{}:{:016x}", path.display(), stable_bytes_hash(&contents)),
+        Err(error) => format!("{}:unreadable:{:?}", path.display(), error.kind()),
+    }
+}
+
+fn stable_bytes_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a is sufficient for cache invalidation; this is not a security
+    // decision or certificate verification primitive.
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 impl ResolvedTarget {
     pub fn reference(&self) -> &str {
         match self {
@@ -401,9 +419,52 @@ impl ResolvedTarget {
         }
     }
 
+    /// Private identity for connection reuse. Unlike the public reference,
+    /// this includes resolved transport and security-relevant configuration so
+    /// aliases or separate runtime roots cannot share the wrong connection.
+    pub fn connection_identity(&self, config: &BmuxConfig, paths: &ConfigPaths) -> String {
+        match self {
+            Self::Local { .. } => format!("local:{}", paths.server_socket().display()),
+            Self::Ssh(target) => format!(
+                "ssh:{}@{}:{}|identity={}|known_hosts={}|strict={}|jump={}|path={}",
+                target.user.as_deref().unwrap_or(""),
+                target.host,
+                target.port.unwrap_or(22),
+                file_identity(target.identity_file.as_deref()),
+                file_identity(target.known_hosts_file.as_deref()),
+                target.strict_host_key_checking,
+                target.jump.as_deref().unwrap_or(""),
+                target.remote_bmux_path,
+            ),
+            Self::Tls(target) => format!(
+                "tls:{}:{}|server_name={}|ca={}|trust_mode={:?}|declared_pin={}|local_pins={}",
+                target.host,
+                target.port,
+                target.server_name,
+                file_identity(target.ca_file.as_deref()),
+                config.connections.tls_trust.mode,
+                config
+                    .connections
+                    .tls_trust
+                    .known_gateways
+                    .get(&format!("{}:{}", target.host.trim(), target.port))
+                    .map_or("", |entry| entry.fingerprint_sha256.as_str()),
+                file_identity(Some(&paths.known_gateways_file())),
+            ),
+            Self::Iroh(target) => format!(
+                "iroh:{}|relay={}|ssh_auth={}|compression={:?}",
+                target.endpoint_id,
+                target.relay_url.as_deref().unwrap_or(""),
+                target.require_ssh_auth,
+                target.compression,
+            ),
+        }
+    }
+
     fn public(&self) -> ResolvedEndpoint {
         match self {
             Self::Local { reference } => ResolvedEndpoint {
+                endpoint_id: reference.clone(),
                 reference: reference.clone(),
                 label: "local".to_string(),
                 transport: ApiTransport::Local,
@@ -412,6 +473,7 @@ impl ResolvedTarget {
                 connect_timeout_ms: 0,
             },
             Self::Ssh(target) => ResolvedEndpoint {
+                endpoint_id: target.reference.clone(),
                 reference: target.reference.clone(),
                 label: target.label.clone(),
                 transport: ApiTransport::Ssh,
@@ -420,6 +482,7 @@ impl ResolvedTarget {
                 connect_timeout_ms: target.connect_timeout_ms,
             },
             Self::Tls(target) => ResolvedEndpoint {
+                endpoint_id: target.reference.clone(),
                 reference: target.reference.clone(),
                 label: target.label.clone(),
                 transport: ApiTransport::Tls,
@@ -428,6 +491,7 @@ impl ResolvedTarget {
                 connect_timeout_ms: target.connect_timeout_ms,
             },
             Self::Iroh(target) => ResolvedEndpoint {
+                endpoint_id: target.reference.clone(),
                 reference: target.reference.clone(),
                 label: target.label.clone(),
                 transport: ApiTransport::Iroh,

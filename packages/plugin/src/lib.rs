@@ -81,7 +81,10 @@ pub use render::{
     register_visual_adapter, registered_render_extensions, registered_visual_adapter,
     render_char_display_width_u16, render_single_display_cell_char, render_text_width_u16,
 };
-pub use service_location::{ServiceLocation, ServiceLocationMap, global_service_locations};
+pub use service_location::{
+    ServiceEndpoint, ServiceEndpointError, ServiceLocation, ServiceLocationMap,
+    global_service_locations,
+};
 pub use startup_gate::{
     StartupReadyGate, StartupReadyGateRegistry, global_startup_ready_gate_registry,
     register_startup_ready_gate, registered_startup_ready_gates,

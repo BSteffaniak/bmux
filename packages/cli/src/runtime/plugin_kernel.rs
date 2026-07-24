@@ -40,6 +40,7 @@ thread_local! {
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
     static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
     static HOST_KERNEL_CLIENT_FACTORY: RefCell<Option<KernelClientFactory>> = const { RefCell::new(None) };
+    static HOST_KERNEL_RESPONSE_REPLAY: RefCell<Option<(u64, Vec<u8>)>> = const { RefCell::new(None) };
 }
 
 static HOST_KERNEL_CONNECTION_FALLBACK: OnceLock<Mutex<Option<HostConnectionInfo>>> =
@@ -268,6 +269,38 @@ fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+fn write_host_kernel_bridge_response(
+    invocation_id: u64,
+    encoded: Vec<u8>,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if invocation_id != 0 && (output_ptr.is_null() || encoded.len() > output_capacity) {
+        HOST_KERNEL_RESPONSE_REPLAY.with(|cache| {
+            *cache.borrow_mut() = Some((invocation_id, encoded));
+        });
+        return 4;
+    }
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return 4;
+    }
+    if invocation_id != 0 {
+        HOST_KERNEL_RESPONSE_REPLAY.with(|cache| {
+            if cache.borrow().as_ref().map(|(id, _)| *id) == Some(invocation_id) {
+                cache.borrow_mut().take();
+            }
+        });
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    0
+}
+
 pub(super) unsafe extern "C" fn host_kernel_bridge(
     input_ptr: *const u8,
     input_len: usize,
@@ -286,6 +319,22 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             Err(_) => return 3,
         };
 
+    if let Some(encoded) = HOST_KERNEL_RESPONSE_REPLAY.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(id, _)| *id == request.invocation_id)
+            .map(|(_, encoded)| encoded.clone())
+    }) {
+        return write_host_kernel_bridge_response(
+            request.invocation_id,
+            encoded,
+            output_ptr,
+            output_capacity,
+            output_len,
+        );
+    }
+
     if let Ok(Some(command_request)) =
         bmux_plugin_sdk::decode_host_kernel_bridge_cli_command_payload(&request.payload)
     {
@@ -301,16 +350,13 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             return 5;
         };
 
-        unsafe {
-            *output_len = encoded.len();
-        }
-        if output_ptr.is_null() || encoded.len() > output_capacity {
-            return 4;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-        }
-        return 0;
+        return write_host_kernel_bridge_response(
+            request.invocation_id,
+            encoded,
+            output_ptr,
+            output_capacity,
+            output_len,
+        );
     }
 
     if let Ok(Some(command_request)) =
@@ -328,16 +374,13 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             return 5;
         };
 
-        unsafe {
-            *output_len = encoded.len();
-        }
-        if output_ptr.is_null() || encoded.len() > output_capacity {
-            return 4;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-        }
-        return 0;
+        return write_host_kernel_bridge_response(
+            request.invocation_id,
+            encoded,
+            output_ptr,
+            output_capacity,
+            output_len,
+        );
     }
 
     let response = match call_host_kernel_bridge_payload(&request.payload) {
@@ -349,16 +392,13 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         return 5;
     };
 
-    unsafe {
-        *output_len = encoded.len();
-    }
-    if output_ptr.is_null() || encoded.len() > output_capacity {
-        return 4;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-    }
-    0
+    write_host_kernel_bridge_response(
+        request.invocation_id,
+        encoded,
+        output_ptr,
+        output_capacity,
+        output_len,
+    )
 }
 
 fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -> Result<i32> {
@@ -845,6 +885,50 @@ mod tests {
             data_dir: format!("/{label}/data"),
             state_dir: format!("/{label}/state"),
         }
+    }
+
+    #[test]
+    fn host_kernel_response_replay_returns_oversized_response_without_reexecution() {
+        HOST_KERNEL_RESPONSE_REPLAY.with(|cache| cache.borrow_mut().take());
+        let invocation_id = 42;
+        let encoded = vec![7_u8; 2_048];
+        let mut required = 0;
+        let mut small = vec![0_u8; 32];
+        assert_eq!(
+            write_host_kernel_bridge_response(
+                invocation_id,
+                encoded.clone(),
+                small.as_mut_ptr(),
+                small.len(),
+                &raw mut required,
+            ),
+            4
+        );
+        assert_eq!(required, encoded.len());
+        let cached = HOST_KERNEL_RESPONSE_REPLAY
+            .with(|cache| {
+                cache
+                    .borrow()
+                    .as_ref()
+                    .filter(|(id, _)| *id == invocation_id)
+                    .map(|(_, encoded)| encoded.clone())
+            })
+            .expect("response should be cached");
+        assert_eq!(cached, encoded);
+
+        let mut output = vec![0_u8; required];
+        assert_eq!(
+            write_host_kernel_bridge_response(
+                invocation_id,
+                cached,
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut required,
+            ),
+            0
+        );
+        assert_eq!(output, encoded);
+        assert!(HOST_KERNEL_RESPONSE_REPLAY.with(|cache| cache.borrow().is_none()));
     }
 
     #[test]

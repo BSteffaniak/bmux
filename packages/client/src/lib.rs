@@ -4,6 +4,30 @@
 
 //! Client component for bmux terminal multiplexer.
 
+mod attach_provider;
+mod attach_session;
+mod connection_pool;
+
+pub use attach_provider::{
+    AttachProvider, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
+    AttachProviderRegistration, AttachProviderRegistrationError, AttachProviderRegistry,
+    AttachProviderResolutionError, AttachProviderSession, AttachTarget, ResolvedAttachTarget,
+    global_attach_provider_registry,
+};
+
+pub use attach_session::{
+    AttachContinuityValidator, AttachControlValidator, AttachDeltaSequence, AttachDetachOutcome,
+    AttachInputPayload, AttachMouseButton, AttachMouseInput, AttachMousePhase, AttachProviderAck,
+    AttachProviderAction, AttachProviderChange, AttachProviderDelta, AttachProviderDisconnect,
+    AttachProviderEvent, AttachProviderInput, AttachProviderSnapshot, AttachProviderViewport,
+    AttachResumeState, AttachSession, AttachSessionError, AttachSessionFuture, AttachStreamCursor,
+    AttachStreamId, AttachStreamSnapshot, AttachViewRevision,
+};
+pub use connection_pool::{
+    ConnectionPoolAcquireError, ConnectionPoolConfigError, ConnectionPoolLimits,
+    DedicatedEndpointConnection, EndpointConnectionLease, EndpointConnectionPool,
+};
+
 use bmux_attach_image_protocol::CompressionId;
 use bmux_attach_layout_protocol::{
     AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneLayoutNode,
@@ -1674,7 +1698,8 @@ fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BmuxClient, ClientStream, ConfigPaths, StreamingBmuxClient, load_or_create_principal_id,
+        BmuxClient, ClientStream, ConfigPaths, ConnectionPoolAcquireError, ConnectionPoolLimits,
+        EndpointConnectionPool, StreamingBmuxClient, load_or_create_principal_id,
     };
     use bmux_ipc::transport::ErasedIpcStream;
     use std::fs;
@@ -1719,6 +1744,53 @@ mod tests {
         fs::write(&path, "not-a-uuid").expect("principal file should be written");
         let error = load_or_create_principal_id(&paths).expect_err("invalid principal should fail");
         assert!(error.to_string().contains("invalid principal id"));
+    }
+
+    #[tokio::test]
+    async fn pooled_client_streaming_upgrade_holds_admission_until_drop() {
+        let pool = EndpointConnectionPool::new(ConnectionPoolLimits {
+            max_connections: 1,
+            max_connections_per_endpoint: 1,
+            max_idle_per_endpoint: 1,
+        })
+        .expect("valid pool limits");
+        let principal_id = Uuid::new_v4();
+        let stream = pool
+            .acquire(
+                "synthetic",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                || async move {
+                    let (bridge_stream, _peer_stream) = tokio::io::duplex(8 * 1024);
+                    Ok::<_, std::convert::Infallible>(BmuxClient {
+                        stream: ClientStream::Bridge(ErasedIpcStream::new(Box::new(bridge_stream))),
+                        timeout: Duration::from_millis(500),
+                        next_request_id: 1,
+                        principal_id,
+                        negotiated_protocol: None,
+                    })
+                },
+            )
+            .await
+            .expect("pooled client")
+            .into_streaming()
+            .expect("streaming conversion");
+        assert_eq!(stream.principal_id(), principal_id);
+        assert_eq!(pool.counts(), (1, 1, 0));
+
+        let error = pool
+            .acquire(
+                "synthetic",
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                || async { unreachable!("saturated pool must not connect") },
+            )
+            .await
+            .expect_err("streaming lease should apply backpressure");
+        assert!(matches!(
+            error,
+            ConnectionPoolAcquireError::<std::convert::Infallible>::AdmissionTimedOut
+        ));
+        drop(stream);
+        assert_eq!(pool.counts(), (0, 0, 0));
     }
 
     #[tokio::test]

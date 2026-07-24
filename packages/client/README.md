@@ -17,9 +17,34 @@ helpers.
 - Encode requests, decode responses, and surface typed client errors.
 - Provide generic helpers for service invocation and event delivery.
 - Preserve caller principal identity for server-side policy checks.
+- Resolve attach targets through registered providers before acquiring a legacy
+  fallback client, allowing alternate providers to open independently.
+- Validate native provider snapshots and deltas before rendering, preserve
+  generation-scoped resume cursors across recoverable disconnects, route
+  focused input/viewport/action operations generically, and always detach.
+- Preserve the existing pane-runtime attach path as the default provider for
+  bare and `local://` targets.
+- Pool handshaken endpoint clients behind global and per-endpoint hard limits.
+- Apply deadline-aware admission backpressure and retain bounded idle clients.
+- Convert pooled clients into dedicated streaming leases whose capacity remains
+  charged for the stream lifetime.
 
 ## Core types
 
+- **`AttachProviderRegistry`**: Process-wide, scheme-neutral attach provider
+  registration and deterministic target resolution with opaque provider plans.
+- **`AttachSession`**: Object-safe native provider session contract for complete
+  snapshots, cancellation-safe ordered events, input, viewport updates, generic
+  actions, recoverable resume, and idempotent detach.
+- **`AttachContinuityValidator`** and **`AttachControlValidator`**: Enforce
+  event-sequence continuity, scene revisions, generation-scoped stream cursors,
+  repair snapshots, resumable state, command ordering, action deduplication,
+  focused-surface routing, and one-way detach.
+- **`AttachProviderSession`**: Neutral legacy-client or native-session backend
+  returned by providers to the attach runtime.
+- **`EndpointConnectionPool`**: Domain-neutral handshaken-client pool with
+  bounded global/per-endpoint admission, idle reuse, unhealthy discard, and
+  dedicated streaming leases.
 - **`BmuxClient`**: Stateful IPC client with request/response helpers.
 - **`ClientError`**: Error type for transport, serialization, timeout, protocol,
   and server response failures.

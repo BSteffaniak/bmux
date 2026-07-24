@@ -81,6 +81,14 @@ impl AsyncWrite for SshBridgeStream {
     }
 }
 
+const fn remote_compression_enabled(config: &BmuxConfig) -> bool {
+    config.behavior.compression.enabled
+        && matches!(
+            config.behavior.compression.remote,
+            bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+        )
+}
+
 async fn connect_ssh(
     paths: &ConfigPaths,
     target: &SshTarget,
@@ -225,8 +233,13 @@ async fn connect_tls(
         .connect(server_name, tcp)
         .await
         .map_err(|error| trust_error(target, error))?;
+    let stream = if remote_compression_enabled(config) {
+        ErasedIpcStream::new(Box::new(CompressedStream::new(stream, 1)))
+    } else {
+        ErasedIpcStream::new(Box::new(stream))
+    };
     BmuxClient::connect_with_bridge_stream(
-        ErasedIpcStream::new(Box::new(stream)),
+        stream,
         Duration::from_millis(target.connect_timeout_ms),
         "bmux-connections-tls".to_string(),
         load_or_create_principal_id(paths).map_err(|error| connection_error(target, error))?,
@@ -624,13 +637,7 @@ async fn connect_iroh(
     let use_compression = match target.compression {
         CompressionMode::None => false,
         CompressionMode::Zstd => true,
-        CompressionMode::Auto => {
-            config.behavior.compression.enabled
-                && matches!(
-                    config.behavior.compression.remote,
-                    bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
-                )
-        }
+        CompressionMode::Auto => remote_compression_enabled(config),
     };
     let stream = if use_compression {
         ErasedIpcStream::new(Box::new(CompressedStream::new(client_stream, 1)))
@@ -834,6 +841,18 @@ fn trust_failure(target: &impl TargetLabel, reason: &str) -> ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_compression_policy_matches_gateway_defaults_and_overrides() {
+        let mut config = BmuxConfig::default();
+        assert!(remote_compression_enabled(&config));
+        config.behavior.compression.remote = bmux_config::CompressionMode::None;
+        assert!(!remote_compression_enabled(&config));
+        config.behavior.compression.remote = bmux_config::CompressionMode::Zstd;
+        assert!(remote_compression_enabled(&config));
+        config.behavior.compression.enabled = false;
+        assert!(!remote_compression_enabled(&config));
+    }
 
     #[test]
     fn ssh_command_preserves_transport_security_options() {

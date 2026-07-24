@@ -16,6 +16,70 @@ interface cluster-types {
         degraded,
     }
 
+    enum cluster-consensus-role {
+        voter,
+        observer-edge,
+    }
+
+    record cluster-node-capabilities {
+        consensus_role: cluster-consensus-role,
+        worker: bool,
+        ingress: bool,
+    }
+
+    record cluster-identity {
+        cluster_id: string?,
+        node_id: string,
+        public_key: string,
+        capabilities: cluster-node-capabilities?,
+    }
+
+    enum cluster-member-state {
+        active,
+        left,
+    }
+
+    record cluster-member {
+        cluster_id: string,
+        node_id: string,
+        public_key: string,
+        endpoint: string?,
+        capabilities: cluster-node-capabilities,
+        joined_at_unix_ms: u64,
+        updated_at_unix_ms: u64,
+        state: cluster-member-state,
+    }
+
+    record cluster-member-list {
+        cluster_id: string?,
+        members: list<cluster-member>,
+    }
+
+    record enrollment-token-result {
+        token: string,
+        expires_at_unix_ms: u64,
+    }
+
+    record cluster-join-result {
+        identity: cluster-identity,
+        member: cluster-member,
+        members: list<cluster-member>,
+    }
+
+    record cluster-leave-request {
+        leave_id: string,
+        issuer_endpoint: string?,
+        cluster_id: string,
+        node_id: string,
+        signature: bytes,
+    }
+
+    record cluster-leave-result {
+        leave_id: string,
+        node_id: string,
+        left: bool,
+    }
+
     record cluster-host-status {
         cluster: string,
         target: string,
@@ -77,13 +141,22 @@ interface cluster-types {
 @capability(CLUSTER_READ)
 @interface-version(1)
 interface cluster-query {
+    query identity() -> cluster-types.cluster-identity;
     query list_clusters() -> cluster-types.cluster-list-result;
     query status(selector: string?, doctor: bool?) -> cluster-types.cluster-status-result;
+    query members() -> cluster-types.cluster-member-list;
 }
 
 @capability(CLUSTER_WRITE)
 @interface-version(1)
 interface cluster-command {
+    command init() -> cluster-types.cluster-identity;
+    command enrollment_token_create(request_id: string, endpoint: string, ttl_ms: u64?, capabilities: cluster-types.cluster-node-capabilities?) -> cluster-types.enrollment-token-result;
+    command join(token: string, issuer: string, enrollment_result: cluster-types.cluster-join-result) -> cluster-types.cluster-join-result;
+    command redeem_enrollment(token: string, node_id: string, public_key: string, endpoint: string?) -> cluster-types.cluster-join-result;
+    command leave_prepare() -> cluster-types.cluster-leave-request;
+    command leave(leave_id: string) -> cluster-types.cluster-leave-result;
+    command accept_leave(leave_id: string, cluster_id: string, node_id: string, signature: bytes) -> cluster-types.cluster-leave-result;
     command up(cluster: string, hosts: list<string>) -> cluster-types.cluster-up-result;
     command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
     command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;

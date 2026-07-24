@@ -351,7 +351,7 @@ fn execute_kernel_request(
 }
 
 fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let request = encode_service_message(&HostKernelBridgeRequest { payload })
+    let request = encode_service_message(&HostKernelBridgeRequest::new(payload))
         .map_err(|error| anyhow::anyhow!("failed encoding host bridge request: {error}"))?;
     let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
     let mut output_len = 0usize;

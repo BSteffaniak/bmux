@@ -174,7 +174,7 @@ pub struct Cli {
     pub config: Option<String>,
 
     /// Execute command against a configured target (local or remote)
-    #[arg(long, global = true)]
+    #[arg(id = "connection_target", long = "target", global = true)]
     pub target: Option<String>,
 
     /// Select named runtime instance (default: `default`)
@@ -3178,8 +3178,20 @@ mod tests {
             panic!("expected attach command");
         };
         assert_eq!(target.as_deref(), Some("dev"));
+        assert_eq!(cli.target, None);
         assert_eq!(follow, None);
         assert!(!global);
+    }
+
+    #[test]
+    fn parses_attach_target_separately_from_connection_target() {
+        let cli = Cli::try_parse_from(["bmux", "--target", "prod", "attach", "local://dev"])
+            .expect("valid CLI args");
+        assert_eq!(cli.target.as_deref(), Some("prod"));
+        let Some(Command::Attach { target, .. }) = cli.command else {
+            panic!("expected attach command");
+        };
+        assert_eq!(target.as_deref(), Some("local://dev"));
     }
 
     #[test]

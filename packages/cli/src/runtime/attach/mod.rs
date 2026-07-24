@@ -5,6 +5,7 @@ pub mod events;
 pub mod input;
 pub mod layout;
 pub mod prompt_ui;
+pub mod provider;
 pub mod render;
 pub mod runtime;
 pub mod sim;

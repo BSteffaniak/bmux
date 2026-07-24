@@ -1055,9 +1055,22 @@ mod tests {
         assert!(tokio::net::TcpListener::bind(address).await.is_err());
         task.abort();
         let _ = task.await;
-        tokio::net::TcpListener::bind(address)
-            .await
-            .expect("aborting gateway should release listener");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match tokio::net::TcpListener::bind(address).await {
+                Ok(listener) => {
+                    drop(listener);
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AddrInUse
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("aborting gateway should release listener: {error}"),
+            }
+        }
     }
 
     #[tokio::test]

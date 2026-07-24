@@ -13,8 +13,8 @@ These targets apply to the first complete trusted-domain federation release. The
 
 Measure and report at least:
 
-1. **LAN:** three voters/workers, <= 2 ms peer RTT, no packet loss.
-2. **Regional WAN:** three voters/workers, <= 50 ms peer RTT, <= 0.1% packet loss.
+1. **LAN:** three voters/workers, \<= 2 ms peer RTT, no packet loss.
+2. **Regional WAN:** three voters/workers, \<= 50 ms peer RTT, \<= 0.1% packet loss.
 3. **Mixed worker topology:** three voters plus five workers, 24 active panes, one client.
 4. **Fan-out stress:** 100 active panes, four attached clients, bounded synthetic output.
 
@@ -54,18 +54,18 @@ Measurements use release builds on documented hardware. Tests report median, p95
 
 Measured excluding terminal application response time:
 
-- Local non-federated attach median input-routing overhead regression: **<= 2%**, p95 absolute added latency **<= 1 ms**.
-- Federated LAN input from ingress to worker write: p50 **<= 5 ms**, p95 **<= 15 ms**, p99 **<= 30 ms**.
-- Regional WAN federation adds no more than **one avoidable application-level RTT** beyond transport RTT for steady-state input; target p95 processing overhead **<= 10 ms**.
-- Federated LAN output from worker read to ingress/client delivery: p50 **<= 10 ms**, p95 **<= 30 ms**, p99 **<= 75 ms** under reference load.
-- Viewport resize reaches all affected workers p95 **<= 100 ms** on LAN and **<= 300 ms** regional WAN.
-- Control actions already on the leader, excluding worker process startup, p95 **<= 100 ms** LAN and **<= 500 ms** regional WAN.
+- Local non-federated attach median input-routing overhead regression: **\<= 2%**, p95 absolute added latency **\<= 1 ms**.
+- Federated LAN input from ingress to worker write: p50 **\<= 5 ms**, p95 **\<= 15 ms**, p99 **\<= 30 ms**.
+- Regional WAN federation adds no more than **one avoidable application-level RTT** beyond transport RTT for steady-state input; target p95 processing overhead **\<= 10 ms**.
+- Federated LAN output from worker read to ingress/client delivery: p50 **\<= 10 ms**, p95 **\<= 30 ms**, p99 **\<= 75 ms** under reference load.
+- Viewport resize reaches all affected workers p95 **\<= 100 ms** on LAN and **\<= 300 ms** regional WAN.
+- Control actions already on the leader, excluding worker process startup, p95 **\<= 100 ms** LAN and **\<= 500 ms** regional WAN.
 
 ## Attach and repair budgets
 
-- Warm attach to a healthy 24-pane workspace: p95 first useful frame **<= 750 ms** LAN, **<= 2 seconds** regional WAN.
-- Warm resume with retained cursors: p95 first updated frame **<= 500 ms** after connection establishment LAN, **<= 1.5 seconds** regional WAN.
-- Snapshot repair for a typical 200x60 text pane without large image payloads: p95 **<= 500 ms** LAN, **<= 2 seconds** regional WAN.
+- Warm attach to a healthy 24-pane workspace: p95 first useful frame **\<= 750 ms** LAN, **\<= 2 seconds** regional WAN.
+- Warm resume with retained cursors: p95 first updated frame **\<= 500 ms** after connection establishment LAN, **\<= 1.5 seconds** regional WAN.
+- Snapshot repair for a typical 200x60 text pane without large image payloads: p95 **\<= 500 ms** LAN, **\<= 2 seconds** regional WAN.
 - Repair is incremental across panes; one slow pane must not prevent useful frames from healthy panes.
 
 ## Resource budgets
@@ -84,14 +84,14 @@ Measured excluding terminal application response time:
 
 At steady state with 24 panes each producing 10 KiB/s and one client:
 
-- Federation routing/composition CPU should consume **<= 1 logical core average** on documented reference hardware, excluding terminal parsing already required locally.
-- Idle cluster overhead across heartbeats/consensus should average **<= 2% of one logical core per node**.
+- Federation routing/composition CPU should consume **\<= 1 logical core average** on documented reference hardware, excluding terminal parsing already required locally.
+- Idle cluster overhead across heartbeats/consensus should average **\<= 2% of one logical core per node**.
 - Snapshot generation is rate-limited so reconnect storms do not starve active input/output.
 
 ### Bandwidth
 
-- Steady-state federation control metadata overhead excluding payload, encryption framing, and transport keepalive should remain **<= 10%** of terminal payload bandwidth in the 24-pane reference workload.
-- Idle three-node cluster control traffic target is **<= 10 KiB/s average per node** on stable membership.
+- Steady-state federation control metadata overhead excluding payload, encryption framing, and transport keepalive should remain **\<= 10%** of terminal payload bandwidth in the 24-pane reference workload.
+- Idle three-node cluster control traffic target is **\<= 10 KiB/s average per node** on stable membership.
 - No terminal payload is replicated to voters that are not serving/relaying that execution stream.
 
 ### Durable state

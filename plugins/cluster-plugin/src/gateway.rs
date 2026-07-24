@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_connections_plugin_api::{connection_types::ServiceInvokeKind, connections_commands};
-use bmux_plugin_sdk::{NativeCommandContext, PluginCliCommandRequest, PluginCliCommandResponse};
+use bmux_plugin_sdk::{
+    NativeCommandContext, PluginCliCommandRequest, PluginCliCommandResponse, TypedDispatchClient,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
@@ -4111,26 +4112,16 @@ async fn run_plugin_command_on_target(
     );
     let payload = bmux_plugin_sdk::encode_service_message(&command)
         .context("failed encoding plugin command request")?;
-    let request = connections_commands::client::InvokeServiceRequest {
-        target: target.to_string(),
-        capability: bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY.to_string(),
-        kind: ServiceInvokeKind::InvokeCommand,
-        interface_id: bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1.to_string(),
-        operation: bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1.to_string(),
-        payload,
-    };
-    let response = connections_commands::client::invoke_service(
-        &mut bmux_plugin::ServiceCallerDispatchClient::new(caller),
-        request.target,
-        request.capability,
-        request.kind,
-        request.interface_id,
-        request.operation,
-        request.payload,
-    )
-    .await
-    .context("connections plugin invoke-service dispatch failed")?
-    .map_err(|error| anyhow::anyhow!("connection invocation failed: {error:?}"))?;
+    let response = crate::endpoint::EndpointDispatchClient::new(caller, target)
+        .invoke_service_raw(
+            bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY,
+            bmux_ipc::InvokeServiceKind::Command,
+            bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1,
+            bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
+            payload,
+        )
+        .await
+        .context("connections plugin endpoint dispatch failed")?;
     let response: PluginCliCommandResponse = bmux_plugin_sdk::decode_service_message(&response)
         .context("failed decoding remote plugin command response")?;
     if let Some(error) = response.error {

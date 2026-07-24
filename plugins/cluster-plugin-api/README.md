@@ -6,8 +6,8 @@ The crate contains BPDL schemas, generated service/client modules, stable wire t
 
 ## Interfaces
 
-- `cluster-query/v1` — cluster inventory and health queries
-- `cluster-command/v1` — current cluster startup and pane mutation commands
+- `cluster-query/v1` — public node identity, durable role/capability-bearing member listing, cluster inventory, and health queries
+- `cluster-command/v1` — durable initialization; signed enrollment/join/leave phases (including capability grants); current cluster startup and pane mutation commands
 - `cluster-connection-events/v1` — persisted connection lifecycle event queries
 
 The source interface names produce idiomatic generated modules while the BPDL

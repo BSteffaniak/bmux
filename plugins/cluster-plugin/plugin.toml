@@ -3,6 +3,11 @@ id = "bmux.cluster"
 name = "bmux Server Clusters"
 owns_namespaces = [
     "cluster",
+    "cluster-init",
+    "cluster-enrollment-token-create",
+    "cluster-join",
+    "cluster-leave",
+    "cluster-members",
     "cluster-up",
     "cluster-status",
     "cluster-doctor",
@@ -56,6 +61,107 @@ kind         = "command"
 capability   = "bmux.server_clusters.read"
 interface_id = "cluster-connection-events/v1"
 kind         = "query"
+
+[[commands]]
+aliases       = [["cluster", "init"]]
+expose_in_cli = true
+name          = "cluster-init"
+path          = ["cluster-init"]
+summary       = "Initialize durable cluster and node identities"
+
+[[commands]]
+aliases       = [["cluster", "enrollment-token", "create"]]
+expose_in_cli = true
+name          = "cluster-enrollment-token-create"
+path          = ["cluster-enrollment-token-create"]
+summary       = "Create a signed single-use cluster enrollment token"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "endpoint"
+name       = "endpoint"
+required   = true
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "ttl-ms"
+name       = "ttl_ms"
+required   = false
+value_name = "MILLISECONDS"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "role"
+name       = "role"
+required   = false
+value_name = "voter|observer-edge"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "worker"
+name     = "worker"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "no-worker"
+name     = "no_worker"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "ingress"
+name     = "ingress"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "no-ingress"
+name     = "no_ingress"
+required = false
+
+[[commands]]
+aliases       = [["cluster", "join"]]
+expose_in_cli = true
+name          = "cluster-join"
+path          = ["cluster-join"]
+summary       = "Join a cluster using a signed enrollment token"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "token"
+position   = 0
+required   = true
+value_name = "TOKEN"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "issuer"
+name       = "issuer"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "endpoint"
+name       = "endpoint"
+required   = false
+value_name = "TARGET"
+
+[[commands]]
+aliases       = [["cluster", "leave"]]
+expose_in_cli = true
+name          = "cluster-leave"
+path          = ["cluster-leave"]
+summary       = "Leave the current cluster"
+
+[[commands]]
+aliases       = [["cluster", "members"]]
+expose_in_cli = true
+name          = "cluster-members"
+path          = ["cluster-members"]
+summary       = "List durable public cluster membership"
 
 [[commands]]
 aliases       = [["cluster", "up"]]

@@ -1094,16 +1094,23 @@ pub fn call_service_raw(
 
     // Consult the process-level `ServiceLocationMap` to decide whether
     // this process owns the provider (`Local` → continue to in-process
-    // dispatch below) or must forward the call over IPC (`Remote` →
-    // wrap in `Request::InvokeService` and ship through the host
-    // kernel bridge). Providers with no recorded location are treated
-    // as local for backward compatibility with tests and pre-bootstrap
-    // paths; real runtime code paths mark every known plugin before
-    // any typed service call fires.
-    if matches!(
-        crate::global_service_locations().get(&provider_plugin_id),
-        Some(crate::ServiceLocation::Remote)
-    ) {
+    // dispatch below) or must route the call to a selected endpoint.
+    // The existing one-server path uses the host kernel bridge endpoint.
+    // Other endpoint identities are rejected until an endpoint dispatcher
+    // is registered rather than silently reaching the wrong server.
+    // Providers with no recorded location are treated as local for backward
+    // compatibility with tests and pre-bootstrap paths; real runtime code
+    // marks every known plugin before any typed service call fires.
+    if let Some(crate::ServiceLocation::Remote { endpoint }) =
+        crate::global_service_locations().get(&provider_plugin_id)
+    {
+        if !endpoint.is_host_kernel() {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "service endpoint '{endpoint}' has no registered typed-service dispatcher"
+                ),
+            });
+        }
         return dispatch_remote_typed_service(
             host_kernel_bridge,
             &provider_plugin_id,
@@ -1621,7 +1628,7 @@ fn execute_plugin_command_request(
 }
 
 fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
+    let request = encode_service_message(&HostKernelBridgeRequest::new(payload))?;
     let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
     let mut output_len = 0usize;
 
@@ -4569,7 +4576,7 @@ minimum = "1.0"
     // supplied capability / kind / interface / operation / payload, and
     // that a `ResponsePayload::ServiceInvoked` reply is decoded back to
     // the caller. The goal is to lock in the contract the rest of the
-    // runtime (attach / CLI) depends on: a `ServiceLocation::Remote`
+    // runtime (attach / CLI) depends on: a remote host-kernel endpoint
     // provider must round-trip through `Request::InvokeService` over
     // the host kernel bridge.
 

@@ -19,12 +19,29 @@ interface connection-types {
     }
 
     record resolved-endpoint {
+        endpoint_id: string,
         reference: string,
         label: string,
         transport: connection-transport,
         address: string,
         server_name: string?,
         connect_timeout_ms: u64,
+    }
+
+    record invocation-options {
+        timeout_ms: u64,
+        max_attempts: u32,
+        retry_backoff_ms: u64,
+    }
+
+    record service-invocation {
+        target: string,
+        capability: string,
+        kind: service-invoke-kind,
+        interface_id: string,
+        operation: string,
+        payload: bytes,
+        options: invocation-options?,
     }
 
     variant connection-error {
@@ -34,6 +51,9 @@ interface connection-types {
         authentication-failed { target: string, reason: string },
         trust-failed { target: string, reason: string },
         connection-failed { target: string, reason: string },
+        cancelled { target: string },
+        timed-out { target: string, phase: string, timeout_ms: u64 },
+        retry-exhausted { target: string, attempts: u32, reason: string },
         service-failed { target: string, reason: string },
     }
 }
@@ -46,12 +66,5 @@ interface connections-state {
 
 @capability(CONNECTIONS_INVOKE)
 interface connections-commands {
-    command invoke-service(
-        target: string,
-        capability: string,
-        kind: connection-types.service-invoke-kind,
-        interface_id: string,
-        operation: string,
-        payload: bytes,
-    ) -> result<bytes, connection-types.connection-error>;
+    command invoke-service(invocation: connection-types.service-invocation) -> result<bytes, connection-types.connection-error>;
 }

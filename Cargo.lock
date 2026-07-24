@@ -1244,6 +1244,7 @@ dependencies = [
  "sha2 0.11.0",
  "similar",
  "sshenv_vault",
+ "tempfile",
  "time 0.3.53",
  "tokio",
  "tokio-rustls",
@@ -1357,10 +1358,12 @@ dependencies = [
  "bmux_cluster_plugin_api",
  "bmux_config",
  "bmux_connections_plugin_api",
+ "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
+ "iroh",
  "serde",
  "serde_json",
  "serial_test",
@@ -1375,6 +1378,7 @@ dependencies = [
 name = "bmux_cluster_plugin_api"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "bmux_codec",
  "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
