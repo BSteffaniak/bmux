@@ -21,9 +21,8 @@ use tracing::{debug, instrument, warn};
 use super::{
     KernelClientFactory, available_capability_providers, available_service_descriptors,
     connect_raw, core_provided_capabilities, enter_host_kernel_client_factory,
-    enter_host_kernel_connection, host_kernel_bridge, map_cli_client_error,
-    plugin_commands::PluginCommandRegistry, plugin_host, server_event_name,
-    service_descriptors_from_declarations,
+    enter_host_kernel_connection, host_kernel_bridge, plugin_commands::PluginCommandRegistry,
+    plugin_host, server_event_name, service_descriptors_from_declarations,
 };
 
 #[derive(Debug, Clone)]
@@ -1596,56 +1595,75 @@ pub(super) async fn plugin_event_bridge_loop(
         return Ok(());
     }
 
-    let client = loop {
+    loop {
         if *shutdown_rx.borrow() {
             return Ok(());
         }
 
-        match connect_raw("bmux-plugin-event-bridge").await {
-            Ok(client) => break client,
-            Err(_) => {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            return Ok(());
+        let client = loop {
+            match connect_raw("bmux-plugin-event-bridge").await {
+                Ok(client) => break client,
+                Err(error) => {
+                    debug!(%error, "plugin event bridge connection failed; retrying");
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                return Ok(());
+                            }
                         }
+                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
                     }
-                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
             }
+        };
+
+        // Upgrade to streaming client for server-push event delivery. A bridge
+        // disconnect is not a server-lifetime signal: reconnect until explicit
+        // shutdown so transient IPC failures cannot stop the server.
+        let Ok(mut streaming_client) = bmux_client::StreamingBmuxClient::from_client(client) else {
+            warn!("plugin event bridge streaming upgrade failed; retrying");
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            continue;
+        };
+        if let Err(error) = streaming_client.subscribe_events().await {
+            warn!(%error, "plugin event bridge subscription failed; retrying");
+            continue;
         }
-    };
+        if let Err(error) = streaming_client.enable_event_push().await {
+            warn!(%error, "plugin event bridge event-push enable failed; retrying");
+            continue;
+        }
 
-    // Upgrade to streaming client for server-push event delivery.
-    let Ok(mut streaming_client) = bmux_client::StreamingBmuxClient::from_client(client) else {
-        // Fallback: if upgrade fails (e.g., bridge stream), just return.
-        return Ok(());
-    };
-    streaming_client
-        .subscribe_events()
-        .await
-        .map_err(map_cli_client_error)?;
-    streaming_client
-        .enable_event_push()
-        .await
-        .map_err(map_cli_client_error)?;
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    return Ok(());
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
                 }
-            }
-            event = streaming_client.event_receiver().recv() => {
-                let Some(event) = event else {
-                    return Ok(()); // server disconnected
-                };
-                // Skip high-frequency pane output notifications for plugins.
-                if is_pane_output_plugin_event(&event) {
-                    continue;
+                event = streaming_client.event_receiver().recv() => {
+                    let Some(event) = event else {
+                        warn!("plugin event bridge disconnected; retrying");
+                        break;
+                    };
+                    // Skip high-frequency pane output notifications for plugins.
+                    if is_pane_output_plugin_event(&event) {
+                        continue;
+                    }
+                    if let Err(error) = dispatch_loaded_plugin_event(
+                        loaded_plugins,
+                        &plugin_event_from_server_event(&event)?,
+                    ) {
+                        warn!(%error, "failed dispatching bridged plugin event");
+                    }
                 }
-                dispatch_loaded_plugin_event(loaded_plugins, &plugin_event_from_server_event(&event)?)?;
             }
         }
     }

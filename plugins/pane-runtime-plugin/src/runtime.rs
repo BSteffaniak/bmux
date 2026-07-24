@@ -29,6 +29,7 @@ use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_p
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -93,6 +94,180 @@ fn snapshot_dirty_flag() -> Arc<SnapshotDirtyFlag> {
 
 fn mark_snapshot_dirty_flag() {
     snapshot_dirty_flag().mark_dirty();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPaneLaunch {
+    shell: String,
+    cwd: Option<String>,
+    replay_command: Option<String>,
+    metadata_changed: bool,
+}
+
+fn path_like_program(program: &str) -> bool {
+    let path = Path::new(program);
+    path.is_absolute() || path.components().count() > 1
+}
+
+fn path_is_usable_program(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn program_name_is_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(program);
+        if path_is_usable_program(&candidate) {
+            return true;
+        }
+        #[cfg(windows)]
+        if candidate.extension().is_none() {
+            let path_ext =
+                std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            for extension in path_ext.to_string_lossy().split(';') {
+                let extension = extension.trim().trim_start_matches('.');
+                if !extension.is_empty()
+                    && path_is_usable_program(&candidate.with_extension(extension))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn program_is_usable(program: &str) -> bool {
+    let program = program.trim();
+    !program.is_empty()
+        && if path_like_program(program) {
+            path_is_usable_program(Path::new(program))
+        } else {
+            program_name_is_on_path(program)
+        }
+}
+
+fn platform_baseline_shell() -> &'static str {
+    if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }
+}
+
+fn shell_basename(shell: &str) -> Option<String> {
+    Path::new(shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim_start_matches('-').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn shells_support_compatible_replay(previous: &str, resolved: &str) -> bool {
+    let previous_kind = shell_kind_for_path(previous);
+    let resolved_kind = shell_kind_for_path(resolved);
+    match (previous_kind, resolved_kind) {
+        (ShellKind::Other, ShellKind::Other) => {
+            shell_basename(previous) == shell_basename(resolved)
+        }
+        (left, right) => left == right,
+    }
+}
+
+fn valid_resurrection_cwd(cwd: Option<&str>) -> Option<String> {
+    cwd.filter(|value| !value.trim().is_empty())
+        .filter(|value| Path::new(value).is_dir())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_shell_with_baseline(
+    persisted_shell: &str,
+    configured_shell: &str,
+    baseline_shell: &str,
+) -> anyhow::Result<String> {
+    [persisted_shell.trim(), configured_shell.trim(), baseline_shell]
+        .into_iter()
+        .find(|candidate| program_is_usable(candidate))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no usable shell found (persisted='{persisted_shell}', configured='{configured_shell}', baseline='{baseline_shell}')"
+            )
+        })
+}
+
+fn resolve_pane_launch(
+    pane_meta: &PaneRuntimeMeta,
+    configured_shell: &str,
+) -> anyhow::Result<ResolvedPaneLaunch> {
+    let shell = if pane_meta.launch.is_some() {
+        pane_meta.shell.clone()
+    } else {
+        resolve_shell_with_baseline(
+            &pane_meta.shell,
+            configured_shell,
+            platform_baseline_shell(),
+        )?
+    };
+    let cwd = valid_resurrection_cwd(pane_meta.resurrection.last_known_cwd.as_deref());
+    let replay_command = if pane_meta.launch.is_some() {
+        pane_meta.resurrection.active_command.clone()
+    } else {
+        pane_meta
+            .resurrection
+            .active_command
+            .clone()
+            .filter(|_| shells_support_compatible_replay(&pane_meta.shell, &shell))
+    };
+    let metadata_changed = shell != pane_meta.shell
+        || cwd != pane_meta.resurrection.last_known_cwd
+        || replay_command != pane_meta.resurrection.active_command;
+
+    Ok(ResolvedPaneLaunch {
+        shell,
+        cwd,
+        replay_command,
+        metadata_changed,
+    })
+}
+
+fn apply_resolved_pane_launch(pane_meta: &mut PaneRuntimeMeta, resolved: &ResolvedPaneLaunch) {
+    pane_meta.shell.clone_from(&resolved.shell);
+    pane_meta
+        .resurrection
+        .last_known_cwd
+        .clone_from(&resolved.cwd);
+    pane_meta
+        .resurrection
+        .active_command
+        .clone_from(&resolved.replay_command);
+    if pane_meta.resurrection.active_command.is_none() {
+        pane_meta.resurrection.active_command_source = None;
+    }
+}
+
+fn validate_explicit_launch(launch: &PaneLaunchSpec) -> anyhow::Result<()> {
+    if launch.program.trim().is_empty() {
+        anyhow::bail!("explicit launch program is empty");
+    }
+    if let Some(cwd) = launch.cwd.as_deref()
+        && (cwd.trim().is_empty() || !Path::new(cwd).is_dir())
+    {
+        anyhow::bail!("explicit launch cwd is unavailable: '{cwd}'");
+    }
+    Ok(())
 }
 
 pub(crate) fn publish_pane_event(event: PaneEvent) {
@@ -201,12 +376,68 @@ async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
 }
 
 fn push_pane_runtime_notice(
+    session_id: SessionId,
+    pane_id: Uuid,
     output_buffer: &Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: &Arc<std::sync::Mutex<TerminalGridStream>>,
+    output_dirty: &Arc<AtomicBool>,
     message: impl AsRef<str>,
 ) {
-    if let Ok(mut output) = output_buffer.lock() {
-        output.push_chunk(message.as_ref().as_bytes());
+    let bytes = message.as_ref().as_bytes();
+    if let Ok(mut grid) = terminal_grid.lock() {
+        grid.process(bytes);
     }
+    if let Ok(mut output) = output_buffer.lock() {
+        output.push_chunk(bytes);
+    }
+    output_dirty.store(true, Ordering::SeqCst);
+    publish_pane_event(PaneEvent::OutputAvailable {
+        session_id: session_id.0,
+        pane_id,
+    });
+}
+
+struct PaneFailureTargets<'a> {
+    process_id: &'a Arc<std::sync::Mutex<Option<u32>>>,
+    process_group_id: &'a Arc<std::sync::Mutex<Option<i32>>>,
+    exit_reason: &'a Arc<std::sync::Mutex<Option<String>>>,
+    exited: &'a Arc<AtomicBool>,
+    output_buffer: &'a Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: &'a Arc<std::sync::Mutex<TerminalGridStream>>,
+    output_dirty: &'a Arc<AtomicBool>,
+    pane_exit_tx: &'a mpsc::UnboundedSender<PaneExitEvent>,
+}
+
+fn mark_pane_startup_failed(
+    session_id: SessionId,
+    pane_id: Uuid,
+    reason: &str,
+    targets: &PaneFailureTargets<'_>,
+) {
+    if let Ok(mut process_id) = targets.process_id.lock() {
+        *process_id = None;
+    }
+    if let Ok(mut process_group_id) = targets.process_group_id.lock() {
+        *process_group_id = None;
+    }
+    if let Ok(mut slot) = targets.exit_reason.lock() {
+        *slot = Some(reason.to_string());
+    }
+    targets.exited.store(true, Ordering::SeqCst);
+    push_pane_runtime_notice(
+        session_id,
+        pane_id,
+        targets.output_buffer,
+        targets.terminal_grid,
+        targets.output_dirty,
+        format!("\r\n[bmux] pane failed to start: {reason}\r\n"),
+    );
+    warn!(%pane_id, %reason, "pane failed to start");
+    let _ = targets.pane_exit_tx.send(PaneExitEvent {
+        session_id,
+        pane_id,
+    });
+    mark_snapshot_dirty_flag();
 }
 
 fn format_pane_exit_reason(status: &portable_pty::ExitStatus) -> String {
@@ -2852,8 +3083,9 @@ impl SessionRuntimeManager {
                 .copied()
                 .unwrap_or((24, 80));
             let pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), initial_size);
+            let restored_meta = pane.meta.clone();
             self.register_pane_input(session_id, &pane);
-            runtime_panes.insert(pane_meta.id, pane);
+            runtime_panes.insert(restored_meta.id, pane);
         }
 
         self.runtimes.insert(
@@ -2882,9 +3114,33 @@ impl SessionRuntimeManager {
     fn spawn_pane_runtime(
         &self,
         session_id: SessionId,
-        pane_meta: PaneRuntimeMeta,
+        mut pane_meta: PaneRuntimeMeta,
         initial_size: (u16, u16),
     ) -> PaneRuntimeHandle {
+        let resolved_launch = resolve_pane_launch(&pane_meta, &self.shell);
+        if let Ok(resolved) = &resolved_launch {
+            if resolved.shell != pane_meta.shell {
+                warn!(
+                    pane_id = %pane_meta.id,
+                    persisted_shell = %pane_meta.shell,
+                    resolved_shell = %resolved.shell,
+                    "replacing unavailable persisted pane shell"
+                );
+            }
+            if pane_meta.resurrection.active_command.is_some() && resolved.replay_command.is_none()
+            {
+                warn!(
+                    pane_id = %pane_meta.id,
+                    persisted_shell = %pane_meta.shell,
+                    resolved_shell = %resolved.shell,
+                    "suppressing resurrected command replay across incompatible shells"
+                );
+            }
+            apply_resolved_pane_launch(&mut pane_meta, resolved);
+            if resolved.metadata_changed {
+                mark_snapshot_dirty_flag();
+            }
+        }
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<PaneRuntimeCommand>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
@@ -2900,6 +3156,7 @@ impl SessionRuntimeManager {
         let last_requested_size = Arc::new(std::sync::Mutex::new((initial_rows, initial_cols)));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
+        let launch_resolution_error = resolved_launch.err().map(|error| error.to_string());
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
         let bracketed_paste_supported = self.bracketed_paste_supported;
@@ -2965,26 +3222,50 @@ impl SessionRuntimeManager {
         let image_dirty_for_reader = Arc::clone(&image_dirty);
 
         let task = tokio::spawn(async move {
+            macro_rules! fail_startup {
+                ($reason:expr) => {{
+                    let reason = $reason;
+                    mark_pane_startup_failed(
+                        session_id,
+                        pane_id,
+                        &reason,
+                        &PaneFailureTargets {
+                            process_id: &process_id_for_task,
+                            process_group_id: &process_group_id_for_task,
+                            exit_reason: &exit_reason_for_task,
+                            exited: &exited_for_task,
+                            output_buffer: &output_buffer_for_reader,
+                            terminal_grid: &terminal_grid_for_reader,
+                            output_dirty: &output_dirty_for_reader,
+                            pane_exit_tx: &pane_exit_tx,
+                        },
+                    );
+                }};
+            }
+            if let Some(reason) = launch_resolution_error {
+                fail_startup!(reason);
+                return;
+            }
             let pty_system = native_pty_system();
-            let Ok(pty_pair) = pty_system.openpty(PtySize {
+            let pty_pair = match pty_system.openpty(PtySize {
                 rows: initial_rows,
                 cols: initial_cols,
                 pixel_width: 0,
                 pixel_height: 0,
-            }) else {
-                if let Ok(mut reason) = exit_reason_for_task.lock() {
-                    *reason = Some("failed to allocate PTY".to_string());
+            }) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    fail_startup!(format!("failed to allocate PTY: {error}"));
+                    return;
                 }
-                push_pane_runtime_notice(
-                    &output_buffer_for_reader,
-                    "\r\n[bmux] pane failed to start: failed to allocate PTY\r\n",
-                );
-                exited_for_task.store(true, Ordering::SeqCst);
-                return;
             };
 
             let mut replay_on_prompt = false;
             let (command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
+                if let Err(error) = validate_explicit_launch(launch) {
+                    fail_startup!(error.to_string());
+                    return;
+                }
                 let mut command = CommandBuilder::new(&launch.program);
                 command.env("TERM", &pane_term);
                 for arg in &launch.args {
@@ -2994,9 +3275,7 @@ impl SessionRuntimeManager {
                     command.env(key, value);
                 }
                 configure_device_seal_broker_env(&mut command);
-                if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref())
-                    && !cwd.is_empty()
-                {
+                if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref()) {
                     command.cwd(cwd);
                 }
                 (command, format!("command '{}'", launch.program))
@@ -3028,18 +3307,12 @@ impl SessionRuntimeManager {
                     );
                 (command, format!("shell '{shell}'"))
             };
-            let Ok(mut child) = pty_pair.slave.spawn_command(command) else {
-                if let Ok(mut reason) = exit_reason_for_task.lock() {
-                    *reason = Some(format!("failed to spawn {failed_spawn_label}"));
+            let mut child = match pty_pair.slave.spawn_command(command) {
+                Ok(child) => child,
+                Err(error) => {
+                    fail_startup!(format!("failed to spawn {failed_spawn_label}: {error}"));
+                    return;
                 }
-                push_pane_runtime_notice(
-                    &output_buffer_for_reader,
-                    format!(
-                        "\r\n[bmux] pane failed to start: failed to spawn {failed_spawn_label}\r\n"
-                    ),
-                );
-                exited_for_task.store(true, Ordering::SeqCst);
-                return;
             };
             if let Ok(mut pid) = process_id_for_task.lock() {
                 *pid = child.process_id();
@@ -3054,29 +3327,21 @@ impl SessionRuntimeManager {
 
             let master = pty_pair.master;
 
-            let Ok(mut reader) = master.try_clone_reader() else {
-                if let Ok(mut reason) = exit_reason_for_task.lock() {
-                    *reason = Some("failed to open PTY reader".to_string());
+            let mut reader = match master.try_clone_reader() {
+                Ok(reader) => reader,
+                Err(error) => {
+                    fail_startup!(format!("failed to open PTY reader: {error}"));
+                    let _ = child.kill();
+                    return;
                 }
-                push_pane_runtime_notice(
-                    &output_buffer_for_reader,
-                    "\r\n[bmux] pane failed to start: failed to open PTY reader\r\n",
-                );
-                let _ = child.kill();
-                exited_for_task.store(true, Ordering::SeqCst);
-                return;
             };
-            let Ok(writer) = master.take_writer() else {
-                if let Ok(mut reason) = exit_reason_for_task.lock() {
-                    *reason = Some("failed to open PTY writer".to_string());
+            let writer = match master.take_writer() {
+                Ok(writer) => writer,
+                Err(error) => {
+                    fail_startup!(format!("failed to open PTY writer: {error}"));
+                    let _ = child.kill();
+                    return;
                 }
-                push_pane_runtime_notice(
-                    &output_buffer_for_reader,
-                    "\r\n[bmux] pane failed to start: failed to open PTY writer\r\n",
-                );
-                let _ = child.kill();
-                exited_for_task.store(true, Ordering::SeqCst);
-                return;
             };
             let writer = Arc::new(std::sync::Mutex::new(writer));
 
@@ -3100,6 +3365,8 @@ impl SessionRuntimeManager {
             let exited_for_waiter = Arc::clone(&exited_for_task);
             let exit_reason_for_waiter = Arc::clone(&exit_reason_for_task);
             let output_buffer_for_waiter = Arc::clone(&output_buffer_for_reader);
+            let terminal_grid_for_waiter = Arc::clone(&terminal_grid_for_reader);
+            let output_dirty_for_waiter = Arc::clone(&output_dirty_for_reader);
             let resurrection_state_for_waiter = Arc::clone(&resurrection_state_for_waiter_seed);
             let child_waiter_done = Arc::new(AtomicBool::new(false));
             let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
@@ -3122,7 +3389,11 @@ impl SessionRuntimeManager {
                         resurrection.active_command_source = None;
                     }
                     push_pane_runtime_notice(
+                        session_id,
+                        pane_id,
                         &output_buffer_for_waiter,
+                        &terminal_grid_for_waiter,
+                        &output_dirty_for_waiter,
                         "\r\n[bmux] pane process exited; layout preserved. Use restart pane or close pane.\r\n",
                     );
                     let _ = pane_exit_tx.send(PaneExitEvent {
@@ -3807,7 +4078,7 @@ impl SessionRuntimeManager {
             shutdown_pane_handle(old_pane).await;
         });
 
-        let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), (24, 80));
+        let new_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
         self.register_pane_input(session_id, &new_pane);
         let client_ids = {
             let session = self
@@ -3825,14 +4096,15 @@ impl SessionRuntimeManager {
             *reason = None;
         }
 
+        let restarted_pane_id = new_pane.meta.id;
         let session = self
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        session.panes.insert(pane_meta.id, new_pane);
-        session.focused_pane_id = pane_meta.id;
+        session.panes.insert(restarted_pane_id, new_pane);
+        session.focused_pane_id = restarted_pane_id;
         self.apply_stored_attach_viewport(session_id);
-        Ok(pane_meta.id)
+        Ok(restarted_pane_id)
     }
 
     fn resize_pane(
@@ -7788,6 +8060,327 @@ mod tests {
         assert!(config.contains("__bmux_original_prompt_command"));
         assert!(config.contains("__bmux_prompt_marker"));
         assert!(!config.contains("hooks.pre_prompt"));
+    }
+
+    #[test]
+    fn missing_persisted_shell_falls_back_and_preserves_same_family_replay() {
+        let configured_shell = std::env::current_exe()
+            .expect("current test executable")
+            .with_file_name(if cfg!(windows) { "nu.exe" } else { "nu" });
+        std::fs::copy(std::env::current_exe().unwrap(), &configured_shell).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = configured_shell.metadata().unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&configured_shell, permissions).unwrap();
+        }
+        let pane_meta = PaneRuntimeMeta {
+            id: Uuid::new_v4(),
+            name: None,
+            shell: "/nix/store/missing-nushell/bin/nu".to_string(),
+            launch: None,
+            resurrection: PaneResurrectionSnapshot {
+                active_command: Some("lazygit".to_string()),
+                active_command_source: Some(PaneCommandSource::Verbatim),
+                last_known_cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            },
+        };
+
+        let resolved = resolve_pane_launch(&pane_meta, &configured_shell.to_string_lossy())
+            .expect("configured shell path");
+
+        assert_eq!(resolved.shell, configured_shell.to_string_lossy());
+        assert_eq!(resolved.replay_command.as_deref(), Some("lazygit"));
+        assert!(resolved.cwd.is_some());
+        assert!(resolved.metadata_changed);
+        std::fs::remove_file(configured_shell).unwrap();
+    }
+
+    #[test]
+    fn cross_family_shell_fallback_suppresses_replay() {
+        let configured_shell = std::env::current_exe()
+            .expect("current test executable")
+            .with_file_name(if cfg!(windows) { "fish.exe" } else { "fish" });
+        std::fs::copy(std::env::current_exe().unwrap(), &configured_shell).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = configured_shell.metadata().unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&configured_shell, permissions).unwrap();
+        }
+        let pane_meta = PaneRuntimeMeta {
+            id: Uuid::new_v4(),
+            name: None,
+            shell: "/missing/zsh".to_string(),
+            launch: None,
+            resurrection: PaneResurrectionSnapshot {
+                active_command: Some("print -r -- hello".to_string()),
+                active_command_source: Some(PaneCommandSource::Verbatim),
+                last_known_cwd: None,
+            },
+        };
+
+        let resolved = resolve_pane_launch(&pane_meta, &configured_shell.to_string_lossy())
+            .expect("configured shell path");
+
+        assert_eq!(resolved.shell, configured_shell.to_string_lossy());
+        assert_eq!(resolved.replay_command, None);
+        assert!(resolved.metadata_changed);
+        std::fs::remove_file(configured_shell).unwrap();
+    }
+
+    #[test]
+    fn missing_resurrection_cwd_is_cleared() {
+        let pane_meta = PaneRuntimeMeta {
+            id: Uuid::new_v4(),
+            name: None,
+            shell: "sh".to_string(),
+            launch: None,
+            resurrection: PaneResurrectionSnapshot {
+                active_command: None,
+                active_command_source: None,
+                last_known_cwd: Some(
+                    std::env::temp_dir()
+                        .join(Uuid::new_v4().to_string())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            },
+        };
+
+        let resolved = resolve_pane_launch(&pane_meta, "sh").expect("bare shell is valid");
+
+        assert_eq!(resolved.cwd, None);
+        assert!(resolved.metadata_changed);
+    }
+
+    #[test]
+    fn shell_resolution_uses_usable_baseline_after_missing_candidates() {
+        let baseline = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let resolved = resolve_shell_with_baseline(
+            "/definitely/missing/persisted-shell",
+            "/definitely/missing/configured-shell",
+            baseline,
+        )
+        .expect("platform baseline shell should be usable");
+        assert_eq!(resolved, baseline);
+    }
+
+    #[test]
+    fn shell_resolution_reports_all_unusable_candidates() {
+        let error = resolve_shell_with_baseline(
+            "/definitely/missing/persisted-shell",
+            "/definitely/missing/configured-shell",
+            "/definitely/missing/baseline-shell",
+        )
+        .expect_err("all path candidates are missing");
+        let message = error.to_string();
+        assert!(message.contains("persisted-shell"));
+        assert!(message.contains("configured-shell"));
+        assert!(message.contains("baseline-shell"));
+    }
+
+    #[test]
+    fn explicit_launch_does_not_replace_persisted_shell_metadata() {
+        let pane_meta = PaneRuntimeMeta {
+            id: Uuid::new_v4(),
+            name: None,
+            shell: "/missing/original-shell".to_string(),
+            launch: Some(PaneLaunchSpec {
+                program: "custom-program".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+            }),
+            resurrection: PaneResurrectionSnapshot::default(),
+        };
+
+        let resolved = resolve_pane_launch(&pane_meta, "sh").expect("explicit launch metadata");
+
+        assert_eq!(resolved.shell, pane_meta.shell);
+        assert!(!resolved.metadata_changed);
+    }
+
+    #[test]
+    fn runtime_notice_updates_grid_and_fanout() {
+        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(Uuid::new_v4());
+        let output = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(4096)));
+        let grid = Arc::new(std::sync::Mutex::new(
+            TerminalGridStream::new(80, 24, GridLimits::default()).unwrap(),
+        ));
+        let dirty = Arc::new(AtomicBool::new(false));
+
+        push_pane_runtime_notice(
+            session_id,
+            pane_id,
+            &output,
+            &grid,
+            &dirty,
+            "pane failed visibly",
+        );
+
+        assert!(dirty.load(Ordering::SeqCst));
+        assert!(
+            output
+                .lock()
+                .unwrap()
+                .read_recent_with_offsets(4096)
+                .bytes
+                .windows(b"pane failed visibly".len())
+                .any(|window| window == b"pane failed visibly")
+        );
+        let snapshot = grid.lock().unwrap().snapshot(0, 24);
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        assert!(
+            encoded
+                .windows(b"pane failed visibly".len())
+                .any(|window| window == b"pane failed visibly")
+        );
+    }
+
+    #[test]
+    fn resolved_launch_heals_pane_metadata() {
+        let mut pane_meta = PaneRuntimeMeta {
+            id: Uuid::new_v4(),
+            name: None,
+            shell: "/missing/zsh".to_string(),
+            launch: None,
+            resurrection: PaneResurrectionSnapshot {
+                active_command: Some("zsh-only-command".to_string()),
+                active_command_source: Some(PaneCommandSource::Verbatim),
+                last_known_cwd: Some("/missing/cwd".to_string()),
+            },
+        };
+        let resolved = ResolvedPaneLaunch {
+            shell: "/bin/sh".to_string(),
+            cwd: None,
+            replay_command: None,
+            metadata_changed: true,
+        };
+
+        apply_resolved_pane_launch(&mut pane_meta, &resolved);
+
+        assert_eq!(pane_meta.shell, "/bin/sh");
+        assert_eq!(pane_meta.resurrection.last_known_cwd, None);
+        assert_eq!(pane_meta.resurrection.active_command, None);
+        assert_eq!(pane_meta.resurrection.active_command_source, None);
+    }
+
+    #[test]
+    fn explicit_launch_validation_rejects_empty_program_and_missing_cwd() {
+        let empty_program = PaneLaunchSpec {
+            program: " ".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        assert!(
+            validate_explicit_launch(&empty_program)
+                .unwrap_err()
+                .to_string()
+                .contains("program is empty")
+        );
+
+        let missing_cwd = PaneLaunchSpec {
+            program: "custom-program".to_string(),
+            args: Vec::new(),
+            cwd: Some(
+                std::env::temp_dir()
+                    .join(Uuid::new_v4().to_string())
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            env: BTreeMap::new(),
+        };
+        assert!(
+            validate_explicit_launch(&missing_cwd)
+                .unwrap_err()
+                .to_string()
+                .contains("cwd is unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_session_restore_heals_stale_shells_in_persistence_snapshot() {
+        let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let stale_shell = if cfg!(windows) {
+            r"C:\definitely\missing\cmd.exe"
+        } else {
+            "/definitely/missing/sh"
+        };
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            configured_shell.to_string(),
+            "xterm-256color".to_string(),
+            ProtocolProfile::Bmux,
+            true,
+            None,
+            pane_exit_tx,
+        );
+        let session_ids = [SessionId(Uuid::new_v4()), SessionId(Uuid::new_v4())];
+        let mut expected_pane_ids = BTreeMap::new();
+
+        for session_id in session_ids {
+            let pane_ids = [Uuid::new_v4(), Uuid::new_v4()];
+            let panes = pane_ids.map(|id| PaneRuntimeMeta {
+                id,
+                name: None,
+                shell: stale_shell.to_string(),
+                launch: None,
+                resurrection: PaneResurrectionSnapshot {
+                    active_command: None,
+                    active_command_source: None,
+                    last_known_cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                },
+            });
+            manager
+                .restore_runtime(session_id, &panes, None, pane_ids[0], Vec::new(), None)
+                .expect("restore stale pane metadata");
+            expected_pane_ids.insert(session_id, pane_ids);
+        }
+
+        let manager = Arc::new(Mutex::new(manager));
+        let handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
+            ServerSessionRuntimeAdapter::new(Arc::clone(&manager)),
+        );
+        for session_id in session_ids {
+            let snapshot = handle
+                .0
+                .snapshot_session_runtime_for_persistence(session_id)
+                .expect("build persistence snapshot")
+                .expect("restored session runtime");
+            let expected = expected_pane_ids[&session_id];
+            assert_eq!(snapshot.panes.len(), expected.len());
+            assert!(
+                snapshot
+                    .panes
+                    .iter()
+                    .all(|pane| expected.contains(&pane.id) && pane.shell == configured_shell)
+            );
+        }
+
+        let removed = manager.lock().expect("manager lock").remove_all_runtimes();
+        for runtime in removed {
+            shutdown_runtime_handle(runtime).await;
+        }
+    }
+
+    #[test]
+    fn pane_input_handle_rejects_exited_pane() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let handle = PaneInputHandle {
+            session_id: SessionId(Uuid::new_v4()),
+            input_tx,
+            exited: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert_eq!(
+            handle.send_input(b"ignored".to_vec()),
+            Err(SessionRuntimeError::Closed)
+        );
     }
 
     #[test]
