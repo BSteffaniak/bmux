@@ -1,12 +1,13 @@
 //! Smoke tests for the BPDL-generated cluster plugin contract.
 
 use bmux_cluster_plugin_api::{
-    cluster_command, cluster_connection_events, cluster_query,
+    cluster_command, cluster_connection_events, cluster_peer_auth, cluster_query,
     cluster_types::{
         ClusterConnectionEvent, ClusterConnectionState, ClusterConsensusRole, ClusterHostState,
         ClusterHostStatus, ClusterIdentity, ClusterJoinResult, ClusterLaunchStatus,
         ClusterLeaveResult, ClusterMember, ClusterMemberList, ClusterMemberState,
-        ClusterNodeCapabilities, ClusterPaneMutationResult, ClusterUpResult, EnrollmentTokenResult,
+        ClusterNegotiatedProtocol, ClusterNodeCapabilities, ClusterPaneMutationResult,
+        ClusterProtocolOffer, ClusterUpResult, EnrollmentTokenResult,
     },
 };
 
@@ -31,11 +32,33 @@ fn cluster_command_results_round_trip() {
         worker: true,
         ingress: true,
     };
+    let protocol = ClusterProtocolOffer {
+        wire_epoch: 3,
+        peer_revision_min: 1,
+        peer_revision_max: 1,
+        schema_version_min: 1,
+        schema_version_max: 1,
+        plugin_version: "1.0.0".to_string(),
+        features: vec![
+            "membership-credential-v1".to_string(),
+            "node-possession-proof-v1".to_string(),
+            "single-use-enrollment-v1".to_string(),
+        ],
+    };
+    let negotiated = ClusterNegotiatedProtocol {
+        wire_epoch: 3,
+        peer_revision: 1,
+        schema_version: 1,
+        local_plugin_version: "1.0.0".to_string(),
+        remote_plugin_version: "1.0.0".to_string(),
+        features: protocol.features.clone(),
+    };
     let identity = ClusterIdentity {
         cluster_id: Some("cluster:0194f776-7c0d-7000-8000-000000000000".to_string()),
         node_id: format!("node:{}", "0".repeat(64)),
         public_key: "0".repeat(64),
         capabilities: Some(capabilities.clone()),
+        protocol,
     };
     let identity_json = serde_json::to_string(&identity).expect("identity should serialize");
     assert_eq!(
@@ -50,6 +73,13 @@ fn cluster_command_results_round_trip() {
         public_key: identity.public_key.clone(),
         endpoint: Some("node-a".to_string()),
         capabilities,
+        credential_serial: "credential-1".to_string(),
+        credential_issuer_node_id: identity.node_id.clone(),
+        credential_issuer_public_key: identity.public_key.clone(),
+        credential_issued_at_unix_ms: 1,
+        credential_expires_at_unix_ms: 3,
+        credential_signature: "00".repeat(64),
+        negotiated_protocol: negotiated,
         joined_at_unix_ms: 1,
         updated_at_unix_ms: 2,
         state: ClusterMemberState::Active,
@@ -133,6 +163,7 @@ fn cluster_connection_event_round_trips() {
 fn interface_ids_and_operations_match_schema() {
     assert_eq!(cluster_query::INTERFACE_ID, "cluster-query/v1");
     assert_eq!(cluster_command::INTERFACE_ID, "cluster-command/v1");
+    assert_eq!(cluster_peer_auth::INTERFACE_ID, "cluster-peer-auth/v1");
     assert_eq!(
         cluster_connection_events::INTERFACE_ID,
         "cluster-connection-events/v1"
@@ -150,6 +181,9 @@ fn interface_ids_and_operations_match_schema() {
     assert_eq!(cluster_command::OP_LEAVE, "leave");
     assert_eq!(cluster_command::OP_ACCEPT_LEAVE, "accept_leave");
     assert_eq!(cluster_command::OP_PANE_MOVE, "pane_move");
+    assert_eq!(cluster_peer_auth::OP_CHALLENGE, "challenge");
+    assert_eq!(cluster_peer_auth::OP_PROVE, "prove");
+    assert_eq!(cluster_peer_auth::OP_AUTHENTICATE, "authenticate");
     assert_eq!(cluster_connection_events::OP_LIST, "list");
 }
 
@@ -157,5 +191,5 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 3);
+    assert_eq!(services.len(), 4);
 }

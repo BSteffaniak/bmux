@@ -1,3 +1,4 @@
+use bmux_cluster_plugin_api::cluster_types::AuthenticatedPeer;
 use bmux_connections_plugin_api::{
     connection_types::{InvocationOptions, ServiceInvocation, ServiceInvokeKind},
     connections_commands,
@@ -82,6 +83,33 @@ where
             })
         }
     }
+}
+
+pub async fn mutually_authenticate_endpoint<C>(
+    caller: &C,
+    endpoint: &str,
+    local_node_id: &str,
+) -> Result<AuthenticatedPeer, String>
+where
+    C: ServiceCaller + Sync + ?Sized,
+{
+    let mut remote = EndpointDispatchClient::new(caller, endpoint);
+    let challenge = bmux_cluster_plugin_api::cluster_peer_auth::client::challenge(
+        &mut remote,
+        local_node_id.to_string(),
+    )
+    .await
+    .map_err(|error| format!("remote peer challenge failed: {error}"))?;
+
+    let mut local = ServiceCallerDispatchClient::new(caller);
+    let proof = bmux_cluster_plugin_api::cluster_peer_auth::client::prove(&mut local, challenge)
+        .await
+        .map_err(|error| format!("local peer proof failed: {error}"))?;
+
+    let mut remote = EndpointDispatchClient::new(caller, endpoint);
+    bmux_cluster_plugin_api::cluster_peer_auth::client::authenticate(&mut remote, proof)
+        .await
+        .map_err(|error| format!("remote peer authentication failed: {error}"))
 }
 
 #[cfg(test)]

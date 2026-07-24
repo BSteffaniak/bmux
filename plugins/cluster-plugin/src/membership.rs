@@ -13,9 +13,25 @@ pub const NODE_IDENTITY_STORAGE_KEY: &str = "cluster.identity.node.v1";
 
 pub const MEMBERSHIP_STATE_STORAGE_KEY: &str = "cluster.membership.state.v1";
 pub const PENDING_LEAVE_STORAGE_KEY: &str = "cluster.membership.pending_leave.v1";
+const PEER_AUTH_STATE_STORAGE_KEY: &str = "cluster.peer_auth.state.v1";
+const PEER_AUTH_PROTOCOL_VERSION: u16 = 1;
+const PEER_AUTH_CHALLENGE_TTL_MS: u64 = 30_000;
+const MAX_PEER_AUTH_CLOCK_SKEW_MS: u64 = 5_000;
+const MAX_PEER_AUTH_TRACKED_ENTRIES: usize = 1_024;
 const DEFAULT_ENROLLMENT_TTL_MS: u64 = 10 * 60 * 1_000;
-const MAX_ENROLLMENT_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_ENROLLMENT_TTL_MS: u64 = 10 * 60 * 1_000;
+const MEMBERSHIP_CREDENTIAL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const ENROLLMENT_TOKEN_PREFIX: &str = "bmux-enroll-v1";
+const CLUSTER_PEER_REVISION_MIN: u32 = 1;
+const CLUSTER_PEER_REVISION_MAX: u32 = 1;
+const CLUSTER_SCHEMA_VERSION_MIN: u32 = 1;
+const CLUSTER_SCHEMA_VERSION_MAX: u32 = 1;
+const CLUSTER_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
+    "membership-credential-v1",
+    "node-possession-proof-v1",
+    "single-use-enrollment-v1",
+];
 
 pub const fn initializer_capabilities() -> ClusterNodeCapabilities {
     ClusterNodeCapabilities {
@@ -31,6 +47,102 @@ pub const fn default_join_capabilities() -> ClusterNodeCapabilities {
         worker: true,
         ingress: false,
     }
+}
+
+#[must_use]
+pub fn current_protocol_offer() -> ClusterProtocolOffer {
+    ClusterProtocolOffer {
+        wire_epoch: bmux_ipc::CURRENT_WIRE_EPOCH,
+        peer_revision_min: CLUSTER_PEER_REVISION_MIN,
+        peer_revision_max: CLUSTER_PEER_REVISION_MAX,
+        schema_version_min: CLUSTER_SCHEMA_VERSION_MIN,
+        schema_version_max: CLUSTER_SCHEMA_VERSION_MAX,
+        plugin_version: CLUSTER_PLUGIN_VERSION.to_string(),
+        features: CLUSTER_PROTOCOL_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect(),
+    }
+}
+
+fn negotiate_protocol(
+    local: &ClusterProtocolOffer,
+    remote: &ClusterProtocolOffer,
+) -> Result<ClusterNegotiatedProtocol, String> {
+    validate_protocol_offer(local, "local")?;
+    validate_protocol_offer(remote, "joining")?;
+    if local.wire_epoch != remote.wire_epoch {
+        return Err(format!(
+            "incompatible cluster wire epoch: local={} joining={}",
+            local.wire_epoch, remote.wire_epoch
+        ));
+    }
+    let peer_revision_min = local.peer_revision_min.max(remote.peer_revision_min);
+    let peer_revision = local.peer_revision_max.min(remote.peer_revision_max);
+    if peer_revision_min > peer_revision {
+        return Err(format!(
+            "no compatible cluster peer revision: local={}..={} joining={}..={}",
+            local.peer_revision_min,
+            local.peer_revision_max,
+            remote.peer_revision_min,
+            remote.peer_revision_max
+        ));
+    }
+    let schema_version_min = local.schema_version_min.max(remote.schema_version_min);
+    let schema_version = local.schema_version_max.min(remote.schema_version_max);
+    if schema_version_min > schema_version {
+        return Err(format!(
+            "no compatible cluster schema version: local={}..={} joining={}..={}",
+            local.schema_version_min,
+            local.schema_version_max,
+            remote.schema_version_min,
+            remote.schema_version_max
+        ));
+    }
+    for required in CLUSTER_PROTOCOL_FEATURES {
+        if !remote.features.iter().any(|feature| feature == required) {
+            return Err(format!(
+                "joining node is missing mandatory cluster feature '{required}'"
+            ));
+        }
+    }
+    let mut features = local
+        .features
+        .iter()
+        .filter(|feature| remote.features.contains(feature))
+        .cloned()
+        .collect::<Vec<_>>();
+    features.sort();
+    features.dedup();
+    Ok(ClusterNegotiatedProtocol {
+        wire_epoch: local.wire_epoch,
+        peer_revision,
+        schema_version,
+        local_plugin_version: local.plugin_version.clone(),
+        remote_plugin_version: remote.plugin_version.clone(),
+        features,
+    })
+}
+
+fn validate_protocol_offer(offer: &ClusterProtocolOffer, source: &str) -> Result<(), String> {
+    if offer.peer_revision_min == 0 || offer.peer_revision_min > offer.peer_revision_max {
+        return Err(format!("{source} cluster peer revision range is invalid"));
+    }
+    if offer.schema_version_min == 0 || offer.schema_version_min > offer.schema_version_max {
+        return Err(format!("{source} cluster schema version range is invalid"));
+    }
+    if offer.plugin_version.trim().is_empty() || offer.plugin_version.len() > 128 {
+        return Err(format!("{source} cluster plugin version is invalid"));
+    }
+    if offer.features.len() > 128
+        || offer
+            .features
+            .iter()
+            .any(|feature| feature.is_empty() || feature.len() > 128)
+    {
+        return Err(format!("{source} cluster feature advertisement is invalid"));
+    }
+    Ok(())
 }
 
 static IDENTITY_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -166,6 +278,30 @@ pub struct EnrollmentClaims {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct NodePossessionClaims {
+    version: u8,
+    token_nonce: String,
+    cluster_id: String,
+    node_id: String,
+    public_key: String,
+    endpoint: Option<String>,
+    protocol: ClusterProtocolOffer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MembershipCredentialClaims {
+    version: u8,
+    serial: String,
+    cluster_id: String,
+    node_id: String,
+    public_key: String,
+    capabilities: ClusterNodeCapabilities,
+    negotiated_protocol: ClusterNegotiatedProtocol,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedEnrollmentToken {
     pub claims: EnrollmentClaims,
     pub signature: Vec<u8>,
@@ -184,6 +320,19 @@ struct PendingLeave {
     transaction: String,
     cluster: String,
     node: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PeerAuthState {
+    version: u16,
+    challenges: BTreeMap<String, StoredPeerAuthChallenge>,
+    consumed: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPeerAuthChallenge {
+    challenge: PeerAuthChallenge,
+    claimant_node_id: String,
 }
 
 pub fn adopt_join_result(
@@ -248,6 +397,7 @@ fn existing_join_result(
                 .members
                 .get(&token.claims.issuer_node_id)
                 .map(|issuer| issuer.capabilities.clone()),
+            protocol: current_protocol_offer(),
         },
         member,
         members: state.members.into_values().collect(),
@@ -392,6 +542,17 @@ fn validate_join_result(
     {
         return Err("issuer response identity does not match enrollment token".to_string());
     }
+    let expected_protocol =
+        negotiate_protocol(&current_protocol_offer(), &result.identity.protocol)?;
+    if result.member.negotiated_protocol != expected_protocol {
+        return Err("issuer returned a different negotiated protocol".to_string());
+    }
+    verify_membership_credential(&result.member, now_unix_ms())?;
+    if result.member.credential_issuer_node_id != token.claims.issuer_node_id
+        || result.member.credential_issuer_public_key != token.claims.issuer_public_key
+    {
+        return Err("membership credential issuer does not match enrollment token".to_string());
+    }
     if result.member.node_id != local_identity.node_id().to_string()
         || result.member.public_key != local_identity.public_key().to_string()
         || result.member.cluster_id != token.claims.cluster_id
@@ -425,6 +586,435 @@ pub fn canonical_leave_claims(claims: &LeaveClaims) -> Result<Vec<u8>, String> {
     serde_json::to_vec(claims).map_err(|error| format!("failed encoding leave claims: {error}"))
 }
 
+fn canonical_possession_claims(claims: &NodePossessionClaims) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(claims)
+        .map_err(|error| format!("failed encoding node possession claims: {error}"))
+}
+
+fn canonical_membership_credential_claims(
+    claims: &MembershipCredentialClaims,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(claims)
+        .map_err(|error| format!("failed encoding membership credential claims: {error}"))
+}
+
+pub fn canonical_peer_challenge(challenge: &PeerAuthChallenge) -> Result<Vec<u8>, String> {
+    #[derive(Serialize)]
+    struct UnsignedPeerChallenge<'a> {
+        protocol_version: u16,
+        cluster_id: &'a str,
+        verifier_node_id: &'a str,
+        verifier_credential_serial: &'a str,
+        audience_node_id: &'a str,
+        nonce: &'a str,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    }
+    serde_json::to_vec(&UnsignedPeerChallenge {
+        protocol_version: challenge.protocol_version,
+        cluster_id: &challenge.cluster_id,
+        verifier_node_id: &challenge.verifier_node_id,
+        verifier_credential_serial: &challenge.verifier_credential_serial,
+        audience_node_id: &challenge.audience_node_id,
+        nonce: &challenge.nonce,
+        issued_at_unix_ms: challenge.issued_at_unix_ms,
+        expires_at_unix_ms: challenge.expires_at_unix_ms,
+    })
+    .map_err(|error| format!("failed encoding peer authentication challenge: {error}"))
+}
+
+pub fn canonical_peer_proof(proof: &PeerAuthProof) -> Result<Vec<u8>, String> {
+    #[derive(Serialize)]
+    struct UnsignedPeerProof<'a> {
+        challenge: &'a PeerAuthChallenge,
+        claimant_node_id: &'a str,
+        claimant_credential_serial: &'a str,
+    }
+    serde_json::to_vec(&UnsignedPeerProof {
+        challenge: &proof.challenge,
+        claimant_node_id: &proof.claimant_node_id,
+        claimant_credential_serial: &proof.claimant_credential_serial,
+    })
+    .map_err(|error| format!("failed encoding peer authentication proof: {error}"))
+}
+
+pub fn create_peer_auth_challenge(
+    caller: &impl ClusterRuntimeOps,
+    request: &ClusterPeerChallengeRequest,
+) -> Result<PeerAuthChallenge, String> {
+    let claimant_node_id = request.claimant_node_id.parse::<NodeId>()?.to_string();
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "peer authentication requires a local node identity".to_string())?;
+    let membership = require_membership_state(caller, cluster_id)?;
+    let verifier =
+        active_valid_member(&membership, &identity.node_id().to_string(), now_unix_ms())?;
+    active_valid_member(&membership, &claimant_node_id, now_unix_ms())?;
+    let now = now_unix_ms();
+    let mut challenge = PeerAuthChallenge {
+        protocol_version: PEER_AUTH_PROTOCOL_VERSION,
+        cluster_id: cluster_id.to_string(),
+        verifier_node_id: identity.node_id().to_string(),
+        verifier_credential_serial: verifier.credential_serial.clone(),
+        audience_node_id: claimant_node_id.clone(),
+        nonce: Uuid::new_v4().to_string(),
+        issued_at_unix_ms: now,
+        expires_at_unix_ms: now
+            .checked_add(PEER_AUTH_CHALLENGE_TTL_MS)
+            .ok_or_else(|| "peer authentication challenge expiry overflow".to_string())?,
+        signature: String::new(),
+    };
+    challenge.signature = encode_hex(&identity.sign(&canonical_peer_challenge(&challenge)?));
+    let _guard = identity_init_guard()?;
+    let mut auth_state = load_peer_auth_state(caller)?;
+    prune_peer_auth_state(&mut auth_state, now);
+    auth_state.challenges.insert(
+        challenge.nonce.clone(),
+        StoredPeerAuthChallenge {
+            challenge: challenge.clone(),
+            claimant_node_id,
+        },
+    );
+    enforce_peer_auth_state_bound(&mut auth_state);
+    store_peer_auth_state(caller, &auth_state)?;
+    Ok(challenge)
+}
+
+pub fn create_peer_auth_proof(
+    caller: &impl ClusterRuntimeOps,
+    challenge: PeerAuthChallenge,
+) -> Result<PeerAuthProof, String> {
+    let now = now_unix_ms();
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "peer authentication requires a local node identity".to_string())?;
+    let membership = require_membership_state(caller, cluster_id)?;
+    let claimant = active_valid_member(&membership, &identity.node_id().to_string(), now)?;
+    validate_peer_auth_challenge(
+        &challenge,
+        &membership,
+        &identity.node_id().to_string(),
+        now,
+    )?;
+    let mut proof = PeerAuthProof {
+        challenge,
+        claimant_node_id: identity.node_id().to_string(),
+        claimant_credential_serial: claimant.credential_serial.clone(),
+        claimant_signature: String::new(),
+    };
+    proof.claimant_signature = encode_hex(&identity.sign(&canonical_peer_proof(&proof)?));
+    Ok(proof)
+}
+
+pub fn authenticate_peer(
+    caller: &impl ClusterRuntimeOps,
+    request: &ClusterPeerAuthenticateRequest,
+) -> Result<AuthenticatedPeer, String> {
+    let proof = &request.proof;
+    let now = now_unix_ms();
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "peer authentication requires a local node identity".to_string())?;
+    let membership = require_membership_state(caller, cluster_id)?;
+    validate_peer_auth_challenge(&proof.challenge, &membership, &proof.claimant_node_id, now)?;
+    if proof.challenge.verifier_node_id != identity.node_id().to_string() {
+        return Err("peer authentication challenge targets a different verifier".to_string());
+    }
+    if proof.challenge.audience_node_id != proof.claimant_node_id {
+        return Err("peer authentication proof has the wrong audience".to_string());
+    }
+    let claimant = active_valid_member(&membership, &proof.claimant_node_id, now)?;
+    if proof.claimant_credential_serial != claimant.credential_serial {
+        return Err("peer authentication proof uses a stale claimant credential".to_string());
+    }
+    let claimant_key = claimant
+        .public_key
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| format!("claimant membership public key is invalid: {error}"))?;
+    let claimant_signature_bytes = decode_hex(&proof.claimant_signature)
+        .map_err(|error| format!("invalid peer authentication proof signature: {error}"))?;
+    let claimant_signature = iroh::Signature::try_from(claimant_signature_bytes.as_slice())
+        .map_err(|error| format!("invalid peer authentication proof signature: {error}"))?;
+    claimant_key
+        .verify(&canonical_peer_proof(proof)?, &claimant_signature)
+        .map_err(|_| "peer authentication proof signature verification failed".to_string())?;
+
+    let _guard = identity_init_guard()?;
+    let mut auth_state = load_peer_auth_state(caller)?;
+    prune_peer_auth_state(&mut auth_state, now);
+    if auth_state.consumed.contains_key(&proof.challenge.nonce) {
+        return Err("peer authentication challenge was already consumed".to_string());
+    }
+    let stored = auth_state
+        .challenges
+        .remove(&proof.challenge.nonce)
+        .ok_or_else(|| "peer authentication challenge is unknown or expired".to_string())?;
+    if stored.challenge != proof.challenge || stored.claimant_node_id != proof.claimant_node_id {
+        return Err("peer authentication challenge does not match issued state".to_string());
+    }
+    auth_state.consumed.insert(
+        proof.challenge.nonce.clone(),
+        proof.challenge.expires_at_unix_ms,
+    );
+    enforce_peer_auth_state_bound(&mut auth_state);
+    store_peer_auth_state(caller, &auth_state)?;
+    Ok(AuthenticatedPeer {
+        cluster_id: cluster_id.to_string(),
+        node_id: claimant.node_id.clone(),
+        capabilities: claimant.capabilities.clone(),
+        credential_serial: claimant.credential_serial.clone(),
+        authenticated_at_unix_ms: now,
+    })
+}
+
+fn validate_peer_auth_challenge(
+    challenge: &PeerAuthChallenge,
+    membership: &MembershipState,
+    expected_audience: &str,
+    now: u64,
+) -> Result<(), String> {
+    if challenge.protocol_version != PEER_AUTH_PROTOCOL_VERSION {
+        return Err("unsupported peer authentication protocol version".to_string());
+    }
+    if challenge.cluster_id != membership.cluster_id {
+        return Err("peer authentication challenge belongs to a different cluster".to_string());
+    }
+    if challenge.audience_node_id != expected_audience {
+        return Err("peer authentication challenge has the wrong audience".to_string());
+    }
+    if challenge.issued_at_unix_ms > now.saturating_add(MAX_PEER_AUTH_CLOCK_SKEW_MS) {
+        return Err("peer authentication challenge was issued in the future".to_string());
+    }
+    if challenge.expires_at_unix_ms < now
+        || challenge
+            .expires_at_unix_ms
+            .saturating_sub(challenge.issued_at_unix_ms)
+            > PEER_AUTH_CHALLENGE_TTL_MS
+    {
+        return Err("peer authentication challenge is expired or has invalid validity".to_string());
+    }
+    let verifier = active_valid_member(membership, &challenge.verifier_node_id, now)?;
+    if verifier.credential_serial != challenge.verifier_credential_serial {
+        return Err("peer authentication challenge uses a stale verifier credential".to_string());
+    }
+    let verifier_key = verifier
+        .public_key
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| format!("verifier membership public key is invalid: {error}"))?;
+    let signature_bytes = decode_hex(&challenge.signature)
+        .map_err(|error| format!("invalid peer authentication challenge signature: {error}"))?;
+    let signature = iroh::Signature::try_from(signature_bytes.as_slice())
+        .map_err(|error| format!("invalid peer authentication challenge signature: {error}"))?;
+    verifier_key
+        .verify(&canonical_peer_challenge(challenge)?, &signature)
+        .map_err(|_| "peer authentication challenge signature verification failed".to_string())
+}
+
+fn active_valid_member<'a>(
+    membership: &'a MembershipState,
+    node_id: &str,
+    now: u64,
+) -> Result<&'a ClusterMember, String> {
+    let member = membership
+        .members
+        .get(node_id)
+        .ok_or_else(|| "peer is not a cluster member".to_string())?;
+    if member.state != ClusterMemberState::Active {
+        return Err("peer membership is not active".to_string());
+    }
+    verify_membership_credential(member, now)?;
+    Ok(member)
+}
+
+fn load_peer_auth_state(caller: &impl ClusterRuntimeOps) -> Result<PeerAuthState, String> {
+    let Some(value) = load_identity_record(caller, PEER_AUTH_STATE_STORAGE_KEY)? else {
+        return Ok(PeerAuthState {
+            version: PEER_AUTH_PROTOCOL_VERSION,
+            ..PeerAuthState::default()
+        });
+    };
+    let state = serde_json::from_slice::<PeerAuthState>(&value)
+        .map_err(|error| format!("peer authentication state is corrupt: {error}"))?;
+    if state.version != PEER_AUTH_PROTOCOL_VERSION {
+        return Err("unsupported peer authentication state version".to_string());
+    }
+    Ok(state)
+}
+
+fn store_peer_auth_state(
+    caller: &impl ClusterRuntimeOps,
+    state: &PeerAuthState,
+) -> Result<(), String> {
+    store_identity_record(caller, PEER_AUTH_STATE_STORAGE_KEY, state)
+}
+
+fn prune_peer_auth_state(state: &mut PeerAuthState, now: u64) {
+    state
+        .challenges
+        .retain(|_, stored| stored.challenge.expires_at_unix_ms >= now);
+    state.consumed.retain(|_, expires_at| *expires_at >= now);
+}
+
+fn enforce_peer_auth_state_bound(state: &mut PeerAuthState) {
+    while state.challenges.len() + state.consumed.len() > MAX_PEER_AUTH_TRACKED_ENTRIES {
+        let oldest_challenge = state
+            .challenges
+            .iter()
+            .min_by_key(|(_, stored)| stored.challenge.expires_at_unix_ms)
+            .map(|(nonce, stored)| (nonce.clone(), stored.challenge.expires_at_unix_ms));
+        let oldest_consumed = state
+            .consumed
+            .iter()
+            .min_by_key(|(_, expires_at)| **expires_at)
+            .map(|(nonce, expires_at)| (nonce.clone(), *expires_at));
+        match (oldest_challenge, oldest_consumed) {
+            (Some((nonce, challenge_expiry)), Some((consumed_nonce, consumed_expiry))) => {
+                if challenge_expiry <= consumed_expiry {
+                    state.challenges.remove(&nonce);
+                } else {
+                    state.consumed.remove(&consumed_nonce);
+                }
+            }
+            (Some((nonce, _)), None) => {
+                state.challenges.remove(&nonce);
+            }
+            (None, Some((nonce, _))) => {
+                state.consumed.remove(&nonce);
+            }
+            (None, None) => break,
+        }
+    }
+}
+
+pub fn create_enrollment_possession_proof(
+    caller: &impl ClusterRuntimeOps,
+    token: &SignedEnrollmentToken,
+    endpoint: Option<String>,
+    protocol: &ClusterProtocolOffer,
+) -> Result<Vec<u8>, String> {
+    let identity = load_or_create_node_identity(caller)?;
+    let claims = NodePossessionClaims {
+        version: CLUSTER_IDENTITY_VERSION,
+        token_nonce: token.claims.nonce.clone(),
+        cluster_id: token.claims.cluster_id.clone(),
+        node_id: identity.node_id().to_string(),
+        public_key: identity.public_key().to_string(),
+        endpoint,
+        protocol: protocol.clone(),
+    };
+    Ok(identity.sign(&canonical_possession_claims(&claims)?))
+}
+
+fn verify_enrollment_possession(
+    token: &SignedEnrollmentToken,
+    request: &ClusterCommandRedeemEnrollmentRequest,
+    public_key: iroh::PublicKey,
+) -> Result<(), String> {
+    let claims = NodePossessionClaims {
+        version: CLUSTER_IDENTITY_VERSION,
+        token_nonce: token.claims.nonce.clone(),
+        cluster_id: token.claims.cluster_id.clone(),
+        node_id: request.node_id.clone(),
+        public_key: request.public_key.clone(),
+        endpoint: request.endpoint.clone(),
+        protocol: request.protocol.clone(),
+    };
+    let signature = iroh::Signature::try_from(request.possession_signature.as_slice())
+        .map_err(|error| format!("invalid node possession signature: {error}"))?;
+    public_key
+        .verify(&canonical_possession_claims(&claims)?, &signature)
+        .map_err(|_| "joining node possession proof verification failed".to_string())
+}
+
+fn issue_membership_credential(
+    issuer: &NodeIdentity,
+    cluster_id: ClusterId,
+    node_id: String,
+    public_key: String,
+    capabilities: ClusterNodeCapabilities,
+    negotiated_protocol: ClusterNegotiatedProtocol,
+    issued_at_unix_ms: u64,
+) -> Result<ClusterMember, String> {
+    let expires_at_unix_ms = issued_at_unix_ms
+        .checked_add(MEMBERSHIP_CREDENTIAL_TTL_MS)
+        .ok_or_else(|| "membership credential expiry overflow".to_string())?;
+    let claims = MembershipCredentialClaims {
+        version: CLUSTER_IDENTITY_VERSION,
+        serial: Uuid::new_v4().to_string(),
+        cluster_id: cluster_id.to_string(),
+        node_id: node_id.clone(),
+        public_key: public_key.clone(),
+        capabilities: capabilities.clone(),
+        negotiated_protocol: negotiated_protocol.clone(),
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    };
+    let signature = issuer.sign(&canonical_membership_credential_claims(&claims)?);
+    Ok(ClusterMember {
+        cluster_id: cluster_id.to_string(),
+        node_id,
+        public_key,
+        endpoint: None,
+        capabilities,
+        credential_serial: claims.serial,
+        credential_issuer_node_id: issuer.node_id().to_string(),
+        credential_issuer_public_key: issuer.public_key().to_string(),
+        credential_issued_at_unix_ms: issued_at_unix_ms,
+        credential_expires_at_unix_ms: expires_at_unix_ms,
+        credential_signature: encode_hex(&signature),
+        negotiated_protocol,
+        joined_at_unix_ms: issued_at_unix_ms,
+        updated_at_unix_ms: issued_at_unix_ms,
+        state: ClusterMemberState::Active,
+    })
+}
+
+pub fn verify_membership_credential(
+    member: &ClusterMember,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    let issued_at_unix_ms = member.credential_issued_at_unix_ms;
+    let expires_at_unix_ms = member.credential_expires_at_unix_ms;
+    if expires_at_unix_ms < now_unix_ms {
+        return Err("membership credential has expired".to_string());
+    }
+    if issued_at_unix_ms > now_unix_ms || issued_at_unix_ms >= expires_at_unix_ms {
+        return Err("membership credential validity interval is invalid".to_string());
+    }
+    let issuer_node_id = member.credential_issuer_node_id.parse::<NodeId>()?;
+    let issuer_public_key = member
+        .credential_issuer_public_key
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| format!("invalid membership credential issuer key: {error}"))?;
+    if issuer_node_id.to_string() != format!("node:{issuer_public_key}") {
+        return Err("membership credential issuer node ID does not match public key".to_string());
+    }
+    let claims = MembershipCredentialClaims {
+        version: CLUSTER_IDENTITY_VERSION,
+        serial: member.credential_serial.clone(),
+        cluster_id: member.cluster_id.clone(),
+        node_id: member.node_id.clone(),
+        public_key: member.public_key.clone(),
+        capabilities: member.capabilities.clone(),
+        negotiated_protocol: member.negotiated_protocol.clone(),
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    };
+    let signature_bytes = decode_hex(&member.credential_signature)
+        .map_err(|error| format!("invalid membership credential signature: {error}"))?;
+    let signature = iroh::Signature::try_from(signature_bytes.as_slice())
+        .map_err(|error| format!("invalid membership credential signature: {error}"))?;
+    issuer_public_key
+        .verify(
+            &canonical_membership_credential_claims(&claims)?,
+            &signature,
+        )
+        .map_err(|_| "membership credential signature verification failed".to_string())
+}
+
 pub fn initialize_cluster(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<ClusterIdentityResponse, String> {
@@ -446,19 +1036,19 @@ pub fn initialize_cluster(
         return Err("membership state cluster ID does not match local cluster ID".to_string());
     }
     let now = now_unix_ms();
-    state
-        .members
-        .entry(node_identity.node_id().to_string())
-        .or_insert_with(|| ClusterMember {
-            cluster_id: cluster_id.to_string(),
-            node_id: node_identity.node_id().to_string(),
-            public_key: node_identity.public_key().to_string(),
-            endpoint: None,
-            capabilities: initializer_capabilities(),
-            joined_at_unix_ms: now,
-            updated_at_unix_ms: now,
-            state: ClusterMemberState::Active,
-        });
+    let node_id = node_identity.node_id().to_string();
+    if let std::collections::btree_map::Entry::Vacant(entry) = state.members.entry(node_id) {
+        let member = issue_membership_credential(
+            &node_identity,
+            cluster_id,
+            node_identity.node_id().to_string(),
+            node_identity.public_key().to_string(),
+            initializer_capabilities(),
+            negotiate_protocol(&current_protocol_offer(), &current_protocol_offer())?,
+            now,
+        )?;
+        entry.insert(member);
+    }
     let capabilities = state
         .members
         .get(&node_identity.node_id().to_string())
@@ -485,6 +1075,7 @@ pub fn current_node_identity(
         node_id: identity.node_id().to_string(),
         public_key: identity.public_key().to_string(),
         capabilities,
+        protocol: current_protocol_offer(),
     })
 }
 
@@ -599,6 +1190,8 @@ pub fn redeem_enrollment(
     if request_node_id.to_string() != format!("node:{request_public_key}") {
         return Err("joining node ID does not match joining public key".to_string());
     }
+    verify_enrollment_possession(&token, request, request_public_key)?;
+    let negotiated_protocol = negotiate_protocol(&current_protocol_offer(), &request.protocol)?;
     let _guard = identity_init_guard()?;
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "issuer cluster is not initialized".to_string())?;
@@ -635,6 +1228,7 @@ pub fn redeem_enrollment(
         if member.public_key != request.public_key
             || member.endpoint != request.endpoint
             || member.capabilities != token.claims.capabilities
+            || member.negotiated_protocol != negotiated_protocol
         {
             return Err("enrollment retry does not match the committed member".to_string());
         }
@@ -657,16 +1251,17 @@ pub fn redeem_enrollment(
         .members
         .get(&request.node_id)
         .map_or(now, |member| member.joined_at_unix_ms);
-    let member = ClusterMember {
-        cluster_id: cluster_id.to_string(),
-        node_id: request.node_id.clone(),
-        public_key: request.public_key.clone(),
-        endpoint: request.endpoint.clone(),
-        capabilities: token.claims.capabilities.clone(),
-        joined_at_unix_ms: joined_at,
-        updated_at_unix_ms: now,
-        state: ClusterMemberState::Active,
-    };
+    let mut member = issue_membership_credential(
+        &local_identity,
+        cluster_id,
+        request.node_id.clone(),
+        request.public_key.clone(),
+        token.claims.capabilities.clone(),
+        negotiated_protocol,
+        now,
+    )?;
+    member.endpoint.clone_from(&request.endpoint);
+    member.joined_at_unix_ms = joined_at;
     state
         .members
         .insert(request.node_id.clone(), member.clone());
@@ -695,6 +1290,7 @@ fn public_identity(
         node_id: identity.node_id().to_string(),
         public_key: identity.public_key().to_string(),
         capabilities,
+        protocol: current_protocol_offer(),
     }
 }
 
@@ -735,7 +1331,14 @@ fn migrate_legacy_member_capabilities(
     let issuer_endpoint_missing = value
         .get("issuer_endpoint")
         .is_none_or(serde_json::Value::is_null);
-    let local_node_id = load_node_identity(caller)?.map(|identity| identity.node_id().to_string());
+    let local_identity = load_node_identity(caller)?
+        .ok_or_else(|| "node identity is required to migrate membership state".to_string())?;
+    let local_node_id = local_identity.node_id().to_string();
+    let cluster_id = value
+        .get("cluster_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "legacy membership state omits cluster_id".to_string())?
+        .parse::<ClusterId>()?;
     let Some(members) = value
         .get_mut("members")
         .and_then(serde_json::Value::as_object_mut)
@@ -743,25 +1346,72 @@ fn migrate_legacy_member_capabilities(
         return Ok(false);
     };
     let mut migrated = false;
-    for (node_id, member) in members {
-        let Some(member) = member.as_object_mut() else {
+    for (node_id, member_value) in members {
+        let Some(member) = member_value.as_object_mut() else {
             continue;
         };
-        if member.contains_key("capabilities") {
-            continue;
-        }
-        let capabilities =
-            if issuer_endpoint_missing && local_node_id.as_deref() == Some(node_id.as_str()) {
+        if !member.contains_key("capabilities") {
+            let capabilities = if issuer_endpoint_missing && local_node_id == *node_id {
                 initializer_capabilities()
             } else {
                 default_join_capabilities()
             };
-        member.insert(
-            "capabilities".to_string(),
-            serde_json::to_value(capabilities)
-                .map_err(|error| format!("failed encoding migrated capabilities: {error}"))?,
-        );
-        migrated = true;
+            member.insert(
+                "capabilities".to_string(),
+                serde_json::to_value(capabilities)
+                    .map_err(|error| format!("failed encoding migrated capabilities: {error}"))?,
+            );
+            migrated = true;
+        }
+        if !member.contains_key("credential_serial") {
+            let public_key = member
+                .get("public_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "legacy member omits public_key".to_string())?
+                .to_string();
+            let capabilities = serde_json::from_value::<ClusterNodeCapabilities>(
+                member
+                    .get("capabilities")
+                    .cloned()
+                    .ok_or_else(|| "legacy member omits capabilities".to_string())?,
+            )
+            .map_err(|error| format!("legacy member capabilities are invalid: {error}"))?;
+            let endpoint = member
+                .get("endpoint")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            let joined_at_unix_ms = member
+                .get("joined_at_unix_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(now_unix_ms);
+            let updated_at_unix_ms = member
+                .get("updated_at_unix_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(joined_at_unix_ms);
+            let state = member
+                .get("state")
+                .cloned()
+                .map(serde_json::from_value::<ClusterMemberState>)
+                .transpose()
+                .map_err(|error| format!("legacy member state is invalid: {error}"))?
+                .unwrap_or(ClusterMemberState::Active);
+            let mut migrated_member = issue_membership_credential(
+                &local_identity,
+                cluster_id,
+                node_id.clone(),
+                public_key,
+                capabilities,
+                negotiate_protocol(&current_protocol_offer(), &current_protocol_offer())?,
+                now_unix_ms(),
+            )?;
+            migrated_member.endpoint = endpoint;
+            migrated_member.joined_at_unix_ms = joined_at_unix_ms;
+            migrated_member.updated_at_unix_ms = updated_at_unix_ms;
+            migrated_member.state = state;
+            *member_value = serde_json::to_value(migrated_member)
+                .map_err(|error| format!("failed encoding migrated member: {error}"))?;
+            migrated = true;
+        }
     }
     Ok(migrated)
 }
@@ -818,7 +1468,7 @@ pub fn decode_and_verify_enrollment_token(
     Ok(signed)
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub fn encode_hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;

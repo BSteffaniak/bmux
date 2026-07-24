@@ -58,6 +58,11 @@ interface_id = "cluster-command/v1"
 kind         = "command"
 
 [[services]]
+capability   = "bmux.server_clusters.auth"
+interface_id = "cluster-peer-auth/v1"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.server_clusters.read"
 interface_id = "cluster-connection-events/v1"
 kind         = "query"

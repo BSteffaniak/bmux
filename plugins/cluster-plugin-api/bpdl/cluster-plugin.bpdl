@@ -9,6 +9,7 @@ plugin bmux.cluster version 1;
 
 capability CLUSTER_READ = bmux.server_clusters.read;
 capability CLUSTER_WRITE = bmux.server_clusters.write;
+capability CLUSTER_AUTH = bmux.server_clusters.auth;
 
 interface cluster-types {
     enum cluster-host-state {
@@ -27,11 +28,31 @@ interface cluster-types {
         ingress: bool,
     }
 
+    record cluster-protocol-offer {
+        wire_epoch: u16,
+        peer_revision_min: u32,
+        peer_revision_max: u32,
+        schema_version_min: u32,
+        schema_version_max: u32,
+        plugin_version: string,
+        features: list<string>,
+    }
+
+    record cluster-negotiated-protocol {
+        wire_epoch: u16,
+        peer_revision: u32,
+        schema_version: u32,
+        local_plugin_version: string,
+        remote_plugin_version: string,
+        features: list<string>,
+    }
+
     record cluster-identity {
         cluster_id: string?,
         node_id: string,
         public_key: string,
         capabilities: cluster-node-capabilities?,
+        protocol: cluster-protocol-offer,
     }
 
     enum cluster-member-state {
@@ -45,6 +66,13 @@ interface cluster-types {
         public_key: string,
         endpoint: string?,
         capabilities: cluster-node-capabilities,
+        credential_serial: string,
+        credential_issuer_node_id: string,
+        credential_issuer_public_key: string,
+        credential_issued_at_unix_ms: u64,
+        credential_expires_at_unix_ms: u64,
+        credential_signature: string,
+        negotiated_protocol: cluster-negotiated-protocol,
         joined_at_unix_ms: u64,
         updated_at_unix_ms: u64,
         state: cluster-member-state,
@@ -64,6 +92,33 @@ interface cluster-types {
         identity: cluster-identity,
         member: cluster-member,
         members: list<cluster-member>,
+    }
+
+    record peer-auth-challenge {
+        protocol_version: u16,
+        cluster_id: string,
+        verifier_node_id: string,
+        verifier_credential_serial: string,
+        audience_node_id: string,
+        nonce: string,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        signature: string,
+    }
+
+    record peer-auth-proof {
+        challenge: peer-auth-challenge,
+        claimant_node_id: string,
+        claimant_credential_serial: string,
+        claimant_signature: string,
+    }
+
+    record authenticated-peer {
+        cluster_id: string,
+        node_id: string,
+        capabilities: cluster-node-capabilities,
+        credential_serial: string,
+        authenticated_at_unix_ms: u64,
     }
 
     record cluster-leave-request {
@@ -153,7 +208,7 @@ interface cluster-command {
     command init() -> cluster-types.cluster-identity;
     command enrollment_token_create(request_id: string, endpoint: string, ttl_ms: u64?, capabilities: cluster-types.cluster-node-capabilities?) -> cluster-types.enrollment-token-result;
     command join(token: string, issuer: string, enrollment_result: cluster-types.cluster-join-result) -> cluster-types.cluster-join-result;
-    command redeem_enrollment(token: string, node_id: string, public_key: string, endpoint: string?) -> cluster-types.cluster-join-result;
+    command redeem_enrollment(token: string, node_id: string, public_key: string, endpoint: string?, protocol: cluster-types.cluster-protocol-offer, possession_signature: bytes) -> cluster-types.cluster-join-result;
     command leave_prepare() -> cluster-types.cluster-leave-request;
     command leave(leave_id: string) -> cluster-types.cluster-leave-result;
     command accept_leave(leave_id: string, cluster_id: string, node_id: string, signature: bytes) -> cluster-types.cluster-leave-result;
@@ -161,6 +216,14 @@ interface cluster-command {
     command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
     command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;
     command pane_move(pane: string?, host: string) -> cluster-types.cluster-pane-mutation-result;
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-peer-auth {
+    command challenge(claimant_node_id: string) -> cluster-types.peer-auth-challenge;
+    command prove(challenge: cluster-types.peer-auth-challenge) -> cluster-types.peer-auth-proof;
+    command authenticate(proof: cluster-types.peer-auth-proof) -> cluster-types.authenticated-peer;
 }
 
 @capability(CLUSTER_READ)

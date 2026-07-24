@@ -73,6 +73,8 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
         ))
     })
     .map_err(|error| format!("local identity service dispatch failed: {error}"))?;
+    let possession_signature =
+        create_enrollment_possession_proof(context, &token, endpoint.clone(), &identity.protocol)?;
 
     let mut remote = endpoint::EndpointDispatchClient::new(context, issuer);
     let enrollment = tokio::task::block_in_place(|| {
@@ -83,6 +85,8 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
                 identity.node_id,
                 identity.public_key,
                 endpoint,
+                identity.protocol,
+                possession_signature,
             ),
         )
     })
@@ -98,6 +102,17 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
         ))
     })
     .map_err(|error| format!("local cluster join commit failed: {error}"))?;
+    let authenticated = tokio::task::block_in_place(|| {
+        handle.block_on(endpoint::mutually_authenticate_endpoint(
+            context,
+            issuer,
+            &result.member.node_id,
+        ))
+    })
+    .map_err(|error| format!("post-join mutual peer authentication failed: {error}"))?;
+    if authenticated.node_id != result.member.node_id {
+        return Err("post-join peer authentication returned the wrong claimant".to_string());
+    }
     println!(
         "joined cluster: cluster_id={} node_id={}",
         result.identity.cluster_id.as_deref().unwrap_or("-"),
@@ -116,6 +131,17 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
     .map_err(|error| format!("cluster leave prepare failed: {error}"))?;
 
     if let Some(issuer) = prepared.issuer_endpoint.as_deref() {
+        let authenticated = tokio::task::block_in_place(|| {
+            handle.block_on(endpoint::mutually_authenticate_endpoint(
+                context,
+                issuer,
+                &prepared.node_id,
+            ))
+        })
+        .map_err(|error| format!("pre-leave mutual peer authentication failed: {error}"))?;
+        if authenticated.node_id != prepared.node_id {
+            return Err("pre-leave peer authentication returned the wrong claimant".to_string());
+        }
         let mut remote = endpoint::EndpointDispatchClient::new(context, issuer);
         tokio::task::block_in_place(|| {
             handle.block_on(

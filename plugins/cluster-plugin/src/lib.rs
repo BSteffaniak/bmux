@@ -29,17 +29,23 @@ pub(crate) use bmux_cluster_plugin_api::{
         RedeemEnrollmentRequest as ClusterCommandRedeemEnrollmentRequest,
         UpRequest as ClusterCommandUpRequest,
     },
+    cluster_peer_auth::client::{
+        AuthenticateRequest as ClusterPeerAuthenticateRequest,
+        ChallengeRequest as ClusterPeerChallengeRequest, ProveRequest as ClusterPeerProveRequest,
+    },
     cluster_query::client::StatusRequest as ClusterQueryStatusRequest,
     cluster_types::{
-        ClusterConnectionEvent, ClusterConnectionEventList as ClusterConnectionEventsListResponse,
-        ClusterConnectionState, ClusterConsensusRole, ClusterHostState, ClusterHostStatus,
+        AuthenticatedPeer, ClusterConnectionEvent,
+        ClusterConnectionEventList as ClusterConnectionEventsListResponse, ClusterConnectionState,
+        ClusterConsensusRole, ClusterHostState, ClusterHostStatus,
         ClusterIdentity as ClusterIdentityResponse, ClusterJoinResult, ClusterLaunchStatus,
         ClusterLeaveRequest, ClusterLeaveResult,
         ClusterListResult as ClusterQueryListClustersResponse, ClusterMember, ClusterMemberList,
-        ClusterMemberState, ClusterNodeCapabilities,
-        ClusterPaneMutationResult as ClusterCommandPaneMutationResponse,
+        ClusterMemberState, ClusterNegotiatedProtocol, ClusterNodeCapabilities,
+        ClusterPaneMutationResult as ClusterCommandPaneMutationResponse, ClusterProtocolOffer,
         ClusterStatusResult as ClusterQueryStatusResponse,
-        ClusterUpResult as ClusterCommandUpResponse, EnrollmentTokenResult,
+        ClusterUpResult as ClusterCommandUpResponse, EnrollmentTokenResult, PeerAuthChallenge,
+        PeerAuthProof,
     },
 };
 pub(crate) use bmux_config::BmuxConfig;
@@ -225,6 +231,10 @@ fn is_cluster_lifecycle_service(context: &NativeServiceContext) -> bool {
                 | "redeem_enrollment"
                 | "init"
         ) | ("cluster-query/v1", "identity" | "members")
+            | (
+                "cluster-peer-auth/v1",
+                "challenge" | "prove" | "authenticate"
+            )
     )
 }
 
@@ -271,6 +281,18 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
         "cluster-query/v1", "members" => |(): (), ctx| {
             list_members(ctx)
                 .map_err(|error| ServiceResponse::error("members_failed", error))
+        },
+        "cluster-peer-auth/v1", "challenge" => |req: ClusterPeerChallengeRequest, ctx| {
+            create_peer_auth_challenge(ctx, &req)
+                .map_err(|error| ServiceResponse::error("peer_auth_challenge_failed", error))
+        },
+        "cluster-peer-auth/v1", "prove" => |req: ClusterPeerProveRequest, ctx| {
+            create_peer_auth_proof(ctx, req.challenge)
+                .map_err(|error| ServiceResponse::error("peer_auth_proof_failed", error))
+        },
+        "cluster-peer-auth/v1", "authenticate" => |req: ClusterPeerAuthenticateRequest, ctx| {
+            authenticate_peer(ctx, &req)
+                .map_err(|error| ServiceResponse::error("peer_authentication_failed", error))
         },
     })
 }
@@ -541,6 +563,43 @@ mod tests {
         Uuid::from_u128(*counter)
     }
 
+    fn complete_test_join(issuer: &FakeRuntime, joiner: &FakeRuntime, request_id: &str) {
+        let token =
+            create_enrollment_token(issuer, request_id, "issuer", Some(60_000), None).unwrap();
+        let signed = decode_and_verify_enrollment_token(&token.token, now_unix_ms()).unwrap();
+        let request = enrollment_request(joiner, &signed, token.token.clone(), None);
+        let result = redeem_enrollment(issuer, &request).unwrap();
+        adopt_join_result(
+            joiner,
+            &ClusterCommandJoinRequest {
+                token: token.token,
+                issuer: "issuer".to_string(),
+                enrollment_result: result,
+            },
+        )
+        .unwrap();
+    }
+
+    fn enrollment_request(
+        joiner: &FakeRuntime,
+        token: &SignedEnrollmentToken,
+        token_text: String,
+        endpoint: Option<String>,
+    ) -> ClusterCommandRedeemEnrollmentRequest {
+        let identity = load_or_create_node_identity(joiner).unwrap();
+        let protocol = current_protocol_offer();
+        let possession_signature =
+            create_enrollment_possession_proof(joiner, token, endpoint.clone(), &protocol).unwrap();
+        ClusterCommandRedeemEnrollmentRequest {
+            token: token_text,
+            node_id: identity.node_id().to_string(),
+            public_key: identity.public_key().to_string(),
+            endpoint,
+            protocol,
+            possession_signature,
+        }
+    }
+
     struct ServiceTestConfigDir {
         dir: std::path::PathBuf,
     }
@@ -749,29 +808,313 @@ mod tests {
         assert_eq!(signed.claims.capabilities, default_join_capabilities());
 
         let joiner = FakeRuntime::default();
-        let joiner_identity = load_or_create_node_identity(&joiner).unwrap();
-        let request = ClusterCommandRedeemEnrollmentRequest {
-            token: token.token.clone(),
-            node_id: joiner_identity.node_id().to_string(),
-            public_key: joiner_identity.public_key().to_string(),
-            endpoint: Some("joiner".to_string()),
-        };
+        let request = enrollment_request(
+            &joiner,
+            &signed,
+            token.token.clone(),
+            Some("joiner".to_string()),
+        );
         let first = redeem_enrollment(&issuer, &request).unwrap();
         let second = redeem_enrollment(&issuer, &request).unwrap();
         assert_eq!(first.member, second.member);
         assert_eq!(first.member.capabilities, default_join_capabilities());
+        verify_membership_credential(&first.member, now_unix_ms()).unwrap();
+        assert_eq!(first.member.credential_issuer_node_id, identity.node_id);
         assert_eq!(first.members, second.members);
         assert_eq!(list_members(&issuer).unwrap().members.len(), 2);
 
-        let attacker = load_or_create_node_identity(&FakeRuntime::default()).unwrap();
-        let replay = ClusterCommandRedeemEnrollmentRequest {
-            token: token.token,
-            node_id: attacker.node_id().to_string(),
-            public_key: attacker.public_key().to_string(),
-            endpoint: None,
-        };
+        let attacker_runtime = FakeRuntime::default();
+        let replay = enrollment_request(&attacker_runtime, &signed, token.token, None);
         let error = redeem_enrollment(&issuer, &replay).expect_err("cross-node replay must fail");
         assert!(error.contains("already consumed by another node"));
+    }
+
+    #[test]
+    fn enrollment_requires_node_possession_and_compatible_protocol_before_membership_mutation() {
+        let issuer = FakeRuntime::default();
+        load_or_create_node_identity(&issuer).unwrap();
+        initialize_cluster(&issuer).unwrap();
+        let token =
+            create_enrollment_token(&issuer, "request-auth", "issuer", Some(60_000), None).unwrap();
+        let signed = decode_and_verify_enrollment_token(&token.token, now_unix_ms()).unwrap();
+        let joiner = FakeRuntime::default();
+        let valid = enrollment_request(&joiner, &signed, token.token, None);
+
+        let mut forged = valid.clone();
+        forged.possession_signature = vec![0; forged.possession_signature.len()];
+        assert!(
+            redeem_enrollment(&issuer, &forged)
+                .unwrap_err()
+                .contains("possession proof verification failed")
+        );
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+
+        let mut incompatible_epoch = valid.clone();
+        incompatible_epoch.protocol.wire_epoch += 1;
+        incompatible_epoch.possession_signature = create_enrollment_possession_proof(
+            &joiner,
+            &signed,
+            incompatible_epoch.endpoint.clone(),
+            &incompatible_epoch.protocol,
+        )
+        .unwrap();
+        assert!(
+            redeem_enrollment(&issuer, &incompatible_epoch)
+                .unwrap_err()
+                .contains("incompatible cluster wire epoch")
+        );
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+
+        let mut incompatible_revision = valid.clone();
+        incompatible_revision.protocol.peer_revision_min = 2;
+        incompatible_revision.protocol.peer_revision_max = 2;
+        incompatible_revision.possession_signature = create_enrollment_possession_proof(
+            &joiner,
+            &signed,
+            incompatible_revision.endpoint.clone(),
+            &incompatible_revision.protocol,
+        )
+        .unwrap();
+        assert!(
+            redeem_enrollment(&issuer, &incompatible_revision)
+                .unwrap_err()
+                .contains("no compatible cluster peer revision")
+        );
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+
+        let mut incompatible_schema = valid.clone();
+        incompatible_schema.protocol.schema_version_min = 2;
+        incompatible_schema.protocol.schema_version_max = 2;
+        incompatible_schema.possession_signature = create_enrollment_possession_proof(
+            &joiner,
+            &signed,
+            incompatible_schema.endpoint.clone(),
+            &incompatible_schema.protocol,
+        )
+        .unwrap();
+        assert!(
+            redeem_enrollment(&issuer, &incompatible_schema)
+                .unwrap_err()
+                .contains("no compatible cluster schema version")
+        );
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+
+        let mut missing_feature = valid.clone();
+        missing_feature.protocol.features.clear();
+        missing_feature.possession_signature = create_enrollment_possession_proof(
+            &joiner,
+            &signed,
+            missing_feature.endpoint.clone(),
+            &missing_feature.protocol,
+        )
+        .unwrap();
+        assert!(
+            redeem_enrollment(&issuer, &missing_feature)
+                .unwrap_err()
+                .contains("missing mandatory cluster feature")
+        );
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+
+        let accepted = redeem_enrollment(&issuer, &valid).unwrap();
+        assert_eq!(accepted.member.negotiated_protocol.peer_revision, 1);
+        assert_eq!(accepted.member.negotiated_protocol.schema_version, 1);
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 2);
+    }
+
+    #[test]
+    fn membership_credential_rejects_tampering_and_expiry() {
+        let issuer = FakeRuntime::default();
+        load_or_create_node_identity(&issuer).unwrap();
+        initialize_cluster(&issuer).unwrap();
+        let token =
+            create_enrollment_token(&issuer, "request-credential", "issuer", Some(60_000), None)
+                .unwrap();
+        let signed = decode_and_verify_enrollment_token(&token.token, now_unix_ms()).unwrap();
+        let joiner = FakeRuntime::default();
+        let request = enrollment_request(&joiner, &signed, token.token, None);
+        let credential = redeem_enrollment(&issuer, &request).unwrap().member;
+        verify_membership_credential(&credential, credential.credential_issued_at_unix_ms).unwrap();
+
+        let mut tampered = credential.clone();
+        tampered.capabilities.ingress = !tampered.capabilities.ingress;
+        assert!(
+            verify_membership_credential(&tampered, now_unix_ms())
+                .unwrap_err()
+                .contains("signature verification failed")
+        );
+        assert!(
+            verify_membership_credential(
+                &credential,
+                credential.credential_expires_at_unix_ms.saturating_add(1)
+            )
+            .unwrap_err()
+            .contains("expired")
+        );
+    }
+
+    #[test]
+    fn peer_authentication_is_mutual_scoped_single_use_and_credential_bound() {
+        let verifier = FakeRuntime::default();
+        load_or_create_node_identity(&verifier).unwrap();
+        initialize_cluster(&verifier).unwrap();
+        let claimant = FakeRuntime::default();
+        let claimant_identity = load_or_create_node_identity(&claimant).unwrap();
+        complete_test_join(&verifier, &claimant, "peer-auth-join");
+        let verifier_identity = load_or_create_node_identity(&verifier).unwrap();
+
+        let challenge = create_peer_auth_challenge(
+            &verifier,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: claimant_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            challenge.audience_node_id,
+            claimant_identity.node_id().to_string()
+        );
+        assert_eq!(
+            challenge.verifier_node_id,
+            verifier_identity.node_id().to_string()
+        );
+        let proof = create_peer_auth_proof(&claimant, challenge.clone()).unwrap();
+        let authenticated = authenticate_peer(
+            &verifier,
+            &ClusterPeerAuthenticateRequest {
+                proof: proof.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            authenticated.node_id,
+            claimant_identity.node_id().to_string()
+        );
+        assert_eq!(authenticated.cluster_id, challenge.cluster_id);
+        assert!(
+            authenticate_peer(&verifier, &ClusterPeerAuthenticateRequest { proof })
+                .unwrap_err()
+                .contains("already consumed")
+        );
+
+        let wrong_audience = create_peer_auth_challenge(
+            &verifier,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: claimant_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            create_peer_auth_proof(&verifier, wrong_audience)
+                .unwrap_err()
+                .contains("wrong audience")
+        );
+
+        let mut tampered = create_peer_auth_challenge(
+            &verifier,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: claimant_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        tampered.nonce.push('x');
+        assert!(
+            create_peer_auth_proof(&claimant, tampered)
+                .unwrap_err()
+                .contains("signature verification failed")
+        );
+    }
+
+    #[test]
+    fn peer_authentication_rejects_forged_expired_stale_and_inactive_credentials() {
+        let verifier = FakeRuntime::default();
+        load_or_create_node_identity(&verifier).unwrap();
+        initialize_cluster(&verifier).unwrap();
+        let claimant = FakeRuntime::default();
+        let claimant_identity = load_or_create_node_identity(&claimant).unwrap();
+        complete_test_join(&verifier, &claimant, "peer-auth-negative-join");
+
+        let challenge = create_peer_auth_challenge(
+            &verifier,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: claimant_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        let mut forged = create_peer_auth_proof(&claimant, challenge).unwrap();
+        forged.claimant_signature = "00".repeat(forged.claimant_signature.len() / 2);
+        assert!(
+            authenticate_peer(&verifier, &ClusterPeerAuthenticateRequest { proof: forged })
+                .unwrap_err()
+                .contains("proof signature verification failed")
+        );
+
+        let mut expired = create_peer_auth_challenge(
+            &verifier,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: claimant_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        expired.expires_at_unix_ms = now_unix_ms().saturating_sub(1);
+        expired.signature = encode_hex(
+            &load_or_create_node_identity(&verifier)
+                .unwrap()
+                .sign(&canonical_peer_challenge(&expired).unwrap()),
+        );
+        assert!(
+            create_peer_auth_proof(&claimant, expired)
+                .unwrap_err()
+                .contains("expired")
+        );
+
+        let challenge = create_peer_auth_challenge(
+            &verifier,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: claimant_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        let mut stale = create_peer_auth_proof(&claimant, challenge).unwrap();
+        stale.claimant_credential_serial = "stale".to_string();
+        stale.claimant_signature = encode_hex(
+            &load_or_create_node_identity(&claimant)
+                .unwrap()
+                .sign(&canonical_peer_proof(&stale).unwrap()),
+        );
+        assert!(
+            authenticate_peer(&verifier, &ClusterPeerAuthenticateRequest { proof: stale })
+                .unwrap_err()
+                .contains("stale claimant credential")
+        );
+
+        let leave_id = Uuid::new_v4().to_string();
+        let cluster_id = list_members(&verifier).unwrap().cluster_id.unwrap();
+        let claims = LeaveClaims {
+            version: CLUSTER_IDENTITY_VERSION,
+            leave_id: leave_id.clone(),
+            cluster_id: cluster_id.clone(),
+            node_id: claimant_identity.node_id().to_string(),
+        };
+        accept_leave(
+            &verifier,
+            &ClusterCommandAcceptLeaveRequest {
+                leave_id,
+                cluster_id,
+                node_id: claimant_identity.node_id().to_string(),
+                signature: claimant_identity.sign(&canonical_leave_claims(&claims).unwrap()),
+            },
+        )
+        .unwrap();
+        assert!(
+            create_peer_auth_challenge(
+                &verifier,
+                &ClusterPeerChallengeRequest {
+                    claimant_node_id: claimant_identity.node_id().to_string()
+                }
+            )
+            .unwrap_err()
+            .contains("not active")
+        );
     }
 
     #[test]
@@ -795,17 +1138,15 @@ mod tests {
         let signed = decode_and_verify_enrollment_token(&token.token, now_unix_ms()).unwrap();
         assert_eq!(signed.claims.capabilities, grant);
 
-        let joiner = load_or_create_node_identity(&FakeRuntime::default()).unwrap();
-        let result = redeem_enrollment(
-            &issuer,
-            &ClusterCommandRedeemEnrollmentRequest {
-                token: token.token,
-                node_id: joiner.node_id().to_string(),
-                public_key: joiner.public_key().to_string(),
-                endpoint: Some("voter-b".to_string()),
-            },
-        )
-        .unwrap();
+        let joiner_runtime = FakeRuntime::default();
+        let joiner = load_or_create_node_identity(&joiner_runtime).unwrap();
+        let request = enrollment_request(
+            &joiner_runtime,
+            &signed,
+            token.token,
+            Some("voter-b".to_string()),
+        );
+        let result = redeem_enrollment(&issuer, &request).unwrap();
         assert_eq!(result.member.capabilities, grant);
         assert_eq!(
             list_members(&issuer)
@@ -940,22 +1281,55 @@ mod tests {
                 .contains("signature verification failed")
         );
 
-        let joiner = load_or_create_node_identity(&FakeRuntime::default()).unwrap();
-        let other = load_or_create_node_identity(&FakeRuntime::default()).unwrap();
         let valid_token =
             create_enrollment_token(&issuer, "request-mismatch", "issuer", Some(60_000), None)
                 .unwrap();
+        let valid_signed =
+            decode_and_verify_enrollment_token(&valid_token.token, now_unix_ms()).unwrap();
+        let joiner_runtime = FakeRuntime::default();
+        let joiner = load_or_create_node_identity(&joiner_runtime).unwrap();
+        let other = load_or_create_node_identity(&FakeRuntime::default()).unwrap();
+        let protocol = current_protocol_offer();
+        let possession_signature =
+            create_enrollment_possession_proof(&joiner_runtime, &valid_signed, None, &protocol)
+                .unwrap();
         let request = ClusterCommandRedeemEnrollmentRequest {
-            token: valid_token.token,
+            token: valid_token.token.clone(),
             node_id: joiner.node_id().to_string(),
             public_key: other.public_key().to_string(),
             endpoint: None,
+            protocol,
+            possession_signature,
         };
         assert!(
             redeem_enrollment(&issuer, &request)
                 .unwrap_err()
                 .contains("does not match joining public key")
         );
+
+        let mut overlong_offer = current_protocol_offer();
+        overlong_offer.plugin_version = "x".repeat(129);
+        let overlong_signature = create_enrollment_possession_proof(
+            &joiner_runtime,
+            &valid_signed,
+            None,
+            &overlong_offer,
+        )
+        .unwrap();
+        let overlong_request = ClusterCommandRedeemEnrollmentRequest {
+            token: valid_token.token,
+            node_id: joiner.node_id().to_string(),
+            public_key: joiner.public_key().to_string(),
+            endpoint: None,
+            protocol: overlong_offer,
+            possession_signature: overlong_signature,
+        };
+        assert!(
+            redeem_enrollment(&issuer, &overlong_request)
+                .unwrap_err()
+                .contains("plugin version is invalid")
+        );
+        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
     }
 
     #[test]

@@ -49,6 +49,7 @@ fn assert_no_cluster_domain_markers(source: &str, context: &str) {
         "bmux.server_clusters",
         "cluster-query/v1",
         "cluster-command/v1",
+        "cluster-peer-auth/v1",
         "cluster-connection-events/v1",
         "ClusterId",
         "NodeId",

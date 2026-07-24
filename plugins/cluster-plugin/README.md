@@ -9,7 +9,8 @@ This crate owns the `bmux.cluster` plugin domain.
 Current scope:
 
 - Durable federation identity foundation: activation creates or validates a local Ed25519 node key; `NodeId` is the canonical public-key identity, and `cluster init` creates an idempotent persistent `ClusterId` through the generated `cluster-command/v1:init` service. Corrupt, future-version, or mismatched identity records fail closed without key rotation.
-- Generated membership lifecycle commands: `cluster enrollment-token create`, `cluster join`, `cluster leave`, and `cluster members`. Enrollment tokens are issuer-signed, expiring, request-idempotent, and single-use across node identities; same-node redemption is retry-safe. Join routes generated redemption through the explicit `bmux.connections` endpoint, validates the issuer/member snapshot before local adoption, and persists only public membership. Leave uses a signed prepare/accept/commit transaction and preserves the local node key.
+- Generated membership lifecycle commands: `cluster enrollment-token create`, `cluster join`, `cluster leave`, and `cluster members`. Enrollment tokens are issuer-signed, expire within the reviewed ten-minute maximum, are request-idempotent, and are single-use across node identities; same-node redemption is retry-safe. The candidate signs token-, endpoint-, identity-, and protocol-bound possession claims before redemption. Join rejects incompatible wire epochs, peer revisions, durable schema ranges, and mandatory feature sets before membership mutation, then persists an issuer-signed, expiring public membership credential while private keys remain local. Join routes generated redemption through the explicit `bmux.connections` endpoint and validates the issuer/member snapshot before local adoption. Leave uses a signed prepare/accept/commit transaction and preserves the local node key.
+- Generated peer authentication: `cluster-peer-auth/v1` issues verifier-signed 30-second challenges bound to cluster, verifier credential, claimant audience, and nonce; the claimant verifies the verifier's active credential and signs the full challenge; the verifier checks the claimant's active credential and consumes the nonce durably. Join and remote leave orchestration require this challenge/prove/authenticate flow through `bmux.connections`, so the same plugin-owned authentication is transport-neutral. Replays, forged proofs, wrong audience, expiry, stale credentials, inactive members, and challenge tampering fail closed. An isolated two-server quick-TLS integration test proves the real join and leave process path.
 - Durable node capability metadata separates the exclusive consensus role (`voter` or `observer-edge`) from independent `worker` and `ingress` grants. Initializers default to voter+worker+ingress; enrollment defaults to observer-edge+worker. Explicit grants are signed into enrollment tokens and validated before adoption. Legacy member records are migrated deterministically.
 - Read-only cluster inventory and health checks (`cluster hosts/status/doctor`)
 - Inventory sourced from `[plugins.settings."bmux.cluster"].clusters`
@@ -174,23 +175,26 @@ gateway_mode = "auto"
 
 - **`cluster-query/v1`**
 - **`cluster-command/v1`**
+- **`cluster-peer-auth/v1`**
 - **`cluster-connection-events/v1`**
 
 ## Service Contract Notes
 
 - `cluster-query/v1`
-  - `identity` returns the local public node identity and optional current cluster ID.
-  - `members` returns durable public membership and member states.
+  - `identity` returns the local public node identity, optional current cluster ID, and explicit wire/peer/schema/plugin/feature compatibility offer.
+  - `members` returns durable public membership, signed credential validity/issuer metadata, negotiated compatibility, and member states.
   - `list_clusters` returns settings-resolved cluster inventory.
   - `status` returns host states from probe execution (`ready` or `degraded`).
   - Errors use `list_clusters_failed` / `status_failed`.
 - `cluster-command/v1`
   - `init` creates or returns the durable cluster identity and returns public node identity metadata.
-  - `enrollment_token_create`, `redeem_enrollment`, and `join` implement signed, expiring, retry-safe enrollment as generated typed phases.
+  - `enrollment_token_create`, `redeem_enrollment`, and `join` implement signed, expiring, retry-safe enrollment as generated typed phases; redemption verifies node-key possession and compatibility before consuming the token, then returns an issuer-signed public membership credential.
   - `leave_prepare`, `accept_leave`, and `leave` implement signed, retryable leave coordination without nested service dispatch.
   - `up` returns session id plus per-host launch status payload.
   - `pane_new`, `pane_retry`, and `pane_move` return operation result payloads with pane/session ids.
   - Errors use `up_failed`, `pane_new_failed`, `pane_retry_failed`, and `pane_move_failed`.
+- `cluster-peer-auth/v1`
+  - `challenge`, `prove`, and `authenticate` provide mutually verified active-member authentication with audience, expiry, credential-serial, signature, and durable single-use nonce checks.
 - `cluster-connection-events/v1`
   - `list` returns persisted lifecycle events ring buffer for cluster connections.
   - Errors use `connection_events_list_failed`.
