@@ -57,6 +57,7 @@ interface cluster-types {
 
     enum cluster-member-state {
         active,
+        revoked,
         left,
     }
 
@@ -86,6 +87,70 @@ interface cluster-types {
     record enrollment-token-result {
         token: string,
         expires_at_unix_ms: u64,
+    }
+
+    enum enrollment-state {
+        active,
+        consumed,
+        revoked,
+        expired,
+    }
+
+    record enrollment-status {
+        enrollment_id: string,
+        request_id: string,
+        expires_at_unix_ms: u64,
+        state: enrollment-state,
+        consumed_by: string?,
+    }
+
+    record enrollment-list {
+        enrollments: list<enrollment-status>,
+    }
+
+    record enrollment-revocation-result {
+        enrollment_id: string,
+        revoked: bool,
+    }
+
+    record member-credential-result {
+        member: cluster-member,
+    }
+
+    enum member-liveness-state {
+        local,
+        reachable,
+        unreachable,
+        unchecked,
+        inactive,
+        incompatible,
+        untrusted,
+    }
+
+    record member-status {
+        member: cluster-member,
+        liveness: member-liveness-state,
+        reachable: bool?,
+        compatible: bool,
+        trusted: bool,
+        authenticated_at_unix_ms: u64?,
+        observed_at_unix_ms: u64,
+        reason: string?,
+    }
+
+    record membership-status {
+        identity: cluster-identity,
+        members: list<member-status>,
+    }
+
+    record credential-rotation-request {
+        node_id: string,
+        current_serial: string,
+        issuer_endpoint: string?,
+        nonce: string,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        signature: string,
     }
 
     record cluster-join-result {
@@ -200,6 +265,8 @@ interface cluster-query {
     query list_clusters() -> cluster-types.cluster-list-result;
     query status(selector: string?, doctor: bool?) -> cluster-types.cluster-status-result;
     query members() -> cluster-types.cluster-member-list;
+    query membership_status() -> cluster-types.membership-status;
+    query enrollments() -> cluster-types.enrollment-list;
 }
 
 @capability(CLUSTER_WRITE)
@@ -207,6 +274,11 @@ interface cluster-query {
 interface cluster-command {
     command init() -> cluster-types.cluster-identity;
     command enrollment_token_create(request_id: string, endpoint: string, ttl_ms: u64?, capabilities: cluster-types.cluster-node-capabilities?) -> cluster-types.enrollment-token-result;
+    command enrollment_revoke(enrollment_id: string) -> cluster-types.enrollment-revocation-result;
+    command credential_rotate_prepare() -> cluster-types.credential-rotation-request;
+    command credential_rotate_accept(request: cluster-types.credential-rotation-request) -> cluster-types.member-credential-result;
+    command credential_rotate_commit(member: cluster-types.cluster-member) -> cluster-types.member-credential-result;
+    command member_revoke(node_id: string) -> cluster-types.member-credential-result;
     command join(token: string, issuer: string, enrollment_result: cluster-types.cluster-join-result) -> cluster-types.cluster-join-result;
     command redeem_enrollment(token: string, node_id: string, public_key: string, endpoint: string?, protocol: cluster-types.cluster-protocol-offer, possession_signature: bytes) -> cluster-types.cluster-join-result;
     command leave_prepare() -> cluster-types.cluster-leave-request;

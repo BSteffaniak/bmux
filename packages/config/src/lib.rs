@@ -1401,6 +1401,8 @@ pub struct ConnectionTargetConfig {
     pub endpoint_id: Option<String>,
     /// Optional Iroh relay URL for hosted transport.
     pub relay_url: Option<String>,
+    /// Optional direct Iroh socket address for explicit/LAN endpoints.
+    pub iroh_ip_addr: Option<std::net::SocketAddr>,
     /// Require SSH auth handshake when connecting to this iroh target.
     pub iroh_ssh_auth: bool,
     /// Require strict host key checking.
@@ -1430,6 +1432,7 @@ impl Default for ConnectionTargetConfig {
             server_name: None,
             endpoint_id: None,
             relay_url: None,
+            iroh_ip_addr: None,
             iroh_ssh_auth: false,
             strict_host_key_checking: true,
             jump: None,

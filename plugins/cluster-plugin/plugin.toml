@@ -5,6 +5,10 @@ owns_namespaces = [
     "cluster",
     "cluster-init",
     "cluster-enrollment-token-create",
+    "cluster-enrollment-list",
+    "cluster-enrollment-revoke",
+    "cluster-credential-rotate",
+    "cluster-member-revoke",
     "cluster-join",
     "cluster-leave",
     "cluster-members",
@@ -125,6 +129,48 @@ kind     = "boolean"
 long     = "no-ingress"
 name     = "no_ingress"
 required = false
+
+[[commands]]
+aliases       = [["cluster", "enrollment", "list"]]
+expose_in_cli = true
+name          = "cluster-enrollment-list"
+path          = ["cluster-enrollment-list"]
+summary       = "List enrollment token metadata and lifecycle state"
+
+[[commands]]
+aliases       = [["cluster", "enrollment", "revoke"]]
+expose_in_cli = true
+name          = "cluster-enrollment-revoke"
+path          = ["cluster-enrollment-revoke"]
+summary       = "Revoke an unconsumed enrollment token"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "enrollment_id"
+position   = 0
+required   = true
+value_name = "ENROLLMENT_ID"
+
+[[commands]]
+aliases       = [["cluster", "credential", "rotate"]]
+expose_in_cli = true
+name          = "cluster-credential-rotate"
+path          = ["cluster-credential-rotate"]
+summary       = "Rotate this node's cluster membership credential"
+
+[[commands]]
+aliases       = [["cluster", "member", "revoke"]]
+expose_in_cli = true
+name          = "cluster-member-revoke"
+path          = ["cluster-member-revoke"]
+summary       = "Revoke a cluster member"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "node_id"
+position   = 0
+required   = true
+value_name = "NODE_ID"
 
 [[commands]]
 aliases       = [["cluster", "join"]]

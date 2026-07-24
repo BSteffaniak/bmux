@@ -14,6 +14,7 @@ This directory contains the accepted architecture decisions for native bmux serv
 | [ADR-0006](adr-0006-trusted-domain-security.md)             | Trusted-domain membership, delegation, and authorization    | Accepted |
 | [ADR-0007](adr-0007-protocol-compatibility-and-upgrades.md) | Protocol compatibility and rolling upgrades                 | Accepted |
 | [ADR-0008](adr-0008-reliability-and-performance-budgets.md) | Reliability and performance budgets                         | Accepted |
+| [ADR-0009](adr-0009-consensus-implementation.md)            | OpenRaft consensus implementation selection                 | Accepted |
 
 ## Global invariants
 

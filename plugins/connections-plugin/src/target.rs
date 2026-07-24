@@ -55,6 +55,7 @@ pub struct IrohTarget {
     pub label: String,
     pub endpoint_id: String,
     pub relay_url: Option<String>,
+    pub ip_addr: Option<std::net::SocketAddr>,
     pub require_ssh_auth: bool,
     pub compression: CompressionMode,
     pub connect_timeout_ms: u64,
@@ -242,6 +243,7 @@ fn resolve_named(
             label: name.to_string(),
             endpoint_id: required(name, "endpoint_id", target.endpoint_id.as_deref())?,
             relay_url: target.relay_url.clone(),
+            ip_addr: target.iroh_ip_addr,
             require_ssh_auth: target.iroh_ssh_auth,
             compression: CompressionMode::Auto,
             connect_timeout_ms: target.connect_timeout_ms.max(1),
@@ -311,6 +313,7 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
         return Err(invalid(reference, "iroh target requires endpoint id"));
     }
     let mut relay_url = None;
+    let mut ip_addr = None;
     let mut require_ssh_auth = false;
     let mut compression = CompressionMode::Auto;
     if let Some(query) = query {
@@ -318,6 +321,13 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
             let (key, value) = part.split_once('=').unwrap_or((part, ""));
             match key {
                 "relay" if !value.is_empty() => relay_url = Some(value.to_string()),
+                "addr" if !value.is_empty() => {
+                    ip_addr = Some(
+                        value
+                            .parse()
+                            .map_err(|_| invalid(reference, "addr must be a socket address"))?,
+                    );
+                }
                 "auth" if value.eq_ignore_ascii_case("ssh") => require_ssh_auth = true,
                 "compression" if value.eq_ignore_ascii_case("none") => {
                     compression = CompressionMode::None;
@@ -341,6 +351,7 @@ fn parse_iroh(reference: &str) -> Result<ResolvedTarget, ConnectionError> {
         label: reference.to_string(),
         endpoint_id: endpoint_id.to_string(),
         relay_url,
+        ip_addr,
         require_ssh_auth,
         compression,
         connect_timeout_ms: 8_000,
@@ -452,9 +463,12 @@ impl ResolvedTarget {
                 file_identity(Some(&paths.known_gateways_file())),
             ),
             Self::Iroh(target) => format!(
-                "iroh:{}|relay={}|ssh_auth={}|compression={:?}",
+                "iroh:{}|relay={}|addr={}|ssh_auth={}|compression={:?}",
                 target.endpoint_id,
                 target.relay_url.as_deref().unwrap_or(""),
+                target
+                    .ip_addr
+                    .map_or_else(String::new, |addr| addr.to_string()),
                 target.require_ssh_auth,
                 target.compression,
             ),
@@ -522,10 +536,53 @@ mod tests {
             resolve_internal(&config, "tls://example.com:7443"),
             Ok(ResolvedTarget::Tls(_))
         ));
-        assert!(matches!(
-            resolve_internal(&config, "iroh://endpoint?compression=none"),
-            Ok(ResolvedTarget::Iroh(_))
-        ));
+        let resolved = resolve_internal(
+            &config,
+            "iroh://endpoint?addr=127.0.0.1:7443&compression=none",
+        )
+        .expect("direct iroh target should resolve");
+        let ResolvedTarget::Iroh(target) = resolved else {
+            panic!("expected iroh target");
+        };
+        assert_eq!(
+            target.ip_addr,
+            Some("127.0.0.1:7443".parse().expect("socket address"))
+        );
+        assert_eq!(target.compression, CompressionMode::None);
+    }
+
+    #[test]
+    fn resolves_named_direct_iroh_target() {
+        let mut config = BmuxConfig::default();
+        config.connections.targets.insert(
+            "peer".to_string(),
+            ConnectionTargetConfig {
+                transport: ConnectionTransport::Iroh,
+                endpoint_id: Some("endpoint".to_string()),
+                iroh_ip_addr: Some("127.0.0.1:7443".parse().expect("socket address")),
+                ..ConnectionTargetConfig::default()
+            },
+        );
+        let ResolvedTarget::Iroh(target) = resolve_internal(&config, "peer").unwrap() else {
+            panic!("expected iroh target");
+        };
+        assert_eq!(
+            target.ip_addr,
+            config.connections.targets["peer"].iroh_ip_addr
+        );
+        let resolved = ResolvedTarget::Iroh(target);
+        assert!(
+            resolved
+                .connection_identity(&config, &ConfigPaths::default())
+                .contains("addr=127.0.0.1:7443")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_direct_iroh_socket_address() {
+        let error = resolve_internal(&BmuxConfig::default(), "iroh://endpoint?addr=invalid")
+            .expect_err("invalid direct address should fail");
+        assert!(matches!(error, ConnectionError::InvalidTarget { .. }));
     }
 
     #[test]

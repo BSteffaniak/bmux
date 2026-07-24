@@ -614,30 +614,66 @@ pub(super) async fn run_server_gateway(
 #[allow(clippy::too_many_lines)]
 async fn run_server_gateway_iroh() -> Result<u8> {
     const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
+    const IROH_DIRECT_BIND_ENV: &str = "BMUX_IROH_DIRECT_BIND";
     let config = bmux_config::BmuxConfig::load().context("failed loading bmux config")?;
     ensure_iroh_ssh_access_ready(&config)?;
     let require_ssh_auth = iroh_ssh_access_enabled(&config);
     let ssh_allowlist = config.connections.iroh_ssh_access.allowlist.clone();
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+    let direct_bind = std::env::var(IROH_DIRECT_BIND_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("invalid {IROH_DIRECT_BIND_ENV} socket address"))
+        })
+        .transpose()?;
+    let mut builder = if direct_bind.is_some() {
+        Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .relay_mode(iroh::RelayMode::Disabled)
+    } else {
+        Endpoint::builder(presets::N0)
+    };
+    builder = builder.alpns(vec![BMUX_IROH_ALPN.to_vec()]);
+    if let Some(bind_addr) = direct_bind {
+        builder = builder
+            .bind_addr(bind_addr)
+            .context("failed configuring direct iroh bind address")?;
+    }
+    let endpoint = builder
         .bind()
         .await
         .context("failed binding iroh endpoint")?;
-    endpoint.online().await;
+    if direct_bind.is_none() {
+        endpoint.online().await;
+    }
     let addr = endpoint.addr();
     let endpoint_id = endpoint.id();
     let relay = addr
         .relay_urls()
         .next()
         .map(std::string::ToString::to_string);
+    let direct_addr = direct_bind.and_then(|configured| {
+        endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(|bound| bound.is_ipv4() == configured.is_ipv4())
+    });
     let transport_compression = iroh_target_compression_from_config(&config);
-    let url = iroh_target_url(
+    let mut url = iroh_target_url(
         &endpoint_id.to_string(),
         relay.as_deref(),
         require_ssh_auth,
         transport_compression,
     );
+    if let Some(direct_addr) = direct_addr {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        url.push(separator);
+        url.push_str("addr=");
+        url.push_str(&direct_addr.to_string());
+    }
     println!("bmux iroh gateway online");
     println!("connect URL: {url}");
     if require_ssh_auth {

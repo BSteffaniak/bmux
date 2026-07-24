@@ -22,8 +22,13 @@ pub(crate) use workspace::*;
 pub(crate) use bmux_cluster_plugin_api::{
     cluster_command::client::{
         AcceptLeaveRequest as ClusterCommandAcceptLeaveRequest,
+        CredentialRotateAcceptRequest as ClusterCommandCredentialRotateAcceptRequest,
+        CredentialRotateCommitRequest as ClusterCommandCredentialRotateCommitRequest,
+        EnrollmentRevokeRequest as ClusterCommandEnrollmentRevokeRequest,
         EnrollmentTokenCreateRequest as ClusterCommandEnrollmentTokenCreateRequest,
-        JoinRequest as ClusterCommandJoinRequest, PaneMoveRequest as ClusterCommandPaneMoveRequest,
+        JoinRequest as ClusterCommandJoinRequest,
+        MemberRevokeRequest as ClusterCommandMemberRevokeRequest,
+        PaneMoveRequest as ClusterCommandPaneMoveRequest,
         PaneNewRequest as ClusterCommandPaneNewRequest,
         PaneRetryRequest as ClusterCommandPaneRetryRequest,
         RedeemEnrollmentRequest as ClusterCommandRedeemEnrollmentRequest,
@@ -44,8 +49,10 @@ pub(crate) use bmux_cluster_plugin_api::{
         ClusterMemberState, ClusterNegotiatedProtocol, ClusterNodeCapabilities,
         ClusterPaneMutationResult as ClusterCommandPaneMutationResponse, ClusterProtocolOffer,
         ClusterStatusResult as ClusterQueryStatusResponse,
-        ClusterUpResult as ClusterCommandUpResponse, EnrollmentTokenResult, PeerAuthChallenge,
-        PeerAuthProof,
+        ClusterUpResult as ClusterCommandUpResponse, CredentialRotationRequest, EnrollmentList,
+        EnrollmentRevocationResult, EnrollmentState, EnrollmentStatus, EnrollmentTokenResult,
+        MemberCredentialResult, MemberLivenessState, MemberStatus, MembershipStatus,
+        PeerAuthChallenge, PeerAuthProof,
     },
 };
 pub(crate) use bmux_config::BmuxConfig;
@@ -116,6 +123,10 @@ impl RustPlugin for ClusterPlugin {
         bmux_plugin_sdk::route_command!(context, {
             "cluster-init" => run_cluster_init(&context).map_err(PluginCommandError::from),
             "cluster-enrollment-token-create" => run_cluster_enrollment_token_create(&context).map_err(PluginCommandError::from),
+            "cluster-enrollment-list" => run_cluster_enrollment_list(&context).map_err(PluginCommandError::from),
+            "cluster-enrollment-revoke" => run_cluster_enrollment_revoke(&context).map_err(PluginCommandError::from),
+            "cluster-credential-rotate" => run_cluster_credential_rotate(&context).map_err(PluginCommandError::from),
+            "cluster-member-revoke" => run_cluster_member_revoke(&context).map_err(PluginCommandError::from),
             "cluster-join" => run_cluster_join(&context).map_err(PluginCommandError::from),
             "cluster-leave" => run_cluster_leave(&context).map_err(PluginCommandError::from),
             "cluster-members" => run_cluster_members(&context).map_err(PluginCommandError::from),
@@ -228,13 +239,20 @@ fn is_cluster_lifecycle_service(context: &NativeServiceContext) -> bool {
                 | "leave"
                 | "accept_leave"
                 | "enrollment_token_create"
+                | "enrollment_revoke"
+                | "credential_rotate_prepare"
+                | "credential_rotate_accept"
+                | "credential_rotate_commit"
+                | "member_revoke"
                 | "redeem_enrollment"
                 | "init"
-        ) | ("cluster-query/v1", "identity" | "members")
-            | (
-                "cluster-peer-auth/v1",
-                "challenge" | "prove" | "authenticate"
-            )
+        ) | (
+            "cluster-query/v1",
+            "identity" | "members" | "membership_status" | "enrollments"
+        ) | (
+            "cluster-peer-auth/v1",
+            "challenge" | "prove" | "authenticate"
+        )
     )
 }
 
@@ -266,6 +284,26 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
             )
                 .map_err(|error| ServiceResponse::error("enrollment_token_create_failed", error))
         },
+        "cluster-command/v1", "enrollment_revoke" => |req: ClusterCommandEnrollmentRevokeRequest, ctx| {
+            revoke_enrollment(ctx, &req.enrollment_id)
+                .map_err(|error| ServiceResponse::error("enrollment_revoke_failed", error))
+        },
+        "cluster-command/v1", "credential_rotate_prepare" => |(): (), ctx| {
+            prepare_credential_rotation(ctx)
+                .map_err(|error| ServiceResponse::error("credential_rotate_prepare_failed", error))
+        },
+        "cluster-command/v1", "credential_rotate_accept" => |req: ClusterCommandCredentialRotateAcceptRequest, ctx| {
+            accept_credential_rotation(ctx, &req.request)
+                .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))
+        },
+        "cluster-command/v1", "credential_rotate_commit" => |req: ClusterCommandCredentialRotateCommitRequest, ctx| {
+            commit_credential_rotation(ctx, &req.member)
+                .map_err(|error| ServiceResponse::error("credential_rotate_commit_failed", error))
+        },
+        "cluster-command/v1", "member_revoke" => |req: ClusterCommandMemberRevokeRequest, ctx| {
+            revoke_member(ctx, &req.node_id)
+                .map_err(|error| ServiceResponse::error("member_revoke_failed", error))
+        },
         "cluster-command/v1", "redeem_enrollment" => |req: ClusterCommandRedeemEnrollmentRequest, ctx| {
             redeem_enrollment(ctx, &req)
                 .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))
@@ -281,6 +319,14 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
         "cluster-query/v1", "members" => |(): (), ctx| {
             list_members(ctx)
                 .map_err(|error| ServiceResponse::error("members_failed", error))
+        },
+        "cluster-query/v1", "membership_status" => |(): (), ctx| {
+            membership_status(ctx)
+                .map_err(|error| ServiceResponse::error("membership_status_failed", error))
+        },
+        "cluster-query/v1", "enrollments" => |(): (), ctx| {
+            list_enrollments(ctx)
+                .map_err(|error| ServiceResponse::error("enrollments_failed", error))
         },
         "cluster-peer-auth/v1", "challenge" => |req: ClusterPeerChallengeRequest, ctx| {
             create_peer_auth_challenge(ctx, &req)
@@ -789,6 +835,223 @@ mod tests {
         let members = list_members(&runtime).unwrap();
         assert_eq!(members.members.len(), 1);
         assert_eq!(members.members[0].capabilities, initializer_capabilities());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn enrollment_rotation_revocation_and_member_revocation_fail_closed() {
+        let issuer = FakeRuntime::default();
+        let issuer_identity = load_or_create_node_identity(&issuer).unwrap();
+        initialize_cluster(&issuer).unwrap();
+        let joiner = FakeRuntime::default();
+        let joiner_identity = load_or_create_node_identity(&joiner).unwrap();
+
+        let revoked_token =
+            create_enrollment_token(&issuer, "request-revoke", "issuer", Some(60_000), None)
+                .unwrap();
+        let revoked_signed =
+            decode_and_verify_enrollment_token(&revoked_token.token, now_unix_ms()).unwrap();
+        let enrollment_id = revoked_signed.claims.nonce.clone();
+        assert_eq!(
+            list_enrollments(&issuer).unwrap().enrollments[0].state,
+            EnrollmentState::Active
+        );
+        assert!(revoke_enrollment(&issuer, &enrollment_id).unwrap().revoked);
+        assert!(!revoke_enrollment(&issuer, &enrollment_id).unwrap().revoked);
+        assert_eq!(
+            list_enrollments(&issuer).unwrap().enrollments[0].state,
+            EnrollmentState::Revoked
+        );
+        let revoked_request =
+            enrollment_request(&joiner, &revoked_signed, revoked_token.token, None);
+        assert!(
+            redeem_enrollment(&issuer, &revoked_request)
+                .unwrap_err()
+                .contains("revoked")
+        );
+        assert!(
+            create_enrollment_token(&issuer, "request-revoke", "issuer", Some(60_000), None)
+                .unwrap_err()
+                .contains("new request_id")
+        );
+
+        let token =
+            create_enrollment_token(&issuer, "request-active", "issuer", Some(60_000), None)
+                .unwrap();
+        let signed = decode_and_verify_enrollment_token(&token.token, now_unix_ms()).unwrap();
+        let request = enrollment_request(&joiner, &signed, token.token.clone(), None);
+        let enrollment_result = redeem_enrollment(&issuer, &request).unwrap();
+        adopt_join_result(
+            &joiner,
+            &ClusterCommandJoinRequest {
+                token: token.token,
+                issuer: "issuer".to_string(),
+                enrollment_result,
+            },
+        )
+        .unwrap();
+
+        let original_member = list_members(&joiner)
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|member| member.node_id == joiner_identity.node_id().to_string())
+            .unwrap();
+        assert!(
+            create_enrollment_token(
+                &joiner,
+                "observer-cannot-issue",
+                "joiner",
+                Some(60_000),
+                None,
+            )
+            .unwrap_err()
+            .contains("active voter")
+        );
+        let stale_challenge = create_peer_auth_challenge(
+            &issuer,
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: joiner_identity.node_id().to_string(),
+            },
+        )
+        .unwrap();
+        let rotation = prepare_credential_rotation(&joiner).unwrap();
+        let mut forged_rotation = rotation.clone();
+        forged_rotation.signature = "00".repeat(64);
+        assert!(
+            accept_credential_rotation(&issuer, &forged_rotation)
+                .unwrap_err()
+                .contains("signature verification failed")
+        );
+        let rotated = accept_credential_rotation(&issuer, &rotation)
+            .unwrap()
+            .member;
+        assert!(
+            accept_credential_rotation(&issuer, &rotation)
+                .unwrap_err()
+                .contains("stale credential")
+        );
+        let stale_proof = create_peer_auth_proof(&joiner, stale_challenge).unwrap();
+        assert!(
+            authenticate_peer(
+                &issuer,
+                &ClusterPeerAuthenticateRequest { proof: stale_proof }
+            )
+            .unwrap_err()
+            .contains("stale claimant credential")
+        );
+        commit_credential_rotation(&joiner, &rotated).unwrap();
+        assert_ne!(rotated.credential_serial, original_member.credential_serial);
+        assert_eq!(rotated.public_key, original_member.public_key);
+        verify_membership_credential(&rotated, now_unix_ms()).unwrap();
+
+        let revoked = revoke_member(&issuer, &joiner_identity.node_id().to_string())
+            .unwrap()
+            .member;
+        assert_eq!(revoked.state, ClusterMemberState::Revoked);
+        assert!(
+            create_peer_auth_challenge(
+                &issuer,
+                &ClusterPeerChallengeRequest {
+                    claimant_node_id: joiner_identity.node_id().to_string()
+                }
+            )
+            .unwrap_err()
+            .contains("not active")
+        );
+        assert!(
+            revoke_member(&issuer, &issuer_identity.node_id().to_string())
+                .unwrap_err()
+                .contains("self-revocation")
+        );
+    }
+
+    #[test]
+    fn membership_status_reports_trust_compatibility_and_non_authoritative_liveness() {
+        let issuer = FakeRuntime::default();
+        let issuer_identity = load_or_create_node_identity(&issuer).unwrap();
+        initialize_cluster(&issuer).unwrap();
+        let joiner = FakeRuntime::default();
+        let joiner_identity = load_or_create_node_identity(&joiner).unwrap();
+        complete_test_join(&issuer, &joiner, "membership-status-join");
+
+        let status = membership_status(&issuer).unwrap();
+        let local = status
+            .members
+            .iter()
+            .find(|member| member.member.node_id == issuer_identity.node_id().to_string())
+            .unwrap();
+        assert_eq!(local.liveness, MemberLivenessState::Local);
+        assert_eq!(local.reachable, Some(true));
+        assert!(local.compatible);
+        assert!(local.trusted);
+        let remote = status
+            .members
+            .iter()
+            .find(|member| member.member.node_id == joiner_identity.node_id().to_string())
+            .unwrap();
+        assert_eq!(remote.liveness, MemberLivenessState::Unchecked);
+        assert_eq!(remote.reachable, None);
+        assert_eq!(remote.member.state, ClusterMemberState::Active);
+
+        let mut state = load_membership_state(&issuer).unwrap().unwrap();
+        let remote = state
+            .members
+            .get_mut(&joiner_identity.node_id().to_string())
+            .unwrap();
+        remote.credential_signature = "00".repeat(64);
+        store_membership_state(&issuer, &state).unwrap();
+        let status = membership_status(&issuer).unwrap();
+        let remote = status
+            .members
+            .iter()
+            .find(|member| member.member.node_id == joiner_identity.node_id().to_string())
+            .unwrap();
+        assert_eq!(remote.liveness, MemberLivenessState::Untrusted);
+        assert!(!remote.trusted);
+        assert_eq!(remote.member.state, ClusterMemberState::Active);
+    }
+
+    #[test]
+    fn expired_credential_rotation_is_rejected_without_state_change() {
+        let issuer = FakeRuntime::default();
+        load_or_create_node_identity(&issuer).unwrap();
+        initialize_cluster(&issuer).unwrap();
+        let joiner = FakeRuntime::default();
+        let joiner_identity = load_or_create_node_identity(&joiner).unwrap();
+        complete_test_join(&issuer, &joiner, "rotation-expiry-join");
+        let original = list_members(&issuer)
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|member| member.node_id == joiner_identity.node_id().to_string())
+            .unwrap();
+        let mut rotation = prepare_credential_rotation(&joiner).unwrap();
+        rotation.expires_at_unix_ms = now_unix_ms().saturating_sub(1);
+        let claims = CredentialRotationClaims {
+            version: CLUSTER_IDENTITY_VERSION,
+            cluster_id: original.cluster_id.clone(),
+            node_id: rotation.node_id.clone(),
+            current_serial: rotation.current_serial.clone(),
+            nonce: rotation.nonce.clone(),
+            issued_at_unix_ms: rotation.issued_at_unix_ms,
+            expires_at_unix_ms: rotation.expires_at_unix_ms,
+        };
+        rotation.signature = encode_hex(
+            &joiner_identity.sign(&canonical_credential_rotation_claims(&claims).unwrap()),
+        );
+        assert!(
+            accept_credential_rotation(&issuer, &rotation)
+                .unwrap_err()
+                .contains("expired")
+        );
+        let unchanged = list_members(&issuer)
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|member| member.node_id == joiner_identity.node_id().to_string())
+            .unwrap();
+        assert_eq!(unchanged.credential_serial, original.credential_serial);
     }
 
     #[test]

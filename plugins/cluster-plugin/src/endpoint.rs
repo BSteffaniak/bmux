@@ -85,11 +85,29 @@ where
     }
 }
 
+#[derive(Debug)]
+pub enum PeerAuthenticationFailure {
+    Unreachable(String),
+    Untrusted(String),
+    Local(String),
+}
+
+impl std::fmt::Display for PeerAuthenticationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(reason) | Self::Untrusted(reason) | Self::Local(reason) => {
+                formatter.write_str(reason)
+            }
+        }
+    }
+}
+
 pub async fn mutually_authenticate_endpoint<C>(
     caller: &C,
     endpoint: &str,
     local_node_id: &str,
-) -> Result<AuthenticatedPeer, String>
+    expected_remote_node_id: &str,
+) -> Result<AuthenticatedPeer, PeerAuthenticationFailure>
 where
     C: ServiceCaller + Sync + ?Sized,
 {
@@ -99,17 +117,89 @@ where
         local_node_id.to_string(),
     )
     .await
-    .map_err(|error| format!("remote peer challenge failed: {error}"))?;
+    .map_err(|error| {
+        PeerAuthenticationFailure::Unreachable(format!("remote peer challenge failed: {error}"))
+    })?;
 
+    let verifier_node_id = challenge.verifier_node_id.clone();
+    if verifier_node_id != expected_remote_node_id {
+        return Err(PeerAuthenticationFailure::Untrusted(
+            "endpoint challenge was signed by an unexpected remote member".to_string(),
+        ));
+    }
     let mut local = ServiceCallerDispatchClient::new(caller);
     let proof = bmux_cluster_plugin_api::cluster_peer_auth::client::prove(&mut local, challenge)
         .await
-        .map_err(|error| format!("local peer proof failed: {error}"))?;
+        .map_err(|error| {
+            PeerAuthenticationFailure::Local(format!("local peer proof failed: {error}"))
+        })?;
 
-    let mut remote = EndpointDispatchClient::new(caller, endpoint);
-    bmux_cluster_plugin_api::cluster_peer_auth::client::authenticate(&mut remote, proof)
+    let peer = bmux_cluster_plugin_api::cluster_peer_auth::client::authenticate(&mut remote, proof)
         .await
-        .map_err(|error| format!("remote peer authentication failed: {error}"))
+        .map_err(|error| {
+            PeerAuthenticationFailure::Untrusted(format!(
+                "remote peer authentication failed: {error}"
+            ))
+        })?;
+    if peer.node_id != local_node_id {
+        return Err(PeerAuthenticationFailure::Untrusted(
+            "remote verifier did not authenticate the local claimant".to_string(),
+        ));
+    }
+    Ok(peer)
+}
+
+pub async fn probe_member_status<C>(
+    caller: &C,
+    local_node_id: &str,
+    mut status: bmux_cluster_plugin_api::cluster_types::MemberStatus,
+) -> bmux_cluster_plugin_api::cluster_types::MemberStatus
+where
+    C: ServiceCaller + Sync + ?Sized,
+{
+    use bmux_cluster_plugin_api::cluster_types::MemberLivenessState;
+
+    if status.liveness != MemberLivenessState::Unchecked {
+        return status;
+    }
+    let Some(endpoint) = status.member.endpoint.as_deref() else {
+        return status;
+    };
+    match mutually_authenticate_endpoint(caller, endpoint, local_node_id, &status.member.node_id)
+        .await
+    {
+        Ok(peer) if peer.node_id == local_node_id => {
+            status.liveness = MemberLivenessState::Reachable;
+            status.reachable = Some(true);
+            status.authenticated_at_unix_ms = Some(peer.authenticated_at_unix_ms);
+            status.reason = None;
+        }
+        Ok(_) => {
+            status.liveness = MemberLivenessState::Untrusted;
+            status.reachable = Some(true);
+            status.trusted = false;
+            status.reason = Some("endpoint authenticated as a different member".to_string());
+        }
+        Err(PeerAuthenticationFailure::Unreachable(error)) => {
+            status.liveness = MemberLivenessState::Unreachable;
+            status.reachable = Some(false);
+            status.reason = Some(error);
+        }
+        Err(PeerAuthenticationFailure::Untrusted(error)) => {
+            status.liveness = MemberLivenessState::Untrusted;
+            status.reachable = Some(true);
+            status.trusted = false;
+            status.reason = Some(error);
+        }
+        Err(PeerAuthenticationFailure::Local(error)) => {
+            status.liveness = MemberLivenessState::Untrusted;
+            status.reachable = None;
+            status.trusted = false;
+            status.reason = Some(error);
+        }
+    }
+    status.observed_at_unix_ms = crate::now_unix_ms();
+    status
 }
 
 #[cfg(test)]

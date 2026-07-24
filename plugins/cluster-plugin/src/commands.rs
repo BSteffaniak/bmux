@@ -53,6 +53,56 @@ pub fn run_cluster_enrollment_token_create(context: &NativeCommandContext) -> Re
     Ok(EXIT_OK)
 }
 
+pub fn run_cluster_enrollment_list(context: &NativeCommandContext) -> Result<i32, String> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("enrollment listing requires the host runtime: {error}"))?;
+    let result = tokio::task::block_in_place(|| {
+        handle.block_on(bmux_cluster_plugin_api::cluster_query::client::enrollments(
+            &mut client,
+        ))
+    })
+    .map_err(|error| format!("enrollment listing service dispatch failed: {error}"))?;
+    for enrollment in result.enrollments {
+        println!(
+            "{} request_id={} state={:?} expires_at_unix_ms={} consumed_by={}",
+            enrollment.enrollment_id,
+            enrollment.request_id,
+            enrollment.state,
+            enrollment.expires_at_unix_ms,
+            enrollment.consumed_by.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+pub fn run_cluster_enrollment_revoke(context: &NativeCommandContext) -> Result<i32, String> {
+    let enrollment_id = positional_argument(&context.arguments)
+        .ok_or_else(|| "cluster enrollment revoke requires an enrollment ID".to_string())?;
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("enrollment revocation requires the host runtime: {error}"))?;
+    let result = tokio::task::block_in_place(|| {
+        handle.block_on(
+            bmux_cluster_plugin_api::cluster_command::client::enrollment_revoke(
+                &mut client,
+                enrollment_id.to_string(),
+            ),
+        )
+    })
+    .map_err(|error| format!("enrollment revocation service dispatch failed: {error}"))?;
+    println!(
+        "enrollment {} {}",
+        result.enrollment_id,
+        if result.revoked {
+            "revoked"
+        } else {
+            "already-revoked"
+        }
+    );
+    Ok(EXIT_OK)
+}
+
 pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
     let token_text = positional_argument(&context.arguments)
         .ok_or_else(|| "cluster join requires an enrollment token".to_string())?;
@@ -107,6 +157,7 @@ pub fn run_cluster_join(context: &NativeCommandContext) -> Result<i32, String> {
             context,
             issuer,
             &result.member.node_id,
+            &result.identity.node_id,
         ))
     })
     .map_err(|error| format!("post-join mutual peer authentication failed: {error}"))?;
@@ -132,10 +183,23 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
 
     if let Some(issuer) = prepared.issuer_endpoint.as_deref() {
         let authenticated = tokio::task::block_in_place(|| {
+            let members =
+                list_members(context).map_err(endpoint::PeerAuthenticationFailure::Local)?;
+            let expected_issuer_node_id = members
+                .members
+                .iter()
+                .find(|member| member.endpoint.as_deref() == Some(issuer))
+                .map(|member| member.node_id.as_str())
+                .ok_or_else(|| {
+                    endpoint::PeerAuthenticationFailure::Local(
+                        "leave issuer endpoint has no matching member".to_string(),
+                    )
+                })?;
             handle.block_on(endpoint::mutually_authenticate_endpoint(
                 context,
                 issuer,
                 &prepared.node_id,
+                expected_issuer_node_id,
             ))
         })
         .map_err(|error| format!("pre-leave mutual peer authentication failed: {error}"))?;
@@ -180,6 +244,73 @@ pub fn run_cluster_leave(context: &NativeCommandContext) -> Result<i32, String> 
     })
     .map_err(|error| format!("cluster leave commit failed: {error}"))?;
     println!("left cluster: node_id={}", result.node_id);
+    Ok(EXIT_OK)
+}
+
+pub fn run_cluster_credential_rotate(context: &NativeCommandContext) -> Result<i32, String> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("credential rotation requires the host runtime: {error}"))?;
+    let mut local = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let request = tokio::task::block_in_place(|| {
+        handle.block_on(
+            bmux_cluster_plugin_api::cluster_command::client::credential_rotate_prepare(&mut local),
+        )
+    })
+    .map_err(|error| format!("credential rotation preparation failed: {error}"))?;
+    let issuer = request.issuer_endpoint.as_deref().unwrap_or("local");
+    let rotated = if issuer == "local" {
+        tokio::task::block_in_place(|| {
+            handle.block_on(
+                bmux_cluster_plugin_api::cluster_command::client::credential_rotate_accept(
+                    &mut local, request,
+                ),
+            )
+        })
+    } else {
+        let mut remote = endpoint::EndpointDispatchClient::new(context, issuer);
+        tokio::task::block_in_place(|| {
+            handle.block_on(
+                bmux_cluster_plugin_api::cluster_command::client::credential_rotate_accept(
+                    &mut remote,
+                    request,
+                ),
+            )
+        })
+    }
+    .map_err(|error| format!("credential rotation acceptance failed: {error}"))?;
+    let mut local = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let committed = tokio::task::block_in_place(|| {
+        handle.block_on(
+            bmux_cluster_plugin_api::cluster_command::client::credential_rotate_commit(
+                &mut local,
+                rotated.member,
+            ),
+        )
+    })
+    .map_err(|error| format!("credential rotation commit failed: {error}"))?;
+    println!(
+        "credential rotated: node_id={} serial={}",
+        committed.member.node_id, committed.member.credential_serial
+    );
+    Ok(EXIT_OK)
+}
+
+pub fn run_cluster_member_revoke(context: &NativeCommandContext) -> Result<i32, String> {
+    let node_id = positional_argument(&context.arguments)
+        .ok_or_else(|| "cluster member revoke requires a node ID".to_string())?;
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("member revocation requires the host runtime: {error}"))?;
+    let result = tokio::task::block_in_place(|| {
+        handle.block_on(
+            bmux_cluster_plugin_api::cluster_command::client::member_revoke(
+                &mut client,
+                node_id.to_string(),
+            ),
+        )
+    })
+    .map_err(|error| format!("member revocation service dispatch failed: {error}"))?;
+    println!("member revoked: node_id={}", result.member.node_id);
     Ok(EXIT_OK)
 }
 
@@ -288,12 +419,18 @@ pub fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> 
 }
 
 pub fn run_cluster_status(context: &NativeCommandContext) -> Result<i32, String> {
+    if load_cluster_id(context)?.is_some() {
+        return run_membership_diagnostics(context, false);
+    }
     let statuses = collect_statuses(context, HealthProbe::Test)?;
     print_status_summary(&statuses, "status");
     Ok(EXIT_OK)
 }
 
 pub fn run_cluster_doctor(context: &NativeCommandContext) -> Result<i32, String> {
+    if load_cluster_id(context)?.is_some() {
+        return run_membership_diagnostics(context, true);
+    }
     let statuses = collect_statuses(context, HealthProbe::Doctor)?;
     print_status_summary(&statuses, "doctor");
     Ok(
@@ -304,6 +441,83 @@ pub fn run_cluster_doctor(context: &NativeCommandContext) -> Result<i32, String>
             EXIT_OK
         } else {
             1
+        },
+    )
+}
+
+fn run_membership_diagnostics(context: &NativeCommandContext, doctor: bool) -> Result<i32, String> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("cluster diagnostics require the host runtime: {error}"))?;
+    let mut local = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let mut status = tokio::task::block_in_place(|| {
+        handle
+            .block_on(bmux_cluster_plugin_api::cluster_query::client::membership_status(&mut local))
+    })
+    .map_err(|error| format!("membership status service dispatch failed: {error}"))?;
+    if doctor {
+        let local_node_id = status.identity.node_id.clone();
+        status.members = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut probed = Vec::with_capacity(status.members.len());
+                for member in status.members {
+                    probed
+                        .push(endpoint::probe_member_status(context, &local_node_id, member).await);
+                }
+                probed
+            })
+        });
+    }
+    println!(
+        "cluster {} identity cluster_id={} node_id={} role={} worker={} ingress={}",
+        if doctor { "doctor" } else { "status" },
+        status.identity.cluster_id.as_deref().unwrap_or("-"),
+        status.identity.node_id,
+        status.identity.capabilities.as_ref().map_or_else(
+            || "-".to_string(),
+            |capabilities| { format!("{:?}", capabilities.consensus_role) }
+        ),
+        status
+            .identity
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.worker),
+        status
+            .identity
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.ingress),
+    );
+    for member in &status.members {
+        println!(
+            "  {} state={:?} liveness={:?} reachable={} compatible={} trusted={} role={:?} worker={} ingress={} endpoint={} reason={}",
+            member.member.node_id,
+            member.member.state,
+            member.liveness,
+            member
+                .reachable
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            member.compatible,
+            member.trusted,
+            member.member.capabilities.consensus_role,
+            member.member.capabilities.worker,
+            member.member.capabilities.ingress,
+            member.member.endpoint.as_deref().unwrap_or("-"),
+            member.reason.as_deref().unwrap_or("-"),
+        );
+    }
+    Ok(
+        if doctor
+            && status.members.iter().any(|member| {
+                member.member.state == ClusterMemberState::Active
+                    && !matches!(
+                        member.liveness,
+                        MemberLivenessState::Local | MemberLivenessState::Reachable
+                    )
+            })
+        {
+            1
+        } else {
+            EXIT_OK
         },
     )
 }

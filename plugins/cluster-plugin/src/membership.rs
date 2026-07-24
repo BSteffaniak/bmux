@@ -16,6 +16,7 @@ pub const PENDING_LEAVE_STORAGE_KEY: &str = "cluster.membership.pending_leave.v1
 const PEER_AUTH_STATE_STORAGE_KEY: &str = "cluster.peer_auth.state.v1";
 const PEER_AUTH_PROTOCOL_VERSION: u16 = 1;
 const PEER_AUTH_CHALLENGE_TTL_MS: u64 = 30_000;
+const CREDENTIAL_ROTATION_TTL_MS: u64 = 30_000;
 const MAX_PEER_AUTH_CLOCK_SKEW_MS: u64 = 5_000;
 const MAX_PEER_AUTH_TRACKED_ENTRIES: usize = 1_024;
 const DEFAULT_ENROLLMENT_TTL_MS: u64 = 10 * 60 * 1_000;
@@ -247,11 +248,11 @@ pub struct StoredNodeIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MembershipState {
+pub struct MembershipState {
     version: u8,
     cluster_id: String,
     issuer_endpoint: Option<String>,
-    members: BTreeMap<String, ClusterMember>,
+    pub members: BTreeMap<String, ClusterMember>,
     enrollment_tokens: BTreeMap<String, StoredEnrollment>,
 }
 
@@ -261,6 +262,8 @@ struct StoredEnrollment {
     expires_at_unix_ms: u64,
     token: String,
     consumed_by: Option<String>,
+    #[serde(default)]
+    revoked_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +316,17 @@ pub struct LeaveClaims {
     pub leave_id: String,
     pub cluster_id: String,
     pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRotationClaims {
+    pub version: u8,
+    pub cluster_id: String,
+    pub node_id: String,
+    pub current_serial: String,
+    pub nonce: String,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,6 +610,13 @@ fn canonical_membership_credential_claims(
 ) -> Result<Vec<u8>, String> {
     serde_json::to_vec(claims)
         .map_err(|error| format!("failed encoding membership credential claims: {error}"))
+}
+
+pub fn canonical_credential_rotation_claims(
+    claims: &CredentialRotationClaims,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(claims)
+        .map_err(|error| format!("failed encoding credential rotation claims: {error}"))
 }
 
 pub fn canonical_peer_challenge(challenge: &PeerAuthChallenge) -> Result<Vec<u8>, String> {
@@ -1090,6 +1111,344 @@ pub fn list_members(caller: &impl ClusterRuntimeOps) -> Result<ClusterMemberList
     })
 }
 
+pub fn list_enrollments(caller: &impl ClusterRuntimeOps) -> Result<EnrollmentList, String> {
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "cluster is not initialized; run 'cluster init' first".to_string())?;
+    let state = require_membership_state(caller, cluster_id)?;
+    let now = now_unix_ms();
+    let enrollments = state
+        .enrollment_tokens
+        .into_iter()
+        .map(|(enrollment_id, enrollment)| {
+            let state = enrollment_state(&enrollment, now);
+            EnrollmentStatus {
+                enrollment_id,
+                request_id: enrollment.request_id,
+                expires_at_unix_ms: enrollment.expires_at_unix_ms,
+                state,
+                consumed_by: enrollment.consumed_by,
+            }
+        })
+        .collect();
+    Ok(EnrollmentList { enrollments })
+}
+
+const fn enrollment_state(enrollment: &StoredEnrollment, now: u64) -> EnrollmentState {
+    if enrollment.revoked_at_unix_ms.is_some() {
+        EnrollmentState::Revoked
+    } else if enrollment.consumed_by.is_some() {
+        EnrollmentState::Consumed
+    } else if enrollment.expires_at_unix_ms < now {
+        EnrollmentState::Expired
+    } else {
+        EnrollmentState::Active
+    }
+}
+
+pub fn revoke_enrollment(
+    caller: &impl ClusterRuntimeOps,
+    enrollment_id: &str,
+) -> Result<EnrollmentRevocationResult, String> {
+    let enrollment_id = enrollment_id.trim();
+    if enrollment_id.is_empty() {
+        return Err("enrollment ID cannot be empty".to_string());
+    }
+    let _guard = identity_init_guard()?;
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "cluster is not initialized; run 'cluster init' first".to_string())?;
+    let mut state = require_membership_state(caller, cluster_id)?;
+    let enrollment = state
+        .enrollment_tokens
+        .get_mut(enrollment_id)
+        .ok_or_else(|| "enrollment token is unknown".to_string())?;
+    if enrollment.consumed_by.is_some() {
+        return Err("consumed enrollment token cannot be revoked".to_string());
+    }
+    let revoked = enrollment.revoked_at_unix_ms.is_none();
+    enrollment
+        .revoked_at_unix_ms
+        .get_or_insert_with(now_unix_ms);
+    store_membership_state(caller, &state)?;
+    Ok(EnrollmentRevocationResult {
+        enrollment_id: enrollment_id.to_string(),
+        revoked,
+    })
+}
+
+pub fn prepare_credential_rotation(
+    caller: &impl ClusterRuntimeOps,
+) -> Result<CredentialRotationRequest, String> {
+    let cluster_id =
+        load_cluster_id(caller)?.ok_or_else(|| "this node is not a cluster member".to_string())?;
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "local node identity is not initialized".to_string())?;
+    let state = require_membership_state(caller, cluster_id)?;
+    let current = active_valid_member(&state, &identity.node_id().to_string(), now_unix_ms())?;
+    let now = now_unix_ms();
+    let claims = CredentialRotationClaims {
+        version: CLUSTER_IDENTITY_VERSION,
+        cluster_id: cluster_id.to_string(),
+        node_id: current.node_id.clone(),
+        current_serial: current.credential_serial.clone(),
+        nonce: Uuid::new_v4().to_string(),
+        issued_at_unix_ms: now,
+        expires_at_unix_ms: now
+            .checked_add(CREDENTIAL_ROTATION_TTL_MS)
+            .ok_or_else(|| "credential rotation expiry overflow".to_string())?,
+    };
+    Ok(CredentialRotationRequest {
+        node_id: claims.node_id.clone(),
+        current_serial: claims.current_serial.clone(),
+        issuer_endpoint: current.endpoint.clone(),
+        nonce: claims.nonce.clone(),
+        issued_at_unix_ms: claims.issued_at_unix_ms,
+        expires_at_unix_ms: claims.expires_at_unix_ms,
+        signature: encode_hex(&identity.sign(&canonical_credential_rotation_claims(&claims)?)),
+    })
+}
+
+pub fn accept_credential_rotation(
+    caller: &impl ClusterRuntimeOps,
+    request: &CredentialRotationRequest,
+) -> Result<MemberCredentialResult, String> {
+    let _guard = identity_init_guard()?;
+    let cluster_id =
+        load_cluster_id(caller)?.ok_or_else(|| "cluster is not initialized".to_string())?;
+    let issuer = load_node_identity(caller)?
+        .ok_or_else(|| "local node identity is not initialized".to_string())?;
+    let mut state = require_membership_state(caller, cluster_id)?;
+    let now = now_unix_ms();
+    let current = active_valid_member(&state, &request.node_id, now)?.clone();
+    if current.credential_serial != request.current_serial {
+        return Err("credential rotation request uses a stale credential".to_string());
+    }
+    if request.issued_at_unix_ms > now.saturating_add(MAX_PEER_AUTH_CLOCK_SKEW_MS)
+        || request.expires_at_unix_ms < now
+        || request
+            .expires_at_unix_ms
+            .saturating_sub(request.issued_at_unix_ms)
+            > CREDENTIAL_ROTATION_TTL_MS
+    {
+        return Err("credential rotation request is expired or has invalid validity".to_string());
+    }
+    let claims = CredentialRotationClaims {
+        version: CLUSTER_IDENTITY_VERSION,
+        cluster_id: cluster_id.to_string(),
+        node_id: request.node_id.clone(),
+        current_serial: request.current_serial.clone(),
+        nonce: request.nonce.clone(),
+        issued_at_unix_ms: request.issued_at_unix_ms,
+        expires_at_unix_ms: request.expires_at_unix_ms,
+    };
+    let public_key = current
+        .public_key
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| format!("member public key is invalid: {error}"))?;
+    let signature_bytes = decode_hex(&request.signature)?;
+    let signature = iroh::Signature::try_from(signature_bytes.as_slice())
+        .map_err(|error| format!("invalid credential rotation signature: {error}"))?;
+    public_key
+        .verify(&canonical_credential_rotation_claims(&claims)?, &signature)
+        .map_err(|_| "credential rotation signature verification failed".to_string())?;
+    if issuer.node_id().to_string() != current.credential_issuer_node_id {
+        return Err("credential rotation must be accepted by the current issuer".to_string());
+    }
+    let mut rotated = issue_membership_credential(
+        &issuer,
+        cluster_id,
+        current.node_id.clone(),
+        current.public_key.clone(),
+        current.capabilities.clone(),
+        current.negotiated_protocol.clone(),
+        now,
+    )?;
+    rotated.endpoint = current.endpoint;
+    rotated.joined_at_unix_ms = current.joined_at_unix_ms;
+    state
+        .members
+        .insert(rotated.node_id.clone(), rotated.clone());
+    store_membership_state(caller, &state)?;
+    Ok(MemberCredentialResult { member: rotated })
+}
+
+pub fn commit_credential_rotation(
+    caller: &impl ClusterRuntimeOps,
+    member: &ClusterMember,
+) -> Result<MemberCredentialResult, String> {
+    let _guard = identity_init_guard()?;
+    let cluster_id =
+        load_cluster_id(caller)?.ok_or_else(|| "this node is not a cluster member".to_string())?;
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "local node identity is not initialized".to_string())?;
+    if member.cluster_id != cluster_id.to_string()
+        || member.node_id != identity.node_id().to_string()
+        || member.public_key != identity.public_key().to_string()
+        || member.state != ClusterMemberState::Active
+    {
+        return Err("rotated credential does not describe the local active member".to_string());
+    }
+    verify_membership_credential(member, now_unix_ms())?;
+    let mut state = require_membership_state(caller, cluster_id)?;
+    let current = state
+        .members
+        .get(&member.node_id)
+        .ok_or_else(|| "local membership record is missing".to_string())?;
+    if current.credential_serial == member.credential_serial {
+        return Ok(MemberCredentialResult {
+            member: member.clone(),
+        });
+    }
+    if current.credential_issuer_node_id != member.credential_issuer_node_id
+        || current.capabilities != member.capabilities
+        || current.negotiated_protocol != member.negotiated_protocol
+    {
+        return Err("rotated credential changes immutable membership authority".to_string());
+    }
+    state.members.insert(member.node_id.clone(), member.clone());
+    store_membership_state(caller, &state)?;
+    Ok(MemberCredentialResult {
+        member: member.clone(),
+    })
+}
+
+pub fn revoke_member(
+    caller: &impl ClusterRuntimeOps,
+    node_id: &str,
+) -> Result<MemberCredentialResult, String> {
+    let node_id = node_id.parse::<NodeId>()?.to_string();
+    let _guard = identity_init_guard()?;
+    let cluster_id =
+        load_cluster_id(caller)?.ok_or_else(|| "cluster is not initialized".to_string())?;
+    let local_identity = load_node_identity(caller)?
+        .ok_or_else(|| "local node identity is not initialized".to_string())?;
+    if node_id == local_identity.node_id().to_string() {
+        return Err("local member must use cluster leave, not self-revocation".to_string());
+    }
+    let mut state = require_membership_state(caller, cluster_id)?;
+    let local_member =
+        active_valid_member(&state, &local_identity.node_id().to_string(), now_unix_ms())?;
+    if local_member.capabilities.consensus_role != ClusterConsensusRole::Voter {
+        return Err("only an active voter may revoke another member".to_string());
+    }
+    let member = state
+        .members
+        .get_mut(&node_id)
+        .ok_or_else(|| "member is unknown".to_string())?;
+    if member.state == ClusterMemberState::Left {
+        return Err("left member cannot be revoked".to_string());
+    }
+    member.state = ClusterMemberState::Revoked;
+    member.updated_at_unix_ms = now_unix_ms();
+    let member = member.clone();
+    store_membership_state(caller, &state)?;
+    Ok(MemberCredentialResult { member })
+}
+
+fn advertise_local_endpoint(
+    state: &mut MembershipState,
+    node_id: &str,
+    endpoint: &str,
+) -> Result<(), String> {
+    let member = state
+        .members
+        .get_mut(node_id)
+        .ok_or_else(|| "local membership record is missing".to_string())?;
+    if member.endpoint.as_deref() != Some(endpoint) {
+        member.endpoint = Some(endpoint.to_string());
+        member.updated_at_unix_ms = now_unix_ms();
+    }
+    Ok(())
+}
+
+fn require_local_voter(
+    caller: &impl ClusterRuntimeOps,
+    state: &MembershipState,
+) -> Result<NodeIdentity, String> {
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "node identity is not initialized".to_string())?;
+    let member = active_valid_member(state, &identity.node_id().to_string(), now_unix_ms())?;
+    if member.capabilities.consensus_role != ClusterConsensusRole::Voter {
+        return Err("only an active voter may issue enrollment tokens".to_string());
+    }
+    Ok(identity)
+}
+
+pub fn membership_status(caller: &impl ClusterRuntimeOps) -> Result<MembershipStatus, String> {
+    let identity = current_node_identity(caller)?;
+    let now = now_unix_ms();
+    let members = load_membership_state(caller)?
+        .map(|state| {
+            state
+                .members
+                .into_values()
+                .map(|member| {
+                    let local = member.node_id == identity.node_id;
+                    let compatible = negotiate_protocol(
+                        &current_protocol_offer(),
+                        &protocol_for_member(&member),
+                    )
+                    .is_ok();
+                    let trust_error = verify_membership_credential(&member, now).err();
+                    let trusted = trust_error.is_none();
+                    let (liveness, reachable, reason) =
+                        if member.state != ClusterMemberState::Active {
+                            (
+                                MemberLivenessState::Inactive,
+                                Some(false),
+                                Some(format!("membership state is {:?}", member.state)),
+                            )
+                        } else if !trusted {
+                            (MemberLivenessState::Untrusted, Some(false), trust_error)
+                        } else if !compatible {
+                            (
+                                MemberLivenessState::Incompatible,
+                                None,
+                                Some("member protocol is incompatible with this node".to_string()),
+                            )
+                        } else if local {
+                            (MemberLivenessState::Local, Some(true), None)
+                        } else if member.endpoint.is_some() {
+                            (
+                                MemberLivenessState::Unchecked,
+                                None,
+                                Some("reachability has not been probed".to_string()),
+                            )
+                        } else {
+                            (
+                                MemberLivenessState::Unchecked,
+                                None,
+                                Some("member has no advertised endpoint".to_string()),
+                            )
+                        };
+                    MemberStatus {
+                        member,
+                        liveness,
+                        reachable,
+                        compatible,
+                        trusted,
+                        authenticated_at_unix_ms: None,
+                        observed_at_unix_ms: now,
+                        reason,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(MembershipStatus { identity, members })
+}
+
+fn protocol_for_member(member: &ClusterMember) -> ClusterProtocolOffer {
+    ClusterProtocolOffer {
+        wire_epoch: member.negotiated_protocol.wire_epoch,
+        peer_revision_min: member.negotiated_protocol.peer_revision,
+        peer_revision_max: member.negotiated_protocol.peer_revision,
+        schema_version_min: member.negotiated_protocol.schema_version,
+        schema_version_max: member.negotiated_protocol.schema_version,
+        plugin_version: member.negotiated_protocol.remote_plugin_version.clone(),
+        features: member.negotiated_protocol.features.clone(),
+    }
+}
+
 pub fn create_enrollment_token(
     caller: &impl ClusterRuntimeOps,
     request_id: &str,
@@ -1115,15 +1474,34 @@ pub fn create_enrollment_token(
     let _guard = identity_init_guard()?;
     let cluster_id = load_cluster_id(caller)?
         .ok_or_else(|| "cluster is not initialized; run 'cluster init' first".to_string())?;
-    let node_identity = load_node_identity(caller)?
-        .ok_or_else(|| "node identity is not initialized".to_string())?;
     let mut state = require_membership_state(caller, cluster_id)?;
+    let node_identity = require_local_voter(caller, &state)?;
+    advertise_local_endpoint(&mut state, &node_identity.node_id().to_string(), endpoint)?;
     if let Some(existing) = state
         .enrollment_tokens
         .values()
         .find(|enrollment| enrollment.request_id == request_id)
     {
-        let signed = decode_and_verify_enrollment_token(&existing.token, now_unix_ms())?;
+        let now = now_unix_ms();
+        if existing.revoked_at_unix_ms.is_some() {
+            return Err(
+                "enrollment request_id belongs to a revoked token; use a new request_id"
+                    .to_string(),
+            );
+        }
+        if existing.consumed_by.is_some() {
+            return Err(
+                "enrollment request_id belongs to a consumed token; use a new request_id"
+                    .to_string(),
+            );
+        }
+        if existing.expires_at_unix_ms < now {
+            return Err(
+                "enrollment request_id belongs to an expired token; use a new request_id"
+                    .to_string(),
+            );
+        }
+        let signed = decode_and_verify_enrollment_token(&existing.token, now)?;
         if signed.claims.issuer_endpoint != endpoint
             || signed
                 .claims
@@ -1168,6 +1546,7 @@ pub fn create_enrollment_token(
             expires_at_unix_ms,
             token: token.clone(),
             consumed_by: None,
+            revoked_at_unix_ms: None,
         },
     );
     store_membership_state(caller, &state)?;
@@ -1212,6 +1591,9 @@ pub fn redeem_enrollment(
         .ok_or_else(|| "enrollment token was not issued by this node".to_string())?;
     if stored.token != request.token {
         return Err("enrollment token does not match issued token".to_string());
+    }
+    if stored.revoked_at_unix_ms.is_some() {
+        return Err("enrollment token has been revoked".to_string());
     }
     if stored.expires_at_unix_ms < now_unix_ms() {
         return Err("enrollment token has expired".to_string());
@@ -1306,7 +1688,7 @@ fn require_membership_state(
     Ok(state)
 }
 
-fn load_membership_state(
+pub fn load_membership_state(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<Option<MembershipState>, String> {
     let Some(value) = load_identity_record(caller, MEMBERSHIP_STATE_STORAGE_KEY)? else {
@@ -1416,7 +1798,7 @@ fn migrate_legacy_member_capabilities(
     Ok(migrated)
 }
 
-fn store_membership_state(
+pub fn store_membership_state(
     caller: &impl ClusterRuntimeOps,
     state: &MembershipState,
 ) -> Result<(), String> {

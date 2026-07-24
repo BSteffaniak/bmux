@@ -597,15 +597,17 @@ async fn connect_iroh(
         .endpoint_id
         .parse()
         .map_err(|error| connection_error(target, error))?;
-    let address = if let Some(relay) = &target.relay_url {
-        EndpointAddr::new(endpoint_id).with_relay_url(
+    let mut address = EndpointAddr::new(endpoint_id);
+    if let Some(relay) = &target.relay_url {
+        address = address.with_relay_url(
             relay
                 .parse()
                 .map_err(|error| connection_error(target, error))?,
-        )
-    } else {
-        EndpointAddr::new(endpoint_id)
-    };
+        );
+    }
+    if let Some(ip_addr) = target.ip_addr {
+        address = address.with_ip_addr(ip_addr);
+    }
     let connection = tokio::time::timeout(
         Duration::from_millis(target.connect_timeout_ms),
         endpoint.connect(address, BMUX_IROH_ALPN),
