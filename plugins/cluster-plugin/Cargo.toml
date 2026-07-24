@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bmux_clients_plugin_api      = { workspace = true }
+bmux_cluster_plugin_api      = { workspace = true }
 bmux_config                  = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                  = { workspace = true }
@@ -28,6 +29,7 @@ uuid                         = { workspace = true, features = ["std"] }
 
 [features]
 fail-on-warnings = [
+    "bmux_cluster_plugin_api/fail-on-warnings",
     "bmux_config/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",

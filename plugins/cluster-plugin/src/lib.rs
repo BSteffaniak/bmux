@@ -3,6 +3,22 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_clients_plugin_api::clients_state as api_clients_state;
+use bmux_cluster_plugin_api::{
+    cluster_command_v1::client::{
+        PaneMoveRequest as ClusterCommandPaneMoveRequest,
+        PaneNewRequest as ClusterCommandPaneNewRequest,
+        PaneRetryRequest as ClusterCommandPaneRetryRequest, UpRequest as ClusterCommandUpRequest,
+    },
+    cluster_query_v1::client::StatusRequest as ClusterQueryStatusRequest,
+    cluster_types::{
+        ClusterConnectionEvent, ClusterConnectionEventList as ClusterConnectionEventsListResponse,
+        ClusterConnectionState, ClusterHostState, ClusterHostStatus, ClusterLaunchStatus,
+        ClusterListResult as ClusterQueryListClustersResponse,
+        ClusterPaneMutationResult as ClusterCommandPaneMutationResponse,
+        ClusterStatusResult as ClusterQueryStatusResponse,
+        ClusterUpResult as ClusterCommandUpResponse,
+    },
+};
 use bmux_config::BmuxConfig;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as api_attach_runtime_commands,
@@ -425,7 +441,7 @@ fn pane_close(
 pub struct ClusterPlugin;
 
 impl RustPlugin for ClusterPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
+    type Contract = bmux_cluster_plugin_api::Contract;
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
@@ -442,14 +458,14 @@ impl RustPlugin for ClusterPlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "cluster-query/v1", "list_clusters" => |_: ClusterQueryListClustersRequest, ctx| {
+            "cluster-query-v1", "list_clusters" => |(): (), ctx| {
                 let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
                     .map_err(|error| ServiceResponse::error("list_clusters_failed", error))?;
                 Ok(ClusterQueryListClustersResponse {
                     clusters: inventory.clusters,
                 })
             },
-            "cluster-query/v1", "status" => |req: ClusterQueryStatusRequest, ctx| {
+            "cluster-query-v1", "status" => |req: ClusterQueryStatusRequest, ctx| {
                 let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
                     .map_err(|error| ServiceResponse::error("status_failed", error))?;
                 let probe = if req.doctor.unwrap_or(false) {
@@ -461,7 +477,7 @@ impl RustPlugin for ClusterPlugin {
                     .map_err(|error| ServiceResponse::error("status_failed", error))?;
                 Ok(ClusterQueryStatusResponse { statuses })
             },
-            "cluster-command/v1", "up" => |req: ClusterCommandUpRequest, ctx| {
+            "cluster-command-v1", "up" => |req: ClusterCommandUpRequest, ctx| {
                 let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
                     .map_err(|error| ServiceResponse::error("up_failed", error))?;
                 let result = execute_cluster_up(
@@ -480,7 +496,7 @@ impl RustPlugin for ClusterPlugin {
                     statuses: result.statuses,
                 })
             },
-            "cluster-command/v1", "pane_new" => |req: ClusterCommandPaneNewRequest, ctx| {
+            "cluster-command-v1", "pane_new" => |req: ClusterCommandPaneNewRequest, ctx| {
                 let result = execute_cluster_pane_new(
                     ctx,
                     ClusterPaneNewArgs {
@@ -491,7 +507,7 @@ impl RustPlugin for ClusterPlugin {
                 .map_err(|error| ServiceResponse::error("pane_new_failed", error))?;
                 Ok(result)
             },
-            "cluster-command/v1", "pane_retry" => |req: ClusterCommandPaneRetryRequest, ctx| {
+            "cluster-command-v1", "pane_retry" => |req: ClusterCommandPaneRetryRequest, ctx| {
                 let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
                 let result = execute_cluster_pane_retry(ctx, &ClusterPaneRetryArgs {
                     pane,
@@ -501,7 +517,7 @@ impl RustPlugin for ClusterPlugin {
                     .map_err(|error| ServiceResponse::error("pane_retry_failed", error))?;
                 Ok(result)
             },
-            "cluster-command/v1", "pane_move" => |req: ClusterCommandPaneMoveRequest, ctx| {
+            "cluster-command-v1", "pane_move" => |req: ClusterCommandPaneMoveRequest, ctx| {
                 let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
                 let result = execute_cluster_pane_move(
                     ctx,
@@ -513,10 +529,10 @@ impl RustPlugin for ClusterPlugin {
                 .map_err(|error| ServiceResponse::error("pane_move_failed", error))?;
                 Ok(result)
             },
-            "cluster-connection-events/v1", "list" => |_: ClusterConnectionEventsListRequest, ctx| {
+            "cluster-connection-events-v1", "list_events" => |(): (), ctx| {
                 let events = get_cluster_connection_events(ctx)
                     .map_err(|error| ServiceResponse::error("connection_events_list_failed", error))?;
-                Ok(ClusterConnectionEventsListResponse { events })
+                Ok(ClusterConnectionEventsListResponse { entries: events })
             },
         })
     }
@@ -552,21 +568,6 @@ struct ClusterInventory {
     known_targets: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ClusterHostState {
-    Ready,
-    Degraded,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterHostStatus {
-    cluster: String,
-    target: String,
-    state: ClusterHostState,
-    reason: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum HealthProbe {
     Test,
@@ -579,14 +580,6 @@ struct ClusterUpArgs {
     hosts: Vec<String>,
     on_failure: RetryFailurePolicy,
     retries: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterLaunchStatus {
-    target: String,
-    state: ClusterHostState,
-    reason: Option<String>,
-    pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -646,93 +639,6 @@ struct ClusterPaneBinding {
     #[serde(default)]
     last_error: Option<String>,
     updated_at_unix_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-enum ClusterConnectionState {
-    #[default]
-    Connecting,
-    Ready,
-    Degraded,
-    Retrying,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterConnectionEvent {
-    ts_unix_ms: u64,
-    pane_id: Option<String>,
-    cluster: Option<String>,
-    target: Option<String>,
-    source: Option<String>,
-    state: ClusterConnectionState,
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterQueryListClustersRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterQueryListClustersResponse {
-    clusters: BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterQueryStatusRequest {
-    selector: Option<String>,
-    doctor: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterQueryStatusResponse {
-    statuses: Vec<ClusterHostStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterCommandUpRequest {
-    cluster: String,
-    hosts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterCommandUpResponse {
-    session_id: String,
-    statuses: Vec<ClusterLaunchStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterCommandPaneNewRequest {
-    host: String,
-    name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterCommandPaneRetryRequest {
-    pane: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterCommandPaneMoveRequest {
-    pane: Option<String>,
-    host: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterCommandPaneMutationResponse {
-    target: String,
-    old_pane_id: Option<String>,
-    old_name: Option<String>,
-    new_pane_id: String,
-    session_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterConnectionEventsListRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterConnectionEventsListResponse {
-    events: Vec<ClusterConnectionEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,7 +740,7 @@ fn run_cluster_events(context: &NativeCommandContext) -> Result<i32, String> {
         println!(
             "  - ts={} state={} pane_id={} cluster={} target={} source={} message={}",
             event.ts_unix_ms,
-            connection_state_label(&event.state),
+            connection_state_label(event.state),
             event.pane_id.as_deref().unwrap_or("-"),
             event.cluster.as_deref().unwrap_or("-"),
             event.target.as_deref().unwrap_or("-"),
@@ -2225,7 +2131,7 @@ fn normalized_non_empty(value: &str) -> Option<String> {
     }
 }
 
-const fn connection_state_label(state: &ClusterConnectionState) -> &'static str {
+const fn connection_state_label(state: ClusterConnectionState) -> &'static str {
     match state {
         ClusterConnectionState::Connecting => "connecting",
         ClusterConnectionState::Ready => "ready",
@@ -2977,12 +2883,12 @@ mod tests {
         payload: Vec<u8>,
         settings: Option<toml::Value>,
     ) -> NativeServiceContext {
-        let kind = if interface_id == "cluster-command/v1" {
+        let kind = if interface_id == "cluster-command-v1" {
             ServiceKind::Command
         } else {
             ServiceKind::Query
         };
-        let capability = if interface_id == "cluster-command/v1" {
+        let capability = if interface_id == "cluster-command-v1" {
             "bmux.server_clusters.write"
         } else {
             "bmux.server_clusters.read"
@@ -3108,12 +3014,12 @@ mod tests {
     #[test]
     fn invoke_service_list_clusters_returns_inventory_from_settings() {
         let harness = ServiceTestHarness::new();
-        let response = harness.invoke(
-            "cluster-query/v1",
-            "list_clusters",
-            &ClusterQueryListClustersRequest {},
+        let response = harness.invoke("cluster-query-v1", "list_clusters", &());
+        assert!(
+            response.error.is_none(),
+            "list_clusters should succeed: {:?}",
+            response.error
         );
-        assert!(response.error.is_none(), "list_clusters should succeed");
         let decoded: ClusterQueryListClustersResponse =
             bmux_plugin_sdk::decode_service_message(&response.payload)
                 .expect("list_clusters response should decode");
@@ -3127,7 +3033,7 @@ mod tests {
     fn invoke_service_status_returns_degraded_when_probe_runtime_is_unavailable() {
         let harness = ServiceTestHarness::new();
         let response = harness.invoke(
-            "cluster-query/v1",
+            "cluster-query-v1",
             "status",
             &ClusterQueryStatusRequest {
                 selector: Some("prod".to_string()),
@@ -3151,7 +3057,7 @@ mod tests {
     fn invoke_service_up_maps_runtime_failures_to_up_failed() {
         let harness = ServiceTestHarness::new();
         harness.expect_error_code(
-            "cluster-command/v1",
+            "cluster-command-v1",
             "up",
             &ClusterCommandUpRequest {
                 cluster: "prod".to_string(),
@@ -3165,7 +3071,7 @@ mod tests {
     fn invoke_service_pane_new_maps_runtime_failures_to_pane_new_failed() {
         let harness = ServiceTestHarness::new();
         harness.expect_error_code(
-            "cluster-command/v1",
+            "cluster-command-v1",
             "pane_new",
             &ClusterCommandPaneNewRequest {
                 host: "db-a".to_string(),
@@ -3179,7 +3085,7 @@ mod tests {
     fn invoke_service_pane_retry_maps_runtime_failures_to_pane_retry_failed() {
         let harness = ServiceTestHarness::new();
         harness.expect_error_code(
-            "cluster-command/v1",
+            "cluster-command-v1",
             "pane_retry",
             &ClusterCommandPaneRetryRequest { pane: None },
             "pane_retry_failed",
@@ -3190,7 +3096,7 @@ mod tests {
     fn invoke_service_pane_move_maps_runtime_failures_to_pane_move_failed() {
         let harness = ServiceTestHarness::new();
         harness.expect_error_code(
-            "cluster-command/v1",
+            "cluster-command-v1",
             "pane_move",
             &ClusterCommandPaneMoveRequest {
                 pane: None,
@@ -3204,9 +3110,9 @@ mod tests {
     fn invoke_service_events_list_maps_runtime_failures_to_connection_events_list_failed() {
         let harness = ServiceTestHarness::new();
         harness.expect_error_code(
-            "cluster-connection-events/v1",
-            "list",
-            &ClusterConnectionEventsListRequest {},
+            "cluster-connection-events-v1",
+            "list_events",
+            &(),
             "connection_events_list_failed",
         );
     }

@@ -1,0 +1,94 @@
+// Stable typed contract for the bmux cluster plugin.
+//
+// This first schema models the plugin's existing inventory, health,
+// orchestration, pane mutation, and connection-event services. Native
+// federation interfaces are added as their implementation phases begin;
+// runtime managers and transport policy remain in the implementation crate.
+
+plugin bmux.cluster version 1;
+
+capability CLUSTER_READ = bmux.server_clusters.read;
+capability CLUSTER_WRITE = bmux.server_clusters.write;
+
+interface cluster-types {
+    enum cluster-host-state {
+        ready,
+        degraded,
+    }
+
+    record cluster-host-status {
+        cluster: string,
+        target: string,
+        state: cluster-host-state,
+        reason: string?,
+    }
+
+    record cluster-launch-status {
+        target: string,
+        state: cluster-host-state,
+        reason: string?,
+        pane_id: string?,
+    }
+
+    record cluster-list-result {
+        clusters: map<string, list<string>>,
+    }
+
+    record cluster-status-result {
+        statuses: list<cluster-host-status>,
+    }
+
+    record cluster-up-result {
+        session_id: string,
+        statuses: list<cluster-launch-status>,
+    }
+
+    record cluster-pane-mutation-result {
+        target: string,
+        old_pane_id: string?,
+        old_name: string?,
+        new_pane_id: string,
+        session_id: string,
+    }
+
+    enum cluster-connection-state {
+        @default connecting,
+        ready,
+        degraded,
+        retrying,
+        failed,
+    }
+
+    record cluster-connection-event {
+        ts_unix_ms: u64,
+        pane_id: string?,
+        cluster: string?,
+        target: string?,
+        source: string?,
+        state: cluster-connection-state,
+        message: string,
+    }
+
+    record cluster-connection-event-list {
+        entries: list<cluster-connection-event>,
+    }
+}
+
+@capability(CLUSTER_READ)
+interface cluster-query-v1 {
+    query list_clusters() -> cluster-types.cluster-list-result;
+    query status(selector: string?, doctor: bool?) -> cluster-types.cluster-status-result;
+}
+
+@capability(CLUSTER_WRITE)
+interface cluster-command-v1 {
+    command up(cluster: string, hosts: list<string>) -> cluster-types.cluster-up-result;
+    command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
+    command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;
+    command pane_move(pane: string?, host: string) -> cluster-types.cluster-pane-mutation-result;
+}
+
+@capability(CLUSTER_READ)
+interface cluster-connection-events-v1 {
+    query list_events() -> cluster-types.cluster-connection-event-list;
+}

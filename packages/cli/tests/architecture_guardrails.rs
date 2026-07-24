@@ -43,6 +43,30 @@ fn assert_no_domain_markers(source: &str, context: &str) {
     }
 }
 
+fn assert_no_cluster_domain_markers(source: &str, context: &str) {
+    let denied = [
+        "bmux.cluster",
+        "bmux.server_clusters",
+        "cluster-query-v1",
+        "cluster-command-v1",
+        "cluster-connection-events-v1",
+        "ClusterId",
+        "NodeId",
+        "WorkspaceId",
+        "LogicalWindowId",
+        "LogicalPaneId",
+        "ExecutionGeneration",
+        "ClusterGatewayMode",
+    ];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "{context} must not contain cluster-domain marker {marker}; cluster behavior belongs in plugins/cluster-plugin",
+        );
+    }
+}
+
 fn assert_no_raw_host_kernel_coupling(source: &str, context: &str) {
     // Legitimate typed dispatch uses `call_service(...)` on
     // `ServiceCaller`. The raw-coupling check focuses on markers
@@ -177,7 +201,9 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
     ];
 
     for (path, source) in core_sources {
-        assert_no_domain_markers(production_section(source), path);
+        let source = production_section(source);
+        assert_no_domain_markers(source, path);
+        assert_no_cluster_domain_markers(source, path);
     }
 }
 
@@ -1447,12 +1473,17 @@ fn plugin_api_crates_do_not_define_public_typed_clients() {
     }
 }
 
-/// Recording, performance, and snapshot service transport is generated from BPDL;
+/// Recording, performance, snapshot, and cluster service transport is generated from BPDL;
 /// public API crates must not reintroduce handwritten request/response
 /// envelopes for those service calls.
 #[test]
 fn generated_transport_api_crates_do_not_define_public_envelopes() {
     for (label, source, markers) in [
+        (
+            "plugins/cluster-plugin-api",
+            include_str!("../../../plugins/cluster-plugin-api/src/lib.rs"),
+            ["pub enum ClusterRequest", "pub enum ClusterResponse"].as_slice(),
+        ),
         (
             "plugins/recording-plugin-api",
             include_str!("../../../plugins/recording-plugin-api/src/lib.rs"),
