@@ -351,6 +351,11 @@ zstd = { version = "0.13", default-features = false }
 notify = { version = "8", default-features = false, features = [
     "macos_fsevent",
 ] }
+openraft = { version = "=0.9.24", default-features = false, features = [
+    "serde",
+    "storage-v2",
+] }
+redb = { version = "=4.1.0", default-features = false }
 
 # Lua scripting runtime for the decoration plugin. Mutually-exclusive
 # features select the Lua ABI; see the decoration plugin's

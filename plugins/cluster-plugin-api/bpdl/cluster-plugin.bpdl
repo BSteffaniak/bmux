@@ -55,6 +55,157 @@ interface cluster-types {
         protocol: cluster-protocol-offer,
     }
 
+    record workspace-id {
+        value: uuid,
+    }
+
+    record logical-window-id {
+        value: uuid,
+    }
+
+    record logical-pane-id {
+        value: uuid,
+    }
+
+    record execution-id {
+        value: uuid,
+    }
+
+    record command-id {
+        value: uuid,
+    }
+
+    record promotion-id {
+        value: uuid,
+    }
+
+    enum pane-restart-policy {
+        manual,
+        never,
+        on-worker-loss,
+    }
+
+    enum pane-availability {
+        pending,
+        ready,
+        suspect,
+        unavailable,
+        reconciling,
+        replacing,
+        exited,
+        failed,
+        quarantined,
+    }
+
+    record placement-label {
+        key: string,
+        value: string,
+    }
+
+    record placement-intent {
+        explicit_node_id: string?,
+        required_labels: list<placement-label>,
+        preferred_labels: list<placement-label>,
+    }
+
+    record execution-assignment {
+        node_id: string,
+        generation: u64,
+        execution_id: execution-id,
+    }
+
+    record workspace-record {
+        workspace_id: workspace-id,
+        name: string?,
+        revision: u64,
+    }
+
+    record logical-window-record {
+        window_id: logical-window-id,
+        workspace_id: workspace-id,
+        name: string?,
+        layout_schema_version: u32,
+        layout: bytes,
+        revision: u64,
+    }
+
+    record logical-pane-record {
+        pane_id: logical-pane-id,
+        workspace_id: workspace-id,
+        window_id: logical-window-id,
+        name: string?,
+        restart_policy: pane-restart-policy,
+        placement: placement-intent,
+        availability: pane-availability,
+        availability_reason: string?,
+        execution: execution-assignment?,
+        revision: u64,
+    }
+
+    variant control-command-request {
+        upsert-member { member: cluster-member },
+        set-member-state { node_id: string, expected_credential_serial: string, state: cluster-member-state },
+        create-workspace { workspace_id: workspace-id, name: string? },
+        rename-workspace { workspace_id: workspace-id, expected_revision: u64, name: string? },
+        put-window { window: logical-window-record, expected_workspace_revision: u64 },
+        remove-window { window_id: logical-window-id, expected_workspace_revision: u64 },
+        put-pane { pane: logical-pane-record, expected_workspace_revision: u64 },
+        remove-pane { pane_id: logical-pane-id, expected_revision: u64, expected_generation: u64? },
+        assign-execution { pane_id: logical-pane-id, expected_revision: u64, expected_generation: u64, assignment: execution-assignment },
+        set-pane-availability { pane_id: logical-pane-id, expected_revision: u64, assignment: execution-assignment, availability: pane-availability, reason: string? },
+        complete-workflow { original_command_id: command-id, response: bytes },
+        prune-dedup { completed_before_unix_ms: u64 },
+    }
+
+    record control-command {
+        schema_version: u16,
+        principal_id: string,
+        command_id: command-id,
+        issued_at_unix_ms: u64,
+        request: control-command-request,
+    }
+
+    enum control-resource-kind {
+        member,
+        workspace,
+        window,
+        pane,
+        execution,
+        workflow,
+    }
+
+    variant control-command-error {
+        command-id-conflict,
+        not-found { resource: control-resource-kind, id: string },
+        already-exists { resource: control-resource-kind, id: string },
+        revision-conflict { expected: u64, current: u64 },
+        generation-conflict { expected: u64, current: u64 },
+        invalid-reference { resource: control-resource-kind, id: string },
+        invalid-transition { reason: string },
+        member-inactive { node_id: string },
+        incompatible-schema { supported: u16, received: u16 },
+        quorum-required,
+        not-leader { leader_node_id: string? },
+    }
+
+    enum control-workflow-status {
+        complete,
+        pending,
+    }
+
+    variant control-command-result {
+        accepted { payload: bytes },
+        rejected { error: control-command-error },
+    }
+
+    record control-response {
+        schema_version: u16,
+        command_id: command-id,
+        control_revision: u64,
+        workflow_status: control-workflow-status,
+        result: control-command-result,
+    }
+
     enum cluster-member-state {
         active,
         revoked,

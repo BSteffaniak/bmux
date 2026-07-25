@@ -15,6 +15,8 @@ This directory contains the accepted architecture decisions for native bmux serv
 | [ADR-0007](adr-0007-protocol-compatibility-and-upgrades.md) | Protocol compatibility and rolling upgrades                 | Accepted |
 | [ADR-0008](adr-0008-reliability-and-performance-budgets.md) | Reliability and performance budgets                         | Accepted |
 | [ADR-0009](adr-0009-consensus-implementation.md)            | OpenRaft consensus implementation selection                 | Accepted |
+| [ADR-0010](adr-0010-consensus-storage.md)                   | redb consensus storage, durability, and recovery            | Accepted |
+| [ADR-0011](adr-0011-deterministic-control-state-machine.md) | Deterministic control commands, responses, and invariants   | Accepted |
 
 ## Global invariants
 

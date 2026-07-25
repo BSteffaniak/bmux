@@ -7,9 +7,125 @@ use bmux_cluster_plugin_api::{
         ClusterHostStatus, ClusterIdentity, ClusterJoinResult, ClusterLaunchStatus,
         ClusterLeaveResult, ClusterMember, ClusterMemberList, ClusterMemberState,
         ClusterNegotiatedProtocol, ClusterNodeCapabilities, ClusterPaneMutationResult,
-        ClusterProtocolOffer, ClusterUpResult, EnrollmentTokenResult,
+        ClusterProtocolOffer, ClusterUpResult, CommandId, ControlCommand, ControlCommandError,
+        ControlCommandRequest, ControlCommandResult, ControlResourceKind, ControlResponse,
+        ControlWorkflowStatus, EnrollmentTokenResult, ExecutionAssignment, ExecutionId,
+        LogicalPaneId, LogicalPaneRecord, LogicalWindowId, LogicalWindowRecord, PaneAvailability,
+        PaneRestartPolicy, PlacementIntent, PromotionId, WorkspaceId, WorkspaceRecord,
     },
 };
+
+#[test]
+fn control_state_contract_uses_typed_ids_and_tagged_commands() {
+    let workspace_id = WorkspaceId {
+        value: uuid::Uuid::new_v4(),
+    };
+    let window_id = LogicalWindowId {
+        value: uuid::Uuid::new_v4(),
+    };
+    let pane_id = LogicalPaneId {
+        value: uuid::Uuid::new_v4(),
+    };
+    let command_id = CommandId {
+        value: uuid::Uuid::new_v4(),
+    };
+    let assignment = ExecutionAssignment {
+        node_id: "node:worker".to_string(),
+        generation: 1,
+        execution_id: ExecutionId {
+            value: uuid::Uuid::new_v4(),
+        },
+    };
+    let workspace = WorkspaceRecord {
+        workspace_id: workspace_id.clone(),
+        name: Some("ops".to_string()),
+        revision: 1,
+    };
+    let window = LogicalWindowRecord {
+        window_id: window_id.clone(),
+        workspace_id: workspace_id.clone(),
+        name: Some("main".to_string()),
+        layout_schema_version: 1,
+        layout: Vec::new(),
+        revision: 1,
+    };
+    let pane = LogicalPaneRecord {
+        pane_id: pane_id.clone(),
+        workspace_id: workspace_id.clone(),
+        window_id,
+        name: Some("shell".to_string()),
+        restart_policy: PaneRestartPolicy::Manual,
+        placement: PlacementIntent {
+            explicit_node_id: Some("node:worker".to_string()),
+            required_labels: Vec::new(),
+            preferred_labels: Vec::new(),
+        },
+        availability: PaneAvailability::Ready,
+        availability_reason: None,
+        execution: Some(assignment.clone()),
+        revision: 1,
+    };
+    let commands = [
+        ControlCommandRequest::CreateWorkspace {
+            workspace_id: workspace.workspace_id,
+            name: workspace.name,
+        },
+        ControlCommandRequest::PutWindow {
+            window,
+            expected_workspace_revision: 1,
+        },
+        ControlCommandRequest::PutPane {
+            pane,
+            expected_workspace_revision: 2,
+        },
+        ControlCommandRequest::AssignExecution {
+            pane_id,
+            expected_revision: 1,
+            expected_generation: 0,
+            assignment,
+        },
+    ];
+    for request in commands {
+        let command = ControlCommand {
+            schema_version: 1,
+            principal_id: "principal:test".to_string(),
+            command_id: command_id.clone(),
+            issued_at_unix_ms: 1,
+            request,
+        };
+        let encoded = bmux_plugin_sdk::encode_service_message(&command)
+            .expect("control command should encode");
+        let decoded: ControlCommand = bmux_plugin_sdk::decode_service_message(&encoded)
+            .expect("control command should decode");
+        assert_eq!(decoded, command);
+    }
+
+    let response = ControlResponse {
+        schema_version: 1,
+        command_id,
+        control_revision: 4,
+        workflow_status: ControlWorkflowStatus::Complete,
+        result: ControlCommandResult::Rejected {
+            error: ControlCommandError::NotFound {
+                resource: ControlResourceKind::Pane,
+                id: "pane:missing".to_string(),
+            },
+        },
+    };
+    let encoded =
+        bmux_plugin_sdk::encode_service_message(&response).expect("control response should encode");
+    let decoded: ControlResponse =
+        bmux_plugin_sdk::decode_service_message(&encoded).expect("control response should decode");
+    assert_eq!(decoded, response);
+
+    let promotion = PromotionId {
+        value: uuid::Uuid::new_v4(),
+    };
+    assert_eq!(
+        serde_json::from_str::<PromotionId>(&serde_json::to_string(&promotion).unwrap()).unwrap(),
+        promotion
+    );
+}
 
 #[test]
 fn cluster_status_types_round_trip() {
