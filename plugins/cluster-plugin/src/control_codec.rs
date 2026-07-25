@@ -3,7 +3,7 @@ use bmux_cluster_plugin_api::cluster_types::{
     ClusterNodeCapabilities, CommandId, ControlCommand, ControlCommandError, ControlCommandRequest,
     ControlCommandResult, ControlResourceKind, ControlResponse, ControlWorkflowStatus,
     ExecutionAssignment, LogicalPaneRecord, LogicalWindowRecord, PaneAvailability,
-    PaneRestartPolicy, PlacementIntent, PlacementLabel, WorkspaceId,
+    PaneRestartPolicy, PlacementIntent, PlacementLabel, WorkspaceId, WorkspaceRecord,
 };
 use sha2::{Digest, Sha256};
 
@@ -106,10 +106,7 @@ pub fn decode_control_command(bytes: &[u8]) -> Result<ControlCommand, CodecError
     Ok(command)
 }
 
-#[must_use]
-pub fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
-    let mut writer = Writer::default();
-    writer.raw(b"BMRES001");
+pub(crate) fn encode_state_response(writer: &mut Writer, response: &ControlResponse) {
     writer.u16(response.schema_version);
     writer.uuid(response.command_id.value);
     writer.u64(response.control_revision);
@@ -124,10 +121,61 @@ pub fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
         }
         ControlCommandResult::Rejected { error } => {
             writer.u16(2);
-            encode_error(&mut writer, error);
+            encode_error(writer, error);
         }
     }
-    writer.bytes
+}
+
+pub(crate) fn decode_state_response(
+    reader: &mut Reader<'_>,
+) -> Result<ControlResponse, CodecError> {
+    let schema_version = reader.u16()?;
+    if schema_version != CONTROL_SCHEMA_VERSION {
+        return Err(CodecError::UnsupportedSchema(schema_version));
+    }
+    let command_id = CommandId {
+        value: reader.uuid()?,
+    };
+    let control_revision = reader.u64()?;
+    let workflow_status = match reader.u16()? {
+        1 => ControlWorkflowStatus::Complete,
+        2 => ControlWorkflowStatus::Pending,
+        tag => {
+            return Err(CodecError::InvalidTag {
+                type_name: "workflow status",
+                tag,
+            });
+        }
+    };
+    let result = match reader.u16()? {
+        1 => ControlCommandResult::Accepted {
+            payload: reader.bytes()?,
+        },
+        2 => ControlCommandResult::Rejected {
+            error: decode_error(reader)?,
+        },
+        tag => {
+            return Err(CodecError::InvalidTag {
+                type_name: "command result",
+                tag,
+            });
+        }
+    };
+    Ok(ControlResponse {
+        schema_version,
+        command_id,
+        control_revision,
+        workflow_status,
+        result,
+    })
+}
+
+#[must_use]
+pub fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
+    let mut writer = Writer::default();
+    writer.raw(b"BMRES001");
+    encode_state_response(&mut writer, response);
+    writer.into_bytes()
 }
 
 fn validate_command(command: &ControlCommand) -> Result<(), CodecError> {
@@ -773,6 +821,52 @@ fn encode_error(writer: &mut Writer, error: &ControlCommandError) {
     }
 }
 
+fn decode_error(reader: &mut Reader<'_>) -> Result<ControlCommandError, CodecError> {
+    Ok(match reader.u16()? {
+        1 => ControlCommandError::CommandIdConflict,
+        2 => ControlCommandError::NotFound {
+            resource: decode_resource_kind(reader)?,
+            id: reader.string()?,
+        },
+        3 => ControlCommandError::AlreadyExists {
+            resource: decode_resource_kind(reader)?,
+            id: reader.string()?,
+        },
+        4 => ControlCommandError::RevisionConflict {
+            expected: reader.u64()?,
+            current: reader.u64()?,
+        },
+        5 => ControlCommandError::GenerationConflict {
+            expected: reader.u64()?,
+            current: reader.u64()?,
+        },
+        6 => ControlCommandError::InvalidReference {
+            resource: decode_resource_kind(reader)?,
+            id: reader.string()?,
+        },
+        7 => ControlCommandError::InvalidTransition {
+            reason: reader.string()?,
+        },
+        8 => ControlCommandError::MemberInactive {
+            node_id: reader.string()?,
+        },
+        9 => ControlCommandError::IncompatibleSchema {
+            supported: reader.u16()?,
+            received: reader.u16()?,
+        },
+        10 => ControlCommandError::QuorumRequired,
+        11 => ControlCommandError::NotLeader {
+            leader_node_id: reader.optional_string()?,
+        },
+        tag => {
+            return Err(CodecError::InvalidTag {
+                type_name: "control error",
+                tag,
+            });
+        }
+    })
+}
+
 fn encode_resource_kind(writer: &mut Writer, kind: ControlResourceKind) {
     writer.u16(match kind {
         ControlResourceKind::Member => 1,
@@ -784,37 +878,74 @@ fn encode_resource_kind(writer: &mut Writer, kind: ControlResourceKind) {
     });
 }
 
+fn decode_resource_kind(reader: &mut Reader<'_>) -> Result<ControlResourceKind, CodecError> {
+    match reader.u16()? {
+        1 => Ok(ControlResourceKind::Member),
+        2 => Ok(ControlResourceKind::Workspace),
+        3 => Ok(ControlResourceKind::Window),
+        4 => Ok(ControlResourceKind::Pane),
+        5 => Ok(ControlResourceKind::Execution),
+        6 => Ok(ControlResourceKind::Workflow),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "resource kind",
+            tag,
+        }),
+    }
+}
+
 #[derive(Default)]
-struct Writer {
+pub(crate) struct Writer {
     bytes: Vec<u8>,
 }
 
 impl Writer {
-    fn raw(&mut self, bytes: &[u8]) {
+    pub(crate) fn encode_state_workspace(&mut self, workspace: &WorkspaceRecord) {
+        encode_workspace_id(self, &workspace.workspace_id);
+        self.optional_string(workspace.name.as_deref());
+        self.u64(workspace.revision);
+    }
+
+    pub(crate) fn encode_state_member(&mut self, member: &ClusterMember) {
+        encode_member(self, member);
+    }
+
+    pub(crate) fn encode_state_window(&mut self, window: &LogicalWindowRecord) {
+        encode_window(self, window);
+    }
+
+    pub(crate) fn encode_state_pane(&mut self, pane: &LogicalPaneRecord) {
+        encode_pane(self, pane);
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
 
-    fn bool(&mut self, value: bool) {
+    pub(crate) fn bool(&mut self, value: bool) {
         self.bytes.push(u8::from(value));
     }
 
-    fn u16(&mut self, value: u16) {
+    pub(crate) fn u16(&mut self, value: u16) {
         self.raw(&value.to_be_bytes());
     }
 
-    fn u32(&mut self, value: u32) {
+    pub(crate) fn u32(&mut self, value: u32) {
         self.raw(&value.to_be_bytes());
     }
 
-    fn u64(&mut self, value: u64) {
+    pub(crate) fn u64(&mut self, value: u64) {
         self.raw(&value.to_be_bytes());
     }
 
-    fn len(&mut self, value: usize) {
+    pub(crate) fn len(&mut self, value: usize) {
         self.u32(u32::try_from(value).expect("validated canonical length must fit u32"));
     }
 
-    fn string(&mut self, value: &str) {
+    pub(crate) fn string(&mut self, value: &str) {
         assert!(
             value.len() <= MAX_STRING_BYTES,
             "canonical string exceeds limit"
@@ -823,7 +954,7 @@ impl Writer {
         self.raw(value.as_bytes());
     }
 
-    fn optional_string(&mut self, value: Option<&str>) {
+    pub(crate) fn optional_string(&mut self, value: Option<&str>) {
         match value {
             Some(value) => {
                 self.bool(true);
@@ -833,7 +964,7 @@ impl Writer {
         }
     }
 
-    fn optional_u64(&mut self, value: Option<u64>) {
+    pub(crate) fn optional_u64(&mut self, value: Option<u64>) {
         match value {
             Some(value) => {
                 self.bool(true);
@@ -843,7 +974,7 @@ impl Writer {
         }
     }
 
-    fn bytes(&mut self, value: &[u8]) {
+    pub(crate) fn bytes(&mut self, value: &[u8]) {
         assert!(
             value.len() <= MAX_BYTES,
             "canonical byte field exceeds limit"
@@ -852,22 +983,42 @@ impl Writer {
         self.raw(value);
     }
 
-    fn uuid(&mut self, value: uuid::Uuid) {
+    pub(crate) fn uuid(&mut self, value: uuid::Uuid) {
         self.raw(value.as_bytes());
     }
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    fn take(&mut self, len: usize) -> Result<&'a [u8], CodecError> {
+    pub(crate) fn decode_state_workspace(&mut self) -> Result<WorkspaceRecord, CodecError> {
+        Ok(WorkspaceRecord {
+            workspace_id: decode_workspace_id(self)?,
+            name: self.optional_string()?,
+            revision: self.u64()?,
+        })
+    }
+
+    pub(crate) fn decode_state_member(&mut self) -> Result<ClusterMember, CodecError> {
+        decode_member(self)
+    }
+
+    pub(crate) fn decode_state_window(&mut self) -> Result<LogicalWindowRecord, CodecError> {
+        decode_window(self)
+    }
+
+    pub(crate) fn decode_state_pane(&mut self) -> Result<LogicalPaneRecord, CodecError> {
+        decode_pane(self)
+    }
+
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], CodecError> {
         let end = self.offset.checked_add(len).ok_or(CodecError::Truncated)?;
         let value = self
             .bytes
@@ -877,7 +1028,7 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    const fn finish(self) -> Result<(), CodecError> {
+    pub(crate) const fn finish(self) -> Result<(), CodecError> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
@@ -885,7 +1036,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn bool(&mut self) -> Result<bool, CodecError> {
+    pub(crate) fn bool(&mut self) -> Result<bool, CodecError> {
         match self.take(1)?[0] {
             0 => Ok(false),
             1 => Ok(true),
@@ -893,19 +1044,19 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn u16(&mut self) -> Result<u16, CodecError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, CodecError> {
         Ok(u16::from_be_bytes(
             self.take(2)?.try_into().expect("exact length"),
         ))
     }
 
-    fn u32(&mut self) -> Result<u32, CodecError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, CodecError> {
         Ok(u32::from_be_bytes(
             self.take(4)?.try_into().expect("exact length"),
         ))
     }
 
-    fn u64(&mut self) -> Result<u64, CodecError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, CodecError> {
         Ok(u64::from_be_bytes(
             self.take(8)?.try_into().expect("exact length"),
         ))
@@ -919,14 +1070,14 @@ impl<'a> Reader<'a> {
         Ok(len)
     }
 
-    fn string(&mut self) -> Result<String, CodecError> {
+    pub(crate) fn string(&mut self) -> Result<String, CodecError> {
         let len = self.len("string", MAX_STRING_BYTES)?;
         std::str::from_utf8(self.take(len)?)
             .map(ToString::to_string)
             .map_err(|_| CodecError::InvalidUtf8)
     }
 
-    fn optional_string(&mut self) -> Result<Option<String>, CodecError> {
+    pub(crate) fn optional_string(&mut self) -> Result<Option<String>, CodecError> {
         if self.bool()? {
             Ok(Some(self.string()?))
         } else {
@@ -934,7 +1085,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn optional_u64(&mut self) -> Result<Option<u64>, CodecError> {
+    pub(crate) fn optional_u64(&mut self) -> Result<Option<u64>, CodecError> {
         if self.bool()? {
             Ok(Some(self.u64()?))
         } else {
@@ -942,12 +1093,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, CodecError> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, CodecError> {
         let len = self.len("byte field", MAX_BYTES)?;
         Ok(self.take(len)?.to_vec())
     }
 
-    fn uuid(&mut self) -> Result<uuid::Uuid, CodecError> {
+    pub(crate) fn uuid(&mut self) -> Result<uuid::Uuid, CodecError> {
         Ok(uuid::Uuid::from_bytes(
             self.take(16)?.try_into().expect("exact length"),
         ))

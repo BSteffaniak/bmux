@@ -3,10 +3,13 @@
 //! The durable format is intentionally byte-oriented: BMUX owns every key and value
 //! encoding instead of coupling consensus compatibility to Rust type layout.
 
-use openraft::storage::{LogFlushed, RaftLogStorage};
+use crate::control_codec::{decode_control_command, encode_control_response};
+use crate::control_state::ControlState;
+use openraft::storage::{LogFlushed, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
     AnyError, BasicNode, CommittedLeaderId, Entry, EntryPayload, LeaderId, LogId, LogState,
-    Membership, RaftLogReader, StorageError, StorageIOError, Vote,
+    Membership, RaftLogReader, Snapshot, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership, Vote,
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -22,10 +25,14 @@ const CONSENSUS_DB_FILE: &str = "raft.redb";
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const HARD_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("hard_state");
 const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("log");
+const STATE_MACHINE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_machine");
 const META_FORMAT_VERSION: &str = "storage_format_version";
 const META_CLUSTER_ID: &str = "cluster_id";
 const HARD_STATE_VOTE: &str = "vote";
 const HARD_STATE_LAST_PURGED: &str = "last_purged_log_id";
+const STATE_MACHINE_LAST_APPLIED: &str = "last_applied_log_id";
+const STATE_MACHINE_MEMBERSHIP: &str = "last_membership";
+const STATE_MACHINE_CONTROL: &str = "control_state";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest(pub Vec<u8>);
@@ -90,6 +97,16 @@ impl From<redb::Error> for ConsensusStorageError {
 pub struct ConsensusLogStore {
     database: Arc<Database>,
     database_path: PathBuf,
+    cluster_id: String,
+}
+
+#[derive(Clone)]
+pub struct ConsensusStateMachine {
+    database: Arc<Database>,
+    cluster_id: String,
+    control_state: ControlState,
+    last_applied: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, BasicNode>,
 }
 
 impl ConsensusLogStore {
@@ -113,12 +130,23 @@ impl ConsensusLogStore {
         Ok(Self {
             database,
             database_path,
+            cluster_id: cluster_id.to_owned(),
         })
     }
 
     #[must_use]
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    /// Opens the state-machine half over the same transactional database.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if any persisted state-machine record is corrupt or belongs
+    /// to another cluster.
+    pub fn state_machine(&self) -> Result<ConsensusStateMachine, ConsensusStorageError> {
+        ConsensusStateMachine::open(self.database.clone(), &self.cluster_id)
     }
 
     fn read_vote(&self) -> Result<Option<Vote<u64>>, ConsensusStorageError> {
@@ -266,6 +294,175 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
     }
 }
 
+impl ConsensusStateMachine {
+    fn open(database: Arc<Database>, cluster_id: &str) -> Result<Self, ConsensusStorageError> {
+        let control_state = read_optional_bytes(
+            &database,
+            STATE_MACHINE_TABLE,
+            STATE_MACHINE_CONTROL,
+            |bytes| {
+                ControlState::decode_snapshot(bytes)
+                    .map_err(|_| ConsensusStorageError::CorruptRecord("control state"))
+            },
+        )?
+        .unwrap_or_else(|| ControlState::new(cluster_id));
+        if control_state.cluster_id != cluster_id {
+            return Err(ConsensusStorageError::ClusterIdMismatch {
+                expected: cluster_id.to_owned(),
+                actual: control_state.cluster_id,
+            });
+        }
+        let last_applied = read_optional_bytes(
+            &database,
+            STATE_MACHINE_TABLE,
+            STATE_MACHINE_LAST_APPLIED,
+            decode_log_id,
+        )?;
+        let last_membership = read_optional_bytes(
+            &database,
+            STATE_MACHINE_TABLE,
+            STATE_MACHINE_MEMBERSHIP,
+            decode_stored_membership,
+        )?
+        .unwrap_or_default();
+        Ok(Self {
+            database,
+            cluster_id: cluster_id.to_owned(),
+            control_state,
+            last_applied,
+            last_membership,
+        })
+    }
+
+    fn persist(&self) -> Result<(), ConsensusStorageError> {
+        let control = self
+            .control_state
+            .encode_snapshot()
+            .map_err(|_| ConsensusStorageError::CorruptRecord("control state encoding"))?;
+        let membership = encode_stored_membership(&self.last_membership)?;
+        let last_applied = self.last_applied.as_ref().map(encode_log_id);
+        immediate_write(&self.database, |transaction| {
+            let mut table = transaction.open_table(STATE_MACHINE_TABLE)?;
+            table.insert(STATE_MACHINE_CONTROL, control.as_slice())?;
+            table.insert(STATE_MACHINE_MEMBERSHIP, membership.as_slice())?;
+            match last_applied.as_deref() {
+                Some(log_id) => {
+                    table.insert(STATE_MACHINE_LAST_APPLIED, log_id)?;
+                }
+                None => {
+                    table.remove(STATE_MACHINE_LAST_APPLIED)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[must_use]
+    pub const fn control_state(&self) -> &ControlState {
+        &self.control_state
+    }
+}
+
+impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
+    type SnapshotBuilder = Self;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+        Ok((self.last_applied, self.last_membership.clone()))
+    }
+
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ControlReply>, StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<ControlRaftConfig>> + Send,
+        I::IntoIter: Send,
+    {
+        let mut next = self.clone();
+        let mut replies = Vec::new();
+        for entry in entries {
+            next.last_applied = Some(entry.log_id);
+            match entry.payload {
+                EntryPayload::Blank => replies.push(ControlReply(Vec::new())),
+                EntryPayload::Membership(membership) => {
+                    next.last_membership = StoredMembership::new(next.last_applied, membership);
+                    replies.push(ControlReply(Vec::new()));
+                }
+                EntryPayload::Normal(request) => {
+                    let command =
+                        decode_control_command(&request.0).map_err(storage_write_error)?;
+                    let response = next.control_state.apply(&command);
+                    replies.push(ControlReply(encode_control_response(&response)));
+                }
+            }
+        }
+        next.persist().map_err(storage_write_error)?;
+        *self = next;
+        Ok(replies)
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.clone()
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
+        Ok(Box::new(Cursor::new(Vec::new())))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        snapshot: Box<Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<u64>> {
+        let control_state =
+            ControlState::decode_snapshot(snapshot.get_ref()).map_err(storage_write_error)?;
+        if control_state.cluster_id != self.cluster_id {
+            return Err(storage_write_error(
+                ConsensusStorageError::ClusterIdMismatch {
+                    expected: self.cluster_id.clone(),
+                    actual: control_state.cluster_id,
+                },
+            ));
+        }
+        let mut next = self.clone();
+        next.control_state = control_state;
+        next.last_applied = meta.last_log_id;
+        next.last_membership = meta.last_membership.clone();
+        next.persist().map_err(storage_write_error)?;
+        *self = next;
+        Ok(())
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<ControlRaftConfig>>, StorageError<u64>> {
+        let mut builder = self.clone();
+        Ok(Some(builder.build_snapshot().await?))
+    }
+}
+
+impl RaftSnapshotBuilder<ControlRaftConfig> for ConsensusStateMachine {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<ControlRaftConfig>, StorageError<u64>> {
+        let bytes = self
+            .control_state
+            .encode_snapshot()
+            .map_err(storage_read_error)?;
+        let last = self
+            .last_applied
+            .map_or_else(|| "none".to_string(), |log_id| log_id.to_string());
+        let snapshot_id = format!("{last}-{}", self.control_state.revision);
+        Ok(Snapshot {
+            meta: SnapshotMeta {
+                last_log_id: self.last_applied,
+                last_membership: self.last_membership.clone(),
+                snapshot_id,
+            },
+            snapshot: Box::new(Cursor::new(bytes)),
+        })
+    }
+}
+
 fn validate_cluster_id(cluster_id: &str) -> Result<(), ConsensusStorageError> {
     if cluster_id.is_empty()
         || cluster_id == "."
@@ -284,6 +481,7 @@ fn initialize_metadata(database: &Database, cluster_id: &str) -> Result<(), Cons
         drop(transaction.open_table(META_TABLE)?);
         drop(transaction.open_table(HARD_STATE_TABLE)?);
         drop(transaction.open_table(LOG_TABLE)?);
+        drop(transaction.open_table(STATE_MACHINE_TABLE)?);
         Ok(())
     })?;
     let read = database.begin_read().map_err(redb::Error::from)?;
@@ -400,6 +598,73 @@ fn decode_log_id(bytes: &[u8]) -> Result<LogId<u64>, ConsensusStorageError> {
     Ok(log_id)
 }
 
+fn encode_stored_membership(
+    membership: &StoredMembership<u64, BasicNode>,
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    let mut writer = DurableWriter::new(*b"BMMEM001");
+    writer.boolean(membership.log_id().is_some());
+    if let Some(log_id) = membership.log_id() {
+        encode_log_id_fields(&mut writer, log_id);
+    }
+    encode_membership_fields(&mut writer, membership.membership())?;
+    Ok(writer.finish())
+}
+
+fn decode_stored_membership(
+    bytes: &[u8],
+) -> Result<StoredMembership<u64, BasicNode>, ConsensusStorageError> {
+    let mut reader = DurableReader::new(bytes, *b"BMMEM001", "membership")?;
+    let log_id = if reader.boolean()? {
+        Some(decode_log_id_fields(&mut reader)?)
+    } else {
+        None
+    };
+    let membership = decode_membership_fields(&mut reader)?;
+    reader.finish()?;
+    Ok(StoredMembership::new(log_id, membership))
+}
+
+fn encode_membership_fields(
+    writer: &mut DurableWriter,
+    membership: &Membership<u64, BasicNode>,
+) -> Result<(), ConsensusStorageError> {
+    writer.count(membership.get_joint_config().len())?;
+    for config in membership.get_joint_config() {
+        writer.count(config.len())?;
+        for node_id in config {
+            writer.u64(*node_id);
+        }
+    }
+    let nodes = membership.nodes().collect::<Vec<_>>();
+    writer.count(nodes.len())?;
+    for (node_id, node) in nodes {
+        writer.u64(*node_id);
+        writer.bytes(node.addr.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn decode_membership_fields(
+    reader: &mut DurableReader<'_>,
+) -> Result<Membership<u64, BasicNode>, ConsensusStorageError> {
+    let configs = (0..reader.count()?)
+        .map(|_| {
+            (0..reader.count()?)
+                .map(|_| reader.u64())
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let nodes = (0..reader.count()?)
+        .map(|_| {
+            let node_id = reader.u64()?;
+            let address = String::from_utf8(reader.bytes()?)
+                .map_err(|_| ConsensusStorageError::CorruptRecord("membership"))?;
+            Ok::<_, ConsensusStorageError>((node_id, BasicNode::new(address)))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    Ok(Membership::new(configs, nodes))
+}
+
 fn encode_entry(entry: &Entry<ControlRaftConfig>) -> Result<Vec<u8>, ConsensusStorageError> {
     let mut writer = DurableWriter::new(*b"BMENT001");
     encode_log_id_fields(&mut writer, &entry.log_id);
@@ -411,19 +676,7 @@ fn encode_entry(entry: &Entry<ControlRaftConfig>) -> Result<Vec<u8>, ConsensusSt
         }
         EntryPayload::Membership(membership) => {
             writer.u8(2);
-            writer.count(membership.get_joint_config().len())?;
-            for config in membership.get_joint_config() {
-                writer.count(config.len())?;
-                for node_id in config {
-                    writer.u64(*node_id);
-                }
-            }
-            let nodes = membership.nodes().collect::<Vec<_>>();
-            writer.count(nodes.len())?;
-            for (node_id, node) in nodes {
-                writer.u64(*node_id);
-                writer.bytes(node.addr.as_bytes())?;
-            }
+            encode_membership_fields(&mut writer, membership)?;
         }
     }
     Ok(writer.finish())
@@ -435,24 +688,7 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry<ControlRaftConfig>, ConsensusStora
     let payload = match reader.u8()? {
         0 => EntryPayload::Blank,
         1 => EntryPayload::Normal(ControlRequest(reader.bytes()?)),
-        2 => {
-            let configs = (0..reader.count()?)
-                .map(|_| {
-                    (0..reader.count()?)
-                        .map(|_| reader.u64())
-                        .collect::<Result<std::collections::BTreeSet<_>, _>>()
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let nodes = (0..reader.count()?)
-                .map(|_| {
-                    let node_id = reader.u64()?;
-                    let address = String::from_utf8(reader.bytes()?)
-                        .map_err(|_| ConsensusStorageError::CorruptRecord("log entry"))?;
-                    Ok::<_, ConsensusStorageError>((node_id, BasicNode::new(address)))
-                })
-                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-            EntryPayload::Membership(Membership::new(configs, nodes))
-        }
+        2 => EntryPayload::Membership(decode_membership_fields(&mut reader)?),
         _ => return Err(ConsensusStorageError::CorruptRecord("log entry")),
     };
     reader.finish()?;
@@ -713,6 +949,131 @@ mod tests {
             ConsensusLogStore::open(root.path(), "cluster-a"),
             Err(ConsensusStorageError::ClusterIdMismatch { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn state_machine_apply_membership_and_dedup_survive_restart() {
+        use bmux_cluster_plugin_api::cluster_types::{
+            CommandId, ControlCommand, ControlCommandRequest, ControlWorkflowStatus, WorkspaceId,
+        };
+        use openraft::storage::RaftStateMachine;
+
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        let command = ControlCommand {
+            schema_version: 1,
+            principal_id: "principal:test".to_string(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(10),
+            },
+            issued_at_unix_ms: 50,
+            request: ControlCommandRequest::CreateWorkspace {
+                workspace_id: WorkspaceId {
+                    value: uuid::Uuid::from_u128(20),
+                },
+                name: Some("workspace".to_string()),
+            },
+        };
+        let membership = Membership::new(
+            vec![std::collections::BTreeSet::from([1, 2])],
+            std::collections::BTreeMap::from([
+                (1, BasicNode::new("one")),
+                (2, BasicNode::new("two")),
+            ]),
+        );
+        let entries = [
+            Entry {
+                log_id: log_id(4, 1),
+                payload: EntryPayload::Membership(membership.clone()),
+            },
+            Entry {
+                log_id: log_id(4, 2),
+                payload: EntryPayload::Normal(ControlRequest(
+                    crate::control_codec::encode_control_command(&command),
+                )),
+            },
+        ];
+        let replies = state_machine.apply(entries).await.unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            state_machine
+                .control_state()
+                .workspaces
+                .contains_key(&uuid::Uuid::from_u128(20))
+        );
+        drop(state_machine);
+        drop(store);
+
+        let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = reopened.state_machine().unwrap();
+        let (last_applied, stored_membership) = state_machine.applied_state().await.unwrap();
+        assert_eq!(last_applied, Some(log_id(4, 2)));
+        assert_eq!(stored_membership.membership(), &membership);
+        let replay = state_machine
+            .apply([Entry {
+                log_id: log_id(4, 3),
+                payload: EntryPayload::Normal(ControlRequest(
+                    crate::control_codec::encode_control_command(&command),
+                )),
+            }])
+            .await
+            .unwrap();
+        let response = &replay[0].0;
+        assert!(response.starts_with(b"BMRES001"));
+        assert_eq!(
+            state_machine.control_state().revision,
+            1,
+            "dedup replay must not create another logical mutation"
+        );
+        let snapshot = state_machine.build_snapshot().await.unwrap();
+        let restored = ControlState::decode_snapshot(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(restored, *state_machine.control_state());
+        let mut restored = restored;
+        assert_eq!(
+            restored.apply(&command).workflow_status,
+            ControlWorkflowStatus::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_is_atomic_and_cluster_bound() {
+        use openraft::storage::RaftStateMachine;
+
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        let original = state_machine.control_state().clone();
+        let mut foreign = ControlState::new("cluster-b");
+        foreign.revision = 9;
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id(3, 7)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "foreign".to_string(),
+        };
+        assert!(
+            state_machine
+                .install_snapshot(
+                    &meta,
+                    Box::new(Cursor::new(foreign.encode_snapshot().unwrap())),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(state_machine.control_state(), &original);
+
+        let mut replacement = ControlState::new("cluster-a");
+        replacement.revision = 11;
+        state_machine
+            .install_snapshot(
+                &meta,
+                Box::new(Cursor::new(replacement.encode_snapshot().unwrap())),
+            )
+            .await
+            .unwrap();
+        drop(state_machine);
+        let reopened = store.state_machine().unwrap();
+        assert_eq!(reopened.control_state(), &replacement);
     }
 
     #[test]

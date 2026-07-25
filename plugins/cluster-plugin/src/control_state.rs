@@ -1,12 +1,56 @@
 use crate::control_codec::request_fingerprint;
+#[path = "control_state_codec.rs"]
+mod control_state_codec;
 use bmux_cluster_plugin_api::cluster_types::{
     ClusterMember, ClusterMemberState, ControlCommand, ControlCommandError, ControlCommandRequest,
     ControlCommandResult, ControlResourceKind, ControlResponse, ControlWorkflowStatus,
     LogicalPaneRecord, LogicalWindowRecord, PaneAvailability, WorkspaceId, WorkspaceRecord,
 };
+use control_state_codec::{decode_snapshot, encode_snapshot};
 use std::collections::BTreeMap;
 
 const CONTROL_SCHEMA_VERSION: u16 = 1;
+const SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA001";
+const MAX_SNAPSHOT_ITEMS: usize = 1_000_000;
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateCodecError {
+    Truncated,
+    InvalidMagic,
+    UnsupportedSchema(u16),
+    InvalidUtf8,
+    InvalidBoolean(u8),
+    LimitExceeded(&'static str),
+    TrailingBytes,
+    InvalidState(&'static str),
+}
+
+impl std::fmt::Display for StateCodecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("control snapshot is truncated"),
+            Self::InvalidMagic => formatter.write_str("control snapshot magic is invalid"),
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "unsupported control snapshot schema {version}")
+            }
+            Self::InvalidUtf8 => formatter.write_str("control snapshot contains invalid UTF-8"),
+            Self::InvalidBoolean(value) => {
+                write!(
+                    formatter,
+                    "control snapshot contains invalid boolean {value}"
+                )
+            }
+            Self::LimitExceeded(name) => write!(formatter, "control snapshot {name} exceeds limit"),
+            Self::TrailingBytes => formatter.write_str("control snapshot has trailing bytes"),
+            Self::InvalidState(reason) => {
+                write!(formatter, "control snapshot state is invalid: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateCodecError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DedupKey {
@@ -59,6 +103,26 @@ impl ControlState {
             panes: BTreeMap::new(),
             dedup: BTreeMap::new(),
         }
+    }
+
+    /// Encodes the complete deterministic state, including dedup outcomes and
+    /// incomplete workflows, into its canonical snapshot representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a field or collection exceeds snapshot bounds.
+    pub fn encode_snapshot(&self) -> Result<Vec<u8>, StateCodecError> {
+        encode_snapshot(self)
+    }
+
+    /// Restores a complete deterministic state from canonical snapshot bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, oversized, incompatible, or internally
+    /// inconsistent snapshots.
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, StateCodecError> {
+        decode_snapshot(bytes)
     }
 
     /// Applies one already-authorized committed command deterministically.
@@ -773,6 +837,69 @@ mod tests {
             }
         ));
         assert_eq!(state.panes[&id(30)].availability, PaneAvailability::Pending);
+    }
+
+    #[test]
+    fn snapshot_round_trip_is_canonical_and_preserves_pending_dedup() {
+        let mut state = ControlState::new("cluster:test");
+        setup_pane(&mut state);
+        let pending = command(
+            20,
+            ControlCommandRequest::AssignExecution {
+                pane_id: LogicalPaneId { value: id(30) },
+                expected_revision: 3,
+                expected_generation: 0,
+                assignment: assignment(1),
+            },
+        );
+        assert_eq!(
+            state.apply(&pending).workflow_status,
+            ControlWorkflowStatus::Pending
+        );
+
+        let first = state.encode_snapshot().unwrap();
+        let restored = ControlState::decode_snapshot(&first).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.encode_snapshot().unwrap(), first);
+
+        let mut restored = restored;
+        assert_eq!(
+            restored.apply(&pending).workflow_status,
+            ControlWorkflowStatus::Pending
+        );
+        let completion = command(
+            21,
+            ControlCommandRequest::CompleteWorkflow {
+                original_command_id: pending.command_id.clone(),
+                response: vec![4, 5, 6],
+            },
+        );
+        assert_accepted(&restored.apply(&completion));
+        let restored_again =
+            ControlState::decode_snapshot(&restored.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored_again, restored);
+    }
+
+    #[test]
+    fn snapshot_rejects_truncation_trailing_bytes_and_future_schema() {
+        let state = ControlState::new("cluster:test");
+        let bytes = state.encode_snapshot().unwrap();
+        assert_eq!(
+            ControlState::decode_snapshot(&bytes[..bytes.len() - 1]),
+            Err(StateCodecError::Truncated)
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            ControlState::decode_snapshot(&trailing),
+            Err(StateCodecError::TrailingBytes)
+        );
+        let mut future = bytes;
+        future[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(
+            ControlState::decode_snapshot(&future),
+            Err(StateCodecError::UnsupportedSchema(2))
+        );
     }
 
     #[test]
