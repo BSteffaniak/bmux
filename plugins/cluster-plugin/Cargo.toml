@@ -14,26 +14,31 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-anyhow                       = { workspace = true, features = ["std"] }
-bmux_clients_plugin_api      = { workspace = true }
-bmux_cluster_plugin_api      = { workspace = true }
-bmux_config                  = { workspace = true }
-bmux_connections_plugin_api  = { workspace = true }
-bmux_ipc                     = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
+bmux_clients_plugin_api = { workspace = true }
+bmux_cluster_plugin_api = { workspace = true }
+bmux_config = { workspace = true }
+bmux_connections_plugin_api = { workspace = true }
+bmux_ipc = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
-bmux_plugin                  = { workspace = true }
-bmux_plugin_sdk              = { workspace = true }
-bmux_sessions_plugin_api     = { workspace = true }
-iroh                         = { workspace = true }
-openraft                     = { workspace = true }
-redb                         = { workspace = true }
-serde                        = { workspace = true, features = ["derive", "std"] }
-serde_json                   = { workspace = true }
-sha2                         = { workspace = true }
-tokio                        = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
-toml                         = { workspace = true }
-tracing                      = { workspace = true, features = ["std"] }
-uuid                         = { workspace = true, features = ["std", "v4"] }
+bmux_plugin = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+bmux_sessions_plugin_api = { workspace = true }
+iroh = { workspace = true }
+openraft = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+toml = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v4"] }
 
 [features]
 fail-on-warnings = [

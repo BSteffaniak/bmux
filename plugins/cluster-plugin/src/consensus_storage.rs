@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // OpenRaft's required StorageError carries detailed defensive context.
+
 //! Crash-safe `OpenRaft` storage-v2 log and hard-state persistence.
 //!
 //! The durable format is intentionally byte-oriented: BMUX owns every key and value
@@ -17,9 +19,33 @@ use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+const STORAGE_BLOCKING_CONCURRENCY: usize = 4;
+
+fn storage_blocking_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(STORAGE_BLOCKING_CONCURRENCY)))
+}
+
+#[allow(clippy::result_large_err)]
+async fn run_storage_blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, StorageError<u64>> + Send + 'static,
+) -> Result<T, StorageError<u64>> {
+    let permit = storage_blocking_permits()
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(storage_write_error)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(storage_write_error)?
+}
 
 const STORAGE_FORMAT_VERSION: u16 = 1;
 const CONSENSUS_DB_FILE: &str = "raft.redb";
@@ -45,6 +71,12 @@ struct SnapshotEnvelope {
     last_log_id: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
     control_bytes: Vec<u8>,
+}
+
+struct PreparedStateMachine {
+    control: Vec<u8>,
+    membership: Vec<u8>,
+    last_applied: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +180,16 @@ impl ConsensusLogStore {
         })
     }
 
+    /// Creates a fresh isolated store for `OpenRaft`'s storage-v2 conformance suite.
+    #[cfg(test)]
+    fn open_for_suite(
+        state_dir: &Path,
+    ) -> Result<(Self, ConsensusStateMachine), ConsensusStorageError> {
+        let store = Self::open(state_dir, "suite-cluster")?;
+        let state_machine = store.state_machine()?;
+        Ok((store, state_machine))
+    }
+
     #[must_use]
     pub fn database_path(&self) -> &Path {
         &self.database_path
@@ -181,28 +223,23 @@ impl ConsensusLogStore {
             decode_log_id,
         )
     }
-}
 
-impl RaftLogReader<ControlRaftConfig> for ConsensusLogStore {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
-        &mut self,
-        range: RB,
+    fn read_entries(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
     ) -> Result<Vec<Entry<ControlRaftConfig>>, StorageError<u64>> {
         let read = self.database.begin_read().map_err(storage_read_error)?;
         let table = read.open_table(LOG_TABLE).map_err(storage_read_error)?;
         let mut entries = Vec::new();
-        for row in table.range(range).map_err(storage_read_error)? {
+        for row in table.range((start, end)).map_err(storage_read_error)? {
             let (_, value) = row.map_err(storage_read_error)?;
             entries.push(decode_entry(value.value()).map_err(storage_read_error)?);
         }
         Ok(entries)
     }
-}
 
-impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
-    type LogReader = Self;
-
-    async fn get_log_state(&mut self) -> Result<LogState<ControlRaftConfig>, StorageError<u64>> {
+    fn log_state(&self) -> Result<LogState<ControlRaftConfig>, StorageError<u64>> {
         let last_purged_log_id = self.read_last_purged().map_err(storage_read_error)?;
         let read = self.database.begin_read().map_err(storage_read_error)?;
         let table = read.open_table(LOG_TABLE).map_err(storage_read_error)?;
@@ -218,24 +255,50 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             last_purged_log_id,
         })
     }
+}
+
+impl RaftLogReader<ControlRaftConfig> for ConsensusLogStore {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<Entry<ControlRaftConfig>>, StorageError<u64>> {
+        let start = range.start_bound().cloned();
+        let end = range.end_bound().cloned();
+        let store = self.clone();
+        run_storage_blocking(move || store.read_entries(start, end)).await
+    }
+}
+
+impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
+    type LogReader = Self;
+
+    async fn get_log_state(&mut self) -> Result<LogState<ControlRaftConfig>, StorageError<u64>> {
+        let store = self.clone();
+        run_storage_blocking(move || store.log_state()).await
+    }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        let database = self.database.clone();
         let encoded = encode_vote(vote);
-        immediate_write(&self.database, |transaction| {
-            transaction
-                .open_table(HARD_STATE_TABLE)?
-                .insert(HARD_STATE_VOTE, encoded.as_slice())?;
-            Ok(())
+        run_storage_blocking(move || {
+            immediate_write(&database, |transaction| {
+                transaction
+                    .open_table(HARD_STATE_TABLE)?
+                    .insert(HARD_STATE_VOTE, encoded.as_slice())?;
+                Ok(())
+            })
+            .map_err(storage_write_error)
         })
-        .map_err(storage_write_error)
+        .await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        Self::read_vote(self).map_err(storage_read_error)
+        let store = self.clone();
+        run_storage_blocking(move || store.read_vote().map_err(storage_read_error)).await
     }
 
     async fn append<I>(
@@ -252,13 +315,18 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             .map(|entry| Ok((entry.log_id.index, encode_entry(&entry)?)))
             .collect::<Result<Vec<_>, ConsensusStorageError>>()
             .map_err(storage_write_error)?;
-        let result = immediate_write(&self.database, |transaction| {
-            let mut table = transaction.open_table(LOG_TABLE)?;
-            for (index, entry) in &encoded {
-                table.insert(*index, entry.as_slice())?;
-            }
-            Ok(())
-        });
+        let database = self.database.clone();
+        let result = run_storage_blocking(move || {
+            immediate_write(&database, |transaction| {
+                let mut table = transaction.open_table(LOG_TABLE)?;
+                for (index, entry) in &encoded {
+                    table.insert(*index, entry.as_slice())?;
+                }
+                Ok(())
+            })
+            .map_err(storage_write_error)
+        })
+        .await;
         match result {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
@@ -267,45 +335,53 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             Err(error) => {
                 let message = error.to_string();
                 callback.log_io_completed(Err(std::io::Error::other(message)));
-                Err(storage_write_error(error))
+                Err(error)
             }
         }
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        immediate_write(&self.database, |transaction| {
-            let mut table = transaction.open_table(LOG_TABLE)?;
-            let keys = table
-                .range(log_id.index..)?
-                .map(|row| row.map(|(key, _)| key.value()))
-                .collect::<Result<Vec<_>, _>>()?;
-            for key in keys {
-                table.remove(key)?;
-            }
-            Ok(())
-        })
-        .map_err(storage_write_error)
-    }
-
-    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let encoded = encode_log_id(&log_id);
-        immediate_write(&self.database, |transaction| {
-            {
+        let database = self.database.clone();
+        run_storage_blocking(move || {
+            immediate_write(&database, |transaction| {
                 let mut table = transaction.open_table(LOG_TABLE)?;
                 let keys = table
-                    .range(..=log_id.index)?
+                    .range(log_id.index..)?
                     .map(|row| row.map(|(key, _)| key.value()))
                     .collect::<Result<Vec<_>, _>>()?;
                 for key in keys {
                     table.remove(key)?;
                 }
-            }
-            transaction
-                .open_table(HARD_STATE_TABLE)?
-                .insert(HARD_STATE_LAST_PURGED, encoded.as_slice())?;
-            Ok(())
+                Ok(())
+            })
+            .map_err(storage_write_error)
         })
-        .map_err(storage_write_error)
+        .await
+    }
+
+    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        let database = self.database.clone();
+        let encoded = encode_log_id(&log_id);
+        run_storage_blocking(move || {
+            immediate_write(&database, |transaction| {
+                {
+                    let mut table = transaction.open_table(LOG_TABLE)?;
+                    let keys = table
+                        .range(..=log_id.index)?
+                        .map(|row| row.map(|(key, _)| key.value()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for key in keys {
+                        table.remove(key)?;
+                    }
+                }
+                transaction
+                    .open_table(HARD_STATE_TABLE)?
+                    .insert(HARD_STATE_LAST_PURGED, encoded.as_slice())?;
+                Ok(())
+            })
+            .map_err(storage_write_error)
+        })
+        .await
     }
 }
 
@@ -356,18 +432,26 @@ impl ConsensusStateMachine {
         Ok(state_machine)
     }
 
-    fn persist(&self) -> Result<(), ConsensusStorageError> {
-        let control = self
-            .control_state
-            .encode_snapshot()
-            .map_err(|_| ConsensusStorageError::CorruptRecord("control state encoding"))?;
-        let membership = encode_stored_membership(&self.last_membership)?;
-        let last_applied = self.last_applied.as_ref().map(encode_log_id);
-        immediate_write(&self.database, |transaction| {
+    fn prepared_state_machine(&self) -> Result<PreparedStateMachine, ConsensusStorageError> {
+        Ok(PreparedStateMachine {
+            control: self
+                .control_state
+                .encode_snapshot()
+                .map_err(|_| ConsensusStorageError::CorruptRecord("control state encoding"))?,
+            membership: encode_stored_membership(&self.last_membership)?,
+            last_applied: self.last_applied.as_ref().map(encode_log_id),
+        })
+    }
+
+    fn persist_prepared(
+        database: &Database,
+        prepared: &PreparedStateMachine,
+    ) -> Result<(), ConsensusStorageError> {
+        immediate_write(database, |transaction| {
             let mut table = transaction.open_table(STATE_MACHINE_TABLE)?;
-            table.insert(STATE_MACHINE_CONTROL, control.as_slice())?;
-            table.insert(STATE_MACHINE_MEMBERSHIP, membership.as_slice())?;
-            match last_applied.as_deref() {
+            table.insert(STATE_MACHINE_CONTROL, prepared.control.as_slice())?;
+            table.insert(STATE_MACHINE_MEMBERSHIP, prepared.membership.as_slice())?;
+            match prepared.last_applied.as_deref() {
                 Some(log_id) => {
                     table.insert(STATE_MACHINE_LAST_APPLIED, log_id)?;
                 }
@@ -403,26 +487,28 @@ impl ConsensusStateMachine {
     }
 
     fn publish_snapshot(
-        &self,
+        database: &Database,
+        snapshot_dir: &Path,
         meta: &SnapshotMeta<u64, BasicNode>,
+        cluster_id: &str,
         control_bytes: &[u8],
     ) -> Result<Vec<u8>, ConsensusStorageError> {
         validate_snapshot_id(&meta.snapshot_id)?;
-        let envelope = encode_snapshot_envelope(&self.cluster_id, meta, control_bytes)?;
-        fs::create_dir_all(&self.snapshot_dir)?;
-        let final_path = snapshot_path(&self.snapshot_dir, &meta.snapshot_id)?;
-        let tmp_path = self.snapshot_dir.join(format!("{}.tmp", meta.snapshot_id));
+        let envelope = encode_snapshot_envelope(cluster_id, meta, control_bytes)?;
+        fs::create_dir_all(snapshot_dir)?;
+        let final_path = snapshot_path(snapshot_dir, &meta.snapshot_id)?;
+        let tmp_path = snapshot_dir.join(format!("{}.tmp", meta.snapshot_id));
         write_snapshot_file(&tmp_path, &envelope)?;
         fs::rename(&tmp_path, &final_path)?;
-        sync_directory(&self.snapshot_dir)?;
+        sync_directory(snapshot_dir)?;
         let checksum = snapshot_checksum(&envelope);
-        immediate_write(&self.database, |transaction| {
+        immediate_write(database, |transaction| {
             let mut table = transaction.open_table(META_TABLE)?;
             table.insert(META_ACTIVE_SNAPSHOT_ID, meta.snapshot_id.as_bytes())?;
             table.insert(META_ACTIVE_SNAPSHOT_CHECKSUM, checksum.as_slice())?;
             Ok(())
         })?;
-        remove_inactive_snapshots(&self.snapshot_dir, &final_path)?;
+        remove_inactive_snapshots(snapshot_dir, &final_path)?;
         Ok(envelope)
     }
 }
@@ -459,7 +545,12 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
                 }
             }
         }
-        next.persist().map_err(storage_write_error)?;
+        let prepared = next.prepared_state_machine().map_err(storage_write_error)?;
+        let database = next.database.clone();
+        run_storage_blocking(move || {
+            Self::persist_prepared(&database, &prepared).map_err(storage_write_error)
+        })
+        .await?;
         *self = next;
         Ok(replies)
     }
@@ -508,9 +599,22 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         next.control_state = control_state;
         next.last_applied = meta.last_log_id;
         next.last_membership = meta.last_membership.clone();
-        next.persist().map_err(storage_write_error)?;
-        next.publish_snapshot(meta, &control_bytes)
-            .map_err(storage_write_error)?;
+        let prepared = next.prepared_state_machine().map_err(storage_write_error)?;
+        let database = next.database.clone();
+        run_storage_blocking(move || {
+            Self::persist_prepared(&database, &prepared).map_err(storage_write_error)
+        })
+        .await?;
+        let snapshot_dir = next.snapshot_dir.clone();
+        let cluster_id = next.cluster_id.clone();
+        let database = next.database.clone();
+        let meta = meta.clone();
+        run_storage_blocking(move || {
+            Self::publish_snapshot(&database, &snapshot_dir, &meta, &cluster_id, &control_bytes)
+                .map(|_| ())
+                .map_err(storage_write_error)
+        })
+        .await?;
         *self = next;
         Ok(())
     }
@@ -518,27 +622,32 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ControlRaftConfig>>, StorageError<u64>> {
-        let Some((snapshot_id, expected_checksum)) =
-            read_active_snapshot_meta(&self.database).map_err(storage_read_error)?
-        else {
-            return Ok(None);
-        };
-        let path = snapshot_path(&self.snapshot_dir, &snapshot_id).map_err(storage_read_error)?;
-        let bytes = read_snapshot_file(&path).map_err(storage_read_error)?;
-        if snapshot_checksum(&bytes) != expected_checksum {
-            return Err(storage_read_error(ConsensusStorageError::CorruptRecord(
-                "snapshot checksum",
-            )));
-        }
-        let envelope = decode_snapshot_envelope(&bytes).map_err(storage_read_error)?;
-        Ok(Some(Snapshot {
-            meta: SnapshotMeta {
-                last_log_id: envelope.last_log_id,
-                last_membership: envelope.last_membership,
-                snapshot_id: envelope.snapshot_id,
-            },
-            snapshot: Box::new(Cursor::new(bytes)),
-        }))
+        let database = self.database.clone();
+        let snapshot_dir = self.snapshot_dir.clone();
+        run_storage_blocking(move || {
+            let Some((snapshot_id, expected_checksum)) =
+                read_active_snapshot_meta(&database).map_err(storage_read_error)?
+            else {
+                return Ok(None);
+            };
+            let path = snapshot_path(&snapshot_dir, &snapshot_id).map_err(storage_read_error)?;
+            let bytes = read_snapshot_file(&path).map_err(storage_read_error)?;
+            if snapshot_checksum(&bytes) != expected_checksum {
+                return Err(storage_read_error(ConsensusStorageError::CorruptRecord(
+                    "snapshot checksum",
+                )));
+            }
+            let envelope = decode_snapshot_envelope(&bytes).map_err(storage_read_error)?;
+            Ok(Some(Snapshot {
+                meta: SnapshotMeta {
+                    last_log_id: envelope.last_log_id,
+                    last_membership: envelope.last_membership,
+                    snapshot_id: envelope.snapshot_id,
+                },
+                snapshot: Box::new(Cursor::new(bytes)),
+            }))
+        })
+        .await
     }
 }
 
@@ -557,9 +666,15 @@ impl RaftSnapshotBuilder<ControlRaftConfig> for ConsensusStateMachine {
             last_membership: self.last_membership.clone(),
             snapshot_id,
         };
-        let bytes = self
-            .publish_snapshot(&meta, &bytes)
-            .map_err(storage_write_error)?;
+        let snapshot_dir = self.snapshot_dir.clone();
+        let cluster_id = self.cluster_id.clone();
+        let database = self.database.clone();
+        let publish_meta = meta.clone();
+        let bytes = run_storage_blocking(move || {
+            Self::publish_snapshot(&database, &snapshot_dir, &publish_meta, &cluster_id, &bytes)
+                .map_err(storage_write_error)
+        })
+        .await?;
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(bytes)),
@@ -1155,6 +1270,39 @@ mod tests {
     use openraft::{CommittedLeaderId, EntryPayload};
     use tempfile::TempDir;
 
+    struct SuiteBuilder;
+
+    impl
+        openraft::testing::StoreBuilder<
+            ControlRaftConfig,
+            ConsensusLogStore,
+            ConsensusStateMachine,
+            TempDir,
+        > for SuiteBuilder
+    {
+        async fn build(
+            &self,
+        ) -> Result<(TempDir, ConsensusLogStore, ConsensusStateMachine), StorageError<u64>>
+        {
+            let root = TempDir::new().map_err(storage_write_error)?;
+            let (store, state_machine) =
+                ConsensusLogStore::open_for_suite(root.path()).map_err(storage_write_error)?;
+            Ok((root, store, state_machine))
+        }
+    }
+
+    #[test]
+    fn openraft_storage_v2_conformance_suite() {
+        openraft::testing::Suite::<
+            ControlRaftConfig,
+            ConsensusLogStore,
+            ConsensusStateMachine,
+            SuiteBuilder,
+            TempDir,
+        >::test_all(SuiteBuilder)
+        .unwrap();
+    }
+
     fn log_id(term: u64, index: u64) -> LogId<u64> {
         LogId::new(CommittedLeaderId::new(term, 1), index)
     }
@@ -1427,6 +1575,26 @@ mod tests {
                 .meta,
             active.meta
         );
+    }
+
+    #[tokio::test]
+    async fn blocking_storage_work_runs_off_the_async_worker() {
+        let async_thread = std::thread::current().id();
+        let blocking_thread =
+            run_storage_blocking(|| Ok::<_, StorageError<u64>>(std::thread::current().id()))
+                .await
+                .unwrap();
+        assert_ne!(async_thread, blocking_thread);
+
+        let mut handles = Vec::new();
+        for _ in 0..(STORAGE_BLOCKING_CONCURRENCY * 3) {
+            handles.push(tokio::spawn(run_storage_blocking(|| {
+                Ok::<_, StorageError<u64>>(std::thread::current().id())
+            })));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
     }
 
     #[test]
