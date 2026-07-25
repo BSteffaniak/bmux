@@ -600,6 +600,8 @@ interface cluster-command {
     command credential_rotate_accept(request: cluster-types.credential-rotation-request) -> cluster-types.member-credential-result;
     command credential_rotate_commit(member: cluster-types.cluster-member) -> cluster-types.member-credential-result;
     command member_revoke(node_id: string) -> cluster-types.member-credential-result;
+    // Internal recovery primitive: converge Raft voters to current signed membership.
+    command consensus_reconcile() -> cluster-types.cluster-member-list;
     // Reconcile a prospective signed membership snapshot before publishing it.
     command consensus_reconcile_members(members: list<cluster-types.cluster-member>, authorization: cluster-types.consensus-voter-change-authorization) -> cluster-types.cluster-member-list;
     // Safely remove one current voter before publishing leave/revocation state.

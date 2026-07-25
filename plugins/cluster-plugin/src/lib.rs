@@ -558,6 +558,20 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
             revoke_member(ctx, &req.node_id)
                 .map_err(|error| ServiceResponse::error("member_revoke_failed", error))
         },
+        "cluster-command/v1", "consensus_reconcile" => |(): (), ctx| {
+            let identity = load_or_create_node_identity(ctx)
+                .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
+            let node_id = *identity.node_id();
+            let nodes = consensus_network::global_consensus_nodes();
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error.to_string()))?;
+            tokio::task::block_in_place(|| {
+                handle.block_on(consensus_membership::reconcile_active_voters(ctx, node_id, &nodes))
+            })
+            .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
+            list_members(ctx)
+                .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))
+        },
         "cluster-command/v1", "consensus_reconcile_members" => |req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest, ctx| {
             reconcile_consensus_members(ctx, req)
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))
