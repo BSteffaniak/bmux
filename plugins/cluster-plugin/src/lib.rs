@@ -14,6 +14,7 @@ pub(crate) mod events;
 mod gateway;
 pub(crate) mod membership;
 pub(crate) mod pane;
+pub mod placement;
 pub(crate) mod storage;
 pub(crate) mod workspace;
 

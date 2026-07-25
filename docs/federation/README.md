@@ -18,6 +18,8 @@ This directory contains the accepted architecture decisions for native bmux serv
 | [ADR-0010](adr-0010-consensus-storage.md)                   | redb consensus storage, durability, and recovery            | Accepted |
 | [ADR-0011](adr-0011-deterministic-control-state-machine.md) | Deterministic control commands, responses, and invariants   | Accepted |
 | [ADR-0012](adr-0012-worker-output-and-attach-ownership.md)  | Worker output transport and federated attach ownership      | Accepted |
+| [ADR-0013](adr-0013-deterministic-worker-placement.md)      | Deterministic worker placement and explanations             | Accepted |
+| [ADR-0014](adr-0014-promotion-one-way-and-export.md)        | One-way v1 promotion and snapshot/export escape path        | Accepted |
 
 ## Global invariants
 
