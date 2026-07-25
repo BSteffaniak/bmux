@@ -13,9 +13,10 @@ use openraft::{
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt::Debug;
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Cursor, Read, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,11 +29,23 @@ const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("log");
 const STATE_MACHINE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_machine");
 const META_FORMAT_VERSION: &str = "storage_format_version";
 const META_CLUSTER_ID: &str = "cluster_id";
+const META_ACTIVE_SNAPSHOT_ID: &str = "active_snapshot_id";
+const META_ACTIVE_SNAPSHOT_CHECKSUM: &str = "active_snapshot_checksum";
 const HARD_STATE_VOTE: &str = "vote";
 const HARD_STATE_LAST_PURGED: &str = "last_purged_log_id";
 const STATE_MACHINE_LAST_APPLIED: &str = "last_applied_log_id";
 const STATE_MACHINE_MEMBERSHIP: &str = "last_membership";
 const STATE_MACHINE_CONTROL: &str = "control_state";
+const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const MAX_SNAPSHOT_FILE_BYTES: usize = 300 * 1024 * 1024;
+
+struct SnapshotEnvelope {
+    cluster_id: String,
+    snapshot_id: String,
+    last_log_id: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, BasicNode>,
+    control_bytes: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest(pub Vec<u8>);
@@ -104,6 +117,7 @@ pub struct ConsensusLogStore {
 pub struct ConsensusStateMachine {
     database: Arc<Database>,
     cluster_id: String,
+    snapshot_dir: PathBuf,
     control_state: ControlState,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
@@ -146,7 +160,8 @@ impl ConsensusLogStore {
     /// Fails closed if any persisted state-machine record is corrupt or belongs
     /// to another cluster.
     pub fn state_machine(&self) -> Result<ConsensusStateMachine, ConsensusStorageError> {
-        ConsensusStateMachine::open(self.database.clone(), &self.cluster_id)
+        let snapshot_dir = self.database_path.with_file_name("snapshots");
+        ConsensusStateMachine::open(self.database.clone(), &self.cluster_id, snapshot_dir)
     }
 
     fn read_vote(&self) -> Result<Option<Vote<u64>>, ConsensusStorageError> {
@@ -295,7 +310,11 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
 }
 
 impl ConsensusStateMachine {
-    fn open(database: Arc<Database>, cluster_id: &str) -> Result<Self, ConsensusStorageError> {
+    fn open(
+        database: Arc<Database>,
+        cluster_id: &str,
+        snapshot_dir: PathBuf,
+    ) -> Result<Self, ConsensusStorageError> {
         let control_state = read_optional_bytes(
             &database,
             STATE_MACHINE_TABLE,
@@ -325,13 +344,16 @@ impl ConsensusStateMachine {
             decode_stored_membership,
         )?
         .unwrap_or_default();
-        Ok(Self {
+        let state_machine = Self {
             database,
             cluster_id: cluster_id.to_owned(),
+            snapshot_dir,
             control_state,
             last_applied,
             last_membership,
-        })
+        };
+        state_machine.validate_active_snapshot()?;
+        Ok(state_machine)
     }
 
     fn persist(&self) -> Result<(), ConsensusStorageError> {
@@ -360,6 +382,48 @@ impl ConsensusStateMachine {
     #[must_use]
     pub const fn control_state(&self) -> &ControlState {
         &self.control_state
+    }
+
+    fn validate_active_snapshot(&self) -> Result<(), ConsensusStorageError> {
+        let Some((snapshot_id, expected_checksum)) = read_active_snapshot_meta(&self.database)?
+        else {
+            return Ok(());
+        };
+        let path = snapshot_path(&self.snapshot_dir, &snapshot_id)?;
+        let bytes = read_snapshot_file(&path)?;
+        let actual_checksum = snapshot_checksum(&bytes);
+        if actual_checksum != expected_checksum {
+            return Err(ConsensusStorageError::CorruptRecord("snapshot checksum"));
+        }
+        let envelope = decode_snapshot_envelope(&bytes)?;
+        if envelope.snapshot_id != snapshot_id || envelope.cluster_id != self.cluster_id {
+            return Err(ConsensusStorageError::CorruptRecord("snapshot metadata"));
+        }
+        Ok(())
+    }
+
+    fn publish_snapshot(
+        &self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        control_bytes: &[u8],
+    ) -> Result<Vec<u8>, ConsensusStorageError> {
+        validate_snapshot_id(&meta.snapshot_id)?;
+        let envelope = encode_snapshot_envelope(&self.cluster_id, meta, control_bytes)?;
+        fs::create_dir_all(&self.snapshot_dir)?;
+        let final_path = snapshot_path(&self.snapshot_dir, &meta.snapshot_id)?;
+        let tmp_path = self.snapshot_dir.join(format!("{}.tmp", meta.snapshot_id));
+        write_snapshot_file(&tmp_path, &envelope)?;
+        fs::rename(&tmp_path, &final_path)?;
+        sync_directory(&self.snapshot_dir)?;
+        let checksum = snapshot_checksum(&envelope);
+        immediate_write(&self.database, |transaction| {
+            let mut table = transaction.open_table(META_TABLE)?;
+            table.insert(META_ACTIVE_SNAPSHOT_ID, meta.snapshot_id.as_bytes())?;
+            table.insert(META_ACTIVE_SNAPSHOT_CHECKSUM, checksum.as_slice())?;
+            Ok(())
+        })?;
+        remove_inactive_snapshots(&self.snapshot_dir, &final_path)?;
+        Ok(envelope)
     }
 }
 
@@ -415,8 +479,23 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        let received = snapshot.into_inner();
+        let control_bytes = match decode_snapshot_envelope(&received) {
+            Ok(envelope) => {
+                if envelope.snapshot_id != meta.snapshot_id
+                    || envelope.last_log_id != meta.last_log_id
+                    || envelope.last_membership != meta.last_membership
+                {
+                    return Err(storage_write_error(ConsensusStorageError::CorruptRecord(
+                        "snapshot metadata mismatch",
+                    )));
+                }
+                envelope.control_bytes
+            }
+            Err(_) => received,
+        };
         let control_state =
-            ControlState::decode_snapshot(snapshot.get_ref()).map_err(storage_write_error)?;
+            ControlState::decode_snapshot(&control_bytes).map_err(storage_write_error)?;
         if control_state.cluster_id != self.cluster_id {
             return Err(storage_write_error(
                 ConsensusStorageError::ClusterIdMismatch {
@@ -430,6 +509,8 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         next.last_applied = meta.last_log_id;
         next.last_membership = meta.last_membership.clone();
         next.persist().map_err(storage_write_error)?;
+        next.publish_snapshot(meta, &control_bytes)
+            .map_err(storage_write_error)?;
         *self = next;
         Ok(())
     }
@@ -437,8 +518,27 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ControlRaftConfig>>, StorageError<u64>> {
-        let mut builder = self.clone();
-        Ok(Some(builder.build_snapshot().await?))
+        let Some((snapshot_id, expected_checksum)) =
+            read_active_snapshot_meta(&self.database).map_err(storage_read_error)?
+        else {
+            return Ok(None);
+        };
+        let path = snapshot_path(&self.snapshot_dir, &snapshot_id).map_err(storage_read_error)?;
+        let bytes = read_snapshot_file(&path).map_err(storage_read_error)?;
+        if snapshot_checksum(&bytes) != expected_checksum {
+            return Err(storage_read_error(ConsensusStorageError::CorruptRecord(
+                "snapshot checksum",
+            )));
+        }
+        let envelope = decode_snapshot_envelope(&bytes).map_err(storage_read_error)?;
+        Ok(Some(Snapshot {
+            meta: SnapshotMeta {
+                last_log_id: envelope.last_log_id,
+                last_membership: envelope.last_membership,
+                snapshot_id: envelope.snapshot_id,
+            },
+            snapshot: Box::new(Cursor::new(bytes)),
+        }))
     }
 }
 
@@ -452,15 +552,185 @@ impl RaftSnapshotBuilder<ControlRaftConfig> for ConsensusStateMachine {
             .last_applied
             .map_or_else(|| "none".to_string(), |log_id| log_id.to_string());
         let snapshot_id = format!("{last}-{}", self.control_state.revision);
+        let meta = SnapshotMeta {
+            last_log_id: self.last_applied,
+            last_membership: self.last_membership.clone(),
+            snapshot_id,
+        };
+        let bytes = self
+            .publish_snapshot(&meta, &bytes)
+            .map_err(storage_write_error)?;
         Ok(Snapshot {
-            meta: SnapshotMeta {
-                last_log_id: self.last_applied,
-                last_membership: self.last_membership.clone(),
-                snapshot_id,
-            },
+            meta,
             snapshot: Box::new(Cursor::new(bytes)),
         })
     }
+}
+
+fn validate_snapshot_id(snapshot_id: &str) -> Result<(), ConsensusStorageError> {
+    if snapshot_id.is_empty()
+        || snapshot_id == "."
+        || snapshot_id == ".."
+        || snapshot_id.contains('/')
+        || snapshot_id.contains('\\')
+        || snapshot_id.chars().any(char::is_control)
+    {
+        return Err(ConsensusStorageError::CorruptRecord("snapshot ID"));
+    }
+    Ok(())
+}
+
+fn snapshot_path(directory: &Path, snapshot_id: &str) -> Result<PathBuf, ConsensusStorageError> {
+    validate_snapshot_id(snapshot_id)?;
+    Ok(directory.join(format!("{snapshot_id}.snapshot")))
+}
+
+fn snapshot_checksum(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn encode_snapshot_envelope(
+    cluster_id: &str,
+    meta: &SnapshotMeta<u64, BasicNode>,
+    control_bytes: &[u8],
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    if control_bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
+    }
+    let mut writer = DurableWriter::new(*b"BMSNP001");
+    writer.u16(SNAPSHOT_FORMAT_VERSION);
+    writer.bytes(cluster_id.as_bytes())?;
+    writer.bytes(meta.snapshot_id.as_bytes())?;
+    writer.boolean(meta.last_log_id.is_some());
+    if let Some(log_id) = &meta.last_log_id {
+        encode_log_id_fields(&mut writer, log_id);
+    }
+    let membership = encode_stored_membership(&meta.last_membership)?;
+    writer.bytes(&membership)?;
+    writer.bytes(control_bytes)?;
+    let without_checksum = writer.finish();
+    let checksum = snapshot_checksum(&without_checksum);
+    let mut result = without_checksum;
+    result.extend_from_slice(&checksum);
+    Ok(result)
+}
+
+fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusStorageError> {
+    if bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
+    }
+    let payload_len = bytes
+        .len()
+        .checked_sub(32)
+        .ok_or(ConsensusStorageError::CorruptRecord("snapshot checksum"))?;
+    let (payload, checksum) = bytes.split_at(payload_len);
+    if snapshot_checksum(payload).as_slice() != checksum {
+        return Err(ConsensusStorageError::CorruptRecord("snapshot checksum"));
+    }
+    let mut reader = DurableReader::new(payload, *b"BMSNP001", "snapshot envelope")?;
+    let version = reader.u16()?;
+    if version != SNAPSHOT_FORMAT_VERSION {
+        return Err(ConsensusStorageError::UnsupportedFormat(version));
+    }
+    let cluster_id = String::from_utf8(reader.bytes()?)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot cluster ID"))?;
+    let snapshot_id = String::from_utf8(reader.bytes()?)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot ID"))?;
+    validate_snapshot_id(&snapshot_id)?;
+    let last_log_id = if reader.boolean()? {
+        Some(decode_log_id_fields(&mut reader)?)
+    } else {
+        None
+    };
+    let last_membership = decode_stored_membership(&reader.bytes()?)?;
+    let control_bytes = reader.bytes()?;
+    reader.finish()?;
+    let control = ControlState::decode_snapshot(&control_bytes)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot control state"))?;
+    if control.cluster_id != cluster_id {
+        return Err(ConsensusStorageError::CorruptRecord(
+            "snapshot cluster mismatch",
+        ));
+    }
+    Ok(SnapshotEnvelope {
+        cluster_id,
+        snapshot_id,
+        last_log_id,
+        last_membership,
+        control_bytes,
+    })
+}
+
+fn write_snapshot_file(path: &Path, bytes: &[u8]) -> Result<(), ConsensusStorageError> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_snapshot_file(path: &Path) -> Result<Vec<u8>, ConsensusStorageError> {
+    let file = File::open(path)?;
+    let size = usize::try_from(file.metadata()?.len())
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot size"))?;
+    if size > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
+    }
+    let mut bytes = Vec::with_capacity(size);
+    file.take(u64::try_from(MAX_SNAPSHOT_FILE_BYTES).expect("snapshot bound fits u64") + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
+    }
+    Ok(bytes)
+}
+
+fn sync_directory(path: &Path) -> Result<(), ConsensusStorageError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn read_active_snapshot_meta(
+    database: &Database,
+) -> Result<Option<(String, [u8; 32])>, ConsensusStorageError> {
+    let read = database.begin_read().map_err(redb::Error::from)?;
+    let table = read.open_table(META_TABLE).map_err(redb::Error::from)?;
+    let id = table
+        .get(META_ACTIVE_SNAPSHOT_ID)
+        .map_err(redb::Error::from)?
+        .map(|value| {
+            String::from_utf8(value.value().to_vec())
+                .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot ID"))
+        })
+        .transpose()?;
+    let checksum = table
+        .get(META_ACTIVE_SNAPSHOT_CHECKSUM)
+        .map_err(redb::Error::from)?
+        .map(|value| {
+            value
+                .value()
+                .try_into()
+                .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot checksum"))
+        })
+        .transpose()?;
+    match (id, checksum) {
+        (None, None) => Ok(None),
+        (Some(id), Some(checksum)) => Ok(Some((id, checksum))),
+        _ => Err(ConsensusStorageError::CorruptRecord("snapshot metadata")),
+    }
+}
+
+fn remove_inactive_snapshots(directory: &Path, active: &Path) -> Result<(), ConsensusStorageError> {
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path != active
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "snapshot")
+        {
+            fs::remove_file(path)?;
+        }
+    }
+    sync_directory(directory)
 }
 
 fn validate_cluster_id(cluster_id: &str) -> Result<(), ConsensusStorageError> {
@@ -729,6 +999,10 @@ impl DurableWriter {
         self.u8(u8::from(value));
     }
 
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
     fn u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
@@ -807,6 +1081,14 @@ impl<'a> DurableReader<'a> {
             1 => Ok(true),
             _ => Err(ConsensusStorageError::CorruptRecord(self.record)),
         }
+    }
+
+    fn u16(&mut self) -> Result<u16, ConsensusStorageError> {
+        let bytes = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| ConsensusStorageError::CorruptRecord(self.record))?;
+        Ok(u16::from_be_bytes(bytes))
     }
 
     fn u32(&mut self) -> Result<u32, ConsensusStorageError> {
@@ -1027,7 +1309,8 @@ mod tests {
             "dedup replay must not create another logical mutation"
         );
         let snapshot = state_machine.build_snapshot().await.unwrap();
-        let restored = ControlState::decode_snapshot(snapshot.snapshot.get_ref()).unwrap();
+        let envelope = decode_snapshot_envelope(snapshot.snapshot.get_ref()).unwrap();
+        let restored = ControlState::decode_snapshot(&envelope.control_bytes).unwrap();
         assert_eq!(restored, *state_machine.control_state());
         let mut restored = restored;
         assert_eq!(
@@ -1074,6 +1357,76 @@ mod tests {
         drop(state_machine);
         let reopened = store.state_machine().unwrap();
         assert_eq!(reopened.control_state(), &replacement);
+    }
+
+    #[tokio::test]
+    async fn snapshot_files_are_checksummed_published_and_recovered() {
+        use openraft::storage::RaftStateMachine;
+
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        assert!(
+            state_machine
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first = state_machine.build_snapshot().await.unwrap();
+        let path = snapshot_path(&state_machine.snapshot_dir, &first.meta.snapshot_id).unwrap();
+        assert!(path.is_file());
+        assert!(
+            !state_machine
+                .snapshot_dir
+                .join(format!("{}.tmp", first.meta.snapshot_id))
+                .exists()
+        );
+        let current = state_machine.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, first.meta);
+        assert_eq!(current.snapshot.get_ref(), first.snapshot.get_ref());
+        drop(state_machine);
+        drop(store);
+
+        let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        assert!(reopened.state_machine().is_ok());
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            reopened.state_machine(),
+            Err(ConsensusStorageError::CorruptRecord("snapshot checksum"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_install_preserves_active_state_and_snapshot() {
+        use openraft::storage::RaftStateMachine;
+
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        let active = state_machine.build_snapshot().await.unwrap();
+        let original = state_machine.control_state().clone();
+        let mut bad = active.snapshot.into_inner();
+        bad.push(0);
+        assert!(
+            state_machine
+                .install_snapshot(&active.meta, Box::new(Cursor::new(bad)))
+                .await
+                .is_err()
+        );
+        assert_eq!(state_machine.control_state(), &original);
+        assert_eq!(
+            state_machine
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .meta,
+            active.meta
+        );
     }
 
     #[test]
