@@ -87,6 +87,48 @@ const STATE_MACHINE_CONTROL: &str = "control_state";
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const MAX_SNAPSHOT_FILE_BYTES: usize = 300 * 1024 * 1024;
 const SNAPSHOT_INSTALL_MANIFEST: &str = "snapshot-install.manifest";
+const SNAPSHOT_LOG_THRESHOLD: u64 = 1_024;
+
+fn should_compact(log_state: &LogState<ControlRaftConfig>) -> bool {
+    let purged = log_state
+        .last_purged_log_id
+        .as_ref()
+        .map_or(0, |log_id| log_id.index.saturating_add(1));
+    let retained = log_state.last_log_id.as_ref().map_or(0, |log_id| {
+        log_id.index.saturating_add(1).saturating_sub(purged)
+    });
+    retained >= SNAPSHOT_LOG_THRESHOLD
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectedStorageErrorPoint {
+    BeforeOperation,
+    AfterOperationBeforeCommit,
+}
+
+#[cfg(test)]
+fn should_inject_storage_error(point: InjectedStorageErrorPoint) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MATCHING_HITS: AtomicUsize = AtomicUsize::new(0);
+    let configured = match std::env::var("BMUX_CONSENSUS_ERROR_POINT").as_deref() {
+        Ok("before-operation") => InjectedStorageErrorPoint::BeforeOperation,
+        Ok("after-operation-before-commit") => {
+            InjectedStorageErrorPoint::AfterOperationBeforeCommit
+        }
+        _ => return false,
+    };
+    if configured != point {
+        return false;
+    }
+    let hit = MATCHING_HITS.fetch_add(1, Ordering::SeqCst) + 1;
+    let target = std::env::var("BMUX_CONSENSUS_ERROR_OCCURRENCE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    hit == target
+}
 
 struct SnapshotEnvelope {
     cluster_id: String,
@@ -508,6 +550,31 @@ impl ConsensusStateMachine {
         &self.control_state
     }
 
+    /// Builds and publishes a snapshot, then purges its covered log prefix when
+    /// the retained log reaches the configured threshold.
+    ///
+    /// Returns `true` when compaction ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if log inspection, snapshot publication, or log
+    /// purge fails. Snapshot publication completes before any covered log is
+    /// removed.
+    pub async fn compact_if_needed(
+        &mut self,
+        log_store: &mut ConsensusLogStore,
+    ) -> Result<bool, StorageError<u64>> {
+        let log_state = log_store.get_log_state().await?;
+        if !should_compact(&log_state) {
+            return Ok(false);
+        }
+        let snapshot = self.build_snapshot().await?;
+        if let Some(last_log_id) = snapshot.meta.last_log_id {
+            log_store.purge(last_log_id).await?;
+        }
+        Ok(true)
+    }
+
     fn validate_active_snapshot(&self) -> Result<(), ConsensusStorageError> {
         let Some((snapshot_id, expected_checksum)) = read_active_snapshot_meta(&self.database)?
         else {
@@ -523,6 +590,7 @@ impl ConsensusStateMachine {
         if envelope.snapshot_id != snapshot_id || envelope.cluster_id != self.cluster_id {
             return Err(ConsensusStorageError::CorruptRecord("snapshot metadata"));
         }
+        remove_inactive_snapshots(&self.snapshot_dir, &path)?;
         Ok(())
     }
 
@@ -1110,11 +1178,23 @@ fn immediate_write(
     database: &Database,
     operation: impl FnOnce(&redb::WriteTransaction) -> Result<(), redb::Error>,
 ) -> Result<(), ConsensusStorageError> {
+    #[cfg(test)]
+    if should_inject_storage_error(InjectedStorageErrorPoint::BeforeOperation) {
+        return Err(ConsensusStorageError::Io(std::io::Error::other(
+            "injected storage error before transaction operation",
+        )));
+    }
     let mut transaction = database.begin_write().map_err(redb::Error::from)?;
     transaction
         .set_durability(Durability::Immediate)
         .map_err(redb::Error::from)?;
     operation(&transaction)?;
+    #[cfg(test)]
+    if should_inject_storage_error(InjectedStorageErrorPoint::AfterOperationBeforeCommit) {
+        return Err(ConsensusStorageError::Io(std::io::Error::other(
+            "injected storage error before transaction commit",
+        )));
+    }
     transaction.commit().map_err(redb::Error::from)?;
     Ok(())
 }
@@ -1482,6 +1562,24 @@ mod tests {
         run_crash_helper_at(root, mode, point, 1)
     }
 
+    fn run_error_helper(
+        root: &Path,
+        mode: &str,
+        point: &str,
+        occurrence: usize,
+    ) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(CRASH_HELPER_TEST)
+            .arg("--nocapture")
+            .env("BMUX_CONSENSUS_CRASH_HELPER_ROOT", root)
+            .env("BMUX_CONSENSUS_CRASH_HELPER_MODE", mode)
+            .env("BMUX_CONSENSUS_ERROR_POINT", point)
+            .env("BMUX_CONSENSUS_ERROR_OCCURRENCE", occurrence.to_string())
+            .status()
+            .unwrap()
+    }
+
     #[test]
     fn consensus_storage_crash_helper() {
         let Ok(root) = std::env::var("BMUX_CONSENSUS_CRASH_HELPER_ROOT") else {
@@ -1586,6 +1684,60 @@ mod tests {
         Entry {
             log_id: log_id(term, index),
             payload: EntryPayload::Normal(ControlRequest(value.to_vec())),
+        }
+    }
+
+    #[test]
+    fn transaction_internal_errors_abort_without_partial_state() {
+        for point in ["before-operation", "after-operation-before-commit"] {
+            for mode in ["vote", "append", "truncate", "purge", "state-machine"] {
+                let root = TempDir::new().unwrap();
+                let occurrence = match mode {
+                    "truncate" | "purge" => 4,
+                    _ => 3,
+                };
+                let status = run_error_helper(root.path(), mode, point, occurrence);
+                assert!(!status.success(), "mode={mode} point={point}");
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let mut reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+                match mode {
+                    "vote" => assert!(
+                        runtime
+                            .block_on(RaftLogStorage::read_vote(&mut reopened))
+                            .unwrap()
+                            .is_none()
+                    ),
+                    "append" => assert!(
+                        runtime
+                            .block_on(reopened.try_get_log_entries(..))
+                            .unwrap()
+                            .is_empty()
+                    ),
+                    "truncate" => assert_eq!(
+                        runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+                        vec![
+                            entry(7, 1, b"one"),
+                            entry(7, 2, b"two"),
+                            entry(7, 3, b"three")
+                        ]
+                    ),
+                    "purge" => assert_eq!(
+                        runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+                        vec![entry(7, 1, b"one"), entry(7, 2, b"two")]
+                    ),
+                    "state-machine" => {
+                        let mut state_machine = reopened.state_machine().unwrap();
+                        assert!(
+                            runtime
+                                .block_on(state_machine.applied_state())
+                                .unwrap()
+                                .0
+                                .is_none()
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
     }
 
@@ -2105,9 +2257,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_compaction_threshold_publishes_before_purge_and_bounds_log() {
+        let root = TempDir::new().unwrap();
+        let mut log_store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = log_store.state_machine().unwrap();
+        log_store
+            .blocking_append((0..SNAPSHOT_LOG_THRESHOLD).map(|index| Entry {
+                log_id: log_id(9, index),
+                payload: EntryPayload::Blank,
+            }))
+            .await
+            .unwrap();
+        state_machine
+            .apply([Entry {
+                log_id: log_id(9, SNAPSHOT_LOG_THRESHOLD - 1),
+                payload: EntryPayload::Blank,
+            }])
+            .await
+            .unwrap();
+        assert!(
+            state_machine
+                .compact_if_needed(&mut log_store)
+                .await
+                .unwrap()
+        );
+        assert!(log_store.try_get_log_entries(..).await.unwrap().is_empty());
+        assert_eq!(
+            log_store.get_log_state().await.unwrap().last_purged_log_id,
+            Some(log_id(9, SNAPSHOT_LOG_THRESHOLD - 1))
+        );
+        assert!(
+            state_machine
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !state_machine
+                .compact_if_needed(&mut log_store)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn repeated_snapshot_compaction_bounds_files_and_preserves_pruned_dedup_semantics() {
         use bmux_cluster_plugin_api::cluster_types::{
-            CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+            CommandId, ControlCommand, ControlCommandRequest, ControlWorkflowStatus,
+            ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord, LogicalWindowId,
+            LogicalWindowRecord, PaneAvailability, PaneRestartPolicy, PlacementIntent, WorkspaceId,
         };
         use openraft::storage::RaftStateMachine;
 
@@ -2133,6 +2333,78 @@ mod tests {
                 name: Some("workspace".to_string()),
             },
         );
+        let workspace = completed.clone();
+        state_machine.control_state.apply(&workspace);
+        state_machine.control_state.apply(&command(
+            10,
+            10,
+            ControlCommandRequest::PutWindow {
+                window: LogicalWindowRecord {
+                    window_id: LogicalWindowId {
+                        value: uuid::Uuid::from_u128(20),
+                    },
+                    workspace_id: WorkspaceId {
+                        value: uuid::Uuid::from_u128(10),
+                    },
+                    name: None,
+                    layout_schema_version: 1,
+                    layout: Vec::new(),
+                    revision: 0,
+                },
+                expected_workspace_revision: 1,
+            },
+        ));
+        state_machine.control_state.apply(&command(
+            11,
+            10,
+            ControlCommandRequest::PutPane {
+                pane: LogicalPaneRecord {
+                    pane_id: LogicalPaneId {
+                        value: uuid::Uuid::from_u128(30),
+                    },
+                    workspace_id: WorkspaceId {
+                        value: uuid::Uuid::from_u128(10),
+                    },
+                    window_id: LogicalWindowId {
+                        value: uuid::Uuid::from_u128(20),
+                    },
+                    name: None,
+                    restart_policy: PaneRestartPolicy::Manual,
+                    placement: PlacementIntent {
+                        explicit_node_id: None,
+                        required_labels: Vec::new(),
+                        preferred_labels: Vec::new(),
+                    },
+                    availability: PaneAvailability::Pending,
+                    availability_reason: None,
+                    execution: None,
+                    revision: 0,
+                },
+                expected_workspace_revision: 2,
+            },
+        ));
+        let pending = command(
+            2,
+            10,
+            ControlCommandRequest::AssignExecution {
+                pane_id: LogicalPaneId {
+                    value: uuid::Uuid::from_u128(30),
+                },
+                expected_revision: 3,
+                expected_generation: 0,
+                assignment: ExecutionAssignment {
+                    node_id: "node:worker".to_string(),
+                    generation: 1,
+                    execution_id: ExecutionId {
+                        value: uuid::Uuid::from_u128(40),
+                    },
+                },
+            },
+        );
+        assert_eq!(
+            state_machine.control_state.apply(&pending).workflow_status,
+            ControlWorkflowStatus::Pending
+        );
         state_machine.control_state.apply(&completed);
         let prune = command(
             3,
@@ -2142,6 +2414,8 @@ mod tests {
             },
         );
         state_machine.control_state.apply(&prune);
+        let snapshot_log_id = log_id(8, 20);
+        state_machine.last_applied = Some(snapshot_log_id);
 
         for revision in 1..=32 {
             state_machine.control_state.revision = revision;
@@ -2163,13 +2437,37 @@ mod tests {
             })
             .count();
         assert_eq!(snapshot_count, 1);
+        let mut log_store = store.clone();
+        log_store
+            .blocking_append((0..=20).map(|index| Entry {
+                log_id: log_id(8, index),
+                payload: EntryPayload::Blank,
+            }))
+            .await
+            .unwrap();
+        log_store.purge(snapshot_log_id).await.unwrap();
+        assert!(log_store.try_get_log_entries(..).await.unwrap().is_empty());
+        let mut restored_machine = store.state_machine().unwrap();
+        let current = restored_machine
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope = decode_snapshot_envelope(current.snapshot.get_ref()).unwrap();
+        restored_machine.control_state =
+            ControlState::decode_snapshot(&envelope.control_bytes).unwrap();
         assert_eq!(
-            state_machine
+            restored_machine
                 .control_state
-                .apply(&completed)
-                .control_revision,
-            32,
-            "replayed completed command remains deduplicated after repeated snapshots"
+                .apply(&pending)
+                .workflow_status,
+            ControlWorkflowStatus::Pending,
+            "pending workflows survive snapshot-backed log compaction"
+        );
+        assert_eq!(
+            state_machine.control_state.apply(&pending).workflow_status,
+            ControlWorkflowStatus::Pending,
+            "pending workflows survive pruning and repeated snapshots"
         );
     }
 
