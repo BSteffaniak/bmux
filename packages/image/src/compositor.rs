@@ -7,6 +7,9 @@
 
 use std::io::Write;
 
+#[cfg(feature = "iterm2")]
+use image::ImageEncoder;
+
 use crate::config::ImageDecodeMode;
 use crate::host_caps::HostImageCapabilities;
 use crate::model::PaneImage;
@@ -197,33 +200,71 @@ fn emit_from_pixels(
         }
         #[cfg(feature = "kitty")]
         Some(crate::model::ImageProtocol::KittyGraphics) => {
-            // Encode pixels as PNG-ish kitty transmission.
-            // For now, send raw RGBA data.
+            let (kitty_format, data) = match pixels.format {
+                crate::model::PixelFormat::Rgb8 => {
+                    (crate::model::KittyFormat::Rgb, pixels.data.as_slice())
+                }
+                crate::model::PixelFormat::Rgba8 => {
+                    (crate::model::KittyFormat::Rgba, pixels.data.as_slice())
+                }
+                crate::model::PixelFormat::Png => {
+                    (crate::model::KittyFormat::Png, pixels.data.as_slice())
+                }
+            };
             let (host_id, needs_transmit) = kitty_state.get_or_allocate(image.id);
             if needs_transmit {
                 out.write_all(b"\x1b_")?;
                 out.write_all(&crate::codec::kitty::encode_transmit(
                     host_id,
-                    crate::model::KittyFormat::Rgba,
-                    &pixels.data,
+                    kitty_format,
+                    data,
                     pixels.width,
                     pixels.height,
                 ))?;
                 out.write_all(b"\x1b\\")?;
             }
             out.write_all(b"\x1b_")?;
-            out.write_all(&crate::codec::kitty::encode_place(
-                host_id, host_id, host_y, host_x,
+            out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(
+                host_id,
+                host_id,
+                0,
+                image.cell_size.cols,
+                image.cell_size.rows,
             ))?;
             out.write_all(b"\x1b\\")?;
         }
-        _ => {
-            // No supported protocol for pixel emission; fall back to passthrough.
-            return emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state);
+        #[cfg(feature = "iterm2")]
+        Some(crate::model::ImageProtocol::ITerm2) => {
+            let png = pixels_as_png(pixels)?;
+            out.write_all(b"\x1b]1337;File=")?;
+            out.write_all(&crate::codec::iterm2::encode_body_with_cells(
+                &png,
+                image.cell_size.cols,
+                image.cell_size.rows,
+            ))?;
+            out.write_all(b"\x07")?;
         }
+        _ => {}
     }
 
     Ok(())
+}
+
+#[cfg(feature = "iterm2")]
+fn pixels_as_png(pixels: &crate::model::PixelBuffer) -> std::io::Result<Vec<u8>> {
+    if pixels.format == crate::model::PixelFormat::Png {
+        return Ok(pixels.data.clone());
+    }
+    let color = match pixels.format {
+        crate::model::PixelFormat::Rgb8 => image::ColorType::Rgb8,
+        crate::model::PixelFormat::Rgba8 => image::ColorType::Rgba8,
+        crate::model::PixelFormat::Png => unreachable!(),
+    };
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&pixels.data, pixels.width, pixels.height, color.into())
+        .map_err(std::io::Error::other)?;
+    Ok(png)
 }
 
 /// Client-decode mode: decode raw bytes, then encode for host protocol.

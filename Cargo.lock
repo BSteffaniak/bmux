@@ -1631,6 +1631,8 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
+ "bmux_tui",
+ "image",
  "serde",
  "uuid",
  "windows-sys 0.61.2",

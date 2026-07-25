@@ -135,6 +135,15 @@ pub fn encode_body(image_data: &[u8], inline: bool) -> Vec<u8> {
     body
 }
 
+/// Encode an inline image with an explicit destination size in terminal cells.
+pub fn encode_body_with_cells(image_data: &[u8], columns: u16, rows: u16) -> Vec<u8> {
+    let b64 = crate::codec::base64::base64_encode(image_data);
+    let mut body =
+        format!("inline=1;width={columns};height={rows};preserveAspectRatio=0:").into_bytes();
+    body.extend_from_slice(b64.as_bytes());
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

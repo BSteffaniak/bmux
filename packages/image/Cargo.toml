@@ -13,6 +13,8 @@ version     = { workspace = true }
 [dependencies]
 bmux_attach_image_protocol = { workspace = true }
 bmux_ipc                   = { workspace = true }
+bmux_tui                   = { workspace = true }
+image                      = { workspace = true, default-features = false, features = ["png"] }
 serde                      = { workspace = true, features = ["derive", "std"] }
 uuid                       = { workspace = true, features = ["std"] }
 

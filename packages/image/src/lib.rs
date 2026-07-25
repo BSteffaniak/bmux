@@ -14,6 +14,7 @@ pub mod intercept;
 pub mod ipc_convert;
 pub mod model;
 pub mod registry;
+pub mod tui;
 
 pub use config::ImageConfig;
 pub use host_caps::HostImageCapabilities;
