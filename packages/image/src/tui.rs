@@ -13,6 +13,7 @@ use crate::model::{
     ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
     PixelBuffer, PixelFormat,
 };
+use crate::registry::ImageRegistry;
 
 /// Failure while adapting a TUI image scene into BMUX's image pipeline.
 #[derive(Debug)]
@@ -56,11 +57,13 @@ impl From<std::io::Error> for TuiImageError {
 
 /// BMUX-owned adapter that assigns image IDs, validates payloads, clips
 /// placements, and delegates host protocol selection to the compositor.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct TuiImageCompositor {
     next_id: u64,
     ids: BTreeMap<ImageKey, u64>,
     payloads: BTreeMap<ImageKey, TuiImagePayload>,
+    registry: ImageRegistry,
+    pending_removals: Vec<u64>,
     kitty_state: KittyHostState,
 }
 
@@ -74,7 +77,9 @@ impl TuiImageCompositor {
     /// Apply lifecycle removals produced by the TUI frame reconciler.
     pub fn apply_delta(&mut self, delta: &ImageSceneDelta) {
         for key in &delta.removed {
-            self.ids.remove(key);
+            if let Some(id) = self.ids.remove(key) {
+                self.pending_removals.push(id);
+            }
             self.payloads.remove(key);
         }
     }
@@ -100,6 +105,7 @@ impl TuiImageCompositor {
             return Ok(());
         }
 
+        self.emit_pending_removals(out, host_caps)?;
         let mut images = Vec::with_capacity(scene.placements().len());
         for placement in scene.placements() {
             let Some(visible) = clipped_destination(
@@ -149,14 +155,35 @@ impl TuiImageCompositor {
             });
         }
 
+        self.registry.replace_images(images);
         render_pane_images(
             out,
-            &images,
+            self.registry.images(),
             terminal,
             host_caps,
             ImageDecodeMode::Server,
             &mut self.kitty_state,
         )?;
+        Ok(())
+    }
+
+    fn emit_pending_removals(
+        &mut self,
+        out: &mut impl Write,
+        host_caps: &HostImageCapabilities,
+    ) -> std::io::Result<()> {
+        #[cfg(feature = "kitty")]
+        if host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics) {
+            for id in self.pending_removals.drain(..) {
+                if let Some(host_id) = self.kitty_state.transmitted.remove(&id) {
+                    out.write_all(b"\x1b_")?;
+                    out.write_all(&crate::codec::kitty::encode_delete_image(host_id))?;
+                    out.write_all(b"\x1b\\")?;
+                }
+            }
+            return Ok(());
+        }
+        self.pending_removals.clear();
         Ok(())
     }
 }
@@ -556,6 +583,17 @@ mod tests {
 
         let removed = scene.reconcile(&[]);
         compositor.apply_delta(&removed);
+        let mut stale_removed = Vec::new();
+        compositor
+            .render(
+                &mut stale_removed,
+                &scene,
+                terminal,
+                &kitty_caps(),
+                &ImageConfig::default(),
+            )
+            .unwrap();
+        assert!(String::from_utf8(stale_removed).unwrap().contains("a=d"));
         scene.reconcile(&[ImageContribution::Present(placement(
             "diagram",
             Rect::new(0, 0, 4, 2),

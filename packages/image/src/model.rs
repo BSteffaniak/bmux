@@ -30,7 +30,7 @@ pub enum PixelFormat {
 }
 
 /// A decoded pixel buffer, independent of any terminal protocol.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelBuffer {
     pub width: u32,
     pub height: u32,
@@ -44,7 +44,7 @@ pub struct PixelBuffer {
 // ---------------------------------------------------------------------------
 
 /// How the image data is represented in transit / storage.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImagePayload {
     /// Original protocol bytes (sixel DCS body, kitty APC body, iTerm2 OSC
     /// body).  Present in client-decode and passthrough modes.
@@ -83,7 +83,7 @@ pub struct ImagePixelSize {
 // ---------------------------------------------------------------------------
 
 /// A fully-described image placed within a pane's content area.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneImage {
     /// Monotonically increasing per-pane identifier.
     pub id: u64,

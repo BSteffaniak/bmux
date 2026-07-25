@@ -235,6 +235,49 @@ impl ImageRegistry {
         });
     }
 
+    /// Replace the registry contents with a caller-projected image scene.
+    ///
+    /// Images are matched by ID. New and changed images are recorded as
+    /// additions, absent IDs as removals, and byte/count limits are enforced.
+    pub fn replace_images(&mut self, images: Vec<PaneImage>) {
+        let previous = self
+            .images
+            .iter()
+            .map(|image| (image.id, image.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let next_ids = images
+            .iter()
+            .map(|image| image.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut changed = false;
+
+        for image in &self.images {
+            if !next_ids.contains(&image.id) {
+                self.sequence = self.sequence.saturating_add(1);
+                self.change_log.push(ChangeLogEntry::Removed {
+                    sequence: self.sequence,
+                    image_id: image.id,
+                });
+                changed = true;
+            }
+        }
+        for image in &images {
+            if previous.get(&image.id) != Some(image) {
+                self.sequence = self.sequence.saturating_add(1);
+                self.change_log.push(ChangeLogEntry::Added {
+                    sequence: self.sequence,
+                    image: image.clone(),
+                });
+                changed = true;
+            }
+        }
+        self.images = images;
+        if changed {
+            self.compact_change_log();
+            self.enforce_limits();
+        }
+    }
+
     /// Get all images currently in the registry.
     pub fn images(&self) -> &[PaneImage] {
         &self.images
