@@ -7,6 +7,8 @@ use crate::buffer::Buffer;
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::HitMap;
+use crate::image::ImageContribution;
+use crate::image_scene::{ImageScene, ImageSceneDelta};
 
 /// Statistics from one terminal draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,17 +46,23 @@ pub struct Terminal<W> {
     area: Rect,
     previous: Option<Buffer>,
     hits: HitMap,
+    images: Vec<ImageContribution>,
+    image_scene: ImageScene,
+    image_delta: ImageSceneDelta,
 }
 
 impl<W: Write> Terminal<W> {
     /// Create a terminal runtime for `area`.
     #[must_use]
-    pub const fn new(writer: W, area: Rect) -> Self {
+    pub fn new(writer: W, area: Rect) -> Self {
         Self {
             writer,
             area,
             previous: None,
             hits: HitMap::new(),
+            images: Vec::new(),
+            image_scene: ImageScene::default(),
+            image_delta: ImageSceneDelta::default(),
         }
     }
 
@@ -68,6 +76,24 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn hits(&self) -> &HitMap {
         &self.hits
+    }
+
+    /// Return image lifecycle contributions registered by the last draw.
+    #[must_use]
+    pub fn images(&self) -> &[ImageContribution] {
+        &self.images
+    }
+
+    /// Return the active image scene after the last draw.
+    #[must_use]
+    pub const fn image_scene(&self) -> &ImageScene {
+        &self.image_scene
+    }
+
+    /// Return image additions, updates, and removals produced by the last draw.
+    #[must_use]
+    pub const fn image_delta(&self) -> &ImageSceneDelta {
+        &self.image_delta
     }
 
     /// Resize the terminal area and force the next draw to repaint fully.
@@ -85,10 +111,14 @@ impl<W: Write> Terminal<W> {
     /// Returns any I/O error reported by the backend writer.
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawStats> {
         let mut buffer = Buffer::empty(self.area);
-        let (cursor, hits) = {
+        let (cursor, hits, images) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
-            (frame.cursor(), frame.hits().clone())
+            (
+                frame.cursor(),
+                frame.hits().clone(),
+                frame.images().to_vec(),
+            )
         };
 
         let stats = if let Some(previous) = &self.previous {
@@ -99,6 +129,8 @@ impl<W: Write> Terminal<W> {
         };
         self.writer.flush()?;
         self.hits = hits;
+        self.image_delta = self.image_scene.reconcile(&images);
+        self.images = images;
         self.previous = Some(buffer);
         Ok(stats)
     }
@@ -124,6 +156,7 @@ impl<W: Write> Terminal<W> {
 mod tests {
     use super::Terminal;
     use crate::geometry::{Point, Rect};
+    use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::style::Style;
 
     #[test]
@@ -180,5 +213,48 @@ mod tests {
 
         assert!(stats.full_repaint);
         assert_eq!(stats.changed_cells, 2);
+    }
+
+    #[test]
+    fn terminal_exposes_only_the_latest_frame_image_contributions() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 1, 1));
+        terminal
+            .draw(|frame| {
+                frame.push_image(ImageContribution::Remove(ImageKey::new("old")));
+            })
+            .unwrap();
+        assert_eq!(terminal.images().len(), 1);
+
+        terminal.draw(|_| {}).unwrap();
+
+        assert!(terminal.images().is_empty());
+    }
+
+    #[test]
+    fn terminal_reconciles_frame_images_after_rendering() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+        let placement = ImagePlacement {
+            key: ImageKey::new("diagram"),
+            payload: ImagePayload::Png {
+                bytes: vec![1, 2, 3],
+                width: 1,
+                height: 1,
+            },
+            destination: Rect::new(1, 0, 2, 1),
+            clip: Rect::new(0, 0, 4, 2),
+            lifecycle: ImageLifecycle::Frame,
+        };
+
+        terminal
+            .draw(|frame| frame.push_image(ImageContribution::Present(placement.clone())))
+            .unwrap();
+        assert_eq!(terminal.image_delta().upserted, [placement]);
+        assert!(terminal.image_delta().removed.is_empty());
+        assert_eq!(terminal.image_scene().placements().len(), 1);
+
+        terminal.draw(|_| {}).unwrap();
+        assert!(terminal.image_delta().upserted.is_empty());
+        assert_eq!(terminal.image_delta().removed, [ImageKey::new("diagram")]);
+        assert_eq!(terminal.image_scene().placements().len(), 0);
     }
 }

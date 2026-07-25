@@ -3,6 +3,7 @@
 use crate::buffer::Buffer;
 use crate::geometry::{Point, Rect};
 use crate::hit::{HitMap, HitRegion};
+use crate::image::ImageContribution;
 use crate::style::Style;
 use crate::text::Line;
 
@@ -40,6 +41,7 @@ pub struct Frame<'buffer> {
     buffer: &'buffer mut Buffer,
     cursor: Option<Cursor>,
     hits: HitMap,
+    images: Vec<ImageContribution>,
 }
 
 impl<'buffer> Frame<'buffer> {
@@ -49,6 +51,7 @@ impl<'buffer> Frame<'buffer> {
             buffer,
             cursor: None,
             hits: HitMap::new(),
+            images: Vec::new(),
         }
     }
 
@@ -91,6 +94,17 @@ impl<'buffer> Frame<'buffer> {
         self.hits.push(region);
     }
 
+    /// Return image lifecycle contributions registered for this frame.
+    #[must_use]
+    pub fn images(&self) -> &[ImageContribution] {
+        &self.images
+    }
+
+    /// Add an image lifecycle contribution to this frame.
+    pub fn push_image(&mut self, contribution: ImageContribution) {
+        self.images.push(contribution);
+    }
+
     /// Fill a rectangular area with a symbol and style.
     pub fn fill(&mut self, area: Rect, symbol: &str, style: Style) {
         self.buffer.fill(area, symbol, style);
@@ -114,6 +128,7 @@ mod tests {
     use super::{Cursor, Frame};
     use crate::buffer::Buffer;
     use crate::geometry::{Point, Rect};
+    use crate::image::{ImageContribution, ImageKey};
 
     #[test]
     fn frame_tracks_cursor_request() {
@@ -123,5 +138,22 @@ mod tests {
         frame.set_cursor(Cursor::visible(Point::new(1, 1)));
 
         assert_eq!(frame.cursor(), Some(Cursor::visible(Point::new(1, 1))));
+    }
+
+    #[test]
+    fn frame_collects_image_contributions_in_render_order() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        frame.push_image(ImageContribution::Remove(ImageKey::new("first")));
+        frame.push_image(ImageContribution::Remove(ImageKey::new("second")));
+
+        assert_eq!(
+            frame.images(),
+            [
+                ImageContribution::Remove(ImageKey::new("first")),
+                ImageContribution::Remove(ImageKey::new("second")),
+            ]
+        );
     }
 }

@@ -24,6 +24,8 @@ pub mod frame;
 pub mod geometry;
 pub mod history;
 pub mod hit;
+pub mod image;
+pub mod image_scene;
 pub mod input;
 pub mod layout;
 pub mod list;
@@ -72,6 +74,10 @@ pub mod prelude {
     pub use crate::geometry::{Insets, Point, Rect, Size};
     pub use crate::history::{TextInputHistory, TextInputHistoryDirection, TextInputHistoryState};
     pub use crate::hit::{Hit, HitId, HitMap, HitRegion, HitRole};
+    pub use crate::image::{
+        ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
+    };
+    pub use crate::image_scene::{ImageScene, ImageSceneDelta};
     pub use crate::input::{
         TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
         TextInputProjection,
