@@ -29,8 +29,18 @@ const TEST_CRASH_EXIT_CODE: i32 = 86;
 
 #[cfg(test)]
 fn test_crash_point(point: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MATCHING_HITS: AtomicUsize = AtomicUsize::new(0);
     if std::env::var("BMUX_CONSENSUS_CRASH_POINT").as_deref() == Ok(point) {
-        std::process::exit(TEST_CRASH_EXIT_CODE);
+        let hit = MATCHING_HITS.fetch_add(1, Ordering::SeqCst) + 1;
+        let target = std::env::var("BMUX_CONSENSUS_CRASH_OCCURRENCE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        if hit == target {
+            std::process::exit(TEST_CRASH_EXIT_CODE);
+        }
     }
 }
 
@@ -980,6 +990,13 @@ fn remove_inactive_snapshots(directory: &Path, active: &Path) -> Result<(), Cons
     sync_directory(directory)
 }
 
+fn final_path_for_manifest(
+    directory: &Path,
+    manifest: &SnapshotInstallManifest,
+) -> Result<PathBuf, ConsensusStorageError> {
+    snapshot_path(&directory.join("snapshots"), &manifest.snapshot_id)
+}
+
 fn reconcile_snapshot_manifest(
     directory: &Path,
     database: &Database,
@@ -996,9 +1013,20 @@ fn reconcile_snapshot_manifest(
             remove_snapshot_manifest(directory)
         }
         None => Ok(()),
-        Some(_) => Err(ConsensusStorageError::CorruptRecord(
-            "snapshot manifest metadata mismatch",
-        )),
+        Some(_) => {
+            let final_path = final_path_for_manifest(directory, &manifest)?;
+            let temporary_path = directory
+                .join("snapshots")
+                .join(format!("{}.tmp", manifest.snapshot_id));
+            if final_path.exists() {
+                fs::remove_file(final_path)?;
+            }
+            if temporary_path.exists() {
+                fs::remove_file(temporary_path)?;
+            }
+            sync_directory(&directory.join("snapshots"))?;
+            remove_snapshot_manifest(directory)
+        }
     }
 }
 
@@ -1427,7 +1455,12 @@ mod tests {
 
     const CRASH_HELPER_TEST: &str = "consensus_storage::tests::consensus_storage_crash_helper";
 
-    fn run_crash_helper(root: &Path, mode: &str, point: &str) -> std::process::ExitStatus {
+    fn run_crash_helper_at(
+        root: &Path,
+        mode: &str,
+        point: &str,
+        occurrence: usize,
+    ) -> std::process::ExitStatus {
         Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg(CRASH_HELPER_TEST)
@@ -1435,8 +1468,13 @@ mod tests {
             .env("BMUX_CONSENSUS_CRASH_HELPER_ROOT", root)
             .env("BMUX_CONSENSUS_CRASH_HELPER_MODE", mode)
             .env("BMUX_CONSENSUS_CRASH_POINT", point)
+            .env("BMUX_CONSENSUS_CRASH_OCCURRENCE", occurrence.to_string())
             .status()
             .unwrap()
+    }
+
+    fn run_crash_helper(root: &Path, mode: &str, point: &str) -> std::process::ExitStatus {
+        run_crash_helper_at(root, mode, point, 1)
     }
 
     #[test]
@@ -1489,6 +1527,13 @@ mod tests {
                 "snapshot" => {
                     let mut state_machine = store.state_machine().unwrap();
                     state_machine.build_snapshot().await.unwrap();
+                }
+                "snapshot-replace" => {
+                    let mut state_machine = store.state_machine().unwrap();
+                    state_machine.build_snapshot().await.unwrap();
+                    let mut replacement = state_machine.clone();
+                    replacement.control_state.revision = 1;
+                    replacement.build_snapshot().await.unwrap();
                 }
                 other => panic!("unknown crash-helper mode {other}"),
             }
@@ -1665,6 +1710,46 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn interrupted_repeated_snapshot_replacement_keeps_one_complete_active_snapshot() {
+        for point in [
+            "snapshot-after-manifest-sync",
+            "snapshot-after-tmp-sync",
+            "snapshot-after-rename-sync",
+            "snapshot-after-meta-commit",
+            "snapshot-after-manifest-remove",
+        ] {
+            let root = TempDir::new().unwrap();
+            let status = run_crash_helper_at(root.path(), "snapshot-replace", point, 2);
+            assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE), "point={point}");
+            let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut state_machine = reopened.state_machine().unwrap();
+            let snapshot = runtime
+                .block_on(state_machine.get_current_snapshot())
+                .unwrap()
+                .expect("first or second snapshot remains active");
+            let envelope = decode_snapshot_envelope(snapshot.snapshot.get_ref()).unwrap();
+            let restored = ControlState::decode_snapshot(&envelope.control_bytes).unwrap();
+            let expected_revision = u64::from(matches!(
+                point,
+                "snapshot-after-meta-commit" | "snapshot-after-manifest-remove"
+            ));
+            assert_eq!(restored.revision, expected_revision, "point={point}");
+            let snapshots = fs::read_dir(&state_machine.snapshot_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "snapshot")
+                })
+                .count();
+            assert!((1..=2).contains(&snapshots), "point={point}");
+        }
     }
 
     #[tokio::test]
