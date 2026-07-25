@@ -1638,6 +1638,19 @@ mod tests {
                     replacement.control_state.revision = 1;
                     replacement.build_snapshot().await.unwrap();
                 }
+                "randomized-sequence" => {
+                    let seed = std::env::var("BMUX_CONSENSUS_RANDOM_SEED")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let steps = std::env::var("BMUX_CONSENSUS_RANDOM_STEPS")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    for operation in randomized_operations(seed, steps) {
+                        execute_randomized_operation(&mut store, &operation).await;
+                    }
+                }
                 other => panic!("unknown crash-helper mode {other}"),
             }
         });
@@ -1684,6 +1697,222 @@ mod tests {
         Entry {
             log_id: log_id(term, index),
             payload: EntryPayload::Normal(ControlRequest(value.to_vec())),
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum RandomizedOperation {
+        SaveVote(Vote<u64>),
+        Append(Vec<Entry<ControlRaftConfig>>),
+        Truncate(LogId<u64>),
+        Purge(LogId<u64>),
+        Apply(LogId<u64>),
+        Snapshot,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct DurableState {
+        vote: Option<Vote<u64>>,
+        log_state: LogState<ControlRaftConfig>,
+        entries: Vec<Entry<ControlRaftConfig>>,
+        last_applied: Option<LogId<u64>>,
+        membership: StoredMembership<u64, BasicNode>,
+        snapshot: Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct DeterministicRng(u64);
+
+    impl DeterministicRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, upper: u64) -> u64 {
+            self.next() % upper
+        }
+    }
+
+    fn randomized_operations(seed: u64, steps: usize) -> Vec<RandomizedOperation> {
+        let mut rng = DeterministicRng(seed.max(1));
+        let mut operations = Vec::with_capacity(steps);
+        let mut last_index = 0_u64;
+        let mut last_applied = 0_u64;
+        let mut last_purged = 0_u64;
+        let mut term = 1_u64;
+        let mut vote_term = 0_u64;
+        for _ in 0..steps {
+            let choice = rng.below(100);
+            let operation = if choice < 15 {
+                vote_term = vote_term.saturating_add(1);
+                RandomizedOperation::SaveVote(Vote::new_committed(vote_term, 1))
+            } else if choice < 50 || last_index == last_purged {
+                term = term.saturating_add(rng.below(2));
+                let count = usize::try_from(rng.below(4) + 1).unwrap();
+                let entries = (0..count)
+                    .map(|offset| {
+                        let index = last_index + u64::try_from(offset).unwrap() + 1;
+                        entry(term, index, &seed.to_be_bytes())
+                    })
+                    .collect::<Vec<_>>();
+                last_index += u64::try_from(count).unwrap();
+                RandomizedOperation::Append(entries)
+            } else if choice < 62 && last_index > last_applied.max(last_purged) {
+                let floor = last_applied.max(last_purged).saturating_add(1);
+                let index = floor + rng.below(last_index - floor + 1);
+                last_index = index.saturating_sub(1);
+                RandomizedOperation::Truncate(log_id(term, index))
+            } else if choice < 74 && last_purged < last_applied {
+                let index = last_purged + 1 + rng.below(last_applied - last_purged);
+                last_purged = index;
+                RandomizedOperation::Purge(log_id(term, index))
+            } else if choice < 90 && last_applied < last_index {
+                last_applied += 1;
+                RandomizedOperation::Apply(log_id(term, last_applied))
+            } else {
+                RandomizedOperation::Snapshot
+            };
+            operations.push(operation);
+        }
+        operations
+    }
+
+    async fn execute_randomized_operation(
+        store: &mut ConsensusLogStore,
+        operation: &RandomizedOperation,
+    ) {
+        match operation {
+            RandomizedOperation::SaveVote(vote) => store.save_vote(vote).await.unwrap(),
+            RandomizedOperation::Append(entries) => {
+                store.blocking_append(entries.clone()).await.unwrap();
+            }
+            RandomizedOperation::Truncate(log_id) => store.truncate(*log_id).await.unwrap(),
+            RandomizedOperation::Purge(log_id) => store.purge(*log_id).await.unwrap(),
+            RandomizedOperation::Apply(log_id) => {
+                store
+                    .state_machine()
+                    .unwrap()
+                    .apply([Entry {
+                        log_id: *log_id,
+                        payload: EntryPayload::Blank,
+                    }])
+                    .await
+                    .unwrap();
+            }
+            RandomizedOperation::Snapshot => {
+                store
+                    .state_machine()
+                    .unwrap()
+                    .build_snapshot()
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn read_durable_state(store: &mut ConsensusLogStore) -> DurableState {
+        let vote = RaftLogStorage::read_vote(store).await.unwrap();
+        let log_state = store.get_log_state().await.unwrap();
+        let entries = store.try_get_log_entries(..).await.unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        let (last_applied, membership) = state_machine.applied_state().await.unwrap();
+        let snapshot = state_machine
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .map(|snapshot| (snapshot.meta, snapshot.snapshot.into_inner()));
+        DurableState {
+            vote,
+            log_state,
+            entries,
+            last_applied,
+            membership,
+            snapshot,
+        }
+    }
+
+    fn randomized_crash_points(operation: &RandomizedOperation) -> &'static [&'static str] {
+        match operation {
+            RandomizedOperation::SaveVote(_) => &["vote-before-commit", "vote-after-commit"],
+            RandomizedOperation::Append(_) => {
+                &["log-append-before-commit", "log-append-after-commit"]
+            }
+            RandomizedOperation::Truncate(_) => {
+                &["truncate-before-commit", "truncate-after-commit"]
+            }
+            RandomizedOperation::Purge(_) => &["purge-before-commit", "purge-after-commit"],
+            RandomizedOperation::Apply(_) => {
+                &["state-machine-before-commit", "state-machine-after-commit"]
+            }
+            RandomizedOperation::Snapshot => &[
+                "snapshot-after-manifest-sync",
+                "snapshot-after-tmp-sync",
+                "snapshot-after-rename-sync",
+                "snapshot-after-meta-commit",
+                "snapshot-after-manifest-remove",
+            ],
+        }
+    }
+
+    #[test]
+    fn randomized_multi_operation_crashes_recover_prefix_or_committed_operation() {
+        const SEEDS: u64 = 4;
+        const STEPS: usize = 16;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for seed in 1..=SEEDS {
+            let operations = randomized_operations(seed, STEPS);
+            for crash_index in 0..operations.len() {
+                for point in randomized_crash_points(&operations[crash_index]) {
+                    let expected_root = TempDir::new().unwrap();
+                    let (before, after) = runtime.block_on(async {
+                        let mut expected =
+                            ConsensusLogStore::open(expected_root.path(), "cluster-a").unwrap();
+                        for operation in &operations[..crash_index] {
+                            execute_randomized_operation(&mut expected, operation).await;
+                        }
+                        let before = read_durable_state(&mut expected).await;
+                        execute_randomized_operation(&mut expected, &operations[crash_index]).await;
+                        let after = read_durable_state(&mut expected).await;
+                        (before, after)
+                    });
+
+                    let crash_root = TempDir::new().unwrap();
+                    let occurrence = operations[..=crash_index]
+                        .iter()
+                        .filter(|operation| randomized_crash_points(operation).contains(point))
+                        .count();
+                    let status = Command::new(std::env::current_exe().unwrap())
+                        .arg("--exact")
+                        .arg(CRASH_HELPER_TEST)
+                        .arg("--nocapture")
+                        .env("BMUX_CONSENSUS_CRASH_HELPER_ROOT", crash_root.path())
+                        .env("BMUX_CONSENSUS_CRASH_HELPER_MODE", "randomized-sequence")
+                        .env("BMUX_CONSENSUS_RANDOM_SEED", seed.to_string())
+                        .env("BMUX_CONSENSUS_RANDOM_STEPS", (crash_index + 1).to_string())
+                        .env("BMUX_CONSENSUS_CRASH_POINT", point)
+                        .env("BMUX_CONSENSUS_CRASH_OCCURRENCE", occurrence.to_string())
+                        .status()
+                        .unwrap();
+                    assert_eq!(
+                        status.code(),
+                        Some(TEST_CRASH_EXIT_CODE),
+                        "seed={seed} operation={crash_index} point={point}"
+                    );
+                    let recovered = runtime.block_on(async {
+                        let mut store =
+                            ConsensusLogStore::open(crash_root.path(), "cluster-a").unwrap();
+                        read_durable_state(&mut store).await
+                    });
+                    assert!(
+                        recovered == before || recovered == after,
+                        "seed={seed} operation={crash_index} point={point}\noperation={:?}\nbefore={before:?}\nafter={after:?}\nrecovered={recovered:?}",
+                        operations[crash_index]
+                    );
+                }
+            }
         }
     }
 
