@@ -315,6 +315,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         let database = self.database.clone();
         let encoded = encode_vote(vote);
         run_storage_blocking(move || {
+            test_crash_point("vote-before-commit");
             immediate_write(&database, |transaction| {
                 transaction
                     .open_table(HARD_STATE_TABLE)?
@@ -348,6 +349,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             .map_err(storage_write_error)?;
         let database = self.database.clone();
         let result = run_storage_blocking(move || {
+            test_crash_point("log-append-before-commit");
             immediate_write(&database, |transaction| {
                 let mut table = transaction.open_table(LOG_TABLE)?;
                 for (index, entry) in &encoded {
@@ -375,6 +377,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let database = self.database.clone();
         run_storage_blocking(move || {
+            test_crash_point("truncate-before-commit");
             immediate_write(&database, |transaction| {
                 let mut table = transaction.open_table(LOG_TABLE)?;
                 let keys = table
@@ -397,6 +400,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         let database = self.database.clone();
         let encoded = encode_log_id(&log_id);
         run_storage_blocking(move || {
+            test_crash_point("purge-before-commit");
             immediate_write(&database, |transaction| {
                 {
                     let mut table = transaction.open_table(LOG_TABLE)?;
@@ -598,6 +602,7 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         let prepared = next.prepared_state_machine().map_err(storage_write_error)?;
         let database = next.database.clone();
         run_storage_blocking(move || {
+            test_crash_point("state-machine-before-commit");
             Self::persist_prepared(&database, &prepared).map_err(storage_write_error)
         })
         .await?;
@@ -1585,6 +1590,70 @@ mod tests {
     }
 
     #[test]
+    fn pre_commit_process_exit_preserves_previous_state() {
+        let cases = [
+            ("vote", "vote-before-commit"),
+            ("append", "log-append-before-commit"),
+            ("truncate", "truncate-before-commit"),
+            ("purge", "purge-before-commit"),
+            ("state-machine", "state-machine-before-commit"),
+        ];
+        for (mode, point) in cases {
+            let root = TempDir::new().unwrap();
+            let status = run_crash_helper(root.path(), mode, point);
+            assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE), "mode={mode}");
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+            match mode {
+                "vote" => assert!(
+                    runtime
+                        .block_on(RaftLogStorage::read_vote(&mut reopened))
+                        .unwrap()
+                        .is_none()
+                ),
+                "append" => assert!(
+                    runtime
+                        .block_on(reopened.try_get_log_entries(..))
+                        .unwrap()
+                        .is_empty()
+                ),
+                "truncate" => assert_eq!(
+                    runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+                    vec![
+                        entry(7, 1, b"one"),
+                        entry(7, 2, b"two"),
+                        entry(7, 3, b"three")
+                    ]
+                ),
+                "purge" => {
+                    assert_eq!(
+                        runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+                        vec![entry(7, 1, b"one"), entry(7, 2, b"two")]
+                    );
+                    assert!(
+                        runtime
+                            .block_on(reopened.get_log_state())
+                            .unwrap()
+                            .last_purged_log_id
+                            .is_none()
+                    );
+                }
+                "state-machine" => {
+                    let mut state_machine = reopened.state_machine().unwrap();
+                    assert!(
+                        runtime
+                            .block_on(state_machine.applied_state())
+                            .unwrap()
+                            .0
+                            .is_none()
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
     fn durable_commit_survives_process_exit_before_acknowledgement() {
         let root = TempDir::new().unwrap();
         let status = run_crash_helper(root.path(), "append", "log-append-after-commit");
@@ -2033,6 +2102,75 @@ mod tests {
         for handle in handles {
             handle.await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_snapshot_compaction_bounds_files_and_preserves_pruned_dedup_semantics() {
+        use bmux_cluster_plugin_api::cluster_types::{
+            CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+        };
+        use openraft::storage::RaftStateMachine;
+
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        let command = |id: u128, issued_at_unix_ms, request| ControlCommand {
+            schema_version: 1,
+            principal_id: "principal:test".to_string(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(id),
+            },
+            issued_at_unix_ms,
+            request,
+        };
+        let completed = command(
+            1,
+            10,
+            ControlCommandRequest::CreateWorkspace {
+                workspace_id: WorkspaceId {
+                    value: uuid::Uuid::from_u128(10),
+                },
+                name: Some("workspace".to_string()),
+            },
+        );
+        state_machine.control_state.apply(&completed);
+        let prune = command(
+            3,
+            100,
+            ControlCommandRequest::PruneDedup {
+                completed_before_unix_ms: 50,
+            },
+        );
+        state_machine.control_state.apply(&prune);
+
+        for revision in 1..=32 {
+            state_machine.control_state.revision = revision;
+            state_machine.build_snapshot().await.unwrap();
+            let current = state_machine.get_current_snapshot().await.unwrap().unwrap();
+            let envelope = decode_snapshot_envelope(current.snapshot.get_ref()).unwrap();
+            let restored = ControlState::decode_snapshot(&envelope.control_bytes).unwrap();
+            assert_eq!(restored.revision, revision);
+            state_machine.control_state = restored;
+        }
+        let snapshot_count = fs::read_dir(&state_machine.snapshot_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "snapshot")
+            })
+            .count();
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(
+            state_machine
+                .control_state
+                .apply(&completed)
+                .control_revision,
+            32,
+            "replayed completed command remains deduplicated after repeated snapshots"
+        );
     }
 
     #[test]
