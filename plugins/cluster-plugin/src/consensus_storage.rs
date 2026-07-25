@@ -474,16 +474,20 @@ impl ConsensusStateMachine {
         cluster_id: &str,
         snapshot_dir: PathBuf,
     ) -> Result<Self, ConsensusStorageError> {
-        let control_state = read_optional_bytes(
+        let (control_state, control_migrated) = read_optional_bytes(
             &database,
             STATE_MACHINE_TABLE,
             STATE_MACHINE_CONTROL,
             |bytes| {
-                ControlState::decode_snapshot(bytes)
-                    .map_err(|_| ConsensusStorageError::CorruptRecord("control state"))
+                let state = ControlState::decode_snapshot(bytes)
+                    .map_err(|_| ConsensusStorageError::CorruptRecord("control state"))?;
+                let canonical = state
+                    .encode_snapshot()
+                    .map_err(|_| ConsensusStorageError::CorruptRecord("control state encoding"))?;
+                Ok((state, canonical != bytes))
             },
         )?
-        .unwrap_or_else(|| ControlState::new(cluster_id));
+        .unwrap_or_else(|| (ControlState::new(cluster_id), false));
         if control_state.cluster_id != cluster_id {
             return Err(ConsensusStorageError::ClusterIdMismatch {
                 expected: cluster_id.to_owned(),
@@ -512,6 +516,10 @@ impl ConsensusStateMachine {
             last_membership,
         };
         state_machine.validate_active_snapshot()?;
+        if control_migrated {
+            let prepared = state_machine.prepared_state_machine()?;
+            Self::persist_prepared(&state_machine.database, &prepared)?;
+        }
         Ok(state_machine)
     }
 
@@ -590,6 +598,24 @@ impl ConsensusStateMachine {
         let envelope = decode_snapshot_envelope(&bytes)?;
         if envelope.snapshot_id != snapshot_id || envelope.cluster_id != self.cluster_id {
             return Err(ConsensusStorageError::CorruptRecord("snapshot metadata"));
+        }
+        let control = ControlState::decode_snapshot(&envelope.control_bytes)
+            .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot control state"))?;
+        let canonical_control = control
+            .encode_snapshot()
+            .map_err(|_| ConsensusStorageError::CorruptRecord("control state encoding"))?;
+        if canonical_control != envelope.control_bytes {
+            Self::publish_snapshot(
+                &self.database,
+                &self.snapshot_dir,
+                &SnapshotMeta {
+                    last_log_id: envelope.last_log_id,
+                    last_membership: envelope.last_membership,
+                    snapshot_id: envelope.snapshot_id,
+                },
+                &self.cluster_id,
+                &canonical_control,
+            )?;
         }
         remove_inactive_snapshots(&self.snapshot_dir, &path)?;
         Ok(())
@@ -2295,6 +2321,54 @@ mod tests {
             ConsensusLogStore::open(root.path(), "cluster-a"),
             Err(ConsensusStorageError::ClusterIdMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn startup_rewrites_legacy_control_snapshot_idempotently() {
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let current = ControlState::new("cluster-a").encode_snapshot().unwrap();
+        let mut legacy = Vec::with_capacity(current.len() - 4);
+        legacy.extend_from_slice(b"BMSTA001");
+        legacy.extend_from_slice(&current[12..]);
+        immediate_write(&store.database, |transaction| {
+            transaction
+                .open_table(STATE_MACHINE_TABLE)?
+                .insert(STATE_MACHINE_CONTROL, legacy.as_slice())?;
+            Ok(())
+        })
+        .unwrap();
+        drop(store);
+
+        let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let state_machine = reopened.state_machine().unwrap();
+        assert_eq!(
+            state_machine.control_state(),
+            &ControlState::new("cluster-a")
+        );
+        let migrated = read_optional_bytes(
+            &reopened.database,
+            STATE_MACHINE_TABLE,
+            STATE_MACHINE_CONTROL,
+            |bytes| Ok(bytes.to_vec()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&migrated[..8], b"BMSTA002");
+        drop(state_machine);
+        drop(reopened);
+
+        let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let _ = reopened.state_machine().unwrap();
+        let unchanged = read_optional_bytes(
+            &reopened.database,
+            STATE_MACHINE_TABLE,
+            STATE_MACHINE_CONTROL,
+            |bytes| Ok(bytes.to_vec()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unchanged, migrated);
     }
 
     #[tokio::test]

@@ -10,8 +10,12 @@ use bmux_cluster_plugin_api::cluster_types::{
 use control_state_codec::{decode_snapshot, encode_snapshot};
 use std::collections::BTreeMap;
 
-const CONTROL_SCHEMA_VERSION: u16 = 1;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA001";
+pub const CONTROL_SCHEMA_VERSION: u16 = 1;
+pub const CONTROL_CODEC_VERSION: u16 = 1;
+const SNAPSHOT_FORMAT_VERSION: u16 = 2;
+const LEGACY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA002";
+const LEGACY_SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA001";
 const MAX_SNAPSHOT_ITEMS: usize = 1_000_000;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -19,6 +23,8 @@ const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 pub enum StateCodecError {
     Truncated,
     InvalidMagic,
+    UnsupportedSnapshotFormat(u16),
+    UnsupportedCodec(u16),
     UnsupportedSchema(u16),
     InvalidUtf8,
     InvalidBoolean(u8),
@@ -32,6 +38,12 @@ impl std::fmt::Display for StateCodecError {
         match self {
             Self::Truncated => formatter.write_str("control snapshot is truncated"),
             Self::InvalidMagic => formatter.write_str("control snapshot magic is invalid"),
+            Self::UnsupportedSnapshotFormat(version) => {
+                write!(formatter, "unsupported control snapshot format {version}")
+            }
+            Self::UnsupportedCodec(version) => {
+                write!(formatter, "unsupported control codec version {version}")
+            }
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported control snapshot schema {version}")
             }
@@ -952,6 +964,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_snapshot_migrates_idempotently_to_current_format() {
+        let mut state = ControlState::new("cluster:test");
+        setup_pane(&mut state);
+        let current = state.encode_snapshot().unwrap();
+        let mut legacy = Vec::with_capacity(current.len() - 4);
+        legacy.extend_from_slice(LEGACY_SNAPSHOT_MAGIC);
+        legacy.extend_from_slice(&current[12..]);
+
+        let migrated = ControlState::decode_snapshot(&legacy).unwrap();
+        assert_eq!(migrated, state);
+        let canonical = migrated.encode_snapshot().unwrap();
+        assert_eq!(&canonical[..8], SNAPSHOT_MAGIC);
+        assert_eq!(ControlState::decode_snapshot(&canonical).unwrap(), migrated);
+        assert_eq!(
+            ControlState::decode_snapshot(&canonical)
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
     fn snapshot_rejects_truncation_trailing_bytes_and_future_schema() {
         let state = ControlState::new("cluster:test");
         let bytes = state.encode_snapshot().unwrap();
@@ -965,8 +1000,20 @@ mod tests {
             ControlState::decode_snapshot(&trailing),
             Err(StateCodecError::TrailingBytes)
         );
+        let mut future_format = bytes.clone();
+        future_format[8..10].copy_from_slice(&3_u16.to_be_bytes());
+        assert_eq!(
+            ControlState::decode_snapshot(&future_format),
+            Err(StateCodecError::UnsupportedSnapshotFormat(3))
+        );
+        let mut future_codec = bytes.clone();
+        future_codec[10..12].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(
+            ControlState::decode_snapshot(&future_codec),
+            Err(StateCodecError::UnsupportedCodec(2))
+        );
         let mut future = bytes;
-        future[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        future[12..14].copy_from_slice(&2_u16.to_be_bytes());
         assert_eq!(
             ControlState::decode_snapshot(&future),
             Err(StateCodecError::UnsupportedSchema(2))

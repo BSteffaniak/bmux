@@ -6,8 +6,9 @@ use bmux_cluster_plugin_api::cluster_types::{
 };
 
 use super::{
-    CONTROL_SCHEMA_VERSION, ControlState, DedupKey, DedupRecord, MAX_SNAPSHOT_BYTES,
-    MAX_SNAPSHOT_ITEMS, SNAPSHOT_MAGIC, StateCodecError,
+    CONTROL_CODEC_VERSION, CONTROL_SCHEMA_VERSION, ControlState, DedupKey, DedupRecord,
+    LEGACY_SNAPSHOT_FORMAT_VERSION, LEGACY_SNAPSHOT_MAGIC, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_ITEMS,
+    SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC, StateCodecError,
 };
 
 impl From<CodecError> for StateCodecError {
@@ -31,6 +32,8 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
     }
     let mut writer = Writer::default();
     writer.raw(SNAPSHOT_MAGIC);
+    writer.u16(SNAPSHOT_FORMAT_VERSION);
+    writer.u16(CONTROL_CODEC_VERSION);
     writer.u16(state.schema_version);
     writer.string(&state.cluster_id);
     writer.u64(state.revision);
@@ -92,10 +95,22 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
         return Err(StateCodecError::LimitExceeded("bytes"));
     }
     let mut reader = Reader::new(bytes);
-    if reader.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
+    let magic = reader.take(SNAPSHOT_MAGIC.len())?;
+    let schema_version = if magic == SNAPSHOT_MAGIC {
+        let format_version = reader.u16()?;
+        if format_version != SNAPSHOT_FORMAT_VERSION {
+            return Err(StateCodecError::UnsupportedSnapshotFormat(format_version));
+        }
+        let codec_version = reader.u16()?;
+        if codec_version != CONTROL_CODEC_VERSION {
+            return Err(StateCodecError::UnsupportedCodec(codec_version));
+        }
+        reader.u16()?
+    } else if magic == LEGACY_SNAPSHOT_MAGIC {
+        migrate_legacy_snapshot_header(&mut reader, LEGACY_SNAPSHOT_FORMAT_VERSION)?
+    } else {
         return Err(StateCodecError::InvalidMagic);
-    }
-    let schema_version = reader.u16()?;
+    };
     if schema_version != CONTROL_SCHEMA_VERSION {
         return Err(StateCodecError::UnsupportedSchema(schema_version));
     }
@@ -173,6 +188,16 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
     };
     validate_references(&state)?;
     Ok(state)
+}
+
+fn migrate_legacy_snapshot_header(
+    reader: &mut Reader<'_>,
+    format_version: u16,
+) -> Result<u16, StateCodecError> {
+    match format_version {
+        LEGACY_SNAPSHOT_FORMAT_VERSION => Ok(reader.u16()?),
+        version => Err(StateCodecError::UnsupportedSnapshotFormat(version)),
+    }
 }
 
 fn write_count(writer: &mut Writer, count: usize) -> Result<(), StateCodecError> {
