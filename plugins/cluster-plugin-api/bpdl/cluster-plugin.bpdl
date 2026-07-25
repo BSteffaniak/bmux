@@ -481,6 +481,19 @@ interface cluster-types {
         authenticated_at_unix_ms: u64,
     }
 
+    enum consensus-voter-change-action {
+        add,
+        remove,
+    }
+
+    record consensus-voter-change-authorization {
+        cluster_id: string,
+        action: consensus-voter-change-action,
+        target_node_id: string,
+        actor_node_id: string,
+        signature: bytes,
+    }
+
     record cluster-leave-request {
         leave_id: string,
         issuer_endpoint: string?,
@@ -587,6 +600,10 @@ interface cluster-command {
     command credential_rotate_accept(request: cluster-types.credential-rotation-request) -> cluster-types.member-credential-result;
     command credential_rotate_commit(member: cluster-types.cluster-member) -> cluster-types.member-credential-result;
     command member_revoke(node_id: string) -> cluster-types.member-credential-result;
+    // Reconcile a prospective signed membership snapshot before publishing it.
+    command consensus_reconcile_members(members: list<cluster-types.cluster-member>, authorization: cluster-types.consensus-voter-change-authorization) -> cluster-types.cluster-member-list;
+    // Safely remove one current voter before publishing leave/revocation state.
+    command consensus_remove_voter(authorization: cluster-types.consensus-voter-change-authorization) -> cluster-types.cluster-member-list;
     command join(token: string, issuer: string, enrollment_result: cluster-types.cluster-join-result) -> cluster-types.cluster-join-result;
     command redeem_enrollment(token: string, node_id: string, public_key: string, endpoint: string?, protocol: cluster-types.cluster-protocol-offer, possession_signature: bytes) -> cluster-types.cluster-join-result;
     command leave_prepare() -> cluster-types.cluster-leave-request;

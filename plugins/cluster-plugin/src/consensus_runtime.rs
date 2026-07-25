@@ -230,6 +230,11 @@ impl ConsensusNode {
     /// voter transition. Every requested voter must have an authenticated
     /// endpoint address.
     ///
+    /// The transition intentionally retains removed servers as learners so
+    /// leave/revoke can first commit the safe voter-set change and then commit
+    /// the replicated member-state update without making either step depend on
+    /// an already-removed voter.
+    ///
     /// # Errors
     ///
     /// Returns leader, quorum, membership, or fatal runtime failures.
@@ -237,7 +242,19 @@ impl ConsensusNode {
         &self,
         voters: std::collections::BTreeMap<NodeId, BasicNode>,
     ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
-        if voters.is_empty() {
+        let authenticated = voters
+            .into_iter()
+            .map(|(node_id, node)| {
+                if node.addr.trim().is_empty() {
+                    Err(ConsensusWriteError::Membership(format!(
+                        "consensus voter {node_id} has no authenticated endpoint"
+                    )))
+                } else {
+                    Ok((node_id, node))
+                }
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        if authenticated.is_empty() {
             return Err(ConsensusWriteError::Membership(
                 "consensus voter set cannot be empty".to_string(),
             ));
@@ -254,11 +271,11 @@ impl ConsensusNode {
                 return Err(ConsensusWriteError::QuorumUnavailable(error.to_string()));
             }
         }
-        let voter_ids = voters
+        let voter_ids = authenticated
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        for (node_id, node) in voters {
+        for (node_id, node) in authenticated {
             self.raft
                 .add_learner(node_id, node, true)
                 .await

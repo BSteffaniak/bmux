@@ -443,7 +443,7 @@ where
         bmux_cluster_plugin_api::cluster_control_command::client::mutate(&mut remote, request)
             .await
             .map_err(|error| ControlServiceError::RuntimeUnavailable {
-                reason: format!("leader forwarding failed: {error}"),
+                reason: format!("leader forwarding failed before a response was received; retry the same CommandId: {error}"),
             })?
     }
 

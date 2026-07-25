@@ -63,6 +63,7 @@ use uuid::Uuid;
 type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
 
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
+const MAX_NODE_OUTPUT_BUFFER_BYTES: usize = 256 * 1_048_576;
 #[cfg(test)]
 const MAX_TERMINAL_GRID_DELTA_BATCHES: usize = 1_024;
 #[cfg(test)]
@@ -451,6 +452,7 @@ struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
     pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
     client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
+    retained_output_bytes: Arc<AtomicUsize>,
     shell: String,
     pane_term: String,
     protocol_profile: ProtocolProfile,
@@ -2067,6 +2069,7 @@ struct OutputFanoutBuffer {
     start_offset: u64,
     data: VecDeque<u8>,
     cursors: BTreeMap<ClientId, u64>,
+    retained_output_bytes: Arc<AtomicUsize>,
     /// Running escape-sequence phase at the end of the buffer.
     esc_phase: EscSeqPhase,
     /// Escape-sequence spans: `(esc_start, safe_resume)` pairs where
@@ -2084,13 +2087,26 @@ struct OutputRead {
     stream_gap: bool,
 }
 
+impl Drop for OutputFanoutBuffer {
+    fn drop(&mut self) {
+        self.retained_output_bytes
+            .fetch_sub(self.data.len(), Ordering::SeqCst);
+    }
+}
+
 impl OutputFanoutBuffer {
+    #[cfg(test)]
     fn new(max_bytes: usize) -> Self {
+        Self::with_accounting(max_bytes, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn with_accounting(max_bytes: usize, retained_output_bytes: Arc<AtomicUsize>) -> Self {
         Self {
             max_bytes: max_bytes.max(1),
             start_offset: 0,
             data: VecDeque::new(),
             cursors: BTreeMap::new(),
+            retained_output_bytes,
             esc_phase: EscSeqPhase::Ground,
             esc_spans: VecDeque::new(),
         }
@@ -2114,7 +2130,13 @@ impl OutputFanoutBuffer {
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) {
+        self.push_chunk_with_node_cap(chunk, MAX_NODE_OUTPUT_BUFFER_BYTES);
+    }
+
+    fn push_chunk_with_node_cap(&mut self, chunk: &[u8], node_max_bytes: usize) {
         let base_offset = self.end_offset();
+        self.retained_output_bytes
+            .fetch_add(chunk.len(), Ordering::SeqCst);
         self.data.extend(chunk.iter().copied());
 
         // Track escape-sequence phase for every byte.  Record spans
@@ -2144,8 +2166,13 @@ impl OutputFanoutBuffer {
             }
         }
 
-        while self.data.len() > self.max_bytes {
-            let _ = self.data.pop_front();
+        while self.data.len() > self.max_bytes
+            || self.retained_output_bytes.load(Ordering::SeqCst) > node_max_bytes
+        {
+            if self.data.pop_front().is_none() {
+                break;
+            }
+            self.retained_output_bytes.fetch_sub(1, Ordering::SeqCst);
             self.start_offset = self.start_offset.saturating_add(1);
         }
 
@@ -2996,6 +3023,7 @@ impl SessionRuntimeManager {
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell,
             pane_term,
             protocol_profile,
@@ -3174,8 +3202,9 @@ impl SessionRuntimeManager {
         }
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<PaneRuntimeCommand>();
-        let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
+        let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::with_accounting(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
+            Arc::clone(&self.retained_output_bytes),
         )));
         let (initial_rows, initial_cols) = sanitize_pty_size(initial_size.0, initial_size.1);
         let terminal_grid = Arc::new(std::sync::Mutex::new(
@@ -7190,6 +7219,7 @@ mod tests {
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7312,6 +7342,7 @@ mod tests {
             ]),
             pane_input_index,
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7651,6 +7682,7 @@ mod tests {
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7707,6 +7739,7 @@ mod tests {
             ]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7755,6 +7788,7 @@ mod tests {
             ]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7792,6 +7826,7 @@ mod tests {
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7836,6 +7871,7 @@ mod tests {
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -7872,6 +7908,7 @@ mod tests {
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -8592,6 +8629,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(capture).unwrap(), "-INT\n--\n-42\n");
+    }
+
+    #[test]
+    fn node_wide_output_cap_accounts_and_evicts_across_buffers() {
+        let retained = Arc::new(AtomicUsize::new(0));
+        let mut first = OutputFanoutBuffer::with_accounting(usize::MAX, Arc::clone(&retained));
+        let mut second = OutputFanoutBuffer::with_accounting(usize::MAX, Arc::clone(&retained));
+        first.push_chunk_with_node_cap(b"abcd", 4);
+        assert_eq!(retained.load(Ordering::SeqCst), 4);
+        second.push_chunk_with_node_cap(b"bc", 4);
+        assert_eq!(retained.load(Ordering::SeqCst), 4);
+        assert!(second.read_at(0, 2).stream_gap);
+        assert_eq!(second.start_offset, 2);
+        drop(first);
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
     }
 
     #[test]

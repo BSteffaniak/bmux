@@ -13,6 +13,7 @@ use tempfile::TempDir;
 struct ForwardingCaller {
     leader: Mutex<Option<Arc<ControlServiceHandle<Self>>>>,
     forwarded: Mutex<Vec<String>>,
+    drop_next_mutation_response: std::sync::atomic::AtomicBool,
 }
 
 impl ForwardingCaller {
@@ -67,6 +68,14 @@ impl ServiceCaller for ForwardingCaller {
                 let response = tokio::task::block_in_place(|| {
                     runtime.block_on(leader.mutate(request.request))
                 });
+                if self
+                    .drop_next_mutation_response
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(PluginError::UnsupportedHostOperation {
+                        operation: "injected response loss",
+                    });
+                }
                 bmux_plugin_sdk::encode_service_message(&response)?
             }
             ("cluster-control-state/v1", "read_linearizable") => {
@@ -177,6 +186,18 @@ async fn follower_forwards_mutations_and_linearizable_reads_once() {
     let follower_service = ControlServiceHandle::new(caller.clone(), follower_id, registry);
 
     follower_service.mutate(command(1, 100)).await.unwrap();
+    caller
+        .drop_next_mutation_response
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let lost = follower_service.mutate(command(2, 200)).await.unwrap_err();
+    assert!(matches!(
+        lost,
+        bmux_cluster_plugin_api::cluster_types::ControlServiceError::RuntimeUnavailable {
+            reason
+        } if reason.contains("retry the same CommandId")
+    ));
+    let replay = follower_service.mutate(command(2, 200)).await.unwrap();
+    assert_eq!(replay.command_id.value, uuid::Uuid::from_u128(2));
     let view = follower_service.read_linearizable().await.unwrap();
     assert_eq!(view.consistency, ControlReadConsistency::Linearizable);
     assert!(
@@ -184,9 +205,16 @@ async fn follower_forwards_mutations_and_linearizable_reads_once() {
             .iter()
             .any(|workspace| workspace.workspace_id.value == uuid::Uuid::from_u128(100))
     );
+    assert!(
+        view.workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id.value == uuid::Uuid::from_u128(200))
+    );
     assert_eq!(
         *caller.forwarded.lock().unwrap(),
         vec![
+            "cluster-control-command/v1/mutate".to_string(),
+            "cluster-control-command/v1/mutate".to_string(),
             "cluster-control-command/v1/mutate".to_string(),
             "cluster-control-state/v1/read_linearizable".to_string(),
         ]

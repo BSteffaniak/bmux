@@ -1019,7 +1019,7 @@ fn verify_enrollment_possession(
         .map_err(|_| "joining node possession proof verification failed".to_string())
 }
 
-fn issue_membership_credential(
+pub fn issue_membership_credential(
     issuer: &NodeIdentity,
     cluster_id: ClusterId,
     node_id: String,
@@ -1403,6 +1403,11 @@ pub fn revoke_member(
         .members
         .get_mut(&node_id)
         .ok_or_else(|| "member is unknown".to_string())?;
+    if member.state == ClusterMemberState::Revoked {
+        return Ok(MemberCredentialResult {
+            member: member.clone(),
+        });
+    }
     if member.state == ClusterMemberState::Left {
         return Err("left member cannot be revoked".to_string());
     }

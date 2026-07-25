@@ -4,6 +4,7 @@
 #![allow(clippy::wildcard_imports)] // Focused private modules expose a crate-internal domain facade.
 
 pub(crate) mod commands;
+pub mod consensus_membership;
 pub mod consensus_network;
 pub mod consensus_runtime;
 pub mod consensus_storage;
@@ -432,6 +433,83 @@ fn is_cluster_lifecycle_service(context: &NativeServiceContext) -> bool {
     )
 }
 
+fn reconcile_consensus_members(
+    ctx: &NativeServiceContext,
+    req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest,
+) -> Result<ClusterMemberList, String> {
+    let current = list_members(ctx)?;
+    let cluster_id = current
+        .cluster_id
+        .as_deref()
+        .ok_or_else(|| "cluster membership is not initialized".to_string())?;
+    let target = req
+        .members
+        .iter()
+        .find(|member| {
+            member.state == ClusterMemberState::Active
+                && member.capabilities.consensus_role == ClusterConsensusRole::Voter
+                && !current.members.iter().any(|existing| {
+                    existing.node_id == member.node_id
+                        && existing.state == ClusterMemberState::Active
+                        && existing.capabilities.consensus_role == ClusterConsensusRole::Voter
+                })
+        })
+        .ok_or_else(|| "membership transition does not add a voter".to_string())?;
+    consensus_membership::verify_voter_change_authorization(
+        &req.authorization,
+        cluster_id,
+        bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Add,
+        target.node_id.parse::<NodeId>()?,
+        &current.members,
+    )?;
+    consensus_membership::validate_membership_transition(&current.members, &req.members)?;
+    let identity = load_or_create_node_identity(ctx)?;
+    let nodes = consensus_network::global_consensus_nodes();
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("consensus reconciliation requires the host runtime: {error}"))?;
+    tokio::task::block_in_place(|| {
+        handle.block_on(consensus_membership::reconcile_members(
+            req.members,
+            *identity.node_id(),
+            &nodes,
+        ))
+    })?;
+    list_members(ctx)
+}
+
+fn remove_consensus_voter(
+    ctx: &NativeServiceContext,
+    req: &bmux_cluster_plugin_api::cluster_command::client::ConsensusRemoveVoterRequest,
+) -> Result<ClusterMemberList, String> {
+    let identity = load_or_create_node_identity(ctx)?;
+    let remove_node_id = req.authorization.target_node_id.parse::<NodeId>()?;
+    let membership = list_members(ctx)?;
+    let cluster_id = membership
+        .cluster_id
+        .as_deref()
+        .ok_or_else(|| "cluster membership is not initialized".to_string())?;
+    consensus_membership::verify_voter_change_authorization(
+        &req.authorization,
+        cluster_id,
+        bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction::Remove,
+        remove_node_id,
+        &membership.members,
+    )?;
+    let nodes = consensus_network::global_consensus_nodes();
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("consensus voter removal requires the host runtime: {error}"))?;
+    tokio::task::block_in_place(|| {
+        handle.block_on(consensus_membership::remove_voter(
+            membership.members,
+            remove_node_id,
+            *identity.node_id(),
+            &nodes,
+        ))
+    })?;
+    list_members(ctx)
+}
+
+#[allow(clippy::too_many_lines)]
 fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "cluster-command/v1", "join" => |req: ClusterCommandJoinRequest, ctx| {
@@ -479,6 +557,14 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
         "cluster-command/v1", "member_revoke" => |req: ClusterCommandMemberRevokeRequest, ctx| {
             revoke_member(ctx, &req.node_id)
                 .map_err(|error| ServiceResponse::error("member_revoke_failed", error))
+        },
+        "cluster-command/v1", "consensus_reconcile_members" => |req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest, ctx| {
+            reconcile_consensus_members(ctx, req)
+                .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))
+        },
+        "cluster-command/v1", "consensus_remove_voter" => |req: bmux_cluster_plugin_api::cluster_command::client::ConsensusRemoveVoterRequest, ctx| {
+            remove_consensus_voter(ctx, &req)
+                .map_err(|error| ServiceResponse::error("consensus_remove_voter_failed", error))
         },
         "cluster-command/v1", "redeem_enrollment" => |req: ClusterCommandRedeemEnrollmentRequest, ctx| {
             redeem_enrollment(ctx, &req)
@@ -1146,6 +1232,10 @@ mod tests {
             .unwrap()
             .member;
         assert_eq!(revoked.state, ClusterMemberState::Revoked);
+        let retried = revoke_member(&issuer, &joiner_identity.node_id().to_string())
+            .unwrap()
+            .member;
+        assert_eq!(retried, revoked);
         assert!(
             create_peer_auth_challenge(
                 &issuer,
