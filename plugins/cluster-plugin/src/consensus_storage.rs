@@ -24,6 +24,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 const STORAGE_BLOCKING_CONCURRENCY: usize = 4;
+#[cfg(test)]
+const TEST_CRASH_EXIT_CODE: i32 = 86;
+
+#[cfg(test)]
+fn test_crash_point(point: &str) {
+    if std::env::var("BMUX_CONSENSUS_CRASH_POINT").as_deref() == Ok(point) {
+        std::process::exit(TEST_CRASH_EXIT_CODE);
+    }
+}
+
+#[cfg(not(test))]
+const fn test_crash_point(_point: &str) {}
 
 fn storage_blocking_permits() -> &'static Arc<tokio::sync::Semaphore> {
     static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -329,6 +341,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         .await;
         match result {
             Ok(()) => {
+                test_crash_point("log-append-after-commit");
                 callback.log_io_completed(Ok(()));
                 Ok(())
             }
@@ -499,8 +512,10 @@ impl ConsensusStateMachine {
         let final_path = snapshot_path(snapshot_dir, &meta.snapshot_id)?;
         let tmp_path = snapshot_dir.join(format!("{}.tmp", meta.snapshot_id));
         write_snapshot_file(&tmp_path, &envelope)?;
+        test_crash_point("snapshot-after-tmp-sync");
         fs::rename(&tmp_path, &final_path)?;
         sync_directory(snapshot_dir)?;
+        test_crash_point("snapshot-after-rename-sync");
         let checksum = snapshot_checksum(&envelope);
         immediate_write(database, |transaction| {
             let mut table = transaction.open_table(META_TABLE)?;
@@ -508,6 +523,7 @@ impl ConsensusStateMachine {
             table.insert(META_ACTIVE_SNAPSHOT_CHECKSUM, checksum.as_slice())?;
             Ok(())
         })?;
+        test_crash_point("snapshot-after-meta-commit");
         remove_inactive_snapshots(snapshot_dir, &final_path)?;
         Ok(envelope)
     }
@@ -551,6 +567,7 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
             Self::persist_prepared(&database, &prepared).map_err(storage_write_error)
         })
         .await?;
+        test_crash_point("state-machine-after-commit");
         *self = next;
         Ok(replies)
     }
@@ -1268,7 +1285,57 @@ mod tests {
     use super::*;
     use openraft::storage::RaftLogStorageExt;
     use openraft::{CommittedLeaderId, EntryPayload};
+    use std::process::Command;
     use tempfile::TempDir;
+
+    const CRASH_HELPER_TEST: &str = "consensus_storage::tests::consensus_storage_crash_helper";
+
+    fn run_crash_helper(root: &Path, mode: &str, point: &str) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(CRASH_HELPER_TEST)
+            .arg("--nocapture")
+            .env("BMUX_CONSENSUS_CRASH_HELPER_ROOT", root)
+            .env("BMUX_CONSENSUS_CRASH_HELPER_MODE", mode)
+            .env("BMUX_CONSENSUS_CRASH_POINT", point)
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn consensus_storage_crash_helper() {
+        let Ok(root) = std::env::var("BMUX_CONSENSUS_CRASH_HELPER_ROOT") else {
+            return;
+        };
+        let mode = std::env::var("BMUX_CONSENSUS_CRASH_HELPER_MODE").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ConsensusLogStore::open(Path::new(&root), "cluster-a").unwrap();
+            match mode.as_str() {
+                "append" => {
+                    store
+                        .blocking_append([entry(7, 1, b"committed")])
+                        .await
+                        .unwrap();
+                }
+                "state-machine" => {
+                    let mut state_machine = store.state_machine().unwrap();
+                    state_machine
+                        .apply([Entry {
+                            log_id: log_id(7, 1),
+                            payload: EntryPayload::Blank,
+                        }])
+                        .await
+                        .unwrap();
+                }
+                "snapshot" => {
+                    let mut state_machine = store.state_machine().unwrap();
+                    state_machine.build_snapshot().await.unwrap();
+                }
+                other => panic!("unknown crash-helper mode {other}"),
+            }
+        });
+    }
 
     struct SuiteBuilder;
 
@@ -1312,6 +1379,64 @@ mod tests {
             log_id: log_id(term, index),
             payload: EntryPayload::Normal(ControlRequest(value.to_vec())),
         }
+    }
+
+    #[test]
+    fn durable_commit_survives_process_exit_before_acknowledgement() {
+        let root = TempDir::new().unwrap();
+        let status = run_crash_helper(root.path(), "append", "log-append-after-commit");
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+            assert_eq!(
+                reopened.try_get_log_entries(..).await.unwrap(),
+                vec![entry(7, 1, b"committed")]
+            );
+        });
+
+        let state_root = TempDir::new().unwrap();
+        let status = run_crash_helper(
+            state_root.path(),
+            "state-machine",
+            "state-machine-after-commit",
+        );
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let reopened = ConsensusLogStore::open(state_root.path(), "cluster-a").unwrap();
+        let mut state_machine = reopened.state_machine().unwrap();
+        let (last_applied, _) = runtime.block_on(state_machine.applied_state()).unwrap();
+        assert_eq!(last_applied, Some(log_id(7, 1)));
+    }
+
+    #[test]
+    fn interrupted_snapshot_publication_recovers_only_committed_state() {
+        for point in ["snapshot-after-tmp-sync", "snapshot-after-rename-sync"] {
+            let root = TempDir::new().unwrap();
+            let status = run_crash_helper(root.path(), "snapshot", point);
+            assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+            let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut state_machine = reopened.state_machine().unwrap();
+            assert!(
+                runtime
+                    .block_on(state_machine.get_current_snapshot())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let root = TempDir::new().unwrap();
+        let status = run_crash_helper(root.path(), "snapshot", "snapshot-after-meta-commit");
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut state_machine = reopened.state_machine().unwrap();
+        assert!(
+            runtime
+                .block_on(state_machine.get_current_snapshot())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1620,6 +1745,91 @@ mod tests {
             decode_entry(&corrupt),
             Err(ConsensusStorageError::CorruptRecord("log entry"))
         ));
+    }
+
+    #[test]
+    fn corrupt_vote_log_and_state_machine_records_fail_closed() {
+        let root = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        runtime.block_on(store.save_vote(&Vote::new(2, 1))).unwrap();
+        runtime
+            .block_on(store.blocking_append([entry(2, 1, b"entry")]))
+            .unwrap();
+        let mut state_machine = store.state_machine().unwrap();
+        runtime
+            .block_on(state_machine.apply([Entry {
+                log_id: log_id(2, 1),
+                payload: EntryPayload::Blank,
+            }]))
+            .unwrap();
+
+        immediate_write(&store.database, |transaction| {
+            transaction
+                .open_table(HARD_STATE_TABLE)?
+                .insert(HARD_STATE_VOTE, b"bad".as_slice())?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(ConsensusLogStore::read_vote(&store).is_err());
+
+        immediate_write(&store.database, |transaction| {
+            transaction
+                .open_table(LOG_TABLE)?
+                .insert(1, b"bad".as_slice())?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(runtime.block_on(store.try_get_log_entries(..)).is_err());
+
+        for key in [
+            STATE_MACHINE_CONTROL,
+            STATE_MACHINE_MEMBERSHIP,
+            STATE_MACHINE_LAST_APPLIED,
+        ] {
+            let clean_root = TempDir::new().unwrap();
+            let clean_store = ConsensusLogStore::open(clean_root.path(), "cluster-a").unwrap();
+            let mut clean_state = clean_store.state_machine().unwrap();
+            runtime
+                .block_on(clean_state.apply([Entry {
+                    log_id: log_id(3, 1),
+                    payload: EntryPayload::Blank,
+                }]))
+                .unwrap();
+            immediate_write(&clean_store.database, |transaction| {
+                transaction
+                    .open_table(STATE_MACHINE_TABLE)?
+                    .insert(key, b"bad".as_slice())?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(matches!(
+                clean_store.state_machine(),
+                Err(ConsensusStorageError::CorruptRecord(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn incomplete_or_corrupt_snapshot_metadata_fails_closed() {
+        for (key, value) in [
+            (META_ACTIVE_SNAPSHOT_ID, b"missing".as_slice()),
+            (META_ACTIVE_SNAPSHOT_CHECKSUM, b"bad".as_slice()),
+        ] {
+            let root = TempDir::new().unwrap();
+            let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+            immediate_write(&store.database, |transaction| {
+                transaction.open_table(META_TABLE)?.insert(key, value)?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(matches!(
+                store.state_machine(),
+                Err(ConsensusStorageError::CorruptRecord(
+                    "snapshot metadata" | "snapshot checksum"
+                ))
+            ));
+        }
     }
 
     #[test]
