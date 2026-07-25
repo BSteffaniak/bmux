@@ -76,6 +76,7 @@ const STATE_MACHINE_MEMBERSHIP: &str = "last_membership";
 const STATE_MACHINE_CONTROL: &str = "control_state";
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const MAX_SNAPSHOT_FILE_BYTES: usize = 300 * 1024 * 1024;
+const SNAPSHOT_INSTALL_MANIFEST: &str = "snapshot-install.manifest";
 
 struct SnapshotEnvelope {
     cluster_id: String,
@@ -89,6 +90,11 @@ struct PreparedStateMachine {
     control: Vec<u8>,
     membership: Vec<u8>,
     last_applied: Option<Vec<u8>>,
+}
+
+struct SnapshotInstallManifest {
+    snapshot_id: String,
+    checksum: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,9 +188,11 @@ impl ConsensusLogStore {
             .join("consensus")
             .join(cluster_id);
         fs::create_dir_all(directory.join("snapshots"))?;
+        recover_snapshot_publication(&directory)?;
         let database_path = directory.join(CONSENSUS_DB_FILE);
         let database = Arc::new(Database::create(&database_path).map_err(redb::Error::from)?);
         initialize_metadata(&database, cluster_id)?;
+        reconcile_snapshot_manifest(&directory, &database)?;
         Ok(Self {
             database,
             database_path,
@@ -511,6 +519,15 @@ impl ConsensusStateMachine {
         fs::create_dir_all(snapshot_dir)?;
         let final_path = snapshot_path(snapshot_dir, &meta.snapshot_id)?;
         let tmp_path = snapshot_dir.join(format!("{}.tmp", meta.snapshot_id));
+        let directory = snapshot_dir
+            .parent()
+            .ok_or(ConsensusStorageError::CorruptRecord("snapshot directory"))?;
+        let manifest = SnapshotInstallManifest {
+            snapshot_id: meta.snapshot_id.clone(),
+            checksum: snapshot_checksum(&envelope),
+        };
+        write_snapshot_manifest(directory, &manifest)?;
+        test_crash_point("snapshot-after-manifest-sync");
         write_snapshot_file(&tmp_path, &envelope)?;
         test_crash_point("snapshot-after-tmp-sync");
         fs::rename(&tmp_path, &final_path)?;
@@ -524,6 +541,8 @@ impl ConsensusStateMachine {
             Ok(())
         })?;
         test_crash_point("snapshot-after-meta-commit");
+        remove_snapshot_manifest(directory)?;
+        test_crash_point("snapshot-after-manifest-remove");
         remove_inactive_snapshots(snapshot_dir, &final_path)?;
         Ok(envelope)
     }
@@ -793,6 +812,97 @@ fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusS
     })
 }
 
+fn encode_snapshot_install_manifest(
+    manifest: &SnapshotInstallManifest,
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    validate_snapshot_id(&manifest.snapshot_id)?;
+    let mut writer = DurableWriter::new(*b"BMSIM001");
+    writer.u16(1);
+    writer.bytes(manifest.snapshot_id.as_bytes())?;
+    writer.bytes(&manifest.checksum)?;
+    Ok(writer.finish())
+}
+
+fn decode_snapshot_install_manifest(
+    bytes: &[u8],
+) -> Result<SnapshotInstallManifest, ConsensusStorageError> {
+    let mut reader = DurableReader::new(bytes, *b"BMSIM001", "snapshot manifest")?;
+    if reader.u16()? != 1 {
+        return Err(ConsensusStorageError::CorruptRecord(
+            "snapshot manifest version",
+        ));
+    }
+    let snapshot_id = String::from_utf8(reader.bytes()?)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot manifest ID"))?;
+    validate_snapshot_id(&snapshot_id)?;
+    let checksum = reader
+        .bytes()?
+        .try_into()
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot manifest checksum"))?;
+    reader.finish()?;
+    Ok(SnapshotInstallManifest {
+        snapshot_id,
+        checksum,
+    })
+}
+
+fn write_snapshot_manifest(
+    directory: &Path,
+    manifest: &SnapshotInstallManifest,
+) -> Result<(), ConsensusStorageError> {
+    let final_path = directory.join(SNAPSHOT_INSTALL_MANIFEST);
+    let tmp_path = directory.join(format!("{SNAPSHOT_INSTALL_MANIFEST}.tmp"));
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path)?;
+    }
+    write_snapshot_file(&tmp_path, &encode_snapshot_install_manifest(manifest)?)?;
+    fs::rename(tmp_path, &final_path)?;
+    sync_directory(directory)
+}
+
+fn remove_snapshot_manifest(directory: &Path) -> Result<(), ConsensusStorageError> {
+    let path = directory.join(SNAPSHOT_INSTALL_MANIFEST);
+    if path.exists() {
+        fs::remove_file(path)?;
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn recover_snapshot_publication(directory: &Path) -> Result<(), ConsensusStorageError> {
+    let manifest_path = directory.join(SNAPSHOT_INSTALL_MANIFEST);
+    let temporary_manifest = directory.join(format!("{SNAPSHOT_INSTALL_MANIFEST}.tmp"));
+    if temporary_manifest.exists() {
+        fs::remove_file(temporary_manifest)?;
+        sync_directory(directory)?;
+    }
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let manifest = decode_snapshot_install_manifest(&read_snapshot_file(&manifest_path)?)?;
+    let snapshot_dir = directory.join("snapshots");
+    let final_path = snapshot_path(&snapshot_dir, &manifest.snapshot_id)?;
+    let tmp_path = snapshot_dir.join(format!("{}.tmp", manifest.snapshot_id));
+    if final_path.exists() {
+        let bytes = read_snapshot_file(&final_path)?;
+        if snapshot_checksum(&bytes) != manifest.checksum {
+            return Err(ConsensusStorageError::CorruptRecord(
+                "snapshot manifest checksum",
+            ));
+        }
+    } else if tmp_path.exists() {
+        let bytes = read_snapshot_file(&tmp_path)?;
+        if snapshot_checksum(&bytes) != manifest.checksum {
+            return Err(ConsensusStorageError::CorruptRecord(
+                "snapshot manifest checksum",
+            ));
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        sync_directory(&snapshot_dir)?;
+    }
+    Ok(())
+}
+
 fn write_snapshot_file(path: &Path, bytes: &[u8]) -> Result<(), ConsensusStorageError> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(bytes)?;
@@ -863,6 +973,28 @@ fn remove_inactive_snapshots(directory: &Path, active: &Path) -> Result<(), Cons
         }
     }
     sync_directory(directory)
+}
+
+fn reconcile_snapshot_manifest(
+    directory: &Path,
+    database: &Database,
+) -> Result<(), ConsensusStorageError> {
+    let manifest_path = directory.join(SNAPSHOT_INSTALL_MANIFEST);
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let manifest = decode_snapshot_install_manifest(&read_snapshot_file(&manifest_path)?)?;
+    match read_active_snapshot_meta(database)? {
+        Some((snapshot_id, checksum))
+            if snapshot_id == manifest.snapshot_id && checksum == manifest.checksum =>
+        {
+            remove_snapshot_manifest(directory)
+        }
+        None => Ok(()),
+        Some(_) => Err(ConsensusStorageError::CorruptRecord(
+            "snapshot manifest metadata mismatch",
+        )),
+    }
 }
 
 fn validate_cluster_id(cluster_id: &str) -> Result<(), ConsensusStorageError> {
@@ -1410,7 +1542,11 @@ mod tests {
 
     #[test]
     fn interrupted_snapshot_publication_recovers_only_committed_state() {
-        for point in ["snapshot-after-tmp-sync", "snapshot-after-rename-sync"] {
+        for point in [
+            "snapshot-after-manifest-sync",
+            "snapshot-after-tmp-sync",
+            "snapshot-after-rename-sync",
+        ] {
             let root = TempDir::new().unwrap();
             let status = run_crash_helper(root.path(), "snapshot", point);
             assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
@@ -1423,6 +1559,18 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            if point != "snapshot-after-manifest-sync" {
+                let directory = root.path().join("plugins/bmux.cluster/consensus/cluster-a");
+                let manifest = decode_snapshot_install_manifest(
+                    &fs::read(directory.join(SNAPSHOT_INSTALL_MANIFEST)).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    snapshot_path(&directory.join("snapshots"), &manifest.snapshot_id)
+                        .unwrap()
+                        .is_file()
+                );
+            }
         }
 
         let root = TempDir::new().unwrap();
@@ -1430,6 +1578,24 @@ mod tests {
         assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
         let reopened = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut state_machine = reopened.state_machine().unwrap();
+        assert!(
+            runtime
+                .block_on(state_machine.get_current_snapshot())
+                .unwrap()
+                .is_some()
+        );
+        let directory = root.path().join("plugins/bmux.cluster/consensus/cluster-a");
+        assert!(!directory.join(SNAPSHOT_INSTALL_MANIFEST).exists());
+
+        let finalized_root = TempDir::new().unwrap();
+        let status = run_crash_helper(
+            finalized_root.path(),
+            "snapshot",
+            "snapshot-after-manifest-remove",
+        );
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let reopened = ConsensusLogStore::open(finalized_root.path(), "cluster-a").unwrap();
         let mut state_machine = reopened.state_machine().unwrap();
         assert!(
             runtime
@@ -1830,6 +1996,19 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn corrupt_snapshot_manifest_fails_closed() {
+        let root = TempDir::new().unwrap();
+        let store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
+        let directory = store.database_path().parent().unwrap().to_path_buf();
+        drop(store);
+        fs::write(directory.join(SNAPSHOT_INSTALL_MANIFEST), b"bad").unwrap();
+        assert!(matches!(
+            ConsensusLogStore::open(root.path(), "cluster-a"),
+            Err(ConsensusStorageError::CorruptRecord("snapshot manifest"))
+        ));
     }
 
     #[test]
