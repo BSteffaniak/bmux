@@ -102,12 +102,12 @@ impl std::fmt::Display for PeerAuthenticationFailure {
     }
 }
 
-pub async fn mutually_authenticate_endpoint<C>(
+pub async fn peer_authentication_proof<C>(
     caller: &C,
     endpoint: &str,
     local_node_id: &str,
     expected_remote_node_id: &str,
-) -> Result<AuthenticatedPeer, PeerAuthenticationFailure>
+) -> Result<bmux_cluster_plugin_api::cluster_types::PeerAuthProof, PeerAuthenticationFailure>
 where
     C: ServiceCaller + Sync + ?Sized,
 {
@@ -120,20 +120,31 @@ where
     .map_err(|error| {
         PeerAuthenticationFailure::Unreachable(format!("remote peer challenge failed: {error}"))
     })?;
-
-    let verifier_node_id = challenge.verifier_node_id.clone();
-    if verifier_node_id != expected_remote_node_id {
+    if challenge.verifier_node_id != expected_remote_node_id {
         return Err(PeerAuthenticationFailure::Untrusted(
             "endpoint challenge was signed by an unexpected remote member".to_string(),
         ));
     }
     let mut local = ServiceCallerDispatchClient::new(caller);
-    let proof = bmux_cluster_plugin_api::cluster_peer_auth::client::prove(&mut local, challenge)
+    bmux_cluster_plugin_api::cluster_peer_auth::client::prove(&mut local, challenge)
         .await
         .map_err(|error| {
             PeerAuthenticationFailure::Local(format!("local peer proof failed: {error}"))
-        })?;
+        })
+}
 
+pub async fn mutually_authenticate_endpoint<C>(
+    caller: &C,
+    endpoint: &str,
+    local_node_id: &str,
+    expected_remote_node_id: &str,
+) -> Result<AuthenticatedPeer, PeerAuthenticationFailure>
+where
+    C: ServiceCaller + Sync + ?Sized,
+{
+    let proof =
+        peer_authentication_proof(caller, endpoint, local_node_id, expected_remote_node_id).await?;
+    let mut remote = EndpointDispatchClient::new(caller, endpoint);
     let peer = bmux_cluster_plugin_api::cluster_peer_auth::client::authenticate(&mut remote, proof)
         .await
         .map_err(|error| {

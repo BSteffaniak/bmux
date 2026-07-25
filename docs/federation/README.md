@@ -17,6 +17,7 @@ This directory contains the accepted architecture decisions for native bmux serv
 | [ADR-0009](adr-0009-consensus-implementation.md)            | OpenRaft consensus implementation selection                 | Accepted |
 | [ADR-0010](adr-0010-consensus-storage.md)                   | redb consensus storage, durability, and recovery            | Accepted |
 | [ADR-0011](adr-0011-deterministic-control-state-machine.md) | Deterministic control commands, responses, and invariants   | Accepted |
+| [ADR-0012](adr-0012-worker-output-and-attach-ownership.md)  | Worker output transport and federated attach ownership      | Accepted |
 
 ## Global invariants
 

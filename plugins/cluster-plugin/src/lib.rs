@@ -4,6 +4,8 @@
 #![allow(clippy::wildcard_imports)] // Focused private modules expose a crate-internal domain facade.
 
 pub(crate) mod commands;
+pub mod consensus_network;
+pub mod consensus_runtime;
 pub mod consensus_storage;
 pub mod control_codec;
 pub mod control_state;
@@ -67,6 +69,7 @@ pub(crate) use bmux_plugin_sdk::{
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::path::PathBuf;
+pub(crate) use std::sync::Arc;
 pub(crate) use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const CLUSTER_PANE_BINDING_PREFIX: &str = "cluster.pane.";
@@ -97,7 +100,149 @@ impl RustPlugin for ClusterPlugin {
         );
         self.node_identity = Some(node_identity);
         self.cluster_id = cluster_id;
+        let configured_endpoint = configured_consensus_endpoint(context.settings.as_ref())
+            .map_err(PluginCommandError::failed)?;
+        configure_local_consensus_endpoint(&context, configured_endpoint.as_deref()).map_err(
+            |error| {
+                PluginCommandError::failed(format!(
+                    "failed configuring local consensus endpoint: {error}"
+                ))
+            },
+        )?;
         Ok(EXIT_OK)
+    }
+
+    fn activate_with_async(
+        &mut self,
+        context: NativeLifecycleContext,
+        async_handle: bmux_plugin_sdk::HostAsyncHandle,
+    ) -> Result<i32, PluginCommandError> {
+        let result = self.activate(context.clone())?;
+        let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_lifecycle_context(
+            &context,
+        ));
+        if let Some((cluster_id, identity, member, single_member)) =
+            local_consensus_member(caller.as_ref()).map_err(PluginCommandError::failed)?
+        {
+            let endpoint = member.endpoint.ok_or_else(|| {
+                PluginCommandError::failed(format!(
+                    "active consensus voter {} has no advertised endpoint; set plugins.settings.\"bmux.cluster\".consensus_endpoint or advertise it during enrollment",
+                    identity.node_id()
+                ))
+            })?;
+            let node_id = *identity.node_id();
+            let cluster_id = cluster_id.to_string();
+            let state_dir = PathBuf::from(&context.connection.state_dir);
+            let nodes = consensus_network::global_consensus_nodes();
+            async_handle.spawn_with_name("bmux-cluster-consensus", async move {
+                match consensus_runtime::ConsensusNode::start_endpoint(
+                    &state_dir,
+                    &cluster_id,
+                    identity,
+                    caller,
+                )
+                .await
+                {
+                    Ok(node) => {
+                        if let Err(error) = nodes.insert(node_id, node.clone()) {
+                            tracing::error!(%error, %node_id, "failed registering consensus node");
+                            let _ = node.shutdown().await;
+                            return;
+                        }
+                        if single_member {
+                            match node.raft().is_initialized().await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    if let Err(error) =
+                                        node.initialize_single(node_id, endpoint.clone()).await
+                                    {
+                                        tracing::error!(%error, %node_id, %endpoint, "failed initializing single-voter consensus cluster");
+                                        let _ = nodes.remove(node_id);
+                                        let _ = node.shutdown().await;
+                                        return;
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, %node_id, "failed reading consensus initialization state");
+                                    let _ = nodes.remove(node_id);
+                                    let _ = node.shutdown().await;
+                                    return;
+                                }
+                            }
+                        }
+                        tracing::info!(%node_id, %endpoint, "cluster consensus node started");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %node_id, "failed starting cluster consensus node");
+                    }
+                }
+            });
+        }
+        Ok(result)
+    }
+
+    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        if let Some(identity) = self.node_identity.as_ref() {
+            let node_id = *identity.node_id();
+            if let Ok(Some(node)) = consensus_network::global_consensus_nodes().remove(node_id) {
+                let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+                    PluginCommandError::failed(format!(
+                        "consensus shutdown requires the host runtime: {error}"
+                    ))
+                })?;
+                tokio::task::block_in_place(|| handle.block_on(node.shutdown())).map_err(
+                    |error| {
+                        PluginCommandError::failed(format!("consensus shutdown failed: {error}"))
+                    },
+                )?;
+            }
+        }
+        Ok(EXIT_OK)
+    }
+
+    fn register_typed_services(
+        &self,
+        context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+    ) {
+        let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_registration_context(
+            &context,
+        ));
+        let Ok(identity) = load_or_create_node_identity(caller.as_ref()) else {
+            return;
+        };
+        let nodes = consensus_network::global_consensus_nodes();
+        let raft_handle: Arc<
+            dyn bmux_cluster_plugin_api::cluster_raft_rpc::ClusterRaftRpcService + Send + Sync,
+        > = Arc::new(consensus_network::RaftRpcServiceHandle::new(
+            caller.clone(),
+            *identity.node_id(),
+            nodes.clone(),
+        ));
+        let control = Arc::new(consensus_network::ControlServiceHandle::new(
+            caller,
+            *identity.node_id(),
+            nodes,
+        ));
+        let control_commands: Arc<
+            dyn bmux_cluster_plugin_api::cluster_control_command::ClusterControlCommandService
+                + Send
+                + Sync,
+        > = control.clone();
+        let control_state: Arc<
+            dyn bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService
+                + Send
+                + Sync,
+        > = control;
+        let _ = bmux_cluster_plugin_api::cluster_raft_rpc::register_provider(registry, raft_handle);
+        let _ = bmux_cluster_plugin_api::cluster_control_command::register_provider(
+            registry,
+            control_commands,
+        );
+        let _ = bmux_cluster_plugin_api::cluster_control_state::register_provider(
+            registry,
+            control_state,
+        );
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
@@ -311,9 +456,18 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
             redeem_enrollment(ctx, &req)
                 .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))
         },
-        "cluster-command/v1", "init" => |(): (), ctx| {
-            initialize_cluster(ctx)
-                .map_err(|error| ServiceResponse::error("cluster_init_failed", error))
+        "cluster-command/v1", "init" => |req: bmux_cluster_plugin_api::cluster_command::client::InitRequest, ctx| {
+            let identity = initialize_cluster(ctx)
+                .map_err(|error| ServiceResponse::error("cluster_init_failed", error))?;
+            let endpoint = req.endpoint.or(
+                configured_consensus_endpoint(ctx.settings.as_ref())
+                    .map_err(|error| ServiceResponse::error("cluster_init_failed", error))?
+            );
+            if let Some(endpoint) = endpoint {
+                configure_local_consensus_endpoint(ctx, Some(&endpoint))
+                    .map_err(|error| ServiceResponse::error("cluster_init_failed", error))?;
+            }
+            Ok(identity)
         },
         "cluster-query/v1", "identity" => |(): (), ctx| {
             current_node_identity(ctx)
@@ -357,6 +511,18 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
+
+    #[test]
+    fn node_id_is_canonical_copyable_and_cryptographically_valid() {
+        let secret = iroh::SecretKey::generate();
+        let node_id = NodeId::from_secret_key(&secret);
+        let encoded = node_id.to_string();
+        assert_eq!(encoded.parse::<NodeId>().unwrap(), node_id);
+        assert_eq!(node_id.public_key().unwrap(), secret.public());
+        assert_eq!(NodeId::from_bytes(*node_id.as_bytes()), node_id);
+        assert_eq!(NodeId::default(), NodeId::from(0));
+        assert!("node:not-a-key".parse::<NodeId>().is_err());
+    }
 
     #[derive(Default)]
     struct FakeRuntime {

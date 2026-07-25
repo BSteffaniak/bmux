@@ -108,6 +108,119 @@ interface cluster-types {
         preferred_labels: list<placement-label>,
     }
 
+    enum worker-operation-class {
+        interactive,
+        lifecycle,
+    }
+
+    record worker-authority {
+        cluster_id: string,
+        workspace_id: workspace-id,
+        pane_id: logical-pane-id,
+        execution_id: execution-id,
+        generation: u64,
+        control_term: u64,
+        lease_sequence: u64,
+        operation_class: worker-operation-class,
+        principal_id: string,
+        audience_node_id: string,
+        lease_id: uuid,
+        lease_issued_at_unix_ms: u64,
+        lease_duration_ms: u64,
+        lease_signature: bytes,
+    }
+
+    record worker-launch-spec {
+        program: string?,
+        args: list<string>,
+        cwd: string?,
+        env: list<placement-label>,
+        cols: u16,
+        rows: u16,
+    }
+
+    record worker-adoption-spec {
+        local_session_id: uuid,
+        local_pane_id: uuid,
+    }
+
+    enum worker-execution-state {
+        launching,
+        ready,
+        exited,
+        unavailable,
+        quarantined,
+        closed,
+    }
+
+    record worker-execution {
+        authority: worker-authority,
+        local_session_id: uuid,
+        local_pane_id: uuid,
+        state: worker-execution-state,
+        exit_code: i32?,
+        output_start: u64,
+        output_end: u64,
+    }
+
+    record worker-execution-list {
+        executions: list<worker-execution>,
+    }
+
+    record worker-mutation-ack {
+        execution_id: execution-id,
+        generation: u64,
+        applied: bool,
+    }
+
+    record worker-output {
+        execution_id: execution-id,
+        generation: u64,
+        requested_cursor: u64,
+        retained_start: u64,
+        next_cursor: u64,
+        gap: bool,
+        output_still_pending: bool,
+        data: bytes,
+    }
+
+    record worker-terminal-snapshot {
+        execution_id: execution-id,
+        generation: u64,
+        cursor: u64,
+        encoded: bytes,
+    }
+
+    variant worker-service-error {
+        not-found { execution_id: execution-id },
+        command-conflict,
+        stale-generation { expected: u64, received: u64 },
+        stale-term { expected_minimum: u64, received: u64 },
+        lease-expired,
+        authority-mismatch,
+        cursor-gap { retained_start: u64, requested: u64 },
+        invalid-request { reason: string },
+        local-runtime { reason: string },
+        unavailable { reason: string },
+    }
+
+    enum worker-signal {
+        interrupt,
+        terminate,
+        kill,
+        hangup,
+    }
+
+    variant worker-launch-result {
+        ready { execution: worker-execution },
+        pending { execution: worker-execution },
+    }
+
+    variant worker-query-result {
+        found { execution: worker-execution },
+        missing,
+    }
+
     record execution-assignment {
         node_id: string,
         generation: u64,
@@ -186,6 +299,31 @@ interface cluster-types {
         incompatible-schema { supported: u16, received: u16 },
         quorum-required,
         not-leader { leader_node_id: string? },
+    }
+
+    record control-state-view {
+        schema_version: u16,
+        cluster_id: string,
+        revision: u64,
+        members: list<cluster-member>,
+        workspaces: list<workspace-record>,
+        windows: list<logical-window-record>,
+        panes: list<logical-pane-record>,
+        consistency: control-read-consistency,
+    }
+
+    enum control-read-consistency {
+        linearizable,
+        stale,
+    }
+
+    variant control-service-error {
+        not-initialized,
+        runtime-unavailable { reason: string },
+        not-leader { leader_node_id: string?, leader_endpoint: string? },
+        quorum-unavailable { reason: string },
+        rejected { error: control-command-error },
+        internal { reason: string },
     }
 
     enum control-workflow-status {
@@ -404,6 +542,19 @@ interface cluster-types {
         message: string,
     }
 
+    record raft-rpc-request {
+        target_node_id: string,
+        proof: peer-auth-proof,
+        payload: bytes,
+        signature: bytes,
+    }
+
+    record raft-rpc-response {
+        source_node_id: string,
+        payload: bytes,
+        error: string?,
+    }
+
     record cluster-connection-event-list {
         events: list<cluster-connection-event>,
     }
@@ -423,7 +574,7 @@ interface cluster-query {
 @capability(CLUSTER_WRITE)
 @interface-version(1)
 interface cluster-command {
-    command init() -> cluster-types.cluster-identity;
+    command init(endpoint: string?) -> cluster-types.cluster-identity;
     command enrollment_token_create(request_id: string, endpoint: string, ttl_ms: u64?, capabilities: cluster-types.cluster-node-capabilities?) -> cluster-types.enrollment-token-result;
     command enrollment_revoke(enrollment_id: string) -> cluster-types.enrollment-revocation-result;
     command credential_rotate_prepare() -> cluster-types.credential-rotation-request;
@@ -441,12 +592,54 @@ interface cluster-command {
     command pane_move(pane: string?, host: string) -> cluster-types.cluster-pane-mutation-result;
 }
 
+@capability(CLUSTER_WRITE)
+@interface-version(1)
+interface cluster-control-command {
+    command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+}
+
+@capability(CLUSTER_READ)
+@interface-version(1)
+interface cluster-control-state {
+    query read_linearizable() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
+    query read_stale() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
+}
+
+@capability(CLUSTER_WRITE)
+@interface-version(1)
+interface cluster-worker-command {
+    command launch(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-launch-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
+    command adopt(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-adoption-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
+    command input(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, data: bytes) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
+    command resize(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, cols: u16, rows: u16) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
+    command signal(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, signal: cluster-types.worker-signal) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
+    command restart(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-launch-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
+    command close(command_id: cluster-types.command-id, authority: cluster-types.worker-authority) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
+}
+
+@capability(CLUSTER_READ)
+@interface-version(1)
+interface cluster-worker-state {
+    query get(execution_id: cluster-types.execution-id) -> result<cluster-types.worker-query-result, cluster-types.worker-service-error>;
+    query output(execution_id: cluster-types.execution-id, generation: u64, cursor: u64, max_bytes: u32) -> result<cluster-types.worker-output, cluster-types.worker-service-error>;
+    query snapshot(execution_id: cluster-types.execution-id, generation: u64) -> result<cluster-types.worker-terminal-snapshot, cluster-types.worker-service-error>;
+    query inventory() -> cluster-types.worker-execution-list;
+}
+
 @capability(CLUSTER_AUTH)
 @interface-version(1)
 interface cluster-peer-auth {
     command challenge(claimant_node_id: string) -> cluster-types.peer-auth-challenge;
     command prove(challenge: cluster-types.peer-auth-challenge) -> cluster-types.peer-auth-proof;
     command authenticate(proof: cluster-types.peer-auth-proof) -> cluster-types.authenticated-peer;
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-raft-rpc {
+    command append_entries(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
+    command install_snapshot(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
+    command vote(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
 }
 
 @capability(CLUSTER_READ)

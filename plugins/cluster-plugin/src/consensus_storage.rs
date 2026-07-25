@@ -7,6 +7,7 @@
 
 use crate::control_codec::{decode_control_command, encode_control_response};
 use crate::control_state::ControlState;
+use crate::membership::NodeId;
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
     AnyError, BasicNode, CommittedLeaderId, Entry, EntryPayload, LeaderId, LogId, LogState,
@@ -54,8 +55,8 @@ fn storage_blocking_permits() -> &'static Arc<tokio::sync::Semaphore> {
 
 #[allow(clippy::result_large_err)]
 async fn run_storage_blocking<T: Send + 'static>(
-    operation: impl FnOnce() -> Result<T, StorageError<u64>> + Send + 'static,
-) -> Result<T, StorageError<u64>> {
+    operation: impl FnOnce() -> Result<T, StorageError<NodeId>> + Send + 'static,
+) -> Result<T, StorageError<NodeId>> {
     let permit = storage_blocking_permits()
         .clone()
         .acquire_owned()
@@ -133,8 +134,8 @@ fn should_inject_storage_error(point: InjectedStorageErrorPoint) -> bool {
 struct SnapshotEnvelope {
     cluster_id: String,
     snapshot_id: String,
-    last_log_id: Option<LogId<u64>>,
-    last_membership: StoredMembership<u64, BasicNode>,
+    last_log_id: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
     control_bytes: Vec<u8>,
 }
 
@@ -158,7 +159,7 @@ pub struct ControlReply(pub Vec<u8>);
 openraft::declare_raft_types!(pub ControlRaftConfig:
     D = ControlRequest,
     R = ControlReply,
-    NodeId = u64,
+    NodeId = NodeId,
     Node = BasicNode,
     Entry = Entry<ControlRaftConfig>,
     SnapshotData = Cursor<Vec<u8>>,
@@ -221,8 +222,8 @@ pub struct ConsensusStateMachine {
     cluster_id: String,
     snapshot_dir: PathBuf,
     control_state: ControlState,
-    last_applied: Option<LogId<u64>>,
-    last_membership: StoredMembership<u64, BasicNode>,
+    last_applied: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
 }
 
 impl ConsensusLogStore {
@@ -278,7 +279,7 @@ impl ConsensusLogStore {
         ConsensusStateMachine::open(self.database.clone(), &self.cluster_id, snapshot_dir)
     }
 
-    fn read_vote(&self) -> Result<Option<Vote<u64>>, ConsensusStorageError> {
+    fn read_vote(&self) -> Result<Option<Vote<NodeId>>, ConsensusStorageError> {
         read_optional_bytes(
             &self.database,
             HARD_STATE_TABLE,
@@ -287,7 +288,7 @@ impl ConsensusLogStore {
         )
     }
 
-    fn read_last_purged(&self) -> Result<Option<LogId<u64>>, ConsensusStorageError> {
+    fn read_last_purged(&self) -> Result<Option<LogId<NodeId>>, ConsensusStorageError> {
         read_optional_bytes(
             &self.database,
             HARD_STATE_TABLE,
@@ -300,7 +301,7 @@ impl ConsensusLogStore {
         &self,
         start: Bound<u64>,
         end: Bound<u64>,
-    ) -> Result<Vec<Entry<ControlRaftConfig>>, StorageError<u64>> {
+    ) -> Result<Vec<Entry<ControlRaftConfig>>, StorageError<NodeId>> {
         let read = self.database.begin_read().map_err(storage_read_error)?;
         let table = read.open_table(LOG_TABLE).map_err(storage_read_error)?;
         let mut entries = Vec::new();
@@ -311,7 +312,7 @@ impl ConsensusLogStore {
         Ok(entries)
     }
 
-    fn log_state(&self) -> Result<LogState<ControlRaftConfig>, StorageError<u64>> {
+    fn log_state(&self) -> Result<LogState<ControlRaftConfig>, StorageError<NodeId>> {
         let last_purged_log_id = self.read_last_purged().map_err(storage_read_error)?;
         let read = self.database.begin_read().map_err(storage_read_error)?;
         let table = read.open_table(LOG_TABLE).map_err(storage_read_error)?;
@@ -333,7 +334,7 @@ impl RaftLogReader<ControlRaftConfig> for ConsensusLogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry<ControlRaftConfig>>, StorageError<u64>> {
+    ) -> Result<Vec<Entry<ControlRaftConfig>>, StorageError<NodeId>> {
         let start = range.start_bound().cloned();
         let end = range.end_bound().cloned();
         let store = self.clone();
@@ -344,7 +345,7 @@ impl RaftLogReader<ControlRaftConfig> for ConsensusLogStore {
 impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
     type LogReader = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<ControlRaftConfig>, StorageError<u64>> {
+    async fn get_log_state(&mut self) -> Result<LogState<ControlRaftConfig>, StorageError<NodeId>> {
         let store = self.clone();
         run_storage_blocking(move || store.log_state()).await
     }
@@ -353,7 +354,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         self.clone()
     }
 
-    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let database = self.database.clone();
         let encoded = encode_vote(vote);
         run_storage_blocking(move || {
@@ -370,7 +371,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         test_crash_point("vote-after-commit");
         Ok(())
     }
-    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
+    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
         let store = self.clone();
         run_storage_blocking(move || store.read_vote().map_err(storage_read_error)).await
     }
@@ -379,7 +380,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         &mut self,
         entries: I,
         callback: LogFlushed<ControlRaftConfig>,
-    ) -> Result<(), StorageError<u64>>
+    ) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<ControlRaftConfig>> + Send,
         I::IntoIter: Send,
@@ -416,7 +417,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         }
     }
 
-    async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let database = self.database.clone();
         run_storage_blocking(move || {
             test_crash_point("truncate-before-commit");
@@ -438,7 +439,7 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
         Ok(())
     }
 
-    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let database = self.database.clone();
         let encoded = encode_log_id(&log_id);
         run_storage_blocking(move || {
@@ -563,7 +564,7 @@ impl ConsensusStateMachine {
     pub async fn compact_if_needed(
         &mut self,
         log_store: &mut ConsensusLogStore,
-    ) -> Result<bool, StorageError<u64>> {
+    ) -> Result<bool, StorageError<NodeId>> {
         let log_state = log_store.get_log_state().await?;
         if !should_compact(&log_state) {
             return Ok(false);
@@ -597,7 +598,7 @@ impl ConsensusStateMachine {
     fn publish_snapshot(
         database: &Database,
         snapshot_dir: &Path,
-        meta: &SnapshotMeta<u64, BasicNode>,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
         cluster_id: &str,
         control_bytes: &[u8],
     ) -> Result<Vec<u8>, ConsensusStorageError> {
@@ -640,11 +641,12 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    {
         Ok((self.last_applied, self.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ControlReply>, StorageError<u64>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ControlReply>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<ControlRaftConfig>> + Send,
         I::IntoIter: Send,
@@ -685,15 +687,15 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<u64, BasicNode>,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<u64>> {
+    ) -> Result<(), StorageError<NodeId>> {
         let received = snapshot.into_inner();
         let control_bytes = match decode_snapshot_envelope(&received) {
             Ok(envelope) => {
@@ -745,7 +747,7 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<ControlRaftConfig>>, StorageError<u64>> {
+    ) -> Result<Option<Snapshot<ControlRaftConfig>>, StorageError<NodeId>> {
         let database = self.database.clone();
         let snapshot_dir = self.snapshot_dir.clone();
         run_storage_blocking(move || {
@@ -776,7 +778,9 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
 }
 
 impl RaftSnapshotBuilder<ControlRaftConfig> for ConsensusStateMachine {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<ControlRaftConfig>, StorageError<u64>> {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<ControlRaftConfig>, StorageError<NodeId>> {
         let bytes = self
             .control_state
             .encode_snapshot()
@@ -830,7 +834,7 @@ fn snapshot_checksum(bytes: &[u8]) -> [u8; 32] {
 
 fn encode_snapshot_envelope(
     cluster_id: &str,
-    meta: &SnapshotMeta<u64, BasicNode>,
+    meta: &SnapshotMeta<NodeId, BasicNode>,
     control_bytes: &[u8],
 ) -> Result<Vec<u8>, ConsensusStorageError> {
     if control_bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
@@ -1214,36 +1218,52 @@ fn read_optional_bytes<T>(
         .transpose()
 }
 
-fn encode_vote(vote: &Vote<u64>) -> Vec<u8> {
+fn encode_vote(vote: &Vote<NodeId>) -> Vec<u8> {
     let mut writer = DurableWriter::new(*b"BMVOT001");
     writer.u64(vote.leader_id.term);
-    writer.optional_u64(vote.leader_id.voted_for());
+    writer.boolean(vote.leader_id.voted_for().is_some());
+    if let Some(node_id) = vote.leader_id.voted_for() {
+        writer.raw(node_id.as_bytes());
+    }
     writer.boolean(vote.committed);
     writer.finish()
 }
 
-fn decode_vote(bytes: &[u8]) -> Result<Vote<u64>, ConsensusStorageError> {
+fn decode_vote(bytes: &[u8]) -> Result<Vote<NodeId>, ConsensusStorageError> {
     let mut reader = DurableReader::new(bytes, *b"BMVOT001", "vote")?;
     let term = reader.u64()?;
-    let voted_for = reader.optional_u64()?;
+    let voted_for = if reader.boolean()? {
+        Some(reader.node_id()?)
+    } else {
+        None
+    };
     let committed = reader.boolean()?;
     reader.finish()?;
-    Ok(Vote {
+    let vote = Vote {
         leader_id: LeaderId::new(
             term,
             voted_for.ok_or(ConsensusStorageError::CorruptRecord("vote"))?,
         ),
         committed,
-    })
+    };
+    validate_node_id(vote.leader_id.node_id)?;
+    Ok(vote)
 }
 
-fn encode_log_id(log_id: &LogId<u64>) -> Vec<u8> {
+fn validate_node_id(node_id: NodeId) -> Result<NodeId, ConsensusStorageError> {
+    node_id
+        .public_key()
+        .map_err(|_| ConsensusStorageError::CorruptRecord("node ID"))?;
+    Ok(node_id)
+}
+
+fn encode_log_id(log_id: &LogId<NodeId>) -> Vec<u8> {
     let mut writer = DurableWriter::new(*b"BMLOGID1");
     encode_log_id_fields(&mut writer, log_id);
     writer.finish()
 }
 
-fn decode_log_id(bytes: &[u8]) -> Result<LogId<u64>, ConsensusStorageError> {
+fn decode_log_id(bytes: &[u8]) -> Result<LogId<NodeId>, ConsensusStorageError> {
     let mut reader = DurableReader::new(bytes, *b"BMLOGID1", "log ID")?;
     let log_id = decode_log_id_fields(&mut reader)?;
     reader.finish()?;
@@ -1251,7 +1271,7 @@ fn decode_log_id(bytes: &[u8]) -> Result<LogId<u64>, ConsensusStorageError> {
 }
 
 fn encode_stored_membership(
-    membership: &StoredMembership<u64, BasicNode>,
+    membership: &StoredMembership<NodeId, BasicNode>,
 ) -> Result<Vec<u8>, ConsensusStorageError> {
     let mut writer = DurableWriter::new(*b"BMMEM001");
     writer.boolean(membership.log_id().is_some());
@@ -1264,7 +1284,7 @@ fn encode_stored_membership(
 
 fn decode_stored_membership(
     bytes: &[u8],
-) -> Result<StoredMembership<u64, BasicNode>, ConsensusStorageError> {
+) -> Result<StoredMembership<NodeId, BasicNode>, ConsensusStorageError> {
     let mut reader = DurableReader::new(bytes, *b"BMMEM001", "membership")?;
     let log_id = if reader.boolean()? {
         Some(decode_log_id_fields(&mut reader)?)
@@ -1278,19 +1298,19 @@ fn decode_stored_membership(
 
 fn encode_membership_fields(
     writer: &mut DurableWriter,
-    membership: &Membership<u64, BasicNode>,
+    membership: &Membership<NodeId, BasicNode>,
 ) -> Result<(), ConsensusStorageError> {
     writer.count(membership.get_joint_config().len())?;
     for config in membership.get_joint_config() {
         writer.count(config.len())?;
         for node_id in config {
-            writer.u64(*node_id);
+            writer.raw(node_id.as_bytes());
         }
     }
     let nodes = membership.nodes().collect::<Vec<_>>();
     writer.count(nodes.len())?;
     for (node_id, node) in nodes {
-        writer.u64(*node_id);
+        writer.raw(node_id.as_bytes());
         writer.bytes(node.addr.as_bytes())?;
     }
     Ok(())
@@ -1298,17 +1318,17 @@ fn encode_membership_fields(
 
 fn decode_membership_fields(
     reader: &mut DurableReader<'_>,
-) -> Result<Membership<u64, BasicNode>, ConsensusStorageError> {
+) -> Result<Membership<NodeId, BasicNode>, ConsensusStorageError> {
     let configs = (0..reader.count()?)
         .map(|_| {
             (0..reader.count()?)
-                .map(|_| reader.u64())
+                .map(|_| reader.node_id())
                 .collect::<Result<std::collections::BTreeSet<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
     let nodes = (0..reader.count()?)
         .map(|_| {
-            let node_id = reader.u64()?;
+            let node_id = reader.node_id()?;
             let address = String::from_utf8(reader.bytes()?)
                 .map_err(|_| ConsensusStorageError::CorruptRecord("membership"))?;
             Ok::<_, ConsensusStorageError>((node_id, BasicNode::new(address)))
@@ -1347,17 +1367,17 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry<ControlRaftConfig>, ConsensusStora
     Ok(Entry { log_id, payload })
 }
 
-fn encode_log_id_fields(writer: &mut DurableWriter, log_id: &LogId<u64>) {
+fn encode_log_id_fields(writer: &mut DurableWriter, log_id: &LogId<NodeId>) {
     writer.u64(log_id.leader_id.term);
-    writer.u64(log_id.leader_id.node_id);
+    writer.raw(log_id.leader_id.node_id.as_bytes());
     writer.u64(log_id.index);
 }
 
 fn decode_log_id_fields(
     reader: &mut DurableReader<'_>,
-) -> Result<LogId<u64>, ConsensusStorageError> {
+) -> Result<LogId<NodeId>, ConsensusStorageError> {
     Ok(LogId::new(
-        CommittedLeaderId::new(reader.u64()?, reader.u64()?),
+        CommittedLeaderId::new(reader.u64()?, reader.node_id()?),
         reader.u64()?,
     ))
 }
@@ -1393,11 +1413,8 @@ impl DurableWriter {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    fn optional_u64(&mut self, value: Option<u64>) {
-        self.boolean(value.is_some());
-        if let Some(value) = value {
-            self.u64(value);
-        }
+    fn raw(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
     }
 
     fn count(&mut self, value: usize) -> Result<(), ConsensusStorageError> {
@@ -1489,12 +1506,12 @@ impl<'a> DurableReader<'a> {
         Ok(u64::from_be_bytes(bytes))
     }
 
-    fn optional_u64(&mut self) -> Result<Option<u64>, ConsensusStorageError> {
-        if self.boolean()? {
-            Ok(Some(self.u64()?))
-        } else {
-            Ok(None)
-        }
+    fn node_id(&mut self) -> Result<NodeId, ConsensusStorageError> {
+        let bytes = self
+            .take(32)?
+            .try_into()
+            .map_err(|_| ConsensusStorageError::CorruptRecord(self.record))?;
+        validate_node_id(NodeId::from_bytes(bytes))
     }
 
     fn count(&mut self) -> Result<usize, ConsensusStorageError> {
@@ -1522,11 +1539,15 @@ fn decode_u16(bytes: &[u8]) -> Result<u16, ConsensusStorageError> {
     Ok(u16::from_be_bytes(bytes))
 }
 
-fn storage_read_error(error: impl std::error::Error + Send + Sync + 'static) -> StorageError<u64> {
+fn storage_read_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> StorageError<NodeId> {
     StorageIOError::read(AnyError::new(&error)).into()
 }
 
-fn storage_write_error(error: impl std::error::Error + Send + Sync + 'static) -> StorageError<u64> {
+fn storage_write_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> StorageError<NodeId> {
     StorageIOError::write(AnyError::new(&error)).into()
 }
 
@@ -1597,7 +1618,10 @@ mod tests {
                         .unwrap();
                 }
                 "vote" => {
-                    store.save_vote(&Vote::new_committed(7, 1)).await.unwrap();
+                    store
+                        .save_vote(&Vote::new_committed(7, test_node_id(1)))
+                        .await
+                        .unwrap();
                 }
                 "truncate" => {
                     store
@@ -1668,7 +1692,7 @@ mod tests {
     {
         async fn build(
             &self,
-        ) -> Result<(TempDir, ConsensusLogStore, ConsensusStateMachine), StorageError<u64>>
+        ) -> Result<(TempDir, ConsensusLogStore, ConsensusStateMachine), StorageError<NodeId>>
         {
             let root = TempDir::new().map_err(storage_write_error)?;
             let (store, state_machine) =
@@ -1689,8 +1713,12 @@ mod tests {
         .unwrap();
     }
 
-    fn log_id(term: u64, index: u64) -> LogId<u64> {
-        LogId::new(CommittedLeaderId::new(term, 1), index)
+    fn test_node_id(value: u64) -> NodeId {
+        NodeId::from(value)
+    }
+
+    fn log_id(term: u64, index: u64) -> LogId<NodeId> {
+        LogId::new(CommittedLeaderId::new(term, test_node_id(1)), index)
     }
 
     fn entry(term: u64, index: u64, value: &[u8]) -> Entry<ControlRaftConfig> {
@@ -1702,22 +1730,22 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum RandomizedOperation {
-        SaveVote(Vote<u64>),
+        SaveVote(Vote<NodeId>),
         Append(Vec<Entry<ControlRaftConfig>>),
-        Truncate(LogId<u64>),
-        Purge(LogId<u64>),
-        Apply(LogId<u64>),
+        Truncate(LogId<NodeId>),
+        Purge(LogId<NodeId>),
+        Apply(LogId<NodeId>),
         Snapshot,
     }
 
     #[derive(Clone, Debug, PartialEq)]
     struct DurableState {
-        vote: Option<Vote<u64>>,
+        vote: Option<Vote<NodeId>>,
         log_state: LogState<ControlRaftConfig>,
         entries: Vec<Entry<ControlRaftConfig>>,
-        last_applied: Option<LogId<u64>>,
-        membership: StoredMembership<u64, BasicNode>,
-        snapshot: Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>,
+        last_applied: Option<LogId<NodeId>>,
+        membership: StoredMembership<NodeId, BasicNode>,
+        snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>,
     }
 
     #[derive(Clone, Copy)]
@@ -1748,7 +1776,7 @@ mod tests {
             let choice = rng.below(100);
             let operation = if choice < 15 {
                 vote_term = vote_term.saturating_add(1);
-                RandomizedOperation::SaveVote(Vote::new_committed(vote_term, 1))
+                RandomizedOperation::SaveVote(Vote::new_committed(vote_term, test_node_id(1)))
             } else if choice < 50 || last_index == last_purged {
                 term = term.saturating_add(rng.below(2));
                 let count = usize::try_from(rng.below(4) + 1).unwrap();
@@ -1884,7 +1912,7 @@ mod tests {
                         .iter()
                         .filter(|operation| randomized_crash_points(operation).contains(point))
                         .count();
-                    let status = Command::new(std::env::current_exe().unwrap())
+                    let output = Command::new(std::env::current_exe().unwrap())
                         .arg("--exact")
                         .arg(CRASH_HELPER_TEST)
                         .arg("--nocapture")
@@ -1894,10 +1922,10 @@ mod tests {
                         .env("BMUX_CONSENSUS_RANDOM_STEPS", (crash_index + 1).to_string())
                         .env("BMUX_CONSENSUS_CRASH_POINT", point)
                         .env("BMUX_CONSENSUS_CRASH_OCCURRENCE", occurrence.to_string())
-                        .status()
+                        .output()
                         .unwrap();
                     assert_eq!(
-                        status.code(),
+                        output.status.code(),
                         Some(TEST_CRASH_EXIT_CODE),
                         "seed={seed} operation={crash_index} point={point}"
                     );
@@ -2068,7 +2096,7 @@ mod tests {
             runtime
                 .block_on(RaftLogStorage::read_vote(&mut reopened))
                 .unwrap(),
-            Some(Vote::new_committed(7, 1))
+            Some(Vote::new_committed(7, test_node_id(1)))
         );
 
         let truncate_root = TempDir::new().unwrap();
@@ -2212,7 +2240,7 @@ mod tests {
                 .ends_with("plugins/bmux.cluster/consensus/cluster-a/raft.redb")
         );
 
-        let vote = Vote::new_committed(7, 1);
+        let vote = Vote::new_committed(7, test_node_id(1));
         store.save_vote(&vote).await.unwrap();
         store
             .blocking_append([
@@ -2294,10 +2322,13 @@ mod tests {
             },
         };
         let membership = Membership::new(
-            vec![std::collections::BTreeSet::from([1, 2])],
+            vec![std::collections::BTreeSet::from([
+                test_node_id(1),
+                test_node_id(2),
+            ])],
             std::collections::BTreeMap::from([
-                (1, BasicNode::new("one")),
-                (2, BasicNode::new("two")),
+                (test_node_id(1), BasicNode::new("one")),
+                (test_node_id(2), BasicNode::new("two")),
             ]),
         );
         let entries = [
@@ -2469,7 +2500,7 @@ mod tests {
     async fn blocking_storage_work_runs_off_the_async_worker() {
         let async_thread = std::thread::current().id();
         let blocking_thread =
-            run_storage_blocking(|| Ok::<_, StorageError<u64>>(std::thread::current().id()))
+            run_storage_blocking(|| Ok::<_, StorageError<NodeId>>(std::thread::current().id()))
                 .await
                 .unwrap();
         assert_ne!(async_thread, blocking_thread);
@@ -2477,7 +2508,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..(STORAGE_BLOCKING_CONCURRENCY * 3) {
             handles.push(tokio::spawn(run_storage_blocking(|| {
-                Ok::<_, StorageError<u64>>(std::thread::current().id())
+                Ok::<_, StorageError<NodeId>>(std::thread::current().id())
             })));
         }
         for handle in handles {
@@ -2703,11 +2734,14 @@ mod tests {
     #[test]
     fn durable_codec_round_trips_membership_and_rejects_corruption() {
         let membership = Membership::new(
-            vec![std::collections::BTreeSet::from([1, 2])],
+            vec![std::collections::BTreeSet::from([
+                test_node_id(1),
+                test_node_id(2),
+            ])],
             std::collections::BTreeMap::from([
-                (1, BasicNode::new("node-one")),
-                (2, BasicNode::new("node-two")),
-                (3, BasicNode::new("learner-three")),
+                (test_node_id(1), BasicNode::new("node-one")),
+                (test_node_id(2), BasicNode::new("node-two")),
+                (test_node_id(3), BasicNode::new("learner-three")),
             ]),
         );
         let entry = Entry {
@@ -2730,7 +2764,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut store = ConsensusLogStore::open(root.path(), "cluster-a").unwrap();
-        runtime.block_on(store.save_vote(&Vote::new(2, 1))).unwrap();
+        runtime
+            .block_on(store.save_vote(&Vote::new(2, test_node_id(1))))
+            .unwrap();
         runtime
             .block_on(store.blocking_append([entry(2, 1, b"entry")]))
             .unwrap();

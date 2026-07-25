@@ -140,6 +140,10 @@ JSON example for routed command dry-run (`cluster status prod --dry-run --format
 Example:
 
 ```toml
+[plugins.settings."bmux.cluster"]
+# Stable connections target advertised for authenticated consensus RPC.
+consensus_endpoint = "prod-a"
+
 [plugins.settings."bmux.cluster".clusters.prod]
 targets = ["prod-a", "prod-b", "prod-c"]
 gateway_mode = "auto"
@@ -149,7 +153,7 @@ gateway_mode = "auto"
 
 ## Commands
 
-- `cluster init`
+- `cluster init --endpoint <advertised-target>`
 - `cluster enrollment-token create --endpoint <target> [--ttl-ms <milliseconds>] [--role voter|observer-edge] [--worker|--no-worker] [--ingress|--no-ingress]`
 - `cluster join <token> [--issuer <target>] [--endpoint <advertised-target>]`
 - `cluster leave`
@@ -175,6 +179,8 @@ gateway_mode = "auto"
 
 - **`cluster-query/v1`**
 - **`cluster-command/v1`**
+- **`cluster-worker-command/v1`** — generated launch/adopt/input/resize/signal/restart/close contracts; every mutation carries typed execution identity, generation, control term, and bounded lease authority.
+- **`cluster-worker-state/v1`** — generated execution query/inventory plus cursor-based output and full terminal snapshot repair contracts.
 - **`cluster-peer-auth/v1`**
 - **`cluster-connection-events/v1`**
 
@@ -187,7 +193,7 @@ gateway_mode = "auto"
   - `status` returns host states from probe execution (`ready` or `degraded`).
   - Errors use `list_clusters_failed` / `status_failed`.
 - `cluster-command/v1`
-  - `init` creates or returns the durable cluster identity and returns public node identity metadata.
+  - `init` creates or returns the durable cluster identity; `--endpoint` advertises the stable connections target required by voter consensus startup. The same endpoint may be configured as `plugins.settings."bmux.cluster".consensus_endpoint` for restart-safe activation.
   - `enrollment_token_create`, `redeem_enrollment`, and `join` implement signed, expiring, retry-safe enrollment as generated typed phases; redemption verifies node-key possession and compatibility before consuming the token, then returns an issuer-signed public membership credential.
   - `leave_prepare`, `accept_leave`, and `leave` implement signed, retryable leave coordination without nested service dispatch.
   - `up` returns session id plus per-host launch status payload.

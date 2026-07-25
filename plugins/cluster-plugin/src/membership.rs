@@ -182,18 +182,42 @@ impl FromStr for ClusterId {
 }
 
 /// Self-authenticating node identifier derived from an Ed25519 public key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NodeId([u8; 32]);
+
+impl Default for NodeId {
+    fn default() -> Self {
+        Self::from_secret_key(&SecretKey::from_bytes(&[0; 32]))
+    }
+}
 
 impl NodeId {
     pub(crate) fn from_secret_key(secret_key: &SecretKey) -> Self {
-        Self(format!("node:{}", secret_key.public()))
+        Self(*secret_key.public().as_bytes())
+    }
+
+    #[must_use]
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub(crate) fn public_key(&self) -> Result<iroh::PublicKey, String> {
+        iroh::PublicKey::from_bytes(&self.0)
+            .map_err(|error| format!("invalid node public key: {error}"))
     }
 }
 
 impl fmt::Display for NodeId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        match self.public_key() {
+            Ok(public_key) => write!(formatter, "node:{public_key}"),
+            Err(_) => formatter.write_str("node:<invalid>"),
+        }
     }
 }
 
@@ -207,7 +231,16 @@ impl FromStr for NodeId {
         let public_key = encoded
             .parse::<iroh::PublicKey>()
             .map_err(|error| format!("invalid node public key: {error}"))?;
-        Ok(Self(format!("node:{public_key}")))
+        Ok(Self(*public_key.as_bytes()))
+    }
+}
+
+#[cfg(test)]
+impl From<u64> for NodeId {
+    fn from(value: u64) -> Self {
+        let mut bytes = [0; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        Self::from_secret_key(&SecretKey::from_bytes(&bytes))
     }
 }
 
@@ -218,6 +251,17 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(seed: u64) -> Self {
+        let mut bytes = [0; 32];
+        bytes[24..].copy_from_slice(&seed.to_be_bytes());
+        let secret_key = SecretKey::from_bytes(&bytes);
+        Self {
+            node_id: NodeId::from_secret_key(&secret_key),
+            secret_key,
+        }
+    }
+
     #[must_use]
     pub const fn node_id(&self) -> &NodeId {
         &self.node_id
@@ -230,6 +274,10 @@ impl NodeIdentity {
 
     pub fn sign(&self, payload: &[u8]) -> Vec<u8> {
         self.secret_key.sign(payload).to_bytes().to_vec()
+    }
+
+    pub fn verify(&self, payload: &[u8], signature: &[u8]) -> Result<(), String> {
+        verify_node_signature(&self.node_id.to_string(), payload, signature)
     }
 }
 
@@ -727,6 +775,27 @@ pub fn create_peer_auth_proof(
     };
     proof.claimant_signature = encode_hex(&identity.sign(&canonical_peer_proof(&proof)?));
     Ok(proof)
+}
+
+pub fn verify_node_signature(
+    node_id: &str,
+    payload: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    let node_id = node_id.parse::<NodeId>()?;
+    let public_key = node_id.public_key()?;
+    let signature = iroh::Signature::try_from(signature)
+        .map_err(|error| format!("invalid node signature: {error}"))?;
+    public_key
+        .verify(payload, &signature)
+        .map_err(|_| "node signature verification failed".to_string())
+}
+
+pub fn authenticate_peer_proof(
+    caller: &impl ClusterRuntimeOps,
+    proof: PeerAuthProof,
+) -> Result<AuthenticatedPeer, String> {
+    authenticate_peer(caller, &ClusterPeerAuthenticateRequest { proof })
 }
 
 pub fn authenticate_peer(
@@ -1688,6 +1757,80 @@ fn require_membership_state(
     Ok(state)
 }
 
+pub fn configured_consensus_endpoint(
+    settings: Option<&toml::Value>,
+) -> Result<Option<String>, String> {
+    settings
+        .cloned()
+        .map(|value| {
+            value
+                .try_into::<ClusterSettings>()
+                .map(|settings| settings.consensus_endpoint)
+                .map_err(|error| format!("invalid bmux.cluster settings: {error}"))
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
+pub fn configure_local_consensus_endpoint(
+    caller: &impl ClusterRuntimeOps,
+    endpoint: Option<&str>,
+) -> Result<(), String> {
+    let Some(endpoint) = endpoint.map(str::trim) else {
+        return Ok(());
+    };
+    if endpoint.is_empty() {
+        return Err("configured consensus_endpoint cannot be empty".to_string());
+    }
+    let Some(cluster_id) = load_cluster_id(caller)? else {
+        return Ok(());
+    };
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "cluster identity exists without a local node identity".to_string())?;
+    let mut state = require_membership_state(caller, cluster_id)?;
+    let member = state
+        .members
+        .get(&identity.node_id().to_string())
+        .ok_or_else(|| "local membership record is missing".to_string())?;
+    if member.state != ClusterMemberState::Active
+        || member.capabilities.consensus_role != ClusterConsensusRole::Voter
+    {
+        return Ok(());
+    }
+    advertise_local_endpoint(&mut state, &identity.node_id().to_string(), endpoint)?;
+    store_membership_state(caller, &state)
+}
+
+pub fn local_consensus_member(
+    caller: &impl ClusterRuntimeOps,
+) -> Result<Option<(ClusterId, NodeIdentity, ClusterMember, bool)>, String> {
+    let Some(cluster_id) = load_cluster_id(caller)? else {
+        return Ok(None);
+    };
+    let identity = load_node_identity(caller)?
+        .ok_or_else(|| "cluster identity exists without a local node identity".to_string())?;
+    let state = require_membership_state(caller, cluster_id)?;
+    let Some(member) = state.members.get(&identity.node_id().to_string()).cloned() else {
+        return Err("local membership record is missing".to_string());
+    };
+    if member.state != ClusterMemberState::Active
+        || member.capabilities.consensus_role != ClusterConsensusRole::Voter
+    {
+        return Ok(None);
+    }
+    verify_membership_credential(&member, now_unix_ms())?;
+    let single_member = state
+        .members
+        .values()
+        .filter(|candidate| {
+            candidate.state == ClusterMemberState::Active
+                && candidate.capabilities.consensus_role == ClusterConsensusRole::Voter
+        })
+        .count()
+        == 1;
+    Ok(Some((cluster_id, identity, member, single_member)))
+}
+
 pub fn load_membership_state(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<Option<MembershipState>, String> {
@@ -1993,6 +2136,7 @@ fn store_identity_record(
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ClusterSettings {
+    pub consensus_endpoint: Option<String>,
     pub clusters: BTreeMap<String, ClusterDefinition>,
 }
 

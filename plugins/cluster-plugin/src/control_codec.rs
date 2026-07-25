@@ -170,6 +170,22 @@ pub(crate) fn decode_state_response(
     })
 }
 
+/// Decodes one complete canonical control response.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the response is malformed, truncated,
+/// non-canonical, or uses an unsupported schema/tag.
+pub fn decode_control_response(bytes: &[u8]) -> Result<ControlResponse, CodecError> {
+    let mut reader = Reader::new(bytes);
+    if reader.take(8)? != b"BMRES001" {
+        return Err(CodecError::InvalidMagic);
+    }
+    let response = decode_state_response(&mut reader)?;
+    reader.finish()?;
+    Ok(response)
+}
+
 #[must_use]
 pub fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
     let mut writer = Writer::default();

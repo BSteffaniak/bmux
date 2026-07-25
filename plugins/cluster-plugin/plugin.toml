@@ -62,6 +62,16 @@ interface_id = "cluster-command/v1"
 kind         = "command"
 
 [[services]]
+capability   = "bmux.server_clusters.write"
+interface_id = "cluster-worker-command/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.read"
+interface_id = "cluster-worker-state/v1"
+kind         = "query"
+
+[[services]]
 capability   = "bmux.server_clusters.auth"
 interface_id = "cluster-peer-auth/v1"
 kind         = "command"
@@ -77,6 +87,13 @@ expose_in_cli = true
 name          = "cluster-init"
 path          = ["cluster-init"]
 summary       = "Initialize durable cluster and node identities"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "endpoint"
+name       = "endpoint"
+required   = false
+value_name = "TARGET"
 
 [[commands]]
 aliases       = [["cluster", "enrollment-token", "create"]]

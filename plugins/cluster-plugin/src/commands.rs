@@ -3,15 +3,20 @@
 use super::*;
 
 pub fn run_cluster_init(context: &NativeCommandContext) -> Result<i32, String> {
+    let endpoint = option_value(&context.arguments, "--endpoint").map(ToString::to_string);
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("cluster init requires the host tokio runtime: {error}"))?;
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let identity = tokio::task::block_in_place(|| {
         handle.block_on(bmux_cluster_plugin_api::cluster_command::client::init(
             &mut client,
+            endpoint.clone(),
         ))
     })
     .map_err(|error| format!("cluster init service dispatch failed: {error}"))?;
+    if endpoint.is_some() {
+        ensure_local_consensus_runtime(context)?;
+    }
     println!(
         "cluster initialized: cluster_id={} node_id={} public_key={}",
         identity.cluster_id.as_deref().unwrap_or("-"),
@@ -19,6 +24,56 @@ pub fn run_cluster_init(context: &NativeCommandContext) -> Result<i32, String> {
         identity.public_key
     );
     Ok(EXIT_OK)
+}
+
+fn ensure_local_consensus_runtime(context: &NativeCommandContext) -> Result<(), String> {
+    let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_command_context(
+        context,
+    ));
+    let Some((cluster_id, identity, member, single_member)) =
+        local_consensus_member(caller.as_ref())?
+    else {
+        return Ok(());
+    };
+    let endpoint = member
+        .endpoint
+        .ok_or_else(|| "local consensus voter has no advertised endpoint".to_string())?;
+    let node_id = *identity.node_id();
+    let nodes = consensus_network::global_consensus_nodes();
+    if nodes.contains(node_id)? {
+        return Ok(());
+    }
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("consensus startup requires the host runtime: {error}"))?;
+    let node = tokio::task::block_in_place(|| {
+        handle.block_on(consensus_runtime::ConsensusNode::start_endpoint(
+            std::path::Path::new(&context.connection.state_dir),
+            &cluster_id.to_string(),
+            identity,
+            caller,
+        ))
+    })
+    .map_err(|error| format!("failed starting consensus runtime: {error}"))?;
+    nodes.insert(node_id, node.clone())?;
+    if single_member {
+        let initialized = tokio::task::block_in_place(|| {
+            handle
+                .block_on(node.raft().is_initialized())
+                .map_err(|error| error.to_string())
+        })?;
+        if !initialized
+            && let Err(error) = tokio::task::block_in_place(|| {
+                handle
+                    .block_on(node.initialize_single(node_id, endpoint))
+                    .map_err(|error| error.to_string())
+            })
+        {
+            let _ = nodes.remove(node_id);
+            let _ = tokio::task::block_in_place(|| handle.block_on(node.shutdown()));
+            return Err(format!("failed initializing consensus cluster: {error}"));
+        }
+    }
+    Ok(())
 }
 
 pub fn run_cluster_enrollment_token_create(context: &NativeCommandContext) -> Result<i32, String> {

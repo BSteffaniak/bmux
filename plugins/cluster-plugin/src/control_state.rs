@@ -3,8 +3,9 @@ use crate::control_codec::request_fingerprint;
 mod control_state_codec;
 use bmux_cluster_plugin_api::cluster_types::{
     ClusterMember, ClusterMemberState, ControlCommand, ControlCommandError, ControlCommandRequest,
-    ControlCommandResult, ControlResourceKind, ControlResponse, ControlWorkflowStatus,
-    LogicalPaneRecord, LogicalWindowRecord, PaneAvailability, WorkspaceId, WorkspaceRecord,
+    ControlCommandResult, ControlReadConsistency, ControlResourceKind, ControlResponse,
+    ControlStateView, ControlWorkflowStatus, LogicalPaneRecord, LogicalWindowRecord,
+    PaneAvailability, WorkspaceId, WorkspaceRecord,
 };
 use control_state_codec::{decode_snapshot, encode_snapshot};
 use std::collections::BTreeMap;
@@ -102,6 +103,20 @@ impl ControlState {
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
             dedup: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_view(&self, consistency: ControlReadConsistency) -> ControlStateView {
+        ControlStateView {
+            schema_version: self.schema_version,
+            cluster_id: self.cluster_id.clone(),
+            revision: self.revision,
+            members: self.members.values().cloned().collect(),
+            workspaces: self.workspaces.values().cloned().collect(),
+            windows: self.windows.values().cloned().collect(),
+            panes: self.panes.values().cloned().collect(),
+            consistency,
         }
     }
 
@@ -757,6 +772,62 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_state_preserves_layout_and_authoritative_execution() {
+        let mut state = ControlState::new("cluster:test");
+        setup_pane(&mut state);
+        let assigned = state.apply(&command(
+            30,
+            ControlCommandRequest::AssignExecution {
+                pane_id: LogicalPaneId { value: id(30) },
+                expected_revision: 3,
+                expected_generation: 0,
+                assignment: assignment(1),
+            },
+        ));
+        assert_eq!(assigned.workflow_status, ControlWorkflowStatus::Pending);
+        let current = state.panes.get(&id(30)).unwrap().clone();
+        let unavailable = state.apply(&command(
+            31,
+            ControlCommandRequest::SetPaneAvailability {
+                pane_id: LogicalPaneId { value: id(30) },
+                expected_revision: current.revision,
+                assignment: current.execution.clone().unwrap(),
+                availability: PaneAvailability::Unavailable,
+                reason: Some("worker unreachable; process state unknown".to_string()),
+            },
+        ));
+        assert_accepted(&unavailable);
+        let pane = state.panes.get(&id(30)).unwrap();
+        assert_eq!(pane.availability, PaneAvailability::Unavailable);
+        assert_eq!(pane.execution, current.execution);
+        assert_eq!(pane.workspace_id.value, id(10));
+        assert_eq!(pane.window_id.value, id(20));
+        assert!(state.windows.contains_key(&id(20)));
+        assert!(state.workspaces.contains_key(&id(10)));
+
+        let rejected = state.apply(&command(
+            32,
+            ControlCommandRequest::SetPaneAvailability {
+                pane_id: LogicalPaneId { value: id(30) },
+                expected_revision: pane.revision,
+                assignment: assignment(2),
+                availability: PaneAvailability::Ready,
+                reason: None,
+            },
+        ));
+        assert!(matches!(
+            rejected.result,
+            ControlCommandResult::Rejected {
+                error: ControlCommandError::GenerationConflict { .. }
+            }
+        ));
+        assert_eq!(
+            state.panes.get(&id(30)).unwrap().availability,
+            PaneAvailability::Unavailable
+        );
+    }
+
+    #[test]
     fn revision_and_generation_fencing_are_strict() {
         let mut state = ControlState::new("cluster:test");
         setup_pane(&mut state);
@@ -946,6 +1017,21 @@ mod tests {
                 payload: vec![1, 2, 3]
             }
         );
+    }
+
+    #[test]
+    fn execution_identity_and_generation_are_independent_from_local_runtime_ids() {
+        let logical_pane = LogicalPaneId { value: id(30) };
+        let first = assignment(1);
+        let second = assignment(2);
+        let local_session_id = id(900);
+        let local_pane_id = id(901);
+        assert_ne!(logical_pane.value, first.execution_id.value);
+        assert_ne!(first.execution_id.value, local_session_id);
+        assert_ne!(first.execution_id.value, local_pane_id);
+        assert_ne!(first.execution_id, second.execution_id);
+        assert_eq!(first.generation, 1);
+        assert_eq!(second.generation, 2);
     }
 
     fn assignment(generation: u64) -> ExecutionAssignment {
