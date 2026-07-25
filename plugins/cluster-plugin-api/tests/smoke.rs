@@ -232,6 +232,7 @@ fn generated_worker_contract_carries_execution_identity_and_fencing() {
         lease_sequence: 3,
         operation_class: WorkerOperationClass::Interactive,
         principal_id: "principal:test".to_string(),
+        issuer_node_id: "node:issuer".to_string(),
         audience_node_id: "node:worker".to_string(),
         lease_id: uuid::Uuid::new_v4(),
         lease_issued_at_unix_ms: 21,

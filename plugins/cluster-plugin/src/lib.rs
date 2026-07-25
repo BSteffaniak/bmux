@@ -16,6 +16,7 @@ pub(crate) mod membership;
 pub(crate) mod pane;
 pub mod placement;
 pub(crate) mod storage;
+pub mod worker_runtime;
 pub(crate) mod workspace;
 
 pub(crate) use commands::*;

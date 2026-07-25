@@ -123,6 +123,7 @@ interface cluster-types {
         lease_sequence: u64,
         operation_class: worker-operation-class,
         principal_id: string,
+        issuer_node_id: string,
         audience_node_id: string,
         lease_id: uuid,
         lease_issued_at_unix_ms: u64,
@@ -165,6 +166,11 @@ interface cluster-types {
 
     record worker-execution-list {
         executions: list<worker-execution>,
+    }
+
+    record worker-registry-stats {
+        execution_count: u32,
+        retained_output_bytes: u64,
     }
 
     record worker-mutation-ack {
@@ -615,6 +621,7 @@ interface cluster-worker-command {
     command signal(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, signal: cluster-types.worker-signal) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
     command restart(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-launch-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
     command close(command_id: cluster-types.command-id, authority: cluster-types.worker-authority) -> result<cluster-types.worker-mutation-ack, cluster-types.worker-service-error>;
+    command reconcile(executions: list<cluster-types.worker-execution>) -> result<cluster-types.worker-registry-stats, cluster-types.worker-service-error>;
 }
 
 @capability(CLUSTER_READ)
