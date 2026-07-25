@@ -313,9 +313,10 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             })
             .map_err(storage_write_error)
         })
-        .await
+        .await?;
+        test_crash_point("vote-after-commit");
+        Ok(())
     }
-
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         let store = self.clone();
         run_storage_blocking(move || store.read_vote().map_err(storage_read_error)).await
@@ -377,7 +378,9 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             })
             .map_err(storage_write_error)
         })
-        .await
+        .await?;
+        test_crash_point("truncate-after-commit");
+        Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
@@ -402,7 +405,9 @@ impl RaftLogStorage<ControlRaftConfig> for ConsensusLogStore {
             })
             .map_err(storage_write_error)
         })
-        .await
+        .await?;
+        test_crash_point("purge-after-commit");
+        Ok(())
     }
 }
 
@@ -1450,6 +1455,27 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                "vote" => {
+                    store.save_vote(&Vote::new_committed(7, 1)).await.unwrap();
+                }
+                "truncate" => {
+                    store
+                        .blocking_append([
+                            entry(7, 1, b"one"),
+                            entry(7, 2, b"two"),
+                            entry(7, 3, b"three"),
+                        ])
+                        .await
+                        .unwrap();
+                    store.truncate(log_id(7, 3)).await.unwrap();
+                }
+                "purge" => {
+                    store
+                        .blocking_append([entry(7, 1, b"one"), entry(7, 2, b"two")])
+                        .await
+                        .unwrap();
+                    store.purge(log_id(7, 1)).await.unwrap();
+                }
                 "state-machine" => {
                     let mut state_machine = store.state_machine().unwrap();
                     state_machine
@@ -1538,6 +1564,42 @@ mod tests {
         let mut state_machine = reopened.state_machine().unwrap();
         let (last_applied, _) = runtime.block_on(state_machine.applied_state()).unwrap();
         assert_eq!(last_applied, Some(log_id(7, 1)));
+
+        let vote_root = TempDir::new().unwrap();
+        let status = run_crash_helper(vote_root.path(), "vote", "vote-after-commit");
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let mut reopened = ConsensusLogStore::open(vote_root.path(), "cluster-a").unwrap();
+        assert_eq!(
+            runtime
+                .block_on(RaftLogStorage::read_vote(&mut reopened))
+                .unwrap(),
+            Some(Vote::new_committed(7, 1))
+        );
+
+        let truncate_root = TempDir::new().unwrap();
+        let status = run_crash_helper(truncate_root.path(), "truncate", "truncate-after-commit");
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let mut reopened = ConsensusLogStore::open(truncate_root.path(), "cluster-a").unwrap();
+        assert_eq!(
+            runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+            vec![entry(7, 1, b"one"), entry(7, 2, b"two")]
+        );
+
+        let purge_root = TempDir::new().unwrap();
+        let status = run_crash_helper(purge_root.path(), "purge", "purge-after-commit");
+        assert_eq!(status.code(), Some(TEST_CRASH_EXIT_CODE));
+        let mut reopened = ConsensusLogStore::open(purge_root.path(), "cluster-a").unwrap();
+        assert_eq!(
+            runtime.block_on(reopened.try_get_log_entries(..)).unwrap(),
+            vec![entry(7, 2, b"two")]
+        );
+        assert_eq!(
+            runtime
+                .block_on(reopened.get_log_state())
+                .unwrap()
+                .last_purged_log_id,
+            Some(log_id(7, 1))
+        );
     }
 
     #[test]
