@@ -239,6 +239,7 @@ impl RustPlugin for ClusterPlugin {
         > = control;
         let worker = Arc::new(worker_runtime::WorkerServiceHandle::new(
             worker_pane_runtime::local_worker_registry(
+                caller.clone(),
                 identity.node_id().to_string(),
                 worker_runtime::NodeSignatureLeaseVerifier::new(caller),
             ),

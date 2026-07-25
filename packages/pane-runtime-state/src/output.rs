@@ -21,7 +21,10 @@ use uuid::Uuid;
 /// - `stream_start` / `stream_end` describe the absolute byte range
 ///   within the pane's output stream that this slice covers (used by
 ///   tests + recording to order chunks).
-/// - `stream_gap` is `true` when the client's previous cursor position
+/// - `retained_start` is the oldest cursor still available from the source.
+/// - `source_end` is the source tail observed by this read and allows callers
+///   to distinguish a bounded partial response from a complete response.
+/// - `stream_gap` is `true` when the requested cursor position
 ///   has been evicted from the output buffer's ring; the caller
 ///   should treat the returned bytes as discontinuous from the
 ///   previous read (and typically resync state).

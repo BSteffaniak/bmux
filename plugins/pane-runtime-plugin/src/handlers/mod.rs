@@ -99,6 +99,21 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-commands", "pane-direct-input" => |req: pane_commands::PaneDirectInputArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::pane_direct_input(req, ctx))
         },
+        "pane-runtime-commands", "execution-pane-input" => |req: pane_commands::ExecutionPaneInputArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::execution_pane_input(req))
+        },
+        "pane-runtime-commands", "destroy-execution-pane" => |req: pane_commands::ExecutionPaneTargetArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::destroy_execution_pane(&req))
+        },
+        "pane-runtime-commands", "ensure-execution-pane" => |req: pane_commands::EnsureExecutionPaneArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::ensure_execution_pane(req))
+        },
+        "pane-runtime-commands", "pane-set-pty-size" => |req: pane_commands::PaneSetPtySizeArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::pane_set_pty_size(&req))
+        },
+        "pane-runtime-commands", "pane-signal" => |req: pane_commands::PaneSignalArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::pane_signal(&req))
+        },
         "pane-runtime-commands", "set-client-write-permission" => |req: pane_commands::SetClientWritePermissionArgs, _ctx| {
             Ok::<_, ServiceResponse>(pane_commands::set_client_write_permission(&req))
         },
@@ -153,6 +168,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
         "attach-runtime-state", "attach-pane-output-batch" => |req: attach_state::AttachPaneOutputBatchArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_output_batch(&req, ctx))
+        },
+        "attach-runtime-state", "pane-output-cursor-state" => |req: attach_state::PaneOutputCursorArgs, _ctx| {
+            Ok::<_, ServiceResponse>(attach_state::pane_output_cursor_state(&req))
+        },
+        "attach-runtime-state", "pane-grid-snapshot-state" => |req: attach_state::PaneGridSnapshotArgs, _ctx| {
+            Ok::<_, ServiceResponse>(attach_state::pane_grid_snapshot_state(&req))
         },
         "attach-runtime-state", "attach-pane-grid-snapshot-state" => |req: attach_state::AttachPaneGridSnapshotArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_snapshot_state(&req, ctx))

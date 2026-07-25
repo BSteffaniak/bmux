@@ -24,7 +24,6 @@ bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_pane_runtime_state = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
-bmux_session_models = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
 iroh = { workspace = true }
 openraft = { workspace = true }

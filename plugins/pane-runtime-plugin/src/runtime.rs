@@ -5546,6 +5546,18 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 
+    fn signal_pane_process(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        signal: bmux_pane_runtime_state::PaneProcessSignal,
+    ) -> anyhow::Result<()> {
+        let process = self
+            .pane_process_identity(session_id, pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+        send_process_signal(&process, signal)
+    }
+
     fn close_pane(
         &self,
         session_id: SessionId,
@@ -6817,6 +6829,53 @@ where
     }
 
     Some(ProcessInspectionResult { command, cwd })
+}
+
+fn send_process_signal_command(
+    program: &str,
+    process: &bmux_pane_runtime_state::PaneProcessIdentity,
+    signal: bmux_pane_runtime_state::PaneProcessSignal,
+) -> anyhow::Result<()> {
+    let number = match signal {
+        bmux_pane_runtime_state::PaneProcessSignal::Interrupt => "INT",
+        bmux_pane_runtime_state::PaneProcessSignal::Terminate => "TERM",
+        bmux_pane_runtime_state::PaneProcessSignal::Kill => "KILL",
+        bmux_pane_runtime_state::PaneProcessSignal::Hangup => "HUP",
+    };
+    let target = process
+        .process_group_id
+        .map(|group| format!("-{group}"))
+        .or_else(|| process.pid.map(|pid| pid.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("pane process identity is not available"))?;
+    let status = std::process::Command::new(program)
+        .arg(format!("-{number}"))
+        .arg("--")
+        .arg(target)
+        .status()
+        .map_err(|error| anyhow::anyhow!("failed invoking kill: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else if let Some(code) = status.code() {
+        anyhow::bail!("kill -{number} failed with exit code {code}")
+    } else {
+        anyhow::bail!("kill -{number} was terminated before completion")
+    }
+}
+
+#[cfg(unix)]
+fn send_process_signal(
+    process: &bmux_pane_runtime_state::PaneProcessIdentity,
+    signal: bmux_pane_runtime_state::PaneProcessSignal,
+) -> anyhow::Result<()> {
+    send_process_signal_command("kill", process, signal)
+}
+
+#[cfg(not(unix))]
+fn send_process_signal(
+    _process: &bmux_pane_runtime_state::PaneProcessIdentity,
+    _signal: bmux_pane_runtime_state::PaneProcessSignal,
+) -> anyhow::Result<()> {
+    anyhow::bail!("pane process signaling is unsupported on this platform")
 }
 
 #[cfg(unix)]
@@ -8505,6 +8564,52 @@ mod tests {
 
         let result = buf.read_recent_with_offsets(30).bytes;
         assert_eq!(result, b"BBBBBBBBBBBBBBBBBB");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_signal_targets_group_with_named_signal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let capture = directory.path().join("capture");
+        let script = directory.path().join("kill");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", capture.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        send_process_signal_command(
+            script.to_str().unwrap(),
+            &bmux_pane_runtime_state::PaneProcessIdentity {
+                session_id: SessionId(Uuid::nil()),
+                pane_id: Uuid::nil(),
+                pid: Some(10),
+                process_group_id: Some(42),
+            },
+            bmux_pane_runtime_state::PaneProcessSignal::Interrupt,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(capture).unwrap(), "-INT\n--\n-42\n");
+    }
+
+    #[test]
+    fn absolute_output_read_reports_retention_and_source_bounds() {
+        let mut output = OutputFanoutBuffer::new(4);
+        output.push_chunk(b"abcdef");
+        let repaired = output.read_at(0, 2);
+        assert!(repaired.stream_gap);
+        assert_eq!(repaired.stream_start, 2);
+        assert_eq!(repaired.stream_end, 4);
+        assert_eq!(repaired.bytes, b"cd");
+        let bounded = output.read_at(4, 1);
+        assert!(!bounded.stream_gap);
+        assert_eq!(bounded.stream_start, 4);
+        assert_eq!(bounded.stream_end, 5);
+        assert_eq!(bounded.bytes, b"e");
+        assert_eq!(output.start_offset, 2);
+        assert_eq!(output.end_offset(), 6);
     }
 
     #[test]

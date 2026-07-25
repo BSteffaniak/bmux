@@ -66,3 +66,6 @@ image-registry = [
     "bmux_image/iterm2",
 ]
 static-bundled = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -246,6 +246,59 @@ interface pane-runtime-commands {
         data: list<u8>,
     ) -> result<pane-ack, pane-command-error>;
 
+    // Internal input path for a previously generation-fenced worker request.
+    command execution-pane-input(
+        session_id: uuid,
+        pane_id: uuid,
+        data: list<u8>,
+    ) -> result<pane-ack, pane-command-error>;
+
+    // Remove the deterministic execution runtime, including its final pane.
+    command destroy-execution-pane(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<pane-ack, pane-command-error>;
+
+    record environment-entry {
+        key: string,
+        value: string,
+    }
+
+    // Idempotently create the exact deterministic worker execution binding.
+    command ensure-execution-pane(
+        session_id: uuid,
+        pane_id: uuid,
+        name: string?,
+        program: string,
+        args: list<string>,
+        cwd: string?,
+        env: list<environment-entry>,
+        rows: u16,
+        cols: u16,
+    ) -> result<pane-ack, pane-command-error>;
+
+    // Set the exact PTY dimensions for a pane without changing split layout.
+    command pane-set-pty-size(
+        session_id: uuid,
+        pane_id: uuid,
+        rows: u16,
+        cols: u16,
+    ) -> result<pane-ack, pane-command-error>;
+
+    enum pane-process-signal {
+        interrupt,
+        terminate,
+        kill,
+        hangup,
+    }
+
+    // Signal the pane process group (or direct process fallback).
+    command pane-signal(
+        session_id: uuid,
+        pane_id: uuid,
+        signal: pane-process-signal,
+    ) -> result<pane-ack, pane-command-error>;
+
     // Update the cached write decision for an already-attached client.
     // The permissions plugin calls this when a role changes so pane input
     // stays hot-path local without becoming stale.
@@ -533,11 +586,35 @@ interface attach-runtime-state {
         max_bytes: u32,
     ) -> result<attach-pane-output-batch, attach-state-error>;
 
+    record pane-output-cursor-read {
+        data: list<u8>,
+        retained_start: u64,
+        stream_start: u64,
+        stream_end: u64,
+        source_end: u64,
+        stream_gap: bool,
+    }
+
+    // Read one pane by absolute stream cursor without attach-client state.
+    query pane-output-cursor-state(
+        session_id: uuid,
+        pane_id: uuid,
+        cursor: u64,
+        max_bytes: u32,
+    ) -> result<pane-output-cursor-read, attach-state-error>;
+
     query attach-pane-grid-snapshot-state(
         session_id: uuid,
         pane_ids: list<uuid>,
         max_rows_per_pane: u32,
     ) -> result<attach-pane-grid-snapshot, attach-state-error>;
+
+    // Complete renderer snapshot for one local pane without attach-client state.
+    query pane-grid-snapshot-state(
+        session_id: uuid,
+        pane_id: uuid,
+        max_rows: u32,
+    ) -> result<pane-grid-snapshot, attach-state-error>;
 
     query attach-pane-grid-window-state(
         session_id: uuid,

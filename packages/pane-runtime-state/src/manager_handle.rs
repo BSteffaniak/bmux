@@ -140,6 +140,14 @@ pub struct PaneProcessIdentity {
     pub process_group_id: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneProcessSignal {
+    Interrupt,
+    Terminate,
+    Kill,
+    Hangup,
+}
+
 /// Public projection of a floating pane runtime.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +250,14 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pane_id: Uuid,
         rows: u16,
         cols: u16,
+    ) -> anyhow::Result<()>;
+
+    /// Sends an operating-system process signal to the exact pane process.
+    fn signal_pane_process(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        signal: PaneProcessSignal,
     ) -> anyhow::Result<()>;
 
     fn close_pane(
@@ -712,6 +728,14 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _pane_id: Uuid,
         _rows: u16,
         _cols: u16,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn signal_pane_process(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _signal: PaneProcessSignal,
     ) -> anyhow::Result<()> {
         anyhow::bail!("pane-runtime plugin not active")
     }

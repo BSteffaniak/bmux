@@ -79,6 +79,51 @@ pub struct ClosePaneArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPaneInputArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPaneTargetArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsureExecutionPaneArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Vec<bmux_pane_runtime_plugin_api::pane_runtime_commands::EnvironmentEntry>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneSetPtySizeArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneSignalArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub signal: bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneProcessSignal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartPaneArgs {
     pub session_id: Uuid,
     #[serde(default)]
@@ -829,6 +874,146 @@ pub fn pane_direct_input(
             return Err(failed_command(reason));
         }
     }
+    Ok(PaneAck {
+        session_id: req.session_id,
+        pane_id: req.pane_id,
+    })
+}
+
+pub fn execution_pane_input(req: ExecutionPaneInputArgs) -> Result<PaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    handle
+        .0
+        .write_input_to_pane(
+            SessionId(req.session_id),
+            ClientId(Uuid::nil()),
+            req.pane_id,
+            req.data,
+        )
+        .map_err(|error| failed_command(error.to_string()))?;
+    Ok(PaneAck {
+        session_id: req.session_id,
+        pane_id: req.pane_id,
+    })
+}
+
+pub fn destroy_execution_pane(req: &ExecutionPaneTargetArgs) -> Result<PaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    if handle
+        .0
+        .pane_process_identity(session_id, req.pane_id)
+        .is_none()
+    {
+        return Err(failed_command("execution pane is missing"));
+    }
+    let removed = handle
+        .0
+        .remove_runtime(session_id)
+        .ok_or_else(|| failed_command("execution runtime is missing"))?;
+    handle.0.shutdown_removed_runtime(removed);
+    Ok(PaneAck {
+        session_id: req.session_id,
+        pane_id: req.pane_id,
+    })
+}
+
+pub fn ensure_execution_pane(req: EnsureExecutionPaneArgs) -> Result<PaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    if req.rows == 0 || req.cols == 0 || req.program.trim().is_empty() {
+        return Err(failed_command(
+            "execution pane requires a program and positive dimensions",
+        ));
+    }
+    let session_id = SessionId(req.session_id);
+    if handle.0.session_exists(session_id) {
+        return handle
+            .0
+            .pane_process_identity(session_id, req.pane_id)
+            .map(|_| PaneAck {
+                session_id: req.session_id,
+                pane_id: req.pane_id,
+            })
+            .ok_or_else(|| {
+                failed_command("execution session exists without its deterministic pane")
+            });
+    }
+    let pane = bmux_pane_runtime_state::PaneRuntimeMeta {
+        id: req.pane_id,
+        name: req.name,
+        shell: req.program.clone(),
+        launch: Some(bmux_pane_runtime_state::PaneLaunchSpec {
+            program: req.program,
+            args: req.args,
+            cwd: req.cwd,
+            env: req
+                .env
+                .into_iter()
+                .map(|entry| (entry.key, entry.value))
+                .collect(),
+        }),
+        resurrection: bmux_pane_runtime_state::PaneResurrectionSnapshot::default(),
+    };
+    handle
+        .0
+        .restore_runtime(
+            session_id,
+            &[pane],
+            Some(bmux_pane_runtime_state::PaneLayoutNode::Leaf {
+                pane_id: req.pane_id,
+            }),
+            req.pane_id,
+            Vec::new(),
+            None,
+        )
+        .map_err(|error| failed_command(error.to_string()))?;
+    handle
+        .0
+        .set_pane_pty_size(session_id, req.pane_id, req.rows, req.cols)
+        .map_err(|error| failed_command(error.to_string()))?;
+    Ok(PaneAck {
+        session_id: req.session_id,
+        pane_id: req.pane_id,
+    })
+}
+
+pub fn pane_set_pty_size(req: &PaneSetPtySizeArgs) -> Result<PaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    handle
+        .0
+        .set_pane_pty_size(SessionId(req.session_id), req.pane_id, req.rows, req.cols)
+        .map_err(|error| failed_command(error.to_string()))?;
+    Ok(PaneAck {
+        session_id: req.session_id,
+        pane_id: req.pane_id,
+    })
+}
+
+pub fn pane_signal(req: &PaneSignalArgs) -> Result<PaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let signal = match req.signal {
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneProcessSignal::Interrupt => {
+            bmux_pane_runtime_state::PaneProcessSignal::Interrupt
+        }
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneProcessSignal::Terminate => {
+            bmux_pane_runtime_state::PaneProcessSignal::Terminate
+        }
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneProcessSignal::Kill => {
+            bmux_pane_runtime_state::PaneProcessSignal::Kill
+        }
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneProcessSignal::Hangup => {
+            bmux_pane_runtime_state::PaneProcessSignal::Hangup
+        }
+    };
+    handle
+        .0
+        .signal_pane_process(SessionId(req.session_id), req.pane_id, signal)
+        .map_err(|error| failed_command(error.to_string()))?;
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id: req.pane_id,

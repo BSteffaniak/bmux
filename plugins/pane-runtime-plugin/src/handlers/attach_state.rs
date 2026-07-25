@@ -15,7 +15,7 @@ use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch,
     AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
     AttachStateError, PaneChunk, PaneGridDelta, PaneGridSnapshot, PaneGridWindow,
-    PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol,
+    PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol, PaneOutputCursorRead,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -45,6 +45,21 @@ pub struct AttachPaneOutputBatchArgs {
     pub session_id: Uuid,
     pub pane_ids: Vec<Uuid>,
     pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneOutputCursorArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub cursor: u64,
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneGridSnapshotArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub max_rows: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +230,56 @@ pub fn attach_pane_output_batch(
         chunks: chunks.into_iter().map(chunk_to_record).collect(),
         output_still_pending,
     })
+}
+
+pub fn pane_output_cursor_state(
+    req: &PaneOutputCursorArgs,
+) -> Result<PaneOutputCursorRead, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let read = handle
+        .0
+        .read_pane_output_at(
+            SessionId(req.session_id),
+            req.pane_id,
+            req.cursor,
+            usize::try_from(req.max_bytes).unwrap_or(usize::MAX),
+        )
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(PaneOutputCursorRead {
+        data: read.bytes,
+        retained_start: read.retained_start,
+        stream_start: read.stream_start,
+        stream_end: read.stream_end,
+        source_end: read.source_end,
+        stream_gap: read.stream_gap,
+    })
+}
+
+pub fn pane_grid_snapshot_state(
+    req: &PaneGridSnapshotArgs,
+) -> Result<PaneGridSnapshot, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let state = handle
+        .0
+        .attach_grid_snapshot_state(
+            SessionId(req.session_id),
+            ClientId(Uuid::nil()),
+            &[req.pane_id],
+            usize::try_from(req.max_rows).unwrap_or(usize::MAX),
+        )
+        .map_err(|error| failed(error.to_string()))?;
+    state
+        .snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.pane_id == req.pane_id)
+        .map(|snapshot| PaneGridSnapshot {
+            pane_id: snapshot.pane_id,
+            stream_end: snapshot.stream_end,
+            encoded: snapshot.encoded,
+        })
+        .ok_or_else(|| failed("pane snapshot is missing"))
 }
 
 pub fn attach_pane_grid_snapshot_state(
