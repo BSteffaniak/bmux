@@ -233,6 +233,17 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         cells: u16,
     ) -> anyhow::Result<()>;
 
+    /// Sets the exact PTY dimensions for one pane without mutating the logical
+    /// split layout. Worker runtimes use this for generation-fenced remote
+    /// resize requests.
+    fn set_pane_pty_size(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<()>;
+
     fn close_pane(
         &self,
         session_id: SessionId,
@@ -348,6 +359,17 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError>;
+
+    /// Reads an absolute output cursor range for a pane without registering a
+    /// connection-scoped client cursor. Returns the retained range and whether
+    /// the requested cursor was repaired to the retention boundary.
+    fn read_pane_output_at(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> Result<crate::OutputRead, SessionRuntimeError>;
 
     fn set_client_write_permission(
         &self,
@@ -684,6 +706,15 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
     ) -> anyhow::Result<()> {
         anyhow::bail!("pane-runtime plugin not active")
     }
+    fn set_pane_pty_size(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _rows: u16,
+        _cols: u16,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
     fn close_pane(
         &self,
         _session_id: SessionId,
@@ -813,6 +844,15 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _pane_id: Uuid,
         _data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+    fn read_pane_output_at(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _cursor: u64,
+        _max_bytes: usize,
+    ) -> Result<crate::OutputRead, SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
     fn set_client_write_permission(

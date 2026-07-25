@@ -1,7 +1,10 @@
 //! Deterministic worker placement and inspectable candidate ranking.
 
 use crate::membership::NodeId;
-use bmux_cluster_plugin_api::cluster_types::{PlacementIntent, PlacementLabel};
+use bmux_cluster_plugin_api::cluster_types::{
+    CommandId, ControlCommand, ControlCommandRequest, ExecutionAssignment, ExecutionId,
+    LogicalPaneId, PlacementIntent, PlacementLabel,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +96,91 @@ pub struct PlacementDecision {
     pub observation_epoch: u64,
     pub selected_node_id: Option<NodeId>,
     pub candidates: Vec<PlacementCandidateExplanation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementWorkflowError {
+    NoEligibleWorker(PlacementDecision),
+    PaneMissing,
+    PaneUnassigned,
+    GenerationOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementAssignmentPlan {
+    pub decision: PlacementDecision,
+    pub command: ControlCommand,
+}
+
+/// Selects a worker and builds the deterministic generation-fenced assignment
+/// command that must commit before any worker launch side effect.
+///
+/// # Errors
+///
+/// Returns an inspectable no-candidate decision or invalid pane/generation state.
+pub fn plan_assignment(
+    state: &crate::control_state::ControlState,
+    pane_id: &LogicalPaneId,
+    principal_id: String,
+    command_id: CommandId,
+    issued_at_unix_ms: u64,
+    request: &PlacementRequest,
+    candidates: impl IntoIterator<Item = PlacementCandidate>,
+) -> Result<PlacementAssignmentPlan, PlacementWorkflowError> {
+    let pane = state
+        .panes
+        .get(&pane_id.value)
+        .ok_or(PlacementWorkflowError::PaneMissing)?;
+    let decision = choose_worker(request, candidates);
+    let selected = decision
+        .selected_node_id
+        .ok_or_else(|| PlacementWorkflowError::NoEligibleWorker(decision.clone()))?;
+    let current_generation = pane
+        .execution
+        .as_ref()
+        .map_or(0, |assignment| assignment.generation);
+    let next_generation = current_generation
+        .checked_add(1)
+        .ok_or(PlacementWorkflowError::GenerationOverflow)?;
+    let execution_id = ExecutionId {
+        value: deterministic_execution_id(&command_id, pane_id, next_generation),
+    };
+    Ok(PlacementAssignmentPlan {
+        decision,
+        command: ControlCommand {
+            schema_version: state.schema_version,
+            principal_id,
+            command_id,
+            issued_at_unix_ms,
+            request: ControlCommandRequest::AssignExecution {
+                pane_id: pane_id.clone(),
+                expected_revision: pane.revision,
+                expected_generation: current_generation,
+                assignment: ExecutionAssignment {
+                    node_id: selected.to_string(),
+                    generation: next_generation,
+                    execution_id,
+                },
+            },
+        },
+    })
+}
+
+fn deterministic_execution_id(
+    command_id: &CommandId,
+    pane_id: &LogicalPaneId,
+    generation: u64,
+) -> uuid::Uuid {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"bmux.cluster.execution.v1\0");
+    digest.update(command_id.value.as_bytes());
+    digest.update(pane_id.value.as_bytes());
+    digest.update(generation.to_be_bytes());
+    let bytes: [u8; 16] = digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix is exactly 16 bytes");
+    uuid::Uuid::from_bytes(bytes)
 }
 
 #[must_use]
@@ -281,6 +369,148 @@ mod tests {
             observation_epoch: 8,
             control_revision: 9,
         }
+    }
+
+    use bmux_cluster_plugin_api::cluster_types::{
+        LogicalWindowId, PaneAvailability, PaneRestartPolicy, WorkspaceId, WorkspaceRecord,
+    };
+
+    fn pane_state(assigned_generation: Option<u64>) -> crate::control_state::ControlState {
+        let mut state = crate::control_state::ControlState::new("cluster:test");
+        let workspace_id = WorkspaceId {
+            value: uuid::Uuid::from_u128(10),
+        };
+        let window_id = LogicalWindowId {
+            value: uuid::Uuid::from_u128(20),
+        };
+        state.workspaces.insert(
+            workspace_id.value,
+            WorkspaceRecord {
+                workspace_id: workspace_id.clone(),
+                name: None,
+                revision: 1,
+            },
+        );
+        state.windows.insert(
+            window_id.value,
+            bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord {
+                window_id: window_id.clone(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                layout_schema_version: 1,
+                layout: Vec::new(),
+                revision: 1,
+            },
+        );
+        state.panes.insert(
+            uuid::Uuid::from_u128(30),
+            bmux_cluster_plugin_api::cluster_types::LogicalPaneRecord {
+                pane_id: LogicalPaneId {
+                    value: uuid::Uuid::from_u128(30),
+                },
+                workspace_id,
+                window_id,
+                name: None,
+                restart_policy: PaneRestartPolicy::Manual,
+                placement: PlacementIntent {
+                    explicit_node_id: None,
+                    required_labels: Vec::new(),
+                    preferred_labels: Vec::new(),
+                },
+                availability: PaneAvailability::Ready,
+                availability_reason: None,
+                execution: assigned_generation.map(|generation| ExecutionAssignment {
+                    node_id: NodeId::from(1).to_string(),
+                    generation,
+                    execution_id: ExecutionId {
+                        value: uuid::Uuid::from_u128(40),
+                    },
+                }),
+                revision: 7,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn assignment_plan_fences_current_generation_before_launch() {
+        let pane_id = LogicalPaneId {
+            value: uuid::Uuid::from_u128(30),
+        };
+        let command_id = CommandId {
+            value: uuid::Uuid::from_u128(100),
+        };
+        let plan = plan_assignment(
+            &pane_state(Some(4)),
+            &pane_id,
+            "principal:test".to_string(),
+            command_id.clone(),
+            55,
+            &request(),
+            [candidate(2)],
+        )
+        .unwrap();
+        let ControlCommandRequest::AssignExecution {
+            expected_revision,
+            expected_generation,
+            assignment,
+            ..
+        } = plan.command.request
+        else {
+            panic!("placement must produce assignment intent");
+        };
+        assert_eq!(expected_revision, 7);
+        assert_eq!(expected_generation, 4);
+        assert_eq!(assignment.generation, 5);
+        assert_eq!(assignment.node_id, NodeId::from(2).to_string());
+        assert_ne!(assignment.execution_id.value, uuid::Uuid::from_u128(40));
+
+        let replay = plan_assignment(
+            &pane_state(Some(4)),
+            &pane_id,
+            "principal:test".to_string(),
+            command_id,
+            55,
+            &request(),
+            [candidate(2)],
+        )
+        .unwrap();
+        let ControlCommandRequest::AssignExecution {
+            assignment: replay_assignment,
+            ..
+        } = replay.command.request
+        else {
+            panic!("placement must produce assignment intent");
+        };
+        assert_eq!(assignment.execution_id, replay_assignment.execution_id);
+    }
+
+    #[test]
+    fn no_eligible_worker_returns_complete_explanation_without_assignment() {
+        let mut unavailable = candidate(2);
+        unavailable.health = PlacementHealth::Unavailable;
+        let error = plan_assignment(
+            &pane_state(None),
+            &LogicalPaneId {
+                value: uuid::Uuid::from_u128(30),
+            },
+            "principal:test".to_string(),
+            CommandId {
+                value: uuid::Uuid::from_u128(101),
+            },
+            55,
+            &request(),
+            [unavailable],
+        )
+        .unwrap_err();
+        let PlacementWorkflowError::NoEligibleWorker(decision) = error else {
+            panic!("expected no eligible worker");
+        };
+        assert_eq!(decision.selected_node_id, None);
+        assert_eq!(
+            decision.candidates[0].rejection,
+            Some(PlacementRejection::Unavailable)
+        );
     }
 
     #[test]

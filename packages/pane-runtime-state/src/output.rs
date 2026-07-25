@@ -28,8 +28,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Default)]
 pub struct OutputRead {
     pub bytes: Vec<u8>,
+    pub retained_start: u64,
     pub stream_start: u64,
     pub stream_end: u64,
+    pub source_end: u64,
     pub stream_gap: bool,
 }
 

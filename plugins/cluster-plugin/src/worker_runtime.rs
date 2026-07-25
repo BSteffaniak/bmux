@@ -6,17 +6,20 @@
 
 use bmux_cluster_plugin_api::cluster_types::{
     CommandId, ExecutionId, WorkerAuthority, WorkerExecution, WorkerExecutionList,
-    WorkerExecutionState, WorkerOperationClass, WorkerOutput, WorkerQueryResult,
-    WorkerRegistryStats, WorkerServiceError,
+    WorkerExecutionState, WorkerLaunchResult, WorkerOperationClass, WorkerOutput,
+    WorkerQueryResult, WorkerRegistryStats, WorkerServiceError,
 };
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
+use std::time::Instant;
 
 pub const MAX_CONTROL_LEASE_DURATION_MS: u64 = 5_000;
+const DEFAULT_REGISTRY_OUTPUT_HARD_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 pub trait WorkerPaneRuntime: Send + Sync {
-    /// Launches one local pane for the committed execution intent.
+    /// Starts a local runtime with the requested command, environment, and PTY
+    /// dimensions for one committed execution.
     ///
     /// # Errors
     ///
@@ -49,6 +52,20 @@ pub trait WorkerPaneRuntime: Send + Sync {
         pane_id: uuid::Uuid,
         data: &[u8],
     ) -> Result<(), WorkerServiceError>;
+
+    /// Reads an absolute output cursor range from the exact local pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns a generated worker error when the binding is missing or output
+    /// cannot be read.
+    fn output(
+        &self,
+        session_id: uuid::Uuid,
+        pane_id: uuid::Uuid,
+        cursor: u64,
+        max_bytes: u32,
+    ) -> Result<bmux_pane_runtime_state::OutputRead, WorkerServiceError>;
 
     /// Applies the viewport size to the exact bound local pane/session.
     ///
@@ -444,6 +461,10 @@ where
             let end = entry.output.append(data, monotonic_now_ms)?;
             entry.execution.output_end = end;
             entry.execution.output_start = entry.output.start;
+            enforce_registry_output_cap(
+                &mut inner.executions,
+                DEFAULT_REGISTRY_OUTPUT_HARD_MAX_BYTES,
+            );
             Ok(end)
         };
         drop(inner);
@@ -463,12 +484,26 @@ where
         max_bytes: u32,
     ) -> Result<WorkerOutput, WorkerServiceError> {
         let inner = self.lock()?;
-        let result = {
-            let entry = execution_entry(&inner.executions, execution_id, generation)?;
-            Ok(entry.output.read(cursor, max_bytes))
-        };
+        let execution = execution_entry(&inner.executions, execution_id, generation)?
+            .execution
+            .clone();
         drop(inner);
-        result
+        let read = self.runtime.output(
+            execution.local_session_id,
+            execution.local_pane_id,
+            cursor,
+            max_bytes,
+        )?;
+        Ok(WorkerOutput {
+            execution_id: execution_id.clone(),
+            generation,
+            requested_cursor: cursor,
+            retained_start: read.retained_start,
+            next_cursor: read.stream_end,
+            gap: read.stream_gap,
+            output_still_pending: read.stream_end < read.source_end,
+            data: read.bytes,
+        })
     }
 
     /// Produces a complete local terminal snapshot for cursor-gap repair.
@@ -763,6 +798,328 @@ fn registry_stats(executions: &BTreeMap<uuid::Uuid, WorkerRegistryEntry>) -> Wor
             .values()
             .map(|entry| u64::try_from(entry.output.retained_bytes).unwrap_or(u64::MAX))
             .fold(0_u64, u64::saturating_add),
+    }
+}
+
+fn enforce_registry_output_cap(
+    executions: &mut BTreeMap<uuid::Uuid, WorkerRegistryEntry>,
+    max_bytes: usize,
+) {
+    let total = executions
+        .values()
+        .map(|entry| entry.output.retained_bytes)
+        .fold(0_usize, usize::saturating_add);
+    if total <= max_bytes {
+        return;
+    }
+    let mut remaining = max_bytes;
+    for entry in executions.values_mut().rev() {
+        let allowance = remaining.min(entry.output.retained_bytes);
+        entry.output.enforce_global_cap(allowance);
+        entry.execution.output_start = entry.output.start;
+        remaining = remaining.saturating_sub(entry.output.retained_bytes);
+    }
+}
+
+pub struct NodeSignatureLeaseVerifier<C> {
+    caller: std::sync::Arc<C>,
+}
+
+impl<C> NodeSignatureLeaseVerifier<C> {
+    #[must_use]
+    pub const fn new(caller: std::sync::Arc<C>) -> Self {
+        Self { caller }
+    }
+}
+
+impl<C> WorkerLeaseVerifier for NodeSignatureLeaseVerifier<C>
+where
+    C: crate::ClusterRuntimeOps + Send + Sync,
+{
+    fn verify(&self, authority: &WorkerAuthority, payload: &[u8]) -> Result<(), String> {
+        let membership = crate::membership::load_membership_state(self.caller.as_ref())?
+            .ok_or_else(|| "cluster membership is not initialized".to_string())?;
+        let issuer = membership
+            .members
+            .get(&authority.issuer_node_id)
+            .ok_or_else(|| "worker lease issuer is not a cluster member".to_string())?;
+        if issuer.state != bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
+            || issuer.capabilities.consensus_role
+                != bmux_cluster_plugin_api::cluster_types::ClusterConsensusRole::Voter
+        {
+            return Err("worker lease issuer is not an active voter".to_string());
+        }
+        crate::membership::verify_node_signature(
+            &authority.issuer_node_id,
+            payload,
+            &authority.lease_signature,
+        )
+    }
+}
+
+/// Generated worker-service provider around one private execution registry.
+///
+/// The registry owns all mutable worker execution state. This handle provides
+/// process-monotonic lease timing and async trait adaptation.
+pub struct WorkerServiceHandle<R, V> {
+    registry: WorkerRegistry<R, V>,
+    started_at: Instant,
+}
+
+impl<R, V> WorkerServiceHandle<R, V>
+where
+    R: WorkerPaneRuntime,
+    V: WorkerLeaseVerifier,
+{
+    #[must_use]
+    pub fn new(registry: WorkerRegistry<R, V>) -> Self {
+        Self {
+            registry,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn monotonic_now_ms(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+const fn launch_result(execution: WorkerExecution) -> WorkerLaunchResult {
+    match execution.state {
+        WorkerExecutionState::Launching => WorkerLaunchResult::Pending { execution },
+        WorkerExecutionState::Ready
+        | WorkerExecutionState::Exited
+        | WorkerExecutionState::Unavailable
+        | WorkerExecutionState::Quarantined
+        | WorkerExecutionState::Closed => WorkerLaunchResult::Ready { execution },
+    }
+}
+
+impl<R, V> bmux_cluster_plugin_api::cluster_worker_command::ClusterWorkerCommandService
+    for WorkerServiceHandle<R, V>
+where
+    R: WorkerPaneRuntime + 'static,
+    V: WorkerLeaseVerifier + 'static,
+{
+    fn launch<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+        spec: bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<WorkerLaunchResult, WorkerServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .launch(&command_id, authority, &spec, self.monotonic_now_ms())
+                .map(launch_result)
+        })
+    }
+
+    fn adopt<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+        spec: bmux_cluster_plugin_api::cluster_types::WorkerAdoptionSpec,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<WorkerLaunchResult, WorkerServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .adopt(&command_id, authority, &spec, self.monotonic_now_ms())
+                .map(launch_result)
+        })
+    }
+
+    fn input<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::WorkerMutationAck,
+                        WorkerServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .input(&command_id, &authority, &data, self.monotonic_now_ms())
+        })
+    }
+
+    fn resize<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+        cols: u16,
+        rows: u16,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::WorkerMutationAck,
+                        WorkerServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .resize(&command_id, &authority, cols, rows, self.monotonic_now_ms())
+        })
+    }
+
+    fn signal<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+        signal: bmux_cluster_plugin_api::cluster_types::WorkerSignal,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::WorkerMutationAck,
+                        WorkerServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .signal(&command_id, &authority, signal, self.monotonic_now_ms())
+        })
+    }
+
+    fn restart<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+        spec: bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<WorkerLaunchResult, WorkerServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .restart(&command_id, authority, &spec, self.monotonic_now_ms())
+                .map(launch_result)
+        })
+    }
+
+    fn close<'a>(
+        &'a self,
+        command_id: CommandId,
+        authority: WorkerAuthority,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::WorkerMutationAck,
+                        WorkerServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.registry
+                .close(&command_id, &authority, self.monotonic_now_ms())
+        })
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        executions: Vec<WorkerExecution>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<WorkerRegistryStats, WorkerServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.registry.reconcile(executions) })
+    }
+}
+
+impl<R, V> bmux_cluster_plugin_api::cluster_worker_state::ClusterWorkerStateService
+    for WorkerServiceHandle<R, V>
+where
+    R: WorkerPaneRuntime + 'static,
+    V: WorkerLeaseVerifier + 'static,
+{
+    fn get<'a>(
+        &'a self,
+        execution_id: ExecutionId,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<WorkerQueryResult, WorkerServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.registry.get(&execution_id) })
+    }
+
+    fn output<'a>(
+        &'a self,
+        execution_id: ExecutionId,
+        generation: u64,
+        cursor: u64,
+        max_bytes: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<WorkerOutput, WorkerServiceError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.registry
+                .output(&execution_id, generation, cursor, max_bytes)
+        })
+    }
+
+    fn snapshot<'a>(
+        &'a self,
+        execution_id: ExecutionId,
+        generation: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot,
+                        WorkerServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.registry.snapshot(&execution_id, generation) })
+    }
+
+    fn inventory<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WorkerExecutionList> + Send + 'a>> {
+        Box::pin(async move {
+            self.registry.inventory().unwrap_or(WorkerExecutionList {
+                executions: Vec::new(),
+            })
+        })
     }
 }
 
@@ -1197,6 +1554,28 @@ mod tests {
             Ok(())
         }
 
+        fn output(
+            &self,
+            _session_id: uuid::Uuid,
+            _pane_id: uuid::Uuid,
+            cursor: u64,
+            max_bytes: u32,
+        ) -> Result<bmux_pane_runtime_state::OutputRead, WorkerServiceError> {
+            let data = b"data";
+            let start = usize::try_from(cursor.min(data.len() as u64)).unwrap();
+            let end = start
+                .saturating_add(usize::try_from(max_bytes).unwrap())
+                .min(data.len());
+            Ok(bmux_pane_runtime_state::OutputRead {
+                bytes: data[start..end].to_vec(),
+                retained_start: 0,
+                stream_start: cursor,
+                stream_end: u64::try_from(end).unwrap(),
+                source_end: u64::try_from(data.len()).unwrap(),
+                stream_gap: false,
+            })
+        }
+
         fn resize(
             &self,
             _session_id: uuid::Uuid,
@@ -1553,6 +1932,44 @@ mod tests {
             registry.runtime.calls.lock().unwrap().as_slice(),
             ["launch", "input"]
         );
+    }
+
+    #[test]
+    fn registry_wide_output_cap_evicts_oldest_execution_streams() {
+        let mut executions = BTreeMap::new();
+        for id in 1..=2 {
+            let mut authority = authority(1, id);
+            authority.execution_id.value = uuid::Uuid::from_u128(3 + u128::from(id));
+            let mut output = WorkerOutputBuffer::new(
+                authority.execution_id.clone(),
+                authority.generation,
+                WorkerOutputRetention {
+                    minimum_bytes: 6,
+                    minimum_duration_ms: u64::MAX,
+                    hard_max_bytes: usize::MAX,
+                },
+            );
+            output
+                .append(vec![u8::try_from(id).unwrap(); 6], id)
+                .unwrap();
+            executions.insert(
+                authority.execution_id.value,
+                WorkerRegistryEntry {
+                    execution: worker_execution(
+                        authority,
+                        uuid::Uuid::from_u128(100 + u128::from(id)),
+                        uuid::Uuid::from_u128(200 + u128::from(id)),
+                    ),
+                    output,
+                },
+            );
+        }
+        enforce_registry_output_cap(&mut executions, 8);
+        assert_eq!(registry_stats(&executions).retained_output_bytes, 6);
+        let entries = executions.values().collect::<Vec<_>>();
+        assert_eq!(entries[0].output.retained_bytes, 0);
+        assert_eq!(entries[0].execution.output_start, 6);
+        assert_eq!(entries[1].output.retained_bytes, 6);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub(crate) mod membership;
 pub(crate) mod pane;
 pub mod placement;
 pub(crate) mod storage;
+pub mod worker_pane_runtime;
 pub mod worker_runtime;
 pub(crate) mod workspace;
 
@@ -222,7 +223,7 @@ impl RustPlugin for ClusterPlugin {
             nodes.clone(),
         ));
         let control = Arc::new(consensus_network::ControlServiceHandle::new(
-            caller,
+            caller.clone(),
             *identity.node_id(),
             nodes,
         ));
@@ -236,6 +237,22 @@ impl RustPlugin for ClusterPlugin {
                 + Send
                 + Sync,
         > = control;
+        let worker = Arc::new(worker_runtime::WorkerServiceHandle::new(
+            worker_pane_runtime::local_worker_registry(
+                identity.node_id().to_string(),
+                worker_runtime::NodeSignatureLeaseVerifier::new(caller),
+            ),
+        ));
+        let worker_commands: Arc<
+            dyn bmux_cluster_plugin_api::cluster_worker_command::ClusterWorkerCommandService
+                + Send
+                + Sync,
+        > = worker.clone();
+        let worker_state: Arc<
+            dyn bmux_cluster_plugin_api::cluster_worker_state::ClusterWorkerStateService
+                + Send
+                + Sync,
+        > = worker;
         let _ = bmux_cluster_plugin_api::cluster_raft_rpc::register_provider(registry, raft_handle);
         let _ = bmux_cluster_plugin_api::cluster_control_command::register_provider(
             registry,
@@ -244,6 +261,14 @@ impl RustPlugin for ClusterPlugin {
         let _ = bmux_cluster_plugin_api::cluster_control_state::register_provider(
             registry,
             control_state,
+        );
+        let _ = bmux_cluster_plugin_api::cluster_worker_command::register_provider(
+            registry,
+            worker_commands,
+        );
+        let _ = bmux_cluster_plugin_api::cluster_worker_state::register_provider(
+            registry,
+            worker_state,
         );
     }
 

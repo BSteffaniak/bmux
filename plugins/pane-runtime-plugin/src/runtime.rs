@@ -2217,6 +2217,37 @@ impl OutputFanoutBuffer {
         }
     }
 
+    fn read_at(&self, cursor: u64, limit: usize) -> OutputRead {
+        let end = self.end_offset();
+        let stream_gap = cursor < self.start_offset || cursor > end;
+        let stream_start = cursor.clamp(self.start_offset, end);
+        if limit == 0 || stream_start == end {
+            return OutputRead {
+                bytes: Vec::new(),
+                stream_start,
+                stream_end: stream_start,
+                stream_gap,
+            };
+        }
+        let available = usize::try_from(end.saturating_sub(stream_start)).unwrap_or(usize::MAX);
+        let to_read = available.min(limit);
+        let start_index =
+            usize::try_from(stream_start.saturating_sub(self.start_offset)).unwrap_or(usize::MAX);
+        let bytes = self
+            .data
+            .iter()
+            .skip(start_index)
+            .take(to_read)
+            .copied()
+            .collect::<Vec<_>>();
+        OutputRead {
+            stream_end: stream_start.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+            bytes,
+            stream_start,
+            stream_gap,
+        }
+    }
+
     fn read_recent_with_offsets(&self, max_bytes: usize) -> OutputRead {
         let end = self.end_offset();
         if self.data.is_empty() || max_bytes == 0 {
@@ -5493,6 +5524,28 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 
+    fn set_pane_pty_size(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<()> {
+        self.with_lock_read_named("set_pane_pty_size", |manager| {
+            let runtime = manager
+                .runtimes
+                .get(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id.0))?;
+            let pane = runtime
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+            pane.resize_pty(rows, cols);
+            Ok(())
+        })
+        .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
     fn close_pane(
         &self,
         session_id: SessionId,
@@ -5735,6 +5788,37 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             warn!(attach_session_id = %session_id.0, owner_session_id = %owner_session_id.0, %pane_id, send_us = send.as_micros(), "pane direct input send exceeded hot-path budget");
         }
         Ok(bytes)
+    }
+
+    fn read_pane_output_at(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> Result<bmux_pane_runtime_state::OutputRead, SessionRuntimeError> {
+        let output = self
+            .with_lock_read_named("read_pane_output_at", |manager| {
+                let runtime = manager.runtimes.get(&session_id)?;
+                runtime
+                    .panes
+                    .get(&pane_id)
+                    .map(|pane| Arc::clone(&pane.output_buffer))
+            })
+            .flatten()
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let read = output.lock().map_err(|_| SessionRuntimeError::Closed)?;
+        let retained_start = read.start_offset;
+        let source_end = read.end_offset();
+        let read = read.read_at(cursor, max_bytes);
+        Ok(bmux_pane_runtime_state::OutputRead {
+            bytes: read.bytes,
+            retained_start,
+            stream_start: read.stream_start,
+            stream_end: read.stream_end,
+            source_end,
+            stream_gap: read.stream_gap,
+        })
     }
 
     fn set_client_write_permission(
@@ -6519,17 +6603,19 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             })
             .flatten()?;
         pane.output_dirty.store(false, Ordering::SeqCst);
-        let inner_read = pane
-            .output_buffer
-            .lock()
-            .ok()?
-            .read_for_client(client_id, budget);
+        let mut output = pane.output_buffer.lock().ok()?;
+        let retained_start = output.start_offset;
+        let source_end = output.end_offset();
+        let inner_read = output.read_for_client(client_id, budget);
+        drop(output);
         let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
         Some((
             bmux_pane_runtime_state::OutputRead {
                 bytes: inner_read.bytes,
+                retained_start,
                 stream_start: inner_read.stream_start,
                 stream_end: inner_read.stream_end,
+                source_end,
                 stream_gap: inner_read.stream_gap,
             },
             sync_update_active,
