@@ -81,6 +81,21 @@ capability   = "bmux.server_clusters.read"
 interface_id = "cluster-connection-events/v1"
 kind         = "query"
 
+[[services]]
+capability   = "bmux.server_clusters.write"
+interface_id = "cluster-control-command/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.read"
+interface_id = "cluster-control-state/v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.server_clusters.auth"
+interface_id = "cluster-raft-rpc/v1"
+kind         = "command"
+
 [[commands]]
 aliases       = [["cluster", "init"]]
 expose_in_cli = true

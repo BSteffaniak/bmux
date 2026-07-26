@@ -9,6 +9,7 @@ use bmux_cluster_plugin_api::cluster_types::{
     ConsensusVoterChangeAuthorization,
 };
 use openraft::BasicNode;
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 
 const VOTER_CHANGE_DOMAIN: &[u8] = b"bmux.cluster.voter-change.v1\0";
@@ -283,6 +284,50 @@ pub async fn remove_voter(
     .await
 }
 
+/// Publishes signed membership records through deterministic idempotent
+/// control commands.
+///
+/// # Errors
+///
+/// Returns control-plane leader, quorum, validation, or storage failures.
+pub async fn publish_members(
+    node: ConsensusNode,
+    principal_id: &str,
+    members: impl IntoIterator<Item = ClusterMember>,
+) -> Result<(), String> {
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    for member in members {
+        let command_id = membership_command_id(&member)?;
+        let command = bmux_cluster_plugin_api::cluster_types::ControlCommand {
+            schema_version: crate::control_state::CONTROL_SCHEMA_VERSION,
+            principal_id: principal_id.to_string(),
+            command_id: bmux_cluster_plugin_api::cluster_types::CommandId { value: command_id },
+            issued_at_unix_ms: member.updated_at_unix_ms,
+            request: bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::UpsertMember {
+                member,
+            },
+        };
+        node.mutate(command)
+            .await
+            .map_err(|error| format!("replicated membership mutation failed: {error:?}"))?;
+    }
+    Ok(())
+}
+
+fn membership_command_id(member: &ClusterMember) -> Result<uuid::Uuid, String> {
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"bmux.cluster.membership-command.v1\0");
+    digest.update(member.cluster_id.as_bytes());
+    digest.update(member.node_id.as_bytes());
+    digest.update(member.credential_serial.as_bytes());
+    digest.update(format!("{:?}", member.state).as_bytes());
+    let bytes: [u8; 32] = digest.finalize().into();
+    Ok(uuid::Uuid::from_bytes(bytes[..16].try_into().map_err(
+        |_| "membership command digest does not contain a UUID prefix".to_string(),
+    )?))
+}
+
 /// Applies a previously validated voter plan.
 ///
 /// # Errors
@@ -470,6 +515,31 @@ mod tests {
                 std::slice::from_ref(&current),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn membership_command_identity_is_stable_and_transition_specific() {
+        let active = member(
+            NodeId::from(1),
+            ClusterConsensusRole::Voter,
+            ClusterMemberState::Active,
+        );
+        assert_eq!(
+            membership_command_id(&active).unwrap(),
+            membership_command_id(&active).unwrap()
+        );
+        let mut left = active.clone();
+        left.state = ClusterMemberState::Left;
+        assert_ne!(
+            membership_command_id(&active).unwrap(),
+            membership_command_id(&left).unwrap()
+        );
+        let mut rotated = active.clone();
+        rotated.credential_serial = "rotated".to_string();
+        assert_ne!(
+            membership_command_id(&active).unwrap(),
+            membership_command_id(&rotated).unwrap()
         );
     }
 

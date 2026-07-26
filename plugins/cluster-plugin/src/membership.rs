@@ -526,21 +526,31 @@ pub fn commit_leave(
     })
 }
 
-pub fn accept_leave(
+pub fn accept_leave_prepare(
     caller: &impl ClusterRuntimeOps,
     request: &ClusterCommandAcceptLeaveRequest,
-) -> Result<ClusterLeaveResult, String> {
+) -> Result<ClusterMember, String> {
     let cluster_id =
         load_cluster_id(caller)?.ok_or_else(|| "cluster is not initialized".to_string())?;
     if request.cluster_id != cluster_id.to_string() {
         return Err("leave request belongs to a different cluster".to_string());
     }
-    let _guard = identity_init_guard()?;
-    let mut state = require_membership_state(caller, cluster_id)?;
+    let state = require_membership_state(caller, cluster_id)?;
     let member = state
         .members
         .get(&request.node_id)
         .ok_or_else(|| "leave request node is not a cluster member".to_string())?;
+    verify_leave_request(member, request)?;
+    let mut prospective = member.clone();
+    prospective.state = ClusterMemberState::Left;
+    prospective.updated_at_unix_ms = now_unix_ms();
+    Ok(prospective)
+}
+
+fn verify_leave_request(
+    member: &ClusterMember,
+    request: &ClusterCommandAcceptLeaveRequest,
+) -> Result<(), String> {
     let public_key = member
         .public_key
         .parse::<iroh::PublicKey>()
@@ -558,7 +568,25 @@ pub fn accept_leave(
     };
     public_key
         .verify(&canonical_leave_claims(&claims)?, &signature)
-        .map_err(|_| "leave signature verification failed".to_string())?;
+        .map_err(|_| "leave signature verification failed".to_string())
+}
+
+pub fn accept_leave(
+    caller: &impl ClusterRuntimeOps,
+    request: &ClusterCommandAcceptLeaveRequest,
+) -> Result<ClusterLeaveResult, String> {
+    let cluster_id =
+        load_cluster_id(caller)?.ok_or_else(|| "cluster is not initialized".to_string())?;
+    if request.cluster_id != cluster_id.to_string() {
+        return Err("leave request belongs to a different cluster".to_string());
+    }
+    let _guard = identity_init_guard()?;
+    let mut state = require_membership_state(caller, cluster_id)?;
+    let member = state
+        .members
+        .get(&request.node_id)
+        .ok_or_else(|| "leave request node is not a cluster member".to_string())?;
+    verify_leave_request(member, request)?;
     if member.state == ClusterMemberState::Left {
         return Ok(ClusterLeaveResult {
             leave_id: request.leave_id.clone(),
@@ -1169,7 +1197,7 @@ pub fn current_node_identity(
     })
 }
 
-pub fn list_members(caller: &impl ClusterRuntimeOps) -> Result<ClusterMemberList, String> {
+pub fn local_members(caller: &impl ClusterRuntimeOps) -> Result<ClusterMemberList, String> {
     let cluster_id = load_cluster_id(caller)?.map(|value| value.to_string());
     let members = load_membership_state(caller)?
         .map(|state| state.members.into_values().collect())
@@ -1178,6 +1206,10 @@ pub fn list_members(caller: &impl ClusterRuntimeOps) -> Result<ClusterMemberList
         cluster_id,
         members,
     })
+}
+
+pub fn list_members(caller: &impl ClusterRuntimeOps) -> Result<ClusterMemberList, String> {
+    local_members(caller)
 }
 
 pub fn list_enrollments(caller: &impl ClusterRuntimeOps) -> Result<EnrollmentList, String> {

@@ -421,6 +421,9 @@ fn is_cluster_lifecycle_service(context: &NativeServiceContext) -> bool {
                 | "credential_rotate_accept"
                 | "credential_rotate_commit"
                 | "member_revoke"
+                | "consensus_reconcile"
+                | "consensus_reconcile_members"
+                | "consensus_remove_voter"
                 | "redeem_enrollment"
                 | "init"
         ) | (
@@ -437,7 +440,7 @@ fn reconcile_consensus_members(
     ctx: &NativeServiceContext,
     req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest,
 ) -> Result<ClusterMemberList, String> {
-    let current = list_members(ctx)?;
+    let current = local_members(ctx)?;
     let cluster_id = current
         .cluster_id
         .as_deref()
@@ -446,15 +449,11 @@ fn reconcile_consensus_members(
         .members
         .iter()
         .find(|member| {
-            member.state == ClusterMemberState::Active
+            member.node_id == req.authorization.target_node_id
+                && member.state == ClusterMemberState::Active
                 && member.capabilities.consensus_role == ClusterConsensusRole::Voter
-                && !current.members.iter().any(|existing| {
-                    existing.node_id == member.node_id
-                        && existing.state == ClusterMemberState::Active
-                        && existing.capabilities.consensus_role == ClusterConsensusRole::Voter
-                })
         })
-        .ok_or_else(|| "membership transition does not add a voter".to_string())?;
+        .ok_or_else(|| "membership transition target is not an active voter".to_string())?;
     consensus_membership::verify_voter_change_authorization(
         &req.authorization,
         cluster_id,
@@ -469,9 +468,17 @@ fn reconcile_consensus_members(
         .map_err(|error| format!("consensus reconciliation requires the host runtime: {error}"))?;
     tokio::task::block_in_place(|| {
         handle.block_on(consensus_membership::reconcile_members(
-            req.members,
+            req.members.clone(),
             *identity.node_id(),
             &nodes,
+        ))
+    })?;
+    let node = nodes.get(*identity.node_id())?;
+    tokio::task::block_in_place(|| {
+        handle.block_on(consensus_membership::publish_members(
+            node,
+            &req.authorization.actor_node_id,
+            req.members,
         ))
     })?;
     list_members(ctx)
@@ -483,7 +490,7 @@ fn remove_consensus_voter(
 ) -> Result<ClusterMemberList, String> {
     let identity = load_or_create_node_identity(ctx)?;
     let remove_node_id = req.authorization.target_node_id.parse::<NodeId>()?;
-    let membership = list_members(ctx)?;
+    let membership = local_members(ctx)?;
     let cluster_id = membership
         .cluster_id
         .as_deref()
@@ -495,15 +502,31 @@ fn remove_consensus_voter(
         remove_node_id,
         &membership.members,
     )?;
+    let members = membership.members.clone();
     let nodes = consensus_network::global_consensus_nodes();
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("consensus voter removal requires the host runtime: {error}"))?;
     tokio::task::block_in_place(|| {
         handle.block_on(consensus_membership::remove_voter(
-            membership.members,
+            members,
             remove_node_id,
             *identity.node_id(),
             &nodes,
+        ))
+    })?;
+    let mut published = membership.members;
+    let target = published
+        .iter_mut()
+        .find(|member| member.node_id == remove_node_id.to_string())
+        .ok_or_else(|| "removed consensus voter is not a member".to_string())?;
+    target.state = ClusterMemberState::Left;
+    target.updated_at_unix_ms = now_unix_ms();
+    let node = nodes.get(*identity.node_id())?;
+    tokio::task::block_in_place(|| {
+        handle.block_on(consensus_membership::publish_members(
+            node,
+            &req.authorization.actor_node_id,
+            published,
         ))
     })?;
     list_members(ctx)
@@ -525,6 +548,25 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("leave_failed", error))
         },
         "cluster-command/v1", "accept_leave" => |req: ClusterCommandAcceptLeaveRequest, ctx| {
+            let prospective = accept_leave_prepare(ctx, &req)
+                .map_err(|error| ServiceResponse::error("accept_leave_failed", error))?;
+            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+                *load_or_create_node_identity(ctx)
+                    .map_err(|error| ServiceResponse::error("accept_leave_failed", error))?
+                    .node_id(),
+            ) {
+                let handle = tokio::runtime::Handle::try_current()
+                    .map_err(|error| ServiceResponse::error("accept_leave_failed", error.to_string()))?;
+                let principal_id = prospective.node_id.clone();
+                tokio::task::block_in_place(|| {
+                    handle.block_on(consensus_membership::publish_members(
+                        node,
+                        &principal_id,
+                        [prospective],
+                    ))
+                })
+                .map_err(|error| ServiceResponse::error("accept_leave_failed", error))?;
+            }
             accept_leave(ctx, &req)
                 .map_err(|error| ServiceResponse::error("accept_leave_failed", error))
         },
@@ -547,16 +589,52 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("credential_rotate_prepare_failed", error))
         },
         "cluster-command/v1", "credential_rotate_accept" => |req: ClusterCommandCredentialRotateAcceptRequest, ctx| {
-            accept_credential_rotation(ctx, &req.request)
-                .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))
+            let result = accept_credential_rotation(ctx, &req.request)
+                .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))?;
+            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+                *load_or_create_node_identity(ctx)
+                    .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))?
+                    .node_id(),
+            ) {
+                let principal_id = result.member.node_id.clone();
+                let handle = tokio::runtime::Handle::try_current()
+                    .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error.to_string()))?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(consensus_membership::publish_members(
+                        node,
+                        &principal_id,
+                        [result.member.clone()],
+                    ))
+                })
+                .map_err(|error| ServiceResponse::error("credential_rotate_accept_failed", error))?;
+            }
+            Ok(result)
         },
         "cluster-command/v1", "credential_rotate_commit" => |req: ClusterCommandCredentialRotateCommitRequest, ctx| {
             commit_credential_rotation(ctx, &req.member)
                 .map_err(|error| ServiceResponse::error("credential_rotate_commit_failed", error))
         },
         "cluster-command/v1", "member_revoke" => |req: ClusterCommandMemberRevokeRequest, ctx| {
-            revoke_member(ctx, &req.node_id)
-                .map_err(|error| ServiceResponse::error("member_revoke_failed", error))
+            let result = revoke_member(ctx, &req.node_id)
+                .map_err(|error| ServiceResponse::error("member_revoke_failed", error))?;
+            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+                *load_or_create_node_identity(ctx)
+                    .map_err(|error| ServiceResponse::error("member_revoke_failed", error))?
+                    .node_id(),
+            ) {
+                let principal_id = result.member.credential_issuer_node_id.clone();
+                let handle = tokio::runtime::Handle::try_current()
+                    .map_err(|error| ServiceResponse::error("member_revoke_failed", error.to_string()))?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(consensus_membership::publish_members(
+                        node,
+                        &principal_id,
+                        [result.member.clone()],
+                    ))
+                })
+                .map_err(|error| ServiceResponse::error("member_revoke_failed", error))?;
+            }
+            Ok(result)
         },
         "cluster-command/v1", "consensus_reconcile" => |(): (), ctx| {
             let identity = load_or_create_node_identity(ctx)
@@ -569,7 +647,19 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 handle.block_on(consensus_membership::reconcile_active_voters(ctx, node_id, &nodes))
             })
             .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
-            list_members(ctx)
+            let membership = local_members(ctx)
+                .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
+            let node = nodes.get(node_id)
+                .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
+            tokio::task::block_in_place(|| {
+                handle.block_on(consensus_membership::publish_members(
+                    node,
+                    &identity.node_id().to_string(),
+                    membership.members,
+                ))
+            })
+            .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))?;
+            local_members(ctx)
                 .map_err(|error| ServiceResponse::error("consensus_reconcile_failed", error))
         },
         "cluster-command/v1", "consensus_reconcile_members" => |req: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest, ctx| {
@@ -581,8 +671,27 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("consensus_remove_voter_failed", error))
         },
         "cluster-command/v1", "redeem_enrollment" => |req: ClusterCommandRedeemEnrollmentRequest, ctx| {
-            redeem_enrollment(ctx, &req)
-                .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))
+            let result = redeem_enrollment(ctx, &req)
+                .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
+            if let Ok(node) = consensus_network::global_consensus_nodes().get(
+                *load_or_create_node_identity(ctx)
+                    .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?
+                    .node_id(),
+            ) {
+                let handle = tokio::runtime::Handle::try_current()
+                    .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error.to_string()))?;
+                if result.member.capabilities.consensus_role != ClusterConsensusRole::Voter {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(consensus_membership::publish_members(
+                            node,
+                            &result.identity.node_id,
+                            result.members.clone(),
+                        ))
+                    })
+                    .map_err(|error| ServiceResponse::error("redeem_enrollment_failed", error))?;
+                }
+            }
+            Ok(result)
         },
         "cluster-command/v1", "init" => |req: bmux_cluster_plugin_api::cluster_command::client::InitRequest, ctx| {
             let identity = initialize_cluster(ctx)
@@ -602,7 +711,7 @@ fn invoke_cluster_lifecycle_service(context: &NativeServiceContext) -> ServiceRe
                 .map_err(|error| ServiceResponse::error("identity_failed", error))
         },
         "cluster-query/v1", "members" => |(): (), ctx| {
-            list_members(ctx)
+            local_members(ctx)
                 .map_err(|error| ServiceResponse::error("members_failed", error))
         },
         "cluster-query/v1", "membership_status" => |(): (), ctx| {
@@ -1129,7 +1238,7 @@ mod tests {
         assert_eq!(initialized.node_id, first_node.node_id().to_string());
         assert_eq!(initialized.public_key, first_node.public_key().to_string());
         assert_eq!(initialized.capabilities, Some(initializer_capabilities()));
-        let members = list_members(&runtime).unwrap();
+        let members = local_members(&runtime).unwrap();
         assert_eq!(members.members.len(), 1);
         assert_eq!(members.members[0].capabilities, initializer_capabilities());
     }
@@ -1188,7 +1297,7 @@ mod tests {
         )
         .unwrap();
 
-        let original_member = list_members(&joiner)
+        let original_member = local_members(&joiner)
             .unwrap()
             .members
             .into_iter()
@@ -1321,7 +1430,7 @@ mod tests {
         let joiner = FakeRuntime::default();
         let joiner_identity = load_or_create_node_identity(&joiner).unwrap();
         complete_test_join(&issuer, &joiner, "rotation-expiry-join");
-        let original = list_members(&issuer)
+        let original = local_members(&issuer)
             .unwrap()
             .members
             .into_iter()
@@ -1346,7 +1455,7 @@ mod tests {
                 .unwrap_err()
                 .contains("expired")
         );
-        let unchanged = list_members(&issuer)
+        let unchanged = local_members(&issuer)
             .unwrap()
             .members
             .into_iter()
@@ -1385,7 +1494,7 @@ mod tests {
         verify_membership_credential(&first.member, now_unix_ms()).unwrap();
         assert_eq!(first.member.credential_issuer_node_id, identity.node_id);
         assert_eq!(first.members, second.members);
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 2);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 2);
 
         let attacker_runtime = FakeRuntime::default();
         let replay = enrollment_request(&attacker_runtime, &signed, token.token, None);
@@ -1411,7 +1520,7 @@ mod tests {
                 .unwrap_err()
                 .contains("possession proof verification failed")
         );
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 1);
 
         let mut incompatible_epoch = valid.clone();
         incompatible_epoch.protocol.wire_epoch += 1;
@@ -1427,7 +1536,7 @@ mod tests {
                 .unwrap_err()
                 .contains("incompatible cluster wire epoch")
         );
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 1);
 
         let mut incompatible_revision = valid.clone();
         incompatible_revision.protocol.peer_revision_min = 2;
@@ -1444,7 +1553,7 @@ mod tests {
                 .unwrap_err()
                 .contains("no compatible cluster peer revision")
         );
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 1);
 
         let mut incompatible_schema = valid.clone();
         incompatible_schema.protocol.schema_version_min = 2;
@@ -1461,7 +1570,7 @@ mod tests {
                 .unwrap_err()
                 .contains("no compatible cluster schema version")
         );
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 1);
 
         let mut missing_feature = valid.clone();
         missing_feature.protocol.features.clear();
@@ -1477,12 +1586,12 @@ mod tests {
                 .unwrap_err()
                 .contains("missing mandatory cluster feature")
         );
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 1);
 
         let accepted = redeem_enrollment(&issuer, &valid).unwrap();
         assert_eq!(accepted.member.negotiated_protocol.peer_revision, 1);
         assert_eq!(accepted.member.negotiated_protocol.schema_version, 1);
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 2);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 2);
     }
 
     #[test]
@@ -1652,7 +1761,7 @@ mod tests {
         );
 
         let leave_id = Uuid::new_v4().to_string();
-        let cluster_id = list_members(&verifier).unwrap().cluster_id.unwrap();
+        let cluster_id = local_members(&verifier).unwrap().cluster_id.unwrap();
         let claims = LeaveClaims {
             version: CLUSTER_IDENTITY_VERSION,
             leave_id: leave_id.clone(),
@@ -1713,7 +1822,7 @@ mod tests {
         let result = redeem_enrollment(&issuer, &request).unwrap();
         assert_eq!(result.member.capabilities, grant);
         assert_eq!(
-            list_members(&issuer)
+            local_members(&issuer)
                 .unwrap()
                 .members
                 .into_iter()
@@ -1757,7 +1866,7 @@ mod tests {
             serde_json::to_vec(&value).unwrap(),
         );
 
-        let members = list_members(&runtime).unwrap().members;
+        let members = local_members(&runtime).unwrap().members;
         assert_eq!(
             members
                 .iter()
@@ -1893,7 +2002,7 @@ mod tests {
                 .unwrap_err()
                 .contains("plugin version is invalid")
         );
-        assert_eq!(list_members(&issuer).unwrap().members.len(), 1);
+        assert_eq!(local_members(&issuer).unwrap().members.len(), 1);
     }
 
     #[test]
@@ -1933,7 +2042,7 @@ mod tests {
         assert!(accept_leave(&issuer, &valid).unwrap().left);
         assert!(accept_leave(&issuer, &valid).unwrap().left);
         assert_eq!(
-            list_members(&issuer).unwrap().members[0].state,
+            local_members(&issuer).unwrap().members[0].state,
             ClusterMemberState::Left
         );
     }

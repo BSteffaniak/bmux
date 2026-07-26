@@ -231,16 +231,28 @@ impl ControlState {
                 if member.cluster_id != self.cluster_id {
                     return Err(invalid_transition("member belongs to a different cluster"));
                 }
-                if let Some(existing) = self.members.get(&member.node_id)
-                    && matches!(
+                if let Some(existing) = self.members.get(&member.node_id) {
+                    if matches!(
                         existing.state,
                         ClusterMemberState::Revoked | ClusterMemberState::Left
-                    )
-                    && member.state == ClusterMemberState::Active
-                {
-                    return Err(invalid_transition(
-                        "inactive member cannot be reactivated by upsert",
-                    ));
+                    ) && member.state == ClusterMemberState::Active
+                    {
+                        return Err(invalid_transition(
+                            "inactive member cannot be reactivated by upsert",
+                        ));
+                    }
+                    if member.updated_at_unix_ms < existing.updated_at_unix_ms {
+                        return Err(invalid_transition(
+                            "membership update is older than replicated state",
+                        ));
+                    }
+                    if member.updated_at_unix_ms == existing.updated_at_unix_ms
+                        && member != existing
+                    {
+                        return Err(invalid_transition(
+                            "membership update conflicts at the same timestamp",
+                        ));
+                    }
                 }
                 let changed = self.members.get(&member.node_id) != Some(member);
                 self.members.insert(member.node_id.clone(), member.clone());
@@ -920,6 +932,64 @@ mod tests {
             }
         ));
         assert_eq!(state.panes[&id(30)].availability, PaneAvailability::Pending);
+    }
+
+    #[test]
+    fn membership_updates_reject_stale_and_same_timestamp_conflicts() {
+        let mut state = ControlState::new("cluster:test");
+        let identity = crate::membership::NodeIdentity::new_for_test(1);
+        let cluster_id = "cluster:00000000-0000-0000-0000-000000000001"
+            .parse::<crate::membership::ClusterId>()
+            .unwrap();
+        let mut member = crate::membership::issue_membership_credential(
+            &identity,
+            cluster_id,
+            identity.node_id().to_string(),
+            identity.public_key().to_string(),
+            crate::membership::initializer_capabilities(),
+            bmux_cluster_plugin_api::cluster_types::ClusterNegotiatedProtocol {
+                wire_epoch: 1,
+                peer_revision: 1,
+                schema_version: 1,
+                local_plugin_version: "test".to_string(),
+                remote_plugin_version: "test".to_string(),
+                features: Vec::new(),
+            },
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        member.cluster_id = "cluster:test".to_string();
+        assert_accepted(&state.apply(&command(
+            50,
+            ControlCommandRequest::UpsertMember {
+                member: member.clone(),
+            },
+        )));
+
+        let mut older = member.clone();
+        older.updated_at_unix_ms -= 1;
+        assert!(matches!(
+            state
+                .apply(&command(
+                    51,
+                    ControlCommandRequest::UpsertMember { member: older }
+                ))
+                .result,
+            ControlCommandResult::Rejected { .. }
+        ));
+        let mut conflicting = member;
+        conflicting.endpoint = Some("different".to_string());
+        assert!(matches!(
+            state
+                .apply(&command(
+                    52,
+                    ControlCommandRequest::UpsertMember {
+                        member: conflicting
+                    }
+                ))
+                .result,
+            ControlCommandResult::Rejected { .. }
+        ));
     }
 
     #[test]
