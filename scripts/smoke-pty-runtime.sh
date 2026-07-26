@@ -74,7 +74,7 @@ run_smoke_with_retry() {
       set -euo pipefail
       (
 ${payload}
-      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null bash -lc 'stty rows 24 cols 80; cargo run -q -p bmux_cli --' >/dev/null 2>&1
+      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null bash -lc 'stty rows 24 cols 80; exec \"${BMUX_SMOKE_BINARY:?}\"' >/dev/null 2>&1
     "
     status=$?
     set -e
@@ -139,6 +139,9 @@ run_keybind_case() {
 }
 
 cd "$ROOT_DIR"
+cargo build -q -p bmux_cli
+BMUX_SMOKE_BINARY="$ROOT_DIR/target/debug/bmux"
+
 run_case /bin/sh
 run_case /bin/bash
 run_case /run/current-system/sw/bin/fish
