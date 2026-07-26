@@ -63,6 +63,16 @@ kind         = "command"
 
 [[services]]
 capability   = "bmux.server_clusters.write"
+interface_id = "cluster-attach-command/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.read"
+interface_id = "cluster-attach-state/v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.server_clusters.write"
 interface_id = "cluster-worker-command/v1"
 kind         = "command"
 

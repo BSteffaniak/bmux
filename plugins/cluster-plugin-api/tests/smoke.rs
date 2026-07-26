@@ -32,6 +32,7 @@ fn generated_control_services_expose_consistency_and_structured_errors() {
         workspaces: Vec::new(),
         windows: Vec::new(),
         panes: Vec::new(),
+        pending_workflows: Vec::new(),
         consistency: ControlReadConsistency::Linearizable,
     };
     let encoded = bmux_plugin_sdk::encode_service_message(&view).unwrap();
@@ -55,6 +56,10 @@ fn generated_control_services_expose_consistency_and_structured_errors() {
     assert_eq!(
         cluster_control_state::INTERFACE_ID,
         "cluster-control-state/v1"
+    );
+    assert_eq!(
+        bmux_cluster_plugin_api::cluster_attach_state::INTERFACE_ID,
+        "cluster-attach-state/v1"
     );
 }
 
@@ -169,6 +174,7 @@ fn control_state_contract_uses_typed_ids_and_tagged_commands() {
             expected_revision: 1,
             expected_generation: 0,
             assignment,
+            launch_spec: None,
         },
     ];
     for request in commands {
@@ -518,8 +524,10 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 9);
+    assert_eq!(services.len(), 11);
     let manifest = include_str!("../../cluster-plugin/plugin.toml");
     assert!(manifest.contains("cluster-worker-command/v1"));
+    assert!(manifest.contains("cluster-attach-state/v1"));
+    assert!(manifest.contains("cluster-attach-command/v1"));
     assert!(manifest.contains("cluster-worker-state/v1"));
 }

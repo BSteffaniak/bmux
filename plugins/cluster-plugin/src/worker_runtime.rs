@@ -1394,7 +1394,7 @@ fn validate_scope(
     Ok(())
 }
 
-fn canonical_unsigned_authority(
+pub(crate) fn canonical_unsigned_authority(
     authority: &WorkerAuthority,
 ) -> Result<Vec<u8>, WorkerServiceError> {
     let mut unsigned = authority.clone();

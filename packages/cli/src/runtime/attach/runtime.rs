@@ -7,6 +7,7 @@ use bmux_attach_layout_protocol::{
     AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding, AttachMouseProtocolMode, AttachRect,
     AttachScene, AttachSurface, AttachSurfaceKind,
 };
+use bmux_attach_pipeline::TerminalGraphicsCache;
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
     apply_attach_output_chunk_with, attach_scene_damage_between,
@@ -395,9 +396,9 @@ use super::prompt_ui::{
 };
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
-    collect_visual_projection_updates, frame_damage_overlay_rects, frame_damage_overlay_render_ops,
-    opaque_row_text, queue_render_ops, render_attach_scene_with_stats_and_trace_with_capabilities,
-    visible_scene_pane_ids,
+    append_pane_output, collect_visual_projection_updates, frame_damage_overlay_rects,
+    frame_damage_overlay_render_ops, opaque_row_text, queue_render_ops,
+    render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
 };
 use super::state::{
     AttachDirtyFlags, AttachDirtySource, AttachEventAction, AttachExitReason,
@@ -2588,7 +2589,8 @@ pub async fn run_session_attach_with_provider_session(
     }
 }
 
-pub async fn run_native_attach_session_with_terminal<T: AttachTerminal + ?Sized>(
+#[allow(clippy::too_many_lines)] // Native provider loop keeps continuity, scene, input, and detach state synchronized.
+pub async fn run_native_attach_session_with_terminal<T: AttachTerminal>(
     mut session: Box<dyn AttachSession>,
     terminal: &mut T,
 ) -> Result<AttachRunOutcome> {
@@ -2603,8 +2605,27 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal + ?Sized>
         .map_err(|error| anyhow::anyhow!("invalid attach provider snapshot: {error}"))?;
 
     let keyboard_enhanced = terminal.enter_attach_mode(true, true, true)?;
+    let native_config = match BmuxConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "bmux warning: failed loading config for provider attach keymap, using defaults ({error})"
+            );
+            BmuxConfig::default()
+        }
+    };
+    let mut input_processor =
+        InputProcessor::new(attach_keymap_from_config(&native_config), keyboard_enhanced);
+    let mut scene = snapshot.scene.clone();
+    let mut pane_buffers = provider_pane_buffers_from_snapshot(&snapshot)?;
+    let mut terminal_graphics_cache = TerminalGraphicsCache::new();
     let mut focused_stream = focused_provider_stream(&snapshot);
-    write_provider_snapshot(terminal, &snapshot)?;
+    render_native_provider_scene(
+        terminal,
+        &scene,
+        &mut pane_buffers,
+        &mut terminal_graphics_cache,
+    )?;
     let geometry = terminal.geometry();
     let mut command_sequence = 1_u64;
     let viewport = AttachProviderViewport {
@@ -2631,6 +2652,9 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal + ?Sized>
                 if let Some(event_outcome) = handle_native_provider_event(
                     terminal,
                     &mut continuity,
+                    &mut scene,
+                    &mut pane_buffers,
+                    &mut terminal_graphics_cache,
                     &mut focused_stream,
                     event,
                 )? {
@@ -2646,15 +2670,24 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal + ?Sized>
                     };
                 };
                 command_sequence = command_sequence.saturating_add(1);
-                handle_native_provider_terminal_event(
+                if handle_native_provider_terminal_event(
                     session.as_mut(),
                     &continuity,
                     &mut controls,
+                    &scene,
+                    &pane_buffers,
+                    &mut input_processor,
                     focused_stream.as_ref(),
                     command_sequence,
                     keyboard_enhanced,
                     event,
-                ).await?;
+                ).await? {
+                    break AttachRunOutcome {
+                        status_code: 0,
+                        exit_reason: AttachExitReason::Detached,
+                        resume: None,
+                    };
+                }
             }
         }
     };
@@ -2670,9 +2703,12 @@ pub async fn run_native_attach_session_with_terminal<T: AttachTerminal + ?Sized>
     Ok(outcome)
 }
 
-fn handle_native_provider_event(
-    terminal: &mut (impl AttachTerminal + ?Sized),
+fn handle_native_provider_event<W: AttachTerminal>(
+    terminal: &mut W,
     continuity: &mut AttachContinuityValidator,
+    scene: &mut bmux_attach_layout_protocol::AttachScene,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
     focused_stream: &mut Option<AttachStreamCursor>,
     event: AttachProviderEvent,
 ) -> Result<Option<AttachRunOutcome>> {
@@ -2681,17 +2717,21 @@ fn handle_native_provider_event(
             continuity
                 .apply_delta(&delta)
                 .map_err(|error| anyhow::anyhow!("invalid attach provider delta: {error}"))?;
-            apply_provider_delta(terminal, &delta)?;
-            if let Some(scene) = delta.changes.iter().find_map(|change| {
-                if let AttachProviderChange::Scene(scene) = change {
-                    Some(scene)
+            if let Some(replacement) = delta.changes.iter().find_map(|change| {
+                if let AttachProviderChange::Scene(replacement) = change {
+                    Some(replacement)
                 } else {
                     None
                 }
             }) {
-                *focused_stream =
-                    focused_provider_stream_for_scene(scene, &continuity.resume_state().streams);
+                scene.clone_from(replacement);
+                *focused_stream = focused_provider_stream_for_scene(
+                    replacement,
+                    &continuity.resume_state().streams,
+                );
             }
+            apply_provider_delta(scene, pane_buffers, &delta)?;
+            render_native_provider_scene(terminal, scene, pane_buffers, terminal_graphics_cache)?;
             Ok(None)
         }
         AttachProviderEvent::Disconnected(disconnect) => {
@@ -2724,33 +2764,128 @@ fn handle_native_provider_event(
     }
 }
 
-fn write_provider_snapshot(
-    terminal: &mut (impl AttachTerminal + ?Sized),
+fn provider_pane_buffers_from_snapshot(
     snapshot: &AttachProviderSnapshot,
-) -> Result<()> {
+) -> Result<BTreeMap<Uuid, PaneRenderBuffer>> {
+    let mut buffers = BTreeMap::new();
     for stream in &snapshot.streams {
-        terminal.write_all(&stream.snapshot)?;
+        let mut buffer = provider_render_buffer(&snapshot.scene, stream.cursor.surface_id)?;
+        append_pane_output(&mut buffer, &stream.snapshot);
+        buffers.insert(stream.cursor.surface_id, buffer);
     }
-    terminal.flush()?;
-    Ok(())
+    Ok(buffers)
+}
+
+fn provider_render_buffer(
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    surface_id: Uuid,
+) -> Result<PaneRenderBuffer> {
+    let surface = scene
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+        .ok_or_else(|| anyhow::anyhow!("attach provider stream surface {surface_id} is missing"))?;
+    let mut buffer = PaneRenderBuffer::default();
+    buffer
+        .terminal_grid
+        .resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
+        .map_err(|error| anyhow::anyhow!("attach provider surface grid is invalid: {error}"))?;
+    Ok(buffer)
 }
 
 fn apply_provider_delta(
-    terminal: &mut (impl AttachTerminal + ?Sized),
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     delta: &bmux_client::AttachProviderDelta,
 ) -> Result<()> {
     for change in &delta.changes {
         match change {
-            AttachProviderChange::StreamAppend { bytes, .. } => terminal.write_all(bytes)?,
+            AttachProviderChange::StreamAppend { cursor, bytes, .. } => {
+                let buffer = pane_buffers
+                    .entry(cursor.surface_id)
+                    .or_insert(provider_render_buffer(scene, cursor.surface_id)?);
+                append_pane_output(buffer, bytes);
+            }
             AttachProviderChange::StreamRepair(snapshot) => {
-                terminal.write_all(&snapshot.snapshot)?;
+                let mut buffer = provider_render_buffer(scene, snapshot.cursor.surface_id)?;
+                append_pane_output(&mut buffer, &snapshot.snapshot);
+                pane_buffers.insert(snapshot.cursor.surface_id, buffer);
             }
-            AttachProviderChange::Status { message } => {
-                writeln!(terminal, "\r\n{message}")?;
+            AttachProviderChange::Scene(replacement) => {
+                for surface in &replacement.surfaces {
+                    if let Some(buffer) = pane_buffers.get_mut(&surface.id) {
+                        buffer
+                            .terminal_grid
+                            .resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "attach provider replacement surface grid is invalid: {error}"
+                                )
+                            })?;
+                    }
+                }
             }
-            AttachProviderChange::Scene(_) | AttachProviderChange::StreamRemoved { .. } => {}
+            AttachProviderChange::StreamRemoved { stream_id: _ }
+            | AttachProviderChange::Status { message: _ } => {}
         }
     }
+    let visible = scene
+        .surfaces
+        .iter()
+        .map(|surface| surface.id)
+        .collect::<BTreeSet<_>>();
+    pane_buffers.retain(|surface_id, _| visible.contains(surface_id));
+    Ok(())
+}
+
+fn render_native_provider_scene<W: AttachTerminal>(
+    terminal: &mut W,
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+) -> Result<()> {
+    let panes = scene
+        .surfaces
+        .iter()
+        .filter_map(|surface| surface.pane_id)
+        .enumerate()
+        .map(
+            |(index, pane_id)| bmux_attach_layout_protocol::PaneSummary {
+                id: pane_id,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                name: None,
+                focused: matches!(
+                    scene.focus,
+                    bmux_attach_layout_protocol::AttachFocusTarget::Pane { pane_id: focused }
+                        if focused == pane_id
+                ),
+                state: bmux_attach_layout_protocol::PaneState::Running,
+                state_reason: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let geometry = terminal.geometry();
+    let _ = render_attach_scene_with_stats_and_trace_with_capabilities(
+        terminal,
+        scene,
+        &panes,
+        pane_buffers,
+        terminal_graphics_cache,
+        &bmux_attach_pipeline::FrameDamage::full_frame(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        None,
+        false,
+        (geometry.cols, geometry.rows),
+        &RuntimeAppearance::default(),
+        DamageCoalescingPolicy::default(),
+        &[],
+        bmux_plugin::TerminalRenderCapabilities::default(),
+        None,
+    )?;
     terminal.flush()?;
     Ok(())
 }
@@ -2774,16 +2909,19 @@ fn focused_provider_stream_for_scene(
         .cloned()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One event must share validated stream, scene, protocol, and control state.
 async fn handle_native_provider_terminal_event(
     session: &mut dyn AttachSession,
     continuity: &AttachContinuityValidator,
     controls: &mut AttachControlValidator,
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+    input_processor: &mut InputProcessor,
     focused_stream: Option<&AttachStreamCursor>,
     command_sequence: u64,
     keyboard_enhanced: bool,
     event: Event,
-) -> Result<()> {
+) -> Result<bool> {
     match event {
         Event::Resize(columns, rows) => {
             let viewport = AttachProviderViewport {
@@ -2814,31 +2952,99 @@ async fn handle_native_provider_terminal_event(
             .await?;
         }
         Event::Key(key) if key.kind != KeyEventKind::Release => {
-            if let Some(stroke) = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&key)
-                && let Some(bytes) = bmux_keyboard::encode::encode_key(&stroke, keyboard_enhanced)
-            {
-                send_native_provider_input(
-                    session,
-                    continuity,
-                    controls,
-                    focused_stream,
-                    command_sequence,
-                    AttachInputPayload::Bytes(bytes),
-                )
-                .await?;
+            let protocol = focused_provider_protocol(pane_buffers, focused_stream);
+            input_processor
+                .set_pane_input_mode(protocol.application_cursor, protocol.application_keypad);
+            let actions = attach_key_event_actions(&key, input_processor, AttachUiMode::Normal)?;
+            for action in actions {
+                match action {
+                    AttachEventAction::Send(bytes) => {
+                        let payload = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&key)
+                            .map_or(AttachInputPayload::Bytes(bytes), |stroke| {
+                                AttachInputPayload::Key {
+                                    stroke,
+                                    enhanced: keyboard_enhanced,
+                                }
+                            });
+                        send_native_provider_input(
+                            session,
+                            continuity,
+                            controls,
+                            focused_stream,
+                            command_sequence,
+                            payload,
+                        )
+                        .await?;
+                    }
+                    AttachEventAction::PluginCommand {
+                        plugin_id,
+                        command_name,
+                        args,
+                    }
+                    | AttachEventAction::Ui(RuntimeAction::PluginCommand {
+                        plugin_id,
+                        command_name,
+                        args,
+                    }) => {
+                        let provider_action = native_provider_plugin_action(
+                            command_sequence,
+                            focused_stream,
+                            &plugin_id,
+                            &command_name,
+                            &args,
+                        )?;
+                        execute_native_provider_action(session, controls, provider_action).await?;
+                    }
+                    AttachEventAction::Detach | AttachEventAction::Ui(RuntimeAction::Quit) => {
+                        return Ok(true);
+                    }
+                    AttachEventAction::Ignore
+                    | AttachEventAction::Redraw
+                    | AttachEventAction::Ui(_)
+                    | AttachEventAction::Paste(_)
+                    | AttachEventAction::Mouse(_) => {}
+                }
             }
         }
         Event::Mouse(mouse) => {
+            let shared = provider_mouse_to_shared(mouse);
+            let Some((pane_id, content_rect)) =
+                bmux_attach_pipeline::mouse::pane_and_rect_at(scene, mouse.column, mouse.row)
+            else {
+                return Ok(false);
+            };
+            let Some(local) =
+                bmux_attach_pipeline::mouse::translate_event_to_pane_local(shared, content_rect)
+            else {
+                return Ok(false);
+            };
+            let stream = provider_stream_for_surface(continuity, pane_id).ok_or_else(|| {
+                anyhow::anyhow!("attach provider mouse target has no current stream")
+            })?;
+            let protocol = focused_provider_protocol(pane_buffers, Some(&stream));
+            if protocol.mouse_mode() == bmux_terminal_grid::MouseProtocolMode::None {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && focused_stream.is_none_or(|focused| focused.surface_id != pane_id)
+                {
+                    let provider_action = bmux_client::AttachProviderAction {
+                        command_id: format!("provider-action:{command_sequence}:mouse-focus"),
+                        action: "focus".to_string(),
+                        arguments: vec![pane_id.to_string()],
+                    };
+                    execute_native_provider_action(session, controls, provider_action).await?;
+                }
+                return Ok(false);
+            }
             let (button, phase) = provider_mouse_event(mouse.kind);
             send_native_provider_input(
                 session,
                 continuity,
                 controls,
-                focused_stream,
+                Some(&stream),
                 command_sequence,
                 AttachInputPayload::Mouse(ProviderMouseInput {
-                    x: mouse.column,
-                    y: mouse.row,
+                    x: local.column,
+                    y: local.row,
                     button,
                     phase,
                     modifiers: provider_modifier_bits(mouse.modifiers),
@@ -2848,7 +3054,116 @@ async fn handle_native_provider_terminal_event(
         }
         Event::FocusGained | Event::FocusLost | Event::Key(_) => {}
     }
-    Ok(())
+    Ok(false)
+}
+
+fn native_provider_plugin_action(
+    command_sequence: u64,
+    focused_stream: Option<&AttachStreamCursor>,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> Result<bmux_client::AttachProviderAction> {
+    if plugin_id != "bmux.windows" {
+        anyhow::bail!(
+            "attach provider does not support caller-process plugin command '{plugin_id}:{command_name}'"
+        );
+    }
+    let focused = || {
+        focused_stream
+            .map(|stream| stream.surface_id.to_string())
+            .ok_or_else(|| anyhow::anyhow!("attach provider has no focused logical pane"))
+    };
+    let option = |name: &str| {
+        args.windows(2)
+            .find_map(|pair| (pair[0] == name).then(|| pair[1].clone()))
+    };
+    let (action, arguments) =
+        match command_name {
+            "focus-pane-in-direction" => (
+                "focus",
+                vec![option("--direction").ok_or_else(|| {
+                    anyhow::anyhow!("focus-pane-in-direction requires --direction")
+                })?],
+            ),
+            "close-active-pane" => ("close", vec![focused()?]),
+            "split-pane" => (
+                "split",
+                vec![
+                    focused()?,
+                    option("--direction")
+                        .ok_or_else(|| anyhow::anyhow!("split-pane requires --direction"))?,
+                ],
+            ),
+            "zoom-pane" => ("zoom", vec![focused()?]),
+            "prev-window" => ("window-prev", Vec::new()),
+            "next-window" => ("window-next", Vec::new()),
+            "goto-window" => ("window-goto", args.to_vec()),
+            "rename-window" => ("rename-window", args.to_vec()),
+            _ => anyhow::bail!("unsupported logical provider command '{command_name}'"),
+        };
+    Ok(bmux_client::AttachProviderAction {
+        command_id: format!("provider-action:{command_sequence}:{plugin_id}:{command_name}"),
+        action: action.to_string(),
+        arguments,
+    })
+}
+
+fn focused_provider_protocol(
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+    focused_stream: Option<&AttachStreamCursor>,
+) -> bmux_terminal_grid::ProtocolState {
+    focused_stream
+        .and_then(|stream| pane_buffers.get(&stream.surface_id))
+        .map_or_else(bmux_terminal_grid::ProtocolState::default, |buffer| {
+            buffer.terminal_grid.grid().protocol_state()
+        })
+}
+
+fn provider_stream_for_surface(
+    continuity: &AttachContinuityValidator,
+    surface_id: Uuid,
+) -> Option<AttachStreamCursor> {
+    continuity
+        .resume_state()
+        .streams
+        .into_iter()
+        .find(|stream| stream.surface_id == surface_id)
+}
+
+const fn provider_mouse_to_shared(mouse: MouseEvent) -> bmux_attach_pipeline::AttachMouseEvent {
+    let (button, phase) = provider_mouse_event(mouse.kind);
+    let button = match button {
+        ProviderMouseButton::Left
+        | ProviderMouseButton::WheelUp
+        | ProviderMouseButton::WheelDown
+        | ProviderMouseButton::None => bmux_attach_pipeline::AttachMouseButton::Left,
+        ProviderMouseButton::Middle => bmux_attach_pipeline::AttachMouseButton::Middle,
+        ProviderMouseButton::Right => bmux_attach_pipeline::AttachMouseButton::Right,
+    };
+    let kind = match phase {
+        ProviderMousePhase::Press => bmux_attach_pipeline::AttachMouseEventKind::Down(button),
+        ProviderMousePhase::Release => bmux_attach_pipeline::AttachMouseEventKind::Up(button),
+        ProviderMousePhase::Move => bmux_attach_pipeline::AttachMouseEventKind::Moved,
+        ProviderMousePhase::Drag => bmux_attach_pipeline::AttachMouseEventKind::Drag(button),
+        ProviderMousePhase::Scroll => match mouse.kind {
+            MouseEventKind::ScrollUp => bmux_attach_pipeline::AttachMouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown => bmux_attach_pipeline::AttachMouseEventKind::ScrollDown,
+            MouseEventKind::ScrollLeft => bmux_attach_pipeline::AttachMouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight => bmux_attach_pipeline::AttachMouseEventKind::ScrollRight,
+            _ => bmux_attach_pipeline::AttachMouseEventKind::Moved,
+        },
+    };
+    bmux_attach_pipeline::AttachMouseEvent {
+        kind,
+        column: mouse.column,
+        row: mouse.row,
+        modifiers: bmux_attach_pipeline::AttachMouseModifiers {
+            shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
+            alt: mouse.modifiers.contains(KeyModifiers::ALT),
+            control: mouse.modifiers.contains(KeyModifiers::CONTROL),
+        },
+    }
 }
 
 async fn send_native_provider_input(
@@ -2877,7 +3192,6 @@ async fn send_native_provider_input(
     ensure_provider_ack("input", &ack)
 }
 
-#[cfg(test)]
 pub async fn execute_native_provider_action(
     session: &mut dyn AttachSession,
     controls: &mut AttachControlValidator,
@@ -13502,6 +13816,254 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    #[test]
+    fn native_provider_key_encoding_respects_focused_application_cursor_mode() {
+        let stroke = bmux_keyboard::crossterm::crossterm_key_event_to_stroke(&KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        ))
+        .unwrap();
+        let bytes = bmux_keyboard::encode::encode_key_with_modes(
+            &stroke,
+            false,
+            bmux_keyboard::encode::KeyEncodingModes {
+                application_cursor: true,
+                application_keypad: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1bOA");
+        let payload = AttachInputPayload::Key {
+            stroke,
+            enhanced: false,
+        };
+        assert!(matches!(
+            payload,
+            AttachInputPayload::Key {
+                stroke: received,
+                enhanced: false
+            } if received == stroke
+        ));
+        assert_eq!(
+            encode_bracketed_paste("input", true),
+            b"\x1b[200~input\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn native_provider_actions_translate_window_keymap_commands() {
+        let focused = AttachStreamCursor {
+            stream_id: bmux_client::AttachStreamId::new("focused").unwrap(),
+            surface_id: Uuid::from_u128(9),
+            generation: 4,
+            offset: 0,
+        };
+        let focus = native_provider_plugin_action(
+            7,
+            Some(&focused),
+            "bmux.windows",
+            "focus-pane-in-direction",
+            &["--direction".to_string(), "left".to_string()],
+        )
+        .unwrap();
+        assert_eq!(focus.action, "focus");
+        assert_eq!(focus.arguments, ["left"]);
+
+        let split = native_provider_plugin_action(
+            8,
+            Some(&focused),
+            "bmux.windows",
+            "split-pane",
+            &["--direction".to_string(), "vertical".to_string()],
+        )
+        .unwrap();
+        assert_eq!(split.action, "split");
+        assert_eq!(split.arguments[0], focused.surface_id.to_string());
+        assert_eq!(split.arguments[1], "vertical");
+        assert!(
+            native_provider_plugin_action(9, Some(&focused), "bmux.sessions", "new-session", &[],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_provider_mouse_translation_selects_local_pane_coordinates() {
+        let pane_id = Uuid::from_u128(5);
+        let scene = AttachScene {
+            session_id: Uuid::nil(),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 10,
+                    y: 4,
+                    w: 8,
+                    h: 6,
+                },
+                content_rect: AttachRect {
+                    x: 11,
+                    y: 5,
+                    w: 6,
+                    h: 4,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 13,
+            row: 7,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let shared = provider_mouse_to_shared(event);
+        let (_, rect) = bmux_attach_pipeline::mouse::pane_and_rect_at(&scene, 13, 7).unwrap();
+        let local = bmux_attach_pipeline::mouse::translate_event_to_pane_local(shared, rect)
+            .expect("point is inside content rect");
+        assert_eq!((local.column, local.row), (2, 2));
+        assert!(local.modifiers.control);
+        assert!(
+            bmux_attach_pipeline::mouse::translate_event_to_pane_local(
+                provider_mouse_to_shared(MouseEvent {
+                    column: 10,
+                    row: 4,
+                    ..event
+                }),
+                rect,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_provider_compositor_renders_and_repairs_independent_surfaces_atomically() {
+        let left = Uuid::from_u128(1);
+        let right = Uuid::from_u128(2);
+        let scene = AttachScene {
+            session_id: Uuid::nil(),
+            focus: AttachFocusTarget::Pane { pane_id: left },
+            surfaces: vec![
+                AttachSurface {
+                    id: left,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 5,
+                        h: 2,
+                    },
+                    content_rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 5,
+                        h: 2,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(left),
+                },
+                AttachSurface {
+                    id: right,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: SurfaceLayer::Pane,
+                    z: 1,
+                    rect: AttachRect {
+                        x: 5,
+                        y: 0,
+                        w: 5,
+                        h: 2,
+                    },
+                    content_rect: AttachRect {
+                        x: 5,
+                        y: 0,
+                        w: 5,
+                        h: 2,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: false,
+                    pane_id: Some(right),
+                },
+            ],
+        };
+        let stream = |name: &str, surface_id, bytes: &[u8]| bmux_client::AttachStreamSnapshot {
+            cursor: bmux_client::AttachStreamCursor {
+                stream_id: bmux_client::AttachStreamId::new(name).unwrap(),
+                surface_id,
+                generation: 1,
+                offset: u64::try_from(bytes.len()).unwrap(),
+            },
+            snapshot: bytes.to_vec(),
+        };
+        let left_stream = stream("left", left, b"left");
+        let right_stream = stream("right", right, b"right");
+        let snapshot = bmux_client::AttachProviderSnapshot {
+            view_revision: bmux_client::AttachViewRevision(1),
+            event_sequence: bmux_client::AttachDeltaSequence(0),
+            scene: scene.clone(),
+            streams: vec![left_stream.clone(), right_stream.clone()],
+            resume: bmux_client::AttachResumeState {
+                view_revision: bmux_client::AttachViewRevision(1),
+                event_sequence: bmux_client::AttachDeltaSequence(0),
+                streams: vec![left_stream.cursor.clone(), right_stream.cursor.clone()],
+                provider_token: Vec::new(),
+            },
+        };
+        let mut buffers = provider_pane_buffers_from_snapshot(&snapshot).unwrap();
+        let (mut terminal, handle) = HeadlessAttachTerminal::new(10, 2);
+        let mut graphics = TerminalGraphicsCache::new();
+        render_native_provider_scene(&mut terminal, &scene, &mut buffers, &mut graphics).unwrap();
+
+        let repaired_cursor = bmux_client::AttachStreamCursor {
+            offset: 8,
+            ..left_stream.cursor
+        };
+        let delta = bmux_client::AttachProviderDelta {
+            sequence: bmux_client::AttachDeltaSequence(1),
+            base_view_revision: bmux_client::AttachViewRevision(1),
+            view_revision: bmux_client::AttachViewRevision(1),
+            changes: vec![AttachProviderChange::StreamRepair(
+                bmux_client::AttachStreamSnapshot {
+                    cursor: repaired_cursor.clone(),
+                    snapshot: b"fixed".to_vec(),
+                },
+            )],
+            resume: bmux_client::AttachResumeState {
+                view_revision: bmux_client::AttachViewRevision(1),
+                event_sequence: bmux_client::AttachDeltaSequence(1),
+                streams: vec![repaired_cursor, right_stream.cursor],
+                provider_token: Vec::new(),
+            },
+        };
+        apply_provider_delta(&scene, &mut buffers, &delta).unwrap();
+        render_native_provider_scene(&mut terminal, &scene, &mut buffers, &mut graphics).unwrap();
+
+        let mut rendered = bmux_terminal_grid::TerminalGridStream::new(
+            10,
+            2,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        rendered.process(&handle.output_bytes());
+        let visible = bmux_terminal_grid::visible_text(rendered.grid(), 0, 2);
+        assert!(visible.starts_with("fixedright"), "{visible:?}");
+    }
 
     #[test]
     fn attach_input_mode_lifecycle_sequences_cover_enabled_and_disabled_modes() {

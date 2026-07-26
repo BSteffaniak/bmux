@@ -139,6 +139,7 @@ pub struct ConsensusNode {
     raft: openraft::Raft<ControlRaftConfig>,
     storage: ConsensusLogStore,
     node_id: NodeId,
+    cluster_id: String,
 }
 
 impl ConsensusNode {
@@ -173,6 +174,7 @@ impl ConsensusNode {
             raft,
             storage,
             node_id,
+            cluster_id: cluster_id.to_string(),
         })
     }
 
@@ -203,6 +205,16 @@ impl ConsensusNode {
     #[must_use]
     pub const fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    #[must_use]
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    #[must_use]
+    pub fn current_term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
     }
 
     #[must_use]
@@ -511,6 +523,13 @@ pub(crate) mod tests {
     }
 
     impl InMemoryNetworkFactory {
+        pub fn unregister(&self, id: NodeId) {
+            self.nodes
+                .write()
+                .expect("network registry lock poisoned")
+                .remove(&id);
+        }
+
         pub fn register(
             &self,
             id: NodeId,
@@ -625,7 +644,7 @@ pub(crate) mod tests {
         .expect("cluster should elect a leader")
     }
 
-    async fn wait_for_leader_excluding(nodes: &[&ConsensusNode], excluded: NodeId) -> NodeId {
+    pub async fn wait_for_leader_excluding(nodes: &[&ConsensusNode], excluded: NodeId) -> NodeId {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 for node in nodes {

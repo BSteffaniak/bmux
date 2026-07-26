@@ -370,6 +370,26 @@ impl ConsensusNodeRegistry {
             .map_err(|reason| ControlServiceError::RuntimeUnavailable { reason })
     }
 
+    /// Returns the registered local node ID when exactly one consensus runtime
+    /// is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for poisoned access or an ambiguous multi-runtime host.
+    pub fn sole_node_id(&self) -> Result<Option<NodeId>, String> {
+        let nodes = self
+            .nodes
+            .read()
+            .map_err(|_| "consensus node registry lock is poisoned".to_string())?;
+        match nodes.len() {
+            0 => Ok(None),
+            1 => Ok(nodes.keys().next().copied()),
+            count => Err(format!(
+                "cannot select one local consensus node from {count} active runtimes"
+            )),
+        }
+    }
+
     /// Resolves one active local consensus node.
     ///
     /// # Errors

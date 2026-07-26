@@ -16,6 +16,7 @@ bmux_attach_image_protocol  = { workspace = true }
 bmux_attach_layout_protocol = { workspace = true }
 bmux_config                 = { workspace = true }
 bmux_ipc                    = { workspace = true }
+bmux_keyboard               = { workspace = true }
 bmux_perf_telemetry         = { workspace = true }
 bmux_plugin_sdk             = { workspace = true }
 
@@ -43,6 +44,7 @@ fail-on-warnings = [
     "bmux_codec/fail-on-warnings",
     "bmux_config/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
+    "bmux_keyboard/fail-on-warnings",
 ]
 
 # Serialization features

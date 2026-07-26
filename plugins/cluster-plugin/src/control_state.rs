@@ -5,7 +5,7 @@ use bmux_cluster_plugin_api::cluster_types::{
     ClusterMember, ClusterMemberState, ControlCommand, ControlCommandError, ControlCommandRequest,
     ControlCommandResult, ControlReadConsistency, ControlResourceKind, ControlResponse,
     ControlStateView, ControlWorkflowStatus, LogicalPaneRecord, LogicalWindowRecord,
-    PaneAvailability, WorkspaceId, WorkspaceRecord,
+    PaneAvailability, PendingWorkflow, WorkspaceId, WorkspaceRecord,
 };
 use control_state_codec::{decode_snapshot, encode_snapshot};
 use std::collections::BTreeMap;
@@ -88,6 +88,7 @@ impl PartialOrd for DedupKey {
 struct DedupRecord {
     fingerprint: [u8; 32],
     issued_at_unix_ms: u64,
+    command: ControlCommand,
     response: ControlResponse,
 }
 
@@ -128,6 +129,17 @@ impl ControlState {
             workspaces: self.workspaces.values().cloned().collect(),
             windows: self.windows.values().cloned().collect(),
             panes: self.panes.values().cloned().collect(),
+            pending_workflows: self
+                .dedup
+                .iter()
+                .filter(|(_, record)| {
+                    record.response.workflow_status == ControlWorkflowStatus::Pending
+                })
+                .map(|(key, record)| PendingWorkflow {
+                    principal_id: key.principal_id.clone(),
+                    control_command: record.command.clone(),
+                })
+                .collect(),
             consistency,
         }
     }
@@ -214,6 +226,7 @@ impl ControlState {
             DedupRecord {
                 fingerprint,
                 issued_at_unix_ms: command.issued_at_unix_ms,
+                command: command.clone(),
                 response: response.clone(),
             },
         );
@@ -371,7 +384,13 @@ impl ControlState {
                 expected_revision,
                 expected_generation,
                 assignment,
+                launch_spec,
             } => {
+                if launch_spec.is_none() {
+                    return Err(invalid_transition(
+                        "execution assignment requires a durable launch specification",
+                    ));
+                }
                 let pane = self.panes.get_mut(&pane_id.value).ok_or_else(|| {
                     not_found(ControlResourceKind::Pane, pane_id.value.to_string())
                 })?;
@@ -643,7 +662,7 @@ mod tests {
     use super::*;
     use bmux_cluster_plugin_api::cluster_types::{
         CommandId, ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalWindowId,
-        PaneAvailability, PaneRestartPolicy, PlacementIntent,
+        PaneAvailability, PaneRestartPolicy, PlacementIntent, WorkerLaunchSpec,
     };
 
     fn id(value: u128) -> uuid::Uuid {
@@ -666,6 +685,17 @@ mod tests {
         ControlCommandRequest::CreateWorkspace {
             workspace_id: WorkspaceId { value: id(10) },
             name: Some(format!("workspace-{id_value}")),
+        }
+    }
+
+    fn launch_spec() -> WorkerLaunchSpec {
+        WorkerLaunchSpec {
+            program: Some("sh".to_string()),
+            args: vec!["-lc".to_string(), "printf ready".to_string()],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
         }
     }
 
@@ -806,6 +836,7 @@ mod tests {
                 expected_revision: 3,
                 expected_generation: 0,
                 assignment: assignment(1),
+                launch_spec: Some(launch_spec()),
             },
         ));
         assert_eq!(assigned.workflow_status, ControlWorkflowStatus::Pending);
@@ -862,6 +893,7 @@ mod tests {
                 expected_revision: 2,
                 expected_generation: 0,
                 assignment: assignment(1),
+                launch_spec: Some(launch_spec()),
             },
         ));
         assert!(matches!(
@@ -877,6 +909,7 @@ mod tests {
                 expected_revision: 3,
                 expected_generation: 0,
                 assignment: assignment(1),
+                launch_spec: Some(launch_spec()),
             },
         ));
         assert_eq!(assigned.workflow_status, ControlWorkflowStatus::Pending);
@@ -887,6 +920,7 @@ mod tests {
                 expected_revision: 4,
                 expected_generation: 1,
                 assignment: assignment(1),
+                launch_spec: Some(launch_spec()),
             },
         ));
         assert!(matches!(
@@ -910,6 +944,7 @@ mod tests {
                         expected_revision: 3,
                         expected_generation: 0,
                         assignment: assignment(1),
+                        launch_spec: Some(launch_spec()),
                     },
                 ))
                 .workflow_status,
@@ -1003,6 +1038,7 @@ mod tests {
                 expected_revision: 3,
                 expected_generation: 0,
                 assignment: assignment(1),
+                launch_spec: Some(launch_spec()),
             },
         );
         assert_eq!(
@@ -1011,7 +1047,20 @@ mod tests {
         );
 
         let first = state.encode_snapshot().unwrap();
+        let pending_view = state.to_view(ControlReadConsistency::Linearizable);
+        assert_eq!(pending_view.pending_workflows.len(), 1);
+        assert_eq!(
+            pending_view.pending_workflows[0].principal_id,
+            "principal:test"
+        );
+        assert_eq!(pending_view.pending_workflows[0].control_command, pending);
         let restored = ControlState::decode_snapshot(&first).unwrap();
+        assert_eq!(
+            restored
+                .to_view(ControlReadConsistency::Linearizable)
+                .pending_workflows,
+            pending_view.pending_workflows
+        );
         assert_eq!(restored, state);
         assert_eq!(restored.encode_snapshot().unwrap(), first);
 
@@ -1101,6 +1150,7 @@ mod tests {
                 expected_revision: 3,
                 expected_generation: 0,
                 assignment: assignment(1),
+                launch_spec: Some(launch_spec()),
             },
         );
         assert_eq!(
@@ -1134,6 +1184,31 @@ mod tests {
                 payload: vec![1, 2, 3]
             }
         );
+    }
+
+    #[test]
+    fn assignment_without_durable_launch_spec_is_rejected_atomically() {
+        let mut state = ControlState::new("cluster:test");
+        setup_pane(&mut state);
+        let before = state.clone();
+        let response = state.apply(&command(
+            4,
+            ControlCommandRequest::AssignExecution {
+                pane_id: LogicalPaneId { value: id(30) },
+                expected_revision: 3,
+                expected_generation: 0,
+                assignment: assignment(1),
+                launch_spec: None,
+            },
+        ));
+        assert!(matches!(
+            response.result,
+            ControlCommandResult::Rejected {
+                error: ControlCommandError::InvalidTransition { .. }
+            }
+        ));
+        assert_eq!(state.revision, before.revision);
+        assert_eq!(state.panes, before.panes);
     }
 
     #[test]

@@ -219,8 +219,27 @@ fn validate_request(request: &ControlCommandRequest) -> Result<(), CodecError> {
         | ControlCommandRequest::RemovePane { .. }
         | ControlCommandRequest::PruneDedup { .. } => Ok(()),
         ControlCommandRequest::PutPane { pane, .. } => validate_pane(pane),
-        ControlCommandRequest::AssignExecution { assignment, .. } => {
-            validate_assignment(assignment)
+        ControlCommandRequest::AssignExecution {
+            assignment,
+            launch_spec,
+            ..
+        } => {
+            validate_assignment(assignment)?;
+            if let Some(spec) = launch_spec {
+                validate_optional_string(spec.program.as_deref())?;
+                validate_optional_string(spec.cwd.as_deref())?;
+                if spec.args.len() > MAX_LIST_ITEMS || spec.env.len() > MAX_LIST_ITEMS {
+                    return Err(CodecError::LimitExceeded("launch spec items"));
+                }
+                for argument in &spec.args {
+                    validate_string(argument)?;
+                }
+                for entry in &spec.env {
+                    validate_string(&entry.key)?;
+                    validate_string(&entry.value)?;
+                }
+            }
+            Ok(())
         }
         ControlCommandRequest::SetPaneAvailability {
             assignment, reason, ..
@@ -379,12 +398,14 @@ fn encode_request(writer: &mut Writer, request: &ControlCommandRequest) {
             expected_revision,
             expected_generation,
             assignment,
+            launch_spec,
         } => {
             writer.u16(9);
             writer.uuid(pane_id.value);
             writer.u64(*expected_revision);
             writer.u64(*expected_generation);
             encode_assignment(writer, assignment);
+            encode_launch_spec(writer, launch_spec.as_ref());
         }
         ControlCommandRequest::SetPaneAvailability {
             pane_id,
@@ -464,6 +485,7 @@ fn decode_request(reader: &mut Reader<'_>) -> Result<ControlCommandRequest, Code
             expected_revision: reader.u64()?,
             expected_generation: reader.u64()?,
             assignment: decode_assignment(reader)?,
+            launch_spec: decode_launch_spec(reader)?,
         },
         10 => ControlCommandRequest::SetPaneAvailability {
             pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId {
@@ -731,6 +753,54 @@ fn decode_member_state(reader: &mut Reader<'_>) -> Result<ClusterMemberState, Co
             tag,
         }),
     }
+}
+
+fn encode_launch_spec(
+    writer: &mut Writer,
+    spec: Option<&bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec>,
+) {
+    let Some(spec) = spec else {
+        writer.bool(false);
+        return;
+    };
+    writer.bool(true);
+    writer.optional_string(spec.program.as_deref());
+    writer.u32(u32::try_from(spec.args.len()).expect("validated launch argument count"));
+    for argument in &spec.args {
+        writer.string(argument);
+    }
+    writer.optional_string(spec.cwd.as_deref());
+    encode_labels(writer, &spec.env);
+    writer.u16(spec.cols);
+    writer.u16(spec.rows);
+}
+
+fn decode_launch_spec(
+    reader: &mut Reader<'_>,
+) -> Result<Option<bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec>, CodecError> {
+    if !reader.bool()? {
+        return Ok(None);
+    }
+    let program = reader.optional_string()?;
+    let count = usize::try_from(reader.u32()?)
+        .map_err(|_| CodecError::LimitExceeded("launch argument count"))?;
+    if count > MAX_LIST_ITEMS {
+        return Err(CodecError::LimitExceeded("launch argument count"));
+    }
+    let mut args = Vec::with_capacity(count);
+    for _ in 0..count {
+        args.push(reader.string()?);
+    }
+    Ok(Some(
+        bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec {
+            program,
+            args,
+            cwd: reader.optional_string()?,
+            env: decode_labels(reader)?,
+            cols: reader.u16()?,
+            rows: reader.u16()?,
+        },
+    ))
 }
 
 fn encode_restart_policy(writer: &mut Writer, policy: PaneRestartPolicy) {
@@ -1173,6 +1243,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn every_initial_command_round_trips_canonically() {
         let member = ClusterMember {
             cluster_id: "cluster:test".to_string(),
@@ -1248,6 +1319,17 @@ mod tests {
                 expected_revision: 1,
                 expected_generation: 0,
                 assignment: assignment(),
+                launch_spec: Some(bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec {
+                    program: Some("sh".to_string()),
+                    args: vec!["-lc".to_string(), "echo ok".to_string()],
+                    cwd: Some("/tmp".to_string()),
+                    env: vec![PlacementLabel {
+                        key: "TERM".to_string(),
+                        value: "xterm-256color".to_string(),
+                    }],
+                    cols: 80,
+                    rows: 24,
+                }),
             },
             ControlCommandRequest::SetPaneAvailability {
                 pane_id: LogicalPaneId { value: id(4) },

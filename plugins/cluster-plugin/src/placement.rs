@@ -112,8 +112,11 @@ pub struct PlacementAssignmentPlan {
     pub command: ControlCommand,
 }
 
-/// Selects a worker and builds the deterministic generation-fenced assignment
-/// command that must commit before any worker launch side effect.
+/// Selects a worker and builds a generation-fenced assignment plan.
+///
+/// Callers must attach a launch specification with
+/// [`plan_assignment_with_launch`] before proposing the command; the replicated
+/// state machine rejects launch-less assignments.
 ///
 /// # Errors
 ///
@@ -126,6 +129,35 @@ pub fn plan_assignment(
     issued_at_unix_ms: u64,
     request: &PlacementRequest,
     candidates: impl IntoIterator<Item = PlacementCandidate>,
+) -> Result<PlacementAssignmentPlan, PlacementWorkflowError> {
+    plan_assignment_with_launch(
+        state,
+        pane_id,
+        principal_id,
+        command_id,
+        issued_at_unix_ms,
+        request,
+        candidates,
+        default_launch_spec(),
+    )
+}
+
+/// Selects a worker and embeds an optional durable launch specification in the
+/// committed assignment workflow.
+///
+/// # Errors
+///
+/// Returns the same placement and generation errors as [`plan_assignment`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_assignment_with_launch(
+    state: &crate::control_state::ControlState,
+    pane_id: &LogicalPaneId,
+    principal_id: String,
+    command_id: CommandId,
+    issued_at_unix_ms: u64,
+    request: &PlacementRequest,
+    candidates: impl IntoIterator<Item = PlacementCandidate>,
+    launch_spec: bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec,
 ) -> Result<PlacementAssignmentPlan, PlacementWorkflowError> {
     let pane = state
         .panes
@@ -161,9 +193,21 @@ pub fn plan_assignment(
                     generation: next_generation,
                     execution_id,
                 },
+                launch_spec: Some(launch_spec),
             },
         },
     })
+}
+
+fn default_launch_spec() -> bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec {
+    bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec {
+        program: Some("sh".to_string()),
+        args: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+    }
 }
 
 fn deterministic_execution_id(
@@ -483,6 +527,38 @@ mod tests {
             panic!("placement must produce assignment intent");
         };
         assert_eq!(assignment.execution_id, replay_assignment.execution_id);
+    }
+
+    #[test]
+    fn assignment_plan_persists_launch_spec_before_side_effects() {
+        let spec = bmux_cluster_plugin_api::cluster_types::WorkerLaunchSpec {
+            program: Some("sh".to_string()),
+            args: vec!["-lc".to_string(), "printf ready".to_string()],
+            cwd: Some("/tmp".to_string()),
+            env: Vec::new(),
+            cols: 100,
+            rows: 30,
+        };
+        let plan = plan_assignment_with_launch(
+            &pane_state(None),
+            &LogicalPaneId {
+                value: uuid::Uuid::from_u128(30),
+            },
+            "principal:test".to_string(),
+            CommandId {
+                value: uuid::Uuid::from_u128(101),
+            },
+            56,
+            &request(),
+            [candidate(2)],
+            spec.clone(),
+        )
+        .unwrap();
+        let ControlCommandRequest::AssignExecution { launch_spec, .. } = plan.command.request
+        else {
+            panic!("placement must produce assignment intent");
+        };
+        assert_eq!(launch_spec, Some(spec));
     }
 
     #[test]

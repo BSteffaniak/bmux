@@ -83,6 +83,20 @@ pub fn full_screen_repaint_bytes(grid: &TerminalGrid) -> Vec<u8> {
         }
     }
     bytes.extend_from_slice(b"\x1b[0m");
+    let cursor = grid.cursor();
+    bytes.extend_from_slice(
+        format!(
+            "\x1b[{};{}H",
+            cursor.row.saturating_add(1),
+            cursor.col.saturating_add(1)
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(if cursor.visible {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    });
     bytes
 }
 
@@ -180,6 +194,19 @@ mod tests {
         assert!(repaint_text.contains("\x1b[1;1H"));
         assert!(repaint_text.contains("1;3;4;9;38;2;1;2;3;48;5;4"));
         assert!(repaint_text.contains('A'));
+    }
+
+    #[test]
+    fn repaint_restores_cursor_position_and_visibility() {
+        let mut grid = test_grid(16, 4);
+        grid.process(b"hello\x1b[3;7H\x1b[?25l");
+
+        let repaint = full_screen_repaint_bytes(grid.grid());
+        assert!(repaint.ends_with(b"\x1b[3;7H\x1b[?25l"));
+
+        let mut replay = test_grid(16, 4);
+        replay.process(&repaint);
+        assert_eq!(replay.grid().cursor(), grid.grid().cursor());
     }
 
     #[test]

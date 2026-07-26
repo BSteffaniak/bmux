@@ -80,6 +80,9 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
         writer.uuid(key.command_id);
         writer.raw(&record.fingerprint);
         writer.u64(record.issued_at_unix_ms);
+        writer.bytes(&crate::control_codec::encode_control_command(
+            &record.command,
+        ));
         encode_state_response(&mut writer, &record.response);
     }
 
@@ -90,6 +93,7 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
     Ok(bytes)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecError> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(StateCodecError::LimitExceeded("bytes"));
@@ -159,7 +163,13 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
             .try_into()
             .expect("exact fingerprint length");
         let issued_at_unix_ms = reader.u64()?;
+        let command = crate::control_codec::decode_control_command(&reader.bytes()?)?;
         let response = decode_state_response(reader)?;
+        if command.principal_id != key.principal_id || command.command_id.value != key.command_id {
+            return Err(StateCodecError::InvalidState(
+                "dedup command identity mismatch",
+            ));
+        }
         if response.command_id.value != key.command_id {
             return Err(StateCodecError::InvalidState(
                 "dedup response command mismatch",
@@ -170,6 +180,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
             DedupRecord {
                 fingerprint,
                 issued_at_unix_ms,
+                command,
                 response,
             },
         ))

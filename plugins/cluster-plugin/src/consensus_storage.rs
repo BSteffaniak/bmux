@@ -2641,7 +2641,8 @@ mod tests {
         use bmux_cluster_plugin_api::cluster_types::{
             CommandId, ControlCommand, ControlCommandRequest, ControlWorkflowStatus,
             ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord, LogicalWindowId,
-            LogicalWindowRecord, PaneAvailability, PaneRestartPolicy, PlacementIntent, WorkspaceId,
+            LogicalWindowRecord, PaneAvailability, PaneRestartPolicy, PlacementIntent,
+            WorkerLaunchSpec, WorkspaceId,
         };
         use openraft::storage::RaftStateMachine;
 
@@ -2733,6 +2734,14 @@ mod tests {
                         value: uuid::Uuid::from_u128(40),
                     },
                 },
+                launch_spec: Some(WorkerLaunchSpec {
+                    program: Some("sh".to_string()),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    cols: 80,
+                    rows: 24,
+                }),
             },
         );
         assert_eq!(

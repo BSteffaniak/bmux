@@ -141,6 +141,10 @@ pub struct AttachProviderInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachInputPayload {
     Bytes(Vec<u8>),
+    Key {
+        stroke: bmux_keyboard::KeyStroke,
+        enhanced: bool,
+    },
     Paste(Vec<u8>),
     Mouse(AttachMouseInput),
 }

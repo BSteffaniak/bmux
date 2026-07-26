@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::wildcard_imports)] // Focused private modules expose a crate-internal domain facade.
 
+pub(crate) mod attach_state;
 pub(crate) mod commands;
 pub mod consensus_membership;
 pub mod consensus_network;
@@ -19,6 +20,7 @@ pub(crate) mod pane;
 pub mod placement;
 pub(crate) mod storage;
 pub mod worker_pane_runtime;
+pub mod worker_reconciler;
 pub mod worker_runtime;
 pub(crate) mod workspace;
 
@@ -140,6 +142,13 @@ impl RustPlugin for ClusterPlugin {
             let cluster_id = cluster_id.to_string();
             let state_dir = PathBuf::from(&context.connection.state_dir);
             let nodes = consensus_network::global_consensus_nodes();
+            let reconciler_nodes = nodes.clone();
+            let reconciler_identity = identity.clone();
+            let reconciler_caller = caller.clone();
+            async_handle.spawn_with_name("bmux-cluster-worker-reconciler", async move {
+                worker_reconciler::run(reconciler_caller, reconciler_identity, reconciler_nodes)
+                    .await;
+            });
             async_handle.spawn_with_name("bmux-cluster-consensus", async move {
                 match consensus_runtime::ConsensusNode::start_endpoint(
                     &state_dir,
@@ -239,7 +248,22 @@ impl RustPlugin for ClusterPlugin {
             dyn bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService
                 + Send
                 + Sync,
-        > = control;
+        > = control.clone();
+        let attach = Arc::new(attach_state::AttachStateServiceHandle::new(
+            caller.clone(),
+            *identity.node_id(),
+            control,
+        ));
+        let attach_commands: Arc<
+            dyn bmux_cluster_plugin_api::cluster_attach_command::ClusterAttachCommandService
+                + Send
+                + Sync,
+        > = attach.clone();
+        let attach_state: Arc<
+            dyn bmux_cluster_plugin_api::cluster_attach_state::ClusterAttachStateService
+                + Send
+                + Sync,
+        > = attach;
         let worker_registry = worker_pane_runtime::local_worker_registry(
             caller.clone(),
             identity.node_id().to_string(),
@@ -271,6 +295,14 @@ impl RustPlugin for ClusterPlugin {
         let _ = bmux_cluster_plugin_api::cluster_control_state::register_provider(
             registry,
             control_state,
+        );
+        let _ = bmux_cluster_plugin_api::cluster_attach_command::register_provider(
+            registry,
+            attach_commands,
+        );
+        let _ = bmux_cluster_plugin_api::cluster_attach_state::register_provider(
+            registry,
+            attach_state,
         );
         let _ = bmux_cluster_plugin_api::cluster_worker_command::register_provider(
             registry,

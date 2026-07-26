@@ -1133,6 +1133,29 @@ pub fn verify_membership_credential(
         .map_err(|_| "membership credential signature verification failed".to_string())
 }
 
+#[cfg(test)]
+pub fn issue_test_member(
+    issuer: &NodeIdentity,
+    cluster_id: ClusterId,
+    node: &NodeIdentity,
+    endpoint: &str,
+    capabilities: ClusterNodeCapabilities,
+    issued_at_unix_ms: u64,
+) -> ClusterMember {
+    let mut member = issue_membership_credential(
+        issuer,
+        cluster_id,
+        node.node_id().to_string(),
+        node.public_key().to_string(),
+        capabilities,
+        negotiate_protocol(&current_protocol_offer(), &current_protocol_offer()).unwrap(),
+        issued_at_unix_ms,
+    )
+    .unwrap();
+    member.endpoint = Some(endpoint.to_string());
+    member
+}
+
 pub fn initialize_cluster(
     caller: &impl ClusterRuntimeOps,
 ) -> Result<ClusterIdentityResponse, String> {
