@@ -688,9 +688,15 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
                     replies.push(ControlReply(Vec::new()));
                 }
                 EntryPayload::Normal(request) => {
-                    let command =
-                        decode_control_command(&request.0).map_err(storage_write_error)?;
-                    let response = next.control_state.apply(&command);
+                    let response = if crate::control_codec::is_feature_activation(&request.0) {
+                        let command = crate::control_codec::decode_feature_activation(&request.0)
+                            .map_err(storage_write_error)?;
+                        next.control_state.apply_feature_activation(&command)
+                    } else {
+                        let command =
+                            decode_control_command(&request.0).map_err(storage_write_error)?;
+                        next.control_state.apply(&command)
+                    };
                     replies.push(ControlReply(encode_control_response(&response)));
                 }
             }

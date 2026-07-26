@@ -113,6 +113,7 @@ pub fn validate_with_imports(
         .iter()
         .map(|c| c.name.as_str())
         .collect();
+    validate_interface_families(schema)?;
 
     for iface in &schema.interfaces {
         validate_interface(
@@ -122,6 +123,47 @@ pub fn validate_with_imports(
             &schema_type_names,
             &declared_capabilities,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_interface_families(schema: &Schema) -> Result<(), Error> {
+    let mut families: BTreeMap<&str, Vec<&Interface>> = BTreeMap::new();
+    for iface in &schema.interfaces {
+        families.entry(iface.name.as_str()).or_default().push(iface);
+    }
+    for (name, family) in families {
+        if family.len() == 1 {
+            continue;
+        }
+        let mut versions = BTreeSet::new();
+        for iface in family {
+            let Some(version) = iface.interface_version else {
+                return Err(Error::Validate {
+                    message: format!(
+                        "duplicate interface `{name}` requires an explicit distinct @interface-version on every declaration"
+                    ),
+                });
+            };
+            if !versions.insert(version) {
+                return Err(Error::Validate {
+                    message: format!(
+                        "duplicate interface `{name}` has repeated wire version {version}"
+                    ),
+                });
+            }
+            let service_only = iface
+                .items
+                .iter()
+                .all(|item| matches!(item, InterfaceItem::Query(_) | InterfaceItem::Command(_)));
+            if !service_only {
+                return Err(Error::Validate {
+                    message: format!(
+                        "versioned interface family `{name}` must be service-only; move shared types and events to uniquely named interfaces"
+                    ),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -738,6 +780,37 @@ mod tests {
             matches!(&err, Error::Validate { message } if message.contains("mixes events with service operations")),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn accepts_distinct_explicit_versions_of_service_only_interface() {
+        let src = "plugin p version 1;\n\
+                   capability RUN = p.run;\n\
+                   @capability(RUN) @interface-version(1)\n\
+                   interface actions { command run() -> unit; }\n\
+                   @capability(RUN) @interface-version(2)\n\
+                   interface actions { command run() -> unit; command stop() -> unit; }";
+        compile(src).expect("versioned service family");
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_type_defining_versioned_interface_families() {
+        let missing_version = "plugin p version 1;\n\
+            capability RUN = p.run;\n\
+            @capability(RUN) interface actions { command run() -> unit; }\n\
+            @capability(RUN) @interface-version(2) interface actions { command run() -> unit; }";
+        assert!(compile(missing_version).is_err());
+
+        let repeated_version = "plugin p version 1;\n\
+            capability RUN = p.run;\n\
+            @capability(RUN) @interface-version(1) interface actions { command run() -> unit; }\n\
+            @capability(RUN) @interface-version(1) interface actions { command run() -> unit; }";
+        assert!(compile(repeated_version).is_err());
+
+        let types = "plugin p version 1;\n\
+            @interface-version(1) interface types { record value { id: uuid } }\n\
+            @interface-version(2) interface types { record value { id: uuid } }";
+        assert!(compile(types).is_err());
     }
 
     #[test]

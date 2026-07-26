@@ -26,12 +26,19 @@ const ENROLLMENT_TOKEN_PREFIX: &str = "bmux-enroll-v1";
 const CLUSTER_PEER_REVISION_MIN: u32 = 1;
 const CLUSTER_PEER_REVISION_MAX: u32 = 1;
 const CLUSTER_SCHEMA_VERSION_MIN: u32 = 1;
-const CLUSTER_SCHEMA_VERSION_MAX: u32 = 1;
+const CLUSTER_SCHEMA_VERSION_MAX: u32 = 2;
 const CLUSTER_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const ATOMIC_LAYOUT_FEATURE: &str = "atomic-layout-mutation-v2";
+const MANDATORY_CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
+    "membership-credential-v1",
+    "node-possession-proof-v1",
+    "single-use-enrollment-v1",
+];
 const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "membership-credential-v1",
     "node-possession-proof-v1",
     "single-use-enrollment-v1",
+    ATOMIC_LAYOUT_FEATURE,
 ];
 
 pub const fn initializer_capabilities() -> ClusterNodeCapabilities {
@@ -100,7 +107,7 @@ fn negotiate_protocol(
             remote.schema_version_max
         ));
     }
-    for required in CLUSTER_PROTOCOL_FEATURES {
+    for required in MANDATORY_CLUSTER_PROTOCOL_FEATURES {
         if !remote.features.iter().any(|feature| feature == required) {
             return Err(format!(
                 "joining node is missing mandatory cluster feature '{required}'"
@@ -1149,6 +1156,30 @@ pub fn issue_test_member(
         node.public_key().to_string(),
         capabilities,
         negotiate_protocol(&current_protocol_offer(), &current_protocol_offer()).unwrap(),
+        issued_at_unix_ms,
+    )
+    .unwrap();
+    member.endpoint = Some(endpoint.to_string());
+    member
+}
+
+#[cfg(test)]
+pub fn issue_test_member_with_protocol(
+    issuer: &NodeIdentity,
+    cluster_id: ClusterId,
+    node: &NodeIdentity,
+    endpoint: &str,
+    capabilities: ClusterNodeCapabilities,
+    negotiated_protocol: ClusterNegotiatedProtocol,
+    issued_at_unix_ms: u64,
+) -> ClusterMember {
+    let mut member = issue_membership_credential(
+        issuer,
+        cluster_id,
+        node.node_id().to_string(),
+        node.public_key().to_string(),
+        capabilities,
+        negotiated_protocol,
         issued_at_unix_ms,
     )
     .unwrap();

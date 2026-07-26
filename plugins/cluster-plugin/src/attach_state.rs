@@ -185,28 +185,6 @@ where
     > {
         Box::pin(async move {
             let control_request = match request.action.as_str() {
-                "close" => {
-                    let pane_id = parse_action_uuid(&request.arguments, 0, "pane ID")?;
-                    let view = bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService::read_linearizable(self.control.as_ref()).await?;
-                    let pane = view
-                        .panes
-                        .iter()
-                        .find(|pane| {
-                            pane.workspace_id == request.workspace_id
-                                && pane.pane_id.value == pane_id
-                        })
-                        .ok_or_else(|| ControlServiceError::Internal {
-                            reason: "logical pane was not found".to_string(),
-                        })?;
-                    bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::RemovePane {
-                        pane_id: pane.pane_id.clone(),
-                        expected_revision: pane.revision,
-                        expected_generation: pane
-                            .execution
-                            .as_ref()
-                            .map(|assignment| assignment.generation),
-                    }
-                }
                 "rename" => {
                     let name = request
                         .arguments
@@ -620,22 +598,6 @@ fn validate_projected_layout(
         });
     }
     Ok(())
-}
-
-fn parse_action_uuid(
-    arguments: &[String],
-    index: usize,
-    name: &str,
-) -> Result<uuid::Uuid, ControlServiceError> {
-    arguments
-        .get(index)
-        .ok_or_else(|| ControlServiceError::Internal {
-            reason: format!("attach action requires {name}"),
-        })?
-        .parse()
-        .map_err(|error| ControlServiceError::Internal {
-            reason: format!("attach action {name} is invalid: {error}"),
-        })
 }
 
 fn control_error(error: &ControlServiceError) -> WorkerServiceError {

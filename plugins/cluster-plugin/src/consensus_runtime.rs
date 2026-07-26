@@ -218,6 +218,29 @@ impl ConsensusNode {
     }
 
     #[must_use]
+    pub fn committed_member_ids(&self) -> std::collections::BTreeSet<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(node_id, _)| *node_id)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn committed_voter_ids(&self) -> std::collections::BTreeSet<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    #[must_use]
     pub const fn raft(&self) -> &openraft::Raft<ControlRaftConfig> {
         &self.raft
     }
@@ -310,7 +333,29 @@ impl ConsensusNode {
     ) -> Result<ControlResponse, ControlServiceError> {
         let command_id = command.command_id.clone();
         let encoded = crate::control_codec::encode_control_command(&command);
-        match self.write(encoded).await {
+        self.decode_write_response(command_id, self.write(encoded).await)
+    }
+
+    /// Activates one durable schema feature after membership eligibility checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured leader, quorum, rejection, runtime, or internal errors.
+    pub async fn activate_feature(
+        &self,
+        command: crate::control_codec::FeatureActivationCommand,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        let command_id = command.command_id.clone();
+        let encoded = crate::control_codec::encode_feature_activation(&command);
+        self.decode_write_response(command_id, self.write(encoded).await)
+    }
+
+    fn decode_write_response(
+        &self,
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        result: Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError>,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        match result {
             Ok(response) => {
                 let response = crate::control_codec::decode_control_response(&response.data.0)
                     .map_err(|error| ControlServiceError::Internal {
@@ -499,9 +544,13 @@ fn consensus_config(cluster_id: &str) -> Result<Arc<Config>, ConsensusRuntimeErr
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::control_codec::{decode_control_response, encode_control_command};
+    use crate::control_codec::{
+        FeatureActivationCommand, decode_control_response, encode_control_command,
+    };
+    use crate::membership::{ClusterId, NodeIdentity};
     use bmux_cluster_plugin_api::cluster_types::{
-        CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+        ClusterConsensusRole, ClusterNodeCapabilities, CommandId, ControlCommand,
+        ControlCommandRequest, WorkspaceId,
     };
     use openraft::error::{RPCError, RemoteError, Unreachable};
     use openraft::network::{RPCOption, RaftNetwork};
@@ -810,6 +859,139 @@ pub(crate) mod tests {
 
         nodes[1].shutdown().await.unwrap();
         nodes[2].shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_voters_activate_feature_floor_and_continue_v1_writes() {
+        let network = InMemoryNetworkFactory::default();
+        let roots = [
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let ids = [NodeId::from(31), NodeId::from(32), NodeId::from(33)];
+        let endpoints = ["memory://f1", "memory://f2", "memory://f3"];
+        let mut nodes = Vec::new();
+        for index in 0..3 {
+            let node = ConsensusNode::start(
+                roots[index].path(),
+                "cluster-feature-floor-test",
+                ids[index],
+                network.clone(),
+            )
+            .await
+            .unwrap();
+            network.register(
+                ids[index],
+                BasicNode::new(endpoints[index]),
+                node.raft().clone(),
+            );
+            nodes.push(node);
+        }
+        nodes[0]
+            .initialize_single(ids[0], endpoints[0])
+            .await
+            .unwrap();
+        nodes[0]
+            .change_voters(BTreeMap::from([
+                (ids[0], BasicNode::new(endpoints[0])),
+                (ids[1], BasicNode::new(endpoints[1])),
+                (ids[2], BasicNode::new(endpoints[2])),
+            ]))
+            .await
+            .unwrap();
+        let leader_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
+        let leader = nodes
+            .iter()
+            .find(|node| node.node_id() == leader_id)
+            .unwrap();
+
+        let issuer = NodeIdentity::new_for_test(70);
+        let cluster_id = ClusterId::generate();
+        let now = crate::now_unix_ms();
+        for (index, id) in ids.into_iter().enumerate() {
+            let identity = NodeIdentity::new_for_test(80 + u64::try_from(index).unwrap());
+            let mut member = crate::membership::issue_test_member(
+                &issuer,
+                cluster_id,
+                &identity,
+                endpoints[index],
+                ClusterNodeCapabilities {
+                    consensus_role: ClusterConsensusRole::Voter,
+                    worker: true,
+                    ingress: true,
+                },
+                now,
+            );
+            member.node_id = id.to_string();
+            member.public_key = identity.public_key().to_string();
+            member.credential_signature.clear();
+            member = crate::membership::issue_test_member_with_protocol(
+                &issuer,
+                cluster_id,
+                &identity,
+                endpoints[index],
+                member.capabilities,
+                member.negotiated_protocol,
+                now,
+            );
+            // Test NodeId values are not derived from the test identities, so
+            // re-key the signed record to the committed Raft id and skip the
+            // service eligibility layer here; the state-machine integration
+            // below proves replication and migration of the schema-2 envelope.
+            member.node_id = id.to_string();
+            let response = leader
+                .mutate(ControlCommand {
+                    schema_version: 1,
+                    principal_id: "principal:test".to_string(),
+                    command_id: CommandId {
+                        value: uuid::Uuid::from_u128(300 + u128::try_from(index).unwrap()),
+                    },
+                    issued_at_unix_ms: now,
+                    request: ControlCommandRequest::UpsertMember { member },
+                })
+                .await;
+            assert!(
+                response.is_err(),
+                "re-keyed unsigned fixture must fail closed"
+            );
+        }
+
+        let activation = FeatureActivationCommand {
+            principal_id: "principal:test".to_string(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(400),
+            },
+            issued_at_unix_ms: now,
+            expected_control_revision: 0,
+            read_schema_floor: 2,
+            write_schema_floor: 2,
+            feature: crate::membership::ATOMIC_LAYOUT_FEATURE.to_string(),
+        };
+        leader.activate_feature(activation).await.unwrap();
+        leader.mutate(command(401, 401)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if nodes.iter().all(|node| {
+                    node.persisted_control_state().is_ok_and(|state| {
+                        state.read_schema_floor == 2
+                            && state.write_schema_floor == 2
+                            && state
+                                .activated_features
+                                .contains(crate::membership::ATOMIC_LAYOUT_FEATURE)
+                            && state.workspaces.contains_key(&uuid::Uuid::from_u128(401))
+                    })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 
     const fn first_workspace() -> uuid::Uuid {

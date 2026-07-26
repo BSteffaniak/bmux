@@ -8,7 +8,9 @@ use bmux_cluster_plugin_api::cluster_types::{
 use sha2::{Digest, Sha256};
 
 const CODEC_MAGIC: &[u8; 8] = b"BMCMD001";
+const FEATURE_COMMAND_MAGIC: &[u8; 8] = b"BMCMD002";
 const CONTROL_SCHEMA_VERSION: u16 = 1;
+const FEATURE_SCHEMA_VERSION: u16 = 2;
 const MAX_STRING_BYTES: usize = 65_536;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LIST_ITEMS: usize = 16_384;
@@ -57,6 +59,65 @@ pub fn request_fingerprint(command: &ControlCommand) -> [u8; 32] {
     let mut writer = Writer::default();
     encode_request(&mut writer, &command.request);
     Sha256::digest(writer.bytes).into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureActivationCommand {
+    pub principal_id: String,
+    pub command_id: CommandId,
+    pub issued_at_unix_ms: u64,
+    pub expected_control_revision: u64,
+    pub read_schema_floor: u16,
+    pub write_schema_floor: u16,
+    pub feature: String,
+}
+
+#[must_use]
+pub fn encode_feature_activation(command: &FeatureActivationCommand) -> Vec<u8> {
+    validate_string(&command.principal_id).expect("feature principal must be bounded");
+    validate_string(&command.feature).expect("feature name must be bounded");
+    let mut writer = Writer::default();
+    writer.raw(FEATURE_COMMAND_MAGIC);
+    writer.u16(FEATURE_SCHEMA_VERSION);
+    writer.string(&command.principal_id);
+    writer.uuid(command.command_id.value);
+    writer.u64(command.issued_at_unix_ms);
+    writer.u64(command.expected_control_revision);
+    writer.u16(command.read_schema_floor);
+    writer.u16(command.write_schema_floor);
+    writer.string(&command.feature);
+    writer.into_bytes()
+}
+
+pub fn decode_feature_activation(bytes: &[u8]) -> Result<FeatureActivationCommand, CodecError> {
+    let mut reader = Reader::new(bytes);
+    if reader.take(FEATURE_COMMAND_MAGIC.len())? != FEATURE_COMMAND_MAGIC {
+        return Err(CodecError::InvalidMagic);
+    }
+    let schema_version = reader.u16()?;
+    if schema_version != FEATURE_SCHEMA_VERSION {
+        return Err(CodecError::UnsupportedSchema(schema_version));
+    }
+    let command = FeatureActivationCommand {
+        principal_id: reader.string()?,
+        command_id: CommandId {
+            value: reader.uuid()?,
+        },
+        issued_at_unix_ms: reader.u64()?,
+        expected_control_revision: reader.u64()?,
+        read_schema_floor: reader.u16()?,
+        write_schema_floor: reader.u16()?,
+        feature: reader.string()?,
+    };
+    reader.finish()?;
+    validate_string(&command.principal_id)?;
+    validate_string(&command.feature)?;
+    Ok(command)
+}
+
+#[must_use]
+pub fn is_feature_activation(bytes: &[u8]) -> bool {
+    bytes.starts_with(FEATURE_COMMAND_MAGIC)
 }
 
 /// Encodes a typed control command into the canonical durable representation.
@@ -130,7 +191,7 @@ pub(crate) fn decode_state_response(
     reader: &mut Reader<'_>,
 ) -> Result<ControlResponse, CodecError> {
     let schema_version = reader.u16()?;
-    if schema_version != CONTROL_SCHEMA_VERSION {
+    if !(CONTROL_SCHEMA_VERSION..=FEATURE_SCHEMA_VERSION).contains(&schema_version) {
         return Err(CodecError::UnsupportedSchema(schema_version));
     }
     let command_id = CommandId {
@@ -1240,6 +1301,25 @@ mod tests {
             execution: Some(assignment()),
             revision: 1,
         }
+    }
+
+    #[test]
+    fn feature_activation_codec_is_distinct_canonical_and_bounded() {
+        let command = FeatureActivationCommand {
+            principal_id: "principal:test".to_string(),
+            command_id: CommandId { value: id(77) },
+            issued_at_unix_ms: 42,
+            expected_control_revision: 9,
+            read_schema_floor: 2,
+            write_schema_floor: 2,
+            feature: "atomic-layout-mutation-v2".to_string(),
+        };
+        let encoded = encode_feature_activation(&command);
+        assert!(is_feature_activation(&encoded));
+        assert!(!encoded.starts_with(CODEC_MAGIC));
+        assert_eq!(decode_feature_activation(&encoded).unwrap(), command);
+        assert_eq!(encode_feature_activation(&command), encoded);
+        assert!(decode_control_command(&encoded).is_err());
     }
 
     #[test]

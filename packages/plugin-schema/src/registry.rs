@@ -194,16 +194,8 @@ impl SchemaRegistry {
             });
         }
 
-        let provider_iface = provider
-            .schema
-            .interfaces
-            .iter()
-            .find(|i| i.name == interface_name);
-        let consumer_iface = consumer
-            .schema
-            .interfaces
-            .iter()
-            .find(|i| i.name == interface_name);
+        let provider_iface = find_interface(&provider.schema, interface_name);
+        let consumer_iface = find_interface(&consumer.schema, interface_name);
 
         let (Some(provider_iface), Some(consumer_iface)) = (provider_iface, consumer_iface) else {
             if provider_iface.is_none() {
@@ -256,6 +248,26 @@ impl SchemaRegistry {
             Err(errors)
         }
     }
+}
+
+fn find_interface<'a>(
+    schema: &'a Schema,
+    canonical_name: &str,
+) -> Option<&'a crate::ast::Interface> {
+    if let Some((name, version)) = canonical_name.rsplit_once("/v")
+        && let Ok(version) = version.parse::<u32>()
+    {
+        return schema
+            .interfaces
+            .iter()
+            .find(|iface| iface.name == name && iface.interface_version == Some(version));
+    }
+    let mut matches = schema
+        .interfaces
+        .iter()
+        .filter(|iface| iface.name == canonical_name);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 fn collect_ops(iface: &crate::ast::Interface) -> BTreeMap<String, String> {
@@ -313,6 +325,31 @@ mod tests {
         assert_eq!(entry.version, 1);
         let fetched = reg.get("bmux.windows").expect("registered");
         assert_eq!(fetched.version, 1);
+    }
+
+    #[test]
+    fn compatibility_selects_canonical_version_and_rejects_ambiguous_bare_name() {
+        let family = |plugin: &str| {
+            format!(
+                "plugin {plugin} version 1;\n\
+                 capability RUN = p.run;\n\
+                 @capability(RUN) @interface-version(1)\n\
+                 interface actions {{ command run() -> unit; }}\n\
+                 @capability(RUN) @interface-version(2)\n\
+                 interface actions {{ command run() -> unit; command stop() -> unit; }}"
+            )
+        };
+        let mut reg = SchemaRegistry::new();
+        reg.register(&family("provider")).unwrap();
+        reg.register(&family("consumer")).unwrap();
+        reg.check_compatibility("provider", "consumer", "actions/v1")
+            .unwrap();
+        reg.check_compatibility("provider", "consumer", "actions/v2")
+            .unwrap();
+        assert!(
+            reg.check_compatibility("provider", "consumer", "actions")
+                .is_err()
+        );
     }
 
     #[test]

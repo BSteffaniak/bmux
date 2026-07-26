@@ -244,8 +244,18 @@ impl RustPlugin for ClusterPlugin {
                 + Send
                 + Sync,
         > = control.clone();
+        let control_commands_v2: Arc<
+            dyn bmux_cluster_plugin_api::cluster_control_command_v2::ClusterControlCommandService
+                + Send
+                + Sync,
+        > = control.clone();
         let control_state: Arc<
             dyn bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService
+                + Send
+                + Sync,
+        > = control.clone();
+        let control_state_v2: Arc<
+            dyn bmux_cluster_plugin_api::cluster_control_state_v2::ClusterControlStateService
                 + Send
                 + Sync,
         > = control.clone();
@@ -292,9 +302,17 @@ impl RustPlugin for ClusterPlugin {
             registry,
             control_commands,
         );
+        let _ = bmux_cluster_plugin_api::cluster_control_command_v2::register_provider(
+            registry,
+            control_commands_v2,
+        );
         let _ = bmux_cluster_plugin_api::cluster_control_state::register_provider(
             registry,
             control_state,
+        );
+        let _ = bmux_cluster_plugin_api::cluster_control_state_v2::register_provider(
+            registry,
+            control_state_v2,
         );
         let _ = bmux_cluster_plugin_api::cluster_attach_command::register_provider(
             registry,

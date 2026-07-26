@@ -7,7 +7,8 @@ use bmux_cluster_plugin_api::cluster_types::{
 
 use super::{
     CONTROL_CODEC_VERSION, CONTROL_SCHEMA_VERSION, ControlState, DedupKey, DedupRecord,
-    LEGACY_SNAPSHOT_FORMAT_VERSION, LEGACY_SNAPSHOT_MAGIC, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_ITEMS,
+    FeatureDedupRecord, LEGACY_SNAPSHOT_FORMAT_VERSION, LEGACY_SNAPSHOT_MAGIC, MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_ITEMS, PREVIOUS_SNAPSHOT_FORMAT_VERSION, PREVIOUS_SNAPSHOT_MAGIC,
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC, StateCodecError,
 };
 
@@ -31,12 +32,28 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
         return Err(StateCodecError::UnsupportedSchema(state.schema_version));
     }
     let mut writer = Writer::default();
-    writer.raw(SNAPSHOT_MAGIC);
-    writer.u16(SNAPSHOT_FORMAT_VERSION);
+    let advanced = state.read_schema_floor != CONTROL_SCHEMA_VERSION
+        || state.write_schema_floor != CONTROL_SCHEMA_VERSION
+        || !state.activated_features.is_empty();
+    if advanced {
+        writer.raw(SNAPSHOT_MAGIC);
+        writer.u16(SNAPSHOT_FORMAT_VERSION);
+    } else {
+        writer.raw(PREVIOUS_SNAPSHOT_MAGIC);
+        writer.u16(PREVIOUS_SNAPSHOT_FORMAT_VERSION);
+    }
     writer.u16(CONTROL_CODEC_VERSION);
     writer.u16(state.schema_version);
     writer.string(&state.cluster_id);
     writer.u64(state.revision);
+    if advanced {
+        writer.u16(state.read_schema_floor);
+        writer.u16(state.write_schema_floor);
+        write_count(&mut writer, state.activated_features.len())?;
+        for feature in &state.activated_features {
+            writer.string(feature);
+        }
+    }
 
     write_count(&mut writer, state.members.len())?;
     for (key, member) in &state.members {
@@ -86,6 +103,20 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
         encode_state_response(&mut writer, &record.response);
     }
 
+    if advanced {
+        write_count(&mut writer, state.feature_dedup.len())?;
+        for (key, record) in &state.feature_dedup {
+            writer.string(&key.principal_id);
+            writer.uuid(key.command_id);
+            writer.raw(&record.fingerprint);
+            writer.u64(record.issued_at_unix_ms);
+            writer.bytes(&crate::control_codec::encode_feature_activation(
+                &record.command,
+            ));
+            encode_state_response(&mut writer, &record.response);
+        }
+    }
+
     let bytes = writer.into_bytes();
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(StateCodecError::LimitExceeded("bytes"));
@@ -100,7 +131,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
     }
     let mut reader = Reader::new(bytes);
     let magic = reader.take(SNAPSHOT_MAGIC.len())?;
-    let schema_version = if magic == SNAPSHOT_MAGIC {
+    let (schema_version, advanced) = if magic == SNAPSHOT_MAGIC {
         let format_version = reader.u16()?;
         if format_version != SNAPSHOT_FORMAT_VERSION {
             return Err(StateCodecError::UnsupportedSnapshotFormat(format_version));
@@ -109,9 +140,22 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
         if codec_version != CONTROL_CODEC_VERSION {
             return Err(StateCodecError::UnsupportedCodec(codec_version));
         }
-        reader.u16()?
+        (reader.u16()?, true)
+    } else if magic == PREVIOUS_SNAPSHOT_MAGIC {
+        let format_version = reader.u16()?;
+        if format_version != PREVIOUS_SNAPSHOT_FORMAT_VERSION {
+            return Err(StateCodecError::UnsupportedSnapshotFormat(format_version));
+        }
+        let codec_version = reader.u16()?;
+        if codec_version != CONTROL_CODEC_VERSION {
+            return Err(StateCodecError::UnsupportedCodec(codec_version));
+        }
+        (reader.u16()?, false)
     } else if magic == LEGACY_SNAPSHOT_MAGIC {
-        migrate_legacy_snapshot_header(&mut reader, LEGACY_SNAPSHOT_FORMAT_VERSION)?
+        (
+            migrate_legacy_snapshot_header(&mut reader, LEGACY_SNAPSHOT_FORMAT_VERSION)?,
+            false,
+        )
     } else {
         return Err(StateCodecError::InvalidMagic);
     };
@@ -120,6 +164,27 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
     }
     let cluster_id = reader.string()?;
     let revision = reader.u64()?;
+    let (read_schema_floor, write_schema_floor, activated_features) = if advanced {
+        let read_schema_floor = reader.u16()?;
+        let write_schema_floor = reader.u16()?;
+        let count = read_count(&mut reader)?;
+        let mut features = std::collections::BTreeSet::new();
+        for _ in 0..count {
+            let feature = reader.string()?;
+            if feature.is_empty() || !features.insert(feature) {
+                return Err(StateCodecError::InvalidState(
+                    "activated feature list is empty or duplicated",
+                ));
+            }
+        }
+        (read_schema_floor, write_schema_floor, features)
+    } else {
+        (
+            CONTROL_SCHEMA_VERSION,
+            CONTROL_SCHEMA_VERSION,
+            std::collections::BTreeSet::new(),
+        )
+    };
 
     let members = read_map(&mut reader, |reader| {
         let key = reader.string()?;
@@ -185,17 +250,55 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
             },
         ))
     })?;
+    let feature_dedup = if advanced {
+        read_map(&mut reader, |reader| {
+            let key = DedupKey {
+                principal_id: reader.string()?,
+                command_id: reader.uuid()?,
+            };
+            let fingerprint = reader
+                .take(32)?
+                .try_into()
+                .expect("exact fingerprint length");
+            let issued_at_unix_ms = reader.u64()?;
+            let command = crate::control_codec::decode_feature_activation(&reader.bytes()?)?;
+            let response = decode_state_response(reader)?;
+            if command.principal_id != key.principal_id
+                || command.command_id.value != key.command_id
+                || response.command_id.value != key.command_id
+            {
+                return Err(StateCodecError::InvalidState(
+                    "feature dedup identity mismatch",
+                ));
+            }
+            Ok((
+                key,
+                FeatureDedupRecord {
+                    fingerprint,
+                    issued_at_unix_ms,
+                    command,
+                    response,
+                },
+            ))
+        })?
+    } else {
+        std::collections::BTreeMap::new()
+    };
     reader.finish()?;
 
     let state = ControlState {
         schema_version,
         cluster_id,
         revision,
+        read_schema_floor,
+        write_schema_floor,
+        activated_features,
         members,
         workspaces,
         windows,
         panes,
         dedup,
+        feature_dedup,
     };
     validate_references(&state)?;
     Ok(state)
@@ -243,6 +346,16 @@ fn read_map<K: Ord, V>(
 }
 
 fn validate_references(state: &ControlState) -> Result<(), StateCodecError> {
+    if state.read_schema_floor < CONTROL_SCHEMA_VERSION
+        || state.write_schema_floor < CONTROL_SCHEMA_VERSION
+        || state.read_schema_floor > state.write_schema_floor
+        || (state.write_schema_floor == CONTROL_SCHEMA_VERSION
+            && !state.activated_features.is_empty())
+    {
+        return Err(StateCodecError::InvalidState(
+            "control feature floors are inconsistent",
+        ));
+    }
     for LogicalWindowRecord { workspace_id, .. } in state.windows.values() {
         if !state.workspaces.contains_key(&workspace_id.value) {
             return Err(StateCodecError::InvalidState(

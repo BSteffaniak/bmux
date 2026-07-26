@@ -47,6 +47,28 @@ pub struct ImportInfo {
     pub schema: Schema,
 }
 
+fn interface_module_counts(schema: &Schema) -> BTreeMap<&str, usize> {
+    let mut counts = BTreeMap::new();
+    for iface in &schema.interfaces {
+        *counts.entry(iface.name.as_str()).or_default() += 1;
+    }
+    counts
+}
+
+fn interface_module_name(iface: &Interface, duplicate_name: bool) -> String {
+    let base = snake_case(&iface.name);
+    if duplicate_name {
+        format!(
+            "{base}_v{}",
+            iface
+                .interface_version
+                .expect("validated duplicate interface names require explicit versions")
+        )
+    } else {
+        base
+    }
+}
+
 /// Emit a Rust module for the entire schema with no imports resolved.
 ///
 /// Suitable for schemas that do not use qualified type references.
@@ -62,6 +84,7 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let mut out = String::new();
     let own_types = own_type_map(schema);
     let non_eq_types = non_eq_type_set(schema);
+    let module_counts = interface_module_counts(schema);
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     out.push_str("use serde::{Deserialize, Serialize};\n\n");
     emit_capabilities(&schema.capabilities, &mut out);
@@ -69,14 +92,35 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
         emit_interface(
             &schema.plugin.plugin_id,
             iface,
+            module_counts.get(iface.name.as_str()).copied().unwrap_or(0) > 1,
             imports,
             &own_types,
             &non_eq_types,
             &mut out,
         );
     }
+    emit_versioned_interface_aliases(schema, &module_counts, &mut out);
     emit_schema_service_declarations(schema, &mut out);
     out
+}
+
+fn emit_versioned_interface_aliases(
+    schema: &Schema,
+    module_counts: &BTreeMap<&str, usize>,
+    out: &mut String,
+) {
+    for iface in &schema.interfaces {
+        if module_counts.get(iface.name.as_str()).copied().unwrap_or(0) > 1
+            && iface.interface_version == Some(1)
+        {
+            let base = snake_case(&iface.name);
+            let versioned = interface_module_name(iface, true);
+            let _ = writeln!(
+                out,
+                "/// Source-compatible alias for the immutable v1 interface.\npub use {versioned} as {base};\n"
+            );
+        }
+    }
 }
 
 fn non_eq_type_set(schema: &Schema) -> NonEqTypeSet {
@@ -170,12 +214,13 @@ fn emit_capabilities(capabilities: &[CapabilityDecl], out: &mut String) {
 fn emit_interface(
     plugin_id: &str,
     iface: &Interface,
+    duplicate_name: bool,
     imports: &ImportMap,
     own_types: &OwnTypeMap,
     non_eq_types: &NonEqTypeSet,
     out: &mut String,
 ) {
-    let module_name = snake_case(&iface.name);
+    let module_name = interface_module_name(iface, duplicate_name);
     let _ = writeln!(out, "pub mod {module_name} {{");
     out.push_str("    use super::*;\n\n");
 
@@ -331,11 +376,17 @@ fn emit_enum(e: &EnumDef, out: &mut String) {
 }
 
 fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
+    let module_counts = interface_module_counts(schema);
     let modules = schema
         .interfaces
         .iter()
         .filter(|iface| iface.capability.is_some() && interface_service_kind(iface).is_some())
-        .map(|iface| snake_case(&iface.name))
+        .map(|iface| {
+            interface_module_name(
+                iface,
+                module_counts.get(iface.name.as_str()).copied().unwrap_or(0) > 1,
+            )
+        })
         .collect::<Vec<_>>();
 
     out.push_str("/// Type-level BPDL contract for this plugin API crate.\n");
@@ -413,7 +464,8 @@ fn emit_service_trait(
     let trait_name = format!("{}Service", pascal_case(&iface.name));
     // Canonical interface identifier used to look up a typed service via
     // the plugin host registry. `@interface-version(N)` appends `/vN` to
-    // the source name without changing the generated Rust module name.
+    // the source name. A unique interface keeps the unsuffixed Rust module;
+    // duplicate explicitly versioned service families emit `_vN` modules.
     let interface_id = iface.interface_version.map_or_else(
         || iface.name.clone(),
         |version| format!("{}/v{version}", iface.name),
@@ -1210,6 +1262,25 @@ mod tests {
             rust.contains("pub const OP_FOCUS_PANE: ::bmux_plugin_sdk::OperationId = ::bmux_plugin_sdk::OperationId::from_static(\"focus-pane\");"),
             "codegen must emit command operation id constants; got: {rust}"
         );
+    }
+
+    #[test]
+    fn emits_distinct_modules_for_versioned_service_family() {
+        let src = "plugin p version 1;\n\
+                   capability RUN = bmux.test.run;\n\
+                   @capability(RUN) @interface-version(1)\n\
+                   interface actions { command run() -> unit; }\n\
+                   @capability(RUN) @interface-version(2)\n\
+                   interface actions { command run() -> unit; command stop() -> unit; }";
+        let schema = compile(src).expect("valid versioned family");
+        let rust = emit(&schema);
+        assert!(rust.contains("pub mod actions_v1"));
+        assert!(rust.contains("pub mod actions_v2"));
+        assert!(rust.contains("pub use actions_v1 as actions;"));
+        assert!(rust.contains("InterfaceId::from_static(\"actions/v1\")"));
+        assert!(rust.contains("InterfaceId::from_static(\"actions/v2\")"));
+        assert!(rust.contains("actions_v1::service_declaration()?"));
+        assert!(rust.contains("actions_v2::service_declaration()?"));
     }
 
     #[test]

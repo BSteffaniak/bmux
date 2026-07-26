@@ -1,4 +1,4 @@
-use crate::control_codec::request_fingerprint;
+use crate::control_codec::{FeatureActivationCommand, request_fingerprint};
 #[path = "control_state_codec.rs"]
 mod control_state_codec;
 use bmux_cluster_plugin_api::cluster_types::{
@@ -8,13 +8,16 @@ use bmux_cluster_plugin_api::cluster_types::{
     PaneAvailability, PendingWorkflow, WorkspaceId, WorkspaceRecord,
 };
 use control_state_codec::{decode_snapshot, encode_snapshot};
-use std::collections::BTreeMap;
+use sha2::Digest as _;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const CONTROL_SCHEMA_VERSION: u16 = 1;
 pub const CONTROL_CODEC_VERSION: u16 = 1;
-const SNAPSHOT_FORMAT_VERSION: u16 = 2;
+const SNAPSHOT_FORMAT_VERSION: u16 = 3;
+const PREVIOUS_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 const LEGACY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA002";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA003";
+const PREVIOUS_SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA002";
 const LEGACY_SNAPSHOT_MAGIC: &[u8; 8] = b"BMSTA001";
 const MAX_SNAPSHOT_ITEMS: usize = 1_000_000;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
@@ -93,15 +96,27 @@ struct DedupRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct FeatureDedupRecord {
+    fingerprint: [u8; 32],
+    issued_at_unix_ms: u64,
+    command: FeatureActivationCommand,
+    response: ControlResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlState {
     pub schema_version: u16,
     pub cluster_id: String,
     pub revision: u64,
+    pub read_schema_floor: u16,
+    pub write_schema_floor: u16,
+    pub activated_features: BTreeSet<String>,
     pub members: BTreeMap<String, ClusterMember>,
     pub workspaces: BTreeMap<uuid::Uuid, WorkspaceRecord>,
     pub windows: BTreeMap<uuid::Uuid, LogicalWindowRecord>,
     pub panes: BTreeMap<uuid::Uuid, LogicalPaneRecord>,
     dedup: BTreeMap<DedupKey, DedupRecord>,
+    feature_dedup: BTreeMap<DedupKey, FeatureDedupRecord>,
 }
 
 impl ControlState {
@@ -111,11 +126,15 @@ impl ControlState {
             schema_version: CONTROL_SCHEMA_VERSION,
             cluster_id: cluster_id.into(),
             revision: 0,
+            read_schema_floor: CONTROL_SCHEMA_VERSION,
+            write_schema_floor: CONTROL_SCHEMA_VERSION,
+            activated_features: BTreeSet::new(),
             members: BTreeMap::new(),
             workspaces: BTreeMap::new(),
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
             dedup: BTreeMap::new(),
+            feature_dedup: BTreeMap::new(),
         }
     }
 
@@ -234,6 +253,92 @@ impl ControlState {
         response
     }
 
+    pub fn apply_feature_activation(
+        &mut self,
+        command: &FeatureActivationCommand,
+    ) -> ControlResponse {
+        let key = DedupKey {
+            principal_id: command.principal_id.clone(),
+            command_id: command.command_id.value,
+        };
+        let encoded = crate::control_codec::encode_feature_activation(command);
+        let fingerprint: [u8; 32] = sha2::Sha256::digest(&encoded).into();
+        if let Some(existing) = self.feature_dedup.get(&key) {
+            return if existing.fingerprint == fingerprint {
+                existing.response.clone()
+            } else {
+                self.feature_error_response(command, ControlCommandError::CommandIdConflict)
+            };
+        }
+        let result = self.validate_feature_activation(command);
+        let mut next = self.clone();
+        let response_result = match result {
+            Ok(()) => {
+                next.read_schema_floor = command.read_schema_floor;
+                next.write_schema_floor = command.write_schema_floor;
+                next.activated_features.insert(command.feature.clone());
+                next.revision = self
+                    .revision
+                    .checked_add(1)
+                    .expect("control revision overflow is unrecoverable");
+                ControlCommandResult::Accepted {
+                    payload: Vec::new(),
+                }
+            }
+            Err(error) => ControlCommandResult::Rejected { error },
+        };
+        let response = ControlResponse {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            command_id: command.command_id.clone(),
+            control_revision: next.revision,
+            workflow_status: ControlWorkflowStatus::Complete,
+            result: response_result,
+        };
+        next.feature_dedup.insert(
+            key,
+            FeatureDedupRecord {
+                fingerprint,
+                issued_at_unix_ms: command.issued_at_unix_ms,
+                command: command.clone(),
+                response: response.clone(),
+            },
+        );
+        *self = next;
+        response
+    }
+
+    fn validate_feature_activation(
+        &self,
+        command: &FeatureActivationCommand,
+    ) -> Result<(), ControlCommandError> {
+        require_revision(command.expected_control_revision, self.revision)?;
+        if command.feature.trim().is_empty()
+            || command.read_schema_floor < self.read_schema_floor
+            || command.write_schema_floor < self.write_schema_floor
+            || command.read_schema_floor > command.write_schema_floor
+            || command.write_schema_floor <= CONTROL_SCHEMA_VERSION
+        {
+            return Err(invalid_transition(
+                "feature activation floors or feature identity are invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn feature_error_response(
+        &self,
+        command: &FeatureActivationCommand,
+        error: ControlCommandError,
+    ) -> ControlResponse {
+        ControlResponse {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            command_id: command.command_id.clone(),
+            control_revision: self.revision,
+            workflow_status: ControlWorkflowStatus::Complete,
+            result: ControlCommandResult::Rejected { error },
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn apply_request(
         &mut self,
@@ -266,6 +371,21 @@ impl ControlState {
                             "membership update conflicts at the same timestamp",
                         ));
                     }
+                }
+                if member.state == ClusterMemberState::Active
+                    && (member.negotiated_protocol.schema_version
+                        < u32::from(self.write_schema_floor)
+                        || self.activated_features.iter().any(|feature| {
+                            !member
+                                .negotiated_protocol
+                                .features
+                                .iter()
+                                .any(|supported| supported == feature)
+                        }))
+                {
+                    return Err(invalid_transition(
+                        "active member does not satisfy the cluster write floor",
+                    ));
                 }
                 let changed = self.members.get(&member.node_id) != Some(member);
                 self.members.insert(member.node_id.clone(), member.clone());
@@ -457,12 +577,16 @@ impl ControlState {
             ControlCommandRequest::PruneDedup {
                 completed_before_unix_ms,
             } => {
-                let before = self.dedup.len();
+                let before = self.dedup.len().saturating_add(self.feature_dedup.len());
                 self.dedup.retain(|_, record| {
                     record.response.workflow_status == ControlWorkflowStatus::Pending
                         || record.issued_at_unix_ms >= *completed_before_unix_ms
                 });
-                Ok(ApplyOutcome::complete(self.dedup.len() != before))
+                self.feature_dedup
+                    .retain(|_, record| record.issued_at_unix_ms >= *completed_before_unix_ms);
+                Ok(ApplyOutcome::complete(
+                    self.dedup.len().saturating_add(self.feature_dedup.len()) != before,
+                ))
             }
         }
     }
@@ -1094,7 +1218,7 @@ mod tests {
         let migrated = ControlState::decode_snapshot(&legacy).unwrap();
         assert_eq!(migrated, state);
         let canonical = migrated.encode_snapshot().unwrap();
-        assert_eq!(&canonical[..8], SNAPSHOT_MAGIC);
+        assert_eq!(&canonical[..8], PREVIOUS_SNAPSHOT_MAGIC);
         assert_eq!(ControlState::decode_snapshot(&canonical).unwrap(), migrated);
         assert_eq!(
             ControlState::decode_snapshot(&canonical)
@@ -1103,6 +1227,123 @@ mod tests {
                 .unwrap(),
             canonical
         );
+    }
+
+    #[test]
+    fn feature_activation_is_revision_fenced_monotonic_and_idempotent() {
+        let mut state = ControlState::new("cluster:test");
+        let command = FeatureActivationCommand {
+            principal_id: "principal:test".to_string(),
+            command_id: CommandId { value: id(99) },
+            issued_at_unix_ms: 42,
+            expected_control_revision: 0,
+            read_schema_floor: 2,
+            write_schema_floor: 2,
+            feature: "atomic-layout-mutation-v2".to_string(),
+        };
+        let response = state.apply_feature_activation(&command);
+        assert_accepted(&response);
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.read_schema_floor, 2);
+        assert_eq!(state.write_schema_floor, 2);
+        assert!(
+            state
+                .activated_features
+                .contains("atomic-layout-mutation-v2")
+        );
+        assert_eq!(state.apply_feature_activation(&command), response);
+        assert_eq!(state.revision, 1);
+
+        let mut conflict = command.clone();
+        conflict.feature = "different".to_string();
+        assert!(matches!(
+            state.apply_feature_activation(&conflict).result,
+            ControlCommandResult::Rejected {
+                error: ControlCommandError::CommandIdConflict
+            }
+        ));
+        let stale = FeatureActivationCommand {
+            command_id: CommandId { value: id(100) },
+            expected_control_revision: 0,
+            ..command.clone()
+        };
+        assert!(matches!(
+            state.apply_feature_activation(&stale).result,
+            ControlCommandResult::Rejected {
+                error: ControlCommandError::RevisionConflict {
+                    expected: 0,
+                    current: 1
+                }
+            }
+        ));
+        let downgrade = FeatureActivationCommand {
+            command_id: CommandId { value: id(101) },
+            expected_control_revision: 1,
+            read_schema_floor: 1,
+            write_schema_floor: 1,
+            ..command
+        };
+        assert!(matches!(
+            state.apply_feature_activation(&downgrade).result,
+            ControlCommandResult::Rejected {
+                error: ControlCommandError::InvalidTransition { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn advanced_feature_floor_uses_v3_snapshot_and_rejects_invalid_floor() {
+        let mut state = ControlState::new("cluster:test");
+        state.read_schema_floor = 2;
+        state.write_schema_floor = 2;
+        state
+            .activated_features
+            .insert("atomic-layout-mutation-v2".to_string());
+        let activation = FeatureActivationCommand {
+            principal_id: "principal:test".to_string(),
+            command_id: CommandId { value: id(200) },
+            issued_at_unix_ms: 5,
+            expected_control_revision: 0,
+            read_schema_floor: 2,
+            write_schema_floor: 2,
+            feature: "atomic-layout-mutation-v2".to_string(),
+        };
+        let key = DedupKey {
+            principal_id: activation.principal_id.clone(),
+            command_id: activation.command_id.value,
+        };
+        let encoded_activation = crate::control_codec::encode_feature_activation(&activation);
+        state.feature_dedup.insert(
+            key,
+            FeatureDedupRecord {
+                fingerprint: sha2::Sha256::digest(&encoded_activation).into(),
+                issued_at_unix_ms: activation.issued_at_unix_ms,
+                command: activation.clone(),
+                response: ControlResponse {
+                    schema_version: CONTROL_SCHEMA_VERSION,
+                    command_id: activation.command_id,
+                    control_revision: 1,
+                    workflow_status: ControlWorkflowStatus::Complete,
+                    result: ControlCommandResult::Accepted {
+                        payload: Vec::new(),
+                    },
+                },
+            },
+        );
+        let encoded = state.encode_snapshot().unwrap();
+        assert_eq!(&encoded[..8], SNAPSHOT_MAGIC);
+        assert_eq!(ControlState::decode_snapshot(&encoded).unwrap(), state);
+
+        let mut invalid = state;
+        invalid.read_schema_floor = 3;
+        invalid.write_schema_floor = 2;
+        let encoded = invalid.encode_snapshot().unwrap();
+        assert!(matches!(
+            ControlState::decode_snapshot(&encoded),
+            Err(StateCodecError::InvalidState(
+                "control feature floors are inconsistent"
+            ))
+        ));
     }
 
     #[test]
@@ -1120,10 +1361,10 @@ mod tests {
             Err(StateCodecError::TrailingBytes)
         );
         let mut future_format = bytes.clone();
-        future_format[8..10].copy_from_slice(&3_u16.to_be_bytes());
+        future_format[8..10].copy_from_slice(&4_u16.to_be_bytes());
         assert_eq!(
             ControlState::decode_snapshot(&future_format),
-            Err(StateCodecError::UnsupportedSnapshotFormat(3))
+            Err(StateCodecError::UnsupportedSnapshotFormat(4))
         );
         let mut future_codec = bytes.clone();
         future_codec[10..12].copy_from_slice(&2_u16.to_be_bytes());

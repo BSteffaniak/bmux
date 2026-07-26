@@ -282,6 +282,13 @@ interface cluster-types {
         rects: list<attach-layout-rect>,
     }
 
+    record feature-floor-state {
+        control_revision: u64,
+        read_schema_floor: u16,
+        write_schema_floor: u16,
+        activated_features: list<string>,
+    }
+
     record logical-pane-record {
         pane_id: logical-pane-id,
         workspace_id: workspace-id,
@@ -663,11 +670,26 @@ interface cluster-control-command {
     command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
+@capability(CLUSTER_WRITE)
+@interface-version(2)
+interface cluster-control-command {
+    command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+    command activate-feature(command_id: cluster-types.command-id, principal_id: string, issued_at_unix_ms: u64, expected_control_revision: u64, read_schema_floor: u16, write_schema_floor: u16, feature: string) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+}
+
 @capability(CLUSTER_READ)
 @interface-version(1)
 interface cluster-control-state {
     query read_linearizable() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
     query read_stale() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
+}
+
+@capability(CLUSTER_READ)
+@interface-version(2)
+interface cluster-control-state {
+    query read_linearizable() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
+    query read_stale() -> result<cluster-types.control-state-view, cluster-types.control-service-error>;
+    query feature-floor() -> result<cluster-types.feature-floor-state, cluster-types.control-service-error>;
 }
 
 @capability(CLUSTER_WRITE)

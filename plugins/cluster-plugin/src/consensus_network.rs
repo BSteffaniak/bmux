@@ -480,6 +480,93 @@ where
         }
     }
 
+    async fn forward_feature_activation(
+        &self,
+        endpoint: &str,
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        principal_id: String,
+        issued_at_unix_ms: u64,
+        expected_control_revision: u64,
+        read_schema_floor: u16,
+        write_schema_floor: u16,
+        feature: String,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), endpoint);
+        bmux_cluster_plugin_api::cluster_control_command_v2::client::activate_feature(
+            &mut remote,
+            command_id,
+            principal_id,
+            issued_at_unix_ms,
+            expected_control_revision,
+            read_schema_floor,
+            write_schema_floor,
+            feature,
+        )
+        .await
+        .map_err(|error| ControlServiceError::RuntimeUnavailable {
+            reason: format!(
+                "leader feature activation forwarding failed before a response was received; retry the same CommandId: {error}"
+            ),
+        })?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn activate_feature_or_forward(
+        &self,
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        principal_id: String,
+        issued_at_unix_ms: u64,
+        expected_control_revision: u64,
+        read_schema_floor: u16,
+        write_schema_floor: u16,
+        feature: String,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        let node = self.active()?;
+        let state = match node.linearizable_control_state().await {
+            Ok(state) => state,
+            Err(crate::consensus_runtime::ConsensusReadError::NotLeader(not_leader)) => {
+                let endpoint =
+                    not_leader
+                        .leader_endpoint
+                        .ok_or_else(|| ControlServiceError::NotLeader {
+                            leader_node_id: not_leader.leader_id.map(|id| id.to_string()),
+                            leader_endpoint: None,
+                        })?;
+                return self
+                    .forward_feature_activation(
+                        &endpoint,
+                        command_id,
+                        principal_id,
+                        issued_at_unix_ms,
+                        expected_control_revision,
+                        read_schema_floor,
+                        write_schema_floor,
+                        feature,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(control_read_service_error(error)),
+        };
+        validate_feature_activation_membership(
+            &node,
+            &state,
+            expected_control_revision,
+            read_schema_floor,
+            write_schema_floor,
+            &feature,
+        )?;
+        node.activate_feature(crate::control_codec::FeatureActivationCommand {
+            principal_id,
+            command_id,
+            issued_at_unix_ms,
+            expected_control_revision,
+            read_schema_floor,
+            write_schema_floor,
+            feature,
+        })
+        .await
+    }
+
     async fn forward_linearizable_read(
         &self,
         endpoint: &str,
@@ -519,6 +606,254 @@ where
         >,
     > {
         Box::pin(async move { self.mutate_or_forward(request).await })
+    }
+}
+
+fn control_read_service_error(
+    error: crate::consensus_runtime::ConsensusReadError,
+) -> ControlServiceError {
+    match error {
+        crate::consensus_runtime::ConsensusReadError::NotLeader(not_leader) => {
+            ControlServiceError::NotLeader {
+                leader_node_id: not_leader.leader_id.map(|id| id.to_string()),
+                leader_endpoint: not_leader.leader_endpoint,
+            }
+        }
+        crate::consensus_runtime::ConsensusReadError::QuorumUnavailable(reason) => {
+            ControlServiceError::QuorumUnavailable { reason }
+        }
+        crate::consensus_runtime::ConsensusReadError::Fatal(error) => {
+            ControlServiceError::Internal {
+                reason: error.to_string(),
+            }
+        }
+        crate::consensus_runtime::ConsensusReadError::Storage(error) => {
+            ControlServiceError::Internal {
+                reason: error.to_string(),
+            }
+        }
+    }
+}
+
+fn validate_feature_activation_membership(
+    node: &crate::consensus_runtime::ConsensusNode,
+    state: &crate::control_state::ControlState,
+    expected_control_revision: u64,
+    read_schema_floor: u16,
+    write_schema_floor: u16,
+    feature: &str,
+) -> Result<(), ControlServiceError> {
+    if state.revision != expected_control_revision {
+        return Err(ControlServiceError::Rejected {
+            error: bmux_cluster_plugin_api::cluster_types::ControlCommandError::RevisionConflict {
+                expected: expected_control_revision,
+                current: state.revision,
+            },
+        });
+    }
+    let committed = node.committed_member_ids();
+    let voters = node.committed_voter_ids();
+    let active_members = state
+        .members
+        .values()
+        .filter(|member| {
+            member.state == bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
+        })
+        .map(|member| member.node_id.parse::<NodeId>())
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(|reason| ControlServiceError::Internal { reason })?;
+    validate_feature_activation_member_sets(
+        state,
+        &committed,
+        &voters,
+        &active_members,
+        expected_control_revision,
+        read_schema_floor,
+        write_schema_floor,
+        feature,
+        crate::now_unix_ms(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_feature_activation_member_sets(
+    state: &crate::control_state::ControlState,
+    committed: &std::collections::BTreeSet<NodeId>,
+    voters: &std::collections::BTreeSet<NodeId>,
+    active_members: &std::collections::BTreeSet<NodeId>,
+    expected_control_revision: u64,
+    read_schema_floor: u16,
+    write_schema_floor: u16,
+    feature: &str,
+    now_unix_ms: u64,
+) -> Result<(), ControlServiceError> {
+    if state.revision != expected_control_revision {
+        return Err(ControlServiceError::Rejected {
+            error: bmux_cluster_plugin_api::cluster_types::ControlCommandError::RevisionConflict {
+                expected: expected_control_revision,
+                current: state.revision,
+            },
+        });
+    }
+    if committed.is_empty()
+        || voters.is_empty()
+        || !voters.is_subset(committed)
+        || !committed.is_subset(active_members)
+        || !active_members.is_subset(committed)
+    {
+        return Err(ControlServiceError::Internal {
+            reason: "committed consensus membership is empty".to_string(),
+        });
+    }
+    for node_id in committed {
+        let member = state
+            .members
+            .get(&node_id.to_string())
+            .filter(|member| {
+                member.state
+                    == bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
+            })
+            .ok_or_else(|| ControlServiceError::Internal {
+                reason: format!(
+                    "committed consensus member {node_id} has no active replicated membership record"
+                ),
+            })?;
+        crate::membership::verify_membership_credential(member, now_unix_ms).map_err(|reason| {
+            ControlServiceError::Internal {
+                reason: format!("committed consensus member {node_id} is untrusted: {reason}"),
+            }
+        })?;
+        if member.negotiated_protocol.schema_version < u32::from(write_schema_floor)
+            || !member
+                .negotiated_protocol
+                .features
+                .iter()
+                .any(|supported| supported == feature)
+        {
+            return Err(ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                        reason: format!(
+                            "committed consensus member {node_id} does not support schema {write_schema_floor} and feature '{feature}'"
+                        ),
+                    },
+            });
+        }
+    }
+    if read_schema_floor > write_schema_floor {
+        return Err(ControlServiceError::Rejected {
+            error: bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                reason: "read schema floor exceeds write schema floor".to_string(),
+            },
+        });
+    }
+    Ok(())
+}
+
+impl<C> bmux_cluster_plugin_api::cluster_control_command_v2::ClusterControlCommandService
+    for ControlServiceHandle<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn mutate<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_types::ControlCommand,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlResponse, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.mutate_or_forward(request).await })
+    }
+
+    fn activate_feature<'a>(
+        &'a self,
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        principal_id: String,
+        issued_at_unix_ms: u64,
+        expected_control_revision: u64,
+        read_schema_floor: u16,
+        write_schema_floor: u16,
+        feature: String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlResponse, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.activate_feature_or_forward(
+                command_id,
+                principal_id,
+                issued_at_unix_ms,
+                expected_control_revision,
+                read_schema_floor,
+                write_schema_floor,
+                feature,
+            )
+            .await
+        })
+    }
+}
+
+impl<C> bmux_cluster_plugin_api::cluster_control_state_v2::ClusterControlStateService
+    for ControlServiceHandle<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn read_linearizable<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlStateView, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.read_linearizable_or_forward().await })
+    }
+
+    fn read_stale<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlStateView, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.active()?.read_stale_view() })
+    }
+
+    fn feature_floor<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::FeatureFloorState,
+                        ControlServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let state = self
+                .active()?
+                .linearizable_control_state()
+                .await
+                .map_err(control_read_service_error)?;
+            Ok(bmux_cluster_plugin_api::cluster_types::FeatureFloorState {
+                control_revision: state.revision,
+                read_schema_floor: state.read_schema_floor,
+                write_schema_floor: state.write_schema_floor,
+                activated_features: state.activated_features.into_iter().collect(),
+            })
+        })
     }
 }
 
@@ -665,7 +1000,110 @@ mod forwarding_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_cluster_plugin_api::cluster_types::{PeerAuthChallenge, PeerAuthProof};
+    use bmux_cluster_plugin_api::cluster_types::{
+        ClusterConsensusRole, ClusterNodeCapabilities, ControlCommandError, PeerAuthChallenge,
+        PeerAuthProof,
+    };
+
+    fn activation_member(
+        issuer: &NodeIdentity,
+        cluster_id: crate::membership::ClusterId,
+        node: &NodeIdentity,
+        now: u64,
+    ) -> bmux_cluster_plugin_api::cluster_types::ClusterMember {
+        crate::membership::issue_test_member(
+            issuer,
+            cluster_id,
+            node,
+            "memory://node",
+            ClusterNodeCapabilities {
+                consensus_role: ClusterConsensusRole::Voter,
+                worker: true,
+                ingress: true,
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn feature_activation_requires_every_committed_member_support() {
+        let now = crate::now_unix_ms();
+        let issuer = NodeIdentity::new_for_test(1);
+        let cluster_id = crate::membership::ClusterId::generate();
+        let first = NodeIdentity::new_for_test(2);
+        let second = NodeIdentity::new_for_test(3);
+        let first_member = activation_member(&issuer, cluster_id, &first, now);
+        let mut second_member = activation_member(&issuer, cluster_id, &second, now);
+        let mut state = crate::control_state::ControlState::new(cluster_id.to_string());
+        state.revision = 8;
+        state
+            .members
+            .insert(first_member.node_id.clone(), first_member);
+        state
+            .members
+            .insert(second_member.node_id.clone(), second_member.clone());
+        let committed = std::collections::BTreeSet::from([*first.node_id(), *second.node_id()]);
+        let voters = std::collections::BTreeSet::from([*first.node_id()]);
+        validate_feature_activation_member_sets(
+            &state,
+            &committed,
+            &voters,
+            &committed,
+            8,
+            2,
+            2,
+            crate::membership::ATOMIC_LAYOUT_FEATURE,
+            now,
+        )
+        .unwrap();
+
+        second_member.negotiated_protocol.schema_version = 1;
+        second_member.negotiated_protocol.features.clear();
+        second_member = crate::membership::issue_test_member_with_protocol(
+            &issuer,
+            cluster_id,
+            &second,
+            "memory://node",
+            second_member.capabilities.clone(),
+            second_member.negotiated_protocol.clone(),
+            now,
+        );
+        state
+            .members
+            .insert(second_member.node_id.clone(), second_member);
+        assert!(matches!(
+            validate_feature_activation_member_sets(
+                &state,
+                &committed,
+                &voters,
+                &committed,
+                8,
+                2,
+                2,
+                crate::membership::ATOMIC_LAYOUT_FEATURE,
+                now,
+            ),
+            Err(ControlServiceError::Rejected {
+                error: ControlCommandError::InvalidTransition { .. }
+            })
+        ));
+        assert!(matches!(
+            validate_feature_activation_member_sets(
+                &state,
+                &committed,
+                &voters,
+                &committed,
+                7,
+                2,
+                2,
+                crate::membership::ATOMIC_LAYOUT_FEATURE,
+                now,
+            ),
+            Err(ControlServiceError::Rejected {
+                error: ControlCommandError::RevisionConflict { .. }
+            })
+        ));
+    }
 
     fn proof(source: NodeId, target: NodeId) -> PeerAuthProof {
         PeerAuthProof {

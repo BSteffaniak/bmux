@@ -146,7 +146,9 @@ struct ClusterAttachSession {
         std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalProtocolTracker>,
     grids: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalGridStream>,
     scene: bmux_attach_layout_protocol::AttachScene,
-    pending_scene: Option<bmux_attach_layout_protocol::AttachScene>,
+    pending_events: std::collections::VecDeque<bmux_client::AttachProviderEvent>,
+    unzoomed_scene: Option<bmux_attach_layout_protocol::AttachScene>,
+    zoomed_pane: Option<uuid::Uuid>,
     viewport: (u16, u16),
     next_reconcile_at: tokio::time::Instant,
     detached: bool,
@@ -232,7 +234,9 @@ impl ClusterAttachSession {
             protocols: built.protocols,
             grids: built.grids,
             scene,
-            pending_scene: None,
+            pending_events: std::collections::VecDeque::new(),
+            unzoomed_scene: None,
+            zoomed_pane: None,
             viewport: (80, 24),
             next_reconcile_at: tokio::time::Instant::now(),
             detached: false,
@@ -249,16 +253,42 @@ impl ClusterAttachSession {
                 self.control_revision, layout.control_revision
             )));
         }
-        let preferred_focus = match self.scene.focus {
-            bmux_attach_layout_protocol::AttachFocusTarget::Pane { pane_id } => Some(pane_id),
-            bmux_attach_layout_protocol::AttachFocusTarget::Surface { surface_id } => {
-                Some(surface_id)
-            }
+        let focused = match self.scene.focus {
+            bmux_attach_layout_protocol::AttachFocusTarget::Pane { pane_id }
+            | bmux_attach_layout_protocol::AttachFocusTarget::Surface {
+                surface_id: pane_id,
+            } => Some(pane_id),
             bmux_attach_layout_protocol::AttachFocusTarget::None => None,
         };
         let (layout, mut built) =
             build_consistent_cluster_snapshot(&mut self.client, layout, self.viewport).await?;
-        built.snapshot.scene = cluster_scene_from_layout(&layout, preferred_focus)?;
+        let base_scene = cluster_scene_from_layout(&layout, focused)?;
+        let (scene, next_unzoomed_scene, next_zoomed_pane) =
+            if let Some(zoomed_pane) = self.zoomed_pane {
+                match zoom_cluster_scene(&base_scene, zoomed_pane, self.viewport) {
+                    Ok(scene) => (scene, Some(base_scene), Some(zoomed_pane)),
+                    Err(_) => (base_scene, None, None),
+                }
+            } else {
+                (base_scene, None, None)
+            };
+        let reconciliation_id = format!("reconcile:{}", layout.control_revision);
+        resize_cluster_scene_workers(
+            &mut self.client,
+            self.workspace_id,
+            &built
+                .snapshot
+                .streams
+                .iter()
+                .map(|stream| stream.cursor.clone())
+                .collect::<Vec<_>>(),
+            &scene,
+            &self.principal_id,
+            &reconciliation_id,
+        )
+        .await?;
+        built.snapshot.scene = scene;
+        reflow_cluster_build_to_scene(&mut built)?;
 
         let base_view_revision = self.view_revision;
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
@@ -283,7 +313,168 @@ impl ClusterAttachSession {
         self.protocols = built.protocols;
         self.grids = built.grids;
         self.scene = built.snapshot.scene;
+        self.unzoomed_scene = next_unzoomed_scene;
+        self.zoomed_pane = next_zoomed_pane;
         Ok(bmux_client::AttachProviderEvent::Delta(delta))
+    }
+    async fn replace_attached_window(
+        &mut self,
+        window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId,
+        action_command_id: &str,
+    ) -> Result<(), AttachSessionError> {
+        if window_id == self.window_id {
+            return Ok(());
+        }
+        let layout = cluster_attach_state::client::layout(
+            &mut self.client,
+            bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+                value: self.workspace_id,
+            },
+            Some(window_id),
+            self.viewport.0,
+            self.viewport.1,
+        )
+        .await
+        .map_err(provider_error)?
+        .map_err(|error| provider_reason(format!("logical window selection failed: {error:?}")))?;
+        if layout.control_revision < self.control_revision {
+            return Err(provider_reason(format!(
+                "cluster control revision regressed from {} to {} during window selection",
+                self.control_revision, layout.control_revision
+            )));
+        }
+        let (layout, built) =
+            build_consistent_cluster_snapshot(&mut self.client, layout, self.viewport).await?;
+        resize_cluster_layout_workers(
+            &mut self.client,
+            &layout,
+            &self.principal_id,
+            action_command_id,
+        )
+        .await?;
+        let base_view_revision = self.view_revision;
+        self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
+        self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
+        self.control_revision = layout.control_revision;
+        self.window_id = layout.window_id;
+        let delta = cluster_reconciliation_delta(
+            base_view_revision,
+            self.view_revision,
+            self.event_sequence,
+            self.control_revision,
+            &self.streams,
+            &built.snapshot,
+        );
+        self.streams = built
+            .snapshot
+            .streams
+            .iter()
+            .map(|stream| stream.cursor.clone())
+            .collect();
+        self.protocols = built.protocols;
+        self.grids = built.grids;
+        self.scene = built.snapshot.scene;
+        self.pending_events
+            .push_back(bmux_client::AttachProviderEvent::Delta(delta));
+        self.unzoomed_scene = None;
+        self.zoomed_pane = None;
+        Ok(())
+    }
+
+    async fn select_window(
+        &mut self,
+        action: &str,
+        arguments: &[String],
+        action_command_id: &str,
+    ) -> Result<bool, AttachSessionError> {
+        let view = cluster_control_state::client::read_linearizable(&mut self.client)
+            .await
+            .map_err(provider_error)?
+            .map_err(|error| provider_reason(format!("control-state read failed: {error:?}")))?;
+        if view.revision < self.control_revision {
+            return Err(provider_reason(format!(
+                "cluster control revision regressed from {} to {} during window navigation",
+                self.control_revision, view.revision
+            )));
+        }
+        let mut windows = view
+            .windows
+            .iter()
+            .filter(|window| window.workspace_id.value == self.workspace_id)
+            .collect::<Vec<_>>();
+        windows.sort_by_key(|window| window.window_id.value.as_u128());
+        let selected = select_cluster_window(&windows, &self.window_id, action, arguments)?;
+        if selected.window_id == self.window_id {
+            return Ok(false);
+        }
+        self.replace_attached_window(selected.window_id.clone(), action_command_id)
+            .await?;
+        Ok(true)
+    }
+
+    async fn toggle_zoom(
+        &mut self,
+        pane_id: uuid::Uuid,
+        action_command_id: &str,
+    ) -> Result<(), AttachSessionError> {
+        let was_zoomed = self.zoomed_pane;
+        let previous_unzoomed = self.unzoomed_scene.clone();
+        let scene = if was_zoomed == Some(pane_id) {
+            previous_unzoomed
+                .clone()
+                .ok_or_else(|| provider_reason("zoom restore scene is unavailable".to_string()))?
+        } else {
+            let base = previous_unzoomed
+                .clone()
+                .unwrap_or_else(|| self.scene.clone());
+            zoom_cluster_scene(&base, pane_id, self.viewport)?
+        };
+        resize_cluster_scene_workers(
+            &mut self.client,
+            self.workspace_id,
+            &self.streams,
+            &scene,
+            &self.principal_id,
+            action_command_id,
+        )
+        .await?;
+        for (cursor, cols, rows) in provider_stream_viewports(&scene, &self.streams)? {
+            if let Some(grid) = self.grids.get_mut(&cursor.stream_id) {
+                grid.resize(cols, rows).map_err(|error| {
+                    provider_reason(format!("cluster terminal grid resize failed: {error}"))
+                })?;
+            }
+        }
+        if was_zoomed == Some(pane_id) {
+            self.zoomed_pane = None;
+            self.unzoomed_scene = None;
+        } else {
+            self.unzoomed_scene = Some(previous_unzoomed.unwrap_or_else(|| self.scene.clone()));
+            self.zoomed_pane = Some(pane_id);
+        }
+        self.enqueue_scene(scene);
+        Ok(())
+    }
+    fn enqueue_scene(&mut self, scene: bmux_attach_layout_protocol::AttachScene) {
+        let base_view_revision = self.view_revision;
+        self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
+        self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
+        self.scene = scene.clone();
+        self.pending_events
+            .push_back(bmux_client::AttachProviderEvent::Delta(
+                bmux_client::AttachProviderDelta {
+                    sequence: self.event_sequence,
+                    base_view_revision,
+                    view_revision: self.view_revision,
+                    changes: vec![bmux_client::AttachProviderChange::Scene(scene)],
+                    resume: AttachResumeState {
+                        view_revision: self.view_revision,
+                        event_sequence: self.event_sequence,
+                        streams: self.streams.clone(),
+                        provider_token: self.control_revision.to_be_bytes().to_vec(),
+                    },
+                },
+            ));
     }
 }
 
@@ -301,26 +492,8 @@ impl AttachSession for ClusterAttachSession {
             if self.detached {
                 return Ok(bmux_client::AttachProviderEvent::Detached);
             }
-            if let Some(scene) = self.pending_scene.take() {
-                let base_view_revision = self.view_revision;
-                self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
-                self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
-                self.scene = scene.clone();
-                let resume = AttachResumeState {
-                    view_revision: self.view_revision,
-                    event_sequence: self.event_sequence,
-                    streams: self.streams.clone(),
-                    provider_token: self.control_revision.to_be_bytes().to_vec(),
-                };
-                return Ok(bmux_client::AttachProviderEvent::Delta(
-                    bmux_client::AttachProviderDelta {
-                        sequence: self.event_sequence,
-                        base_view_revision,
-                        view_revision: self.view_revision,
-                        changes: vec![bmux_client::AttachProviderChange::Scene(scene)],
-                        resume,
-                    },
-                ));
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(event);
             }
             loop {
                 if tokio::time::Instant::now() >= self.next_reconcile_at {
@@ -579,8 +752,8 @@ impl AttachSession for ClusterAttachSession {
         &mut self,
         viewport: AttachProviderViewport,
     ) -> AttachSessionFuture<'_, AttachProviderAck> {
-        self.viewport = (viewport.columns, viewport.rows);
         Box::pin(async move {
+            let next_viewport = (viewport.columns, viewport.rows);
             let layout = cluster_attach_state::client::layout(
                 &mut self.client,
                 bmux_cluster_plugin_api::cluster_types::WorkspaceId {
@@ -606,13 +779,13 @@ impl AttachSession for ClusterAttachSession {
                 } => Some(pane_id),
                 bmux_attach_layout_protocol::AttachFocusTarget::None => None,
             };
-            let scene = cluster_scene_from_layout(&layout, focused)?;
+            let base_scene = cluster_scene_from_layout(&layout, focused)?;
+            let scene = if let Some(zoomed_pane) = self.zoomed_pane {
+                zoom_cluster_scene(&base_scene, zoomed_pane, next_viewport)?
+            } else {
+                base_scene.clone()
+            };
             for (cursor, cols, rows) in provider_stream_viewports(&scene, &self.streams)? {
-                if let Some(grid) = self.grids.get_mut(&cursor.stream_id) {
-                    grid.resize(cols, rows).map_err(|error| {
-                        provider_reason(format!("cluster terminal grid resize failed: {error}"))
-                    })?;
-                }
                 if !cursor.stream_id.as_str().starts_with("execution:") {
                     continue;
                 }
@@ -636,8 +809,19 @@ impl AttachSession for ClusterAttachSession {
                 .map_err(provider_error)?
                 .map_err(|error| provider_reason(format!("worker resize failed: {error:?}")))?;
             }
+            for (cursor, cols, rows) in provider_stream_viewports(&scene, &self.streams)? {
+                if let Some(grid) = self.grids.get_mut(&cursor.stream_id) {
+                    grid.resize(cols, rows).map_err(|error| {
+                        provider_reason(format!("cluster terminal grid resize failed: {error}"))
+                    })?;
+                }
+            }
+            self.viewport = next_viewport;
+            if self.zoomed_pane.is_some() {
+                self.unzoomed_scene = Some(base_scene);
+            }
             if scene != self.scene {
-                self.pending_scene = Some(scene);
+                self.enqueue_scene(scene);
             }
             Ok(AttachProviderAck {
                 command_id: None,
@@ -652,23 +836,59 @@ impl AttachSession for ClusterAttachSession {
         action: AttachProviderAction,
     ) -> AttachSessionFuture<'_, AttachProviderAck> {
         if action.action == "focus" {
-            let result = apply_local_focus_action(&self.scene, &action.arguments).map(|scene| {
+            let result = apply_local_focus_action(&self.scene, &action.arguments);
+            return Box::pin(async move {
+                let scene = result?;
                 if let Some(scene) = scene {
-                    self.pending_scene = Some(scene);
-                    AttachProviderAck {
+                    self.enqueue_scene(scene);
+                    Ok(AttachProviderAck {
                         command_id: Some(action.command_id),
                         accepted: true,
                         message: None,
-                    }
+                    })
                 } else {
-                    AttachProviderAck {
+                    Ok(AttachProviderAck {
                         command_id: Some(action.command_id),
                         accepted: true,
                         message: Some("logical focus did not change".to_string()),
-                    }
+                    })
                 }
             });
-            return Box::pin(async move { result });
+        }
+        if action.action == "zoom" {
+            let pane_id = action
+                .arguments
+                .first()
+                .ok_or_else(|| provider_reason("logical zoom requires a pane ID".to_string()))
+                .and_then(|value| {
+                    value.parse::<uuid::Uuid>().map_err(|error| {
+                        provider_reason(format!("logical zoom pane ID is invalid: {error}"))
+                    })
+                });
+            return Box::pin(async move {
+                let pane_id = pane_id?;
+                self.toggle_zoom(pane_id, &action.command_id).await?;
+                Ok(AttachProviderAck {
+                    command_id: Some(action.command_id),
+                    accepted: true,
+                    message: None,
+                })
+            });
+        }
+        if matches!(
+            action.action.as_str(),
+            "window-next" | "window-prev" | "window-goto"
+        ) {
+            return Box::pin(async move {
+                let changed = self
+                    .select_window(&action.action, &action.arguments, &action.command_id)
+                    .await?;
+                Ok(AttachProviderAck {
+                    command_id: Some(action.command_id),
+                    accepted: true,
+                    message: (!changed).then(|| "logical window did not change".to_string()),
+                })
+            });
         }
         Box::pin(async move {
             let command_uuid = action
@@ -713,6 +933,201 @@ impl AttachSession for ClusterAttachSession {
             })
         })
     }
+}
+
+fn reflow_cluster_build_to_scene(
+    built: &mut ClusterSnapshotBuild,
+) -> Result<(), AttachSessionError> {
+    for stream in &mut built.snapshot.streams {
+        let Some(grid) = built.grids.get_mut(&stream.cursor.stream_id) else {
+            continue;
+        };
+        let surface = built
+            .snapshot
+            .scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == stream.cursor.surface_id)
+            .ok_or_else(|| {
+                provider_reason("cluster scene dropped an assembled stream".to_string())
+            })?;
+        grid.resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
+            .map_err(|error| provider_reason(format!("cluster grid reflow failed: {error}")))?;
+        stream.snapshot = cluster_terminal_repaint(grid);
+        built.protocols.insert(
+            stream.cursor.stream_id.clone(),
+            protocol_tracker_from_grid(grid),
+        );
+    }
+    Ok(())
+}
+
+fn select_cluster_window<'a>(
+    windows: &[&'a bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord],
+    current: &bmux_cluster_plugin_api::cluster_types::LogicalWindowId,
+    action: &str,
+    arguments: &[String],
+) -> Result<&'a bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord, AttachSessionError> {
+    if windows.is_empty() {
+        return Err(provider_reason(
+            "logical workspace has no windows".to_string(),
+        ));
+    }
+    let current_index = windows
+        .iter()
+        .position(|window| window.window_id == *current)
+        .ok_or_else(|| provider_reason("current logical window no longer exists".to_string()))?;
+    match action {
+        "window-next" => Ok(windows[(current_index + 1) % windows.len()]),
+        "window-prev" => Ok(windows[(current_index + windows.len() - 1) % windows.len()]),
+        "window-goto" => {
+            let target = arguments
+                .iter()
+                .find(|argument| !argument.starts_with('-'))
+                .ok_or_else(|| provider_reason("window-goto requires a target".to_string()))?;
+            if let Ok(index) = target.parse::<usize>() {
+                return index
+                    .checked_sub(1)
+                    .and_then(|index| windows.get(index).copied())
+                    .ok_or_else(|| {
+                        provider_reason(format!(
+                            "logical window index {index} is out of range for {} windows",
+                            windows.len()
+                        ))
+                    });
+            }
+            if let Ok(id) = target.parse::<uuid::Uuid>() {
+                return windows
+                    .iter()
+                    .copied()
+                    .find(|window| window.window_id.value == id)
+                    .ok_or_else(|| provider_reason(format!("logical window {id} was not found")));
+            }
+            let matches = windows
+                .iter()
+                .copied()
+                .filter(|window| window.name.as_deref() == Some(target.as_str()))
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [window] => Ok(*window),
+                [] => Err(provider_reason(format!(
+                    "logical window '{target}' was not found"
+                ))),
+                _ => Err(provider_reason(format!(
+                    "logical window name '{target}' is ambiguous"
+                ))),
+            }
+        }
+        _ => Err(provider_reason(format!(
+            "unsupported logical window action '{action}'"
+        ))),
+    }
+}
+
+fn zoom_cluster_scene(
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    pane_id: uuid::Uuid,
+    viewport: (u16, u16),
+) -> Result<bmux_attach_layout_protocol::AttachScene, AttachSessionError> {
+    let target = scene
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == pane_id && surface.visible && surface.accepts_input)
+        .ok_or_else(|| provider_reason("logical zoom target is unavailable".to_string()))?;
+    let mut zoomed = scene.clone();
+    for surface in &mut zoomed.surfaces {
+        let selected = surface.id == target.id;
+        surface.visible = selected;
+        surface.accepts_input = selected;
+        surface.cursor_owner = selected;
+        if selected {
+            surface.rect = bmux_attach_layout_protocol::AttachRect {
+                x: 0,
+                y: 0,
+                w: viewport.0,
+                h: viewport.1,
+            };
+            surface.content_rect = surface.rect;
+        }
+    }
+    zoomed.focus = bmux_attach_layout_protocol::AttachFocusTarget::Pane { pane_id };
+    Ok(zoomed)
+}
+
+async fn resize_cluster_scene_workers(
+    client: &mut BmuxClient,
+    workspace_id: uuid::Uuid,
+    streams: &[AttachStreamCursor],
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    principal_id: &str,
+    action_command_id: &str,
+) -> Result<(), AttachSessionError> {
+    for (cursor, cols, rows) in provider_stream_viewports(scene, streams)? {
+        if !cursor.stream_id.as_str().starts_with("execution:") {
+            continue;
+        }
+        cluster_attach_command::client::resize(
+            client,
+            bmux_cluster_plugin_api::cluster_types::AttachResizeRequest {
+                workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+                    value: workspace_id,
+                },
+                command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                    value: action_stream_command_id(action_command_id, &cursor.stream_id),
+                },
+                execution_id: stream_execution_id(&cursor.stream_id)?,
+                generation: cursor.generation,
+                principal_id: principal_id.to_string(),
+                cols,
+                rows,
+            },
+        )
+        .await
+        .map_err(provider_error)?
+        .map_err(|error| provider_reason(format!("worker resize failed: {error:?}")))?;
+    }
+    Ok(())
+}
+
+async fn resize_cluster_layout_workers(
+    client: &mut BmuxClient,
+    layout: &bmux_cluster_plugin_api::cluster_types::AttachLayout,
+    principal_id: &str,
+    action_command_id: &str,
+) -> Result<(), AttachSessionError> {
+    for pane in &layout.panes {
+        let Some(assignment) = pane.execution.as_ref() else {
+            continue;
+        };
+        if pane.availability != bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready {
+            continue;
+        }
+        let rect = layout
+            .rects
+            .iter()
+            .find(|rect| rect.pane_id == pane.pane_id)
+            .ok_or_else(|| provider_reason("logical layout is missing a pane rect".to_string()))?;
+        let stream_id =
+            AttachStreamId::new(format!("execution:{}", assignment.execution_id.value))?;
+        cluster_attach_command::client::resize(
+            client,
+            bmux_cluster_plugin_api::cluster_types::AttachResizeRequest {
+                workspace_id: layout.workspace_id.clone(),
+                command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                    value: action_stream_command_id(action_command_id, &stream_id),
+                },
+                execution_id: assignment.execution_id.clone(),
+                generation: assignment.generation,
+                principal_id: principal_id.to_string(),
+                cols: rect.width.max(1),
+                rows: rect.height.max(1),
+            },
+        )
+        .await
+        .map_err(provider_error)?
+        .map_err(|error| provider_reason(format!("worker resize failed: {error:?}")))?;
+    }
+    Ok(())
 }
 
 fn provider_stream_viewports(
@@ -1414,6 +1829,19 @@ fn validate_worker_output(
     Ok(())
 }
 
+fn action_stream_command_id(action_command_id: &str, stream_id: &AttachStreamId) -> uuid::Uuid {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"bmux.cluster.attach-action-stream.v1\0");
+    digest.update(action_command_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(stream_id.as_str().as_bytes());
+    let bytes: [u8; 16] = digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix length");
+    uuid::Uuid::from_bytes(bytes)
+}
+
 fn command_id_from_text(value: &str) -> uuid::Uuid {
     use sha2::Digest;
     let mut digest = sha2::Sha256::new();
@@ -2059,6 +2487,118 @@ mod tests {
             apply_local_focus_action(&scene, &["up".to_string()])
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn logical_window_navigation_is_deterministic_and_rejects_ambiguity() {
+        let workspace_id = bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+            value: uuid::Uuid::from_u128(1),
+        };
+        let window =
+            |id: u128, name: &str| bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord {
+                window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+                    value: uuid::Uuid::from_u128(id),
+                },
+                workspace_id: workspace_id.clone(),
+                name: Some(name.to_string()),
+                layout_schema_version: 1,
+                layout: Vec::new(),
+                revision: 1,
+            };
+        let first = window(1, "one");
+        let second = window(2, "duplicate");
+        let third = window(3, "duplicate");
+        let windows = vec![&first, &second, &third];
+        assert_eq!(
+            select_cluster_window(&windows, &first.window_id, "window-next", &[])
+                .unwrap()
+                .window_id,
+            second.window_id
+        );
+        assert_eq!(
+            select_cluster_window(&windows, &first.window_id, "window-prev", &[])
+                .unwrap()
+                .window_id,
+            third.window_id
+        );
+        assert_eq!(
+            select_cluster_window(
+                &windows,
+                &first.window_id,
+                "window-goto",
+                &["2".to_string()]
+            )
+            .unwrap()
+            .window_id,
+            second.window_id
+        );
+        assert!(
+            select_cluster_window(
+                &windows,
+                &first.window_id,
+                "window-goto",
+                &["duplicate".to_string()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn logical_zoom_projects_one_pane_without_mutating_base_scene() {
+        use bmux_attach_layout_protocol::{
+            AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface,
+            AttachSurfaceKind,
+        };
+        let pane = |id: u128, x: u16| AttachSurface {
+            id: uuid::Uuid::from_u128(id),
+            kind: AttachSurfaceKind::Pane,
+            layer: AttachLayer::Pane,
+            z: 0,
+            rect: AttachRect {
+                x,
+                y: 0,
+                w: 40,
+                h: 24,
+            },
+            content_rect: AttachRect {
+                x,
+                y: 0,
+                w: 40,
+                h: 24,
+            },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: id == 1,
+            pane_id: Some(uuid::Uuid::from_u128(id)),
+        };
+        let scene = AttachScene {
+            session_id: uuid::Uuid::nil(),
+            focus: AttachFocusTarget::Pane {
+                pane_id: uuid::Uuid::from_u128(1),
+            },
+            surfaces: vec![pane(1, 0), pane(2, 40)],
+        };
+        let zoomed = zoom_cluster_scene(&scene, uuid::Uuid::from_u128(2), (80, 24)).unwrap();
+        assert!(scene.surfaces.iter().all(|surface| surface.visible));
+        assert!(!zoomed.surfaces[0].visible);
+        assert!(zoomed.surfaces[1].visible);
+        assert_eq!(
+            zoomed.surfaces[1].rect,
+            AttachRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24
+            }
+        );
+        assert_eq!(
+            zoomed.focus,
+            AttachFocusTarget::Pane {
+                pane_id: uuid::Uuid::from_u128(2)
+            }
         );
     }
 
