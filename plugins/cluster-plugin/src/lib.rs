@@ -14,6 +14,7 @@ pub(crate) mod endpoint;
 pub(crate) mod events;
 mod gateway;
 pub(crate) mod membership;
+mod native_consensus_service;
 pub(crate) mod pane;
 pub mod placement;
 pub(crate) mod storage;
@@ -24,6 +25,7 @@ pub(crate) mod workspace;
 pub(crate) use commands::*;
 pub(crate) use events::*;
 pub(crate) use membership::*;
+use native_consensus_service::invoke_native_consensus_service;
 pub(crate) use pane::*;
 pub(crate) use storage::*;
 pub(crate) use workspace::*;
@@ -238,12 +240,18 @@ impl RustPlugin for ClusterPlugin {
                 + Send
                 + Sync,
         > = control;
-        let worker = Arc::new(worker_runtime::WorkerServiceHandle::new(
-            worker_pane_runtime::local_worker_registry(
-                caller.clone(),
-                identity.node_id().to_string(),
-                worker_runtime::NodeSignatureLeaseVerifier::new(caller),
-            ),
+        let worker_registry = worker_pane_runtime::local_worker_registry(
+            caller.clone(),
+            identity.node_id().to_string(),
+            worker_runtime::NodeSignatureLeaseVerifier::new(caller.clone()),
+        );
+        let durable_worker = worker_runtime::DurableWorkerRegistry::new(worker_registry, caller);
+        if let Err(error) = durable_worker.restore_and_reconcile() {
+            tracing::error!(%error, "failed restoring worker registry");
+            return;
+        }
+        let worker = Arc::new(worker_runtime::WorkerServiceHandle::from_durable(
+            durable_worker,
         ));
         let worker_commands: Arc<
             dyn bmux_cluster_plugin_api::cluster_worker_command::ClusterWorkerCommandService
@@ -319,6 +327,9 @@ impl RustPlugin for ClusterPlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        if let Some(response) = invoke_native_consensus_service(&context) {
+            return response;
+        }
         if is_cluster_lifecycle_service(&context) {
             return invoke_cluster_lifecycle_service(&context);
         }

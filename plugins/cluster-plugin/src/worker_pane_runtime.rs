@@ -261,9 +261,13 @@ pub fn local_worker_registry<V>(
     caller: Arc<TypedServiceCaller>,
     local_node_id: impl Into<String>,
     verifier: V,
-) -> WorkerRegistry<TypedPaneRuntime, V>
+) -> Arc<WorkerRegistry<TypedPaneRuntime, V>>
 where
     V: WorkerLeaseVerifier,
 {
-    WorkerRegistry::new(local_node_id, TypedPaneRuntime::new(caller), verifier)
+    Arc::new(WorkerRegistry::new(
+        local_node_id,
+        TypedPaneRuntime::new(caller),
+        verifier,
+    ))
 }

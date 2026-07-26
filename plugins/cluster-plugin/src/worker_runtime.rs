@@ -188,6 +188,12 @@ where
         {
             return outcome_execution(outcome);
         }
+        if let Some(existing) = inner.executions.get(&authority.execution_id.value) {
+            if existing.execution.authority == authority {
+                return Ok(existing.execution.clone());
+            }
+            return Err(WorkerServiceError::CommandConflict);
+        }
         ensure_new_execution(&inner.executions, &authority)?;
         let expected = expected_authority(&self.local_node_id, &authority);
         inner.fence.validate_mutation(
@@ -861,12 +867,100 @@ where
 ///
 /// The registry owns all mutable worker execution state. This handle provides
 /// process-monotonic lease timing and async trait adaptation.
-pub struct WorkerServiceHandle<R, V> {
-    registry: WorkerRegistry<R, V>,
+const WORKER_REGISTRY_STORAGE_KEY: &str = "cluster.worker.registry.v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredWorkerRegistry {
+    version: u16,
+    executions: Vec<WorkerExecution>,
+}
+
+#[derive(Clone)]
+pub struct DurableWorkerRegistry<R, V, C> {
+    registry: std::sync::Arc<WorkerRegistry<R, V>>,
+    caller: std::sync::Arc<C>,
+}
+
+impl<R, V, C> DurableWorkerRegistry<R, V, C>
+where
+    R: WorkerPaneRuntime,
+    V: WorkerLeaseVerifier,
+    C: crate::ClusterRuntimeOps,
+{
+    #[must_use]
+    pub const fn new(
+        registry: std::sync::Arc<WorkerRegistry<R, V>>,
+        caller: std::sync::Arc<C>,
+    ) -> Self {
+        Self { registry, caller }
+    }
+
+    /// Restores the durable authoritative inventory and reconciles it against
+    /// the local pane runtime without launching, adopting, or deleting a pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns corrupt-state, storage, authority, or registry failures.
+    pub fn restore_and_reconcile(&self) -> Result<WorkerRegistryStats, String> {
+        let executions = self.load()?;
+        self.registry
+            .reconcile(executions)
+            .map_err(|error| format!("worker registry reconciliation failed: {error:?}"))
+    }
+
+    /// Persists the canonical registry inventory after a successful mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns inventory, encoding, storage-key, or storage-write failures.
+    pub fn persist(&self) -> Result<(), String> {
+        let record = StoredWorkerRegistry {
+            version: 1,
+            executions: self
+                .registry
+                .inventory()
+                .map_err(|error| format!("worker inventory failed: {error:?}"))?
+                .executions,
+        };
+        let value = bmux_plugin_sdk::encode_service_message(&record)
+            .map_err(|error| format!("worker registry encoding failed: {error}"))?;
+        self.caller
+            .storage_set(&bmux_plugin_sdk::StorageSetRequest::new(
+                bmux_plugin_sdk::StorageKey::new(WORKER_REGISTRY_STORAGE_KEY)
+                    .map_err(|error| format!("worker registry storage key failed: {error}"))?,
+                value,
+            ))
+    }
+
+    fn load(&self) -> Result<Vec<WorkerExecution>, String> {
+        let response = self
+            .caller
+            .storage_get(&bmux_plugin_sdk::StorageGetRequest::new(
+                bmux_plugin_sdk::StorageKey::new(WORKER_REGISTRY_STORAGE_KEY)
+                    .map_err(|error| format!("worker registry storage key failed: {error}"))?,
+            ))?;
+        let Some(value) = response.value else {
+            return Ok(Vec::new());
+        };
+        let record = bmux_plugin_sdk::decode_service_message::<StoredWorkerRegistry>(&value)
+            .map_err(|error| format!("worker registry state is corrupt: {error}"))?;
+        if record.version != 1 {
+            return Err(format!(
+                "unsupported worker registry version {}",
+                record.version
+            ));
+        }
+        Ok(record.executions)
+    }
+}
+
+pub struct WorkerServiceHandle<R, V, C> {
+    registry: std::sync::Arc<WorkerRegistry<R, V>>,
+    durable: Option<DurableWorkerRegistry<R, V, C>>,
     started_at: Instant,
 }
 
-impl<R, V> WorkerServiceHandle<R, V>
+impl<R, V, C> WorkerServiceHandle<R, V, C>
 where
     R: WorkerPaneRuntime,
     V: WorkerLeaseVerifier,
@@ -874,9 +968,40 @@ where
     #[must_use]
     pub fn new(registry: WorkerRegistry<R, V>) -> Self {
         Self {
-            registry,
+            registry: std::sync::Arc::new(registry),
+            durable: None,
             started_at: Instant::now(),
         }
+    }
+
+    #[must_use]
+    pub fn from_durable(durable: DurableWorkerRegistry<R, V, C>) -> Self {
+        Self {
+            registry: durable.registry.clone(),
+            durable: Some(durable),
+            started_at: Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub const fn registry(&self) -> &std::sync::Arc<WorkerRegistry<R, V>> {
+        &self.registry
+    }
+
+    fn persist_after<T>(
+        &self,
+        result: Result<T, WorkerServiceError>,
+    ) -> Result<T, WorkerServiceError>
+    where
+        C: crate::ClusterRuntimeOps,
+    {
+        let value = result?;
+        if let Some(durable) = &self.durable {
+            durable
+                .persist()
+                .map_err(|reason| WorkerServiceError::LocalRuntime { reason })?;
+        }
+        Ok(value)
     }
 
     fn monotonic_now_ms(&self) -> u64 {
@@ -895,11 +1020,12 @@ const fn launch_result(execution: WorkerExecution) -> WorkerLaunchResult {
     }
 }
 
-impl<R, V> bmux_cluster_plugin_api::cluster_worker_command::ClusterWorkerCommandService
-    for WorkerServiceHandle<R, V>
+impl<R, V, C> bmux_cluster_plugin_api::cluster_worker_command::ClusterWorkerCommandService
+    for WorkerServiceHandle<R, V, C>
 where
     R: WorkerPaneRuntime + 'static,
     V: WorkerLeaseVerifier + 'static,
+    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
 {
     fn launch<'a>(
         &'a self,
@@ -914,9 +1040,11 @@ where
         >,
     > {
         Box::pin(async move {
-            self.registry
-                .launch(&command_id, authority, &spec, self.monotonic_now_ms())
-                .map(launch_result)
+            self.persist_after(
+                self.registry
+                    .launch(&command_id, authority, &spec, self.monotonic_now_ms())
+                    .map(launch_result),
+            )
         })
     }
 
@@ -933,9 +1061,11 @@ where
         >,
     > {
         Box::pin(async move {
-            self.registry
-                .adopt(&command_id, authority, &spec, self.monotonic_now_ms())
-                .map(launch_result)
+            self.persist_after(
+                self.registry
+                    .adopt(&command_id, authority, &spec, self.monotonic_now_ms())
+                    .map(launch_result),
+            )
         })
     }
 
@@ -1056,15 +1186,16 @@ where
                 + 'a,
         >,
     > {
-        Box::pin(async move { self.registry.reconcile(executions) })
+        Box::pin(async move { self.persist_after(self.registry.reconcile(executions)) })
     }
 }
 
-impl<R, V> bmux_cluster_plugin_api::cluster_worker_state::ClusterWorkerStateService
-    for WorkerServiceHandle<R, V>
+impl<R, V, C> bmux_cluster_plugin_api::cluster_worker_state::ClusterWorkerStateService
+    for WorkerServiceHandle<R, V, C>
 where
     R: WorkerPaneRuntime + 'static,
     V: WorkerLeaseVerifier + 'static,
+    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
 {
     fn get<'a>(
         &'a self,
@@ -1497,11 +1628,11 @@ mod tests {
     };
     use std::sync::Mutex as StdMutex;
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct FakePaneRuntime {
-        calls: StdMutex<Vec<String>>,
-        existing: StdMutex<BTreeSet<(uuid::Uuid, uuid::Uuid)>>,
-        next: StdMutex<u128>,
+        calls: std::sync::Arc<StdMutex<Vec<String>>>,
+        existing: std::sync::Arc<StdMutex<BTreeSet<(uuid::Uuid, uuid::Uuid)>>>,
+        next: std::sync::Arc<StdMutex<u128>>,
     }
 
     impl FakePaneRuntime {
@@ -1846,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_launch_is_idempotent_and_binds_local_runtime_identity() {
+    fn registry_launch_is_idempotent_across_command_and_recovery_retries() {
         let registry =
             WorkerRegistry::new("node:local", FakePaneRuntime::default(), AcceptSignature);
         let mut authority = authority(1, 1);
@@ -1865,8 +1996,21 @@ mod tests {
         let first = registry
             .launch(&command_id, authority.clone(), &spec, 10)
             .unwrap();
-        let replay = registry.launch(&command_id, authority, &spec, 11).unwrap();
+        let replay = registry
+            .launch(&command_id, authority.clone(), &spec, 11)
+            .unwrap();
         assert_eq!(first, replay);
+        let recovered = registry
+            .launch(
+                &CommandId {
+                    value: uuid::Uuid::from_u128(51),
+                },
+                authority,
+                &spec,
+                12,
+            )
+            .unwrap();
+        assert_eq!(first, recovered);
         assert_eq!(
             registry.runtime.calls.lock().unwrap().as_slice(),
             ["launch"]
@@ -1973,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_output_snapshot_and_reconciliation_preserve_authority() {
+    fn registry_output_snapshot_and_reconciliation_classify_current_missing_and_orphaned() {
         let registry =
             WorkerRegistry::new("node:local", FakePaneRuntime::default(), AcceptSignature);
         let mut lifecycle = authority(1, 1);
@@ -2021,6 +2165,15 @@ mod tests {
         assert_eq!(snapshot.cursor, 7);
         assert_eq!(snapshot.encoded, vec![1, 2, 3]);
 
+        registry.reconcile(vec![execution.clone()]).unwrap();
+        let WorkerQueryResult::Found { execution: current } =
+            registry.get(&execution.authority.execution_id).unwrap()
+        else {
+            panic!("current execution should remain in registry");
+        };
+        assert_eq!(current.state, WorkerExecutionState::Ready);
+        assert_eq!(current.authority, execution.authority);
+
         registry
             .runtime
             .existing
@@ -2042,6 +2195,115 @@ mod tests {
             panic!("orphan should remain inspectable");
         };
         assert_eq!(orphan.state, WorkerExecutionState::Quarantined);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn durable_worker_registry_restores_and_reconciles_after_restart() {
+        #[derive(Default)]
+        struct MemoryStorage {
+            value: Mutex<Option<Vec<u8>>>,
+        }
+
+        impl crate::ClusterRuntimeOps for MemoryStorage {
+            fn core_cli_command_run_path(
+                &self,
+                _: &bmux_plugin_sdk::CoreCliCommandRequest,
+            ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
+                Err("unused".to_string())
+            }
+            fn session_list(&self) -> Result<crate::SessionListResponse, String> {
+                Err("unused".to_string())
+            }
+            fn session_create(
+                &self,
+                _: &crate::SessionCreateRequest,
+            ) -> Result<crate::SessionCreateResponse, String> {
+                Err("unused".to_string())
+            }
+            fn session_select(
+                &self,
+                _: &crate::SessionSelectRequest,
+            ) -> Result<crate::SessionSelectResponse, String> {
+                Err("unused".to_string())
+            }
+            fn pane_list(
+                &self,
+                _: &crate::PaneListRequest,
+            ) -> Result<crate::PaneListResponse, String> {
+                Err("unused".to_string())
+            }
+            fn pane_launch(
+                &self,
+                _: &crate::PaneLaunchRequest,
+            ) -> Result<crate::PaneLaunchResponse, String> {
+                Err("unused".to_string())
+            }
+            fn pane_close(
+                &self,
+                _: &crate::PaneCloseRequest,
+            ) -> Result<crate::PaneCloseResponse, String> {
+                Err("unused".to_string())
+            }
+            fn storage_get(
+                &self,
+                _: &bmux_plugin_sdk::StorageGetRequest,
+            ) -> Result<bmux_plugin_sdk::StorageGetResponse, String> {
+                Ok(bmux_plugin_sdk::StorageGetResponse {
+                    value: self.value.lock().unwrap().clone(),
+                })
+            }
+            fn storage_set(
+                &self,
+                request: &bmux_plugin_sdk::StorageSetRequest,
+            ) -> Result<(), String> {
+                *self.value.lock().unwrap() = Some(request.value.clone());
+                Ok(())
+            }
+        }
+
+        let storage = std::sync::Arc::new(MemoryStorage::default());
+        let runtime = FakePaneRuntime::default();
+        let registry = std::sync::Arc::new(WorkerRegistry::new(
+            "node:local",
+            runtime.clone(),
+            AcceptSignature,
+        ));
+        let mut lifecycle = authority(1, 1);
+        lifecycle.operation_class = WorkerOperationClass::Lifecycle;
+        let execution = registry
+            .launch(
+                &CommandId {
+                    value: uuid::Uuid::from_u128(90),
+                },
+                lifecycle,
+                &WorkerLaunchSpec {
+                    program: Some("sh".to_string()),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+                1,
+            )
+            .unwrap();
+        let durable = DurableWorkerRegistry::new(registry, storage.clone());
+        durable.persist().unwrap();
+
+        let restored =
+            std::sync::Arc::new(WorkerRegistry::new("node:local", runtime, AcceptSignature));
+        let durable = DurableWorkerRegistry::new(restored.clone(), storage);
+        let stats = durable.restore_and_reconcile().unwrap();
+        assert_eq!(stats.execution_count, 1);
+        let WorkerQueryResult::Found {
+            execution: recovered,
+        } = restored.get(&execution.authority.execution_id).unwrap()
+        else {
+            panic!("execution should restore");
+        };
+        assert_eq!(recovered.state, WorkerExecutionState::Ready);
+        assert_eq!(recovered.authority, execution.authority);
     }
 
     #[test]

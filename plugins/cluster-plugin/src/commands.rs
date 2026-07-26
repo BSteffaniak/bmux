@@ -501,15 +501,28 @@ pub fn run_cluster_member_revoke(context: &NativeCommandContext) -> Result<i32, 
 }
 
 pub fn run_cluster_members(context: &NativeCommandContext) -> Result<i32, String> {
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("cluster members requires the host runtime: {error}"))?;
-    let result = tokio::task::block_in_place(|| {
-        handle.block_on(bmux_cluster_plugin_api::cluster_query::client::members(
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let identity = tokio::task::block_in_place(|| {
+        handle.block_on(bmux_cluster_plugin_api::cluster_query::client::identity(
             &mut client,
         ))
     })
-    .map_err(|error| format!("cluster members service dispatch failed: {error}"))?;
+    .map_err(|error| format!("cluster identity service dispatch failed: {error}"))?;
+    let local = list_members(context)?;
+    let result = if let Ok(node) =
+        consensus_network::global_consensus_nodes().get(identity.node_id.parse::<NodeId>()?)
+    {
+        tokio::task::block_in_place(|| handle.block_on(node.read_linearizable_view()))
+            .map(|view| ClusterMemberList {
+                cluster_id: Some(view.cluster_id),
+                members: view.members,
+            })
+            .map_err(|error| format!("replicated membership read failed: {error:?}"))?
+    } else {
+        local
+    };
     println!(
         "cluster {}",
         result.cluster_id.as_deref().unwrap_or("not-initialized")
