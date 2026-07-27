@@ -1,3 +1,4 @@
+use crate::connection::CliAttachEndpointConnector;
 use anyhow::{Context, Result};
 use bmux_cli_schema::LogLevel;
 use bmux_client::{BmuxClient, ClientError};
@@ -746,7 +747,15 @@ pub(super) async fn run_session_attach(
     );
     let provider = super::attach::provider::resolve(target)?;
     if !provider.requires_fallback_client() {
-        let session = provider.open(None, None).await?;
+        let session = provider
+            .open(
+                None,
+                bmux_client::AttachProviderOpenContext {
+                    fallback_client: None,
+                    endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+                },
+            )
+            .await?;
         return super::attach::runtime::run_session_attach_with_provider_session(
             session, target, follow, global, None,
         )

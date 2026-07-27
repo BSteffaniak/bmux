@@ -1,9 +1,8 @@
 //! Production voter-set reconciliation for membership workflows.
 
-use crate::ClusterRuntimeOps;
 use crate::consensus_network::ConsensusNodeRegistry;
 use crate::consensus_runtime::{ConsensusNode, ConsensusWriteError};
-use crate::membership::{NodeId, load_membership_state};
+use crate::membership::NodeId;
 use bmux_cluster_plugin_api::cluster_types::{
     ClusterConsensusRole, ClusterMember, ClusterMemberState, ConsensusVoterChangeAction,
     ConsensusVoterChangeAuthorization,
@@ -138,6 +137,15 @@ pub fn plan_active_voters_ref<'a>(
             .map(str::trim)
             .filter(|endpoint| !endpoint.is_empty())
             .ok_or_else(|| format!("active voter {node_id} has no advertised endpoint"))?;
+        crate::membership::validate_advertised_endpoint(endpoint)?;
+        if let Some((existing_id, _)) = voters
+            .iter()
+            .find(|(_, existing): &(&NodeId, &BasicNode)| existing.addr == endpoint)
+        {
+            return Err(format!(
+                "active voters {existing_id} and {node_id} share advertised endpoint '{endpoint}'"
+            ));
+        }
         if voters.insert(node_id, BasicNode::new(endpoint)).is_some() {
             return Err(format!("duplicate active voter {node_id}"));
         }
@@ -184,40 +192,6 @@ pub fn validate_membership_transition(
         }
     }
     Ok(prospective_plan)
-}
-
-/// Builds the exact active voter set from stored membership.
-///
-/// # Errors
-///
-/// Returns storage, credential, identity, or endpoint validation failures.
-pub fn plan_stored_active_voters(caller: &impl ClusterRuntimeOps) -> Result<VoterSetPlan, String> {
-    let state = load_membership_state(caller)?
-        .ok_or_else(|| "cluster membership is not initialized".to_string())?;
-    plan_active_voters(state.members.into_values())
-}
-
-/// Applies the planned learner-first joint-consensus transition through the
-/// active local node. Followers return the same actionable leader guidance as
-/// ordinary control writes.
-///
-/// # Errors
-///
-/// Returns registry, leader, quorum, authentication, or `OpenRaft` membership
-/// errors without modifying plugin membership records.
-pub async fn reconcile_active_voters(
-    caller: &(impl ClusterRuntimeOps + Sync),
-    local_node_id: NodeId,
-    nodes: &ConsensusNodeRegistry,
-) -> Result<(), String> {
-    let plan = plan_stored_active_voters(caller)?;
-    change_voters(
-        nodes
-            .active(local_node_id)
-            .map_err(|error| service_error(&error))?,
-        plan,
-    )
-    .await
 }
 
 /// Reconciles a provided membership snapshot through the active local node.
@@ -383,7 +357,7 @@ mod tests {
         )
         .unwrap();
         member.state = state;
-        member.endpoint = Some(format!("memory://{id}"));
+        member.endpoint = Some(format!("tls://node-{}:7443", id.as_bytes()[31]));
         member
     }
 
@@ -544,6 +518,45 @@ mod tests {
     }
 
     #[test]
+    fn active_voter_plan_rejects_duplicate_and_noncanonical_endpoints() {
+        let first = member(
+            NodeId::from(1),
+            ClusterConsensusRole::Voter,
+            ClusterMemberState::Active,
+        );
+        let mut duplicate = member(
+            NodeId::from(2),
+            ClusterConsensusRole::Voter,
+            ClusterMemberState::Active,
+        );
+        duplicate.endpoint.clone_from(&first.endpoint);
+        assert!(
+            plan_active_voters([first.clone(), duplicate])
+                .unwrap_err()
+                .contains("share advertised endpoint")
+        );
+
+        let mut wrong_identity = first.clone();
+        wrong_identity.node_id = "node:not-a-key".to_string();
+        assert!(plan_active_voters([wrong_identity]).is_err());
+
+        let mut local = first.clone();
+        local.endpoint = Some("local".to_string());
+        assert!(
+            plan_active_voters([local])
+                .unwrap_err()
+                .contains("node-local")
+        );
+        let mut malformed = first;
+        malformed.endpoint = Some("tls://".to_string());
+        assert!(
+            plan_active_voters([malformed])
+                .unwrap_err()
+                .contains("authority")
+        );
+    }
+
+    #[test]
     fn transition_allows_add_remove_and_rejects_endpoint_rewrite() {
         let first = member(
             NodeId::from(1),
@@ -566,7 +579,7 @@ mod tests {
             .unwrap();
 
         let mut rewritten = second.clone();
-        rewritten.endpoint = Some("memory://different".to_string());
+        rewritten.endpoint = Some("tls://different:7443".to_string());
         assert!(
             validate_membership_transition(std::slice::from_ref(&second), &[rewritten])
                 .unwrap_err()

@@ -73,6 +73,12 @@ pub struct FeatureActivationCommand {
 }
 
 #[must_use]
+/// Encodes one feature activation into its canonical durable representation.
+///
+/// # Panics
+///
+/// Panics if a typed principal or feature name exceeds the schema-defined
+/// canonical bounds. Callers must reject such a command before proposal.
 pub fn encode_feature_activation(command: &FeatureActivationCommand) -> Vec<u8> {
     validate_string(&command.principal_id).expect("feature principal must be bounded");
     validate_string(&command.feature).expect("feature name must be bounded");
@@ -89,6 +95,11 @@ pub fn encode_feature_activation(command: &FeatureActivationCommand) -> Vec<u8> 
     writer.into_bytes()
 }
 
+/// Decodes and validates one canonical durable feature activation.
+///
+/// # Errors
+///
+/// Returns an error for malformed, oversized, trailing, or unsupported data.
 pub fn decode_feature_activation(bytes: &[u8]) -> Result<FeatureActivationCommand, CodecError> {
     let mut reader = Reader::new(bytes);
     if reader.take(FEATURE_COMMAND_MAGIC.len())? != FEATURE_COMMAND_MAGIC {

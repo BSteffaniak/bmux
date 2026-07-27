@@ -776,6 +776,9 @@ fn emit_transport_client_function(
         "        /// Invoke `{}` through a typed dispatch client.",
         op.name
     );
+    if op.params.len() >= 7 {
+        out.push_str("        #[allow(clippy::too_many_arguments)]\n");
+    }
     let _ = writeln!(
         out,
         "        pub async fn {name}<C: ::bmux_plugin_sdk::TypedDispatchClient>(client: &mut C{sep}{params}) -> ::bmux_plugin_sdk::TypedServiceClientResult<{returns}> {{"
@@ -829,6 +832,9 @@ fn emit_client_forwarder(
         .collect::<Vec<_>>()
         .join(", ");
     out.push_str("\n        /// Forward to the provider's trait method.\n");
+    if op.params.len() >= 7 {
+        out.push_str("        #[allow(clippy::too_many_arguments)]\n");
+    }
     let _ = writeln!(
         out,
         "        pub fn {name}<'a>(&'a self{sep}{params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>> {{",
@@ -858,6 +864,9 @@ fn emit_operation_signature(
         .join(", ");
     let returns = rust_type(&op.returns, imports, own_types);
     let sep = if op.params.is_empty() { "" } else { ", " };
+    if op.params.len() >= 7 {
+        out.push_str("        #[allow(clippy::too_many_arguments)]\n");
+    }
     let _ = writeln!(
         out,
         "        fn {name}<'a>(&'a self{sep}{params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>>;"
@@ -1281,6 +1290,23 @@ mod tests {
         assert!(rust.contains("InterfaceId::from_static(\"actions/v2\")"));
         assert!(rust.contains("actions_v1::service_declaration()?"));
         assert!(rust.contains("actions_v2::service_declaration()?"));
+    }
+
+    #[test]
+    fn emits_targeted_clippy_allow_for_wide_generated_operations() {
+        let src = "plugin p version 1;\n\
+                   capability RUN = bmux.test.run;\n\
+                   @capability(RUN)\n\
+                   interface actions {\n\
+                     command run(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64) -> unit;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert_eq!(
+            rust.matches("#[allow(clippy::too_many_arguments)]").count(),
+            3,
+            "service trait, typed forwarder, and transport client should each carry a targeted allow; got: {rust}"
+        );
     }
 
     #[test]

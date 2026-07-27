@@ -253,6 +253,12 @@ impl ControlState {
         response
     }
 
+    /// Applies one feature-floor activation deterministically.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replicated control revision overflows `u64`, which is an
+    /// unrecoverable state-machine invariant violation.
     pub fn apply_feature_activation(
         &mut self,
         command: &FeatureActivationCommand,
@@ -349,7 +355,41 @@ impl ControlState {
                 if member.cluster_id != self.cluster_id {
                     return Err(invalid_transition("member belongs to a different cluster"));
                 }
+                crate::membership::verify_membership_credential(member, command.issued_at_unix_ms)
+                    .map_err(|error| {
+                        invalid_transition(&format!("member credential is invalid: {error}"))
+                    })?;
+                if let Some(endpoint) = member.endpoint.as_deref() {
+                    crate::membership::validate_advertised_endpoint(endpoint).map_err(|error| {
+                        invalid_transition(&format!("member endpoint is invalid: {error}"))
+                    })?;
+                    if self.members.values().any(|existing| {
+                        existing.node_id != member.node_id
+                            && existing.state == ClusterMemberState::Active
+                            && existing.endpoint.as_deref() == Some(endpoint)
+                    }) {
+                        return Err(invalid_transition(
+                            "member endpoint is already assigned to another active member",
+                        ));
+                    }
+                } else if member.state == ClusterMemberState::Active
+                    && member.capabilities.consensus_role
+                        == bmux_cluster_plugin_api::cluster_types::ClusterConsensusRole::Voter
+                {
+                    return Err(invalid_transition(
+                        "active voter requires an advertised endpoint",
+                    ));
+                }
                 if let Some(existing) = self.members.get(&member.node_id) {
+                    if existing.state == ClusterMemberState::Active
+                        && existing.capabilities.consensus_role
+                            == bmux_cluster_plugin_api::cluster_types::ClusterConsensusRole::Voter
+                        && existing.endpoint != member.endpoint
+                    {
+                        return Err(invalid_transition(
+                            "active voter endpoint cannot be rewritten by membership publication",
+                        ));
+                    }
                     if matches!(
                         existing.state,
                         ClusterMemberState::Revoked | ClusterMemberState::Left
@@ -1095,11 +1135,11 @@ mod tests {
 
     #[test]
     fn membership_updates_reject_stale_and_same_timestamp_conflicts() {
-        let mut state = ControlState::new("cluster:test");
         let identity = crate::membership::NodeIdentity::new_for_test(1);
         let cluster_id = "cluster:00000000-0000-0000-0000-000000000001"
             .parse::<crate::membership::ClusterId>()
             .unwrap();
+        let mut state = ControlState::new(cluster_id.to_string());
         let mut member = crate::membership::issue_membership_credential(
             &identity,
             cluster_id,
@@ -1117,36 +1157,78 @@ mod tests {
             crate::now_unix_ms(),
         )
         .unwrap();
-        member.cluster_id = "cluster:test".to_string();
-        assert_accepted(&state.apply(&command(
+        member.endpoint = Some("tls://member.example:7443".to_string());
+        let issued_at_unix_ms = member.updated_at_unix_ms;
+        let mut initial = command(
             50,
             ControlCommandRequest::UpsertMember {
                 member: member.clone(),
             },
-        )));
+        );
+        initial.issued_at_unix_ms = issued_at_unix_ms;
+        assert_accepted(&state.apply(&initial));
 
         let mut older = member.clone();
         older.updated_at_unix_ms -= 1;
+        let mut older_command = command(51, ControlCommandRequest::UpsertMember { member: older });
+        older_command.issued_at_unix_ms = issued_at_unix_ms;
         assert!(matches!(
-            state
-                .apply(&command(
-                    51,
-                    ControlCommandRequest::UpsertMember { member: older }
-                ))
-                .result,
+            state.apply(&older_command).result,
             ControlCommandResult::Rejected { .. }
         ));
-        let mut conflicting = member;
-        conflicting.endpoint = Some("different".to_string());
+        let mut conflicting = member.clone();
+        conflicting.endpoint = Some("tls://different.example:7443".to_string());
+        conflicting.updated_at_unix_ms += 1;
+        let mut conflicting_command = command(
+            52,
+            ControlCommandRequest::UpsertMember {
+                member: conflicting,
+            },
+        );
+        conflicting_command.issued_at_unix_ms = issued_at_unix_ms;
         assert!(matches!(
-            state
-                .apply(&command(
-                    52,
-                    ControlCommandRequest::UpsertMember {
-                        member: conflicting
-                    }
-                ))
-                .result,
+            state.apply(&conflicting_command).result,
+            ControlCommandResult::Rejected {
+                error: ControlCommandError::InvalidTransition { ref reason }
+            } if reason.contains("endpoint cannot be rewritten")
+        ));
+
+        let mut wrong_node_id = member.clone();
+        wrong_node_id.node_id = crate::membership::NodeIdentity::new_for_test(2)
+            .node_id()
+            .to_string();
+        wrong_node_id.updated_at_unix_ms += 1;
+        let mut wrong_node_command = command(
+            53,
+            ControlCommandRequest::UpsertMember {
+                member: wrong_node_id,
+            },
+        );
+        wrong_node_command.issued_at_unix_ms = issued_at_unix_ms;
+        assert!(matches!(
+            state.apply(&wrong_node_command).result,
+            ControlCommandResult::Rejected { .. }
+        ));
+
+        let duplicate_identity = crate::membership::NodeIdentity::new_for_test(2);
+        let mut duplicate = crate::membership::issue_membership_credential(
+            &identity,
+            cluster_id,
+            duplicate_identity.node_id().to_string(),
+            duplicate_identity.public_key().to_string(),
+            crate::membership::initializer_capabilities(),
+            member.negotiated_protocol.clone(),
+            issued_at_unix_ms,
+        )
+        .unwrap();
+        duplicate.endpoint.clone_from(&member.endpoint);
+        let mut duplicate_command = command(
+            54,
+            ControlCommandRequest::UpsertMember { member: duplicate },
+        );
+        duplicate_command.issued_at_unix_ms = issued_at_unix_ms;
+        assert!(matches!(
+            state.apply(&duplicate_command).result,
             ControlCommandResult::Rejected { .. }
         ));
     }
@@ -1262,13 +1344,13 @@ mod tests {
                 error: ControlCommandError::CommandIdConflict
             }
         ));
-        let stale = FeatureActivationCommand {
+        let stale_command = FeatureActivationCommand {
             command_id: CommandId { value: id(100) },
             expected_control_revision: 0,
             ..command.clone()
         };
         assert!(matches!(
-            state.apply_feature_activation(&stale).result,
+            state.apply_feature_activation(&stale_command).result,
             ControlCommandResult::Rejected {
                 error: ControlCommandError::RevisionConflict {
                     expected: 0,

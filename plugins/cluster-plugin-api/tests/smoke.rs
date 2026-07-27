@@ -1,8 +1,9 @@
 //! Smoke tests for the BPDL-generated cluster plugin contract.
 
 use bmux_cluster_plugin_api::{
-    cluster_command, cluster_connection_events, cluster_control_command, cluster_control_state,
-    cluster_peer_auth, cluster_query, cluster_raft_rpc,
+    cluster_command, cluster_connection_events, cluster_control_command,
+    cluster_control_command_v2, cluster_control_state, cluster_control_state_v2, cluster_peer_auth,
+    cluster_query, cluster_raft_rpc,
     cluster_types::{
         ClusterConnectionEvent, ClusterConnectionState, ClusterConsensusRole, ClusterHostState,
         ClusterHostStatus, ClusterIdentity, ClusterJoinResult, ClusterLaunchStatus,
@@ -509,11 +510,22 @@ fn interface_ids_and_operations_match_schema() {
     assert_eq!(cluster_worker_state::OP_SNAPSHOT, "snapshot");
     assert_eq!(cluster_worker_state::OP_INVENTORY, "inventory");
     assert_eq!(cluster_control_command::OP_MUTATE, "mutate");
+    assert_eq!(cluster_control_command_v2::OP_MUTATE, "mutate");
+    assert_eq!(
+        cluster_control_command_v2::OP_ACTIVATE_FEATURE,
+        "activate-feature"
+    );
     assert_eq!(
         cluster_control_state::OP_READ_LINEARIZABLE,
         "read_linearizable"
     );
     assert_eq!(cluster_control_state::OP_READ_STALE, "read_stale");
+    assert_eq!(
+        cluster_control_state_v2::OP_READ_LINEARIZABLE,
+        "read_linearizable"
+    );
+    assert_eq!(cluster_control_state_v2::OP_READ_STALE, "read_stale");
+    assert_eq!(cluster_control_state_v2::OP_FEATURE_FLOOR, "feature-floor");
     assert_eq!(cluster_raft_rpc::OP_APPEND_ENTRIES, "append_entries");
     assert_eq!(cluster_raft_rpc::OP_INSTALL_SNAPSHOT, "install_snapshot");
     assert_eq!(cluster_raft_rpc::OP_VOTE, "vote");
@@ -524,7 +536,22 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 11);
+    assert_eq!(services.len(), 13);
+    let service_ids = services
+        .iter()
+        .map(|service| service.interface_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for interface_id in [
+        "cluster-control-command/v1",
+        "cluster-control-command/v2",
+        "cluster-control-state/v1",
+        "cluster-control-state/v2",
+    ] {
+        assert!(
+            service_ids.contains(interface_id),
+            "missing generated service declaration {interface_id}"
+        );
+    }
     let manifest = include_str!("../../cluster-plugin/plugin.toml");
     assert!(manifest.contains("cluster-worker-command/v1"));
     assert!(manifest.contains("cluster-attach-state/v1"));

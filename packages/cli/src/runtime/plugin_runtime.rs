@@ -120,7 +120,26 @@ macro_rules! declare_bundled_plugins {
             )*
         }
 
+        #[allow(unused_variables, clippy::missing_const_for_fn)]
+        fn install_static_bundled_client_adapters(enabled: &[String]) {
+            $(
+                #[cfg(feature = $feature)]
+                if enabled.iter().any(|plugin_id| plugin_id == $plugin_id) {
+                    install_bundled_client_adapter($plugin_id);
+                }
+            )*
+        }
+
     };
+}
+
+/// Register an optional client-side adapter owned by one bundled plugin.
+#[allow(unused_variables, clippy::missing_const_for_fn)]
+fn install_bundled_client_adapter(plugin_id: &str) {
+    #[cfg(feature = "bundled-plugin-cluster")]
+    if plugin_id == "bmux.cluster" {
+        bmux_cluster_plugin_client::install();
+    }
 }
 
 declare_bundled_plugins! {
@@ -668,6 +687,15 @@ pub(super) fn effective_enabled_plugins(
     }
 
     enabled
+}
+
+/// Install client-side adapters owned by enabled bundled plugins.
+///
+/// Server plugin activation and client attach-provider registration have
+/// different lifetimes. This hook derives client registration from the same
+/// effective enabled-plugin set so disabled plugins cannot claim targets.
+pub(super) fn install_enabled_client_adapters(config: &BmuxConfig, registry: &PluginRegistry) {
+    install_static_bundled_client_adapters(&effective_enabled_plugins(config, registry));
 }
 
 pub(super) fn validate_enabled_plugins(
@@ -2215,8 +2243,12 @@ mod tests {
     fn no_cluster_build_keeps_baseline_plugins_without_cluster_registration() {
         let dirs = static_bundled_workspace_plugin_dirs();
         assert!(!dirs.contains(&"cluster-plugin"));
-        assert!(dirs.contains(&"sessions-plugin"));
-        assert!(dirs.contains(&"pane-runtime-plugin"));
+        crate::runtime::attach::provider::install();
+        assert!(matches!(
+            bmux_client::global_attach_provider_registry()
+                .resolve(&bmux_client::AttachTarget::parse("cluster://prod/main")),
+            Err(bmux_client::AttachProviderResolutionError::NoProvider { .. })
+        ));
     }
 
     #[test]

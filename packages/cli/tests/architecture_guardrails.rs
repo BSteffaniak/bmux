@@ -46,6 +46,7 @@ fn assert_no_domain_markers(source: &str, context: &str) {
 fn assert_no_cluster_domain_markers(source: &str, context: &str) {
     let denied = [
         "bmux.cluster",
+        "bmux.cluster",
         "bmux.server_clusters",
         "cluster-query/v1",
         "cluster-command/v1",
@@ -95,7 +96,7 @@ fn assert_no_raw_host_kernel_coupling(source: &str, context: &str) {
     }
 }
 
-fn runtime_sources() -> [(&'static str, &'static str); 11] {
+fn runtime_sources() -> [(&'static str, &'static str); 12] {
     [
         (
             "packages/cli/src/runtime/mod.rs",
@@ -138,10 +139,28 @@ fn runtime_sources() -> [(&'static str, &'static str); 11] {
             include_str!("../src/runtime/attach/state.rs"),
         ),
         (
+            "packages/cli/src/runtime/attach/provider.rs",
+            include_str!("../src/runtime/attach/provider.rs"),
+        ),
+        (
             "packages/cli/src/runtime/terminal_protocol.rs",
             include_str!("../src/runtime/terminal_protocol.rs"),
         ),
     ]
+}
+
+#[test]
+fn cluster_attach_adapter_is_plugin_owned() {
+    let generic = include_str!("../src/runtime/attach/provider.rs");
+    assert_no_cluster_domain_markers(
+        production_section(generic),
+        "packages/cli/src/runtime/attach/provider.rs",
+    );
+
+    let adapter = include_str!("../../../plugins/cluster-plugin-client/src/lib.rs");
+    assert!(adapter.contains("cluster://<cluster>/<workspace>"));
+    assert!(adapter.contains("ClusterAttachProvider"));
+    assert!(adapter.contains("cluster_attach_state"));
 }
 
 #[test]

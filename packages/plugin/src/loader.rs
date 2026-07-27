@@ -806,7 +806,8 @@ fn load_static_service_provider_cached(
             details: "embedded manifest is not valid UTF-8".to_string(),
         })?;
     let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
-    let declaration = embedded_manifest.to_declaration()?;
+    let mut declaration = embedded_manifest.to_declaration()?;
+    declaration.merge_services((vtable.declared_services)()?)?;
     let synthetic = RegisteredPlugin {
         search_root: PathBuf::new(),
         manifest_path: PathBuf::new(),

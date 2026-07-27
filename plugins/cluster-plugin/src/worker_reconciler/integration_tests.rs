@@ -235,7 +235,7 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
         &issuer,
         cluster_id,
         &worker_identity,
-        "memory://worker",
+        "worker-a",
         capabilities(true),
         now,
     );
@@ -329,7 +329,7 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
     let launch_observed = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let worker: TestWorkerClient<_, _, UnusedRuntimeOps> = TestWorkerClient::new(
-        "memory://worker",
+        "worker-a",
         WorkerServiceHandle::new(crate::worker_runtime::WorkerRegistry::new(
             worker_member.node_id.clone(),
             runtime,

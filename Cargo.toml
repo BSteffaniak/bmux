@@ -69,6 +69,7 @@ members = [
     "plugins/clipboard-plugin",
     "plugins/cluster-plugin",
     "plugins/cluster-plugin-api",
+    "plugins/cluster-plugin-client",
     "plugins/connections-plugin",
     "plugins/connections-plugin-api",
     "plugins/command-palette-plugin",
@@ -209,6 +210,7 @@ bmux_clients_plugin_api              = { version = "0.0.1-alpha.1", default-feat
 bmux_clipboard_plugin                = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clipboard-plugin" }
 bmux_cluster_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin" }
 bmux_cluster_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-api" }
+bmux_cluster_plugin_client           = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-client" }
 bmux_command_palette_plugin          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/command-palette-plugin" }
 bmux_connections_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin" }
 bmux_connections_plugin_api          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin-api" }

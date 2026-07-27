@@ -11,9 +11,13 @@ Federated attach must compose one native workspace from control metadata and ter
 
 ### Attach adapter ownership
 
-The federated attach adapter lives in `cluster-plugin` as a plugin-owned provider of the existing generic attach contract. It may use private helper modules and generated `cluster-plugin-api` clients. If native rendering integration later requires a paired renderer artifact, that artifact remains an implementation detail of the cluster plugin and does not own policy or stable transport envelopes.
+The federated attach adapter is a plugin-owned client artifact paired with `cluster-plugin`; the current implementation lives in `plugins/cluster-plugin-client`. It registers a provider of the existing generic attach contract only when `bmux.cluster` is bundled and enabled. It may use private helper modules and generated `cluster-plugin-api` clients. Native rendering integration remains an implementation detail of this paired artifact and does not own server policy or stable transport envelopes.
 
 Core attach code receives only neutral provider snapshots, deltas, controls, resume state, and status. It does not parse `cluster://`, choose members, inspect placement, or understand executions.
+
+### View-local versus durable state
+
+Focus, zoom, and the selected logical window are client attach-view state. They are validated against the current scene/control revision but are not proposed through Raft. Workspace and window names, logical layout, pane lifecycle, placement, execution generation, availability, and restart policy are durable cluster control state and mutate only through typed, idempotent control commands. A later shared-view feature would require a separate versioned contract rather than silently making current attach-local controls durable.
 
 ### Worker output transport
 
@@ -31,6 +35,7 @@ Long-poll is the required first implementation because it composes with the exis
 ## Consequences
 
 - Cluster policy and URI handling stay out of core architecture.
+- View-local focus, zoom, and selected-window changes avoid unnecessary quorum writes while durable logical mutations remain authoritative.
 - The first implementation can prioritize correctness and bounded behavior without introducing a second transport stack.
 - Poll overhead may be higher than a mature multiplexed stream; performance budgets determine whether a later optional revision is justified.
 - Worker output and attach implementation can be tested using generated service clients and the synthetic generic attach-provider harness.
@@ -42,3 +47,7 @@ Long-poll is the required first implementation because it composes with the exis
 3. Slow-worker tests prove bounded polling fan-out, queues, retained output, and cancellation.
 4. Local and cluster attach providers coexist, and disabling the cluster plugin preserves baseline attach behavior.
 5. Any future streaming revision has explicit capability negotiation and behavioral parity tests with v1 long-poll.
+
+## Implementation location
+
+The accepted adapter is implemented in `plugins/cluster-plugin-client`; the generic endpoint connector is `AttachEndpointConnector` in `bmux_client`, with the CLI transport implementation in `packages/cli/src/connection.rs`. The core attach runtime never parses cluster targets or imports the cluster API.

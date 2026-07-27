@@ -70,6 +70,43 @@ fn valid_scheme(scheme: &str) -> bool {
 pub type AttachProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, AttachProviderError>> + Send + 'a>>;
 
+/// Future returned by a domain-neutral attach endpoint connector.
+pub type AttachEndpointConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BmuxClient, String>> + Send + 'a>>;
+
+/// Generic endpoint dialing supplied by the host attach runtime.
+///
+/// Providers choose endpoint candidates according to their own domain policy;
+/// this connector only establishes one opaque target and returns a normal bmux
+/// client. Targets may be host-configured aliases, direct endpoint labels, or
+/// plugin-defined bootstrap references understood by the host dialer.
+pub trait AttachEndpointConnector: fmt::Debug + Send + Sync + 'static {
+    /// Connect to one opaque endpoint target.
+    fn connect<'a>(
+        &'a self,
+        target: &'a str,
+        client_name: &'static str,
+    ) -> AttachEndpointConnectFuture<'a>;
+}
+
+/// Host capabilities supplied while opening one resolved provider target.
+pub struct AttachProviderOpenContext {
+    /// Existing one-server connection for providers that declare fallback use.
+    pub fallback_client: Option<BmuxClient>,
+    /// Generic endpoint dialer for providers that own candidate selection.
+    pub endpoint_connector: Option<Arc<dyn AttachEndpointConnector>>,
+}
+
+impl fmt::Debug for AttachProviderOpenContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachProviderOpenContext")
+            .field("has_fallback_client", &self.fallback_client.is_some())
+            .field("has_endpoint_connector", &self.endpoint_connector.is_some())
+            .finish()
+    }
+}
+
 /// Opaque provider resolution carried into attach opening.
 pub trait ResolvedAttachTarget: fmt::Debug + Send + Sync + 'static {
     /// Stable provider ID that produced this plan.
@@ -142,14 +179,14 @@ pub trait AttachProvider: fmt::Debug + Send + Sync + 'static {
     ) -> Result<Arc<dyn ResolvedAttachTarget>, AttachProviderError>;
 
     /// Open the resolved plan into the neutral client/session input consumed by
-    /// the current attach runtime. `fallback_client` is present only when
-    /// [`requires_fallback_client`](Self::requires_fallback_client) returned
-    /// `true`.
+    /// the current attach runtime. The context supplies only generic host
+    /// capabilities: an optional legacy fallback client and an optional opaque
+    /// endpoint connector.
     fn open(
         &self,
         resolved: Arc<dyn ResolvedAttachTarget>,
         resume: Option<crate::AttachResumeState>,
-        fallback_client: Option<BmuxClient>,
+        context: AttachProviderOpenContext,
     ) -> AttachProviderFuture<'_, AttachProviderSession>;
 }
 
@@ -391,7 +428,7 @@ mod tests {
             &self,
             _resolved: Arc<dyn ResolvedAttachTarget>,
             _resume: Option<crate::AttachResumeState>,
-            _fallback_client: Option<BmuxClient>,
+            _context: AttachProviderOpenContext,
         ) -> AttachProviderFuture<'_, AttachProviderSession> {
             Box::pin(async move {
                 Err(AttachProviderError::OpenFailed {

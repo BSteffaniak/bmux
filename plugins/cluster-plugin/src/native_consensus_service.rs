@@ -50,33 +50,56 @@ fn invoke_control_read(context: &NativeServiceContext, linearizable: bool) -> Se
     if let Err(error) = bmux_plugin_sdk::decode_service_message::<()>(&context.request.payload) {
         return ServiceResponse::error("invalid_control_request", error.to_string());
     }
-    let result = active_node(context)
-        .map_err(|reason| {
+    let result: Result<
+        bmux_cluster_plugin_api::cluster_types::ControlStateView,
+        bmux_cluster_plugin_api::cluster_types::ControlServiceError,
+    > = (|| {
+        let identity = load_or_create_node_identity(context).map_err(|reason| {
             bmux_cluster_plugin_api::cluster_types::ControlServiceError::RuntimeUnavailable {
                 reason,
             }
-        })
-        .and_then(|node| {
-            if linearizable {
-                let handle = tokio::runtime::Handle::try_current().map_err(|error| {
-                    bmux_cluster_plugin_api::cluster_types::ControlServiceError::RuntimeUnavailable {
-                        reason: error.to_string(),
-                    }
-                })?;
-                tokio::task::block_in_place(|| handle.block_on(node.read_linearizable_view()))
-            } else {
-                node.read_stale_view()
+        })?;
+        let handle = consensus_network::ControlServiceHandle::new(
+            Arc::new(context.clone()),
+            *identity.node_id(),
+            consensus_network::global_consensus_nodes(),
+        );
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            bmux_cluster_plugin_api::cluster_types::ControlServiceError::RuntimeUnavailable {
+                reason: error.to_string(),
             }
-        });
+        })?;
+        tokio::task::block_in_place(|| {
+            if linearizable {
+                runtime.block_on(
+                    bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService::read_linearizable(
+                        &handle,
+                    ),
+                )
+            } else {
+                runtime.block_on(
+                    bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService::read_stale(
+                        &handle,
+                    ),
+                )
+            }
+        })
+    })();
     typed_result(&result)
 }
 
 fn invoke_raft_rpc(context: &NativeServiceContext, operation: &str) -> ServiceResponse {
     service_result((|| {
-        let request = bmux_plugin_sdk::decode_service_message::<
-            bmux_cluster_plugin_api::cluster_types::RaftRpcRequest,
+        let request = match bmux_plugin_sdk::decode_service_message::<
+            bmux_cluster_plugin_api::cluster_raft_rpc::client::AppendEntriesRequest,
         >(&context.request.payload)
-        .map_err(|error| error.to_string())?;
+        {
+            Ok(request) => request.request,
+            Err(_) => bmux_plugin_sdk::decode_service_message::<
+                bmux_cluster_plugin_api::cluster_types::RaftRpcRequest,
+            >(&context.request.payload)
+            .map_err(|error| error.to_string())?,
+        };
         let identity = load_or_create_node_identity(context)?;
         let handle = consensus_network::RaftRpcServiceHandle::new(
             Arc::new(context.clone()),

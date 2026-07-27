@@ -13,10 +13,12 @@ pub const NODE_IDENTITY_STORAGE_KEY: &str = "cluster.identity.node.v1";
 
 pub const MEMBERSHIP_STATE_STORAGE_KEY: &str = "cluster.membership.state.v1";
 pub const PENDING_LEAVE_STORAGE_KEY: &str = "cluster.membership.pending_leave.v1";
+pub const PENDING_JOIN_STORAGE_KEY: &str = "cluster.membership.pending_join.v1";
 const PEER_AUTH_STATE_STORAGE_KEY: &str = "cluster.peer_auth.state.v1";
 const PEER_AUTH_PROTOCOL_VERSION: u16 = 1;
 const PEER_AUTH_CHALLENGE_TTL_MS: u64 = 30_000;
 const CREDENTIAL_ROTATION_TTL_MS: u64 = 30_000;
+const MAX_ACCEPTED_ROTATIONS: usize = 1_024;
 const MAX_PEER_AUTH_CLOCK_SKEW_MS: u64 = 5_000;
 const MAX_PEER_AUTH_TRACKED_ENTRIES: usize = 1_024;
 const DEFAULT_ENROLLMENT_TTL_MS: u64 = 10 * 60 * 1_000;
@@ -309,6 +311,8 @@ pub struct MembershipState {
     issuer_endpoint: Option<String>,
     pub members: BTreeMap<String, ClusterMember>,
     enrollment_tokens: BTreeMap<String, StoredEnrollment>,
+    #[serde(default)]
+    accepted_rotations: BTreeMap<String, StoredCredentialRotation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +323,12 @@ struct StoredEnrollment {
     consumed_by: Option<String>,
     #[serde(default)]
     revoked_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredCredentialRotation {
+    request: CredentialRotationRequest,
+    member: ClusterMember,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +401,16 @@ struct PendingLeave {
     node: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingJoin {
+    cluster_id: String,
+    issuer_node_id: String,
+    issuer_credential_serial: String,
+    local_node_id: String,
+    local_credential_serial: String,
+    expires_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PeerAuthState {
     version: u16,
@@ -436,10 +456,40 @@ pub fn adopt_join_result(
             .map(|member| (member.node_id.clone(), member))
             .collect(),
         enrollment_tokens: BTreeMap::new(),
+        accepted_rotations: BTreeMap::new(),
     };
     store_membership_state(caller, &state)?;
     store_cluster_id(caller, cluster_id)?;
+    ensure_pending_join_record(caller, &token, &local_identity, &state)?;
     Ok(request.enrollment_result.clone())
+}
+
+fn ensure_pending_join_record(
+    caller: &impl ClusterRuntimeOps,
+    token: &SignedEnrollmentToken,
+    local_identity: &NodeIdentity,
+    state: &MembershipState,
+) -> Result<(), String> {
+    let local_member = state
+        .members
+        .get(&local_identity.node_id().to_string())
+        .ok_or_else(|| "join result omits the local member".to_string())?;
+    let issuer_member = state
+        .members
+        .get(&token.claims.issuer_node_id)
+        .ok_or_else(|| "join result omits the issuer member".to_string())?;
+    store_identity_record(
+        caller,
+        PENDING_JOIN_STORAGE_KEY,
+        &PendingJoin {
+            cluster_id: state.cluster_id.clone(),
+            issuer_node_id: issuer_member.node_id.clone(),
+            issuer_credential_serial: issuer_member.credential_serial.clone(),
+            local_node_id: local_member.node_id.clone(),
+            local_credential_serial: local_member.credential_serial.clone(),
+            expires_at_unix_ms: token.claims.expires_at_unix_ms,
+        },
+    )
 }
 
 fn existing_join_result(
@@ -452,6 +502,7 @@ fn existing_join_result(
         return Err("this node already belongs to a different cluster".to_string());
     }
     let state = require_membership_state(caller, cluster_id)?;
+    ensure_pending_join_record(caller, token, identity, &state)?;
     let member = state
         .members
         .get(&identity.node_id().to_string())
@@ -676,7 +727,8 @@ fn clear_identity_record(caller: &impl ClusterRuntimeOps, key: &str) -> Result<(
 
 fn clear_local_cluster_membership(caller: &impl ClusterRuntimeOps) -> Result<(), String> {
     clear_identity_record(caller, CLUSTER_ID_STORAGE_KEY)?;
-    clear_identity_record(caller, MEMBERSHIP_STATE_STORAGE_KEY)
+    clear_identity_record(caller, MEMBERSHIP_STATE_STORAGE_KEY)?;
+    clear_identity_record(caller, PENDING_JOIN_STORAGE_KEY)
 }
 
 pub fn canonical_leave_claims(claims: &LeaveClaims) -> Result<Vec<u8>, String> {
@@ -742,19 +794,19 @@ pub fn canonical_peer_proof(proof: &PeerAuthProof) -> Result<Vec<u8>, String> {
     .map_err(|error| format!("failed encoding peer authentication proof: {error}"))
 }
 
-pub fn create_peer_auth_challenge(
+pub fn create_peer_auth_challenge_for_members(
     caller: &impl ClusterRuntimeOps,
     request: &ClusterPeerChallengeRequest,
+    members: &[ClusterMember],
 ) -> Result<PeerAuthChallenge, String> {
     let claimant_node_id = request.claimant_node_id.parse::<NodeId>()?.to_string();
     let cluster_id = load_cluster_id(caller)?
         .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
     let identity = load_node_identity(caller)?
         .ok_or_else(|| "peer authentication requires a local node identity".to_string())?;
-    let membership = require_membership_state(caller, cluster_id)?;
     let verifier =
-        active_valid_member(&membership, &identity.node_id().to_string(), now_unix_ms())?;
-    active_valid_member(&membership, &claimant_node_id, now_unix_ms())?;
+        active_valid_member_slice(members, &identity.node_id().to_string(), now_unix_ms())?;
+    active_valid_member_slice(members, &claimant_node_id, now_unix_ms())?;
     let now = now_unix_ms();
     let mut challenge = PeerAuthChallenge {
         protocol_version: PEER_AUTH_PROTOCOL_VERSION,
@@ -785,6 +837,21 @@ pub fn create_peer_auth_challenge(
     Ok(challenge)
 }
 
+#[cfg(test)]
+pub fn create_peer_auth_challenge(
+    caller: &impl ClusterRuntimeOps,
+    request: &ClusterPeerChallengeRequest,
+) -> Result<PeerAuthChallenge, String> {
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
+    let membership = require_membership_state(caller, cluster_id)?;
+    create_peer_auth_challenge_for_members(
+        caller,
+        request,
+        &membership.members.into_values().collect::<Vec<_>>(),
+    )
+}
+
 pub fn create_peer_auth_proof(
     caller: &impl ClusterRuntimeOps,
     challenge: PeerAuthChallenge,
@@ -798,7 +865,8 @@ pub fn create_peer_auth_proof(
     let claimant = active_valid_member(&membership, &identity.node_id().to_string(), now)?;
     validate_peer_auth_challenge(
         &challenge,
-        &membership,
+        &membership.cluster_id,
+        &membership.members.values().cloned().collect::<Vec<_>>(),
         &identity.node_id().to_string(),
         now,
     )?;
@@ -830,12 +898,20 @@ pub fn authenticate_peer_proof(
     caller: &impl ClusterRuntimeOps,
     proof: PeerAuthProof,
 ) -> Result<AuthenticatedPeer, String> {
-    authenticate_peer(caller, &ClusterPeerAuthenticateRequest { proof })
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
+    let membership = require_membership_state(caller, cluster_id)?;
+    authenticate_peer_for_members(
+        caller,
+        &ClusterPeerAuthenticateRequest { proof },
+        &membership.members.into_values().collect::<Vec<_>>(),
+    )
 }
 
-pub fn authenticate_peer(
+pub fn authenticate_peer_for_members(
     caller: &impl ClusterRuntimeOps,
     request: &ClusterPeerAuthenticateRequest,
+    members: &[ClusterMember],
 ) -> Result<AuthenticatedPeer, String> {
     let proof = &request.proof;
     let now = now_unix_ms();
@@ -843,15 +919,20 @@ pub fn authenticate_peer(
         .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
     let identity = load_node_identity(caller)?
         .ok_or_else(|| "peer authentication requires a local node identity".to_string())?;
-    let membership = require_membership_state(caller, cluster_id)?;
-    validate_peer_auth_challenge(&proof.challenge, &membership, &proof.claimant_node_id, now)?;
+    validate_peer_auth_challenge(
+        &proof.challenge,
+        &cluster_id.to_string(),
+        members,
+        &proof.claimant_node_id,
+        now,
+    )?;
     if proof.challenge.verifier_node_id != identity.node_id().to_string() {
         return Err("peer authentication challenge targets a different verifier".to_string());
     }
     if proof.challenge.audience_node_id != proof.claimant_node_id {
         return Err("peer authentication proof has the wrong audience".to_string());
     }
-    let claimant = active_valid_member(&membership, &proof.claimant_node_id, now)?;
+    let claimant = active_valid_member_slice(members, &proof.claimant_node_id, now)?;
     if proof.claimant_credential_serial != claimant.credential_serial {
         return Err("peer authentication proof uses a stale claimant credential".to_string());
     }
@@ -895,16 +976,32 @@ pub fn authenticate_peer(
     })
 }
 
+#[cfg(test)]
+pub fn authenticate_peer(
+    caller: &impl ClusterRuntimeOps,
+    request: &ClusterPeerAuthenticateRequest,
+) -> Result<AuthenticatedPeer, String> {
+    let cluster_id = load_cluster_id(caller)?
+        .ok_or_else(|| "peer authentication requires initialized cluster membership".to_string())?;
+    let membership = require_membership_state(caller, cluster_id)?;
+    authenticate_peer_for_members(
+        caller,
+        request,
+        &membership.members.into_values().collect::<Vec<_>>(),
+    )
+}
+
 fn validate_peer_auth_challenge(
     challenge: &PeerAuthChallenge,
-    membership: &MembershipState,
+    cluster_id: &str,
+    members: &[ClusterMember],
     expected_audience: &str,
     now: u64,
 ) -> Result<(), String> {
     if challenge.protocol_version != PEER_AUTH_PROTOCOL_VERSION {
         return Err("unsupported peer authentication protocol version".to_string());
     }
-    if challenge.cluster_id != membership.cluster_id {
+    if challenge.cluster_id != cluster_id {
         return Err("peer authentication challenge belongs to a different cluster".to_string());
     }
     if challenge.audience_node_id != expected_audience {
@@ -921,7 +1018,7 @@ fn validate_peer_auth_challenge(
     {
         return Err("peer authentication challenge is expired or has invalid validity".to_string());
     }
-    let verifier = active_valid_member(membership, &challenge.verifier_node_id, now)?;
+    let verifier = active_valid_member_slice(members, &challenge.verifier_node_id, now)?;
     if verifier.credential_serial != challenge.verifier_credential_serial {
         return Err("peer authentication challenge uses a stale verifier credential".to_string());
     }
@@ -938,6 +1035,18 @@ fn validate_peer_auth_challenge(
         .map_err(|_| "peer authentication challenge signature verification failed".to_string())
 }
 
+fn active_valid_member_slice<'a>(
+    members: &'a [ClusterMember],
+    node_id: &str,
+    now: u64,
+) -> Result<&'a ClusterMember, String> {
+    let member = members
+        .iter()
+        .find(|member| member.node_id == node_id)
+        .ok_or_else(|| "peer is not a cluster member".to_string())?;
+    validate_active_member(member, now)
+}
+
 fn active_valid_member<'a>(
     membership: &'a MembershipState,
     node_id: &str,
@@ -947,6 +1056,10 @@ fn active_valid_member<'a>(
         .members
         .get(node_id)
         .ok_or_else(|| "peer is not a cluster member".to_string())?;
+    validate_active_member(member, now)
+}
+
+fn validate_active_member(member: &ClusterMember, now: u64) -> Result<&ClusterMember, String> {
     if member.state != ClusterMemberState::Active {
         return Err("peer membership is not active".to_string());
     }
@@ -1109,6 +1222,14 @@ pub fn verify_membership_credential(
     if issued_at_unix_ms > now_unix_ms || issued_at_unix_ms >= expires_at_unix_ms {
         return Err("membership credential validity interval is invalid".to_string());
     }
+    let member_node_id = member.node_id.parse::<NodeId>()?;
+    let member_public_key = member
+        .public_key
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| format!("invalid membership public key: {error}"))?;
+    if member_node_id.to_string() != format!("node:{member_public_key}") {
+        return Err("membership node ID does not match public key".to_string());
+    }
     let issuer_node_id = member.credential_issuer_node_id.parse::<NodeId>()?;
     let issuer_public_key = member
         .credential_issuer_public_key
@@ -1203,6 +1324,7 @@ pub fn initialize_cluster(
         issuer_endpoint: None,
         members: BTreeMap::new(),
         enrollment_tokens: BTreeMap::new(),
+        accepted_rotations: BTreeMap::new(),
     });
     if state.cluster_id != cluster_id.to_string() {
         return Err("membership state cluster ID does not match local cluster ID".to_string());
@@ -1373,6 +1495,27 @@ pub fn accept_credential_rotation(
         .ok_or_else(|| "local node identity is not initialized".to_string())?;
     let mut state = require_membership_state(caller, cluster_id)?;
     let now = now_unix_ms();
+    state
+        .accepted_rotations
+        .retain(|_, stored| stored.request.expires_at_unix_ms >= now);
+    if let Some(stored) = state.accepted_rotations.get(&request.nonce) {
+        if stored.request == *request {
+            return Ok(MemberCredentialResult {
+                member: stored.member.clone(),
+            });
+        }
+        return Err("credential rotation nonce was reused with different arguments".to_string());
+    }
+    while state.accepted_rotations.len() >= MAX_ACCEPTED_ROTATIONS {
+        let oldest = state
+            .accepted_rotations
+            .iter()
+            .min_by_key(|(_, stored)| stored.request.expires_at_unix_ms)
+            .map(|(nonce, _)| nonce.clone())
+            .ok_or_else(|| "accepted credential rotation bound is inconsistent".to_string())?;
+        state.accepted_rotations.remove(&oldest);
+    }
+    let now = now_unix_ms();
     let current = active_valid_member(&state, &request.node_id, now)?.clone();
     if current.credential_serial != request.current_serial {
         return Err("credential rotation request uses a stale credential".to_string());
@@ -1422,6 +1565,13 @@ pub fn accept_credential_rotation(
     state
         .members
         .insert(rotated.node_id.clone(), rotated.clone());
+    state.accepted_rotations.insert(
+        request.nonce.clone(),
+        StoredCredentialRotation {
+            request: request.clone(),
+            member: rotated.clone(),
+        },
+    );
     store_membership_state(caller, &state)?;
     Ok(MemberCredentialResult { member: rotated })
 }
@@ -1509,11 +1659,29 @@ fn advertise_local_endpoint(
     node_id: &str,
     endpoint: &str,
 ) -> Result<(), String> {
+    let endpoint = validate_advertised_endpoint(endpoint)?;
+    if state.members.values().any(|member| {
+        member.node_id != node_id
+            && member.state == ClusterMemberState::Active
+            && member.endpoint.as_deref() == Some(endpoint)
+    }) {
+        return Err(format!(
+            "advertised endpoint '{endpoint}' is already assigned to another active member"
+        ));
+    }
     let member = state
         .members
         .get_mut(node_id)
         .ok_or_else(|| "local membership record is missing".to_string())?;
     if member.endpoint.as_deref() != Some(endpoint) {
+        if member.endpoint.is_some()
+            && member.state == ClusterMemberState::Active
+            && member.capabilities.consensus_role == ClusterConsensusRole::Voter
+        {
+            return Err(format!(
+                "active consensus voter {node_id} endpoint cannot change without an explicit membership transition"
+            ));
+        }
         member.endpoint = Some(endpoint.to_string());
         member.updated_at_unix_ms = now_unix_ms();
     }
@@ -1533,67 +1701,61 @@ fn require_local_voter(
     Ok(identity)
 }
 
-pub fn membership_status(caller: &impl ClusterRuntimeOps) -> Result<MembershipStatus, String> {
+pub fn membership_status_for_members(
+    caller: &impl ClusterRuntimeOps,
+    members: &[ClusterMember],
+) -> Result<MembershipStatus, String> {
     let identity = current_node_identity(caller)?;
     let now = now_unix_ms();
-    let members = load_membership_state(caller)?
-        .map(|state| {
-            state
-                .members
-                .into_values()
-                .map(|member| {
-                    let local = member.node_id == identity.node_id;
-                    let compatible = negotiate_protocol(
-                        &current_protocol_offer(),
-                        &protocol_for_member(&member),
-                    )
-                    .is_ok();
-                    let trust_error = verify_membership_credential(&member, now).err();
-                    let trusted = trust_error.is_none();
-                    let (liveness, reachable, reason) =
-                        if member.state != ClusterMemberState::Active {
-                            (
-                                MemberLivenessState::Inactive,
-                                Some(false),
-                                Some(format!("membership state is {:?}", member.state)),
-                            )
-                        } else if !trusted {
-                            (MemberLivenessState::Untrusted, Some(false), trust_error)
-                        } else if !compatible {
-                            (
-                                MemberLivenessState::Incompatible,
-                                None,
-                                Some("member protocol is incompatible with this node".to_string()),
-                            )
-                        } else if local {
-                            (MemberLivenessState::Local, Some(true), None)
-                        } else if member.endpoint.is_some() {
-                            (
-                                MemberLivenessState::Unchecked,
-                                None,
-                                Some("reachability has not been probed".to_string()),
-                            )
-                        } else {
-                            (
-                                MemberLivenessState::Unchecked,
-                                None,
-                                Some("member has no advertised endpoint".to_string()),
-                            )
-                        };
-                    MemberStatus {
-                        member,
-                        liveness,
-                        reachable,
-                        compatible,
-                        trusted,
-                        authenticated_at_unix_ms: None,
-                        observed_at_unix_ms: now,
-                        reason,
-                    }
-                })
-                .collect()
+    let members = members
+        .iter()
+        .map(|member| {
+            let local = member.node_id == identity.node_id;
+            let compatible =
+                negotiate_protocol(&current_protocol_offer(), &protocol_for_member(member)).is_ok();
+            let trust_error = verify_membership_credential(member, now).err();
+            let trusted = trust_error.is_none();
+            let (liveness, reachable, reason) = if member.state != ClusterMemberState::Active {
+                (
+                    MemberLivenessState::Inactive,
+                    Some(false),
+                    Some(format!("membership state is {:?}", member.state)),
+                )
+            } else if !trusted {
+                (MemberLivenessState::Untrusted, Some(false), trust_error)
+            } else if !compatible {
+                (
+                    MemberLivenessState::Incompatible,
+                    None,
+                    Some("member protocol is incompatible with this node".to_string()),
+                )
+            } else if local {
+                (MemberLivenessState::Local, Some(true), None)
+            } else if member.endpoint.is_some() {
+                (
+                    MemberLivenessState::Unchecked,
+                    None,
+                    Some("reachability has not been probed".to_string()),
+                )
+            } else {
+                (
+                    MemberLivenessState::Unchecked,
+                    None,
+                    Some("member has no advertised endpoint".to_string()),
+                )
+            };
+            MemberStatus {
+                member: member.clone(),
+                liveness,
+                reachable,
+                compatible,
+                trusted,
+                authenticated_at_unix_ms: None,
+                observed_at_unix_ms: now,
+                reason,
+            }
         })
-        .unwrap_or_default();
+        .collect();
     Ok(MembershipStatus { identity, members })
 }
 
@@ -1609,6 +1771,134 @@ fn protocol_for_member(member: &ClusterMember) -> ClusterProtocolOffer {
     }
 }
 
+const MAX_ADVERTISED_ENDPOINT_LEN: usize = 512;
+
+/// Validates one canonical cluster-wide advertised endpoint.
+///
+/// Endpoints are either stable aliases or self-contained supported transport
+/// URIs. Local targets and path/query/fragment-bearing aliases are forbidden
+/// because every member must resolve the same identity-bound target.
+///
+/// # Errors
+///
+/// Returns an actionable validation failure for empty, oversized, malformed,
+/// local-only, or unsupported endpoint references.
+pub fn validate_advertised_endpoint(endpoint: &str) -> Result<&str, String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err("advertised endpoint cannot be empty".to_string());
+    }
+    if endpoint.len() > MAX_ADVERTISED_ENDPOINT_LEN {
+        return Err(format!(
+            "advertised endpoint exceeds {MAX_ADVERTISED_ENDPOINT_LEN} bytes"
+        ));
+    }
+    if endpoint == "local" || endpoint.starts_with("local://") {
+        return Err("advertised endpoint cannot use a node-local target".to_string());
+    }
+    if endpoint.chars().any(char::is_whitespace) {
+        return Err("advertised endpoint cannot contain whitespace".to_string());
+    }
+    if let Some((scheme, reference)) = endpoint.split_once("://") {
+        match scheme {
+            "tls" | "https" => validate_network_authority(endpoint, reference, false)?,
+            "ssh" => validate_network_authority(endpoint, reference, true)?,
+            "iroh" => validate_iroh_endpoint(endpoint, reference)?,
+            _ => return Err(format!("unsupported advertised endpoint scheme '{scheme}'")),
+        }
+        return Ok(endpoint);
+    }
+    if endpoint.contains(['/', '?', '#'])
+        || !endpoint.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(
+            "advertised endpoint alias may contain only letters, numbers, '-', '_', and '.'"
+                .to_string(),
+        );
+    }
+    Ok(endpoint)
+}
+
+fn validate_network_authority(
+    endpoint: &str,
+    reference: &str,
+    allow_user: bool,
+) -> Result<(), String> {
+    if reference.is_empty() || reference.contains(['/', '?', '#']) {
+        return Err("advertised network endpoint requires only a non-empty authority".to_string());
+    }
+    let host_port = if allow_user {
+        reference
+            .rsplit_once('@')
+            .map_or(reference, |(_, value)| value)
+    } else {
+        reference
+    };
+    if host_port.is_empty() {
+        return Err("advertised network endpoint requires a host".to_string());
+    }
+    if host_port.starts_with('[') {
+        let end = host_port
+            .find(']')
+            .ok_or_else(|| "advertised endpoint has an invalid bracketed host".to_string())?;
+        if host_port[1..end].parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("advertised endpoint has an invalid IPv6 host".to_string());
+        }
+        let suffix = &host_port[end + 1..];
+        if !suffix.is_empty() {
+            validate_endpoint_port(endpoint, suffix.strip_prefix(':'))?;
+        }
+        return Ok(());
+    }
+    if host_port.matches(':').count() > 1 {
+        return Err("advertised IPv6 endpoint must use bracket notation".to_string());
+    }
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .map_or((host_port, None), |(host, port)| (host, Some(port)));
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+    {
+        return Err("advertised endpoint has an invalid host".to_string());
+    }
+    if let Some(port) = port {
+        validate_endpoint_port(endpoint, Some(port))?;
+    }
+    Ok(())
+}
+
+fn validate_endpoint_port(endpoint: &str, port: Option<&str>) -> Result<(), String> {
+    let port =
+        port.ok_or_else(|| format!("advertised endpoint '{endpoint}' has an invalid port"))?;
+    if port
+        .parse::<u16>()
+        .ok()
+        .as_ref()
+        .is_none_or(|port| *port == 0)
+    {
+        return Err(format!(
+            "advertised endpoint '{endpoint}' has an invalid port"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_iroh_endpoint(endpoint: &str, reference: &str) -> Result<(), String> {
+    let endpoint_id = reference
+        .split_once('?')
+        .map_or(reference, |(endpoint_id, _)| endpoint_id);
+    endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map(|_| ())
+        .map_err(|error| {
+            format!("advertised Iroh endpoint '{endpoint}' has an invalid ID: {error}")
+        })
+}
+
 pub fn create_enrollment_token(
     caller: &impl ClusterRuntimeOps,
     request_id: &str,
@@ -1620,10 +1910,7 @@ pub fn create_enrollment_token(
     if request_id.is_empty() || request_id.len() > 128 {
         return Err("enrollment request_id must contain 1..=128 characters".to_string());
     }
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err("enrollment endpoint cannot be empty".to_string());
-    }
+    let endpoint = validate_advertised_endpoint(endpoint)?;
     let ttl_ms = ttl_ms.unwrap_or(DEFAULT_ENROLLMENT_TTL_MS);
     if ttl_ms == 0 || ttl_ms > MAX_ENROLLMENT_TTL_MS {
         return Err(format!(
@@ -1716,6 +2003,7 @@ pub fn create_enrollment_token(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn redeem_enrollment(
     caller: &impl ClusterRuntimeOps,
     request: &ClusterCommandRedeemEnrollmentRequest,
@@ -1728,6 +2016,20 @@ pub fn redeem_enrollment(
         .map_err(|error| format!("invalid joining public key: {error}"))?;
     if request_node_id.to_string() != format!("node:{request_public_key}") {
         return Err("joining node ID does not match joining public key".to_string());
+    }
+    let canonical_request_endpoint = request
+        .endpoint
+        .as_deref()
+        .map(validate_advertised_endpoint)
+        .transpose()?
+        .map(ToString::to_string);
+    if token.claims.capabilities.consensus_role == ClusterConsensusRole::Voter
+        && canonical_request_endpoint.is_none()
+    {
+        return Err("joining voter requires an advertised endpoint".to_string());
+    }
+    if request.endpoint != canonical_request_endpoint {
+        return Err("joining endpoint must already be in canonical trimmed form".to_string());
     }
     verify_enrollment_possession(&token, request, request_public_key)?;
     let negotiated_protocol = negotiate_protocol(&current_protocol_offer(), &request.protocol)?;
@@ -1787,6 +2089,14 @@ pub fn redeem_enrollment(
             members: state.members.into_values().collect(),
         });
     }
+    if state.members.values().any(|existing| {
+        existing.node_id != request.node_id
+            && existing.state == ClusterMemberState::Active
+            && existing.endpoint == canonical_request_endpoint
+            && canonical_request_endpoint.is_some()
+    }) {
+        return Err("joining endpoint is already assigned to another active member".to_string());
+    }
     stored.consumed_by = Some(request.node_id.clone());
     let now = now_unix_ms();
     let joined_at = state
@@ -1802,7 +2112,7 @@ pub fn redeem_enrollment(
         negotiated_protocol,
         now,
     )?;
-    member.endpoint.clone_from(&request.endpoint);
+    member.endpoint = canonical_request_endpoint;
     member.joined_at_unix_ms = joined_at;
     state
         .members
@@ -1870,9 +2180,7 @@ pub fn configure_local_consensus_endpoint(
     let Some(endpoint) = endpoint.map(str::trim) else {
         return Ok(());
     };
-    if endpoint.is_empty() {
-        return Err("configured consensus_endpoint cannot be empty".to_string());
-    }
+    let endpoint = validate_advertised_endpoint(endpoint)?;
     let Some(cluster_id) = load_cluster_id(caller)? else {
         return Ok(());
     };
@@ -1920,6 +2228,57 @@ pub fn local_consensus_member(
         .count()
         == 1;
     Ok(Some((cluster_id, identity, member, single_member)))
+}
+
+pub fn clear_pending_join(caller: &impl ClusterRuntimeOps) -> Result<(), String> {
+    clear_identity_record(caller, PENDING_JOIN_STORAGE_KEY)
+}
+
+pub fn peer_authentication_members(
+    caller: &impl ClusterRuntimeOps,
+    committed: Vec<ClusterMember>,
+    local_node_id: &str,
+    requested_node_id: &str,
+) -> Result<Vec<ClusterMember>, String> {
+    let state = load_membership_state(caller)?
+        .ok_or_else(|| "cluster membership is not initialized".to_string())?;
+    let pending = load_identity_record(caller, PENDING_JOIN_STORAGE_KEY)?
+        .map(|value| {
+            serde_json::from_slice::<PendingJoin>(&value)
+                .map_err(|error| format!("pending join state is corrupt: {error}"))
+        })
+        .transpose()?;
+    let mut members = committed;
+    for node_id in [local_node_id, requested_node_id] {
+        if members.iter().any(|member| member.node_id == node_id) {
+            continue;
+        }
+        let allowed = pending.as_ref().is_some_and(|pending| {
+            pending.expires_at_unix_ms >= now_unix_ms()
+                && pending.cluster_id == state.cluster_id
+                && ((pending.local_node_id == node_id
+                    && state.members.get(node_id).is_some_and(|member| {
+                        member.credential_serial == pending.local_credential_serial
+                    }))
+                    || (pending.issuer_node_id == node_id
+                        && state.members.get(node_id).is_some_and(|member| {
+                            member.credential_serial == pending.issuer_credential_serial
+                        })))
+        }) || state.enrollment_tokens.values().any(|enrollment| {
+            enrollment.consumed_by.as_deref() == Some(node_id)
+                && enrollment.revoked_at_unix_ms.is_none()
+        });
+        if !allowed {
+            return Err("peer is not committed or authorized by a pending join".to_string());
+        }
+        let member = state
+            .members
+            .get(node_id)
+            .ok_or_else(|| "pending join member is missing from the signed cache".to_string())?;
+        validate_active_member(member, now_unix_ms())?;
+        members.push(member.clone());
+    }
+    Ok(members)
 }
 
 pub fn load_membership_state(

@@ -407,6 +407,7 @@ use super::state::{
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
     AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
 };
+use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
     attach_pane_grid_delta_state_streaming, attach_pane_grid_snapshot_state_streaming,
@@ -2556,7 +2557,15 @@ pub async fn run_session_attach_with_client(
     kernel_client_factory: Option<KernelClientFactory>,
 ) -> Result<AttachRunOutcome> {
     let provider = super::provider::resolve(target)?;
-    let session = provider.open(None, Some(client)).await?;
+    let session = provider
+        .open(
+            None,
+            bmux_client::AttachProviderOpenContext {
+                fallback_client: Some(client),
+                endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+            },
+        )
+        .await?;
     run_session_attach_with_provider_session(session, target, follow, global, kernel_client_factory)
         .await
 }

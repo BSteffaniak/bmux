@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Client-side native attach adapter for the bmux cluster plugin"
+edition     = { workspace = true }
+keywords    = ["bmux", "cluster", "plugin", "client"]
+license     = { workspace = true }
+name        = "bmux_cluster_plugin_client"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_attach_layout_protocol = { workspace = true }
+bmux_attach_pipeline        = { workspace = true }
+bmux_client                 = { workspace = true }
+bmux_cluster_plugin_api     = { workspace = true }
+bmux_keyboard               = { workspace = true }
+bmux_terminal_grid          = { workspace = true }
+serde_json                  = { workspace = true }
+sha2                        = { workspace = true }
+tokio                       = { workspace = true, features = ["time"] }
+uuid                        = { workspace = true, features = ["std"] }
+
+[features]
+default = []
+
+fail-on-warnings = [
+    "bmux_attach_layout_protocol/fail-on-warnings",
+    "bmux_attach_pipeline/fail-on-warnings",
+    "bmux_client/fail-on-warnings",
+    "bmux_cluster_plugin_api/fail-on-warnings",
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_terminal_grid/fail-on-warnings",
+]

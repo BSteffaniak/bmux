@@ -109,7 +109,7 @@ pub async fn peer_authentication_proof<C>(
     expected_remote_node_id: &str,
 ) -> Result<bmux_cluster_plugin_api::cluster_types::PeerAuthProof, PeerAuthenticationFailure>
 where
-    C: ServiceCaller + Sync + ?Sized,
+    C: ServiceCaller + Sync,
 {
     let mut remote = EndpointDispatchClient::new(caller, endpoint);
     let challenge = bmux_cluster_plugin_api::cluster_peer_auth::client::challenge(
@@ -118,19 +118,25 @@ where
     )
     .await
     .map_err(|error| {
+        tracing::warn!(%endpoint, %local_node_id, %expected_remote_node_id, %error, "remote peer challenge failed");
         PeerAuthenticationFailure::Unreachable(format!("remote peer challenge failed: {error}"))
     })?;
     if challenge.verifier_node_id != expected_remote_node_id {
+        tracing::warn!(
+            %endpoint,
+            %local_node_id,
+            %expected_remote_node_id,
+            actual_remote_node_id = %challenge.verifier_node_id,
+            "endpoint challenge was signed by an unexpected remote member"
+        );
         return Err(PeerAuthenticationFailure::Untrusted(
             "endpoint challenge was signed by an unexpected remote member".to_string(),
         ));
     }
-    let mut local = ServiceCallerDispatchClient::new(caller);
-    bmux_cluster_plugin_api::cluster_peer_auth::client::prove(&mut local, challenge)
-        .await
-        .map_err(|error| {
-            PeerAuthenticationFailure::Local(format!("local peer proof failed: {error}"))
-        })
+    crate::membership::create_peer_auth_proof(caller, challenge).map_err(|error| {
+        tracing::warn!(%endpoint, %local_node_id, %expected_remote_node_id, %error, "local peer proof failed");
+        PeerAuthenticationFailure::Local(format!("local peer proof failed: {error}"))
+    })
 }
 
 pub async fn mutually_authenticate_endpoint<C>(
@@ -140,7 +146,7 @@ pub async fn mutually_authenticate_endpoint<C>(
     expected_remote_node_id: &str,
 ) -> Result<AuthenticatedPeer, PeerAuthenticationFailure>
 where
-    C: ServiceCaller + Sync + ?Sized,
+    C: ServiceCaller + Sync,
 {
     let proof =
         peer_authentication_proof(caller, endpoint, local_node_id, expected_remote_node_id).await?;
@@ -166,7 +172,7 @@ pub async fn probe_member_status<C>(
     mut status: bmux_cluster_plugin_api::cluster_types::MemberStatus,
 ) -> bmux_cluster_plugin_api::cluster_types::MemberStatus
 where
-    C: ServiceCaller + Sync + ?Sized,
+    C: ServiceCaller + Sync,
 {
     use bmux_cluster_plugin_api::cluster_types::MemberLivenessState;
 

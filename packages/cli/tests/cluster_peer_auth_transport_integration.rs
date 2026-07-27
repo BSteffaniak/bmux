@@ -1,202 +1,16 @@
-use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+mod support;
+
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-
-fn bmux_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
-}
-
-struct TempDirGuard {
-    path: PathBuf,
-}
-
-impl TempDirGuard {
-    fn new(label: &str) -> Self {
-        let path = PathBuf::from("/tmp").join(format!("bmux-pa-{label}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-struct ServerEnv {
-    _root: TempDirGuard,
-    runtime_dir: PathBuf,
-    config_dir: PathBuf,
-    data_dir: PathBuf,
-    state_dir: PathBuf,
-    log_dir: PathBuf,
-    started: bool,
-    server_child: Option<std::process::Child>,
-    gateway_child: Option<std::process::Child>,
-}
-
-impl ServerEnv {
-    fn new(label: &str) -> Self {
-        let root = TempDirGuard::new(label);
-        let runtime_dir = root.path().join("runtime");
-        let config_dir = root.path().join("config");
-        let data_dir = root.path().join("data");
-        let state_dir = root.path().join("state");
-        let log_dir = root.path().join("logs");
-        for path in [&runtime_dir, &config_dir, &data_dir, &state_dir, &log_dir] {
-            std::fs::create_dir_all(path).expect("create isolated bmux directory");
-        }
-        Self {
-            _root: root,
-            runtime_dir,
-            config_dir,
-            data_dir,
-            state_dir,
-            log_dir,
-            started: false,
-            server_child: None,
-            gateway_child: None,
-        }
-    }
-
-    fn write_config(&self, contents: &str) {
-        std::fs::write(self.config_dir.join("bmux.toml"), contents)
-            .expect("write isolated bmux config");
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(bmux_binary());
-        command
-            .args(args)
-            .env("BMUX_RUNTIME_DIR", &self.runtime_dir)
-            .env("BMUX_CONFIG_DIR", &self.config_dir)
-            .env("BMUX_DATA_DIR", &self.data_dir)
-            .env("BMUX_STATE_DIR", &self.state_dir)
-            .env("BMUX_LOG_DIR", &self.log_dir);
-        command
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.command(args).output().expect("run bmux command")
-    }
-
-    fn start_iroh_gateway(&mut self) -> String {
-        let mut child = self
-            .command(&[
-                "server",
-                "gateway",
-                "--listen",
-                "127.0.0.1:0",
-                "--host",
-                "--host-mode",
-                "iroh",
-            ])
-            .env("BMUX_IROH_DIRECT_BIND", "127.0.0.1:0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn isolated direct iroh gateway");
-        let stdout = child.stdout.take().expect("capture iroh gateway stdout");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(url) = line.strip_prefix("connect URL: ") {
-                    let _ = sender.send(url.to_string());
-                    return;
-                }
-            }
-        });
-        let url = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("direct iroh gateway publishes connect URL");
-        self.gateway_child = Some(child);
-        url
-    }
-
-    fn start(&mut self) {
-        let child = self
-            .command(&["server", "start", "--foreground-internal"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn isolated server");
-        self.started = true;
-        self.server_child = Some(child);
-        for _ in 0..200 {
-            if self.run(&["server", "status"]).status.success() {
-                return;
-            }
-            let child = self
-                .server_child
-                .as_mut()
-                .expect("server child should be retained");
-            if let Some(status) = child.try_wait().expect("inspect isolated server") {
-                panic!(
-                    "isolated server exited before readiness with {status}; root={}",
-                    self._root.path().display(),
-                );
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!(
-            "isolated server did not become ready; root={}",
-            self._root.path().display()
-        );
-    }
-}
-
-impl Drop for ServerEnv {
-    fn drop(&mut self) {
-        if self.started {
-            let _ = self.run(&["server", "stop"]);
-        }
-        if let Some(child) = self.server_child.as_mut() {
-            let _ = child.wait();
-        }
-        if let Some(child) = self.gateway_child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-fn combined_output(output: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-fn assert_success(output: &Output, operation: &str) {
-    assert!(
-        output.status.success(),
-        "{operation} failed with {:?}: {}",
-        output.status.code(),
-        combined_output(output)
-    );
-}
-
-fn reserve_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve loopback port")
-        .local_addr()
-        .expect("read loopback address")
-        .port()
-}
+use support::{
+    ProcessGuard, ServerEnv, assert_success, bmux_binary, combined_output, generate_ed25519_key,
+    reserve_tcp_port,
+};
 
 fn create_enrollment_token(issuer: &ServerEnv, endpoint: &str) -> String {
-    let init = issuer.run(&["cluster", "init"]);
+    let init = issuer.run(&["cluster", "init", "--endpoint", endpoint]);
     assert_success(&init, "initialize issuer cluster");
     let enrollment = issuer.run(&[
         "cluster",
@@ -273,26 +87,6 @@ fn assert_join_and_leave(issuer: &ServerEnv, joiner: &ServerEnv, token: &str, ta
     );
 }
 
-struct ProcessGuard {
-    child: Child,
-}
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn generate_ed25519_key(path: &Path) {
-    let output = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-        .arg(path)
-        .output()
-        .expect("run ssh-keygen");
-    assert_success(&output, "generate SSH key");
-}
-
 #[test]
 fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
     if !Path::new("/usr/sbin/sshd").exists() {
@@ -303,7 +97,7 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
     let mut issuer = ServerEnv::new("ssh-issuer");
     issuer.write_config("");
     let mut joiner = ServerEnv::new("ssh-joiner");
-    let ssh_root = joiner._root.path().join("sshd");
+    let ssh_root = joiner.root().join("sshd");
     std::fs::create_dir_all(&ssh_root).expect("create SSH test root");
     let host_key = ssh_root.join("host-key");
     let client_key = ssh_root.join("client-key");
@@ -343,7 +137,7 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn isolated sshd");
-    let _sshd = ProcessGuard { child: sshd };
+    let _sshd = ProcessGuard::new(sshd);
     thread::sleep(Duration::from_millis(250));
 
     std::fs::write(
@@ -406,6 +200,201 @@ fn iroh_join_and_leave_require_real_mutual_peer_authentication() {
 
     let token = create_enrollment_token(&issuer, "issuer");
     assert_join_and_leave(&issuer, &joiner, &token, "issuer");
+}
+
+fn create_voter_enrollment_token(issuer: &ServerEnv, issuer_endpoint: &str) -> String {
+    let enrollment = issuer.run(&[
+        "cluster",
+        "enrollment-token",
+        "create",
+        "--endpoint",
+        issuer_endpoint,
+        "--role",
+        "voter",
+        "--worker",
+        "--ingress",
+    ]);
+    assert_success(&enrollment, "create voter enrollment token");
+    String::from_utf8(enrollment.stdout)
+        .expect("token output is UTF-8")
+        .lines()
+        .find(|line| line.starts_with("bmux-enroll-v1:"))
+        .expect("enrollment output contains token")
+        .to_string()
+}
+
+fn assert_success_with_server_logs(
+    output: &std::process::Output,
+    operation: &str,
+    nodes: &[&ServerEnv],
+) {
+    assert!(
+        output.status.success(),
+        "{operation} failed with {:?}: {}\nserver logs:\n{}",
+        output.status.code(),
+        combined_output(output),
+        nodes
+            .iter()
+            .map(|node| format!("root={}\n{}", node.root().display(), node.server_output()))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    );
+}
+
+fn join_voter(
+    issuer_node: &ServerEnv,
+    joiner: &ServerEnv,
+    token: &str,
+    issuer: &str,
+    endpoint: &str,
+) {
+    let join = joiner.run(&[
+        "cluster",
+        "join",
+        token,
+        "--issuer",
+        issuer,
+        "--endpoint",
+        endpoint,
+    ]);
+    assert_success_with_server_logs(
+        &join,
+        "join voter through authenticated endpoint",
+        &[issuer_node, joiner],
+    );
+    assert!(combined_output(&join).contains("joined cluster:"));
+
+    let retry = joiner.run(&[
+        "cluster",
+        "join",
+        token,
+        "--issuer",
+        issuer,
+        "--endpoint",
+        endpoint,
+    ]);
+    assert_success_with_server_logs(
+        &retry,
+        "retry voter join after an assumed lost success response",
+        &[issuer_node, joiner],
+    );
+    assert!(combined_output(&retry).contains("joined cluster:"));
+}
+
+fn tls_cluster_config(own_port: u16, ports: &[u16; 3]) -> String {
+    format!(
+        "[general]\nserver_timeout = 30000\n\n[server.gateway]\nenabled = true\nlisten = \"127.0.0.1:{own_port}\"\nquick = true\n\n[connections.tls_trust]\nmode = \"trust_new\"\n\n[connections.targets.node-a]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {}\nserver_name = \"localhost\"\nconnect_timeout_ms = 30000\nserver_start_mode = \"require_running\"\n\n[connections.targets.node-b]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {}\nserver_name = \"localhost\"\nconnect_timeout_ms = 30000\nserver_start_mode = \"require_running\"\n\n[connections.targets.node-c]\ntransport = \"tls\"\nhost = \"127.0.0.1\"\nport = {}\nserver_name = \"localhost\"\nconnect_timeout_ms = 30000\nserver_start_mode = \"require_running\"\n",
+        ports[0], ports[1], ports[2]
+    )
+}
+
+#[test]
+fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
+    let ports = [reserve_tcp_port(), reserve_tcp_port(), reserve_tcp_port()];
+    let mut harness =
+        support::ClusterProcessHarness::new(["three-voter-a", "three-voter-b", "three-voter-c"]);
+    for (index, port) in ports.iter().copied().enumerate() {
+        harness
+            .node(index)
+            .write_config(&tls_cluster_config(port, &ports));
+    }
+    harness.start_all();
+
+    let init = harness
+        .node(0)
+        .run(&["cluster", "init", "--endpoint", "node-a"]);
+    assert_success(&init, "initialize real three-voter cluster");
+    let token_b = create_voter_enrollment_token(harness.node(0), "node-a");
+    join_voter(
+        harness.node(0),
+        harness.node(1),
+        &token_b,
+        "node-a",
+        "node-b",
+    );
+    let token_c = create_voter_enrollment_token(harness.node(0), "node-a");
+    join_voter(
+        harness.node(0),
+        harness.node(2),
+        &token_c,
+        "node-a",
+        "node-c",
+    );
+
+    for index in 0..harness.len() {
+        let members = harness.node(index).run(&["cluster", "members"]);
+        assert_success(&members, "read replicated three-voter membership");
+        let output = combined_output(&members);
+        assert_eq!(
+            output.matches(" state=Active role=Voter ").count(),
+            3,
+            "unexpected membership on node {index}: {output}"
+        );
+    }
+
+    harness.node_mut(2).kill();
+    for index in 0..2 {
+        let members = harness.node(index).run(&["cluster", "members"]);
+        assert_success(&members, "read membership with one voter down");
+        assert_eq!(
+            combined_output(&members)
+                .matches(" state=Active role=Voter ")
+                .count(),
+            3
+        );
+    }
+    harness.node_mut(2).restart();
+    let recovered = harness.node(2).run(&["cluster", "members"]);
+    assert_success(&recovered, "read membership after voter restart");
+    assert_eq!(
+        combined_output(&recovered)
+            .matches(" state=Active role=Voter ")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn shared_process_harness_supports_three_isolated_lifecycles_and_log_capture() {
+    let mut harness =
+        support::ClusterProcessHarness::new(["lifecycle-a", "lifecycle-b", "lifecycle-c"]);
+    assert_eq!(harness.len(), 3);
+    assert!(!harness.is_empty());
+    let roots = (0..harness.len())
+        .map(|index| harness.node(index).root().to_path_buf())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3
+    );
+
+    harness.start_all();
+    for index in 0..harness.len() {
+        assert!(harness.node_mut(index).is_running());
+        assert!(
+            harness
+                .node(index)
+                .run(&["server", "status"])
+                .status
+                .success()
+        );
+    }
+
+    harness.node_mut(1).kill();
+    assert!(!harness.node_mut(1).is_running());
+    harness.node_mut(1).restart();
+    assert!(harness.node_mut(1).is_running());
+    assert!(harness.node(1).server_output().is_char_boundary(0));
+
+    harness.stop_all();
+    for index in 0..harness.len() {
+        assert!(!harness.node_mut(index).is_running());
+    }
+    drop(harness);
+    assert!(roots.iter().all(|root| !root.exists()));
 }
 
 #[test]

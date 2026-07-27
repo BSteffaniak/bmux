@@ -97,6 +97,24 @@ impl TypedServiceCaller {
         }
     }
 
+    /// Capture a standalone caller from a service invocation context.
+    #[must_use]
+    pub fn from_service_context(context: &bmux_plugin_sdk::NativeServiceContext) -> Self {
+        Self {
+            plugin_id: context.plugin_id.clone(),
+            required_capabilities: context.required_capabilities.clone(),
+            provided_capabilities: context.provided_capabilities.clone(),
+            services: context.services.clone(),
+            available_capabilities: context.available_capabilities.clone(),
+            enabled_plugins: context.enabled_plugins.clone(),
+            plugin_search_roots: context.plugin_search_roots.clone(),
+            host: context.host.clone(),
+            connection: context.connection.clone(),
+            host_kernel_bridge: context.host_kernel_bridge,
+            plugin_settings_map: context.plugin_settings_map.clone(),
+        }
+    }
+
     /// Return the plugin id this caller identifies as.
     #[must_use]
     pub fn plugin_id(&self) -> &str {

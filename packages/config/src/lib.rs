@@ -608,17 +608,18 @@ fn merged_raw_config_value_with_overrides(
 
     // Apply override layers (base / env / cli) only when:
     //   - the caller provided explicit non-empty overrides, OR
-    //   - a process-scoped overrides guard is active, OR
-    //   - the base_path points at the *current* default config file
-    //     (preserves legacy behavior for callers that do not pass overrides).
+    //   - the base_path points at the current default config file.
+    //
+    // Process-scoped overrides belong to default-config loading. Applying them
+    // to unrelated explicit paths makes independent loads interfere and can
+    // redirect a caller to another task's temporary file.
     let process_overrides = process_config_overrides()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let has_explicit_overrides = explicit_overrides.is_some_and(|overrides| !overrides.is_empty());
     let matches_default_config_file = base_path == ConfigPaths::default().config_file();
-    let include_override_layers =
-        has_explicit_overrides || process_overrides.is_some() || matches_default_config_file;
+    let include_override_layers = has_explicit_overrides || matches_default_config_file;
 
     if !include_override_layers {
         let mut merged = toml::Value::Table(toml::Table::new());
@@ -634,7 +635,11 @@ fn merged_raw_config_value_with_overrides(
     let resolved_overrides = explicit_overrides
         .cloned()
         .filter(|overrides| !overrides.is_empty())
-        .or(process_overrides)
+        .or_else(|| {
+            matches_default_config_file
+                .then_some(process_overrides)
+                .flatten()
+        })
         .unwrap_or_else(|| ConfigLoadOverrides::from_env_with_cli(None));
 
     // Precedence (low → high):

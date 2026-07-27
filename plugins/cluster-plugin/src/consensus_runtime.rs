@@ -333,7 +333,7 @@ impl ConsensusNode {
     ) -> Result<ControlResponse, ControlServiceError> {
         let command_id = command.command_id.clone();
         let encoded = crate::control_codec::encode_control_command(&command);
-        self.decode_write_response(command_id, self.write(encoded).await)
+        Self::decode_write_response(&command_id, self.write(encoded).await)
     }
 
     /// Activates one durable schema feature after membership eligibility checks.
@@ -347,12 +347,11 @@ impl ConsensusNode {
     ) -> Result<ControlResponse, ControlServiceError> {
         let command_id = command.command_id.clone();
         let encoded = crate::control_codec::encode_feature_activation(&command);
-        self.decode_write_response(command_id, self.write(encoded).await)
+        Self::decode_write_response(&command_id, self.write(encoded).await)
     }
 
     fn decode_write_response(
-        &self,
-        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        command_id: &bmux_cluster_plugin_api::cluster_types::CommandId,
         result: Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError>,
     ) -> Result<ControlResponse, ControlServiceError> {
         match result {
@@ -861,6 +860,7 @@ pub(crate) mod tests {
         nodes[2].shutdown().await.unwrap();
     }
 
+    #[allow(clippy::too_many_lines)] // Integration test keeps one three-voter lifecycle explicit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_voters_activate_feature_floor_and_continue_v1_writes() {
         let network = InMemoryNetworkFactory::default();
@@ -1068,15 +1068,47 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(wait_for_leader(&[&nodes[0], &nodes[1]]).await, ids[0]);
-        nodes[0]
-            .change_voters(BTreeMap::from([
-                (ids[1], BasicNode::new(endpoints[1])),
-                (ids[2], BasicNode::new(endpoints[2])),
-            ]))
+        let prospective = BTreeMap::from([
+            (ids[1], BasicNode::new(endpoints[1])),
+            (ids[2], BasicNode::new(endpoints[2])),
+        ]);
+        network.unregister(ids[1]);
+        network.unregister(ids[2]);
+        let failed = tokio::time::timeout(
+            Duration::from_secs(5),
+            nodes[0].change_voters(prospective.clone()),
+        )
+        .await
+        .expect("voter transition failure should be bounded")
+        .expect_err("minority must reject voter transition");
+        assert!(matches!(failed, ConsensusWriteError::QuorumUnavailable(_)));
+        assert_eq!(
+            nodes[0].committed_voter_ids(),
+            BTreeSet::from([ids[0], ids[1]])
+        );
+        for index in 1..3 {
+            network.register(
+                ids[index],
+                BasicNode::new(endpoints[index]),
+                nodes[index].raft().clone(),
+            );
+        }
+        let recovered_leader = wait_for_leader(&[&nodes[0], &nodes[1], &nodes[2]]).await;
+        let recovered_index = ids
+            .iter()
+            .position(|node_id| *node_id == recovered_leader)
+            .unwrap();
+        nodes[recovered_index]
+            .change_voters(prospective.clone())
             .await
             .unwrap();
         nodes[0].shutdown().await.unwrap();
         let replacement = wait_for_leader(&[&nodes[1], &nodes[2]]).await;
+        let replacement_index = if replacement == ids[1] { 1 } else { 2 };
+        nodes[replacement_index]
+            .change_voters(prospective)
+            .await
+            .unwrap();
         assert!(replacement == ids[1] || replacement == ids[2]);
         let leader = if replacement == ids[1] {
             &nodes[1]
@@ -1179,6 +1211,117 @@ pub(crate) mod tests {
         );
 
         nodes[0].shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn membership_publication_retries_after_quorum_restoration() {
+        let network = InMemoryNetworkFactory::default();
+        let roots = [
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let identities = [
+            NodeIdentity::new_for_test(51),
+            NodeIdentity::new_for_test(52),
+            NodeIdentity::new_for_test(53),
+        ];
+        let ids = identities.each_ref().map(|identity| *identity.node_id());
+        let endpoints = ["memory://p1", "memory://p2", "memory://p3"];
+        let cluster_id: ClusterId = "cluster:00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let mut nodes = Vec::new();
+        for index in 0..3 {
+            let node = ConsensusNode::start(
+                roots[index].path(),
+                &cluster_id.to_string(),
+                ids[index],
+                network.clone(),
+            )
+            .await
+            .unwrap();
+            network.register(
+                ids[index],
+                BasicNode::new(endpoints[index]),
+                node.raft().clone(),
+            );
+            nodes.push(node);
+        }
+        nodes[0]
+            .initialize_single(ids[0], endpoints[0])
+            .await
+            .unwrap();
+        wait_for_leader(&[&nodes[0]]).await;
+        for index in 1..3 {
+            nodes[0]
+                .raft()
+                .add_learner(ids[index], BasicNode::new(endpoints[index]), true)
+                .await
+                .unwrap();
+        }
+        nodes[0]
+            .raft()
+            .change_membership(BTreeSet::from(ids), false)
+            .await
+            .unwrap();
+
+        let member = crate::membership::issue_test_member(
+            &identities[0],
+            cluster_id,
+            &identities[0],
+            "node-a",
+            ClusterNodeCapabilities {
+                consensus_role: ClusterConsensusRole::Voter,
+                worker: true,
+                ingress: true,
+            },
+            crate::now_unix_ms(),
+        );
+        network.unregister(ids[1]);
+        network.unregister(ids[2]);
+        let failed = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::consensus_membership::publish_members(
+                nodes[0].clone(),
+                &member.node_id,
+                [member.clone()],
+            ),
+        )
+        .await
+        .expect("publication failure should be bounded")
+        .expect_err("minority must reject membership publication");
+        assert!(failed.contains("QuorumUnavailable"));
+        assert!(nodes[0].read_stale_view().unwrap().members.is_empty());
+
+        for index in 1..3 {
+            network.register(
+                ids[index],
+                BasicNode::new(endpoints[index]),
+                nodes[index].raft().clone(),
+            );
+        }
+        crate::consensus_membership::publish_members(
+            nodes[0].clone(),
+            &member.node_id,
+            [member.clone()],
+        )
+        .await
+        .unwrap();
+        crate::consensus_membership::publish_members(
+            nodes[0].clone(),
+            &member.node_id,
+            [member.clone()],
+        )
+        .await
+        .unwrap();
+        let view = nodes[0].read_linearizable_view().await.unwrap();
+        assert_eq!(view.members, vec![member]);
+
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

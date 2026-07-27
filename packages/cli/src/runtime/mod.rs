@@ -97,10 +97,10 @@ use plugin_kernel::{
 use plugin_runtime::{
     activate_loaded_plugins, build_runtime_command_state, command_accepts_repeat,
     deactivate_loaded_plugins, discover_bundled_plugin_ids, dispatch_loaded_plugin_event,
-    effective_enabled_plugins, load_enabled_plugins, load_plugin, plugin_command_policy_hints,
-    plugin_event_bridge_loop, plugin_host_metadata, plugin_system_event,
-    resolve_plugin_search_paths, run_external_plugin_command, run_plugin_command,
-    run_plugin_command_with_state, run_plugin_keybinding_command,
+    effective_enabled_plugins, install_enabled_client_adapters, load_enabled_plugins, load_plugin,
+    plugin_command_policy_hints, plugin_event_bridge_loop, plugin_host_metadata,
+    plugin_system_event, resolve_plugin_search_paths, run_external_plugin_command,
+    run_plugin_command, run_plugin_command_with_state, run_plugin_keybinding_command,
     run_plugin_keybinding_command_with_active_bindings, run_plugin_keybinding_command_with_state,
     scan_available_plugins, validate_enabled_plugins,
 };

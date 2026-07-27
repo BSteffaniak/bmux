@@ -829,25 +829,46 @@ fn enforce_registry_output_cap(
 
 pub struct NodeSignatureLeaseVerifier<C> {
     caller: std::sync::Arc<C>,
+    local_node_id: crate::membership::NodeId,
+    nodes: crate::consensus_network::ConsensusNodeRegistry,
 }
 
 impl<C> NodeSignatureLeaseVerifier<C> {
     #[must_use]
-    pub const fn new(caller: std::sync::Arc<C>) -> Self {
-        Self { caller }
+    pub const fn new(
+        caller: std::sync::Arc<C>,
+        local_node_id: crate::membership::NodeId,
+        nodes: crate::consensus_network::ConsensusNodeRegistry,
+    ) -> Self {
+        Self {
+            caller,
+            local_node_id,
+            nodes,
+        }
     }
 }
 
 impl<C> WorkerLeaseVerifier for NodeSignatureLeaseVerifier<C>
 where
-    C: crate::ClusterRuntimeOps + Send + Sync,
+    C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
 {
     fn verify(&self, authority: &WorkerAuthority, payload: &[u8]) -> Result<(), String> {
-        let membership = crate::membership::load_membership_state(self.caller.as_ref())?
-            .ok_or_else(|| "cluster membership is not initialized".to_string())?;
-        let issuer = membership
-            .members
-            .get(&authority.issuer_node_id)
+        let control = crate::consensus_network::ControlServiceHandle::new(
+            self.caller.clone(),
+            self.local_node_id,
+            self.nodes.clone(),
+        );
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            format!("worker lease verification requires the host runtime: {error}")
+        })?;
+        let members =
+            tokio::task::block_in_place(|| runtime.block_on(control.authoritative_members()))
+                .map_err(|error| {
+                    format!("authoritative worker lease membership read failed: {error:?}")
+                })?;
+        let issuer = members
+            .iter()
+            .find(|member| member.node_id == authority.issuer_node_id)
             .ok_or_else(|| "worker lease issuer is not a cluster member".to_string())?;
         if issuer.state != bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
             || issuer.capabilities.consensus_role

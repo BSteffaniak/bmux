@@ -142,6 +142,10 @@ Example:
 ```toml
 [plugins.settings."bmux.cluster"]
 # Stable connections target advertised for authenticated consensus RPC.
+# This may be a self-contained tls://, https://, iroh://, or ssh:// URI, or a
+# named [connections.targets] alias provisioned identically on every cluster
+# member. Local targets are forbidden. Aliases are part of cluster provisioning:
+# the same alias must resolve to the same remote identity on every node.
 consensus_endpoint = "prod-a"
 
 [plugins.settings."bmux.cluster".clusters.prod]
@@ -193,7 +197,7 @@ gateway_mode = "auto"
   - `status` returns host states from probe execution (`ready` or `degraded`).
   - Errors use `list_clusters_failed` / `status_failed`.
 - `cluster-command/v1`
-  - `init` creates or returns the durable cluster identity; `--endpoint` advertises the stable connections target required by voter consensus startup. The same endpoint may be configured as `plugins.settings."bmux.cluster".consensus_endpoint` for restart-safe activation.
+  - `init` creates or returns the durable cluster identity; `--endpoint` advertises the stable connections target required by voter consensus startup. Advertised endpoints are either self-contained `tls://`, `https://`, `iroh://`, or `ssh://` references, or named `[connections.targets]` aliases provisioned identically across the cluster. Blank/local/malformed references, duplicate active-member endpoints, and implicit active-voter endpoint rewrites are rejected. Every authenticated connection verifies that the resolved endpoint presents the expected member `NodeId`. The same endpoint may be configured as `plugins.settings."bmux.cluster".consensus_endpoint` for restart-safe activation.
   - `enrollment_token_create`, `redeem_enrollment`, and `join` implement signed, expiring, retry-safe enrollment as generated typed phases; redemption verifies node-key possession and compatibility before consuming the token, then returns an issuer-signed public membership credential.
   - `leave_prepare`, `accept_leave`, and `leave` implement signed, retryable leave coordination without nested service dispatch.
   - `up` returns session id plus per-host launch status payload.

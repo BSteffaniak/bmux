@@ -10,8 +10,8 @@ use tracing::Level;
 
 use super::plugin_runtime::{RuntimeCommandState, build_runtime_command_state};
 use super::{
-    effective_enabled_plugins, plugin_commands, plugin_commands::PluginCommandRegistry,
-    scan_available_plugins,
+    effective_enabled_plugins, install_enabled_client_adapters, plugin_commands,
+    plugin_commands::PluginCommandRegistry, scan_available_plugins,
 };
 
 #[derive(Debug)]
@@ -89,6 +89,7 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let scan_us = scan_started.elapsed().as_micros();
     let state_started = Instant::now();
     let command_state = build_runtime_command_state(config.clone(), paths, Arc::clone(&registry))?;
+    install_enabled_client_adapters(&config, &registry);
     let state_us = state_started.elapsed().as_micros();
     let parse_started = Instant::now();
     let parsed = parse_runtime_cli_with_registry(

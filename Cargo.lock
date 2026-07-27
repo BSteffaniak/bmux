@@ -1195,7 +1195,7 @@ dependencies = [
  "bmux_clipboard",
  "bmux_clipboard_plugin",
  "bmux_cluster_plugin",
- "bmux_cluster_plugin_api",
+ "bmux_cluster_plugin_client",
  "bmux_codec",
  "bmux_command_palette_plugin",
  "bmux_config",
@@ -1412,6 +1412,22 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_cluster_plugin_client"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_attach_layout_protocol",
+ "bmux_attach_pipeline",
+ "bmux_client",
+ "bmux_cluster_plugin_api",
+ "bmux_keyboard",
+ "bmux_terminal_grid",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
  "uuid",
 ]
 

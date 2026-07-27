@@ -9,7 +9,8 @@ mod attach_session;
 mod connection_pool;
 
 pub use attach_provider::{
-    AttachProvider, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
+    AttachEndpointConnectFuture, AttachEndpointConnector, AttachProvider, AttachProviderBackend,
+    AttachProviderError, AttachProviderFuture, AttachProviderOpenContext,
     AttachProviderRegistration, AttachProviderRegistrationError, AttachProviderRegistry,
     AttachProviderResolutionError, AttachProviderSession, AttachTarget, ResolvedAttachTarget,
     global_attach_provider_registry,

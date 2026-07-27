@@ -3,7 +3,7 @@ use crate::ssh_access::{
     parse_iroh_target as parse_iroh_target_parts,
 };
 use anyhow::{Context, Result};
-use bmux_client::{BmuxClient, ClientError};
+use bmux_client::{AttachEndpointConnectFuture, AttachEndpointConnector, BmuxClient, ClientError};
 use bmux_config::{
     BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction,
 };
@@ -56,6 +56,32 @@ pub struct ConnectionContext<'a> {
 impl<'a> ConnectionContext<'a> {
     pub const fn new(target_override: Option<&'a str>) -> Self {
         Self { target_override }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CliAttachEndpointConnector;
+
+impl AttachEndpointConnector for CliAttachEndpointConnector {
+    fn connect<'a>(
+        &'a self,
+        target: &'a str,
+        client_name: &'static str,
+    ) -> AttachEndpointConnectFuture<'a> {
+        Box::pin(async move {
+            let config = BmuxConfig::load().map_err(|error| error.to_string())?;
+            let expanded = expand_bmux_target_if_needed(&config, target)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !is_explicit_connection_target(&config, &expanded) {
+                return Err(format!(
+                    "attach endpoint target '{target}' is not a configured alias or direct endpoint"
+                ));
+            }
+            connect_raw_with_context(client_name, ConnectionContext::new(Some(&expanded)))
+                .await
+                .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -343,6 +369,14 @@ fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed reading {}", path.display())),
     }
+}
+
+fn is_explicit_connection_target(config: &BmuxConfig, target: &str) -> bool {
+    target == "local"
+        || config.connections.targets.contains_key(target)
+        || target.starts_with("https://")
+        || target.starts_with("iroh://")
+        || target.starts_with("tls://")
 }
 
 fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveTarget> {
@@ -825,11 +859,11 @@ pub fn remove_server_runtime_metadata_file() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionPolicyScope, ServerBuildPolicyEffect, ServerRuntimeMetadata,
-        check_cross_slot_mismatch, evaluate_stale_build_policy, expand_bmux_target_if_needed,
-        is_server_unavailable_client_error, map_client_connect_error,
+        CliAttachEndpointConnector, ConnectionPolicyScope, ServerBuildPolicyEffect,
+        ServerRuntimeMetadata, check_cross_slot_mismatch, evaluate_stale_build_policy,
+        expand_bmux_target_if_needed, is_server_unavailable_client_error, map_client_connect_error,
     };
-    use bmux_client::ClientError;
+    use bmux_client::{AttachEndpointConnector, ClientError};
     use bmux_config::{BmuxConfig, StaleBuildAction};
     use bmux_ipc::IncompatibilityReason;
     use bmux_ipc::frame::FrameDecodeError;
@@ -886,6 +920,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn attach_endpoint_connector_uses_opaque_connection_target() {
+        let connector = CliAttachEndpointConnector;
+        let future = connector.connect("missing-attach-target", "bmux-test-attach-connector");
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+            .expect_err("unknown opaque target must fail");
+        assert!(error.contains("missing-attach-target"));
     }
 
     #[test]

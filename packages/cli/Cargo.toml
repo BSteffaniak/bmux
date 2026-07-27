@@ -25,7 +25,6 @@ bmux_attach_view_protocol       = { workspace = true }
 bmux_cli_schema                 = { workspace = true }
 bmux_client                     = { workspace = true }
 bmux_clients_plugin_api         = { workspace = true }
-bmux_cluster_plugin_api         = { workspace = true }
 bmux_codec                      = { workspace = true }
 bmux_config                     = { workspace = true }
 bmux_context_state              = { workspace = true }
@@ -67,6 +66,7 @@ bmux_clipboard_plugin = { workspace = true, optional = true, features = [
 bmux_cluster_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_cluster_plugin_client = { workspace = true, optional = true }
 bmux_command_palette_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -198,6 +198,7 @@ fail-on-warnings = [
     "bmux_clients_plugin?/fail-on-warnings",
     "bmux_clipboard_plugin?/fail-on-warnings",
     "bmux_cluster_plugin?/fail-on-warnings",
+    "bmux_cluster_plugin_client?/fail-on-warnings",
     "bmux_connections_plugin?/fail-on-warnings",
     "bmux_command_palette_plugin?/fail-on-warnings",
     "bmux_config/fail-on-warnings",
@@ -263,7 +264,10 @@ bundled-plugins = [
 bundled-plugin-cli = ["dep:bmux_plugin_cli_plugin"]
 bundled-plugin-clients = ["dep:bmux_clients_plugin"]
 bundled-plugin-clipboard = ["dep:bmux_clipboard_plugin"]
-bundled-plugin-cluster = ["dep:bmux_cluster_plugin"]
+bundled-plugin-cluster = [
+    "dep:bmux_cluster_plugin",
+    "dep:bmux_cluster_plugin_client",
+]
 bundled-plugin-command-palette = ["dep:bmux_command_palette_plugin"]
 bundled-plugin-connections = ["dep:bmux_connections_plugin"]
 bundled-plugin-contexts = ["dep:bmux_contexts_plugin"]

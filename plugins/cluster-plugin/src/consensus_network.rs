@@ -448,6 +448,17 @@ impl<C> ControlServiceHandle<C> {
     pub(crate) fn active(&self) -> Result<ConsensusNode, ControlServiceError> {
         self.nodes.active(self.local_node_id)
     }
+
+    pub(crate) async fn authoritative_members(
+        &self,
+    ) -> Result<Vec<bmux_cluster_plugin_api::cluster_types::ClusterMember>, ControlServiceError>
+    where
+        C: ServiceCaller + Send + Sync + 'static,
+    {
+        self.read_linearizable_or_forward()
+            .await
+            .map(|view| view.members)
+    }
 }
 
 impl<C> ControlServiceHandle<C>
@@ -480,6 +491,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_feature_activation(
         &self,
         endpoint: &str,
