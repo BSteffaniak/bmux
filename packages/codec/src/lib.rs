@@ -397,6 +397,46 @@ mod tests {
     }
 
     #[test]
+    fn typed_stable_supports_recursive_internally_tagged_enums_in_maps() {
+        use std::collections::BTreeMap;
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "operation", rename_all = "snake_case")]
+        enum Expression {
+            Input {
+                source: String,
+            },
+            Object {
+                fields: BTreeMap<String, Self>,
+            },
+            Merge {
+                objects: Vec<Self>,
+                conflict: Conflict,
+            },
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Conflict {
+            KeepLast,
+        }
+
+        let value = Expression::Merge {
+            objects: vec![Expression::Object {
+                fields: BTreeMap::from([(
+                    "value".to_string(),
+                    Expression::Input {
+                        source: "current".to_string(),
+                    },
+                )]),
+            }],
+            conflict: Conflict::KeepLast,
+        };
+        let bytes = to_typed_vec(&value).unwrap();
+        assert_eq!(from_typed_bytes::<Expression>(&bytes).unwrap(), value);
+    }
+
+    #[test]
     fn typed_stable_supports_externally_tagged_enums() {
         let values = [
             TestEnum::Unit,

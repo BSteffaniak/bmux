@@ -231,11 +231,15 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
             TypeTag::Enum => {
                 let variant = self.read_str()?;
                 let len = self.read_varint_usize()?;
-                visitor.visit_enum(InternallyTaggedEnum {
-                    de: self,
-                    variant,
-                    remaining: len,
-                })
+                if len == 0 {
+                    visitor.visit_borrowed_str(variant)
+                } else {
+                    visitor.visit_enum(InternallyTaggedEnum {
+                        de: self,
+                        variant,
+                        remaining: len,
+                    })
+                }
             }
         }
     }
