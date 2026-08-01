@@ -676,6 +676,37 @@ mod tests {
     }
 
     #[test]
+    fn decset_1049_resize_exit_keeps_shell_output_live() {
+        let mut stream = TerminalGridStream::new(8, 2, GridLimits::default()).unwrap();
+        stream.process(b"shell\r\nready");
+        stream.process(b"\x1b[?1049hALT");
+
+        stream.resize(16, 6).unwrap();
+        stream.process(b"\x1b[?1049l\r\nPROMPT> echo alive\r\nalive");
+
+        assert_eq!(stream.grid().mode(), crate::model::GridMode::Main);
+        assert_eq!(stream.grid().viewport_rows().len(), 6);
+        let text = crate::visible_text(stream.grid(), 0, 6);
+        assert!(text.contains("PROMPT>"));
+        assert!(text.contains("alive"));
+    }
+
+    #[test]
+    fn alternate_screen_modes_remain_writable_after_resize_and_exit() {
+        for mode in [47, 1047, 1049] {
+            let mut stream = TerminalGridStream::new(8, 2, GridLimits::default()).unwrap();
+            stream.process(b"main");
+            stream.process(format!("\x1b[?{mode}hALT").as_bytes());
+            stream.resize(14, 5).unwrap();
+            stream.process(format!("\x1b[?{mode}l\r\nLIVE").as_bytes());
+
+            assert_eq!(stream.grid().mode(), crate::model::GridMode::Main);
+            assert_eq!(stream.grid().viewport_rows().len(), 5);
+            assert!(crate::visible_text(stream.grid(), 0, 5).contains("LIVE"));
+        }
+    }
+
+    #[test]
     fn cursor_visibility_is_structured_state_and_survives_snapshot() {
         let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
         stream.process(b"\x1b[?25l");

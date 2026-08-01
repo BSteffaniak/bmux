@@ -571,8 +571,17 @@ impl TerminalGrid {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        if self.mode == GridMode::Main {
-            self.resize_main_viewport(width, height);
+        let main_cursor = match self.mode {
+            GridMode::Main => self.cursor,
+            GridMode::Alternate => self.saved_cursor,
+        };
+        let resized_main_cursor = self.resize_main_viewport(width, height, main_cursor);
+        match self.mode {
+            GridMode::Main => self.cursor = resized_main_cursor,
+            GridMode::Alternate => {
+                self.saved_cursor = resized_main_cursor;
+                self.saved_pending_wrap = false;
+            }
         }
         self.width = width;
         self.height = height;
@@ -588,8 +597,8 @@ impl TerminalGrid {
             row.truncate(width);
             row.set_wrapped(false);
         }
-        self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
-        self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
+        self.cursor = clamp_cursor_to_dimensions(self.cursor, width, height);
+        self.saved_cursor = clamp_cursor_to_dimensions(self.saved_cursor, width, height);
         self.bump_content_revision();
         Ok(())
     }
@@ -1325,17 +1334,22 @@ impl TerminalGrid {
         self.alt_rows[start..end].to_vec()
     }
 
-    fn resize_main_viewport(&mut self, new_width: usize, new_height: usize) {
+    fn resize_main_viewport(
+        &mut self,
+        new_width: usize,
+        new_height: usize,
+        main_cursor: Cursor,
+    ) -> Cursor {
         let mut source_rows = self.main_rows.iter().cloned().collect::<Vec<_>>();
         while source_rows.len() > 1
             && source_rows
                 .last()
                 .is_some_and(|row| row_is_blank(row) && !row.wrapped())
-            && self.cursor.row < source_rows.len().saturating_sub(1)
+            && main_cursor.row < source_rows.len().saturating_sub(1)
         {
             source_rows.pop();
         }
-        let anchor = self.live_cursor_anchor(&source_rows);
+        let anchor = self.live_cursor_anchor(&source_rows, main_cursor);
         let live_lines = self.live_logical_lines(&source_rows);
         let mut projected_by_line = Vec::with_capacity(live_lines.len());
         let mut total_rows = 0_usize;
@@ -1378,29 +1392,34 @@ impl TerminalGrid {
             }
         }
         self.main_rows = next_rows;
-        self.restore_live_cursor_anchor(
+        Self::restored_live_cursor_anchor(
+            main_cursor,
             anchor,
             &projected_by_line,
             keep_start,
             new_width,
             new_height,
-        );
+        )
     }
 
-    fn live_cursor_anchor(&self, source_rows: &[PhysicalRow]) -> Option<CursorAnchor> {
-        if self.mode != GridMode::Main || source_rows.is_empty() {
+    fn live_cursor_anchor(
+        &self,
+        source_rows: &[PhysicalRow],
+        main_cursor: Cursor,
+    ) -> Option<CursorAnchor> {
+        if source_rows.is_empty() {
             return None;
         }
         let mut logical_line = 0_usize;
         let mut run_start = 0_usize;
         let mut prefix_cols = logical_width(&self.pending_history_cells);
         for (index, row) in source_rows.iter().enumerate() {
-            if index == self.cursor.row.min(source_rows.len().saturating_sub(1)) {
+            if index == main_cursor.row.min(source_rows.len().saturating_sub(1)) {
                 return Some(CursorAnchor {
                     logical_line,
                     logical_col: prefix_cols
                         .saturating_add(index.saturating_sub(run_start).saturating_mul(self.width))
-                        .saturating_add(self.cursor.col),
+                        .saturating_add(main_cursor.col),
                 });
             }
             if !row.wrapped() {
@@ -1432,32 +1451,32 @@ impl TerminalGrid {
         lines
     }
 
-    fn restore_live_cursor_anchor(
-        &mut self,
+    fn restored_live_cursor_anchor(
+        fallback_cursor: Cursor,
         anchor: Option<CursorAnchor>,
         projected_by_line: &[Vec<PhysicalRow>],
         keep_start: usize,
         width: usize,
         height: usize,
-    ) {
+    ) -> Cursor {
         let Some(anchor) = anchor else {
-            self.clamp_cursor();
-            return;
+            return clamp_cursor_to_dimensions(fallback_cursor, width, height);
         };
         let mut absolute_row = 0_usize;
         for (line_index, rows) in projected_by_line.iter().enumerate() {
             if line_index == anchor.logical_line {
                 absolute_row = absolute_row.saturating_add(anchor.logical_col / width.max(1));
-                self.cursor.row = absolute_row
-                    .saturating_sub(keep_start)
-                    .min(height.saturating_sub(1));
-                self.cursor.col = (anchor.logical_col % width.max(1)).min(width.saturating_sub(1));
-                self.clamp_cursor();
-                return;
+                return Cursor {
+                    row: absolute_row
+                        .saturating_sub(keep_start)
+                        .min(height.saturating_sub(1)),
+                    col: (anchor.logical_col % width.max(1)).min(width.saturating_sub(1)),
+                    visible: fallback_cursor.visible,
+                };
             }
             absolute_row = absolute_row.saturating_add(rows.len());
         }
-        self.clamp_cursor();
+        clamp_cursor_to_dimensions(fallback_cursor, width, height)
     }
 
     fn append_combining(&mut self, ch: char) {
@@ -1487,6 +1506,12 @@ impl TerminalGrid {
             }
         }
     }
+}
+
+fn clamp_cursor_to_dimensions(mut cursor: Cursor, width: usize, height: usize) -> Cursor {
+    cursor.row = cursor.row.min(height.saturating_sub(1));
+    cursor.col = cursor.col.min(width.saturating_sub(1));
+    cursor
 }
 
 fn normalized_visual_cells(mut cells: Vec<Cell>, width: usize) -> Vec<Cell> {
@@ -1818,6 +1843,66 @@ mod tests {
         grid.resize(8, 2).unwrap();
         grid.set_mode(GridMode::Main);
         assert_eq!(row_text(&grid.viewport_rows()[0]), "main");
+    }
+
+    #[test]
+    fn alternate_screen_resize_keeps_main_screen_writable_after_exit() {
+        let mut grid = TerminalGrid::new(
+            5,
+            2,
+            GridLimits {
+                scrollback_rows: 20,
+            },
+        )
+        .unwrap();
+        grid.process(b"top\r\nbot");
+        grid.save_cursor();
+        grid.set_mode(GridMode::Alternate);
+        grid.process(b"alternate");
+
+        grid.resize(9, 5).unwrap();
+        grid.set_mode(GridMode::Main);
+        grid.restore_cursor();
+        grid.process(b"\r\nPROMPT");
+
+        assert_eq!(grid.viewport_rows().len(), 5);
+        assert_eq!(row_text(&grid.viewport_rows()[0]), "top");
+        assert_eq!(row_text(&grid.viewport_rows()[1]), "bot");
+        assert_eq!(row_text(&grid.viewport_rows()[2]), "PROMPT");
+    }
+
+    #[test]
+    fn alternate_screen_resize_preserves_main_cursor_anchor_across_width_reflow() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
+        grid.process(b"abcdefgh");
+        grid.save_cursor();
+        grid.set_mode(GridMode::Alternate);
+
+        grid.resize(10, 4).unwrap();
+        grid.set_mode(GridMode::Main);
+        grid.restore_cursor();
+        grid.process(b"X");
+
+        assert_eq!(grid.viewport_rows().len(), 4);
+        assert_eq!(row_text(&grid.viewport_rows()[0]), "abcdefghX");
+    }
+
+    #[test]
+    fn repeated_alternate_screen_resizes_leave_both_screens_usable() {
+        let mut grid = TerminalGrid::new(8, 3, GridLimits::default()).unwrap();
+        for (width, height) in [(16, 6), (4, 2), (12, 5), (7, 4)] {
+            grid.save_cursor();
+            grid.set_mode(GridMode::Alternate);
+            grid.process(b"alternate");
+            grid.resize(width, height).unwrap();
+            grid.set_mode(GridMode::Main);
+            grid.restore_cursor();
+            grid.process(b"x");
+
+            assert_eq!(grid.viewport_rows().len(), usize::from(height));
+            assert!(grid.cursor().row < usize::from(height));
+            assert!(grid.cursor().col < usize::from(width));
+        }
     }
 
     #[test]

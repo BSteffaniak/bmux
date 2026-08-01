@@ -394,6 +394,15 @@ fn playbook_synthetic_alt_split_exit_reentry_restores_cursor() {
 }
 
 #[test]
+fn playbook_alternate_screen_resize_keeps_shell_live() {
+    let (json, pass) = run_playbook_fixture("alternate_screen_resize_shell_liveness.dsl");
+    assert!(
+        pass,
+        "resizing in alternate screen must return to an interactive shell: {json:#}"
+    );
+}
+
+#[test]
 fn playbook_send_keys_fails_during_attach_scrollback() {
     let (json, pass) = run_playbook_fixture("send_keys_in_scrollback.dsl");
     assert!(
@@ -552,6 +561,7 @@ fn playbook_failing_assert() {
 fn parse_and_validate_fixtures() {
     let fixtures = [
         "alt_screen_exit_cursor.dsl",
+        "alternate_screen_resize_shell_liveness.dsl",
         "synthetic_alt_sigint_reentry.dsl",
         "synthetic_alt_split_exit_reentry.dsl",
         "echo_hello.dsl",
