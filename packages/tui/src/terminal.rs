@@ -96,11 +96,16 @@ impl<W: Write> Terminal<W> {
         &self.image_delta
     }
 
+    /// Reset retained terminal presentation state so the next draw repaints fully.
+    pub fn reset(&mut self) {
+        self.previous = None;
+    }
+
     /// Resize the terminal area and force the next draw to repaint fully.
     pub fn resize(&mut self, area: Rect) {
         if self.area != area {
             self.area = area;
-            self.previous = None;
+            self.reset();
         }
     }
 

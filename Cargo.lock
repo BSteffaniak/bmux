@@ -2407,6 +2407,8 @@ dependencies = [
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
+ "bmux_tui_runtime",
+ "tokio",
 ]
 
 [[package]]
@@ -2438,6 +2440,14 @@ dependencies = [
  "bmux_keyboard",
  "bmux_tui",
  "bmux_tui_components",
+]
+
+[[package]]
+name = "bmux_tui_runtime"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_tui",
+ "tokio",
 ]
 
 [[package]]

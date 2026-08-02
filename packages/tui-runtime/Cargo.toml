@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "gui"]
+description = "Bounded scheduling and presentation runtime for bmux terminal UIs"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "tui", "runtime"]
+license     = { workspace = true }
+name        = "bmux_tui_runtime"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_tui = { workspace = true }
+tokio    = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[features]
+crossterm        = ["bmux_tui/crossterm"]
+default          = []
+fail-on-warnings = []

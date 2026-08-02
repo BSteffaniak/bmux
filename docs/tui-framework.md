@@ -21,9 +21,19 @@ The framework is not a product-specific UI layer. It owns terminal UI primitives
 - Do not rewrite the attach pipeline wholesale as an early step.
 - Do not create speculative helper crates before implementation pressure proves they are needed.
 
-## Initial crate boundary
+## TUI crate boundaries
 
-The initial crate is `packages/tui`, published in the workspace as `bmux_tui`.
+BMUX's TUI framework has three domain-neutral layers:
+
+- `packages/tui` (`bmux_tui`) owns low-level terminal primitives, frames, events, and backends.
+- `packages/tui-components` (`bmux_tui_components`) owns reusable controls and component-local interaction state.
+- `packages/tui-runtime` (`bmux_tui_runtime`) owns bounded event admission, fair scheduling, commands, timers, redraw coalescing, render cadence, terminal-input lifecycle, shutdown, and neutral runtime statistics.
+
+The runtime depends on `bmux_tui` but not `bmux_tui_components`. Applications may use all three while retaining product state and behavior. See [`tui-runtime.md`](tui-runtime.md) for the runtime contract.
+
+## Initial primitive crate boundary
+
+The primitive crate is `packages/tui`, published in the workspace as `bmux_tui`.
 
 The first crate owns neutral primitives:
 

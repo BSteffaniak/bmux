@@ -59,6 +59,7 @@ members = [
     "packages/text-edit",
     "packages/tui",
     "packages/tui-components",
+    "packages/tui-runtime",
     "packages/mobile-core",
     "packages/mobile-ffi",
     "packages/image",
@@ -200,6 +201,7 @@ bmux_terminal_protocol = { version = "0.0.1-alpha.1", default-features = false, 
 bmux_text_edit = { version = "0.0.1-alpha.1", default-features = false, path = "packages/text-edit" }
 bmux_tui = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui" }
 bmux_tui_components = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-components" }
+bmux_tui_runtime = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-runtime" }
 hyperchad_docs_config = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_docs_config_derive = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_docs_site = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
