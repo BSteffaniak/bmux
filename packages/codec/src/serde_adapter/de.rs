@@ -459,7 +459,17 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         visitor: V,
     ) -> Result<V::Value, Error> {
         self.expect_tag(TypeTag::Enum)?;
-        visitor.visit_enum(self)
+        // An enum's own `Enum` type tag is consumed above. Its variant identifier is always
+        // encoded as an untagged string (see `serialize_*_variant`), regardless of whether this
+        // enum value was reached as a map key. Clear `tagged_identifier`, which only applies to
+        // the immediate map-key scalar type, so the variant name is not misread as a tagged
+        // string. Without this, enum-keyed maps (`BTreeMap<SomeEnum, _>`) fail to round-trip in
+        // `TypedStable` mode with "unexpected type tag: expected String".
+        let previous = self.tagged_identifier;
+        self.tagged_identifier = false;
+        let result = visitor.visit_enum(&mut *self);
+        self.tagged_identifier = previous;
+        result
     }
 
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {

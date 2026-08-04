@@ -735,6 +735,56 @@ mod tests {
     }
 
     #[test]
+    fn typed_stable_roundtrips_enum_keyed_map() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Key {
+            Alpha,
+            Beta,
+            Gamma,
+        }
+
+        let mut map: BTreeMap<Key, u32> = BTreeMap::new();
+        map.insert(Key::Alpha, 1);
+        map.insert(Key::Beta, 2);
+        map.insert(Key::Gamma, 3);
+
+        let bytes = to_typed_vec(&map).unwrap();
+        let decoded: BTreeMap<Key, u32> = from_typed_bytes(&bytes).unwrap();
+        assert_eq!(decoded, map);
+    }
+
+    #[test]
+    fn typed_stable_roundtrips_enum_keyed_map_with_struct_variant_values() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Key {
+            First,
+            Second,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(tag = "status", rename_all = "snake_case")]
+        enum Value {
+            Unknown,
+            Supported { source: String },
+        }
+
+        let mut map: BTreeMap<Key, Value> = BTreeMap::new();
+        map.insert(Key::First, Value::Unknown);
+        map.insert(
+            Key::Second,
+            Value::Supported {
+                source: "catalog".to_string(),
+            },
+        );
+
+        let bytes = to_typed_vec(&map).unwrap();
+        let decoded: BTreeMap<Key, Value> = from_typed_bytes(&bytes).unwrap();
+        assert_eq!(decoded, map);
+    }
+
+    #[test]
     fn typed_stable_rejects_truncated_payload() {
         let mut bytes = to_typed_vec(&"hello".to_string()).unwrap();
         bytes.pop();
