@@ -32,6 +32,27 @@ pub struct ModalTheme {
 }
 
 impl ModalTheme {
+    /// Create a modal theme from caller-owned semantic styles.
+    #[must_use]
+    pub const fn new(
+        background: Style,
+        border: Style,
+        title: Style,
+        text: Style,
+        muted: Style,
+        focused: Style,
+    ) -> Self {
+        Self {
+            background,
+            border,
+            title,
+            text,
+            muted,
+            focused,
+            scrim: None,
+        }
+    }
+
     /// Create a default dark opaque modal theme using `accent` for focused
     /// chrome.
     #[must_use]

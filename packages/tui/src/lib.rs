@@ -11,6 +11,7 @@
 pub mod ansi;
 pub mod blocks;
 pub mod buffer;
+pub mod capabilities;
 pub mod chrome;
 pub mod clear;
 #[cfg(feature = "crossterm")]
@@ -49,6 +50,7 @@ pub mod prelude {
     };
     pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
+    pub use crate::capabilities::{TerminalBackground, TerminalCapabilities, TerminalColorDepth};
     pub use crate::chrome::{
         Border, BorderSet, BorderSides, Modal, Panel, PanelTitle, TitlePosition,
     };
