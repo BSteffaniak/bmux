@@ -721,4 +721,107 @@ mod tests {
         assert_eq!(theme.chart_styles().dataset, theme.info);
         assert_eq!(theme.sparkline_styles().low, theme.error);
     }
+
+    #[test]
+    fn component_state_matrix_uses_only_supplied_theme_styles() {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::geometry::{Point, Rect};
+
+        use crate::button::{Button, ButtonState};
+        use crate::common::InteractionState;
+
+        let theme = ComponentTheme {
+            base: Style::new().fg(Color::Rgb(1, 1, 1)),
+            background: Style::new().bg(Color::Rgb(2, 2, 2)),
+            focused: Style::new().fg(Color::Rgb(3, 3, 3)),
+            selected: Style::new().fg(Color::Rgb(4, 4, 4)),
+            disabled: Style::new().fg(Color::Rgb(5, 5, 5)),
+            muted: Style::new().fg(Color::Rgb(6, 6, 6)),
+            info: Style::new().fg(Color::Rgb(7, 7, 7)),
+            success: Style::new().fg(Color::Rgb(8, 8, 8)),
+            warning: Style::new().fg(Color::Rgb(9, 9, 9)),
+            error: Style::new().fg(Color::Rgb(10, 10, 10)),
+            border: Style::new().fg(Color::Rgb(11, 11, 11)),
+        };
+        let states = [
+            ("normal", InteractionState::new(), theme.base),
+            (
+                "hovered",
+                InteractionState {
+                    hovered: true,
+                    ..InteractionState::new()
+                },
+                theme.info,
+            ),
+            (
+                "focused",
+                InteractionState {
+                    focused: true,
+                    ..InteractionState::new()
+                },
+                theme.focused,
+            ),
+            (
+                "pressed",
+                InteractionState {
+                    pressed: true,
+                    ..InteractionState::new()
+                },
+                theme.selected,
+            ),
+            (
+                "disabled",
+                InteractionState {
+                    disabled: true,
+                    ..InteractionState::new()
+                },
+                theme.disabled,
+            ),
+            (
+                "disabled-precedence",
+                InteractionState {
+                    focused: true,
+                    hovered: true,
+                    pressed: true,
+                    disabled: true,
+                },
+                theme.disabled,
+            ),
+        ];
+
+        for (label, interaction, expected) in states {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+            let mut frame = Frame::new(&mut buffer);
+            Button::new("Action").styles(theme.button_styles()).render(
+                Rect::new(0, 0, 12, 1),
+                &ButtonState { interaction },
+                &mut frame,
+            );
+            assert_eq!(
+                frame
+                    .buffer()
+                    .get(Point::new(0, 0))
+                    .expect("button cell")
+                    .style,
+                expected,
+                "button {label}"
+            );
+        }
+
+        let checkbox = theme.checkbox_styles();
+        assert_eq!(checkbox.normal, theme.base);
+        assert_eq!(checkbox.hovered, theme.info);
+        assert_eq!(checkbox.focused, theme.focused);
+        assert_eq!(checkbox.pressed, theme.selected);
+        assert_eq!(checkbox.disabled, theme.disabled);
+
+        let badge = theme.badge_styles();
+        assert_eq!(badge.info.fg, theme.info.fg);
+        assert_eq!(badge.success.fg, theme.success.fg);
+        assert_eq!(badge.warning.fg, theme.warning.fg);
+        assert_eq!(badge.error.fg, theme.error.fg);
+        assert_eq!(theme.empty_state_styles().body, theme.muted);
+        assert_eq!(theme.progress_bar_styles().indeterminate, theme.info);
+    }
 }
