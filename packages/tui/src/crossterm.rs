@@ -11,12 +11,31 @@ use crossterm::event::{
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    size as crossterm_size,
 };
 use crossterm::{execute, queue};
 
 use crate::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use crate::geometry::{Point, Size};
 use bmux_keyboard::crossterm::{crossterm_key_event_is_release, crossterm_key_event_to_stroke};
+
+/// Return the current physical terminal size.
+///
+/// Widgets should consume the bounds supplied by their frame rather than call
+/// this function directly. Terminal applications use it at the backend
+/// boundary before constructing a [`crate::terminal::Terminal`].
+///
+/// # Errors
+///
+/// Returns any error reported by crossterm while querying terminal dimensions.
+pub fn terminal_size() -> io::Result<Size> {
+    let (width, height) = crossterm_size()?;
+    Ok(size_from_dimensions(width, height))
+}
+
+const fn size_from_dimensions(width: u16, height: u16) -> Size {
+    Size::new(width, height)
+}
 
 /// RAII guard for crossterm raw mode and alternate-screen lifecycle.
 ///
@@ -232,7 +251,10 @@ const fn mouse_modifiers_from_crossterm(modifiers: CrosstermKeyModifiers) -> Mou
 mod tests {
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 
-    use super::{event_from_crossterm, key_from_crossterm, poll_event, read_event};
+    use super::{
+        event_from_crossterm, key_from_crossterm, poll_event, read_event, size_from_dimensions,
+        terminal_size,
+    };
     use crate::event::{Event, FocusEvent, MouseButton, MouseEventKind};
 
     #[test]
@@ -240,6 +262,15 @@ mod tests {
         let _ = core::mem::size_of::<Option<super::CrosstermTerminalGuard<Vec<u8>>>>();
         let _ = poll_event as fn(std::time::Duration) -> std::io::Result<Option<Event>>;
         let _ = read_event as fn() -> std::io::Result<Option<Event>>;
+        let _ = terminal_size as fn() -> std::io::Result<crate::geometry::Size>;
+    }
+
+    #[test]
+    fn converts_terminal_dimensions_to_bmux_size() {
+        assert_eq!(
+            size_from_dimensions(144, 52),
+            crate::geometry::Size::new(144, 52)
+        );
     }
 
     #[test]

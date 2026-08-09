@@ -2,12 +2,12 @@ use std::io::{Stdout, stdout};
 
 use anyhow::Result;
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
-use bmux_tui::crossterm::CrosstermTerminalGuard;
+use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
-use bmux_tui_components_gallery::{HEIGHT, WIDTH, render_gallery_into};
+use bmux_tui_components_gallery::render_gallery_into;
 use bmux_tui_runtime::{
     Lifecycle, Program, Runtime, RuntimeConfig, RuntimeEvent, TerminalInput, TerminalPresenter,
     Update,
@@ -40,7 +40,8 @@ async fn main() -> Result<()> {
     let mut guard = CrosstermTerminalGuard::enter(stdout())?;
     let result = {
         let writer = guard.writer_mut().expect("guard should own stdout");
-        let terminal = Terminal::new(writer, Rect::new(0, 0, WIDTH, HEIGHT));
+        let size = terminal_size()?;
+        let terminal = Terminal::new(writer, Rect::new(0, 0, size.width, size.height));
         let presenter = TerminalPresenter::new(terminal, render_gallery_program);
         let (runtime, handle) = Runtime::new(
             GalleryProgram,

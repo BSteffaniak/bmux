@@ -59,7 +59,7 @@ pub mod prelude {
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
-        poll_event, read_event,
+        poll_event, read_event, terminal_size,
     };
     pub use crate::damage::{Damage, DamagePolicy};
     pub use crate::dialog::{Button, Dialog, DialogAction, DialogState};
