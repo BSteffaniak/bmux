@@ -1,0 +1,18 @@
+[benchmark]
+name = "tui-runtime-render"
+kind = "tui-runtime-render"
+
+[defaults]
+iterations = 50
+warmup = 5
+max_p99_ms = 100
+
+[profiles.normal]
+
+[profiles.diagnostic]
+loosen_slo = true
+
+[profiles.ci]
+
+[profiles.stress]
+loosen_slo = true

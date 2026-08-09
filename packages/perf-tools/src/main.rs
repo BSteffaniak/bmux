@@ -46,6 +46,7 @@ fn run() -> Result<(), String> {
         "sample-generic-ipc" => run_sample_generic_ipc(args),
         "sample-static-service" => run_sample_static_service(args),
         "sample-core-services" => run_sample_core_services(args),
+        "sample-tui-runtime-render" => run_sample_tui_runtime_render(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
         "compare-report" => run_compare_report(args),
         "discover-run-candidate" => run_discover_run_candidate(args),
@@ -72,6 +73,7 @@ fn usage() -> &'static str {
   sample-generic-ipc --iterations N --warmup N --out-json PATH
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
+  sample-tui-runtime-render --iterations N --warmup N --out-json PATH
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
   compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
   discover-run-candidate --bmux-bin PATH"
@@ -153,6 +155,7 @@ fn run_benchmark(args: Vec<String>) -> Result<(), String> {
         "generic-ipc" => run_generic_ipc_benchmark(&manifest, &options),
         "attach-tab-switch" => run_attach_tab_switch_benchmark(&manifest, &options),
         "plugin-hot-path" => run_plugin_hot_path_benchmark(&manifest, &options),
+        "tui-runtime-render" => run_tui_runtime_render_benchmark(&manifest, &options),
         other => Err(format!("unsupported benchmark kind '{other}'")),
     }
 }
@@ -286,6 +289,313 @@ fn parse_bool_arg(value: &str, name: &str) -> Result<bool, String> {
         "false" | "0" | "no" => Ok(false),
         _ => Err(format!("{name} must be true or false")),
     }
+}
+
+fn run_tui_runtime_render_benchmark(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
+        env::temp_dir()
+            .join("bmux-tui-runtime-render.json")
+            .display()
+            .to_string()
+    });
+    run_sample_tui_runtime_render(vec![
+        "--iterations".to_string(),
+        options.iterations.to_string(),
+        "--warmup".to_string(),
+        options.warmup.to_string(),
+        "--out-json".to_string(),
+        artifact_json.clone(),
+    ])?;
+    report_latency_if_needed(&artifact_json, options.max_p99_ms)?;
+    write_standard_benchmark_artifact(manifest, options, &artifact_json, &artifact_json)?;
+    println!("artifact_json={artifact_json}");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TuiBenchMessage {
+    Noop,
+    Localized,
+    Flood,
+    Resize,
+    Fallback,
+    UnicodeMetadata,
+    Exit,
+}
+
+#[derive(Default)]
+struct TuiBenchProgram {
+    revision: u64,
+    force_full: bool,
+}
+
+impl bmux_tui_runtime::Program for TuiBenchProgram {
+    type Message = TuiBenchMessage;
+    type Error = std::convert::Infallible;
+
+    fn update(
+        &mut self,
+        event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
+    ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+        let update = match event {
+            bmux_tui_runtime::RuntimeEvent::Message(TuiBenchMessage::Noop) => {
+                bmux_tui_runtime::Update::none()
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(TuiBenchMessage::Resize) => {
+                self.revision = self.revision.saturating_add(1);
+                self.force_full = true;
+                bmux_tui_runtime::Update::reset()
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(TuiBenchMessage::Fallback) => {
+                self.revision = self.revision.saturating_add(1);
+                self.force_full = true;
+                bmux_tui_runtime::Update::redraw()
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(TuiBenchMessage::Exit) => {
+                bmux_tui_runtime::Update::exit()
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(_)
+            | bmux_tui_runtime::RuntimeEvent::Terminal(_)
+            | bmux_tui_runtime::RuntimeEvent::Timer(_) => {
+                self.revision = self.revision.saturating_add(1);
+                bmux_tui_runtime::Update::redraw()
+            }
+        };
+        Ok(update)
+    }
+}
+
+struct TuiBenchPresenter {
+    terminal: bmux_tui::terminal::Terminal<Vec<u8>>,
+}
+
+impl Default for TuiBenchPresenter {
+    fn default() -> Self {
+        Self {
+            terminal: bmux_tui::terminal::Terminal::new(
+                Vec::new(),
+                bmux_tui::geometry::Rect::new(0, 0, 100, 30),
+            ),
+        }
+    }
+}
+
+impl bmux_tui_runtime::Presenter<TuiBenchProgram> for TuiBenchPresenter {
+    type Error = std::io::Error;
+
+    fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {
+        self.terminal.reset();
+    }
+
+    fn present(
+        &mut self,
+        program: &mut TuiBenchProgram,
+    ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
+        let area = bmux_tui::geometry::Rect::new(0, 0, 100, 30);
+        let localized = bmux_tui::geometry::Rect::new(2, 28, 60, 1);
+        let render = |frame: &mut bmux_tui::frame::Frame<'_>| {
+            let style = bmux_tui::style::Style::new()
+                .fg(bmux_tui::style::Color::Cyan)
+                .add_modifier(bmux_tui::style::Modifier::BOLD);
+            frame.fill(area, " ", bmux_tui::style::Style::new());
+            frame.write_line(
+                bmux_tui::geometry::Rect::new(1, 1, 98, 1),
+                &bmux_tui::text::Line::from_spans([
+                    bmux_tui::text::Span::styled("BMUX TUI ", style),
+                    bmux_tui::text::Span::raw("Unicode: 界 👨‍👩‍👧‍👦 e\u{301}"),
+                ]),
+            );
+            frame.write_line(
+                localized,
+                &bmux_tui::text::Line::raw(format!("revision {}", program.revision)),
+            );
+            frame.push_hit(bmux_tui::hit::HitRegion::new("benchmark.action", localized));
+            frame.push_image(bmux_tui::image::ImageContribution::Present(
+                bmux_tui::image::ImagePlacement {
+                    key: bmux_tui::image::ImageKey::new("benchmark.image"),
+                    payload: bmux_tui::image::ImagePayload::Pixels {
+                        bytes: vec![0, 128, 255, 255],
+                        width: 1,
+                        height: 1,
+                        format: bmux_tui::image::ImagePixelFormat::Rgba8,
+                    },
+                    destination: bmux_tui::geometry::Rect::new(90, 2, 2, 1),
+                    clip: area,
+                    lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                },
+            ));
+            frame.set_cursor(bmux_tui::frame::Cursor::visible(
+                bmux_tui::geometry::Point::new(2, 28),
+            ));
+        };
+        let damage = if program.force_full {
+            program.force_full = false;
+            bmux_tui::damage::Damage::Full
+        } else {
+            bmux_tui::damage::Damage::regions(
+                [localized],
+                area,
+                bmux_tui::damage::DamagePolicy::default(),
+            )
+        };
+        let stats = if self.terminal.retained_buffer().is_some() {
+            self.terminal.draw_damage(damage, render)?
+        } else {
+            self.terminal.draw(render)?
+        };
+        Ok(bmux_tui_runtime::PresentReport {
+            changed_cells: stats.changed_cells,
+            full_repaint: stats.full_repaint,
+        })
+    }
+}
+
+async fn tui_runtime_render_sample() -> Result<(f64, bmux_tui_runtime::RuntimeStats), String> {
+    let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+        TuiBenchProgram::default(),
+        TuiBenchPresenter::default(),
+        bmux_tui_runtime::RuntimeConfig {
+            reliable_capacity: 512,
+            terminal_capacity: 16,
+            latest_capacity: 16,
+            messages_per_turn: 8,
+            processing_time_per_turn: std::time::Duration::from_millis(1),
+            frame_interval: None,
+            ..bmux_tui_runtime::RuntimeConfig::default()
+        },
+    );
+    let started = Instant::now();
+    handle
+        .try_send(TuiBenchMessage::Noop)
+        .map_err(|_| "noop admission failed")?;
+    handle
+        .try_send(TuiBenchMessage::Localized)
+        .map_err(|_| "localized admission failed")?;
+    for _ in 0..128 {
+        handle
+            .try_send(TuiBenchMessage::Flood)
+            .map_err(|_| "flood admission failed")?;
+    }
+    handle
+        .send_latest(
+            bmux_tui_runtime::MessageKey::new("tui.redraw"),
+            TuiBenchMessage::Localized,
+        )
+        .map_err(|_| "latest redraw admission failed")?;
+    handle
+        .try_send_terminal(bmux_tui::event::Event::Tick)
+        .map_err(|_| "terminal admission failed")?;
+    handle.schedule_timer(bmux_tui_runtime::TimerId::new("tui.timer"), Instant::now());
+    for message in [
+        TuiBenchMessage::UnicodeMetadata,
+        TuiBenchMessage::Resize,
+        TuiBenchMessage::Fallback,
+        TuiBenchMessage::Exit,
+    ] {
+        handle
+            .try_send(message)
+            .map_err(|_| "scenario admission failed")?;
+    }
+    let output = runtime
+        .run()
+        .await
+        .map_err(|_| "TUI runtime benchmark failed".to_string())?;
+    Ok((started.elapsed().as_secs_f64() * 1_000.0, output.stats))
+}
+
+fn run_sample_tui_runtime_render(args: Vec<String>) -> Result<(), String> {
+    let mut iterations = None;
+    let mut warmup = 0_usize;
+    let mut out_json = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--iterations" => {
+                iterations = Some(parse_usize_arg(&args, index, "--iterations")?);
+                index += 2;
+            }
+            "--warmup" => {
+                warmup = parse_usize_arg(&args, index, "--warmup")?;
+                index += 2;
+            }
+            "--out-json" => {
+                out_json = Some(require_arg(&args, index, "--out-json")?.to_string());
+                index += 2;
+            }
+            other => return Err(format!("unknown TUI benchmark argument: {other}")),
+        }
+    }
+    let iterations = iterations.ok_or_else(|| "--iterations is required".to_string())?;
+    let out_json = out_json.ok_or_else(|| "--out-json is required".to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("failed building benchmark runtime: {error}"))?;
+    for _ in 0..warmup {
+        runtime.block_on(tui_runtime_render_sample())?;
+    }
+    let mut samples_ms = Vec::with_capacity(iterations);
+    let mut aggregate = bmux_tui_runtime::RuntimeStats::default();
+    for _ in 0..iterations {
+        let (sample_ms, stats) = runtime.block_on(tui_runtime_render_sample())?;
+        samples_ms.push(sample_ms);
+        aggregate.frames_presented = aggregate
+            .frames_presented
+            .saturating_add(stats.frames_presented);
+        aggregate.full_repaints = aggregate.full_repaints.saturating_add(stats.full_repaints);
+        aggregate.presented_changed_cells = aggregate
+            .presented_changed_cells
+            .saturating_add(stats.presented_changed_cells);
+        aggregate.scheduler_budget_exhausted = aggregate
+            .scheduler_budget_exhausted
+            .saturating_add(stats.scheduler_budget_exhausted);
+        aggregate.terminal_processed = aggregate
+            .terminal_processed
+            .saturating_add(stats.terminal_processed);
+        aggregate.timers_delivered = aggregate
+            .timers_delivered
+            .saturating_add(stats.timers_delivered);
+        aggregate.reliable_rejected = aggregate
+            .reliable_rejected
+            .saturating_add(stats.reliable_rejected);
+        aggregate.terminal_rejected = aggregate
+            .terminal_rejected
+            .saturating_add(stats.terminal_rejected);
+        aggregate.latest_rejected = aggregate
+            .latest_rejected
+            .saturating_add(stats.latest_rejected);
+    }
+    let payload = json!({
+        "samples_ms": samples_ms,
+        "workload": {
+            "quiet_noop": 1,
+            "localized_changes": 2,
+            "flood_messages": 128,
+            "terminal_events": 1,
+            "timers": 1,
+            "resize_resets": 1,
+            "damage_fallbacks": 1,
+            "unicode_image_hit_map_cases": 1,
+        },
+        "structural_counts": {
+            "frames_presented": aggregate.frames_presented,
+            "full_repaints": aggregate.full_repaints,
+            "changed_cells": aggregate.presented_changed_cells,
+            "scheduler_budget_exhausted": aggregate.scheduler_budget_exhausted,
+            "terminal_processed": aggregate.terminal_processed,
+            "timers_delivered": aggregate.timers_delivered,
+            "admission_rejections": aggregate.reliable_rejected
+                .saturating_add(aggregate.terminal_rejected)
+                .saturating_add(aggregate.latest_rejected),
+        },
+        "runtime_faults": {"retries": 0, "respawns": 0, "timeouts": 0},
+    });
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding TUI benchmark: {error}"))?;
+    fs::write(out_json, encoded).map_err(|error| format!("failed writing TUI benchmark: {error}"))
 }
 
 fn run_core_services_benchmark(
@@ -829,6 +1139,15 @@ fn validate_benchmark_phases_with_vars(
     run_validate_phase_config(args)
 }
 
+fn latency_gate_passed(latency: Option<&Value>, max_p99_ms: Option<f64>) -> bool {
+    max_p99_ms.is_none_or(|limit| {
+        latency
+            .and_then(|value| value.get("p99"))
+            .and_then(Value::as_f64)
+            .is_some_and(|p99| p99 <= limit)
+    })
+}
+
 fn write_standard_benchmark_artifact(
     manifest: &BenchmarkManifest,
     options: &BenchmarkResolvedOptions,
@@ -847,6 +1166,10 @@ fn write_standard_benchmark_artifact(
         "started_at_unix_ms": unix_now_ms(),
         "git_rev": git_output(&["rev-parse", "HEAD"]),
         "git_dirty": git_dirty(),
+        "rustc_version": command_output("rustc", &["--version"]),
+        "cargo_version": command_output("cargo", &["--version"]),
+        "target_os": env::consts::OS,
+        "target_arch": env::consts::ARCH,
         "manifest_path": options.manifest_path,
         "command": format!("run-benchmark --manifest {} --profile {}", options.manifest_path, options.profile),
         "profile": options.profile,
@@ -859,6 +1182,8 @@ fn write_standard_benchmark_artifact(
         "previsit_rounds": options.previsit_rounds,
         "phase_report_dir": options.phase_report_dir,
         "limits": options.limits,
+        "max_p99_ms": options.max_p99_ms,
+        "latency_gate_passed": latency_gate_passed(latency.as_ref(), options.max_p99_ms),
         "tags": options.tags,
         "loosen_slo": options.loosen_slo,
         "plugin_timing": options.plugin_timing,
@@ -882,12 +1207,16 @@ fn unix_now_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
-fn git_output(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    command_output("git", args)
 }
 
 fn git_dirty() -> Option<bool> {
@@ -3983,6 +4312,17 @@ mod tests {
         assert_eq!(summary.steady_p95_ms, None);
         assert_eq!(summary.steady_p99_ms, None);
         assert_eq!(summary.steady_avg_ms, None);
+    }
+
+    #[test]
+    fn standard_artifact_latency_gate_requires_present_passing_p99() {
+        let passing = json!({"p99": 19.5});
+        let failing = json!({"p99": 101.0});
+
+        assert!(super::latency_gate_passed(Some(&passing), Some(100.0)));
+        assert!(!super::latency_gate_passed(Some(&failing), Some(100.0)));
+        assert!(!super::latency_gate_passed(None, Some(100.0)));
+        assert!(super::latency_gate_passed(None, None));
     }
 
     #[test]

@@ -51,8 +51,18 @@ pub struct RuntimeStats {
     pub redraw_coalesced: u64,
     /// Frames successfully presented.
     pub frames_presented: u64,
+    /// Successful presentations that repainted the complete terminal surface.
+    pub full_repaints: u64,
+    /// Total terminal cells reported changed by successful presentations.
+    pub presented_changed_cells: u64,
     /// Total presentation scheduling delay in microseconds.
     pub presentation_delay_us: u64,
+    /// Total time spent in successful presenter calls, in microseconds.
+    pub presentation_time_us: u64,
+    /// Program update calls completed successfully.
+    pub updates_completed: u64,
+    /// Total time spent in successful program update calls, in microseconds.
+    pub update_time_us: u64,
     /// Commands started by the runtime.
     pub commands_started: u64,
     /// Commands queued behind keyed work.

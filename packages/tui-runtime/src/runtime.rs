@@ -511,7 +511,14 @@ where
             RuntimeEvent::Terminal(Event::Resize(size)) => Some(*size),
             RuntimeEvent::Terminal(_) | RuntimeEvent::Message(_) | RuntimeEvent::Timer(_) => None,
         };
+        let update_started = Instant::now();
         let update = self.program.update(event)?;
+        let update_time_us =
+            u64::try_from(update_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        with_stats(&self.stats, |stats| {
+            stats.updates_completed = stats.updates_completed.saturating_add(1);
+            stats.update_time_us = stats.update_time_us.saturating_add(update_time_us);
+        });
         if let Some(size) = resize {
             self.presenter.resize(size);
             self.presenter.reset(ResetReason::Resize);
@@ -591,19 +598,36 @@ where
         if reset {
             self.presenter.reset(ResetReason::Application);
         }
-        let _report = self.presenter.present(&mut self.program)?;
-        self.last_presented = Some(Instant::now());
+        let presentation_started = Instant::now();
+        let report = self.presenter.present(&mut self.program)?;
+        let presented_at = Instant::now();
+        let presentation_time_us = u64::try_from(
+            presented_at
+                .saturating_duration_since(presentation_started)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        self.last_presented = Some(presented_at);
         {
             let mut state = lock_unpoisoned(&self.control.state);
             state.dirty = false;
             state.reset = false;
         }
-        let delay = Instant::now().saturating_duration_since(scheduled_at);
+        let delay = presented_at.saturating_duration_since(scheduled_at);
         with_stats(&self.stats, |stats| {
             stats.frames_presented = stats.frames_presented.saturating_add(1);
+            stats.full_repaints = stats
+                .full_repaints
+                .saturating_add(u64::from(report.full_repaint));
+            stats.presented_changed_cells = stats
+                .presented_changed_cells
+                .saturating_add(u64::try_from(report.changed_cells).unwrap_or(u64::MAX));
             stats.presentation_delay_us = stats
                 .presentation_delay_us
                 .saturating_add(u64::try_from(delay.as_micros()).unwrap_or(u64::MAX));
+            stats.presentation_time_us = stats
+                .presentation_time_us
+                .saturating_add(presentation_time_us);
         });
         Ok(())
     }

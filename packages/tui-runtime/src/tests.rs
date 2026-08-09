@@ -224,6 +224,45 @@ async fn disabled_cadence_presents_dirty_state_promptly() {
     assert_eq!(output.stats.frames_presented, 1);
 }
 
+struct ReportingPresenter {
+    report: crate::PresentReport,
+}
+
+impl<P> crate::Presenter<P> for ReportingPresenter {
+    type Error = Infallible;
+
+    fn reset(&mut self, _reason: crate::ResetReason) {}
+
+    fn present(&mut self, _program: &mut P) -> Result<crate::PresentReport, Self::Error> {
+        Ok(self.report)
+    }
+}
+
+#[tokio::test]
+async fn successful_updates_and_presenter_reports_are_accounted() {
+    let (runtime, handle) = Runtime::new(
+        RecordingProgram {
+            exit_after: Some(1),
+            ..RecordingProgram::default()
+        },
+        ReportingPresenter {
+            report: crate::PresentReport {
+                changed_cells: 7,
+                full_repaint: true,
+            },
+        },
+        unlimited_config(),
+    );
+    handle.try_send(1).expect("message fits");
+
+    let output = runtime_output(runtime.run().await);
+
+    assert_eq!(output.stats.updates_completed, 1);
+    assert_eq!(output.stats.frames_presented, 1);
+    assert_eq!(output.stats.full_repaints, 1);
+    assert_eq!(output.stats.presented_changed_cells, 7);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PresentFailure;
 
@@ -250,6 +289,9 @@ async fn presenter_failure_is_terminal_and_does_not_commit_frame() {
     let crate::RuntimeError::Presenter { error, output } = error;
     assert_eq!(error, PresentFailure);
     assert_eq!(output.stats.frames_presented, 0);
+    assert_eq!(output.stats.full_repaints, 0);
+    assert_eq!(output.stats.presented_changed_cells, 0);
+    assert_eq!(output.stats.presentation_time_us, 0);
 }
 
 #[tokio::test]

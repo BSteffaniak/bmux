@@ -90,6 +90,26 @@ impl Buffer {
             .and_then(|index| self.cells.get_mut(index))
     }
 
+    /// Restore cells outside `regions` from `retained`, leaving region cells as rendered.
+    pub fn restore_outside(&mut self, retained: &Self, regions: &[Rect]) {
+        if self.area != retained.area {
+            return;
+        }
+        for y in self.area.y..self.area.bottom() {
+            for x in self.area.x..self.area.right() {
+                let point = Point::new(x, y);
+                if regions.iter().any(|region| region.contains(point)) {
+                    continue;
+                }
+                if let (Some(source), Some(destination)) =
+                    (retained.get(point), self.get_mut(point))
+                {
+                    destination.clone_from(source);
+                }
+            }
+        }
+    }
+
     /// Set a cell if the point is inside this buffer.
     pub fn set_cell(&mut self, point: Point, symbol: impl Into<String>, style: Style) {
         if let Some(cell) = self.get_mut(point) {

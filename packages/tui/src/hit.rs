@@ -175,6 +175,12 @@ impl HitMap {
         }
     }
 
+    /// Retain only regions that do not intersect `area`.
+    pub fn retain_outside(&mut self, area: Rect) {
+        self.regions
+            .retain(|region| region.area.intersection(area).is_empty());
+    }
+
     /// Add and return this hit map for builder-style composition.
     #[must_use]
     pub fn with_region(mut self, region: HitRegion) -> Self {

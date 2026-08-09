@@ -156,15 +156,21 @@ Future responsive widgets should be able to switch presentation by available wid
 
 ## Rendering model
 
-The framework should render into a neutral cell buffer first. Backends then flush the buffer to crossterm/ANSI or other targets.
+The framework renders into a neutral cell buffer first. Backends then flush the buffer to crossterm/ANSI or other targets.
 
 Important properties:
 
-- clipping must be explicit and reliable
-- wide/unicode text behavior must be deliberate
-- style patching should be cheap and predictable
-- render output should be easy to assert in tests
-- later backend flushing should support damage/incremental updates
+- clipping is explicit and reliable
+- wide/unicode text behavior is deliberate
+- style patching is cheap and predictable
+- render output is easy to assert in tests
+- complete frames use retained-buffer incremental ANSI diffing
+- `Damage::Regions` supports process-local partial presentation: regions are clipped, deterministically coalesced, bounded by count and area, and promoted to `Damage::Full` when excessive
+- partial renders begin with an empty staging buffer; only declared damaged cells survive, while cells and hit/image metadata outside damage are restored from the last committed presentation
+- resize, reset, first presentation, and unknown damage use a complete presentation
+- terminal output and metadata commit atomically after a successful flush; output failure preserves committed metadata, discards the uncertain retained buffer, and forces the next successful draw to repaint fully
+
+This retained state is process-local terminal presentation state. It does not define transport retention, acknowledgment, replay, conflict handling, reconnect safety, or durable resume.
 
 ## Performance direction
 
@@ -174,8 +180,8 @@ Required performance direction:
 
 - virtualized lists/transcripts/diffs
 - wrapping caches keyed by content revision and width
-- dirty-region or damage tracking where practical
-- incremental buffer diffing before backend flush
+- bounded dirty-region damage with safe full-frame fallback
+- incremental retained-buffer diffing before backend flush
 - avoid full transcript/diff re-render work every frame
 - performance tests for resize churn, large transcripts, and large diffs
 

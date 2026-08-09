@@ -4,6 +4,7 @@ use std::io::{self, Write};
 
 use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 use crate::buffer::Buffer;
+use crate::damage::Damage;
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::HitMap;
@@ -49,6 +50,7 @@ pub struct Terminal<W> {
     images: Vec<ImageContribution>,
     image_scene: ImageScene,
     image_delta: ImageSceneDelta,
+    cursor: Option<crate::frame::Cursor>,
 }
 
 impl<W: Write> Terminal<W> {
@@ -63,6 +65,7 @@ impl<W: Write> Terminal<W> {
             images: Vec::new(),
             image_scene: ImageScene::default(),
             image_delta: ImageSceneDelta::default(),
+            cursor: None,
         }
     }
 
@@ -70,6 +73,18 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn area(&self) -> Rect {
         self.area
+    }
+
+    /// Return the last successfully committed cell buffer, if one exists.
+    #[must_use]
+    pub const fn retained_buffer(&self) -> Option<&Buffer> {
+        self.previous.as_ref()
+    }
+
+    /// Return the cursor state from the last successfully committed draw.
+    #[must_use]
+    pub const fn cursor(&self) -> Option<crate::frame::Cursor> {
+        self.cursor
     }
 
     /// Return the hit map registered by the last draw.
@@ -109,33 +124,101 @@ impl<W: Write> Terminal<W> {
         }
     }
 
-    /// Draw one frame.
+    /// Draw one complete frame.
     ///
     /// # Errors
     ///
     /// Returns any I/O error reported by the backend writer.
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawStats> {
+        self.draw_damage(Damage::Full, render)
+    }
+
+    /// Draw a frame using process-local retained presentation state outside `damage`.
+    ///
+    /// Region damage is valid only after a successful complete presentation. If no retained
+    /// frame exists, the terminal safely promotes the draw to a complete presentation. Rendering
+    /// and metadata are staged and become authoritative only after terminal output flushes.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error reported by the backend writer. Failed output does not advance the
+    /// retained buffer, hit map, cursor, or image scene.
+    pub fn draw_damage(
+        &mut self,
+        damage: Damage,
+        render: impl FnOnce(&mut Frame<'_>),
+    ) -> io::Result<DrawStats> {
+        let damage = if self.previous.is_none() {
+            Damage::Full
+        } else {
+            damage
+        };
+        if damage.is_none() {
+            return Ok(DrawStats {
+                changed_cells: 0,
+                full_repaint: false,
+            });
+        }
+        let regions = damage.retained_regions();
         let mut buffer = Buffer::empty(self.area);
         let (cursor, hits, images) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
-            (
-                frame.cursor(),
-                frame.hits().clone(),
-                frame.images().to_vec(),
-            )
+            let mut hits = if matches!(damage, Damage::Regions(_)) {
+                let mut retained = self.hits.clone();
+                for region in regions {
+                    retained.retain_outside(*region);
+                }
+                retained
+            } else {
+                HitMap::new()
+            };
+            for hit in frame.hits().regions() {
+                if !matches!(damage, Damage::Regions(_))
+                    || regions
+                        .iter()
+                        .any(|region| !hit.area.intersection(*region).is_empty())
+                {
+                    hits.push(hit.clone());
+                }
+            }
+            let mut images = if matches!(damage, Damage::Regions(_)) {
+                self.image_scene.contributions_outside(regions)
+            } else {
+                Vec::new()
+            };
+            images.extend_from_slice(frame.images());
+            let cursor = frame.cursor();
+            (cursor, hits, images)
         };
+        if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
+            buffer.restore_outside(previous, regions);
+        }
 
-        let stats = if let Some(previous) = &self.previous {
-            write_ansi_frame_diff(&mut self.writer, previous, &buffer, cursor)?.into()
-        } else {
-            write_ansi_frame(&mut self.writer, &buffer, cursor)?;
-            DrawStats::full(buffer.cells().len())
+        let output = (|| {
+            let stats = if let Some(previous) = &self.previous {
+                write_ansi_frame_diff(&mut self.writer, previous, &buffer, cursor)?.into()
+            } else {
+                write_ansi_frame(&mut self.writer, &buffer, cursor)?;
+                DrawStats::full(buffer.cells().len())
+            };
+            self.writer.flush()?;
+            Ok(stats)
+        })();
+        let stats = match output {
+            Ok(stats) => stats,
+            Err(error) => {
+                self.reset();
+                return Err(error);
+            }
         };
-        self.writer.flush()?;
+        let mut image_scene = self.image_scene.clone();
+        let image_delta = image_scene.reconcile(&images);
         self.hits = hits;
-        self.image_delta = self.image_scene.reconcile(&images);
+        self.image_scene = image_scene;
+        self.image_delta = image_delta;
         self.images = images;
+        self.cursor = cursor;
         self.previous = Some(buffer);
         Ok(stats)
     }
@@ -160,9 +243,37 @@ impl<W: Write> Terminal<W> {
 #[cfg(test)]
 mod tests {
     use super::Terminal;
+    use crate::damage::Damage;
+    use crate::frame::Cursor;
     use crate::geometry::{Point, Rect};
+    use crate::hit::HitRegion;
     use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::style::Style;
+    use std::io::{self, Write};
+
+    struct FailingWriter {
+        bytes: Vec<u8>,
+        fail: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail {
+                Err(io::Error::other("injected write failure"))
+            } else {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     #[test]
     fn terminal_first_draw_repaints_full_frame() {
@@ -215,6 +326,161 @@ mod tests {
 
         terminal.resize(Rect::new(0, 0, 2, 1));
         let stats = terminal.draw(|_| {}).unwrap();
+
+        assert!(stats.full_repaint);
+        assert_eq!(stats.changed_cells, 2);
+    }
+
+    #[test]
+    fn region_draw_retains_undamaged_cells_and_metadata() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+        terminal
+            .draw(|frame| {
+                frame.fill(Rect::new(0, 0, 4, 2), "A", Style::new());
+                frame.push_hit(HitRegion::new("left", Rect::new(0, 0, 2, 2)));
+                frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 2)));
+                frame.set_cursor(Cursor::visible(Point::new(3, 1)));
+            })
+            .unwrap();
+
+        let stats = terminal
+            .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 2, 2)]), |frame| {
+                frame.fill(Rect::new(0, 0, 2, 2), "B", Style::new());
+                frame.push_hit(HitRegion::new("new-left", Rect::new(0, 0, 2, 2)));
+            })
+            .unwrap();
+
+        assert_eq!(stats.changed_cells, 4);
+        assert!(!stats.full_repaint);
+        assert_eq!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .map(|region| region.id.as_str())
+                .collect::<Vec<_>>(),
+            ["right", "new-left"]
+        );
+    }
+
+    #[test]
+    fn region_draw_discards_writes_outside_declared_damage() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 4, 1));
+        terminal
+            .draw(|frame| frame.fill(frame.area(), "A", Style::new()))
+            .unwrap();
+        let before = terminal.writer().len();
+
+        let stats = terminal
+            .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |frame| {
+                frame.fill(frame.area(), "Z", Style::new());
+            })
+            .unwrap();
+
+        assert_eq!(stats.changed_cells, 1);
+        assert_eq!(
+            String::from_utf8_lossy(&terminal.writer()[before..])
+                .matches('Z')
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn region_draw_clears_removed_content_inside_damage() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
+        terminal
+            .draw(|frame| frame.fill(frame.area(), "A", Style::new()))
+            .unwrap();
+
+        let stats = terminal
+            .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |_| {})
+            .unwrap();
+
+        assert_eq!(stats.changed_cells, 1);
+    }
+
+    #[test]
+    fn failed_region_draw_does_not_commit_metadata() {
+        let writer = FailingWriter {
+            bytes: Vec::new(),
+            fail: false,
+        };
+        let mut terminal = Terminal::new(writer, Rect::new(0, 0, 2, 1));
+        terminal
+            .draw(|frame| {
+                frame.fill(frame.area(), "A", Style::new());
+                frame.push_hit(HitRegion::new("committed", frame.area()));
+                frame.set_cursor(Cursor::visible(Point::new(1, 0)));
+            })
+            .unwrap();
+        terminal.writer_mut().fail = true;
+
+        let result = terminal.draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |frame| {
+            frame.fill(frame.area(), "B", Style::new());
+            frame.push_hit(HitRegion::new("uncommitted", frame.area()));
+            frame.set_cursor(Cursor::hidden(Point::new(0, 0)));
+        });
+
+        assert!(result.is_err());
+        assert_eq!(terminal.hits().regions()[0].id.as_str(), "committed");
+        terminal.writer_mut().fail = false;
+        let recovered = terminal.draw(|frame| frame.fill(frame.area(), "C", Style::new()));
+        assert!(recovered.expect("full recovery draw succeeds").full_repaint);
+    }
+
+    #[test]
+    fn region_draw_matches_complete_frame_for_declared_change() {
+        fn first(frame: &mut crate::frame::Frame<'_>) {
+            frame.fill(frame.area(), "A", Style::new());
+            frame.push_hit(HitRegion::new("left", Rect::new(0, 0, 2, 1)));
+            frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 1)));
+            frame.set_cursor(Cursor::visible(Point::new(3, 0)));
+        }
+        fn second(frame: &mut crate::frame::Frame<'_>) {
+            frame.fill(Rect::new(0, 0, 2, 1), "B", Style::new());
+            frame.fill(Rect::new(2, 0, 2, 1), "A", Style::new());
+            frame.push_hit(HitRegion::new("new-left", Rect::new(0, 0, 2, 1)));
+            frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 1)));
+            frame.set_cursor(Cursor::visible(Point::new(3, 0)));
+        }
+
+        let area = Rect::new(0, 0, 4, 1);
+        let mut complete = Terminal::new(Vec::new(), area);
+        complete.draw(first).unwrap();
+        complete.draw(second).unwrap();
+        let mut partial = Terminal::new(Vec::new(), area);
+        partial.draw(first).unwrap();
+        partial
+            .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 2, 1)]), second)
+            .unwrap();
+
+        assert_eq!(partial.retained_buffer(), complete.retained_buffer());
+        for point in [Point::new(0, 0), Point::new(3, 0)] {
+            assert_eq!(
+                partial
+                    .hits()
+                    .hit_test(point)
+                    .map(|hit| hit.id().as_str().to_owned()),
+                complete
+                    .hits()
+                    .hit_test(point)
+                    .map(|hit| hit.id().as_str().to_owned())
+            );
+        }
+        assert_eq!(partial.cursor(), complete.cursor());
+        assert_eq!(partial.image_scene(), complete.image_scene());
+    }
+
+    #[test]
+    fn region_draw_without_retained_frame_promotes_to_full() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
+
+        let stats = terminal
+            .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |frame| {
+                frame.fill(Rect::new(0, 0, 1, 1), "X", Style::new());
+            })
+            .unwrap();
 
         assert!(stats.full_repaint);
         assert_eq!(stats.changed_cells, 2);

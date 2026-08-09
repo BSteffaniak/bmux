@@ -16,6 +16,7 @@ pub mod chrome;
 pub mod clear;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
+pub mod damage;
 pub mod dialog;
 #[cfg(feature = "diff")]
 pub mod diff;
@@ -60,6 +61,7 @@ pub mod prelude {
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
         poll_event, read_event,
     };
+    pub use crate::damage::{Damage, DamagePolicy};
     pub use crate::dialog::{Button, Dialog, DialogAction, DialogState};
     #[cfg(feature = "diff")]
     pub use crate::diff::{

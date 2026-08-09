@@ -1898,6 +1898,8 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_server",
+ "bmux_tui",
+ "bmux_tui_runtime",
  "serde",
  "serde_json",
  "tokio",

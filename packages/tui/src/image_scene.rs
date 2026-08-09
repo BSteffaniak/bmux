@@ -32,6 +32,24 @@ impl ImageScene {
         self.active.get(key)
     }
 
+    /// Clone retained placements that do not intersect any damaged region.
+    #[must_use]
+    pub fn contributions_outside(
+        &self,
+        regions: &[crate::geometry::Rect],
+    ) -> Vec<ImageContribution> {
+        self.active
+            .values()
+            .filter(|placement| {
+                !regions
+                    .iter()
+                    .any(|region| !placement.destination.intersection(*region).is_empty())
+            })
+            .cloned()
+            .map(ImageContribution::Present)
+            .collect()
+    }
+
     /// Reconcile contributions emitted by one complete rendered frame.
     ///
     /// Frame-scoped images omitted from `contributions` are removed. Persistent
@@ -149,5 +167,24 @@ mod tests {
         ]);
 
         assert_eq!(scene.get(&ImageKey::new("image")), Some(&last));
+    }
+
+    #[test]
+    fn retained_contributions_outside_damage_use_destination_not_shared_clip() {
+        let mut scene = ImageScene::default();
+        let left = placement("left", 1, ImageLifecycle::Frame);
+        let right = placement("right", 5, ImageLifecycle::Frame);
+        scene.reconcile(&[
+            ImageContribution::Present(left),
+            ImageContribution::Present(right),
+        ]);
+
+        let retained = scene.contributions_outside(&[Rect::new(0, 0, 3, 3)]);
+
+        assert_eq!(retained.len(), 1);
+        assert!(matches!(
+            &retained[0],
+            ImageContribution::Present(placement) if placement.key.as_str() == "right"
+        ));
     }
 }

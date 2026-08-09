@@ -66,7 +66,7 @@ Graceful exit stops admission processing, cancels runtime-owned command and subs
 
 ## Observability
 
-A lightweight runtime statistics snapshot reports queue depth and high-water marks, backpressure/rejection counts, latest-value replacements, processed event classes, scheduler budget exhaustion, redraw requests and coalescing, frame count and scheduling delay, command lifecycle, stale completions, and timer activity. Consumers translate these neutral measurements into their own metrics systems.
+A lightweight runtime statistics snapshot reports queue depth and high-water marks, backpressure/rejection counts, latest-value replacements, processed event classes, scheduler budget exhaustion, redraw requests and coalescing, frame count and scheduling delay, successful update and presentation time, presenter-reported changed cells and full repaints, command lifecycle, stale completions, and timer activity. Timing fields are cumulative microsecond observations intended for attribution and consumer-side deltas, not embedded product SLOs. Failed updates and presentations do not advance successful-work or committed-output totals. Consumers translate these neutral measurements into their own metrics systems.
 
 ## Non-goals
 

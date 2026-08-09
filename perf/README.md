@@ -89,6 +89,7 @@ Run manifests directly with:
 bmux-perf-tools run-benchmark --manifest perf/core-services.toml --profile normal
 bmux-perf-tools run-benchmark --manifest perf/codec-payloads.toml --profile normal
 bmux-perf-tools run-benchmark --manifest perf/generic-ipc.toml --profile normal
+bmux-perf-tools run-benchmark --manifest perf/tui-runtime-render.toml --profile normal
 bmux-perf-tools run-benchmark --manifest perf/attach-tab-switch.toml --profile normal --bmux-bin target/debug/bmux
 bmux-perf-tools list-benchmarks --dir perf
 bmux-perf-tools validate-phase-schema --input /tmp/bmux-benchmark.json
@@ -131,13 +132,14 @@ The benchmark runner forwards all standard phase channels when their profile ena
 
 ## Registry
 
-| Benchmark         | Manifest                      | Runner Kind         | Normal SLO                                                |
-| ----------------- | ----------------------------- | ------------------- | --------------------------------------------------------- |
-| Attach tab switch | `perf/attach-tab-switch.toml` | `attach-tab-switch` | `attach.plugin_command` p99 \<= 8ms, retarget p99 \<= 8ms |
-| Codec payloads    | `perf/codec-payloads.toml`    | `codec-payloads`    | codec payload p99 \<= 0.08ms                              |
-| Core services     | `perf/core-services.toml`     | `core-services`     | core service p99 \<= 1ms                                  |
-| Generic IPC       | `perf/generic-ipc.toml`       | `generic-ipc`       | ping/invoke p99 \<= 5ms                                   |
-| Plugin hot path   | `perf/plugin-hot-path.toml`   | `plugin-hot-path`   | static service dispatch p99 \<= 5ms                       |
+| Benchmark          | Manifest                       | Runner Kind          | Normal SLO                                                |
+| ------------------ | ------------------------------ | -------------------- | --------------------------------------------------------- |
+| Attach tab switch  | `perf/attach-tab-switch.toml`  | `attach-tab-switch`  | `attach.plugin_command` p99 \<= 8ms, retarget p99 \<= 8ms |
+| Codec payloads     | `perf/codec-payloads.toml`     | `codec-payloads`     | codec payload p99 \<= 0.08ms                              |
+| Core services      | `perf/core-services.toml`      | `core-services`      | core service p99 \<= 1ms                                  |
+| Generic IPC        | `perf/generic-ipc.toml`        | `generic-ipc`        | ping/invoke p99 \<= 5ms                                   |
+| Plugin hot path    | `perf/plugin-hot-path.toml`    | `plugin-hot-path`    | static service dispatch p99 \<= 5ms                       |
+| TUI runtime/render | `perf/tui-runtime-render.toml` | `tui-runtime-render` | end-to-end runtime/render p99 \<= 100ms                   |
 
 ## Maintenance Checklist
 
