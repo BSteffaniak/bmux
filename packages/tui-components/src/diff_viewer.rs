@@ -663,6 +663,25 @@ pub struct DiffViewerStyle {
     pub removed_emphasis: Style,
 }
 
+impl From<crate::theme::ComponentTheme> for DiffViewerStyle {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let defaults = Self::default();
+        Self {
+            text: theme.text,
+            muted: theme.muted,
+            title: theme.focused,
+            label: theme.text.add_modifier(Modifier::BOLD),
+            added: theme.success,
+            removed: theme.error,
+            hunk: theme.focused,
+            added_row: defaults.added_row,
+            removed_row: defaults.removed_row,
+            added_emphasis: defaults.added_emphasis,
+            removed_emphasis: defaults.removed_emphasis,
+        }
+    }
+}
+
 impl Default for DiffViewerStyle {
     fn default() -> Self {
         Self {

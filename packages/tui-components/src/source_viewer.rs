@@ -40,6 +40,17 @@ pub struct SourceViewerStyle {
     pub truncated: Style,
 }
 
+impl From<crate::theme::ComponentTheme> for SourceViewerStyle {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            source: theme.text,
+            border: theme.border,
+            gutter: theme.muted,
+            truncated: theme.muted,
+        }
+    }
+}
+
 impl Default for SourceViewerStyle {
     fn default() -> Self {
         let muted = Style::new().fg(Color::BrightBlack);
