@@ -214,8 +214,9 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for FormFieldStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            label: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            label: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             required_marker: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
             help: theme.muted,
             error: theme.error,

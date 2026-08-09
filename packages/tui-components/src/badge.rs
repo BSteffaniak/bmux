@@ -230,8 +230,9 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for BadgeStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            default: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            default: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             info: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
             success: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
             warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),

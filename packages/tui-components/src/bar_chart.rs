@@ -398,8 +398,9 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for BarChartStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            label: theme.base,
+            label: theme.text,
             bar: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
             empty: theme.muted,
             value: theme.muted,

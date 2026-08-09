@@ -157,9 +157,10 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for LabeledDetailsStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             label: theme.muted.add_modifier(bmux_tui::style::Modifier::BOLD),
-            value: theme.base,
+            value: theme.text,
             continuation: theme.muted,
         }
     }

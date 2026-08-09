@@ -2395,9 +2395,11 @@ name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_keyboard",
+ "bmux_terminal_grid",
  "bmux_text_edit",
  "bmux_tui",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

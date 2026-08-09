@@ -344,12 +344,13 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for PickerFrameStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Raised);
         Self {
             border: theme.focused,
-            background: theme.background,
-            header: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
-            input: theme.base,
-            list: theme.base,
+            background: theme.surfaces.raised,
+            header: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
+            input: theme.text,
+            list: theme.text,
             footer: theme.muted,
         }
     }

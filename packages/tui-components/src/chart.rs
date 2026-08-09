@@ -762,6 +762,7 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for ChartStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             dataset: theme.info,
             empty: theme.muted,

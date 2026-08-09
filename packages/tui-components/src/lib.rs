@@ -30,8 +30,12 @@ pub mod chart;
 #[cfg(feature = "checkbox")]
 pub mod checkbox;
 pub mod common;
+#[cfg(feature = "compact")]
+pub mod compact;
 #[cfg(feature = "dialog")]
 pub mod dialog;
+#[cfg(feature = "diff-viewer")]
+pub mod diff_viewer;
 #[cfg(feature = "empty-state")]
 pub mod empty_state;
 #[cfg(feature = "filtered-list")]
@@ -69,6 +73,8 @@ pub mod scrollbar_layout;
 pub mod select_dropdown;
 #[cfg(feature = "selectable-list")]
 pub mod selectable_list;
+#[cfg(feature = "source-viewer")]
+pub mod source_viewer;
 #[cfg(feature = "sparkline")]
 pub mod sparkline;
 #[cfg(feature = "status-bar")]
@@ -79,6 +85,8 @@ pub mod stepper;
 pub mod tab_bar;
 #[cfg(feature = "table")]
 pub mod table;
+#[cfg(feature = "terminal-viewer")]
+pub mod terminal_viewer;
 #[cfg(feature = "text-input")]
 pub mod text_input;
 #[cfg(feature = "text-input-box")]

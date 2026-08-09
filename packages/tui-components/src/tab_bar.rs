@@ -573,6 +573,7 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for TabBarStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             normal: theme.muted,
             selected: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),

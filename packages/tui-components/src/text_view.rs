@@ -866,10 +866,11 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for TextViewStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            text: theme.base,
+            text: theme.text,
             empty: theme.muted,
-            background: theme.background,
+            background: theme.surfaces.normal,
         }
     }
 }

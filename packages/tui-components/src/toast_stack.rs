@@ -392,13 +392,14 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for ToastStackStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Raised);
         Self {
-            default: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            default: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             info: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
             success: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
             warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
             error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
-            body: theme.base,
+            body: theme.text,
             close: theme.muted,
             border: theme.border,
         }

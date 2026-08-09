@@ -741,6 +741,7 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for PanelGroupStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             divider: theme.border,
             hovered_divider: theme.info,

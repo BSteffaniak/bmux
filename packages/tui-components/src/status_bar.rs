@@ -378,15 +378,16 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for StatusBarStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            default: theme.base,
+            default: theme.text,
             muted: theme.muted,
             info: theme.info,
             success: theme.success,
             warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
             error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
             separator: theme.border,
-            background: theme.background,
+            background: theme.surfaces.normal,
         }
     }
 }

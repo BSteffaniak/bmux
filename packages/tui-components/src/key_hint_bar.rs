@@ -239,12 +239,13 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for KeyHintBarStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            key: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            key: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             label: theme.muted,
             separator: theme.border,
             disabled: theme.disabled,
-            background: theme.background,
+            background: theme.surfaces.normal,
         }
     }
 }

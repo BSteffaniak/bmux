@@ -511,13 +511,14 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for ProgressBarStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             filled: theme.success,
             empty: theme.muted,
-            label: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            label: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             complete: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
             indeterminate: theme.info,
-            background: theme.background,
+            background: theme.surfaces.normal,
         }
     }
 }

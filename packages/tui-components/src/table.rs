@@ -1223,9 +1223,10 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for TableStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             header: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
-            row: theme.base,
+            row: theme.text,
             selected: theme.selected,
             selected_column: theme.focused,
             selected_cell: theme.warning,

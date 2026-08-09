@@ -275,12 +275,13 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for EmptyStateStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             icon: theme.muted,
-            title: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            title: theme.text.add_modifier(bmux_tui::style::Modifier::BOLD),
             body: theme.muted,
             action: theme.info,
-            background: theme.background,
+            background: theme.surfaces.normal,
         }
     }
 }

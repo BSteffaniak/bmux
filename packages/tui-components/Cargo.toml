@@ -12,61 +12,114 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_keyboard        = { workspace = true, optional = true }
+bmux_terminal_grid   = { workspace = true, optional = true }
 bmux_text_edit       = { workspace = true, features = ["keyboard"], optional = true }
 bmux_tui             = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
+unicode-width        = { workspace = true, optional = true }
 
 [features]
-default = []
+default          = []
 fail-on-warnings = []
 
 # Individual components. Composed controls enable their implementation prerequisites.
-action-row      = ["button"]
-badge           = []
-bar-chart       = []
-breadcrumbs     = ["keyboard-input"]
-button          = ["keyboard-input"]
-canvas          = []
-chart           = []
-checkbox        = ["keyboard-input"]
-dialog          = ["action-row", "modal-frame"]
-empty-state     = []
-filtered-list   = []
-form            = ["keyboard-input"]
-form-field      = []
-key-hint-bar    = []
+action-row = ["button"]
+badge = []
+bar-chart = []
+breadcrumbs = ["keyboard-input"]
+button = ["keyboard-input"]
+canvas = []
+chart = []
+checkbox = ["keyboard-input"]
+compact = ["dep:unicode-segmentation", "dep:unicode-width"]
+dialog = ["action-row", "modal-frame"]
+diff-viewer = ["source-viewer", "dep:unicode-segmentation", "dep:unicode-width"]
+empty-state = []
+filtered-list = []
+form = ["keyboard-input"]
+form-field = []
+key-hint-bar = []
 labeled-details = []
-menu            = ["selectable-list"]
-modal-frame     = []
-pane            = []
-panel-group     = []
-picker-frame    = []
-progress-bar    = []
-radio-group     = ["keyboard-input"]
-scroll-area     = ["keyboard-input", "scrollbar"]
-scrollbar       = []
+menu = ["selectable-list"]
+modal-frame = []
+pane = []
+panel-group = []
+picker-frame = []
+progress-bar = []
+radio-group = ["keyboard-input"]
+scroll-area = ["keyboard-input", "scrollbar"]
+scrollbar = []
 select-dropdown = ["selectable-list"]
 selectable-list = ["keyboard-input", "scroll-area"]
-sparkline       = []
-status-bar      = []
-stepper         = []
-tab-bar         = ["keyboard-input"]
-table           = ["keyboard-input", "scroll-area"]
-text-input      = ["keyboard-input", "dep:bmux_text_edit", "dep:unicode-segmentation"]
-text-input-box  = ["text-input", "form-field"]
-text-view       = ["keyboard-input", "scroll-area"]
-toast-stack     = []
-tree-view       = ["keyboard-input"]
+source-viewer = ["dep:unicode-segmentation", "dep:unicode-width"]
+sparkline = []
+status-bar = []
+stepper = []
+tab-bar = ["keyboard-input"]
+table = ["keyboard-input", "scroll-area"]
+terminal-viewer = ["dep:bmux_terminal_grid"]
+text-input = [
+    "keyboard-input",
+    "dep:bmux_text_edit",
+    "dep:unicode-segmentation",
+]
+text-input-box = ["text-input", "form-field"]
+text-view = ["keyboard-input", "scroll-area"]
+toast-stack = []
+tree-view = ["keyboard-input"]
 
 # Private dependency capability shared by keyboard-interactive controls.
 keyboard-input = ["dep:bmux_keyboard"]
 
 # Optional ergonomic bundles.
+all = [
+    "action-row",
+    "badge",
+    "bar-chart",
+    "breadcrumbs",
+    "button",
+    "canvas",
+    "chart",
+    "compact",
+    "checkbox",
+    "dialog",
+    "diff-viewer",
+    "empty-state",
+    "filtered-list",
+    "form",
+    "form-field",
+    "key-hint-bar",
+    "labeled-details",
+    "menu",
+    "modal-frame",
+    "pane",
+    "panel-group",
+    "picker-frame",
+    "progress-bar",
+    "radio-group",
+    "scroll-area",
+    "scrollbar",
+    "select-dropdown",
+    "selectable-list",
+    "source-viewer",
+    "sparkline",
+    "status-bar",
+    "stepper",
+    "tab-bar",
+    "table",
+    "text-input",
+    "text-input-box",
+    "terminal-viewer",
+    "text-view",
+    "toast-stack",
+    "tree-view",
+]
 data-display = [
     "badge",
     "bar-chart",
     "canvas",
     "chart",
+    "compact",
     "empty-state",
     "labeled-details",
     "progress-bar",
@@ -95,41 +148,3 @@ navigation = [
 ]
 overlays = ["dialog", "modal-frame", "picker-frame", "toast-stack"]
 text-editing = ["text-input", "text-input-box", "text-view"]
-all = [
-    "action-row",
-    "badge",
-    "bar-chart",
-    "breadcrumbs",
-    "button",
-    "canvas",
-    "chart",
-    "checkbox",
-    "dialog",
-    "empty-state",
-    "filtered-list",
-    "form",
-    "form-field",
-    "key-hint-bar",
-    "labeled-details",
-    "menu",
-    "modal-frame",
-    "pane",
-    "panel-group",
-    "picker-frame",
-    "progress-bar",
-    "radio-group",
-    "scroll-area",
-    "scrollbar",
-    "select-dropdown",
-    "selectable-list",
-    "sparkline",
-    "status-bar",
-    "stepper",
-    "tab-bar",
-    "table",
-    "text-input",
-    "text-input-box",
-    "text-view",
-    "toast-stack",
-    "tree-view",
-]

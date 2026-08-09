@@ -288,6 +288,7 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for StepperStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             pending: theme.muted,
             current: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),

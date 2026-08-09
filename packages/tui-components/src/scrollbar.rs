@@ -405,6 +405,7 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for ScrollbarStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             begin: theme.border,
             track: theme.border,

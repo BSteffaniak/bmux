@@ -312,14 +312,15 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for SparklineStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
             normal: theme.info,
             latest: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
-            first: theme.base,
+            first: theme.text,
             high: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
             low: theme.error,
             empty: theme.muted,
-            background: theme.background,
+            background: theme.surfaces.normal,
         }
     }
 }

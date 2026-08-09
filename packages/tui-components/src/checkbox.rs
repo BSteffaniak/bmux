@@ -318,8 +318,9 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for CheckboxStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            normal: theme.base,
+            normal: theme.text,
             focused: theme.focused,
             hovered: theme.info,
             pressed: theme.selected,

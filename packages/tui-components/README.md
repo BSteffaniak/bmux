@@ -31,6 +31,17 @@ input. Display-only components do not activate BMUX text editing or Unicode grap
 The repository verifies the no-feature, individual-feature, bundle, and all-feature matrix with
 `scripts/check-tui-component-features.sh`.
 
+The component theme separates application canvas from normal, raised, and overlay surfaces. Semantic
+role styles are deterministically patched over the selected surface: an explicit role foreground,
+background, or modifier wins, while omitted values inherit from that surface. Overlay themes may
+also carry a scrim. `terminal_default()` preserves `Color::Default` at every depth; `opaque_dark()`
+and `opaque_light()` provide neutral gallery/reference palettes rather than product theme policy.
+
+The feature-gated `compact` helpers provide grapheme-safe width truncation, rich metadata header
+wrapping, and compact byte formatting. The feature-gated `terminal-viewer` owns bounded generic
+terminal-grid decoding and ANSI preservation; applications remain responsible for process, shell,
+artifact, and recording semantics.
+
 ## Component conventions
 
 Interactive components should follow the same shape as the existing text input

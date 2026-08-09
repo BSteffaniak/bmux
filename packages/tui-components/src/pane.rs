@@ -670,8 +670,9 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for PaneStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Raised);
         Self {
-            background: Some(theme.background),
+            background: Some(theme.surfaces.raised),
             border: theme.border,
             focused_border: theme.focused,
         }

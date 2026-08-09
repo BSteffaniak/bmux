@@ -393,8 +393,9 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for BreadcrumbsStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
-            normal: theme.base,
+            normal: theme.text,
             current: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
             hovered: theme.info,
             pressed: theme.selected,

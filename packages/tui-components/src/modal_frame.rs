@@ -271,14 +271,15 @@ impl crate::theme::ComponentTheme {
 
 impl From<crate::theme::ComponentTheme> for ModalTheme {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
+        let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Overlay);
         Self {
-            background: theme.background,
+            background: theme.surfaces.overlay,
             border: theme.focused,
             title: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
-            text: theme.base,
+            text: theme.text,
             muted: theme.muted,
             focused: theme.focused,
-            scrim: None,
+            scrim: theme.surfaces.scrim,
         }
     }
 }
