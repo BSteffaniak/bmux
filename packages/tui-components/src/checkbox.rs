@@ -308,6 +308,26 @@ const fn toggle(state: &mut CheckboxState) -> CheckboxOutcome {
     CheckboxOutcome::Toggled(state.checked)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`CheckboxStyles`].
+    #[must_use]
+    pub fn checkbox_styles(self) -> CheckboxStyles {
+        CheckboxStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for CheckboxStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            focused: theme.focused,
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

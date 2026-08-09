@@ -383,6 +383,27 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`BreadcrumbsStyles`].
+    #[must_use]
+    pub fn breadcrumbs_styles(self) -> BreadcrumbsStyles {
+        BreadcrumbsStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for BreadcrumbsStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            current: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+            separator: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

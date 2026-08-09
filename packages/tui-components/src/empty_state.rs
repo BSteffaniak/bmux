@@ -265,6 +265,26 @@ const fn apply_insets(area: Rect, insets: Insets) -> Rect {
     )
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`EmptyStateStyles`].
+    #[must_use]
+    pub fn empty_state_styles(self) -> EmptyStateStyles {
+        EmptyStateStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for EmptyStateStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            icon: theme.muted,
+            title: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            body: theme.muted,
+            action: theme.info,
+            background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

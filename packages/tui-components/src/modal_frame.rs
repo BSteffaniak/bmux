@@ -261,6 +261,28 @@ fn clamp_axis(available: u16, min: u16, max: u16) -> u16 {
     available.clamp(min.min(available), max)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`ModalTheme`].
+    #[must_use]
+    pub fn modal_theme(self) -> ModalTheme {
+        ModalTheme::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for ModalTheme {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            background: theme.background,
+            border: theme.focused,
+            title: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            text: theme.base,
+            muted: theme.muted,
+            focused: theme.focused,
+            scrim: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};

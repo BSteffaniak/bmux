@@ -921,6 +921,27 @@ enum Direction {
     Next,
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`SelectableListStyles`].
+    #[must_use]
+    pub fn selectable_list_styles(self) -> SelectableListStyles {
+        SelectableListStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for SelectableListStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            focused: theme.focused,
+            selected: theme.selected,
+            hovered: theme.info,
+            pressed: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),
+            disabled: theme.disabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

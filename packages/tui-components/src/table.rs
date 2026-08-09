@@ -1213,6 +1213,30 @@ fn resolve_column_widths(
         .collect()
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`TableStyles`].
+    #[must_use]
+    pub fn table_styles(self) -> TableStyles {
+        TableStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for TableStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            header: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            row: theme.base,
+            selected: theme.selected,
+            selected_column: theme.focused,
+            selected_cell: theme.warning,
+            hovered: theme.info,
+            disabled: theme.disabled,
+            separator: theme.border,
+            empty: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 fn format_cell(text: &str, width: u16, align: TableAlign, truncate: bool) -> String {
     let line = Line::from(text);

@@ -368,6 +368,29 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`StatusBarStyles`].
+    #[must_use]
+    pub fn status_bar_styles(self) -> StatusBarStyles {
+        StatusBarStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for StatusBarStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            default: theme.base,
+            muted: theme.muted,
+            info: theme.info,
+            success: theme.success,
+            warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
+            error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
+            separator: theme.border,
+            background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

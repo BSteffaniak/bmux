@@ -579,6 +579,27 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`TreeViewStyles`].
+    #[must_use]
+    pub fn tree_view_styles(self) -> TreeViewStyles {
+        TreeViewStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for TreeViewStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            selected: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+            marker: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

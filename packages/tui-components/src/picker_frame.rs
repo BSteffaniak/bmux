@@ -334,6 +334,27 @@ fn place_rect(area: Rect, size: Size, placement: PickerFramePlacement) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`PickerFrameStyles`].
+    #[must_use]
+    pub fn picker_frame_styles(self) -> PickerFrameStyles {
+        PickerFrameStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for PickerFrameStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            border: theme.focused,
+            background: theme.background,
+            header: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            input: theme.base,
+            list: theme.base,
+            footer: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

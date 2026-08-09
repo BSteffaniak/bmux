@@ -462,6 +462,11 @@ jobs:
           run-matrix-debug-shells: "fish,bash"
           run-matrix-auto-upload: true
 
+      - name: Verify bmux_tui_components feature isolation
+        if: matrix.package.os == 'ubuntu-latest' && matrix.package.name == 'bmux_tui_components'
+        shell: bash
+        run: ./scripts/check-tui-component-features.sh
+
       - name: Upload failure data for workflow summary
         if: always() && steps.test-suite.outputs.failure-artifact-path != ''
         uses: actions/upload-artifact@v4

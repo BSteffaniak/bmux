@@ -731,6 +731,24 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`PanelGroupStyles`].
+    #[must_use]
+    pub fn panel_group_styles(self) -> PanelGroupStyles {
+        PanelGroupStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for PanelGroupStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            divider: theme.border,
+            hovered_divider: theme.info,
+            active_divider: theme.focused,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

@@ -563,6 +563,28 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`TabBarStyles`].
+    #[must_use]
+    pub fn tab_bar_styles(self) -> TabBarStyles {
+        TabBarStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for TabBarStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.muted,
+            selected: theme.selected.add_modifier(bmux_tui::style::Modifier::BOLD),
+            focused: theme.focused,
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+            separator: theme.border,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

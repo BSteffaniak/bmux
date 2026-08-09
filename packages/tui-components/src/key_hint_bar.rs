@@ -229,6 +229,26 @@ fn hint_text(hints: &[KeyHint<'_>], separator: &str) -> String {
         .join(separator)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`KeyHintBarStyles`].
+    #[must_use]
+    pub fn key_hint_bar_styles(self) -> KeyHintBarStyles {
+        KeyHintBarStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for KeyHintBarStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            key: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            label: theme.muted,
+            separator: theme.border,
+            disabled: theme.disabled,
+            background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

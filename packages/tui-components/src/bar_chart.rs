@@ -388,6 +388,26 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`BarChartStyles`].
+    #[must_use]
+    pub fn bar_chart_styles(self) -> BarChartStyles {
+        BarChartStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for BarChartStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            label: theme.base,
+            bar: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            empty: theme.muted,
+            value: theme.muted,
+            empty_message: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

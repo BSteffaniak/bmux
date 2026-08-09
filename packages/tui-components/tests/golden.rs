@@ -1,3 +1,5 @@
+#![cfg(feature = "all")]
+
 use bmux_tui::buffer::Buffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;

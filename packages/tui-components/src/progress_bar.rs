@@ -501,6 +501,27 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`ProgressBarStyles`].
+    #[must_use]
+    pub fn progress_bar_styles(self) -> ProgressBarStyles {
+        ProgressBarStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for ProgressBarStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            filled: theme.success,
+            empty: theme.muted,
+            label: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            complete: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
+            indeterminate: theme.info,
+            background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

@@ -856,6 +856,24 @@ fn clamp_scroll(scroll: usize, line_count: usize, height: u16) -> usize {
     scroll.min(line_count.saturating_sub(usize::from(height)))
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`TextViewStyles`].
+    #[must_use]
+    pub fn text_view_styles(self) -> TextViewStyles {
+        TextViewStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for TextViewStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            text: theme.base,
+            empty: theme.muted,
+            background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

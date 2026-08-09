@@ -399,6 +399,31 @@ impl<'a> TextInputBox<'a> {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`TextInputBoxStyles`].
+    #[must_use]
+    pub fn text_input_box_styles(self) -> TextInputBoxStyles {
+        TextInputBoxStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for TextInputBoxStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            text: theme.base,
+            focused_text: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            disabled_text: theme.disabled,
+            placeholder: theme.muted,
+            selection: theme.selected,
+            border: theme.border,
+            focused_border: theme.focused,
+            background: theme.background,
+            focused_background: theme.background,
+            disabled_background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};

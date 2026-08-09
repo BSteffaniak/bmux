@@ -395,6 +395,25 @@ impl Default for Scrollbar {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`ScrollbarStyles`].
+    #[must_use]
+    pub fn scrollbar_styles(self) -> ScrollbarStyles {
+        ScrollbarStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for ScrollbarStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            begin: theme.border,
+            track: theme.border,
+            thumb: theme.info,
+            end: theme.border,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

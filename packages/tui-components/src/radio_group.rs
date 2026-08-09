@@ -556,6 +556,26 @@ enum Direction {
     Next,
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`RadioGroupStyles`].
+    #[must_use]
+    pub fn radio_group_styles(self) -> RadioGroupStyles {
+        RadioGroupStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for RadioGroupStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            focused: theme.focused,
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

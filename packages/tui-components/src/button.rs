@@ -320,6 +320,26 @@ const fn set_hovered(state: &mut ButtonState, hovered: bool) -> ButtonOutcome {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`ButtonStyles`].
+    #[must_use]
+    pub fn button_styles(self) -> ButtonStyles {
+        ButtonStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for ButtonStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            focused: theme.focused,
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

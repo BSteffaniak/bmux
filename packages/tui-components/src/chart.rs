@@ -752,6 +752,23 @@ fn map_point(
     Some((rounded_u16(x), rounded_u16(y)))
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`ChartStyles`].
+    #[must_use]
+    pub fn chart_styles(self) -> ChartStyles {
+        ChartStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for ChartStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            dataset: theme.info,
+            empty: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

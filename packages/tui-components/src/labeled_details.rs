@@ -147,6 +147,24 @@ fn push_wrapped_value(rows: &mut Vec<Line>, text: &str, width: u16, styles: Labe
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`LabeledDetailsStyles`].
+    #[must_use]
+    pub fn labeled_details_styles(self) -> LabeledDetailsStyles {
+        LabeledDetailsStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for LabeledDetailsStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            label: theme.muted.add_modifier(bmux_tui::style::Modifier::BOLD),
+            value: theme.base,
+            continuation: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DetailItem, LabeledDetails};

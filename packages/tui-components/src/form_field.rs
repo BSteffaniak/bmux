@@ -204,6 +204,25 @@ pub struct FormFieldLayout {
     pub error: Option<Rect>,
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`FormFieldStyles`].
+    #[must_use]
+    pub fn form_field_styles(self) -> FormFieldStyles {
+        FormFieldStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for FormFieldStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            label: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            required_marker: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
+            help: theme.muted,
+            error: theme.error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

@@ -11,12 +11,125 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard        = { workspace = true }
+bmux_keyboard        = { workspace = true, optional = true }
 bmux_text_edit       = { workspace = true, features = ["keyboard"], optional = true }
 bmux_tui             = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
 
 [features]
-default          = []
+default = []
 fail-on-warnings = []
-text-input       = ["dep:bmux_text_edit", "dep:unicode-segmentation"]
+
+# Individual components. Composed controls enable their implementation prerequisites.
+action-row      = ["button"]
+badge           = []
+bar-chart       = []
+breadcrumbs     = ["keyboard-input"]
+button          = ["keyboard-input"]
+canvas          = []
+chart           = []
+checkbox        = ["keyboard-input"]
+dialog          = ["action-row", "modal-frame"]
+empty-state     = []
+filtered-list   = []
+form            = ["keyboard-input"]
+form-field      = []
+key-hint-bar    = []
+labeled-details = []
+menu            = ["selectable-list"]
+modal-frame     = []
+pane            = []
+panel-group     = []
+picker-frame    = []
+progress-bar    = []
+radio-group     = ["keyboard-input"]
+scroll-area     = ["keyboard-input", "scrollbar"]
+scrollbar       = []
+select-dropdown = ["selectable-list"]
+selectable-list = ["keyboard-input", "scroll-area"]
+sparkline       = []
+status-bar      = []
+stepper         = []
+tab-bar         = ["keyboard-input"]
+table           = ["keyboard-input", "scroll-area"]
+text-input      = ["keyboard-input", "dep:bmux_text_edit", "dep:unicode-segmentation"]
+text-input-box  = ["text-input", "form-field"]
+text-view       = ["keyboard-input", "scroll-area"]
+toast-stack     = []
+tree-view       = ["keyboard-input"]
+
+# Private dependency capability shared by keyboard-interactive controls.
+keyboard-input = ["dep:bmux_keyboard"]
+
+# Optional ergonomic bundles.
+data-display = [
+    "badge",
+    "bar-chart",
+    "canvas",
+    "chart",
+    "empty-state",
+    "labeled-details",
+    "progress-bar",
+    "sparkline",
+    "status-bar",
+    "stepper",
+    "table",
+    "text-view",
+]
+forms = [
+    "action-row",
+    "checkbox",
+    "form",
+    "form-field",
+    "radio-group",
+    "select-dropdown",
+    "text-input-box",
+]
+navigation = [
+    "breadcrumbs",
+    "filtered-list",
+    "menu",
+    "selectable-list",
+    "tab-bar",
+    "tree-view",
+]
+overlays = ["dialog", "modal-frame", "picker-frame", "toast-stack"]
+text-editing = ["text-input", "text-input-box", "text-view"]
+all = [
+    "action-row",
+    "badge",
+    "bar-chart",
+    "breadcrumbs",
+    "button",
+    "canvas",
+    "chart",
+    "checkbox",
+    "dialog",
+    "empty-state",
+    "filtered-list",
+    "form",
+    "form-field",
+    "key-hint-bar",
+    "labeled-details",
+    "menu",
+    "modal-frame",
+    "pane",
+    "panel-group",
+    "picker-frame",
+    "progress-bar",
+    "radio-group",
+    "scroll-area",
+    "scrollbar",
+    "select-dropdown",
+    "selectable-list",
+    "sparkline",
+    "status-bar",
+    "stepper",
+    "tab-bar",
+    "table",
+    "text-input",
+    "text-input-box",
+    "text-view",
+    "toast-stack",
+    "tree-view",
+]

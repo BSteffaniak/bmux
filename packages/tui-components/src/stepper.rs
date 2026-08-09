@@ -278,6 +278,28 @@ const fn marker_for(status: StepStatus) -> &'static str {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`StepperStyles`].
+    #[must_use]
+    pub fn stepper_styles(self) -> StepperStyles {
+        StepperStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for StepperStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            pending: theme.muted,
+            current: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            complete: theme.success,
+            warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
+            error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
+            disabled: theme.disabled,
+            connector: theme.border,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

@@ -382,6 +382,29 @@ impl<'a> ToastStack<'a> {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`ToastStackStyles`].
+    #[must_use]
+    pub fn toast_stack_styles(self) -> ToastStackStyles {
+        ToastStackStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for ToastStackStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            default: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            info: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            success: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
+            warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
+            error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
+            body: theme.base,
+            close: theme.muted,
+            border: theme.border,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

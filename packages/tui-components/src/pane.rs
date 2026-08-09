@@ -660,6 +660,24 @@ const fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`PaneStyles`].
+    #[must_use]
+    pub fn pane_styles(self) -> PaneStyles {
+        PaneStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for PaneStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            background: Some(theme.background),
+            border: theme.border,
+            focused_border: theme.focused,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

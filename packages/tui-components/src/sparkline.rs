@@ -302,6 +302,28 @@ fn glyph_for(value: u64, max: u64, symbols: &[&'static str]) -> &'static str {
     symbols[usize::try_from(scaled).unwrap_or(last).min(last)]
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`SparklineStyles`].
+    #[must_use]
+    pub fn sparkline_styles(self) -> SparklineStyles {
+        SparklineStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for SparklineStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.info,
+            latest: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            first: theme.base,
+            high: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
+            low: theme.error,
+            empty: theme.muted,
+            background: theme.background,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;

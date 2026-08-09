@@ -531,6 +531,26 @@ impl<'a> SelectDropdown<'a> {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`SelectDropdownStyles`].
+    #[must_use]
+    pub fn select_dropdown_styles(self) -> SelectDropdownStyles {
+        SelectDropdownStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for SelectDropdownStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            normal: theme.base,
+            focused: theme.focused,
+            hovered: theme.info,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};

@@ -220,6 +220,27 @@ impl<'a> Badge<'a> {
     }
 }
 
+impl crate::theme::ComponentTheme {
+    /// Convert this semantic component theme into [`BadgeStyles`].
+    #[must_use]
+    pub fn badge_styles(self) -> BadgeStyles {
+        BadgeStyles::from(self)
+    }
+}
+
+impl From<crate::theme::ComponentTheme> for BadgeStyles {
+    fn from(theme: crate::theme::ComponentTheme) -> Self {
+        Self {
+            default: theme.base.add_modifier(bmux_tui::style::Modifier::BOLD),
+            info: theme.info.add_modifier(bmux_tui::style::Modifier::BOLD),
+            success: theme.success.add_modifier(bmux_tui::style::Modifier::BOLD),
+            warning: theme.warning.add_modifier(bmux_tui::style::Modifier::BOLD),
+            error: theme.error.add_modifier(bmux_tui::style::Modifier::BOLD),
+            muted: theme.muted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
