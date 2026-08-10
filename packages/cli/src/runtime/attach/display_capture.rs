@@ -168,15 +168,25 @@ enum DisplayCaptureCommand {
     Close(mpsc::Sender<Result<()>>),
 }
 
-struct DisplayCaptureFileWriter {
-    recording_path: PathBuf,
-    client_id: Uuid,
-    rolling_window: Option<Duration>,
-    started_at: Instant,
+/// Outcome of writing one event into the current segment.
+///
+/// An empty image update for an already-empty screen writes nothing, and a
+/// segment that received no bytes must not age into a rotation, so the caller
+/// needs to distinguish the two cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordOutcome {
+    Written,
+    Skipped,
+}
+
+/// Writes display events into the current segment file.
+///
+/// This type deliberately owns no rotation state: without a rolling window,
+/// segment index, or segment clock there is nothing for a segment-level write
+/// to rotate. That makes the "baseline writes must not rotate" invariant a
+/// property of the type rather than something callers must remember.
+struct DisplaySegmentWriter {
     writer: BufWriter<std::fs::File>,
-    segment_index: u64,
-    segment_start_ns: u64,
-    closed_segments: VecDeque<(PathBuf, u64)>,
     stream_opened_baseline: DisplayTrackEvent,
     latest_resize: Option<(u16, u16)>,
     replay_grid: bmux_terminal_grid::TerminalGridStream,
@@ -187,6 +197,19 @@ struct DisplayCaptureFileWriter {
         feature = "image-iterm2"
     ))]
     last_image_count: usize,
+}
+
+/// Owns the capture clock, segment rotation, and pruning, and delegates every
+/// write to [`DisplaySegmentWriter`].
+struct DisplayCaptureFileWriter {
+    segment: DisplaySegmentWriter,
+    recording_path: PathBuf,
+    client_id: Uuid,
+    rolling_window: Option<Duration>,
+    started_at: Instant,
+    segment_index: u64,
+    segment_start_ns: u64,
+    closed_segments: VecDeque<(PathBuf, u64)>,
 }
 
 impl DisplayCaptureWriter {
@@ -341,6 +364,93 @@ impl Drop for DisplayCaptureWriter {
     }
 }
 
+impl DisplaySegmentWriter {
+    /// Swap in a new output file, flushing whatever is still buffered for the
+    /// outgoing one first.
+    ///
+    /// Flushing is folded into the swap so buffered bytes for a closed segment
+    /// cannot be dropped by reordering the two steps at a call site. Replay
+    /// state (grid, cursor, last resize) is intentionally preserved so the next
+    /// segment can emit a self-contained baseline.
+    fn replace_output(&mut self, file: std::fs::File) -> Result<()> {
+        self.flush()?;
+        self.writer = BufWriter::new(file);
+        Ok(())
+    }
+
+    /// Write the events that let a replayer start from this segment alone: the
+    /// stream-opened metadata, the last known size, and a full repaint.
+    ///
+    /// All three share `mono_ns` so a segment's opening events carry the exact
+    /// segment boundary timestamp instead of drifting later clock reads.
+    fn write_baseline(&mut self, mono_ns: u64) -> Result<()> {
+        self.write(self.stream_opened_baseline.clone(), mono_ns)?;
+        if let Some((cols, rows)) = self.latest_resize {
+            self.write(DisplayTrackEvent::Resize { cols, rows }, mono_ns)?;
+        }
+        let repaint = bmux_terminal_grid::full_screen_repaint_bytes(self.replay_grid.grid());
+        if !repaint.is_empty() {
+            self.write(DisplayTrackEvent::FrameBytes { data: repaint }, mono_ns)?;
+        }
+        Ok(())
+    }
+
+    fn write_cursor_snapshot(
+        &mut self,
+        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
+        mono_ns: u64,
+    ) -> Result<RecordOutcome> {
+        let (x, y, visible) =
+            cursor_state.map_or((0, 0, false), |state| (state.x, state.y, state.visible));
+        self.write(
+            DisplayTrackEvent::CursorSnapshot {
+                x,
+                y,
+                visible,
+                shape: display_cursor_shape_from_visual(self.cursor_replay_state.shape),
+                blink_enabled: self.cursor_replay_state.blink_enabled,
+            },
+            mono_ns,
+        )
+    }
+
+    fn write(&mut self, event: DisplayTrackEvent, mono_ns: u64) -> Result<RecordOutcome> {
+        if let DisplayTrackEvent::Resize { cols, rows } = &event
+            && *cols > 0
+            && *rows > 0
+        {
+            self.latest_resize = Some((*cols, *rows));
+            let _ = self.replay_grid.resize(*cols, *rows);
+        }
+        if let DisplayTrackEvent::FrameBytes { data } = &event {
+            update_cursor_replay_state(&mut self.cursor_replay_state, data);
+            self.replay_grid.process(data);
+        }
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        if let DisplayTrackEvent::ImageUpdate { images } = &event {
+            let count = images.len();
+            if count == 0 && self.last_image_count == 0 {
+                return Ok(RecordOutcome::Skipped);
+            }
+            self.last_image_count = count;
+        }
+        let envelope = DisplayTrackEnvelope { mono_ns, event };
+        write_frame(&mut self.writer, &envelope)
+            .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
+        Ok(RecordOutcome::Written)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .context("failed flushing display capture writer")
+    }
+}
+
 impl DisplayCaptureFileWriter {
     fn open(
         recording_id: Uuid,
@@ -367,100 +477,62 @@ impl DisplayCaptureFileWriter {
         )
         .expect("display capture replay grid dimensions are valid");
         Ok(Self {
+            segment: DisplaySegmentWriter {
+                writer: BufWriter::new(file),
+                stream_opened_baseline,
+                latest_resize,
+                replay_grid,
+                cursor_replay_state: CursorReplayState::default(),
+                #[cfg(any(
+                    feature = "image-sixel",
+                    feature = "image-kitty",
+                    feature = "image-iterm2"
+                ))]
+                last_image_count: 0,
+            },
             recording_path: recording_path.to_path_buf(),
             client_id,
             rolling_window,
             started_at: Instant::now(),
-            writer: BufWriter::new(file),
             segment_index: 0,
             segment_start_ns: 0,
             closed_segments: VecDeque::new(),
-            stream_opened_baseline,
-            latest_resize,
-            replay_grid,
-            cursor_replay_state: CursorReplayState::default(),
-            #[cfg(any(
-                feature = "image-sixel",
-                feature = "image-kitty",
-                feature = "image-iterm2"
-            ))]
-            last_image_count: 0,
         })
     }
 
     fn record_stream_opened(&mut self) -> Result<()> {
-        self.record_segment_baseline()
+        self.segment.write_baseline(self.elapsed_ns())
     }
 
-    fn record_segment_baseline(&mut self) -> Result<()> {
-        self.record(self.stream_opened_baseline.clone())?;
-        if let Some((cols, rows)) = self.latest_resize {
-            self.record(DisplayTrackEvent::Resize { cols, rows })?;
-        }
-        let repaint = bmux_terminal_grid::full_screen_repaint_bytes(self.replay_grid.grid());
-        if !repaint.is_empty() {
-            self.record(DisplayTrackEvent::FrameBytes { data: repaint })?;
-        }
-        Ok(())
+    fn elapsed_ns(&self) -> u64 {
+        duration_nanos_u64(self.started_at.elapsed())
     }
 
     fn record_cursor_snapshot(
         &mut self,
         cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
     ) -> Result<()> {
-        let (x, y, visible) =
-            cursor_state.map_or((0, 0, false), |state| (state.x, state.y, state.visible));
-        self.record(DisplayTrackEvent::CursorSnapshot {
-            x,
-            y,
-            visible,
-            shape: display_cursor_shape_from_visual(self.cursor_replay_state.shape),
-            blink_enabled: self.cursor_replay_state.blink_enabled,
-        })
+        let mono_ns = self.elapsed_ns();
+        if self.segment.write_cursor_snapshot(cursor_state, mono_ns)? == RecordOutcome::Written {
+            self.maybe_rotate(mono_ns)?;
+        }
+        Ok(())
     }
 
+    /// Record one externally queued event, then consider rotation exactly once.
+    ///
+    /// This is the only path that can rotate: baseline writes go straight to
+    /// [`DisplaySegmentWriter`], which cannot reach rotation at all.
     fn record(&mut self, event: DisplayTrackEvent) -> Result<()> {
-        if let DisplayTrackEvent::Resize { cols, rows } = &event
-            && *cols > 0
-            && *rows > 0
-        {
-            self.latest_resize = Some((*cols, *rows));
-            let _ = self.replay_grid.resize(*cols, *rows);
+        let mono_ns = self.elapsed_ns();
+        if self.segment.write(event, mono_ns)? == RecordOutcome::Written {
+            self.maybe_rotate(mono_ns)?;
         }
-        if let DisplayTrackEvent::FrameBytes { data } = &event {
-            update_cursor_replay_state(&mut self.cursor_replay_state, data);
-            self.replay_grid.process(data);
-        }
-        #[cfg(any(
-            feature = "image-sixel",
-            feature = "image-kitty",
-            feature = "image-iterm2"
-        ))]
-        if let DisplayTrackEvent::ImageUpdate { images } = &event {
-            let count = images.len();
-            if count == 0 && self.last_image_count == 0 {
-                return Ok(());
-            }
-            self.last_image_count = count;
-        }
-        let mono_ns = u64::try_from(
-            self.started_at
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)),
-        )
-        .unwrap_or(u64::MAX);
-        let envelope = DisplayTrackEnvelope { mono_ns, event };
-        write_frame(&mut self.writer, &envelope)
-            .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
-        self.maybe_rotate(mono_ns)?;
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .context("failed flushing display capture writer")
+        self.segment.flush()
     }
 
     fn maybe_rotate(&mut self, mono_ns: u64) -> Result<()> {
@@ -475,7 +547,6 @@ impl DisplayCaptureFileWriter {
     }
 
     fn rotate(&mut self, end_ns: u64) -> Result<()> {
-        self.flush()?;
         let old_path =
             display_track_segment_path(&self.recording_path, self.client_id, self.segment_index);
         self.closed_segments.push_back((old_path, end_ns));
@@ -483,8 +554,9 @@ impl DisplayCaptureFileWriter {
         self.segment_start_ns = end_ns;
         let new_path =
             display_track_segment_path(&self.recording_path, self.client_id, self.segment_index);
-        self.writer = BufWriter::new(open_display_track_file(&new_path)?);
-        self.record_segment_baseline()?;
+        self.segment
+            .replace_output(open_display_track_file(&new_path)?)?;
+        self.segment.write_baseline(end_ns)?;
         self.prune_closed_segments(end_ns)
     }
 
@@ -625,5 +697,147 @@ fn display_track_output_path(
         display_track_segment_path(recording_path, client_id, index)
     } else {
         display_track_path(recording_path, client_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_recording_protocol::read_frames;
+
+    const ROLLING_WINDOW: Duration = Duration::from_secs(10);
+    const SECOND_NS: u64 = 1_000_000_000;
+
+    fn rolling_writer(dir: &Path) -> (DisplayCaptureFileWriter, Uuid) {
+        let client_id = Uuid::new_v4();
+        let writer =
+            DisplayCaptureFileWriter::open(Uuid::new_v4(), dir, client_id, Some(ROLLING_WINDOW))
+                .expect("rolling display capture writer opens");
+        (writer, client_id)
+    }
+
+    fn segment_events(path: &Path) -> Vec<DisplayTrackEnvelope> {
+        let bytes = std::fs::read(path).expect("segment file is readable");
+        let result =
+            read_frames::<DisplayTrackEnvelope>(&bytes).expect("segment frames decode cleanly");
+        assert_eq!(result.bytes_remaining, 0, "segment must not be truncated");
+        result.frames
+    }
+
+    /// Rotation must advance by exactly one segment per call, and the new
+    /// segment must open with its own baseline.
+    #[test]
+    fn rotate_advances_exactly_one_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, client_id) = rolling_writer(dir.path());
+
+        writer
+            .rotate(50 * SECOND_NS)
+            .expect("rotation past the segment age succeeds");
+
+        assert_eq!(writer.segment_index, 1);
+        assert_eq!(writer.closed_segments.len(), 1);
+        assert_eq!(writer.segment_start_ns, 50 * SECOND_NS);
+        assert!(display_track_segment_path(dir.path(), client_id, 1).exists());
+    }
+
+    /// A rotation baseline is stamped at the segment boundary, so seeking to a
+    /// segment start yields a coherent stream-opened/resize/repaint prefix.
+    #[test]
+    fn segment_baseline_events_share_boundary_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, client_id) = rolling_writer(dir.path());
+        let boundary_ns = 7 * SECOND_NS;
+
+        writer.rotate(boundary_ns).expect("rotation succeeds");
+        writer.flush().expect("flush succeeds");
+
+        let events = segment_events(&display_track_segment_path(dir.path(), client_id, 1));
+        assert!(
+            !events.is_empty(),
+            "a rotated segment starts with a baseline"
+        );
+        for envelope in &events {
+            assert_eq!(
+                envelope.mono_ns, boundary_ns,
+                "baseline events carry the segment boundary timestamp"
+            );
+        }
+        assert!(matches!(
+            events.first().map(|envelope| &envelope.event),
+            Some(DisplayTrackEvent::StreamOpened { .. })
+        ));
+    }
+
+    /// Aged events must rotate at most once each and prune old segments, so a
+    /// long rolling-window capture stays bounded in segment count and disk use.
+    ///
+    /// This exercises the rotation/pruning policy, not the old recursion: the
+    /// recursion is now prevented structurally (baseline writes go through
+    /// [`DisplaySegmentWriter`], which cannot reach rotation), so there is no
+    /// runtime path left for a test to drive into it.
+    #[test]
+    fn rolling_window_capture_stays_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, client_id) = rolling_writer(dir.path());
+
+        for step in 0..40_u64 {
+            let mono_ns = step * 5 * SECOND_NS;
+            let outcome = writer
+                .segment
+                .write(
+                    DisplayTrackEvent::FrameBytes {
+                        data: format!("frame {step}\r\n").into_bytes(),
+                    },
+                    mono_ns,
+                )
+                .expect("segment write succeeds");
+            assert_eq!(outcome, RecordOutcome::Written);
+            writer
+                .maybe_rotate(mono_ns)
+                .expect("rotation stays bounded across many segments");
+        }
+        writer.flush().expect("flush succeeds");
+
+        assert_eq!(
+            writer.segment_index, 39,
+            "each aged event rotates at most once"
+        );
+        assert!(
+            writer.closed_segments.len() < 5,
+            "pruning bounds retained segments, got {}",
+            writer.closed_segments.len()
+        );
+        assert!(
+            !display_track_segment_path(dir.path(), client_id, 0).exists(),
+            "segments older than the retention window are pruned"
+        );
+    }
+
+    /// An empty image update for an already-empty screen writes nothing, so it
+    /// must not age the segment into a rotation.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    #[test]
+    fn empty_image_update_does_not_rotate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut writer, _client_id) = rolling_writer(dir.path());
+
+        let outcome = writer
+            .segment
+            .write(
+                DisplayTrackEvent::ImageUpdate { images: Vec::new() },
+                50 * SECOND_NS,
+            )
+            .expect("empty image update succeeds");
+
+        assert_eq!(outcome, RecordOutcome::Skipped);
+        assert_eq!(
+            writer.segment_index, 0,
+            "a skipped write must not trigger rotation"
+        );
     }
 }
