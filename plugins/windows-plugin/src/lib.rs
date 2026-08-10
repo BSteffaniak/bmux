@@ -388,6 +388,35 @@ fn close_pane(
     Ok(ack)
 }
 
+/// Kills whatever is running in the target pane and respawns a fresh
+/// shell in the same layout slot. The pane-runtime primitive preserves
+/// the pane id, name, and last-known cwd while dropping the recorded
+/// active command, so the pane returns to a clean prompt without
+/// disturbing the layout tree.
+fn restart_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::restart_pane(&mut client, session_id, target),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/restart-pane", err))?;
+    let ack = result.map_err(|err| format!("restart-pane failed: {err:?}"))?;
+    // The windows-plugin pane-event variant set has no dedicated
+    // `restarted` case; a respawned pane is a lifecycle transition back
+    // to running, which is exactly what `status-changed` models.
+    emit_pane_event(
+        bmux_windows_plugin_api::windows_events::PaneEvent::StatusChanged {
+            pane_id: ack.pane_id,
+        },
+    );
+    Ok(ack)
+}
+
 #[derive(Default)]
 struct FloatingPaneCommandOptions {
     origin_x: Option<u16>,
@@ -1170,11 +1199,10 @@ impl RustPlugin for WindowsPlugin {
                     .map(|ack| PaneZoomAck { pane_id: ack.pane_id, zoomed: true })
                     .map_err(|e| ServiceResponse::error("zoom_failed", e))
             },
-            "windows-commands", "restart-pane" => |_req: RestartPaneArgs, _ctx| {
-                Err::<PaneAck, _>(ServiceResponse::error(
-                    "unsupported",
-                    "restart-pane typed command is not wired to a host primitive yet",
-                ))
+            "windows-commands", "restart-pane" => |req: RestartPaneArgs, ctx| {
+                restart_pane(ctx, req.session.as_ref(), req.target.as_ref())
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("restart_failed", e))
             },
         })
     }
@@ -1975,9 +2003,10 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             Ok(())
         }
         "restart-pane" => {
-            // Restart wiring is a pre-existing stub; we return a clean
-            // error until the host primitive lands.
-            Err("restart-pane is not yet wired to a host primitive".to_string())
+            // Mirrors `close-active-pane`: the active pane of the
+            // caller's selected session is the target.
+            restart_pane(context, None, None)?;
+            Ok(())
         }
         _ => Err(format!("unsupported command '{}'", context.command)),
     }
@@ -3236,13 +3265,17 @@ impl WindowsCommandsService for WindowsCommandsHandle {
 
     fn restart_pane<'a>(
         &'a self,
-        _session: Option<Selector>,
-        _target: Option<Selector>,
+        session: Option<Selector>,
+        target: Option<Selector>,
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            Err(PaneMutationError::Failed {
-                reason: "restart-pane typed command is not wired to a host primitive yet".into(),
-            })
+            restart_pane(&*caller, session.as_ref(), target.as_ref())
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.pane_id),
+                })
+                .map_err(map_host_error)
         })
     }
 
@@ -5487,6 +5520,35 @@ mod tests {
         let response = plugin.invoke_service(context);
         let error = response.error.expect("expected invalid request");
         assert_eq!(error.code, "invalid_request");
+    }
+
+    /// `restart-pane` must reach the pane-runtime primitive rather than
+    /// short-circuiting with the old `unsupported` stub. The test router
+    /// does not serve `clients-state`, so session resolution fails and
+    /// the error surfaces under the command's own `restart_failed` code —
+    /// proof the request was dispatched instead of rejected up front.
+    #[test]
+    fn invoke_service_restart_pane_is_wired() {
+        let _router = install_context_test_router(false, false);
+        let plugin = WindowsPlugin::default();
+        let context = service_test_context(
+            "windows-commands",
+            "restart-pane",
+            encode_service_message(&RestartPaneArgs {
+                session: None,
+                target: None,
+            })
+            .expect("request should encode"),
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected restart dispatch failure");
+        assert_eq!(
+            error.code, "restart_failed",
+            "restart-pane must dispatch, not return the `unsupported` stub",
+        );
     }
 
     #[test]
