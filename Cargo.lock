@@ -1444,6 +1444,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_codec_derive"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_codec",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "bmux_command_palette_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [

@@ -1,6 +1,8 @@
 mod de;
 mod ser;
 
+pub mod flatten;
+
 #[cfg(feature = "positional")]
 pub mod positional;
 #[cfg(feature = "stable")]

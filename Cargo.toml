@@ -17,6 +17,7 @@ members = [
     "packages/attach_pipeline/models",
     "packages/bmux",
     "packages/codec",
+    "packages/codec-derive",
     "packages/fonts",
     "packages/cli_output",
     "packages/cli",
@@ -163,6 +164,7 @@ bmux_codec = { version = "0.0.1-alpha.1", default-features = false, features = [
     "positional",
     "typed-stable",
 ], path = "packages/codec" }
+bmux_codec_derive = { version = "0.0.1-alpha.1", default-features = false, path = "packages/codec-derive" }
 bmux_config = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config" }
 bmux_config_doc = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config-doc" }
 bmux_config_doc_derive = { version = "0.0.1-alpha.1", default-features = false, path = "packages/config-doc-derive" }

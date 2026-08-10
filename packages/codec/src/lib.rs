@@ -26,6 +26,9 @@ pub use serde_adapter::positional::{from_positional_bytes, to_positional_vec};
 pub use serde_adapter::typed_stable::{from_typed_bytes, to_typed_vec};
 
 #[cfg(feature = "serde")]
+pub use serde_adapter::flatten::{FlattenedVariantName, FlattenedVariants, split_variant};
+
+#[cfg(feature = "serde")]
 pub use serde_adapter::serde_bytes_vec;
 
 #[cfg(test)]
