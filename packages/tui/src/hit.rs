@@ -55,6 +55,10 @@ pub enum HitRole {
 }
 
 /// One rectangular node in the committed interaction scene.
+///
+/// Independent boolean capabilities intentionally model orthogonal visibility,
+/// pointer, hover, focus, and enabled semantics without a combinatorial enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HitRegion {
     /// Stable region id.
@@ -65,6 +69,10 @@ pub struct HitRegion {
     pub layer: i16,
     /// Region role.
     pub role: HitRole,
+    /// Whether this region is present in the committed interaction scene.
+    pub visible: bool,
+    /// Whether this region accepts pointer button, drag, and scroll events.
+    pub pointer_events: bool,
     /// Whether this region accepts hover/move events.
     pub hoverable: bool,
     /// Whether this region participates in keyboard focus traversal.
@@ -86,6 +94,8 @@ impl HitRegion {
             area,
             layer: 0,
             role: HitRole::Action,
+            visible: true,
+            pointer_events: true,
             hoverable: false,
             focusable: false,
             enabled: true,
@@ -105,6 +115,20 @@ impl HitRegion {
     #[must_use]
     pub const fn role(mut self, role: HitRole) -> Self {
         self.role = role;
+        self
+    }
+
+    /// Mark whether this region is visible and eligible for interaction.
+    #[must_use]
+    pub const fn visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    /// Mark whether this region accepts pointer button, drag, and scroll events.
+    #[must_use]
+    pub const fn pointer_events(mut self, pointer_events: bool) -> Self {
+        self.pointer_events = pointer_events;
         self
     }
 
@@ -146,13 +170,13 @@ impl HitRegion {
     /// Return true when the region contains the point and is non-empty.
     #[must_use]
     pub const fn contains(&self, point: Point) -> bool {
-        !self.area.is_empty() && self.area.contains(point)
+        self.visible && !self.area.is_empty() && self.area.contains(point)
     }
 
     /// Return whether this region accepts the mouse-event kind.
     #[must_use]
     pub const fn accepts(&self, kind: MouseEventKind) -> bool {
-        if !self.enabled {
+        if !self.visible || !self.enabled {
             return false;
         }
         match kind {
@@ -163,7 +187,7 @@ impl HitRegion {
             | MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight => true,
+            | MouseEventKind::ScrollRight => self.pointer_events,
         }
     }
 }
@@ -240,7 +264,8 @@ impl HitMap {
             .iter()
             .enumerate()
             .filter(|(_, region)| {
-                region.focusable
+                region.visible
+                    && region.focusable
                     && region.enabled
                     && !region.area.is_empty()
                     && region.focus_scope.as_ref() == scope
@@ -374,6 +399,25 @@ mod tests {
         assert_eq!(hit.id().as_str(), "row-1");
         assert_eq!(hit.role(), HitRole::ListItem);
         assert_eq!(hit.local, Point::new(2, 0));
+    }
+
+    #[test]
+    fn hidden_and_pointer_excluded_regions_do_not_route_or_receive_focus() {
+        let map = HitMap::new()
+            .with_region(
+                HitRegion::new("hidden", Rect::new(0, 0, 2, 2))
+                    .visible(false)
+                    .focusable(true),
+            )
+            .with_region(
+                HitRegion::new("keyboard-only", Rect::new(0, 0, 2, 2))
+                    .pointer_events(false)
+                    .focusable(true),
+            );
+        let click = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 1));
+
+        assert!(map.hit_mouse(click).is_none());
+        assert_eq!(map.focus_targets(None), [HitId::new("keyboard-only")]);
     }
 
     #[test]

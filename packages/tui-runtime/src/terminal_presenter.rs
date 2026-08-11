@@ -1,4 +1,9 @@
 //! [`bmux_tui::terminal::Terminal`] presenter adapter.
+//!
+//! [`TerminalPresenter::with_commit`] publishes the exact interaction metadata
+//! from the last successfully flushed frame. Applications should update their
+//! [`bmux_tui::interaction::InteractionRouter`] from this callback and route
+//! subsequent input through that committed scene instead of recomputing layout.
 
 use std::io::{self, Write};
 

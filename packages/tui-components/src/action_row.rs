@@ -103,9 +103,17 @@ impl ActionRowKeyboardPolicy {
     const ENTER_ACTIVATES: u8 = 1 << 3;
     const SPACE_ACTIVATES: u8 = 1 << 4;
 
-    /// Common keyboard action-row behavior.
+    /// Global action-row behavior: each rendered button is an independent tab stop.
     #[must_use]
-    pub const fn interactive() -> Self {
+    pub const fn global() -> Self {
+        Self {
+            flags: Self::ENTER_ACTIVATES | Self::SPACE_ACTIVATES,
+        }
+    }
+
+    /// Deliberate local roving behavior with arrow navigation and wrapping.
+    #[must_use]
+    pub const fn roving() -> Self {
         Self {
             flags: Self::ARROW_NAVIGATION
                 | Self::TAB_NAVIGATION
@@ -113,6 +121,12 @@ impl ActionRowKeyboardPolicy {
                 | Self::ENTER_ACTIVATES
                 | Self::SPACE_ACTIVATES,
         }
+    }
+
+    /// Legacy alias for deliberate local roving behavior.
+    #[must_use]
+    pub const fn interactive() -> Self {
+        Self::roving()
     }
 
     /// Return true when Left/Right move focus.
@@ -148,7 +162,7 @@ impl ActionRowKeyboardPolicy {
 
 impl Default for ActionRowKeyboardPolicy {
     fn default() -> Self {
-        Self::interactive()
+        Self::global()
     }
 }
 
@@ -162,19 +176,34 @@ pub struct ActionRowPolicy {
 }
 
 impl ActionRowPolicy {
-    /// Common keyboard and mouse action-row behavior.
+    /// Default global keyboard and mouse action-row behavior.
     #[must_use]
-    pub const fn interactive() -> Self {
+    pub const fn global() -> Self {
         Self {
             mouse: ComponentMousePolicy::button(),
-            keyboard: ActionRowKeyboardPolicy::interactive(),
+            keyboard: ActionRowKeyboardPolicy::global(),
         }
+    }
+
+    /// Deliberate local roving keyboard and mouse behavior.
+    #[must_use]
+    pub const fn roving() -> Self {
+        Self {
+            mouse: ComponentMousePolicy::button(),
+            keyboard: ActionRowKeyboardPolicy::roving(),
+        }
+    }
+
+    /// Legacy alias for deliberate local roving behavior.
+    #[must_use]
+    pub const fn interactive() -> Self {
+        Self::roving()
     }
 }
 
 impl Default for ActionRowPolicy {
     fn default() -> Self {
-        Self::interactive()
+        Self::global()
     }
 }
 
@@ -240,7 +269,7 @@ impl<'a> ActionRow<'a> {
             actions,
             focused: 0,
             spacing: 1,
-            policy: ActionRowPolicy::interactive(),
+            policy: ActionRowPolicy::default(),
             styles: ActionRowStyles::default(),
         }
     }
@@ -291,6 +320,8 @@ impl<'a> ActionRow<'a> {
 
     /// Render the action row using stateless focused-index configuration.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("action-row");
+        self.register_actions(area, None, frame, id.as_str());
         self.render_actions(area, None, frame, None);
     }
 
@@ -308,6 +339,17 @@ impl<'a> ActionRow<'a> {
         frame: &mut Frame<'_>,
         id_prefix: &str,
     ) {
+        self.register_actions(area, Some(state), frame, id_prefix);
+        self.render_actions(area, Some(state), frame, None);
+    }
+
+    fn register_actions(
+        &self,
+        area: Rect,
+        state: Option<&ActionRowState>,
+        frame: &mut Frame<'_>,
+        id_prefix: &str,
+    ) {
         for (index, action_area) in self.action_areas(area).into_iter().enumerate() {
             let Some(action) = self.actions.get(index) else {
                 break;
@@ -320,14 +362,15 @@ impl<'a> ActionRow<'a> {
                 .role(HitRole::Action)
                 .hoverable(self.policy.mouse.hover)
                 .focusable(true)
-                .enabled(!state.interaction.disabled),
+                .enabled(state.is_none_or(|state| !state.interaction.disabled)),
             );
         }
-        self.render_actions(area, Some(state), frame, None);
     }
 
     /// Render the action row with a fallback style filling each button area.
     pub fn render_with_fallback_style(&self, area: Rect, frame: &mut Frame<'_>, style: Style) {
+        let id = frame.next_interaction_id("action-row");
+        self.register_actions(area, None, frame, id.as_str());
         self.render_actions(area, None, frame, Some(style));
     }
 
@@ -339,6 +382,8 @@ impl<'a> ActionRow<'a> {
         frame: &mut Frame<'_>,
         style: Style,
     ) {
+        let id = frame.next_interaction_id("action-row");
+        self.register_actions(area, Some(state), frame, id.as_str());
         self.render_actions(area, Some(state), frame, Some(style));
     }
 
@@ -571,7 +616,7 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
 
-    use super::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
+    use super::{ActionButton, ActionRow, ActionRowOutcome, ActionRowPolicy, ActionRowState};
 
     #[test]
     fn action_areas_follow_rendered_button_widths() {
@@ -601,12 +646,28 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_navigation_moves_focus() {
+    fn default_global_row_yields_arrow_navigation_to_global_routing() {
         let actions = [
             ActionButton::new("approve", "Approve"),
             ActionButton::new("deny", "Deny"),
         ];
         let row = ActionRow::new(&actions);
+        let mut state = ActionRowState::new();
+        state.set_focused(Some(0));
+
+        let outcome = row.handle_event(Rect::new(0, 0, 30, 1), &mut state, &key(KeyCode::Right));
+
+        assert_eq!(outcome, ActionRowOutcome::Ignored);
+        assert_eq!(state.focused(), Some(0));
+    }
+
+    #[test]
+    fn explicitly_roving_row_moves_focus_with_arrows() {
+        let actions = [
+            ActionButton::new("approve", "Approve"),
+            ActionButton::new("deny", "Deny"),
+        ];
+        let row = ActionRow::new(&actions).policy(ActionRowPolicy::roving());
         let mut state = ActionRowState::new();
         state.set_focused(Some(0));
 
@@ -664,6 +725,39 @@ mod tests {
                 id: "deny".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn every_render_path_registers_individual_global_tab_stops() {
+        let actions = [
+            ActionButton::new("approve", "Approve"),
+            ActionButton::new("deny", "Deny"),
+        ];
+        let row = ActionRow::new(&actions).spacing(2);
+        let area = Rect::new(3, 4, 30, 1);
+
+        for render in 0..4 {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 8));
+            let mut frame = Frame::new(&mut buffer);
+            let state = ActionRowState::new();
+            match render {
+                0 => row.render(area, &mut frame),
+                1 => row.render_state(area, &state, &mut frame),
+                2 => {
+                    row.render_with_fallback_style(area, &mut frame, bmux_tui::style::Style::new());
+                }
+                _ => row.render_state_with_fallback_style(
+                    area,
+                    &state,
+                    &mut frame,
+                    bmux_tui::style::Style::new(),
+                ),
+            }
+
+            assert_eq!(frame.hits().focus_targets(None).len(), 2);
+            assert_eq!(frame.hits().regions()[0].area, Rect::new(3, 4, 11, 1));
+            assert_eq!(frame.hits().regions()[1].area, Rect::new(16, 4, 8, 1));
+        }
     }
 
     #[test]

@@ -161,6 +161,7 @@ impl InteractionRouter {
     }
 
     /// Route one event using generic webpage-like traversal semantics.
+    #[allow(clippy::too_many_lines)]
     pub fn route(&mut self, event: Event) -> InteractionRoute {
         if let Event::Key(stroke) = &event
             && is_tab_traversal(*stroke)
