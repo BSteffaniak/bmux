@@ -4,6 +4,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
@@ -220,10 +221,32 @@ impl<'a> Breadcrumbs<'a> {
         self
     }
 
-    /// Render breadcrumbs.
+    /// Render breadcrumbs and register the composite interaction area.
     pub fn render(&self, area: Rect, state: &BreadcrumbsState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("breadcrumbs");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render breadcrumbs with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &BreadcrumbsState,
+        frame: &mut Frame<'_>,
+    ) {
         if area.is_empty() {
             return;
+        }
+        let interactive = self.policy.keyboard || self.policy.mouse.enabled;
+        if interactive && self.items.iter().any(|item| !item.disabled) {
+            frame.push_hit(
+                SceneRegion::new(id, area)
+                    .role(HitRole::ListItem)
+                    .pointer_events(self.policy.mouse.enabled)
+                    .hoverable(self.policy.mouse.hover)
+                    .focusable(self.policy.keyboard),
+            );
         }
         let mut line = self.line(state);
         if self.policy.truncate {
@@ -423,6 +446,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
 
     use super::{BreadcrumbItem, Breadcrumbs, BreadcrumbsOutcome, BreadcrumbsState};
 
@@ -442,6 +466,56 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("Home / Docs     ")
         );
+    }
+
+    #[test]
+    fn render_registers_exact_composite_geometry() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let state = BreadcrumbsState::new(Some(1));
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 20, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Breadcrumbs::new(&items).render_with_id(
+            "location",
+            Rect::new(6, 3, 14, 1),
+            &state,
+            &mut frame,
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id.as_str(), "location");
+        assert_eq!(regions[0].area, Rect::new(6, 3, 14, 1));
+        assert_eq!(regions[0].role, HitRole::ListItem);
+        assert!(regions[0].focusable);
+        assert!(regions[0].pointer_events);
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+    }
+
+    #[test]
+    fn empty_or_fully_disabled_breadcrumbs_register_nothing() {
+        let disabled = [BreadcrumbItem::new("home", "Home").disabled(true)];
+        let empty: [BreadcrumbItem<'_>; 0] = [];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        Breadcrumbs::new(&disabled).render_with_id(
+            "disabled",
+            Rect::new(0, 0, 12, 1),
+            &BreadcrumbsState::new(Some(0)),
+            &mut frame,
+        );
+        Breadcrumbs::new(&empty).render_with_id(
+            "empty",
+            Rect::new(0, 1, 12, 1),
+            &BreadcrumbsState::new(None),
+            &mut frame,
+        );
+
+        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]

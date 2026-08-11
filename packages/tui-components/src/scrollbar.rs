@@ -291,7 +291,7 @@ impl Scrollbar {
         if area.is_empty() {
             return;
         }
-        if self.policy.mouse_drag {
+        if self.policy.mouse_drag && state.max_offset() > 0 {
             frame.push_hit(
                 SceneRegion::new(id, area)
                     .role(HitRole::Scroll)

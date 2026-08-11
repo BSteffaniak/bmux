@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Style};
 use bmux_tui::text::line_viewport;
 
@@ -370,9 +371,21 @@ impl<'a> ScrollArea<'a> {
         start..end
     }
 
-    /// Render visible lines.
+    /// Render visible lines and register the scrollable viewport.
     pub fn render(&self, area: Rect, state: &ScrollAreaState, frame: &mut Frame<'_>) {
-        self.render_with_fallback_style(area, state, frame, Style::new());
+        let id = frame.next_interaction_id("scroll-area");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render visible lines with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &ScrollAreaState,
+        frame: &mut Frame<'_>,
+    ) {
+        self.render_with_id_and_fallback_style(id, area, state, frame, Style::new());
     }
 
     /// Render visible lines with a fallback style filling each rendered row.
@@ -383,7 +396,33 @@ impl<'a> ScrollArea<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
+        let id = frame.next_interaction_id("scroll-area");
+        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
+    }
+
+    /// Render with a stable interaction identifier and fallback style.
+    pub fn render_with_id_and_fallback_style(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &ScrollAreaState,
+        frame: &mut Frame<'_>,
+        fallback: Style,
+    ) {
+        let id = id.into();
         let layout = self.layout(area);
+        let vertical_scrollable = self.max_vertical_offset(layout.content) > 0;
+        let horizontal_scrollable = self.max_horizontal_offset(layout.content) > 0;
+        let scrollable = vertical_scrollable || horizontal_scrollable;
+        if scrollable && (self.policy.keyboard || self.policy.mouse_wheel || self.policy.drag_pan) {
+            frame.push_hit(
+                SceneRegion::new(id.clone(), layout.content)
+                    .role(HitRole::Scroll)
+                    .pointer_events(self.policy.mouse_wheel || self.policy.drag_pan)
+                    .focusable(self.policy.keyboard)
+                    .enabled(!state.interaction.disabled),
+            );
+        }
         let range = self.visible_range(layout.content, state);
         for (row, line) in self.lines[range].iter().enumerate() {
             let y = layout
@@ -406,14 +445,24 @@ impl<'a> ScrollArea<'a> {
                 .offset(state.vertical_offset);
             Scrollbar::new()
                 .policy(self.policy.scrollbar_policy)
-                .render(scrollbar_area, &scrollbar_state, frame);
+                .render_with_id(
+                    format!("{}.vertical-scrollbar", id.as_str()),
+                    scrollbar_area,
+                    &scrollbar_state,
+                    frame,
+                );
         }
         if let Some(scrollbar_area) = layout.horizontal_scrollbar {
             let scrollbar_state = ScrollbarState::new(self.content_width(), layout.content.width)
                 .offset(state.horizontal_offset);
             Scrollbar::new()
                 .policy(self.policy.horizontal_scrollbar_policy)
-                .render(scrollbar_area, &scrollbar_state, frame);
+                .render_with_id(
+                    format!("{}.horizontal-scrollbar", id.as_str()),
+                    scrollbar_area,
+                    &scrollbar_state,
+                    frame,
+                );
         }
         if let Some(corner) = layout.corner {
             frame.fill(corner, " ", fallback);
@@ -755,6 +804,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
@@ -773,6 +823,78 @@ mod tests {
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("one     "));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("two     "));
+    }
+
+    #[test]
+    fn render_registers_exact_viewport_and_scrollbar_geometry() {
+        let lines = lines(&["zero", "one", "two", "three"]);
+        let area = ScrollArea::new(&lines).policy(
+            super::ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter),
+        );
+        let state = ScrollAreaState::new();
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 14, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        area.render_with_id_and_fallback_style(
+            "results",
+            Rect::new(6, 3, 10, 3),
+            &state,
+            &mut frame,
+            Style::new(),
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].id.as_str(), "results");
+        assert_eq!(regions[0].area, Rect::new(6, 3, 9, 3));
+        assert_eq!(regions[0].role, HitRole::Scroll);
+        assert!(regions[0].focusable);
+        assert_eq!(regions[1].id.as_str(), "results.vertical-scrollbar");
+        assert_eq!(regions[1].area, Rect::new(15, 3, 1, 3));
+        assert_eq!(regions[1].role, HitRole::Scroll);
+        assert!(!regions[1].focusable);
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+    }
+
+    #[test]
+    fn non_scrollable_and_input_disabled_areas_register_nothing() {
+        let short = lines(&["one"]);
+        let long = lines(&["zero", "one", "two"]);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        ScrollArea::new(&short).render_with_id(
+            "short",
+            Rect::new(0, 0, 10, 2),
+            &ScrollAreaState::new(),
+            &mut frame,
+        );
+        ScrollArea::new(&long)
+            .policy(super::ScrollAreaPolicy::disabled())
+            .render_with_id(
+                "static",
+                Rect::new(0, 2, 10, 1),
+                &ScrollAreaState::new(),
+                &mut frame,
+            );
+
+        assert!(frame.hits().regions().is_empty());
+    }
+
+    #[test]
+    fn whole_area_disabled_is_excluded_from_traversal() {
+        let lines = lines(&["zero", "one", "two"]);
+        let area = ScrollArea::new(&lines);
+        let mut state = ScrollAreaState::new();
+        state.set_disabled(true);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+
+        area.render_with_id("results", Rect::new(0, 0, 10, 1), &state, &mut frame);
+
+        assert_eq!(frame.hits().regions().len(), 1);
+        assert!(!frame.hits().regions()[0].enabled);
+        assert!(frame.hits().focus_targets(None).is_empty());
     }
 
     #[test]

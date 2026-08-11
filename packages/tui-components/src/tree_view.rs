@@ -4,6 +4,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 
@@ -193,6 +194,15 @@ impl TreeViewState {
         self.interaction.focused = focused;
     }
 
+    /// Set whether the whole tree is disabled.
+    pub const fn set_disabled(&mut self, disabled: bool) {
+        self.interaction.disabled = disabled;
+        if disabled {
+            self.hovered_visible = None;
+            self.pressed_visible = None;
+        }
+    }
+
     /// Return selected visible row.
     #[must_use]
     pub const fn selected_visible(&self) -> Option<usize> {
@@ -312,13 +322,36 @@ impl<'a> TreeView<'a> {
         visible_indices(self.items, state)
     }
 
-    /// Render visible tree rows.
+    /// Render visible tree rows and register one composite tab stop.
     pub fn render(&self, area: Rect, state: &TreeViewState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("tree-view");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render visible tree rows with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &TreeViewState,
+        frame: &mut Frame<'_>,
+    ) {
         if area.is_empty() {
             return;
         }
-        for (visible, source) in self
-            .visible_indices(state)
+        let visible = self.visible_indices(state);
+        let usable = visible.iter().any(|source| !self.items[*source].disabled);
+        if usable && (self.policy.keyboard.enabled || self.policy.mouse.enabled) {
+            frame.push_hit(
+                SceneRegion::new(id, area)
+                    .role(HitRole::ListItem)
+                    .pointer_events(self.policy.mouse.enabled)
+                    .hoverable(self.policy.mouse.hover)
+                    .focusable(self.policy.keyboard.enabled)
+                    .enabled(!state.interaction.disabled),
+            );
+        }
+        for (visible, source) in visible
             .into_iter()
             .take(usize::from(area.height))
             .enumerate()
@@ -621,6 +654,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
 
     use super::{TreeView, TreeViewItem, TreeViewOutcome, TreeViewPolicy, TreeViewState};
 
@@ -655,6 +689,70 @@ mod tests {
             frame.buffer().row_symbols(1).as_deref(),
             Some("    lib.rs          ")
         );
+    }
+
+    #[test]
+    fn render_registers_exact_composite_geometry_and_disabled_state() {
+        let items = sample_items();
+        let view = TreeView::new(&items);
+        let mut enabled = TreeViewState::new(Some(0));
+        enabled.set_expanded("src", true);
+        let mut disabled = enabled.clone();
+        disabled.set_disabled(true);
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 24, 10));
+        let mut frame = Frame::new(&mut buffer);
+
+        view.render_with_id("files", Rect::new(6, 3, 18, 4), &enabled, &mut frame);
+        view.render_with_id(
+            "disabled-files",
+            Rect::new(6, 7, 18, 4),
+            &disabled,
+            &mut frame,
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].id.as_str(), "files");
+        assert_eq!(regions[0].area, Rect::new(6, 3, 18, 4));
+        assert_eq!(regions[0].role, HitRole::ListItem);
+        assert!(regions[0].focusable);
+        assert!(regions[0].enabled);
+        assert_eq!(regions[1].id.as_str(), "disabled-files");
+        assert_eq!(regions[1].area, Rect::new(6, 7, 18, 4));
+        assert!(!regions[1].enabled);
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+    }
+
+    #[test]
+    fn empty_fully_disabled_and_bare_trees_register_nothing() {
+        let disabled = [TreeViewItem::new("disabled", "Disabled", 0).disabled(true)];
+        let empty: [TreeViewItem; 0] = [];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        TreeView::new(&disabled).render_with_id(
+            "disabled",
+            Rect::new(0, 0, 20, 1),
+            &TreeViewState::new(Some(0)),
+            &mut frame,
+        );
+        TreeView::new(&empty).render_with_id(
+            "empty",
+            Rect::new(0, 1, 20, 1),
+            &TreeViewState::new(None),
+            &mut frame,
+        );
+        let items = sample_items();
+        TreeView::new(&items)
+            .policy(TreeViewPolicy::bare())
+            .render_with_id(
+                "bare",
+                Rect::new(0, 2, 20, 1),
+                &TreeViewState::new(Some(0)),
+                &mut frame,
+            );
+
+        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
