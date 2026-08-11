@@ -342,6 +342,9 @@ impl HitMap {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
     use super::{HitId, HitMap, HitRegion, HitRole};
     use crate::event::{MouseButton, MouseEvent, MouseEventKind};
     use crate::geometry::{Point, Rect};
@@ -418,6 +421,38 @@ mod tests {
 
         assert!(map.hit_mouse(click).is_none());
         assert_eq!(map.focus_targets(None), [HitId::new("keyboard-only")]);
+    }
+
+    #[test]
+    fn representative_scene_routing_cost_remains_bounded() {
+        fn scene(count: usize) -> HitMap {
+            let mut map = HitMap::new();
+            for index in 0..count {
+                let x = u16::try_from(index % 100).expect("bounded x");
+                let y = u16::try_from(index / 100).expect("bounded y");
+                map.push(
+                    HitRegion::new(format!("item.{index}"), Rect::new(x, y, 1, 1)).focusable(true),
+                );
+            }
+            map
+        }
+
+        let small = scene(32);
+        let large = scene(10_000);
+        let event = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(99, 99));
+        let started = Instant::now();
+        for _ in 0..1_000 {
+            black_box(large.hit_mouse(event));
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(small.focus_targets(None).len(), 32);
+        assert_eq!(large.focus_targets(None).len(), 10_000);
+        assert_eq!(
+            large.hit_mouse(event).map(|hit| hit.region.id.as_str()),
+            Some("item.9999")
+        );
+        assert!(elapsed.as_secs_f64() < 5.0, "routing took {elapsed:?}");
     }
 
     #[test]
