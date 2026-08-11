@@ -247,6 +247,20 @@ fn expand_variants(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
                     .map(|field| field.ident.clone().expect("named field"))
                     .collect();
                 let field_types: Vec<_> = fields.named.iter().map(|field| &field.ty).collect();
+                // Forward each field's `serde` attributes onto the generated struct. Dropping them
+                // would silently change decoding behaviour, for example losing
+                // `#[serde(default)]` so a peer that omits an optional field no longer decodes.
+                let field_attrs: Vec<Vec<&syn::Attribute>> = fields
+                    .named
+                    .iter()
+                    .map(|field| {
+                        field
+                            .attrs
+                            .iter()
+                            .filter(|attr| attr.path().is_ident("serde"))
+                            .collect()
+                    })
+                    .collect();
                 let field_lits: Vec<_> = field_idents
                     .iter()
                     .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
@@ -269,7 +283,7 @@ fn expand_variants(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
                 deserialize_arms.push(quote! {
                     #wire_lit => {
                         #[derive(::serde::Deserialize)]
-                        struct Fields { #(#field_idents: #field_types,)* }
+                        struct Fields { #( #(#field_attrs)* #field_idents: #field_types,)* }
 
                         struct Bridge;
                         impl<'de> ::serde::de::Visitor<'de> for Bridge {
