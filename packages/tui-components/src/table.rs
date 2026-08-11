@@ -233,6 +233,11 @@ impl TableState {
         }
     }
 
+    /// Set whether this composite currently owns keyboard focus.
+    pub const fn set_focused(&mut self, focused: bool) {
+        self.interaction.focused = focused;
+    }
+
     /// Return selected source row.
     #[must_use]
     pub const fn selected(&self) -> Option<usize> {
@@ -755,18 +760,24 @@ impl<'a> Table<'a> {
             return TableOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if self.policy.keyboard => match stroke.key {
-                KeyCode::Up => self.move_selection(state, -1),
-                KeyCode::Down => self.move_selection(state, 1),
-                KeyCode::Home => self.select_index(state, 0),
-                KeyCode::End => self.select_index(state, self.rows.len().saturating_sub(1)),
-                KeyCode::Left => self.scroll_horizontal(state, -1),
-                KeyCode::Right => self.scroll_horizontal(state, 1),
-                KeyCode::Enter => state
-                    .selected
-                    .map_or(TableOutcome::Ignored, TableOutcome::Selected),
-                _ => TableOutcome::Ignored,
-            },
+            Event::Key(stroke)
+                if state.interaction.focused
+                    && self.policy.keyboard
+                    && stroke.modifiers.is_empty() =>
+            {
+                match stroke.key {
+                    KeyCode::Up => self.move_selection(state, -1),
+                    KeyCode::Down => self.move_selection(state, 1),
+                    KeyCode::Home => self.select_index(state, 0),
+                    KeyCode::End => self.select_index(state, self.rows.len().saturating_sub(1)),
+                    KeyCode::Left => self.scroll_horizontal(state, -1),
+                    KeyCode::Right => self.scroll_horizontal(state, 1),
+                    KeyCode::Enter => state
+                        .selected
+                        .map_or(TableOutcome::Ignored, TableOutcome::Selected),
+                    _ => TableOutcome::Ignored,
+                }
+            }
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
                 self.handle_mouse(area, state, *mouse)
             }
@@ -1422,6 +1433,7 @@ mod tests {
         ];
         let rows = [TableRow::new(vec!["abcd", "efgh"])];
         let mut state = TableState::new(Some(0));
+        state.set_focused(true);
         state.set_horizontal_scroll(2);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
         let mut frame = Frame::new(&mut buffer);
@@ -1752,6 +1764,7 @@ mod tests {
         let columns = [TableColumn::new("A"), TableColumn::new("B")];
         let rows = [TableRow::new(vec!["a", "b"])];
         let mut state = TableState::new(Some(0));
+        state.set_focused(true);
 
         assert_eq!(
             Table::new(&columns, &rows).handle_event(
@@ -1845,6 +1858,7 @@ mod tests {
         let columns = [TableColumn::new("Name")];
         let rows = [TableRow::new(vec!["alpha"]), TableRow::new(vec!["beta"])];
         let mut state = TableState::new(Some(0));
+        state.set_focused(true);
 
         let outcome = Table::new(&columns, &rows).handle_event(
             Rect::new(0, 0, 10, 3),
@@ -1854,6 +1868,22 @@ mod tests {
 
         assert_eq!(outcome, TableOutcome::Focused(1));
         assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn unfocused_table_does_not_consume_keyboard_navigation() {
+        let columns = [TableColumn::new("Name")];
+        let rows = [TableRow::new(vec!["alpha"]), TableRow::new(vec!["beta"])];
+        let mut state = TableState::new(Some(0));
+
+        let outcome = Table::new(&columns, &rows).handle_event(
+            Rect::new(0, 0, 10, 3),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Down)),
+        );
+
+        assert_eq!(outcome, TableOutcome::Ignored);
+        assert_eq!(state.selected(), Some(0));
     }
 
     #[test]

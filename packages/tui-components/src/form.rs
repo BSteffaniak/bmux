@@ -62,7 +62,7 @@ pub struct FormPolicy {
 }
 
 impl FormPolicy {
-    /// Common interactive form behavior.
+    /// Conventional form behavior that yields traversal at field boundaries.
     #[must_use]
     pub const fn interactive() -> Self {
         Self {
@@ -71,7 +71,16 @@ impl FormPolicy {
             backtab_moves_focus: true,
             enter_submits: true,
             escape_cancels: true,
+            wrap_focus: false,
+        }
+    }
+
+    /// Deliberate local form behavior that wraps traversal at field boundaries.
+    #[must_use]
+    pub const fn wrapping() -> Self {
+        Self {
             wrap_focus: true,
+            ..Self::interactive()
         }
     }
 }
@@ -152,18 +161,7 @@ impl<'a> Form<'a> {
             fields,
             values,
             field_areas: &[],
-            policy: FormPolicy {
-                mouse: ComponentMousePolicy {
-                    enabled: true,
-                    hover: true,
-                    click: true,
-                },
-                tab_moves_focus: true,
-                backtab_moves_focus: true,
-                enter_submits: true,
-                escape_cancels: true,
-                wrap_focus: true,
-            },
+            policy: FormPolicy::interactive(),
         }
     }
 
@@ -348,7 +346,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::geometry::{Point, Rect};
 
-    use super::{Form, FormFieldItem, FormOutcome, FormState};
+    use super::{Form, FormFieldItem, FormOutcome, FormPolicy, FormState};
 
     #[test]
     fn tab_moves_focus_to_next_enabled_field() {
@@ -407,6 +405,48 @@ mod tests {
 
         assert_eq!(outcome, FormOutcome::Ignored);
         assert_eq!(state.focused(), Some(0));
+    }
+
+    #[test]
+    fn default_form_yields_forward_and_reverse_focus_at_boundaries() {
+        let fields = vec![FormFieldItem::new("name"), FormFieldItem::new("email")];
+        let values = vec![Some("Ada"), Some("ada@example.test")];
+        let form = Form::new(&fields, &values);
+        let mut state = FormState::new(Some(1));
+
+        assert_eq!(
+            form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Tab))),
+            FormOutcome::Ignored
+        );
+        assert_eq!(state.focused(), Some(1));
+        state.set_focused(Some(0));
+        assert_eq!(
+            form.handle_event(
+                &mut state,
+                &Event::Key(KeyStroke {
+                    key: KeyCode::Tab,
+                    modifiers: bmux_keyboard::Modifiers {
+                        shift: true,
+                        ..bmux_keyboard::Modifiers::NONE
+                    },
+                }),
+            ),
+            FormOutcome::Ignored
+        );
+        assert_eq!(state.focused(), Some(0));
+    }
+
+    #[test]
+    fn wrapping_form_explicitly_wraps_at_boundaries() {
+        let fields = vec![FormFieldItem::new("name"), FormFieldItem::new("email")];
+        let values = vec![Some("Ada"), Some("ada@example.test")];
+        let form = Form::new(&fields, &values).policy(FormPolicy::wrapping());
+        let mut state = FormState::new(Some(1));
+
+        assert_eq!(
+            form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Tab))),
+            FormOutcome::Focused(0)
+        );
     }
 
     #[test]

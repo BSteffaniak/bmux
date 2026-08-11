@@ -242,6 +242,11 @@ impl TabBarState {
         self.selected = selected;
     }
 
+    /// Set whether this composite currently owns keyboard focus.
+    pub const fn set_focused(&mut self, focused: bool) {
+        self.interaction.focused = focused;
+    }
+
     /// Return hovered tab index.
     #[must_use]
     pub const fn hovered(&self) -> Option<usize> {
@@ -409,13 +414,23 @@ impl<'a> TabBar<'a> {
             return TabBarOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if self.policy.keyboard.enabled => match stroke.key {
-                KeyCode::Left => self.select_relative(state, -1),
-                KeyCode::Right => self.select_relative(state, 1),
-                KeyCode::Home if self.policy.keyboard.home_end => self.select_endpoint(state, true),
-                KeyCode::End if self.policy.keyboard.home_end => self.select_endpoint(state, false),
-                _ => TabBarOutcome::Ignored,
-            },
+            Event::Key(stroke)
+                if state.interaction.focused
+                    && self.policy.keyboard.enabled
+                    && stroke.modifiers.is_empty() =>
+            {
+                match stroke.key {
+                    KeyCode::Left => self.select_relative(state, -1),
+                    KeyCode::Right => self.select_relative(state, 1),
+                    KeyCode::Home if self.policy.keyboard.home_end => {
+                        self.select_endpoint(state, true)
+                    }
+                    KeyCode::End if self.policy.keyboard.home_end => {
+                        self.select_endpoint(state, false)
+                    }
+                    _ => TabBarOutcome::Ignored,
+                }
+            }
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
                 self.handle_mouse(area, state, *mouse)
             }
@@ -691,6 +706,21 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_tab_bar_does_not_consume_keyboard_navigation() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let mut state = TabBarState::new(Some(0));
+
+        let outcome = TabBar::new(&items).handle_event(
+            Rect::new(0, 0, 20, 1),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Right)),
+        );
+
+        assert_eq!(outcome, TabBarOutcome::Ignored);
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
     fn keyboard_navigation_selects_next_enabled_tab() {
         let items = [
             TabItem::new("one", "One"),
@@ -698,6 +728,7 @@ mod tests {
             TabItem::new("three", "Three"),
         ];
         let mut state = TabBarState::new(Some(0));
+        state.set_focused(true);
 
         let outcome = TabBar::new(&items).handle_event(
             Rect::new(0, 0, 20, 1),
@@ -713,6 +744,7 @@ mod tests {
     fn keyboard_navigation_can_disable_wrapping() {
         let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
         let mut state = TabBarState::new(Some(0));
+        state.set_focused(true);
         let bar = TabBar::new(&items).policy(TabBarPolicy {
             keyboard: TabBarKeyboardPolicy {
                 enabled: true,
@@ -736,6 +768,7 @@ mod tests {
     fn home_and_end_select_endpoints() {
         let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
         let mut state = TabBarState::new(Some(0));
+        state.set_focused(true);
         let bar = TabBar::new(&items);
 
         assert_eq!(
@@ -760,6 +793,7 @@ mod tests {
     fn mouse_click_selects_tab() {
         let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
         let mut state = TabBarState::new(Some(0));
+        state.set_focused(true);
         let bar = TabBar::new(&items);
         let area = Rect::new(0, 0, 20, 1);
 
@@ -795,6 +829,7 @@ mod tests {
             TabItem::new("two", "Two").disabled(true),
         ];
         let mut state = TabBarState::new(Some(0));
+        state.set_focused(true);
         let bar = TabBar::new(&items);
 
         assert_eq!(
@@ -830,6 +865,7 @@ mod tests {
     fn bare_policy_ignores_events() {
         let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
         let mut state = TabBarState::new(Some(0));
+        state.set_focused(true);
         let bar = TabBar::new(&items).policy(TabBarPolicy::bare());
 
         let outcome = bar.handle_event(

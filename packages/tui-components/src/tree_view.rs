@@ -188,6 +188,11 @@ impl TreeViewState {
         }
     }
 
+    /// Set whether this composite currently owns keyboard focus.
+    pub const fn set_focused(&mut self, focused: bool) {
+        self.interaction.focused = focused;
+    }
+
     /// Return selected visible row.
     #[must_use]
     pub const fn selected_visible(&self) -> Option<usize> {
@@ -344,17 +349,25 @@ impl<'a> TreeView<'a> {
             return TreeViewOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if self.policy.keyboard.enabled => match stroke.key {
-                KeyCode::Up => self.move_selection(state, -1),
-                KeyCode::Down => self.move_selection(state, 1),
-                KeyCode::Left => self.collapse_selected(state),
-                KeyCode::Right => self.expand_selected(state),
-                KeyCode::Enter if self.policy.keyboard.enter_selects => self.select_selected(state),
-                KeyCode::Char(' ') if self.policy.keyboard.space_toggles => {
-                    self.toggle_selected(state)
+            Event::Key(stroke)
+                if state.interaction.focused
+                    && self.policy.keyboard.enabled
+                    && stroke.modifiers.is_empty() =>
+            {
+                match stroke.key {
+                    KeyCode::Up => self.move_selection(state, -1),
+                    KeyCode::Down => self.move_selection(state, 1),
+                    KeyCode::Left => self.collapse_selected(state),
+                    KeyCode::Right => self.expand_selected(state),
+                    KeyCode::Enter if self.policy.keyboard.enter_selects => {
+                        self.select_selected(state)
+                    }
+                    KeyCode::Char(' ') if self.policy.keyboard.space_toggles => {
+                        self.toggle_selected(state)
+                    }
+                    _ => TreeViewOutcome::Ignored,
                 }
-                _ => TreeViewOutcome::Ignored,
-            },
+            }
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
                 self.handle_mouse(area, state, *mouse)
             }
@@ -649,6 +662,7 @@ mod tests {
         let items = sample_items();
         let view = TreeView::new(&items);
         let mut state = TreeViewState::new(Some(0));
+        state.set_focused(true);
         state.set_expanded("src", true);
 
         let outcome = view.handle_event(
@@ -668,10 +682,28 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_tree_does_not_consume_keyboard_navigation() {
+        let items = sample_items();
+        let view = TreeView::new(&items);
+        let mut state = TreeViewState::new(Some(0));
+        state.set_expanded("src", true);
+
+        let outcome = view.handle_event(
+            Rect::new(0, 0, 20, 4),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Down)),
+        );
+
+        assert_eq!(outcome, TreeViewOutcome::Ignored);
+        assert_eq!(state.selected_visible(), Some(0));
+    }
+
+    #[test]
     fn right_and_left_expand_and_collapse_selected_item() {
         let items = sample_items();
         let view = TreeView::new(&items);
         let mut state = TreeViewState::new(Some(0));
+        state.set_focused(true);
 
         assert_eq!(
             view.handle_event(
@@ -705,6 +737,7 @@ mod tests {
         let items = sample_items();
         let view = TreeView::new(&items);
         let mut state = TreeViewState::new(Some(1));
+        state.set_focused(true);
 
         assert_eq!(
             view.handle_event(
