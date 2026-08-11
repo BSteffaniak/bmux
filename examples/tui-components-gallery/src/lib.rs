@@ -391,6 +391,42 @@ mod tests {
     use super::{HEIGHT, WIDTH, render_gallery, render_gallery_interactive, rows};
 
     #[test]
+    fn gallery_committed_scene_routes_exact_pointer_coordinates() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        let scene = {
+            let mut frame = Frame::new(&mut buffer);
+            render_gallery_interactive(&mut frame, None);
+            frame.hits().clone()
+        };
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene, None);
+
+        let outside = router.route(bmux_tui::event::Event::Mouse(
+            bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Move,
+                bmux_tui::geometry::Point::new(0, 1),
+            ),
+        ));
+        assert!(outside.target.is_none());
+
+        let inside = router.route(bmux_tui::event::Event::Mouse(
+            bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Move,
+                bmux_tui::geometry::Point::new(3, 1),
+            ),
+        ));
+        assert_eq!(
+            inside.target.as_ref().map(bmux_tui::hit::HitId::as_str),
+            Some("gallery.save")
+        );
+        assert_eq!(inside.bounds, Some(Rect::new(1, 1, 10, 1)));
+        assert_eq!(
+            inside.local_position,
+            Some(bmux_tui::geometry::Point::new(2, 0))
+        );
+    }
+
+    #[test]
     fn gallery_committed_scene_supports_forward_and_reverse_traversal() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
         let scene = {
