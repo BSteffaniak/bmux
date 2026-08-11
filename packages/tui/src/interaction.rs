@@ -205,11 +205,11 @@ impl InteractionRouter {
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.pressed.clone_from(&hit);
-                        if let Some(id) = hit.as_ref()
-                            && self.focus.set_active(id)
-                            && self.focus.active() == Some(id)
-                        {
-                            focus_changed = Some(id.clone());
+                        if let Some(id) = hit.as_ref() {
+                            let focus_was_different = self.focus.active() != Some(id);
+                            if self.focus.set_active(id) && focus_was_different {
+                                focus_changed = Some(id.clone());
+                            }
                         }
                     }
                     MouseEventKind::Down(_)
@@ -395,6 +395,30 @@ mod tests {
         assert_eq!(router.focused(), Some(&HitId::new("rendered-second")));
         let forward = router.route(Event::Key(KeyStroke::simple(KeyCode::Tab)));
         assert_eq!(forward.focus_changed, Some(HitId::new("rendered-first")));
+    }
+
+    #[test]
+    fn unchanged_hover_and_focus_emit_no_transition() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene(), None);
+
+        let entered = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            Point::new(3, 3),
+        )));
+        assert_eq!(entered.hover_entered, Some(HitId::new("first")));
+        let unchanged_hover = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            Point::new(4, 3),
+        )));
+        assert!(unchanged_hover.hover_left.is_none());
+        assert!(unchanged_hover.hover_entered.is_none());
+
+        let unchanged_focus = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(3, 3),
+        )));
+        assert!(unchanged_focus.focus_changed.is_none());
     }
 
     #[test]
