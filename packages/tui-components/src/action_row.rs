@@ -4,6 +4,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::Style;
 
 use crate::button::{Button, ButtonState};
@@ -295,6 +296,33 @@ impl<'a> ActionRow<'a> {
 
     /// Render the action row with runtime state.
     pub fn render_state(&self, area: Rect, state: &ActionRowState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("action-row");
+        self.render_state_with_id_prefix(area, state, frame, id.as_str());
+    }
+
+    /// Render state and register each visible button as an individual tab stop.
+    pub fn render_state_with_id_prefix(
+        &self,
+        area: Rect,
+        state: &ActionRowState,
+        frame: &mut Frame<'_>,
+        id_prefix: &str,
+    ) {
+        for (index, action_area) in self.action_areas(area).into_iter().enumerate() {
+            let Some(action) = self.actions.get(index) else {
+                break;
+            };
+            frame.push_hit(
+                SceneRegion::new(
+                    HitId::new(format!("{id_prefix}.{}", action.id)),
+                    action_area,
+                )
+                .role(HitRole::Action)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+            );
+        }
         self.render_actions(area, Some(state), frame, None);
     }
 
@@ -325,7 +353,13 @@ impl<'a> ActionRow<'a> {
             return ActionRowOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if stroke.modifiers.is_empty() => self.handle_key(state, stroke.key),
+            Event::Key(stroke)
+                if state.interaction.focused
+                    && stroke.modifiers.is_empty()
+                    && stroke.key != KeyCode::Tab =>
+            {
+                self.handle_key(state, stroke.key)
+            }
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
             Event::Key(_)
             | Event::Resize(_)
@@ -352,7 +386,7 @@ impl<'a> ActionRow<'a> {
             if let Some(fallback) = fallback {
                 button.render_with_fallback_style(action_area, &button_state, frame, fallback);
             } else {
-                button.render(action_area, &button_state, frame);
+                button.render_visual(action_area, button_state, frame);
             }
         }
     }
@@ -376,9 +410,6 @@ impl<'a> ActionRow<'a> {
                 self.move_focus(state, Direction::Previous)
             }
             KeyCode::Right if self.policy.keyboard.arrow_navigation() => {
-                self.move_focus(state, Direction::Next)
-            }
-            KeyCode::Tab if self.policy.keyboard.tab_navigation() => {
                 self.move_focus(state, Direction::Next)
             }
             KeyCode::Enter if self.policy.keyboard.enter_activates() => {

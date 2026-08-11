@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 use crate::buffer::Buffer;
 use crate::damage::Damage;
+use crate::focus::{FocusId, FocusScopeId, FocusTrap};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::HitMap;
@@ -47,6 +48,8 @@ pub struct Terminal<W> {
     area: Rect,
     previous: Option<Buffer>,
     hits: HitMap,
+    focus: FocusTrap,
+    focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
     image_scene: ImageScene,
     image_delta: ImageSceneDelta,
@@ -62,6 +65,8 @@ impl<W: Write> Terminal<W> {
             area,
             previous: None,
             hits: HitMap::new(),
+            focus: FocusTrap::new(),
+            focus_scope: None,
             images: Vec::new(),
             image_scene: ImageScene::default(),
             image_delta: ImageSceneDelta::default(),
@@ -87,10 +92,27 @@ impl<W: Write> Terminal<W> {
         self.cursor
     }
 
-    /// Return the hit map registered by the last draw.
+    /// Return the interaction scene registered by the last draw.
     #[must_use]
     pub const fn hits(&self) -> &HitMap {
         &self.hits
+    }
+
+    /// Return ordered focus state derived from the last committed scene.
+    #[must_use]
+    pub const fn focus(&self) -> &FocusTrap {
+        &self.focus
+    }
+
+    /// Return the active focus target after the last committed draw.
+    #[must_use]
+    pub fn focused(&self) -> Option<&FocusId> {
+        self.focus.active()
+    }
+
+    /// Set the active focus target when it exists in the committed scene.
+    pub fn set_focused(&mut self, id: &FocusId) -> bool {
+        self.focus.set_active(id)
     }
 
     /// Return image lifecycle contributions registered by the last draw.
@@ -161,7 +183,7 @@ impl<W: Write> Terminal<W> {
         }
         let regions = damage.retained_regions();
         let mut buffer = Buffer::empty(self.area);
-        let (cursor, hits, images) = {
+        let (cursor, hits, focus_scope, images) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
             let mut hits = if matches!(damage, Damage::Regions(_)) {
@@ -189,7 +211,8 @@ impl<W: Write> Terminal<W> {
             };
             images.extend_from_slice(frame.images());
             let cursor = frame.cursor();
-            (cursor, hits, images)
+            let focus_scope = frame.focus_scope().cloned();
+            (cursor, hits, focus_scope, images)
         };
         if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
             buffer.restore_outside(previous, regions);
@@ -214,7 +237,14 @@ impl<W: Write> Terminal<W> {
         };
         let mut image_scene = self.image_scene.clone();
         let image_delta = image_scene.reconcile(&images);
+        let previous_focus = self.focus.active().cloned();
         self.hits = hits;
+        self.focus_scope = focus_scope;
+        self.focus = FocusTrap::from_hits(
+            &self.hits,
+            self.focus_scope.as_ref(),
+            previous_focus.as_ref(),
+        );
         self.image_scene = image_scene;
         self.image_delta = image_delta;
         self.images = images;

@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
@@ -403,6 +404,25 @@ impl<'a> SelectableList<'a> {
 
     /// Render the selectable list.
     pub fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("selectable-list");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render and register this composite control as one roving-focus tab stop.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &SelectableListState,
+        frame: &mut Frame<'_>,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::ListItem)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
         self.render_with_fallback_style(area, state, frame, Style::new());
     }
 

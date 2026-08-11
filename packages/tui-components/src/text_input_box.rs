@@ -4,6 +4,7 @@ use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
@@ -297,6 +298,29 @@ impl<'a> TextInputBox<'a> {
 
     /// Render the text input box and update state's content area.
     pub fn render(&self, area: Rect, state: &mut TextInputState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("text-input");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render and register this text field as a keyboard focus target.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &mut TextInputState,
+        frame: &mut Frame<'_>,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, self.layout(area).field_control)
+                .role(HitRole::TextInput)
+                .hoverable(true)
+                .focusable(true)
+                .enabled(!self.policy.disabled),
+        );
+        self.render_body(area, state, frame);
+    }
+
+    fn render_body(&self, area: Rect, state: &mut TextInputState, frame: &mut Frame<'_>) {
         let field_control = if self.policy.field_chrome {
             self.form_field().render(area, frame)
         } else {

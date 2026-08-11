@@ -477,7 +477,7 @@ impl DiffLine {
 
     /// Return true when the line has inline spans.
     #[must_use]
-    pub fn has_inline_spans(&self) -> bool {
+    pub const fn has_inline_spans(&self) -> bool {
         !self.inline_spans.is_empty()
     }
 }

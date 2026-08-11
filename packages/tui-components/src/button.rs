@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -187,13 +188,54 @@ impl<'a> Button<'a> {
             .saturating_add(4)
     }
 
-    /// Render the button.
+    /// Render the button and register its default interaction semantics.
+    ///
+    /// Use [`Self::render_with_id`] when stable focus preservation or semantic
+    /// routing across responsive reflow is required.
     pub fn render(&self, area: Rect, state: &ButtonState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("button");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render the button with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<bmux_tui::hit::HitId>,
+        area: Rect,
+        state: &ButtonState,
+        frame: &mut Frame<'_>,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::Action)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        self.render_line(area, *state, frame, None);
+    }
+
+    /// Render button visuals without registering another interaction region.
+    pub(crate) fn render_visual(&self, area: Rect, state: ButtonState, frame: &mut Frame<'_>) {
+        self.render_line(area, state, frame, None);
+    }
+
+    fn render_line(
+        &self,
+        area: Rect,
+        state: ButtonState,
+        frame: &mut Frame<'_>,
+        fallback: Option<Style>,
+    ) {
         let line = Line::from_spans(vec![Span::styled(
             format!("[ {} ]", self.label),
-            self.style_for(*state),
+            self.style_for(state),
         )]);
-        frame.write_line(area, &line);
+        if let Some(fallback) = fallback {
+            frame.write_line_with_fallback_style(area, &line, fallback);
+        } else {
+            frame.write_line(area, &line);
+        }
     }
 
     /// Render the button with a fallback style filling its area.
@@ -204,11 +246,7 @@ impl<'a> Button<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
-        let line = Line::from_spans(vec![Span::styled(
-            format!("[ {} ]", self.label),
-            self.style_for(*state),
-        )]);
-        frame.write_line_with_fallback_style(area, &line, fallback);
+        self.render_line(area, *state, frame, Some(fallback));
     }
 
     /// Handle one input event.

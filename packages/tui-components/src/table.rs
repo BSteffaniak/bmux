@@ -4,6 +4,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{line_viewport, truncate_line_to_display_width};
@@ -602,6 +603,29 @@ impl<'a> Table<'a> {
 
     /// Render table.
     pub fn render(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("table");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render and register this table as one roving-focus tab stop.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &TableState,
+        frame: &mut Frame<'_>,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::ListItem)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        self.render_body(area, state, frame);
+    }
+
+    fn render_body(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>) {
         if area.is_empty() {
             return;
         }

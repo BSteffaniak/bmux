@@ -29,6 +29,7 @@ pub mod hit;
 pub mod image;
 pub mod image_scene;
 pub mod input;
+pub mod interaction;
 pub mod layout;
 pub mod list;
 pub mod overlay;
@@ -86,6 +87,7 @@ pub mod prelude {
         TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
         TextInputProjection,
     };
+    pub use crate::interaction::{InteractionRoute, InteractionRouter};
     pub use crate::layout::{
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
         Split, split,

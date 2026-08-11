@@ -1,21 +1,17 @@
-//! Focus routing primitives.
+//! Focus routing primitives derived from committed interaction regions.
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 
-/// Stable focus target identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FocusId(pub u64);
+use crate::hit::{HitId, HitMap};
 
-impl FocusId {
-    /// Create a focus id.
-    #[must_use]
-    pub const fn new(id: u64) -> Self {
-        Self(id)
-    }
-}
+/// Stable focus target identifier shared with pointer hit testing.
+pub type FocusId = HitId;
+
+/// Stable identifier for a focus scope such as a page or modal.
+pub type FocusScopeId = HitId;
 
 /// Result of focus key handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FocusKeyOutcome {
     /// Key was not handled as focus navigation.
     Ignored,
@@ -23,11 +19,16 @@ pub enum FocusKeyOutcome {
     Moved(FocusId),
 }
 
-/// A modal-style focus trap with ordered targets.
+/// Ordered focus state for one active scope.
+///
+/// Targets are normally derived from the last successfully committed frame via
+/// [`Self::from_hits`]. The explicit constructor remains useful for tests and
+/// callers that deliberately own a custom focus order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FocusTrap {
     targets: Vec<FocusId>,
     active: Option<usize>,
+    scope: Option<FocusScopeId>,
 }
 
 impl FocusTrap {
@@ -37,6 +38,7 @@ impl FocusTrap {
         Self {
             targets: Vec::new(),
             active: None,
+            scope: None,
         }
     }
 
@@ -45,7 +47,39 @@ impl FocusTrap {
     pub fn with_targets(targets: impl Into<Vec<FocusId>>) -> Self {
         let targets = targets.into();
         let active = if targets.is_empty() { None } else { Some(0) };
-        Self { targets, active }
+        Self {
+            targets,
+            active,
+            scope: None,
+        }
+    }
+
+    /// Build focus order from enabled, focusable regions in the committed scene.
+    ///
+    /// Explicit tab order wins, with render order providing a stable default.
+    /// When `scope` is present, only targets in that scope participate. The
+    /// previous active target is preserved when it remains eligible.
+    #[must_use]
+    pub fn from_hits(
+        hits: &HitMap,
+        scope: Option<&FocusScopeId>,
+        previous: Option<&FocusId>,
+    ) -> Self {
+        let targets = hits.focus_targets(scope);
+        let active = previous
+            .and_then(|id| targets.iter().position(|target| target == id))
+            .or_else(|| (!targets.is_empty()).then_some(0));
+        Self {
+            targets,
+            active,
+            scope: scope.cloned(),
+        }
+    }
+
+    /// Reconcile this trap with a newly committed interaction scene.
+    pub fn reconcile(&mut self, hits: &HitMap, scope: Option<&FocusScopeId>) {
+        let previous = self.active().cloned();
+        *self = Self::from_hits(hits, scope, previous.as_ref());
     }
 
     /// Return ordered focus targets.
@@ -54,16 +88,21 @@ impl FocusTrap {
         &self.targets
     }
 
+    /// Return active focus scope, when traversal is trapped.
+    #[must_use]
+    pub const fn active_scope(&self) -> Option<&FocusScopeId> {
+        self.scope.as_ref()
+    }
+
     /// Return active focus id.
     #[must_use]
-    pub fn active(&self) -> Option<FocusId> {
-        self.active
-            .and_then(|index| self.targets.get(index).copied())
+    pub fn active(&self) -> Option<&FocusId> {
+        self.active.and_then(|index| self.targets.get(index))
     }
 
     /// Set active focus target if it exists in the trap.
-    pub fn set_active(&mut self, id: FocusId) -> bool {
-        let Some(index) = self.targets.iter().position(|target| *target == id) else {
+    pub fn set_active(&mut self, id: &FocusId) -> bool {
+        let Some(index) = self.targets.iter().position(|target| target == id) else {
             return false;
         };
         self.active = Some(index);
@@ -71,7 +110,7 @@ impl FocusTrap {
     }
 
     /// Move focus to the next target, wrapping within the trap.
-    pub fn focus_next(&mut self) -> Option<FocusId> {
+    pub fn focus_next(&mut self) -> Option<&FocusId> {
         if self.targets.is_empty() {
             self.active = None;
             return None;
@@ -84,7 +123,7 @@ impl FocusTrap {
     }
 
     /// Move focus to the previous target, wrapping within the trap.
-    pub fn focus_previous(&mut self) -> Option<FocusId> {
+    pub fn focus_previous(&mut self) -> Option<&FocusId> {
         if self.targets.is_empty() {
             self.active = None;
             return None;
@@ -100,7 +139,7 @@ impl FocusTrap {
         self.active()
     }
 
-    /// Handle tab-navigation keys.
+    /// Handle Tab and Shift-Tab navigation.
     pub fn handle_key(&mut self, stroke: KeyStroke) -> FocusKeyOutcome {
         if stroke.key != KeyCode::Tab || stroke.modifiers.ctrl || stroke.modifiers.alt {
             return FocusKeyOutcome::Ignored;
@@ -110,7 +149,9 @@ impl FocusTrap {
         } else {
             self.focus_next()
         };
-        moved.map_or(FocusKeyOutcome::Ignored, FocusKeyOutcome::Moved)
+        moved.map_or(FocusKeyOutcome::Ignored, |id| {
+            FocusKeyOutcome::Moved(id.clone())
+        })
     }
 }
 
@@ -119,23 +160,26 @@ mod tests {
     use super::{FocusId, FocusKeyOutcome, FocusTrap};
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 
+    use crate::geometry::Rect;
+    use crate::hit::{HitMap, HitRegion};
+
     #[test]
     fn focus_trap_cycles_next_and_previous() {
-        let mut trap = FocusTrap::with_targets(vec![FocusId::new(1), FocusId::new(2)]);
+        let mut trap = FocusTrap::with_targets(vec![FocusId::new("one"), FocusId::new("two")]);
 
-        assert_eq!(trap.active(), Some(FocusId::new(1)));
-        assert_eq!(trap.focus_next(), Some(FocusId::new(2)));
-        assert_eq!(trap.focus_next(), Some(FocusId::new(1)));
-        assert_eq!(trap.focus_previous(), Some(FocusId::new(2)));
+        assert_eq!(trap.active(), Some(&FocusId::new("one")));
+        assert_eq!(trap.focus_next(), Some(&FocusId::new("two")));
+        assert_eq!(trap.focus_next(), Some(&FocusId::new("one")));
+        assert_eq!(trap.focus_previous(), Some(&FocusId::new("two")));
     }
 
     #[test]
     fn focus_trap_handles_tab_keys() {
-        let mut trap = FocusTrap::with_targets(vec![FocusId::new(1), FocusId::new(2)]);
+        let mut trap = FocusTrap::with_targets(vec![FocusId::new("one"), FocusId::new("two")]);
 
         assert_eq!(
             trap.handle_key(KeyStroke::simple(KeyCode::Tab)),
-            FocusKeyOutcome::Moved(FocusId::new(2))
+            FocusKeyOutcome::Moved(FocusId::new("two"))
         );
         assert_eq!(
             trap.handle_key(KeyStroke::with_modifiers(
@@ -145,15 +189,54 @@ mod tests {
                     ..Modifiers::NONE
                 },
             )),
-            FocusKeyOutcome::Moved(FocusId::new(1))
+            FocusKeyOutcome::Moved(FocusId::new("one"))
         );
     }
 
     #[test]
     fn focus_trap_rejects_unknown_active_target() {
-        let mut trap = FocusTrap::with_targets(vec![FocusId::new(1)]);
+        let mut trap = FocusTrap::with_targets(vec![FocusId::new("one")]);
 
-        assert!(!trap.set_active(FocusId::new(9)));
-        assert_eq!(trap.active(), Some(FocusId::new(1)));
+        assert!(!trap.set_active(&FocusId::new("missing")));
+        assert_eq!(trap.active(), Some(&FocusId::new("one")));
+    }
+
+    #[test]
+    fn committed_regions_define_default_and_explicit_focus_order() {
+        let hits = HitMap::new()
+            .with_region(HitRegion::new("second", Rect::new(0, 0, 1, 1)).focusable(true))
+            .with_region(
+                HitRegion::new("first", Rect::new(1, 0, 1, 1))
+                    .focusable(true)
+                    .tab_order(-1),
+            )
+            .with_region(
+                HitRegion::new("disabled", Rect::new(2, 0, 1, 1))
+                    .focusable(true)
+                    .enabled(false),
+            );
+
+        let trap = FocusTrap::from_hits(&hits, None, None);
+
+        assert_eq!(
+            trap.targets(),
+            [FocusId::new("first"), FocusId::new("second")]
+        );
+    }
+
+    #[test]
+    fn reconciliation_preserves_focus_by_stable_identity() {
+        let initial = HitMap::new()
+            .with_region(HitRegion::new("one", Rect::new(0, 0, 1, 1)).focusable(true))
+            .with_region(HitRegion::new("two", Rect::new(1, 0, 1, 1)).focusable(true));
+        let mut trap = FocusTrap::from_hits(&initial, None, None);
+        assert!(trap.set_active(&FocusId::new("two")));
+        let reflowed = HitMap::new()
+            .with_region(HitRegion::new("two", Rect::new(0, 1, 1, 1)).focusable(true))
+            .with_region(HitRegion::new("one", Rect::new(0, 2, 1, 1)).focusable(true));
+
+        trap.reconcile(&reflowed, None);
+
+        assert_eq!(trap.active(), Some(&FocusId::new("two")));
     }
 }

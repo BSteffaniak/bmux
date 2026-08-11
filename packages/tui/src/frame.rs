@@ -1,6 +1,7 @@
 //! Frame render context.
 
 use crate::buffer::Buffer;
+use crate::focus::FocusScopeId;
 use crate::geometry::{Point, Rect};
 use crate::hit::{HitMap, HitRegion};
 use crate::image::ImageContribution;
@@ -41,6 +42,8 @@ pub struct Frame<'buffer> {
     buffer: &'buffer mut Buffer,
     cursor: Option<Cursor>,
     hits: HitMap,
+    automatic_hit_index: usize,
+    focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
 }
 
@@ -51,6 +54,8 @@ impl<'buffer> Frame<'buffer> {
             buffer,
             cursor: None,
             hits: HitMap::new(),
+            automatic_hit_index: 0,
+            focus_scope: None,
             images: Vec::new(),
         }
     }
@@ -90,8 +95,32 @@ impl<'buffer> Frame<'buffer> {
     }
 
     /// Add a hit-test region for this frame.
-    pub fn push_hit(&mut self, region: HitRegion) {
+    pub fn push_hit(&mut self, mut region: HitRegion) {
+        if let Some(scope) = self.focus_scope.as_ref()
+            && region.focusable
+            && region.focus_scope.is_none()
+        {
+            region.focus_scope = Some(scope.clone());
+        }
         self.hits.push(region);
+    }
+
+    /// Create a deterministic render-order identifier for an automatic control.
+    pub fn next_interaction_id(&mut self, kind: &str) -> crate::hit::HitId {
+        let index = self.automatic_hit_index;
+        self.automatic_hit_index = self.automatic_hit_index.saturating_add(1);
+        crate::hit::HitId::new(format!("auto.{kind}.{index}"))
+    }
+
+    /// Return the active focus scope requested by this frame.
+    #[must_use]
+    pub const fn focus_scope(&self) -> Option<&FocusScopeId> {
+        self.focus_scope.as_ref()
+    }
+
+    /// Select the focus scope active after this frame commits.
+    pub fn set_focus_scope(&mut self, scope: Option<FocusScopeId>) {
+        self.focus_scope = scope;
     }
 
     /// Return image lifecycle contributions registered for this frame.

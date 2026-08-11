@@ -1,5 +1,6 @@
 //! Configurable dialog composition built from modal frame, action row, and text primitives.
 
+use bmux_tui::focus::FocusScopeId;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::Line;
@@ -146,6 +147,19 @@ impl<'a> Dialog<'a> {
 
     /// Render the dialog frame, body, and actions.
     pub fn render(&self, parent: Rect, state: &DialogState, frame: &mut Frame<'_>) {
+        self.render_with_scope("dialog", parent, state, frame);
+    }
+
+    /// Render a modal focus scope and register only its visible action targets.
+    pub fn render_with_scope(
+        &self,
+        scope: impl Into<FocusScopeId>,
+        parent: Rect,
+        state: &DialogState,
+        frame: &mut Frame<'_>,
+    ) {
+        let scope = scope.into();
+        frame.set_focus_scope(Some(scope.clone()));
         let modal = self.modal();
         modal.render(parent, frame);
         let layout = self.layout(parent);
@@ -170,14 +184,8 @@ impl<'a> Dialog<'a> {
             );
         }
         if !self.actions.is_empty() {
-            ActionRow::new(self.actions)
-                .spacing(self.action_spacing)
-                .render_state_with_fallback_style(
-                    layout.actions,
-                    &state.actions,
-                    frame,
-                    self.theme.background,
-                );
+            let row = ActionRow::new(self.actions).spacing(self.action_spacing);
+            row.render_state_with_id_prefix(layout.actions, &state.actions, frame, scope.as_str());
         }
     }
 
@@ -190,6 +198,9 @@ impl<'a> Dialog<'a> {
     ) -> DialogOutcome {
         if self.actions.is_empty() {
             return DialogOutcome::Ignored;
+        }
+        if state.actions.focused().is_none() {
+            state.actions.set_focused(Some(0));
         }
         match ActionRow::new(self.actions)
             .spacing(self.action_spacing)
@@ -265,6 +276,46 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(5).as_deref(),
             Some("     │ [ OK ]           │     ")
+        );
+    }
+
+    #[test]
+    fn explicit_scope_tags_each_dialog_action_and_traps_focus() {
+        let body = vec![Line::from("Proceed?")];
+        let actions = vec![
+            ActionButton::new("ok", "OK"),
+            ActionButton::new("cancel", "Cancel"),
+        ];
+        let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan)).sizing(
+            ModalSizing::new(Size::new(24, 7), Size::new(24, 7), Insets::all(0)),
+        );
+        let state = DialogState::new();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 10));
+        let mut frame = Frame::new(&mut buffer);
+
+        dialog.render_with_scope("confirm", frame.area(), &state, &mut frame);
+
+        assert_eq!(
+            frame.focus_scope().map(bmux_tui::hit::HitId::as_str),
+            Some("confirm")
+        );
+        assert_eq!(
+            frame
+                .hits()
+                .regions()
+                .iter()
+                .map(|region| (
+                    region.id.as_str(),
+                    region
+                        .focus_scope
+                        .as_ref()
+                        .map(bmux_tui::hit::HitId::as_str)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("confirm.ok", Some("confirm")),
+                ("confirm.cancel", Some("confirm")),
+            ]
         );
     }
 

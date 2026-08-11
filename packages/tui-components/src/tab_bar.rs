@@ -4,6 +4,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
@@ -333,6 +334,40 @@ impl<'a> TabBar<'a> {
 
     /// Render tabs into one row.
     pub fn render(&self, area: Rect, state: &TabBarState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("tab-bar");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render and register this tab list as one roving-focus tab stop.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &TabBarState,
+        frame: &mut Frame<'_>,
+    ) {
+        let id = id.into();
+        frame.push_hit(
+            SceneRegion::new(id.clone(), area)
+                .role(HitRole::Action)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        for (index, item_area) in self.hit_rects(area).into_iter().enumerate() {
+            let Some(item) = self.items.get(index) else {
+                break;
+            };
+            frame.push_hit(
+                SceneRegion::new(
+                    HitId::new(format!("{}.{}", id.as_str(), item.id)),
+                    item_area,
+                )
+                .role(HitRole::Action)
+                .hoverable(self.policy.mouse.hover)
+                .enabled(!state.interaction.disabled && !item.disabled),
+            );
+        }
         if area.is_empty() || self.items.is_empty() {
             return;
         }
