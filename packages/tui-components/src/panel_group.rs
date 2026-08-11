@@ -3,6 +3,7 @@
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::style::{Color, Modifier, Style};
 
 use crate::common::DragState;
@@ -429,9 +430,44 @@ impl PanelGroup {
         self.rects_from_lengths(area, &lengths)
     }
 
-    /// Render dividers only. Callers own child panel rendering.
+    /// Render dividers and register enabled divider/panel interaction regions.
     pub fn render_dividers(&self, area: Rect, state: &PanelGroupState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("panel-group");
+        self.render_dividers_with_id(id, area, state, frame);
+    }
+
+    /// Render dividers with a stable interaction identifier prefix.
+    pub fn render_dividers_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &PanelGroupState,
+        frame: &mut Frame<'_>,
+    ) {
+        let id = id.into();
         let layout = self.layout(area, state);
+        if self.policy.focus.enabled && self.policy.mouse.click_to_focus {
+            for (index, panel) in layout.panels.iter().copied().enumerate() {
+                frame.push_hit(
+                    SceneRegion::new(format!("{}.panel.{index}", id.as_str()), panel)
+                        .role(HitRole::Decoration)
+                        .focusable(false),
+                );
+            }
+        }
+        let divider_interactive = self.policy.mouse.enabled
+            && (self.policy.mouse.hover_dividers
+                || (self.policy.mouse.drag_dividers && self.policy.resize.enabled));
+        if divider_interactive {
+            for (index, divider) in layout.dividers.iter().copied().enumerate() {
+                frame.push_hit(
+                    SceneRegion::new(format!("{}.divider.{index}", id.as_str()), divider)
+                        .role(HitRole::ResizeHandle)
+                        .hoverable(self.policy.mouse.hover_dividers)
+                        .focusable(false),
+                );
+            }
+        }
         for (index, divider) in layout.dividers.iter().copied().enumerate() {
             let style = if state.active_divider() == Some(index) {
                 self.styles.active_divider
@@ -756,6 +792,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
 
     use super::{
         PanelGroup, PanelGroupAxis, PanelGroupConstraints, PanelGroupOutcome, PanelGroupPolicy,
@@ -882,6 +919,46 @@ mod tests {
             }
         );
         assert_eq!(state.sizes(), &[PanelSize::fixed(12), PanelSize::fixed(8)]);
+    }
+
+    #[test]
+    fn interactive_render_registers_exact_panel_and_divider_geometry() {
+        let group =
+            PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::interactive());
+        let state = PanelGroupState::new([PanelSize::fixed(4), PanelSize::flex(1)]);
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 16, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        group.render_dividers_with_id("workspace", Rect::new(5, 3, 12, 3), &state, &mut frame);
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].id.as_str(), "workspace.panel.0");
+        assert_eq!(regions[0].area, Rect::new(5, 3, 4, 3));
+        assert_eq!(regions[0].role, HitRole::Decoration);
+        assert_eq!(regions[1].id.as_str(), "workspace.panel.1");
+        assert_eq!(regions[1].area, Rect::new(10, 3, 7, 3));
+        assert_eq!(regions[2].id.as_str(), "workspace.divider.0");
+        assert_eq!(regions[2].area, Rect::new(9, 3, 1, 3));
+        assert_eq!(regions[2].role, HitRole::ResizeHandle);
+        assert!(regions[2].hoverable);
+        assert!(frame.hits().focus_targets(None).is_empty());
+    }
+
+    #[test]
+    fn bare_and_empty_groups_register_nothing() {
+        let bare = PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::bare());
+        let state = PanelGroupState::new([PanelSize::fixed(2), PanelSize::fixed(2)]);
+        let empty = PanelGroupState::new([]);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        bare.render_dividers_with_id("bare", Rect::new(0, 0, 5, 1), &state, &mut frame);
+        PanelGroup::new(PanelGroupAxis::Horizontal)
+            .policy(PanelGroupPolicy::interactive())
+            .render_dividers_with_id("empty", Rect::new(0, 1, 5, 1), &empty, &mut frame);
+
+        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
