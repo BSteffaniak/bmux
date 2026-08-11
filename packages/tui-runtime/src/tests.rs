@@ -204,6 +204,8 @@ async fn resize_and_mouse_motion_use_explicit_latest_value_admission() {
     assert!(handle.send_latest_terminal(Event::Tick).is_err());
     let output = runtime_output(runtime.run().await);
     assert_eq!(output.program.terminal_events, 2);
+    assert_eq!(output.stats.latest_replaced, 1);
+    assert_eq!(output.stats.terminal_processed, 2);
 }
 
 #[tokio::test]
