@@ -8,7 +8,9 @@ use crate::render::{
     DamageCoalescingPolicy, FrameDamage, render_attach_scene_with_terminal_graphics_cache,
     visible_scene_pane_ids,
 };
-use crate::types::{AttachCursorState, PaneRenderBuffer, TerminalGraphicsCache};
+use crate::types::{
+    AttachCursorState, PaneRenderBuffer, PaneScrollbackViews, TerminalGraphicsCache,
+};
 use crate::update_protocol_hints_from_state;
 use anyhow::Result;
 use bmux_attach_layout_protocol::{
@@ -439,10 +441,9 @@ impl AttachScenePipeline {
             &frame_damage,
             self.viewport.status_top_inset,
             self.viewport.status_bottom_inset,
-            false,
-            0,
-            None,
-            None,
+            // Snapshot-mode scene pipeline renders live pane output only; it has
+            // no per-pane scrollback views.
+            &PaneScrollbackViews::new(),
             layout_state.zoomed,
             (self.viewport.cols, self.viewport.rows),
             &bmux_appearance::RuntimeAppearance::default(),

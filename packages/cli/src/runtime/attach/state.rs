@@ -5,7 +5,8 @@ use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachMouseProtocolState, AttachScene, AttachSurface,
 };
 pub use bmux_attach_pipeline::{
-    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
+    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect,
+    PaneRenderBuffer, PaneScrollbackView, PaneScrollbackViews,
 };
 use bmux_attach_pipeline::{FrameDamage, RetainedCompositor, TerminalGraphicsCache};
 use bmux_client::AttachLayoutState;
@@ -259,10 +260,12 @@ pub struct AttachViewState {
     pub ui_mode: AttachUiMode,
     pub active_mode_id: String,
     pub active_mode_label: String,
-    pub scrollback_active: bool,
-    pub scrollback_offset: usize,
-    pub scrollback_cursor: Option<AttachScrollbackCursor>,
-    pub selection_anchor: Option<AttachScrollbackPosition>,
+    /// Per-pane scrollback view positions. A pane is in scrollback if and only
+    /// if it has an entry here, so the state cannot follow focus between panes.
+    ///
+    /// Scrollback history itself lives on the server (pane-runtime plugin);
+    /// these are just this client's per-pane view offsets into that history.
+    pub pane_scrollback: PaneScrollbackViews,
     pub help_overlay_open: bool,
     pub help_overlay_scroll: usize,
     pub prompt: AttachPromptState,
@@ -629,10 +632,7 @@ impl AttachViewState {
             ui_mode: AttachUiMode::Normal,
             active_mode_id: "normal".to_string(),
             active_mode_label: "NORMAL".to_string(),
-            scrollback_active: false,
-            scrollback_offset: 0,
-            scrollback_cursor: None,
-            selection_anchor: None,
+            pane_scrollback: PaneScrollbackViews::new(),
             help_overlay_open: false,
             help_overlay_scroll: 0,
             prompt: AttachPromptState::default(),
@@ -743,15 +743,79 @@ impl AttachViewState {
         self.transient_status.as_deref()
     }
 
-    pub const fn exit_scrollback(&mut self) {
-        self.scrollback_active = false;
-        self.scrollback_offset = 0;
-        self.scrollback_cursor = None;
-        self.selection_anchor = None;
+    /// Pane that keyboard scrollback actions apply to.
+    #[must_use]
+    pub fn focused_pane_id(&self) -> Option<Uuid> {
+        Some(self.cached_layout_state.as_ref()?.focused_pane_id)
     }
 
-    pub const fn selection_active(&self) -> bool {
-        self.selection_anchor.is_some()
+    /// Scrollback view for one specific pane, if that pane is in scrollback.
+    #[must_use]
+    pub fn scrollback_for(&self, pane_id: Uuid) -> Option<PaneScrollbackView> {
+        self.pane_scrollback.get(&pane_id).copied()
+    }
+
+    pub fn scrollback_for_mut(&mut self, pane_id: Uuid) -> Option<&mut PaneScrollbackView> {
+        self.pane_scrollback.get_mut(&pane_id)
+    }
+
+    /// Whether one specific pane is in scrollback.
+    #[must_use]
+    pub fn scrollback_active_for(&self, pane_id: Uuid) -> bool {
+        self.pane_scrollback.contains_key(&pane_id)
+    }
+
+    /// Scrollback view of the focused pane, if any.
+    #[must_use]
+    pub fn focused_scrollback(&self) -> Option<PaneScrollbackView> {
+        self.scrollback_for(self.focused_pane_id()?)
+    }
+
+    pub fn focused_scrollback_mut(&mut self) -> Option<&mut PaneScrollbackView> {
+        let pane_id = self.focused_pane_id()?;
+        self.scrollback_for_mut(pane_id)
+    }
+
+    /// Whether the *focused* pane is in scrollback.
+    ///
+    /// This derives the UI-level "scroll mode" from the focused pane rather
+    /// than storing it globally, so focusing a pane that is not scrolled back
+    /// reports `false` without any explicit focus-change bookkeeping.
+    #[must_use]
+    pub fn scrollback_active(&self) -> bool {
+        self.focused_pane_id()
+            .is_some_and(|pane_id| self.scrollback_active_for(pane_id))
+    }
+
+    /// Leave scrollback for one specific pane.
+    pub fn exit_scrollback_for(&mut self, pane_id: Uuid) -> bool {
+        self.pane_scrollback.remove(&pane_id).is_some()
+    }
+
+    /// Leave scrollback for the focused pane only.
+    pub fn exit_focused_scrollback(&mut self) -> bool {
+        self.focused_pane_id()
+            .is_some_and(|pane_id| self.exit_scrollback_for(pane_id))
+    }
+
+    /// Drop scrollback views for panes that no longer exist.
+    pub fn retain_scrollback_panes(&mut self, active_pane_ids: &BTreeSet<Uuid>) {
+        self.pane_scrollback
+            .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+    }
+
+    /// Whether one specific pane has an active selection.
+    #[must_use]
+    pub fn selection_active_for(&self, pane_id: Uuid) -> bool {
+        self.scrollback_for(pane_id)
+            .is_some_and(|view| view.selection_anchor.is_some())
+    }
+
+    /// Whether the focused pane has an active selection.
+    #[must_use]
+    pub fn selection_active(&self) -> bool {
+        self.focused_scrollback()
+            .is_some_and(|view| view.selection_anchor.is_some())
     }
 }
 

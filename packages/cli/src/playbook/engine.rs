@@ -807,10 +807,8 @@ impl PlaybookRenderTraceState {
             &damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            // Playbook render facts capture live pane content.
+            &bmux_attach_pipeline::PaneScrollbackViews::new(),
             layout.zoomed,
             viewport,
             &RuntimeAppearance::default(),

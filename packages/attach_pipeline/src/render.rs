@@ -2,9 +2,9 @@ use crate::compositor::retained_repaint_plan_from_frame_damage;
 #[cfg(feature = "image-kitty")]
 use crate::types::TerminalGraphicCacheEntry;
 use crate::types::{
-    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, ExtensionRenderCacheEntry,
-    PaneRect, PaneRenderBuffer, TerminalGraphicPlacementSignature, TerminalGraphicSourceSignature,
-    TerminalGraphicsCache,
+    AttachCursorState, AttachScrollbackPosition, ExtensionRenderCacheEntry, PaneRect,
+    PaneRenderBuffer, PaneScrollbackView, PaneScrollbackViews, TerminalGraphicPlacementSignature,
+    TerminalGraphicSourceSignature, TerminalGraphicsCache,
 };
 use anyhow::{Context, Result};
 use bmux_appearance::{
@@ -2871,24 +2871,6 @@ fn merge_ranges(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
     merged_ranges
 }
 
-fn selection_bounds(
-    anchor: Option<AttachScrollbackPosition>,
-    cursor: Option<AttachScrollbackCursor>,
-    scrollback_offset: usize,
-) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
-    let anchor = anchor?;
-    let cursor = cursor?;
-    let head = AttachScrollbackPosition {
-        row: scrollback_offset.saturating_add(cursor.row),
-        col: cursor.col,
-    };
-    Some(if anchor <= head {
-        (anchor, head)
-    } else {
-        (head, anchor)
-    })
-}
-
 const fn cell_selected(
     selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
     row: usize,
@@ -3132,10 +3114,7 @@ pub fn render_attach_scene<W: io::Write>(
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
@@ -3153,10 +3132,7 @@ pub fn render_attach_scene<W: io::Write>(
         frame_damage,
         status_top_inset,
         status_bottom_inset,
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback_views,
         zoomed,
         terminal_size,
         runtime_appearance,
@@ -3188,10 +3164,7 @@ pub fn render_attach_scene_with_terminal_graphics_cache<W: io::Write>(
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
@@ -3208,10 +3181,7 @@ pub fn render_attach_scene_with_terminal_graphics_cache<W: io::Write>(
         frame_damage,
         status_top_inset,
         status_bottom_inset,
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback_views,
         zoomed,
         terminal_size,
         runtime_appearance,
@@ -3242,10 +3212,7 @@ pub fn render_attach_scene_with_stats<W: io::Write>(
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
@@ -3260,10 +3227,7 @@ pub fn render_attach_scene_with_stats<W: io::Write>(
         frame_damage,
         status_top_inset,
         status_bottom_inset,
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback_views,
         zoomed,
         terminal_size,
         runtime_appearance,
@@ -3296,10 +3260,7 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
@@ -3317,10 +3278,7 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
         frame_damage,
         status_top_inset,
         status_bottom_inset,
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback_views,
         zoomed,
         terminal_size,
         runtime_appearance,
@@ -3351,10 +3309,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
@@ -3376,10 +3331,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
         frame_damage,
         status_top_inset,
         status_bottom_inset,
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback_views,
         zoomed,
         terminal_size,
         runtime_appearance,
@@ -4257,10 +4209,10 @@ struct PaneContentRenderStage<'a> {
     content: PaneRect,
     focus: bool,
     sync_deferred: bool,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    /// This pane's own scrollback view, or `None` when it renders live.
+    /// Resolved per pane so an unfocused pane in scrollback stays frozen and
+    /// a focused pane not in scrollback keeps rendering live output.
+    scrollback: Option<PaneScrollbackView>,
     runtime_appearance: &'a RuntimeAppearance,
     before_content_cells: &'a BeforeContentCells,
     content_damage: &'a PaneContentDamagePlan,
@@ -4285,10 +4237,8 @@ struct SurfaceOutputPlan<'a> {
     before_content_output_plan: BeforeContentSurfaceOutputPlan,
     after_content_snapshots: Vec<ExtensionLayerSnapshot>,
     after_content_output_plan: AfterContentSurfaceOutputPlan,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    /// This surface's pane scrollback view, resolved during planning.
+    scrollback: Option<PaneScrollbackView>,
     runtime_appearance: &'a RuntimeAppearance,
 }
 
@@ -4345,10 +4295,7 @@ fn build_render_frame_output_plan<'a>(
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
     status_insets: (u16, u16),
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     runtime_appearance: &'a RuntimeAppearance,
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
@@ -4384,10 +4331,7 @@ fn build_render_frame_output_plan<'a>(
                 &retained_repaint_ids,
                 focused_surface_id,
                 focused_pane_id,
-                scrollback_active,
-                scrollback_offset,
-                scrollback_cursor,
-                selection_anchor,
+                scrollback_views,
                 runtime_appearance,
                 damage_policy,
                 render_extensions,
@@ -4453,10 +4397,7 @@ fn build_surface_output_plan<'a>(
     retained_repaint_ids: &BTreeSet<Uuid>,
     focused_surface_id: Option<Uuid>,
     focused_pane_id: Option<Uuid>,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     runtime_appearance: &'a RuntimeAppearance,
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
@@ -4558,10 +4499,7 @@ fn build_surface_output_plan<'a>(
         before_content_output_plan,
         after_content_snapshots,
         after_content_output_plan,
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback: scrollback_views.get(&pane_id).copied(),
         runtime_appearance,
     })
 }
@@ -4746,10 +4684,7 @@ fn execute_surface_output_plan<W: io::Write>(
                         content: plan.content,
                         focus: plan.surface_plan.focused,
                         sync_deferred: plan.surface_plan.sync_deferred,
-                        scrollback_active: plan.scrollback_active,
-                        scrollback_offset: plan.scrollback_offset,
-                        scrollback_cursor: plan.scrollback_cursor,
-                        selection_anchor: plan.selection_anchor,
+                        scrollback: plan.scrollback,
                         runtime_appearance: plan.runtime_appearance,
                         before_content_cells: &before_content_cells,
                         content_damage: &plan.surface_plan.content_damage,
@@ -4950,12 +4885,17 @@ fn queue_pane_content_for_surface<W: io::Write>(
             entry.prev_rows.clear();
             entry.scrollback_window = None;
         }
-        let use_scrollback = stage.scrollback_active && stage.focus;
-        let grid_rows = if use_scrollback {
+        // Per-pane scrollback: a pane renders frozen history if and only if it
+        // has its own scrollback view. This is deliberately NOT gated on focus
+        // — gating on focus made a single global view position follow whichever
+        // pane was focused, leaking pane A's offset into pane B.
+        let scrollback = stage.scrollback;
+        let use_scrollback = scrollback.is_some();
+        let grid_rows = if let Some(view) = scrollback {
             entry
                 .scrollback_window
                 .as_ref()
-                .filter(|window| window.scrollback_offset == stage.scrollback_offset)
+                .filter(|window| window.scrollback_offset == view.offset)
                 .map_or_else(
                     || vec![PhysicalRow::new(); inner_h],
                     |window| window.rows.clone(),
@@ -4963,20 +4903,10 @@ fn queue_pane_content_for_surface<W: io::Write>(
         } else {
             entry.terminal_grid.grid().display_rows(0, inner_h)
         };
-        let selection = if use_scrollback {
-            selection_bounds(
-                stage.selection_anchor,
-                stage.scrollback_cursor,
-                stage.scrollback_offset,
-            )
-        } else {
-            None
-        };
+        let selection = scrollback.and_then(|view| view.selection_bounds());
         if stage.focus {
-            let (cursor_row, cursor_col) = if use_scrollback {
-                let cursor = stage
-                    .scrollback_cursor
-                    .unwrap_or(AttachScrollbackCursor { row: 0, col: 0 });
+            let (cursor_row, cursor_col) = if let Some(view) = scrollback {
+                let cursor = view.cursor;
                 (
                     u16::try_from(cursor.row.min(inner_h.saturating_sub(1))).unwrap_or(u16::MAX),
                     u16::try_from(cursor.col.min(inner_w.saturating_sub(1))).unwrap_or(u16::MAX),
@@ -5046,11 +4976,8 @@ fn queue_pane_content_for_surface<W: io::Write>(
                             GridRowRenderContext {
                                 row: &blank_row,
                                 selection,
-                                absolute_row: if use_scrollback {
-                                    stage.scrollback_offset.saturating_add(row)
-                                } else {
-                                    row
-                                },
+                                absolute_row: scrollback
+                                    .map_or(row, |view| view.offset.saturating_add(row)),
                                 runtime_appearance: stage.runtime_appearance,
                                 palette: entry.terminal_grid.grid().palette(),
                                 before_content_cells: &before_cells,
@@ -5064,11 +4991,8 @@ fn queue_pane_content_for_surface<W: io::Write>(
                             GridRowRenderContext {
                                 row: grid_row,
                                 selection,
-                                absolute_row: if use_scrollback {
-                                    stage.scrollback_offset.saturating_add(row)
-                                } else {
-                                    row
-                                },
+                                absolute_row: scrollback
+                                    .map_or(row, |view| view.offset.saturating_add(row)),
                                 runtime_appearance: stage.runtime_appearance,
                                 palette: entry.terminal_grid.grid().palette(),
                                 before_content_cells: &before_cells,
@@ -5095,11 +5019,9 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                         GridRowRenderContext {
                                             row: &blank_row,
                                             selection,
-                                            absolute_row: if use_scrollback {
-                                                stage.scrollback_offset.saturating_add(row)
-                                            } else {
-                                                row
-                                            },
+                                            absolute_row: scrollback.map_or(row, |view| {
+                                                view.offset.saturating_add(row)
+                                            }),
                                             runtime_appearance: stage.runtime_appearance,
                                             palette: entry.terminal_grid.grid().palette(),
                                             before_content_cells: &before_cells,
@@ -5113,11 +5035,9 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                         GridRowRenderContext {
                                             row: grid_row,
                                             selection,
-                                            absolute_row: if use_scrollback {
-                                                stage.scrollback_offset.saturating_add(row)
-                                            } else {
-                                                row
-                                            },
+                                            absolute_row: scrollback.map_or(row, |view| {
+                                                view.offset.saturating_add(row)
+                                            }),
                                             runtime_appearance: stage.runtime_appearance,
                                             palette: entry.terminal_grid.grid().palette(),
                                             before_content_cells: &before_cells,
@@ -5209,10 +5129,7 @@ fn render_attach_scene_inner<W: io::Write>(
     frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
-    scrollback_active: bool,
-    scrollback_offset: usize,
-    scrollback_cursor: Option<AttachScrollbackCursor>,
-    selection_anchor: Option<AttachScrollbackPosition>,
+    scrollback_views: &PaneScrollbackViews,
     _zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
@@ -5251,10 +5168,7 @@ fn render_attach_scene_inner<W: io::Write>(
         frame_damage,
         terminal_size,
         (status_top_inset, status_bottom_inset),
-        scrollback_active,
-        scrollback_offset,
-        scrollback_cursor,
-        selection_anchor,
+        scrollback_views,
         runtime_appearance,
         damage_policy,
         render_extensions,
@@ -5312,6 +5226,7 @@ mod tests {
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
+        PaneScrollbackView, PaneScrollbackViews,
     };
     use bmux_appearance::{RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect};
     use bmux_attach_layout_protocol::{
@@ -5355,6 +5270,13 @@ mod tests {
             .resize(cols.max(1), rows.max(1))
             .expect("test terminal grid dimensions should be valid");
         append_pane_output(buffer, bytes);
+    }
+
+    /// One-entry scrollback view map for tests.
+    fn scrollback_views_for(pane_id: Uuid, view: PaneScrollbackView) -> PaneScrollbackViews {
+        let mut views = PaneScrollbackViews::new();
+        views.insert(pane_id, view);
+        views
     }
 
     fn single_pane_scene(pane_id: Uuid, width: u16, height: u16) -> AttachScene {
@@ -5554,10 +5476,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (4, 2),
             &RuntimeAppearance::default(),
@@ -5646,10 +5565,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (4, 2),
             &RuntimeAppearance::default(),
@@ -5748,10 +5664,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (4, 2),
             &RuntimeAppearance::default(),
@@ -5770,10 +5683,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (4, 2),
             &RuntimeAppearance::default(),
@@ -6117,10 +6027,7 @@ mod tests {
                 retained_extension_names: BTreeSet::new(),
                 retained_cleanup_damage: RenderDamage::None,
             },
-            scrollback_active: false,
-            scrollback_offset: 0,
-            scrollback_cursor: None,
-            selection_anchor: None,
+            scrollback: None,
             runtime_appearance: &runtime_appearance,
         };
 
@@ -7071,10 +6978,7 @@ mod tests {
             frame_damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (10, 4),
             &RuntimeAppearance::default(),
@@ -7729,10 +7633,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (10, 4),
             &RuntimeAppearance::default(),
@@ -7876,10 +7777,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (40, 6),
             &RuntimeAppearance::default(),
@@ -7903,10 +7801,7 @@ mod tests {
             &damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (40, 6),
             &RuntimeAppearance::default(),
@@ -8029,10 +7924,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (12, 4),
             &RuntimeAppearance::default(),
@@ -8054,10 +7946,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (12, 4),
             &RuntimeAppearance::default(),
@@ -8561,10 +8450,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (5, 3),
             &RuntimeAppearance::default(),
@@ -8623,10 +8509,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &RuntimeAppearance::default(),
@@ -8652,10 +8535,7 @@ mod tests {
             &damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &RuntimeAppearance::default(),
@@ -8735,10 +8615,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -8763,10 +8640,7 @@ mod tests {
             &damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -8778,6 +8652,111 @@ mod tests {
         let output = String::from_utf8(output).expect("output should be utf8");
         assert!(output.contains("\u{1b}[1;3H界"), "{output:?}");
         assert!(!output.contains("ab界ef"), "{output:?}");
+    }
+
+    /// Regression guard for per-pane scrollback rendering.
+    ///
+    /// Only the pane with a scrollback view may render frozen history rows; a
+    /// pane without one must render live grid output even when it is focused.
+    /// The previous implementation gated scrollback on `focus`, so focusing an
+    /// unrelated pane made it render from another pane's view position.
+    #[test]
+    fn render_attach_scene_renders_scrollback_per_pane_not_by_focus() {
+        let scrolled_pane = Uuid::from_u128(0x5c01);
+        let live_pane = Uuid::from_u128(0x11e0);
+        let pane_surface = |pane_id: Uuid, x: u16, cursor_owner: bool| AttachSurface {
+            id: pane_id,
+            kind: AttachSurfaceKind::Pane,
+            layer: SurfaceLayer::Pane,
+            z: 0,
+            rect: AttachRect {
+                x,
+                y: 0,
+                w: 10,
+                h: 2,
+            },
+            content_rect: AttachRect {
+                x,
+                y: 0,
+                w: 10,
+                h: 2,
+            },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner,
+            pane_id: Some(pane_id),
+        };
+        // The live pane is the focused one, to prove focus no longer drives
+        // scrollback rendering.
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(0x5e55),
+            focus: AttachFocusTarget::Pane { pane_id: live_pane },
+            surfaces: vec![
+                pane_surface(scrolled_pane, 0, false),
+                pane_surface(live_pane, 10, true),
+            ],
+        };
+
+        let mut pane_buffers = BTreeMap::new();
+        // Build frozen window rows from a real grid so they carry the same cell
+        // shape the production window-hydration path produces.
+        let frozen_rows = {
+            let mut frozen = PaneRenderBuffer::default();
+            feed_pane_buffer(&mut frozen, 2, 10, b"FROZEN\r\n");
+            frozen.terminal_grid.grid().display_rows(0, 2)
+        };
+        for pane_id in [scrolled_pane, live_pane] {
+            let mut buffer = PaneRenderBuffer::default();
+            feed_pane_buffer(&mut buffer, 2, 10, b"LIVEROW\r\n");
+            // Give each pane a frozen window so the only difference between the
+            // two panes is whether it has a scrollback *view*.
+            buffer.scrollback_window = Some(crate::types::PaneScrollbackWindow {
+                scrollback_offset: 1,
+                max_scrollback_offset: 5,
+                total_scrolled_rows: 5,
+                rows: frozen_rows.clone(),
+            });
+            pane_buffers.insert(pane_id, buffer);
+        }
+
+        let scrollback_views = scrollback_views_for(
+            scrolled_pane,
+            PaneScrollbackView {
+                offset: 1,
+                cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                selection_anchor: None,
+            },
+        );
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            &scrollback_views,
+            false,
+            (20, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("output should be utf8");
+        assert!(
+            rendered.contains("FROZEN"),
+            "pane with a scrollback view must render frozen history rows: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("LIVEROW"),
+            "focused pane without a scrollback view must render live rows: {rendered:?}"
+        );
     }
 
     #[test]
@@ -8825,10 +8804,14 @@ mod tests {
             &FrameDamage::full_frame(),
             1,
             0,
-            true,
-            1,
-            Some(AttachScrollbackCursor { row: 0, col: 0 }),
-            None,
+            &scrollback_views_for(
+                pane_id,
+                PaneScrollbackView {
+                    offset: 1,
+                    cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                    selection_anchor: None,
+                },
+            ),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -8887,10 +8870,14 @@ mod tests {
             &FrameDamage::full_frame(),
             1,
             0,
-            true,
-            0,
-            Some(AttachScrollbackCursor { row: 0, col: 4 }),
-            Some(AttachScrollbackPosition { row: 0, col: 1 }),
+            &scrollback_views_for(
+                pane_id,
+                PaneScrollbackView {
+                    offset: 0,
+                    cursor: AttachScrollbackCursor { row: 0, col: 4 },
+                    selection_anchor: Some(AttachScrollbackPosition { row: 0, col: 1 }),
+                },
+            ),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -8921,10 +8908,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &appearance,
@@ -8957,10 +8941,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &appearance,
@@ -8992,10 +8973,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &appearance,
@@ -9013,10 +8991,7 @@ mod tests {
             &content_damage(pane_id),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &appearance,
@@ -9048,10 +9023,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &RuntimeAppearance::default(),
@@ -9069,10 +9041,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 3),
             &red_wash_appearance(),
@@ -9225,10 +9194,7 @@ mod tests {
             &damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &RuntimeAppearance::default(),
@@ -9310,10 +9276,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (10, 2),
             &RuntimeAppearance::default(),
@@ -9337,10 +9300,7 @@ mod tests {
             &content_damage(pane_id),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (10, 2),
             &RuntimeAppearance::default(),
@@ -9430,10 +9390,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9453,10 +9410,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9563,10 +9517,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9585,10 +9536,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9704,10 +9652,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9726,10 +9671,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9834,10 +9776,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9856,10 +9795,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9960,10 +9896,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -9983,10 +9916,7 @@ mod tests {
             &frame_damage,
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -10097,10 +10027,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -10119,10 +10046,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -10240,10 +10164,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -10262,10 +10183,7 @@ mod tests {
             &FrameDamage::default(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (8, 2),
             &RuntimeAppearance::default(),
@@ -10448,10 +10366,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -10493,10 +10408,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -10645,10 +10557,7 @@ mod tests {
             &FrameDamage::full_frame(),
             1,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -10738,10 +10647,7 @@ mod tests {
             &FrameDamage::full_frame(),
             1,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -10768,10 +10674,7 @@ mod tests {
             &content_damage(pane_id),
             1,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -10802,10 +10705,7 @@ mod tests {
             &content_damage(pane_id),
             1,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -10869,10 +10769,7 @@ mod tests {
             &FrameDamage::full_frame(),
             1,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
@@ -11024,10 +10921,7 @@ mod tests {
             &FrameDamage::full_frame(),
             0,
             0,
-            false,
-            0,
-            None,
-            None,
+            &PaneScrollbackViews::new(),
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),

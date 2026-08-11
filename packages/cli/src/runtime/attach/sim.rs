@@ -669,12 +669,13 @@ impl AttachSimHarness {
         let mut bytes = lines.join("\r\n").into_bytes();
         bytes.extend_from_slice(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
         append_sim_pane_output(buffer, &bytes);
-        self.view_state.exit_scrollback();
+        // Reseeding one pane's content invalidates only that pane's view.
+        self.view_state.exit_scrollback_for(pane_id);
     }
 
     pub fn send_attach_chord(&mut self, chord: &str) -> Result<Vec<String>> {
         self.input_processor
-            .set_scroll_mode(self.view_state.scrollback_active);
+            .set_scroll_mode(self.view_state.scrollback_active());
         let strokes = crate::input::parse_key_chord(chord)
             .map_err(|error| anyhow::anyhow!("invalid attach key chord '{chord}': {error}"))?;
         let mut emitted = Vec::new();
@@ -799,11 +800,11 @@ impl AttachSimHarness {
             .map(|window| window.name.as_str())
     }
 
-    pub const fn scrollback_active(&self) -> bool {
-        self.view_state.scrollback_active
+    pub fn scrollback_active(&self) -> bool {
+        self.view_state.scrollback_active()
     }
 
-    pub const fn selection_active(&self) -> bool {
+    pub fn selection_active(&self) -> bool {
         self.view_state.selection_active()
     }
 
@@ -825,8 +826,8 @@ impl AttachSimHarness {
 
     pub fn scrollback_cursor(&self) -> Option<(usize, usize)> {
         self.view_state
-            .scrollback_cursor
-            .map(|cursor| (cursor.row, cursor.col))
+            .focused_scrollback()
+            .map(|view| (view.cursor.row, view.cursor.col))
     }
 
     pub fn locate_text(&self, text: &str) -> Option<AttachSimLocatedText> {

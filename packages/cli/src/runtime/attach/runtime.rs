@@ -406,6 +406,7 @@ use super::state::{
     AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachPointerOwner,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
     AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
+    PaneScrollbackView,
 };
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
@@ -2883,10 +2884,8 @@ fn render_native_provider_scene<W: AttachTerminal>(
         &bmux_attach_pipeline::FrameDamage::full_frame(),
         0,
         0,
-        false,
-        0,
-        None,
-        None,
+        // Diagnostic scene dump renders live pane content only.
+        &bmux_attach_pipeline::PaneScrollbackViews::new(),
         false,
         (geometry.cols, geometry.rows),
         &RuntimeAppearance::default(),
@@ -4093,6 +4092,22 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             drop(current_pane_ids);
             view_state.dirty.layout_needs_refresh = false;
 
+            // Scroll mode is derived from the focused pane's own scrollback
+            // view, so resync the keymap here — this is the single point every
+            // focus change flows through (mouse, keybind, plugin command, or
+            // another client moving focus). Without this, scroll bindings would
+            // stay active after focusing a pane that is not scrolled back.
+            attach_input_processor.set_scroll_mode(view_state.scrollback_active());
+            // Drop views for panes that no longer exist in the new layout.
+            if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
+                let active_pane_ids = layout_state
+                    .panes
+                    .iter()
+                    .map(|pane| pane.id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                view_state.retain_scrollback_panes(&active_pane_ids);
+            }
+
             // Reset image sequences on layout change so the next fetch
             // gets a full snapshot from the server (handles zoom/unzoom).
             #[cfg(any(
@@ -4337,9 +4352,9 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 .any(|b| b.sync_update_in_progress);
             pane_output_pending = last_round_had_data || any_sync_still_active;
             if drained_any_data
-                && view_state.scrollback_active
+                && !view_state.pane_scrollback.is_empty()
                 && let Err(error) =
-                    ensure_focused_scrollback_window(&mut client, &mut view_state, true).await
+                    ensure_pane_scrollback_windows(&mut client, &mut view_state, true).await
             {
                 view_state.set_transient_status(
                     format!(
@@ -6199,7 +6214,7 @@ pub fn handle_attach_ui_action_at(
             if view_state.selection_active() {
                 clear_attach_selection_at(view_state, true, now);
             } else {
-                view_state.exit_scrollback();
+                view_state.exit_focused_scrollback();
             }
         }
         RuntimeAction::ScrollUpLine => {
@@ -6220,12 +6235,17 @@ pub fn handle_attach_ui_action_at(
                 attach_scrollback_page_size(view_state).cast_signed(),
             );
         }
-        RuntimeAction::ScrollTop if view_state.scrollback_active => {
-            view_state.scrollback_offset = max_attach_scrollback(view_state);
+        RuntimeAction::ScrollTop if view_state.scrollback_active() => {
+            let max_offset = max_attach_scrollback(view_state);
+            if let Some(view) = view_state.focused_scrollback_mut() {
+                view.offset = max_offset;
+            }
             clamp_attach_scrollback_cursor(view_state);
         }
-        RuntimeAction::ScrollBottom if view_state.scrollback_active => {
-            view_state.scrollback_offset = 0;
+        RuntimeAction::ScrollBottom if view_state.scrollback_active() => {
+            if let Some(view) = view_state.focused_scrollback_mut() {
+                view.offset = 0;
+            }
             clamp_attach_scrollback_cursor(view_state);
         }
         RuntimeAction::MoveCursorLeft => {
@@ -6343,30 +6363,84 @@ pub fn handle_attach_ui_action_at(
     }
 }
 
-pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
-    let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
+/// Pane content size for an arbitrary pane, from the authoritative scene
+/// `content_rect`.
+pub fn attach_pane_inner_size(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<(usize, usize)> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    layout_state
+        .scene
+        .surfaces
+        .iter()
+        .find(|surface| surface.visible && surface.pane_id == Some(pane_id))
+        .map(|surface| {
+            (
+                usize::from(surface.content_rect.w.max(1)),
+                usize::from(surface.content_rect.h.max(1)),
+            )
+        })
+}
+
+pub fn attach_pane_buffer_mut(
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+) -> Option<&mut attach::state::PaneRenderBuffer> {
+    view_state.pane_buffers.get_mut(&pane_id)
+}
+
+/// Enter scrollback for one specific pane, seeded from that pane's own live
+/// cursor and content rect.
+pub fn enter_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uuid) -> bool {
+    if view_state.scrollback_active_for(pane_id) {
+        return true;
+    }
+    let Some((inner_w, inner_h)) = attach_pane_inner_size(view_state, pane_id) else {
         return false;
     };
-    let Some(buffer) = focused_attach_pane_buffer(view_state) else {
+    let Some(buffer) = attach_pane_buffer_mut(view_state, pane_id) else {
         return false;
     };
     let cursor = buffer.terminal_grid.grid().cursor();
-    view_state.scrollback_active = true;
-    view_state.scrollback_offset = 0;
-    view_state.scrollback_cursor = Some(AttachScrollbackCursor {
-        row: cursor.row.min(inner_h.saturating_sub(1)),
-        col: cursor.col.min(inner_w.saturating_sub(1)),
-    });
-    view_state.selection_anchor = None;
+    view_state.pane_scrollback.insert(
+        pane_id,
+        PaneScrollbackView {
+            offset: 0,
+            cursor: AttachScrollbackCursor {
+                row: cursor.row.min(inner_h.saturating_sub(1)),
+                col: cursor.col.min(inner_w.saturating_sub(1)),
+            },
+            selection_anchor: None,
+        },
+    );
     true
 }
 
-pub fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
-    if !view_state.scrollback_active {
+pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
+    let Some(pane_id) = view_state.focused_pane_id() else {
         return false;
+    };
+    enter_attach_scrollback_for(view_state, pane_id)
+}
+
+pub fn begin_attach_selection_for(view_state: &mut AttachViewState, pane_id: Uuid) -> bool {
+    let Some(view) = view_state.scrollback_for(pane_id) else {
+        return false;
+    };
+    let anchor = view.cursor_absolute_position();
+    if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+        view.selection_anchor = Some(anchor);
+        return true;
     }
-    view_state.selection_anchor = attach_scrollback_cursor_absolute_position(view_state);
-    view_state.selection_anchor.is_some()
+    false
+}
+
+pub fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return false;
+    };
+    begin_attach_selection_for(view_state, pane_id)
 }
 
 pub fn clear_attach_selection_at(
@@ -6374,7 +6448,9 @@ pub fn clear_attach_selection_at(
     show_status: bool,
     now: Instant,
 ) {
-    view_state.selection_anchor = None;
+    if let Some(view) = view_state.focused_scrollback_mut() {
+        view.selection_anchor = None;
+    }
     if show_status {
         view_state.set_transient_status(
             ATTACH_SELECTION_CLEARED_STATUS,
@@ -6384,82 +6460,81 @@ pub fn clear_attach_selection_at(
     }
 }
 
-pub fn attach_scrollback_cursor_absolute_position(
-    view_state: &AttachViewState,
-) -> Option<AttachScrollbackPosition> {
-    let cursor = view_state.scrollback_cursor?;
-    Some(AttachScrollbackPosition {
-        row: view_state.scrollback_offset.saturating_add(cursor.row),
-        col: cursor.col,
-    })
-}
-
 pub fn attach_selection_bounds(
     view_state: &AttachViewState,
 ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
-    let anchor = view_state.selection_anchor?;
-    let head = attach_scrollback_cursor_absolute_position(view_state)?;
-    Some(if anchor <= head {
-        (anchor, head)
-    } else {
-        (head, anchor)
-    })
+    view_state.focused_scrollback()?.selection_bounds()
+}
+
+pub fn step_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uuid, delta: isize) {
+    if !view_state.scrollback_active_for(pane_id) {
+        return;
+    }
+    let max_offset = max_attach_scrollback_for(view_state, pane_id);
+    if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+        view.offset = adjust_attach_scrollback_offset(view.offset, delta, max_offset);
+    }
+    clamp_attach_scrollback_cursor_for(view_state, pane_id);
 }
 
 pub fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
-    if !view_state.scrollback_active {
+    let Some(pane_id) = view_state.focused_pane_id() else {
         return;
-    }
-    let max_offset = max_attach_scrollback(view_state);
-    view_state.scrollback_offset =
-        adjust_attach_scrollback_offset(view_state.scrollback_offset, delta, max_offset);
-    clamp_attach_scrollback_cursor(view_state);
+    };
+    step_attach_scrollback_for(view_state, pane_id, delta);
 }
 
 pub fn move_attach_scrollback_cursor_horizontal(view_state: &mut AttachViewState, delta: isize) {
-    if !view_state.scrollback_active {
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return;
+    };
+    if !view_state.scrollback_active_for(pane_id) {
         return;
     }
-    let Some((inner_w, _)) = focused_attach_pane_inner_size(view_state) else {
+    let Some((inner_w, _)) = attach_pane_inner_size(view_state, pane_id) else {
         return;
     };
-    let Some(cursor) = view_state.scrollback_cursor.as_mut() else {
+    let Some(view) = view_state.scrollback_for_mut(pane_id) else {
         return;
     };
-    cursor.col = adjust_scrollback_cursor_component(cursor.col, delta, inner_w.saturating_sub(1));
+    view.cursor.col =
+        adjust_scrollback_cursor_component(view.cursor.col, delta, inner_w.saturating_sub(1));
 }
 
 pub fn move_attach_scrollback_cursor_vertical(view_state: &mut AttachViewState, delta: isize) {
-    if !view_state.scrollback_active || delta == 0 {
-        return;
-    }
-    let Some((_, inner_h)) = focused_attach_pane_inner_size(view_state) else {
+    let Some(pane_id) = view_state.focused_pane_id() else {
         return;
     };
-    let max_offset = max_attach_scrollback(view_state);
-    let Some(cursor) = view_state.scrollback_cursor.as_mut() else {
+    if !view_state.scrollback_active_for(pane_id) || delta == 0 {
+        return;
+    }
+    let Some((_, inner_h)) = attach_pane_inner_size(view_state, pane_id) else {
+        return;
+    };
+    let max_offset = max_attach_scrollback_for(view_state, pane_id);
+    let Some(view) = view_state.scrollback_for_mut(pane_id) else {
         return;
     };
 
     if delta < 0 {
         for _ in 0..delta.unsigned_abs() {
-            if cursor.row > 0 {
-                cursor.row -= 1;
-            } else if view_state.scrollback_offset < max_offset {
-                view_state.scrollback_offset += 1;
+            if view.cursor.row > 0 {
+                view.cursor.row -= 1;
+            } else if view.offset < max_offset {
+                view.offset += 1;
             }
         }
     } else {
         for _ in 0..(delta.cast_unsigned()) {
-            if cursor.row + 1 < inner_h {
-                cursor.row += 1;
-            } else if view_state.scrollback_offset > 0 {
-                view_state.scrollback_offset -= 1;
+            if view.cursor.row + 1 < inner_h {
+                view.cursor.row += 1;
+            } else if view.offset > 0 {
+                view.offset -= 1;
             }
         }
     }
 
-    clamp_attach_scrollback_cursor(view_state);
+    clamp_attach_scrollback_cursor_for(view_state, pane_id);
 }
 
 pub fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_value: usize) -> usize {
@@ -6477,7 +6552,7 @@ pub fn copy_attach_selection_at(
 ) {
     let Some(text) = selected_attach_text(view_state) else {
         if exit_after_copy {
-            view_state.exit_scrollback();
+            view_state.exit_focused_scrollback();
         } else {
             view_state.set_transient_status(
                 ATTACH_SELECTION_EMPTY_STATUS,
@@ -6496,7 +6571,7 @@ pub fn copy_attach_selection_at(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
             if exit_after_copy {
-                view_state.exit_scrollback();
+                view_state.exit_focused_scrollback();
             }
         }
         Err(error) => {
@@ -6704,8 +6779,8 @@ pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset:
     }
 }
 
-pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
-    let Some(buffer) = focused_attach_pane_buffer(view_state) else {
+pub fn max_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uuid) -> usize {
+    let Some(buffer) = attach_pane_buffer_mut(view_state, pane_id) else {
         return 0;
     };
     let local = buffer
@@ -6719,16 +6794,29 @@ pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
         .map_or(local, |window| local.max(window.max_scrollback_offset))
 }
 
+pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return 0;
+    };
+    max_attach_scrollback_for(view_state, pane_id)
+}
+
+pub fn clamp_attach_scrollback_cursor_for(view_state: &mut AttachViewState, pane_id: Uuid) {
+    let Some((inner_w, inner_h)) = attach_pane_inner_size(view_state, pane_id) else {
+        return;
+    };
+    let Some(view) = view_state.scrollback_for_mut(pane_id) else {
+        return;
+    };
+    view.cursor.row = view.cursor.row.min(inner_h.saturating_sub(1));
+    view.cursor.col = view.cursor.col.min(inner_w.saturating_sub(1));
+}
+
 pub fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
-    let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
-        view_state.scrollback_cursor = None;
+    let Some(pane_id) = view_state.focused_pane_id() else {
         return;
     };
-    let Some(cursor) = view_state.scrollback_cursor.as_mut() else {
-        return;
-    };
-    cursor.row = cursor.row.min(inner_h.saturating_sub(1));
-    cursor.col = cursor.col.min(inner_w.saturating_sub(1));
+    clamp_attach_scrollback_cursor_for(view_state, pane_id);
 }
 
 pub fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize {
@@ -7122,7 +7210,7 @@ fn apply_attach_profile_switch_with_path(
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
         let keymap = attach_keymap_from_config(&resolved_config);
         attach_input_processor.replace_keymap(keymap);
-        attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+        attach_input_processor.set_scroll_mode(view_state.scrollback_active());
         view_state.status_position = if resolved_config.status_bar.enabled {
             resolved_config.appearance.status_position
         } else {
@@ -7159,7 +7247,7 @@ fn apply_attach_profile_switch_with_path(
             }
         }
         attach_input_processor.replace_keymap(previous_keymap);
-        attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+        attach_input_processor.set_scroll_mode(view_state.scrollback_active());
         view_state.mouse.config = previous_mouse_config;
         view_state.mouse.tab_drag_enabled = previous_tab_drag_enabled;
         view_state.status_position = previous_status_position;
@@ -7887,7 +7975,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             view_state.attached_id,
             view_state.can_write,
             view_state.ui_mode,
-            view_state.scrollback_active,
+            view_state.scrollback_active(),
             follow_target_id,
             follow_global,
             view_state.prompt.is_active(),
@@ -7975,7 +8063,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         "help"
     } else if view_state.prompt.is_active() {
         "prompt"
-    } else if view_state.scrollback_active {
+    } else if view_state.scrollback_active() {
         "scroll"
     } else if layout_state.zoomed {
         "zoom"
@@ -8007,10 +8095,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             &frame_damage,
             status_top_inset,
             status_bottom_inset,
-            view_state.scrollback_active,
-            view_state.scrollback_offset,
-            view_state.scrollback_cursor,
-            view_state.selection_anchor,
+            &view_state.pane_scrollback,
             layout_state.zoomed,
             terminal_size,
             &active_runtime_appearance,
@@ -9247,80 +9332,98 @@ async fn hydrate_attach_structured_grid_snapshots(
     Ok(hydrated)
 }
 
-async fn ensure_focused_scrollback_window(
+/// Fetch bounded scrollback windows for every pane currently in scrollback.
+///
+/// Scrollback history is server-owned; this pulls one viewport-sized window per
+/// scrolled pane. The wire request is already multi-pane, so every pane in
+/// scrollback is refreshed in a single round trip. Keeping unfocused panes
+/// refreshed is what lets them stay frozen at their own offset while they keep
+/// producing output (the server's `anchor_total_scrolled_rows` handling).
+async fn ensure_pane_scrollback_windows(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     force_refresh: bool,
 ) -> std::result::Result<(), ClientError> {
-    if !view_state.scrollback_active {
+    if view_state.pane_scrollback.is_empty() {
         return Ok(());
     }
-    let Some(pane_id) = focused_attach_pane_id(view_state) else {
-        return Ok(());
-    };
-    let Some((_, rows)) = focused_attach_pane_inner_size(view_state) else {
-        return Ok(());
-    };
-    let scrollback_offset = view_state.scrollback_offset;
-    let cached_window = view_state
-        .pane_buffers
-        .get(&pane_id)
-        .and_then(|buffer| buffer.scrollback_window.as_ref());
-    if !force_refresh
-        && cached_window.is_some_and(|window| window.scrollback_offset == scrollback_offset)
-    {
-        return Ok(());
-    }
-    let anchor_total_scrolled_rows = cached_window.map(|window| window.total_scrolled_rows);
 
-    let windows = attach_pane_grid_window_state_streaming(
-        client,
-        view_state.attached_id,
-        vec![PaneGridWindowRequest {
-            pane_id,
-            scrollback_offset,
+    let mut requests = Vec::new();
+    let mut requested_offsets = BTreeMap::new();
+    for (pane_id, view) in &view_state.pane_scrollback {
+        let Some((_, rows)) = attach_pane_inner_size(view_state, *pane_id) else {
+            continue;
+        };
+        let cached_window = view_state
+            .pane_buffers
+            .get(pane_id)
+            .and_then(|buffer| buffer.scrollback_window.as_ref());
+        if !force_refresh
+            && cached_window.is_some_and(|window| window.scrollback_offset == view.offset)
+        {
+            continue;
+        }
+        requested_offsets.insert(*pane_id, view.offset);
+        requests.push(PaneGridWindowRequest {
+            pane_id: *pane_id,
+            scrollback_offset: view.offset,
             rows,
-            anchor_total_scrolled_rows,
-        }],
-    )
-    .await?;
-    let Some(window) = windows.into_iter().find(|window| window.pane_id == pane_id) else {
+            anchor_total_scrolled_rows: cached_window.map(|window| window.total_scrolled_rows),
+        });
+    }
+
+    if requests.is_empty() {
         return Ok(());
-    };
-    let decoded = serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&window.encoded)
-        .map_err(|error| ClientError::ServerError {
+    }
+
+    let windows =
+        attach_pane_grid_window_state_streaming(client, view_state.attached_id, requests).await?;
+
+    for window in windows {
+        let pane_id = window.pane_id;
+        let Some(&requested_offset) = requested_offsets.get(&pane_id) else {
+            continue;
+        };
+        let decoded = serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&window.encoded)
+            .map_err(|error| ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("decoding structured scrollback window: {error}"),
         })?;
-    let grid = bmux_terminal_grid::TerminalGrid::from_snapshot(
-        &decoded,
-        bmux_terminal_grid::GridLimits::default(),
-    )
-    .map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("hydrating structured scrollback window: {error}"),
-    })?;
-    let adjusted_offset = window.scrollback_offset;
-    let offset_delta = adjusted_offset.saturating_sub(scrollback_offset);
-    if offset_delta > 0 {
-        view_state.scrollback_offset = adjusted_offset;
-        if let Some(anchor) = view_state.selection_anchor.as_mut() {
-            anchor.row = anchor.row.saturating_add(offset_delta);
+        let grid = bmux_terminal_grid::TerminalGrid::from_snapshot(
+            &decoded,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("hydrating structured scrollback window: {error}"),
+        })?;
+
+        // The server clamps/advances the offset to keep a scrolled view anchored
+        // as new output scrolls history. Re-apply that adjustment to this pane's
+        // view and to its selection anchor only.
+        let adjusted_offset = window.scrollback_offset;
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.offset = adjusted_offset;
+            if let Some(anchor) = view.selection_anchor.as_mut() {
+                if adjusted_offset > requested_offset {
+                    anchor.row = anchor
+                        .row
+                        .saturating_add(adjusted_offset - requested_offset);
+                } else if adjusted_offset < requested_offset {
+                    anchor.row = anchor
+                        .row
+                        .saturating_sub(requested_offset - adjusted_offset);
+                }
+            }
         }
-    } else if adjusted_offset < scrollback_offset {
-        let delta = scrollback_offset - adjusted_offset;
-        view_state.scrollback_offset = adjusted_offset;
-        if let Some(anchor) = view_state.selection_anchor.as_mut() {
-            anchor.row = anchor.row.saturating_sub(delta);
+        if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
+            buffer.scrollback_window = Some(PaneScrollbackWindow {
+                scrollback_offset: adjusted_offset,
+                max_scrollback_offset: window.max_scrollback_offset,
+                total_scrolled_rows: window.total_scrolled_rows,
+                rows: grid.viewport_rows(),
+            });
         }
-    }
-    if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
-        buffer.scrollback_window = Some(PaneScrollbackWindow {
-            scrollback_offset: adjusted_offset,
-            max_scrollback_offset: window.max_scrollback_offset,
-            total_scrolled_rows: window.total_scrolled_rows,
-            rows: grid.viewport_rows(),
-        });
     }
     Ok(())
 }
@@ -9328,26 +9431,36 @@ async fn ensure_focused_scrollback_window(
 async fn handle_attach_mouse_scrollback_with_window(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
+    pane_id: Option<Uuid>,
     kind: MouseEventKind,
 ) -> std::result::Result<bool, ClientError> {
-    let was_active = view_state.scrollback_active;
-    let before_offset = view_state.scrollback_offset;
+    // Scroll the pane the wheel event resolved to, falling back to the focused
+    // pane when the pointer is not over a pane surface.
+    let Some(pane_id) = pane_id.or_else(|| view_state.focused_pane_id()) else {
+        return Ok(false);
+    };
+    let was_active = view_state.scrollback_active_for(pane_id);
+    let before_offset = view_state
+        .scrollback_for(pane_id)
+        .map_or(0, |view| view.offset);
     let scroll_lines =
         isize::try_from(view_state.mouse.config.scroll_lines_per_tick.max(1)).unwrap_or(isize::MAX);
-    let consumed = handle_attach_mouse_scrollback(view_state, kind);
+    let consumed = handle_attach_mouse_scrollback_for(view_state, pane_id, kind);
     if !consumed {
         return Ok(false);
     }
 
-    ensure_focused_scrollback_window(client, view_state, false).await?;
+    ensure_pane_scrollback_windows(client, view_state, false).await?;
 
     if matches!(kind, MouseEventKind::ScrollUp)
         && !was_active
-        && view_state.scrollback_active
-        && view_state.scrollback_offset == before_offset
+        && view_state.scrollback_active_for(pane_id)
+        && view_state
+            .scrollback_for(pane_id)
+            .is_some_and(|view| view.offset == before_offset)
     {
-        step_attach_scrollback(view_state, -scroll_lines);
-        ensure_focused_scrollback_window(client, view_state, false).await?;
+        step_attach_scrollback_for(view_state, pane_id, -scroll_lines);
+        ensure_pane_scrollback_windows(client, view_state, false).await?;
     }
 
     Ok(true)
@@ -9365,15 +9478,15 @@ async fn handle_attach_ui_action_with_scrollback(
             | RuntimeAction::ScrollUpPage
             | RuntimeAction::ScrollTop
             | RuntimeAction::MoveCursorUp
-    ) && view_state.scrollback_active;
+    ) && view_state.scrollback_active();
     if needs_max_before {
-        ensure_focused_scrollback_window(client, view_state, false).await?;
+        ensure_pane_scrollback_windows(client, view_state, false).await?;
     }
 
     handle_attach_ui_action_at(action, view_state, now);
 
-    if view_state.scrollback_active {
-        ensure_focused_scrollback_window(client, view_state, false).await?;
+    if !view_state.pane_scrollback.is_empty() {
+        ensure_pane_scrollback_windows(client, view_state, false).await?;
     }
     Ok(())
 }
@@ -9415,6 +9528,8 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state.pane_buffers.clear();
         view_state.pane_mouse_protocol_hints.clear();
         view_state.pane_input_mode_hints.clear();
+        // A different session or a full resync invalidates every cached view.
+        view_state.pane_scrollback.clear();
     } else {
         view_state
             .pane_buffers
@@ -9425,6 +9540,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state
             .pane_input_mode_hints
             .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+        view_state.retain_scrollback_panes(&active_pane_ids);
     }
     let retained_pane_ids = view_state
         .pane_buffers
@@ -10402,7 +10518,7 @@ pub async fn handle_attach_terminal_event(
                     active_keybindings_for_context(
                         attach_input_processor.keymap(),
                         attach_input_processor.active_mode_id(),
-                        view_state.scrollback_active,
+                        view_state.scrollback_active(),
                     ),
                 )
                 .await
@@ -10413,7 +10529,7 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
-                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active());
             }
             AttachEventAction::Mouse(mouse_event) => {
                 if let Err(error) = handle_attach_mouse_event_at(
@@ -10432,8 +10548,7 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
-                if let Err(error) =
-                    ensure_focused_scrollback_window(client, view_state, false).await
+                if let Err(error) = ensure_pane_scrollback_windows(client, view_state, false).await
                 {
                     view_state.set_transient_status(
                         format!(
@@ -10444,7 +10559,7 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
-                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active());
             }
             AttachEventAction::Ui(action) => {
                 if let RuntimeAction::SwitchProfile(profile_id) = &action {
@@ -10521,7 +10636,7 @@ pub async fn handle_attach_terminal_event(
                         .dirty
                         .mark_layout_frame_dirty(AttachDirtySource::UserAction);
                 }
-                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active());
                 view_state
                     .dirty
                     .mark_status_dirty(AttachDirtySource::UserAction);
@@ -11786,6 +11901,7 @@ async fn handle_attach_mouse_event_at(
                 let _ = handle_attach_mouse_scrollback_with_window(
                     client,
                     view_state,
+                    target_context.focus_target,
                     mouse_event.kind,
                 )
                 .await?;
@@ -11804,6 +11920,7 @@ async fn handle_attach_mouse_event_at(
                 let _ = handle_attach_mouse_scrollback_with_window(
                     client,
                     view_state,
+                    target_context.focus_target,
                     mouse_event.kind,
                 )
                 .await?;
@@ -12937,13 +13054,24 @@ pub async fn handle_attach_mouse_wheel_auto(
                 .await
             }
             bmux_config::AlternateScreenWheelBehavior::ScrollbackOnly => {
-                handle_attach_mouse_scrollback_with_window(client, view_state, mouse_event.kind)
-                    .await
+                handle_attach_mouse_scrollback_with_window(
+                    client,
+                    view_state,
+                    Some(focus_target),
+                    mouse_event.kind,
+                )
+                .await
             }
         };
     }
 
-    handle_attach_mouse_scrollback_with_window(client, view_state, mouse_event.kind).await
+    handle_attach_mouse_scrollback_with_window(
+        client,
+        view_state,
+        Some(focus_target),
+        mouse_event.kind,
+    )
+    .await
 }
 
 pub fn pane_mouse_protocol_reports_event(
@@ -13040,7 +13168,9 @@ fn update_attach_mouse_selection_drag_at(
         return false;
     };
 
-    if !view_state.scrollback_active && !enter_attach_scrollback(view_state) {
+    if !view_state.scrollback_active_for(drag.pane_id)
+        && !enter_attach_scrollback_for(view_state, drag.pane_id)
+    {
         view_state.mouse.selection_drag = None;
         return true;
     }
@@ -13051,7 +13181,9 @@ fn update_attach_mouse_selection_drag_at(
         return true;
     };
 
-    view_state.selection_anchor = Some(drag.anchor);
+    if let Some(view) = view_state.scrollback_for_mut(drag.pane_id) {
+        view.selection_anchor = Some(drag.anchor);
+    }
     let _ = set_attach_scrollback_cursor_to_position(view_state, head);
     if !drag.active {
         view_state.set_transient_status(
@@ -13123,7 +13255,8 @@ fn attach_mouse_scrollback_position_for_event(
         .min(content.h.saturating_sub(1));
     Some(AttachScrollbackPosition {
         row: view_state
-            .scrollback_offset
+            .scrollback_for(pane_id)
+            .map_or(0, |view| view.offset)
             .saturating_add(usize::from(local_row)),
         col: usize::from(local_col),
     })
@@ -13133,24 +13266,33 @@ fn set_attach_scrollback_cursor_to_position(
     view_state: &mut AttachViewState,
     position: AttachScrollbackPosition,
 ) -> bool {
-    let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return false;
+    };
+    let Some((inner_w, inner_h)) = attach_pane_inner_size(view_state, pane_id) else {
         return false;
     };
     if inner_w == 0 || inner_h == 0 {
         return false;
     }
-    view_state.scrollback_cursor = Some(AttachScrollbackCursor {
+    let Some(view) = view_state.scrollback_for_mut(pane_id) else {
+        return false;
+    };
+    view.cursor = AttachScrollbackCursor {
         row: position
             .row
-            .saturating_sub(view_state.scrollback_offset)
+            .saturating_sub(view.offset)
             .min(inner_h.saturating_sub(1)),
         col: position.col.min(inner_w.saturating_sub(1)),
-    });
+    };
     true
 }
 
-pub fn handle_attach_mouse_scrollback(
+/// Wheel scrollback for one specific pane (the pane under the pointer), so the
+/// wheel never scrolls a pane the pointer is not over.
+pub fn handle_attach_mouse_scrollback_for(
     view_state: &mut AttachViewState,
+    pane_id: Uuid,
     kind: MouseEventKind,
 ) -> bool {
     if !view_state.mouse.config.scroll_scrollback {
@@ -13162,10 +13304,12 @@ pub fn handle_attach_mouse_scrollback(
     let lines = view_state.mouse.config.scroll_lines_per_tick.max(1) as isize;
     match kind {
         MouseEventKind::ScrollUp => {
-            if !view_state.scrollback_active && !enter_attach_scrollback(view_state) {
+            if !view_state.scrollback_active_for(pane_id)
+                && !enter_attach_scrollback_for(view_state, pane_id)
+            {
                 return false;
             }
-            step_attach_scrollback(view_state, -lines);
+            step_attach_scrollback_for(view_state, pane_id, -lines);
             view_state
                 .dirty
                 .mark_full_frame(AttachDirtySource::Scrollback);
@@ -13175,15 +13319,17 @@ pub fn handle_attach_mouse_scrollback(
             true
         }
         MouseEventKind::ScrollDown => {
-            if !view_state.scrollback_active {
+            if !view_state.scrollback_active_for(pane_id) {
                 return false;
             }
-            step_attach_scrollback(view_state, lines);
+            step_attach_scrollback_for(view_state, pane_id, lines);
             if view_state.mouse.config.exit_scrollback_on_bottom
-                && view_state.scrollback_offset == 0
-                && !view_state.selection_active()
+                && view_state
+                    .scrollback_for(pane_id)
+                    .is_some_and(|view| view.offset == 0)
+                && !view_state.selection_active_for(pane_id)
             {
-                view_state.exit_scrollback();
+                view_state.exit_scrollback_for(pane_id);
             }
             view_state
                 .dirty
@@ -13195,6 +13341,18 @@ pub fn handle_attach_mouse_scrollback(
         }
         _ => false,
     }
+}
+
+/// Wheel scrollback against the focused pane.
+#[cfg(test)]
+pub fn handle_attach_mouse_scrollback(
+    view_state: &mut AttachViewState,
+    kind: MouseEventKind,
+) -> bool {
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return false;
+    };
+    handle_attach_mouse_scrollback_for(view_state, pane_id, kind)
 }
 
 async fn send_attach_bytes_to_focused(
@@ -15156,6 +15314,36 @@ mod tests {
         assert!(damage.extension_surface_damaged(surface_id, pane_id));
     }
 
+    /// Focused pane's scrollback offset, for assertions.
+    fn test_scrollback_offset(view_state: &AttachViewState) -> usize {
+        view_state
+            .focused_scrollback()
+            .map_or(0, |view| view.offset)
+    }
+
+    /// Focused pane's scrollback cursor, for assertions.
+    fn test_scrollback_cursor(view_state: &AttachViewState) -> Option<AttachScrollbackCursor> {
+        view_state.focused_scrollback().map(|view| view.cursor)
+    }
+
+    /// Focused pane's selection anchor, for assertions.
+    fn test_selection_anchor(view_state: &AttachViewState) -> Option<AttachScrollbackPosition> {
+        view_state
+            .focused_scrollback()
+            .and_then(|view| view.selection_anchor)
+    }
+
+    /// Force the focused pane's scrollback offset, entering scrollback first.
+    fn test_set_scrollback_offset(view_state: &mut AttachViewState, offset: usize) {
+        assert!(
+            enter_attach_scrollback(view_state),
+            "fixture must support scrollback"
+        );
+        if let Some(view) = view_state.focused_scrollback_mut() {
+            view.offset = offset;
+        }
+    }
+
     fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
@@ -15225,6 +15413,229 @@ mod tests {
             });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
+    }
+
+    /// Two side-by-side panes, left focused, both with scrollable history.
+    ///
+    /// Used to prove scrollback state is isolated per pane rather than
+    /// following focus.
+    fn attach_view_state_with_two_panes_fixture() -> (AttachViewState, Uuid, Uuid) {
+        let session_id = Uuid::new_v4();
+        let left_pane = Uuid::from_u128(0x1eaf);
+        let right_pane = Uuid::from_u128(0x21c8);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        let pane_surface = |pane_id: Uuid, x: u16, cursor_owner: bool| AttachSurface {
+            id: Uuid::new_v4(),
+            kind: AttachSurfaceKind::Pane,
+            layer: SurfaceLayer::Pane,
+            z: 0,
+            pane_id: Some(pane_id),
+            rect: AttachRect {
+                x,
+                y: 0,
+                w: 9,
+                h: 6,
+            },
+            content_rect: AttachRect {
+                x: x + 1,
+                y: 1,
+                w: 7,
+                h: 4,
+            },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner,
+        };
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: left_pane,
+            panes: vec![
+                PaneSummary {
+                    id: left_pane,
+                    index: 1,
+                    name: None,
+                    focused: true,
+                    state: PaneState::Running,
+                    state_reason: None,
+                },
+                PaneSummary {
+                    id: right_pane,
+                    index: 2,
+                    name: None,
+                    focused: false,
+                    state: PaneState::Running,
+                    state_reason: None,
+                },
+            ],
+            layout_root: PaneLayoutNode::Leaf { pane_id: left_pane },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id: left_pane },
+                surfaces: vec![
+                    pane_surface(left_pane, 0, true),
+                    pane_surface(right_pane, 10, false),
+                ],
+            },
+            zoomed: false,
+        });
+        for pane_id in [left_pane, right_pane] {
+            let buffer =
+                view_state
+                    .pane_buffers
+                    .entry(pane_id)
+                    .or_insert_with(|| PaneRenderBuffer {
+                        terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                            20,
+                            4,
+                            bmux_terminal_grid::GridLimits::default(),
+                        )
+                        .expect("test grid dimensions are valid"),
+                        ..PaneRenderBuffer::default()
+                    });
+            append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
+        }
+        (view_state, left_pane, right_pane)
+    }
+
+    /// Move focus the way a layout refresh does, without touching scrollback.
+    fn test_focus_pane(view_state: &mut AttachViewState, pane_id: Uuid) {
+        let layout_state = view_state
+            .cached_layout_state
+            .as_mut()
+            .expect("layout state");
+        layout_state.focused_pane_id = pane_id;
+        layout_state.scene.focus = AttachFocusTarget::Pane { pane_id };
+        for pane in &mut layout_state.panes {
+            pane.focused = pane.id == pane_id;
+        }
+    }
+
+    /// Entering scrollback in one pane must not put another pane in scrollback,
+    /// and focusing away must not carry the view across.
+    #[test]
+    fn scrollback_state_is_isolated_per_pane_across_focus_changes() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        step_attach_scrollback_for(&mut view_state, left_pane, -2);
+        let left_offset = view_state
+            .scrollback_for(left_pane)
+            .expect("left pane in scrollback")
+            .offset;
+        assert!(left_offset > 0, "left pane should be scrolled back");
+
+        // Focus the unrelated pane: it must not inherit scrollback state.
+        test_focus_pane(&mut view_state, right_pane);
+        assert!(
+            !view_state.scrollback_active_for(right_pane),
+            "focusing an unrelated pane must not put it in scrollback"
+        );
+        assert!(
+            !view_state.scrollback_active(),
+            "derived scroll mode must be false for a pane that is not scrolled back"
+        );
+        assert!(
+            view_state.scrollback_active_for(left_pane),
+            "left pane must stay in scrollback while unfocused"
+        );
+
+        // Scrolling the now-focused pane must not disturb the other pane.
+        assert!(enter_attach_scrollback_for(&mut view_state, right_pane));
+        step_attach_scrollback_for(&mut view_state, right_pane, -1);
+        assert_eq!(
+            view_state
+                .scrollback_for(left_pane)
+                .expect("left pane view")
+                .offset,
+            left_offset,
+            "scrolling one pane must not change another pane's offset"
+        );
+
+        // Returning focus restores the original pane's own position.
+        test_focus_pane(&mut view_state, left_pane);
+        assert_eq!(test_scrollback_offset(&view_state), left_offset);
+        assert!(view_state.scrollback_active());
+    }
+
+    /// Exiting scrollback must only affect the focused pane.
+    #[test]
+    fn exit_scrollback_only_affects_focused_pane() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        assert!(enter_attach_scrollback_for(&mut view_state, right_pane));
+
+        test_focus_pane(&mut view_state, right_pane);
+        handle_attach_ui_action_at(
+            &RuntimeAction::ExitScrollMode,
+            &mut view_state,
+            Instant::now(),
+        );
+
+        assert!(!view_state.scrollback_active_for(right_pane));
+        assert!(
+            view_state.scrollback_active_for(left_pane),
+            "exiting scrollback must not exit it for other panes"
+        );
+    }
+
+    /// Selections are per pane; a drag in one pane must not select in another.
+    #[test]
+    fn selection_state_is_isolated_per_pane() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        assert!(begin_attach_selection_for(&mut view_state, left_pane));
+
+        assert!(view_state.selection_active_for(left_pane));
+        assert!(!view_state.selection_active_for(right_pane));
+
+        test_focus_pane(&mut view_state, right_pane);
+        assert!(
+            !view_state.selection_active(),
+            "focused pane without a selection must not report one"
+        );
+    }
+
+    /// The wheel scrolls the pane under the pointer, not whichever pane is
+    /// focused.
+    #[test]
+    fn mouse_wheel_scrolls_pane_under_pointer_not_focused_pane() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        view_state.mouse.config.scroll_lines_per_tick = 1;
+        view_state.mouse.config.scroll_scrollback = true;
+
+        // Left pane is focused; scroll the right pane.
+        assert!(handle_attach_mouse_scrollback_for(
+            &mut view_state,
+            right_pane,
+            MouseEventKind::ScrollUp,
+        ));
+
+        assert!(view_state.scrollback_active_for(right_pane));
+        assert!(
+            !view_state.scrollback_active_for(left_pane),
+            "wheel over one pane must not scroll the focused pane"
+        );
+    }
+
+    /// Closed panes must not leak scrollback views.
+    #[test]
+    fn scrollback_views_are_pruned_for_removed_panes() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        assert!(enter_attach_scrollback_for(&mut view_state, right_pane));
+
+        let remaining = std::iter::once(left_pane).collect::<BTreeSet<_>>();
+        view_state.retain_scrollback_panes(&remaining);
+
+        assert!(view_state.scrollback_active_for(left_pane));
+        assert!(!view_state.scrollback_active_for(right_pane));
     }
 
     #[test]
@@ -16073,7 +16484,7 @@ mod tests {
             Some(pane_id),
             down,
         ));
-        assert!(!view_state.scrollback_active);
+        assert!(!view_state.scrollback_active());
 
         let drag = MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
@@ -16086,13 +16497,13 @@ mod tests {
             drag,
             Instant::now()
         ));
-        assert!(view_state.scrollback_active);
+        assert!(view_state.scrollback_active());
         assert_eq!(
-            view_state.selection_anchor,
+            test_selection_anchor(&view_state),
             Some(AttachScrollbackPosition { row: 1, col: 1 })
         );
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 2, col: 4 })
         );
 
@@ -16107,7 +16518,7 @@ mod tests {
             up,
             Instant::now()
         ));
-        assert!(view_state.scrollback_active);
+        assert!(view_state.scrollback_active());
         assert_eq!(view_state.mouse.selection_drag, None);
         assert!(view_state.selection_active());
     }
@@ -16139,8 +16550,8 @@ mod tests {
             up,
             Instant::now()
         ));
-        assert!(!view_state.scrollback_active);
-        assert_eq!(view_state.selection_anchor, None);
+        assert!(!view_state.scrollback_active());
+        assert_eq!(test_selection_anchor(&view_state), None);
     }
 
     #[test]
@@ -16154,8 +16565,10 @@ mod tests {
             active: true,
         });
         assert!(enter_attach_scrollback(&mut view_state));
-        view_state.selection_anchor = Some(AttachScrollbackPosition { row: 1, col: 1 });
-        view_state.scrollback_cursor = Some(AttachScrollbackCursor { row: 2, col: 4 });
+        if let Some(view) = view_state.focused_scrollback_mut() {
+            view.selection_anchor = Some(AttachScrollbackPosition { row: 1, col: 1 });
+            view.cursor = AttachScrollbackCursor { row: 2, col: 4 };
+        }
 
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
@@ -17838,10 +18251,10 @@ mod tests {
         let mut view_state = attach_view_state_with_scrollback_fixture();
 
         assert!(enter_attach_scrollback(&mut view_state));
-        assert!(view_state.scrollback_active);
-        assert_eq!(view_state.scrollback_offset, 0);
+        assert!(view_state.scrollback_active());
+        assert_eq!(test_scrollback_offset(&view_state), 0);
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 3, col: 2 })
         );
     }
@@ -17853,24 +18266,24 @@ mod tests {
 
         move_attach_scrollback_cursor_vertical(&mut view_state, -1);
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 2, col: 2 })
         );
-        assert_eq!(view_state.scrollback_offset, 0);
+        assert_eq!(test_scrollback_offset(&view_state), 0);
 
         move_attach_scrollback_cursor_vertical(&mut view_state, -3);
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 0, col: 2 })
         );
-        assert_eq!(view_state.scrollback_offset, 1);
+        assert_eq!(test_scrollback_offset(&view_state), 1);
 
         move_attach_scrollback_cursor_vertical(&mut view_state, 1);
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 1, col: 2 })
         );
-        assert_eq!(view_state.scrollback_offset, 1);
+        assert_eq!(test_scrollback_offset(&view_state), 1);
     }
 
     #[test]
@@ -17880,13 +18293,13 @@ mod tests {
 
         move_attach_scrollback_cursor_horizontal(&mut view_state, 3);
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 3, col: 5 })
         );
 
         move_attach_scrollback_cursor_horizontal(&mut view_state, -10);
         assert_eq!(
-            view_state.scrollback_cursor,
+            test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 3, col: 0 })
         );
     }
@@ -17895,11 +18308,11 @@ mod tests {
     fn begin_attach_selection_uses_absolute_cursor_position() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         assert!(enter_attach_scrollback(&mut view_state));
-        view_state.scrollback_offset = 2;
+        test_set_scrollback_offset(&mut view_state, 2);
 
         assert!(begin_attach_selection(&mut view_state));
         assert_eq!(
-            view_state.selection_anchor,
+            test_selection_anchor(&view_state),
             Some(AttachScrollbackPosition { row: 5, col: 2 })
         );
     }
@@ -17911,16 +18324,18 @@ mod tests {
         assert!(begin_attach_selection(&mut view_state));
 
         clear_attach_selection_at(&mut view_state, false, Instant::now());
-        assert_eq!(view_state.selection_anchor, None);
+        assert_eq!(test_selection_anchor(&view_state), None);
     }
 
     #[test]
     fn selected_attach_text_extracts_multiline_range() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         assert!(enter_attach_scrollback(&mut view_state));
-        view_state.selection_anchor = Some(AttachScrollbackPosition { row: 2, col: 2 });
-        view_state.scrollback_cursor = Some(AttachScrollbackCursor { row: 3, col: 8 });
-        view_state.scrollback_offset = 0;
+        if let Some(view) = view_state.focused_scrollback_mut() {
+            view.selection_anchor = Some(AttachScrollbackPosition { row: 2, col: 2 });
+            view.cursor = AttachScrollbackCursor { row: 3, col: 8 };
+            view.offset = 0;
+        }
 
         assert_eq!(
             selected_attach_text(&mut view_state),
@@ -17934,7 +18349,7 @@ mod tests {
         assert!(enter_attach_scrollback(&mut view_state));
 
         confirm_attach_scrollback_at(&mut view_state, Instant::now());
-        assert!(!view_state.scrollback_active);
+        assert!(!view_state.scrollback_active());
     }
 
     #[test]
@@ -17947,8 +18362,8 @@ mod tests {
             &mut view_state,
             MouseEventKind::ScrollUp,
         ));
-        assert!(view_state.scrollback_active);
-        assert_eq!(view_state.scrollback_offset, 1);
+        assert!(view_state.scrollback_active());
+        assert_eq!(test_scrollback_offset(&view_state), 1);
     }
 
     #[test]
@@ -17958,14 +18373,14 @@ mod tests {
         view_state.mouse.config.scroll_scrollback = true;
         view_state.mouse.config.exit_scrollback_on_bottom = true;
         assert!(enter_attach_scrollback(&mut view_state));
-        view_state.scrollback_offset = 1;
+        test_set_scrollback_offset(&mut view_state, 1);
 
         assert!(handle_attach_mouse_scrollback(
             &mut view_state,
             MouseEventKind::ScrollDown,
         ));
-        assert!(!view_state.scrollback_active);
-        assert_eq!(view_state.scrollback_offset, 0);
+        assert!(!view_state.scrollback_active());
+        assert_eq!(test_scrollback_offset(&view_state), 0);
     }
 
     #[test]

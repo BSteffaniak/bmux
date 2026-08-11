@@ -34,6 +34,51 @@ pub struct AttachScrollbackPosition {
     pub col: usize,
 }
 
+/// Per-pane scrollback view position.
+///
+/// Scrollback history itself is owned by the server (the pane-runtime
+/// plugin's `TerminalGrid`); this type only records *where* one client is
+/// looking into that history for one pane. The presence of an entry in
+/// [`PaneScrollbackViews`] is what makes a pane "in scrollback" — there is
+/// deliberately no separate active flag, so the state cannot follow focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaneScrollbackView {
+    /// Rows scrolled back from the live viewport bottom.
+    pub offset: usize,
+    /// Viewport-relative selection/navigation cursor.
+    pub cursor: AttachScrollbackCursor,
+    /// Absolute (history-relative) selection anchor, when selecting.
+    pub selection_anchor: Option<AttachScrollbackPosition>,
+}
+
+impl PaneScrollbackView {
+    /// Absolute history position of this view's cursor.
+    #[must_use]
+    pub const fn cursor_absolute_position(&self) -> AttachScrollbackPosition {
+        AttachScrollbackPosition {
+            row: self.offset.saturating_add(self.cursor.row),
+            col: self.cursor.col,
+        }
+    }
+
+    /// Ordered selection bounds, when a selection anchor is set.
+    #[must_use]
+    pub fn selection_bounds(&self) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
+        let anchor = self.selection_anchor?;
+        let head = self.cursor_absolute_position();
+        Some(if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        })
+    }
+}
+
+/// Scrollback view positions keyed by pane id.
+///
+/// A pane is in scrollback if and only if it has an entry here.
+pub type PaneScrollbackViews = BTreeMap<Uuid, PaneScrollbackView>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionRenderCacheEntry {
     pub surface_id: Uuid,
