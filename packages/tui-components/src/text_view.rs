@@ -4,6 +4,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::{line_viewport, wrap_line_character, wrap_line_word};
@@ -479,10 +480,33 @@ impl<'a> TextView<'a> {
         );
     }
 
-    /// Render text view.
+    /// Render text view and register it when scrolling is possible.
     pub fn render(&self, area: Rect, state: &TextViewState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("text-view");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render text view with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &TextViewState,
+        frame: &mut Frame<'_>,
+    ) {
         if area.is_empty() {
             return;
+        }
+        let id = id.into();
+        let content_area = self.content_area(area);
+        let scrollable = self.max_vertical_scroll(area) > 0 || self.max_horizontal_scroll(area) > 0;
+        if scrollable && (self.policy.keyboard || self.policy.mouse_wheel) {
+            frame.push_hit(
+                SceneRegion::new(id.clone(), content_area)
+                    .role(HitRole::Scroll)
+                    .pointer_events(self.policy.mouse_wheel)
+                    .focusable(self.policy.keyboard),
+            );
         }
         if self.policy.background {
             frame.fill(area, " ", self.styles.background);
@@ -491,7 +515,6 @@ impl<'a> TextView<'a> {
             frame.write_line_with_fallback_style(area, &Line::from(self.empty), self.styles.empty);
             return;
         }
-        let content_area = self.content_area(area);
         let layout = self.layout(area, state);
         let lines = if self.policy.wrap == TextWrap::None && state.horizontal_scroll > 0 {
             let horizontal_scroll = self.clamped_horizontal_scroll(area, state);
@@ -512,11 +535,19 @@ impl<'a> TextView<'a> {
             .wrap(TextWrap::None)
             .vertical_scroll(layout.vertical_scroll)
             .render(content_area, frame);
-        self.render_scrollbars(area, content_area, state, layout.vertical_scroll, frame);
+        self.render_scrollbars(
+            id.as_str(),
+            area,
+            content_area,
+            state,
+            layout.vertical_scroll,
+            frame,
+        );
     }
 
     fn render_scrollbars(
         &self,
+        id: &str,
         area: Rect,
         content_area: Rect,
         state: &TextViewState,
@@ -530,11 +561,14 @@ impl<'a> TextView<'a> {
                 content_area.height,
             )
             .offset(u16::try_from(vertical_scroll).unwrap_or(u16::MAX));
-            Scrollbar::new().policy(ScrollbarPolicy::vertical()).render(
-                scrollbar_area,
-                &scrollbar_state,
-                frame,
-            );
+            Scrollbar::new()
+                .policy(ScrollbarPolicy::vertical())
+                .render_with_id(
+                    format!("{id}.vertical-scrollbar"),
+                    scrollbar_area,
+                    &scrollbar_state,
+                    frame,
+                );
         }
         if let Some(scrollbar_area) = self.horizontal_scrollbar_area(area) {
             let scrollbar_state = ScrollbarState::new(
@@ -544,7 +578,12 @@ impl<'a> TextView<'a> {
             .offset(u16::try_from(self.clamped_horizontal_scroll(area, state)).unwrap_or(u16::MAX));
             Scrollbar::new()
                 .policy(ScrollbarPolicy::horizontal())
-                .render(scrollbar_area, &scrollbar_state, frame);
+                .render_with_id(
+                    format!("{id}.horizontal-scrollbar"),
+                    scrollbar_area,
+                    &scrollbar_state,
+                    frame,
+                );
         }
         if let Some(corner) = scrollbar_layout(
             area,
@@ -893,6 +932,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
     use bmux_tui::prelude::{Alignment, Line};
     use bmux_tui::style::{Color, Style};
 
@@ -909,6 +949,71 @@ mod tests {
         let layout = view.layout(Rect::new(0, 0, 3, 5), &TextViewState::new());
 
         assert_eq!(layout.lines.len(), 2);
+    }
+
+    #[test]
+    fn render_registers_exact_scrollable_viewport_and_scrollbar_geometry() {
+        let lines = [
+            Line::from("zero"),
+            Line::from("one"),
+            Line::from("two"),
+            Line::from("three"),
+        ];
+        let view = TextView::new(&lines).policy(
+            TextViewPolicy::scrollable().vertical_scrollbar(ScrollAreaScrollbarMode::Gutter),
+        );
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 14, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        view.render_with_id(
+            "preview",
+            Rect::new(6, 3, 10, 3),
+            &TextViewState::new(),
+            &mut frame,
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].id.as_str(), "preview");
+        assert_eq!(regions[0].area, Rect::new(6, 3, 9, 3));
+        assert_eq!(regions[0].role, HitRole::Scroll);
+        assert!(regions[0].focusable);
+        assert_eq!(regions[1].id.as_str(), "preview.vertical-scrollbar");
+        assert_eq!(regions[1].area, Rect::new(15, 3, 1, 3));
+        assert!(!regions[1].focusable);
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+    }
+
+    #[test]
+    fn non_scrollable_empty_and_bare_views_register_nothing() {
+        let short = [Line::from("one")];
+        let long = [Line::from("zero"), Line::from("one")];
+        let empty: [Line; 0] = [];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        TextView::new(&short).render_with_id(
+            "short",
+            Rect::new(0, 0, 10, 2),
+            &TextViewState::new(),
+            &mut frame,
+        );
+        TextView::new(&long)
+            .policy(TextViewPolicy::bare())
+            .render_with_id(
+                "bare",
+                Rect::new(0, 2, 10, 1),
+                &TextViewState::new(),
+                &mut frame,
+            );
+        TextView::new(&empty).render_with_id(
+            "empty",
+            Rect::new(0, 3, 10, 1),
+            &TextViewState::new(),
+            &mut frame,
+        );
+
+        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
