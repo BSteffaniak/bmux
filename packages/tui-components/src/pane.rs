@@ -6,6 +6,7 @@ use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui::widget::Widget;
@@ -341,8 +342,42 @@ impl Pane<'_> {
         self.panel(state).inner_area(state.area)
     }
 
-    /// Render pane chrome and background.
+    /// Render pane chrome/background and register enabled pane interaction.
     pub fn render(&self, state: &PaneState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("pane");
+        self.render_with_id(id, state, frame);
+    }
+
+    /// Render pane chrome/background with a stable interaction identifier.
+    pub fn render_with_id(&self, id: impl Into<HitId>, state: &PaneState, frame: &mut Frame<'_>) {
+        let id = id.into();
+        if self.policy.mouse.enabled && !state.area.is_empty() {
+            frame.push_hit(
+                SceneRegion::new(id.clone(), state.area)
+                    .role(HitRole::Decoration)
+                    .hoverable(true)
+                    .focusable(false)
+                    .enabled(!state.interaction.disabled),
+            );
+            if self.policy.mouse.title_bar_drag {
+                frame.push_hit(
+                    SceneRegion::new(format!("{}.title", id.as_str()), title_bar_area(state.area))
+                        .role(HitRole::DragHandle)
+                        .hoverable(true)
+                        .focusable(false)
+                        .enabled(!state.interaction.disabled),
+                );
+            }
+            for (suffix, area) in self.resize_regions(state.area) {
+                frame.push_hit(
+                    SceneRegion::new(format!("{}.resize.{suffix}", id.as_str()), area)
+                        .role(HitRole::ResizeHandle)
+                        .hoverable(true)
+                        .focusable(false)
+                        .enabled(!state.interaction.disabled),
+                );
+            }
+        }
         self.panel(state).render(state.area, frame);
     }
 
@@ -503,6 +538,38 @@ impl Pane<'_> {
         } else {
             PaneOutcome::Ignored
         }
+    }
+
+    fn resize_regions(&self, area: Rect) -> Vec<(&'static str, Rect)> {
+        let handles = self.policy.mouse.resize_handles;
+        let right = area.right().saturating_sub(1);
+        let bottom = area.bottom().saturating_sub(1);
+        let mut regions = Vec::new();
+        if handles.top_left {
+            regions.push(("top-left", Rect::new(area.x, area.y, 1, 1)));
+        }
+        if handles.top_right {
+            regions.push(("top-right", Rect::new(right, area.y, 1, 1)));
+        }
+        if handles.bottom_right {
+            regions.push(("bottom-right", Rect::new(right, bottom, 1, 1)));
+        }
+        if handles.bottom_left {
+            regions.push(("bottom-left", Rect::new(area.x, bottom, 1, 1)));
+        }
+        if handles.top {
+            regions.push(("top", Rect::new(area.x, area.y, area.width, 1)));
+        }
+        if handles.right {
+            regions.push(("right", Rect::new(right, area.y, 1, area.height)));
+        }
+        if handles.bottom {
+            regions.push(("bottom", Rect::new(area.x, bottom, area.width, 1)));
+        }
+        if handles.left {
+            regions.push(("left", Rect::new(area.x, area.y, 1, area.height)));
+        }
+        regions
     }
 
     const fn resize_handle_at(&self, area: Rect, position: Point) -> Option<ResizeHandle> {
@@ -685,6 +752,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
+    use bmux_tui::hit::HitRole;
 
     use super::{
         Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
@@ -708,6 +776,56 @@ mod tests {
         pane.render(&state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("┌Pane────┐"));
+    }
+
+    #[test]
+    fn interactive_render_registers_pane_drag_and_resize_geometry() {
+        let pane = Pane::new().policy(PanePolicy {
+            mouse: PaneMousePolicy {
+                resize_handles: ResizeHandles::ALL,
+                ..PaneMousePolicy::draggable()
+            },
+            bounds: PaneBoundsPolicy::default(),
+        });
+        let state = PaneState::new(Rect::new(5, 3, 10, 5));
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 14, 8));
+        let mut frame = Frame::new(&mut buffer);
+
+        pane.render_with_id("editor", &state, &mut frame);
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions[0].id.as_str(), "editor");
+        assert_eq!(regions[0].area, Rect::new(5, 3, 10, 5));
+        assert_eq!(regions[0].role, HitRole::Decoration);
+        assert_eq!(regions[1].id.as_str(), "editor.title");
+        assert_eq!(regions[1].area, Rect::new(5, 3, 10, 1));
+        assert_eq!(regions[1].role, HitRole::DragHandle);
+        assert!(regions.iter().any(|region| {
+            region.id.as_str() == "editor.resize.bottom-right"
+                && region.area == Rect::new(14, 7, 1, 1)
+                && region.role == HitRole::ResizeHandle
+        }));
+        assert!(frame.hits().focus_targets(None).is_empty());
+    }
+
+    #[test]
+    fn static_and_empty_panes_register_nothing() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let mut frame = Frame::new(&mut buffer);
+
+        Pane::new().render_with_id(
+            "static",
+            &PaneState::new(Rect::new(0, 0, 10, 3)),
+            &mut frame,
+        );
+        Pane::new()
+            .policy(PanePolicy {
+                mouse: PaneMousePolicy::draggable(),
+                bounds: PaneBoundsPolicy::default(),
+            })
+            .render_with_id("empty", &PaneState::new(Rect::new(0, 0, 0, 0)), &mut frame);
+
+        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
