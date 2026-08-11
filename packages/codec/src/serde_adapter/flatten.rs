@@ -43,6 +43,21 @@ pub trait FlattenedVariants: Sized {
     ) -> Result<Self, A::Error>;
 }
 
+/// Boxing a domain enum keeps its variants in the same flattened space.
+///
+/// Large domains are often boxed so they do not set the size of the composed enum. The wire form is
+/// unchanged, because `Box` serializes transparently.
+impl<T: FlattenedVariants> FlattenedVariants for Box<T> {
+    const OWNED_VARIANTS: &'static [&'static str] = T::OWNED_VARIANTS;
+
+    fn deserialize_variant<'de, A: VariantAccess<'de>>(
+        variant: &str,
+        access: A,
+    ) -> Result<Self, A::Error> {
+        T::deserialize_variant(variant, access).map(Box::new)
+    }
+}
+
 /// An owned enum variant name read through serde's identifier path.
 ///
 /// Reading a variant name as a [`String`] asks the format for a *string value*, which fails on

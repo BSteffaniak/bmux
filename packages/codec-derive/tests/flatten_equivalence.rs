@@ -194,6 +194,43 @@ fn flat_decodes_composed_bytes() {
     }
 }
 
+/// A boxed domain keeps its variants in the same flat space and the same wire form.
+///
+/// Large domains are boxed so they do not set the composed enum's size, so this must hold for the
+/// composition to be usable.
+#[test]
+fn boxed_domain_preserves_the_flat_wire_form() {
+    #[derive(Debug, Clone, PartialEq, Eq, FlattenedEnum)]
+    enum BoxedComposed {
+        #[flattened]
+        Daemon(DaemonRequest),
+        #[flattened]
+        Permission(Box<PermissionRequest>),
+    }
+
+    let flat = FlatRequest::ResolvePermission {
+        permission_id: "p-1".to_owned(),
+        approved: true,
+        remember: false,
+    };
+    let boxed = BoxedComposed::Permission(Box::new(PermissionRequest::ResolvePermission {
+        permission_id: "p-1".to_owned(),
+        approved: true,
+        remember: false,
+    }));
+
+    let flat_bytes = bmux_codec::to_typed_vec(&flat).expect("encode flat");
+    let boxed_bytes = bmux_codec::to_typed_vec(&boxed).expect("encode boxed composed");
+    assert_eq!(
+        flat_bytes, boxed_bytes,
+        "boxing must not change the wire form"
+    );
+
+    let decoded: BoxedComposed =
+        bmux_codec::from_typed_bytes(&flat_bytes).expect("decode flat bytes as boxed composed");
+    assert_eq!(decoded, boxed);
+}
+
 #[test]
 fn flattened_variant_space_is_reported() {
     let names = ComposedRequest::flattened_variants();
