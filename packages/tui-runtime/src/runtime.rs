@@ -445,6 +445,11 @@ where
                     stats.terminal_processed = stats.terminal_processed.saturating_add(1);
                 });
                 self.apply_event(RuntimeEvent::Terminal(event))?;
+            } else if let Some(timer) = self.take_due_timer(Instant::now()) {
+                with_stats(&self.stats, |stats| {
+                    stats.timers_delivered = stats.timers_delivered.saturating_add(1);
+                });
+                self.apply_event(RuntimeEvent::Timer(timer))?;
             } else if let Some(message) = self.try_next_application_message() {
                 self.apply_event(RuntimeEvent::Message(message))?;
             } else if let Some(completion) = self.commands.try_next_completion() {
@@ -455,11 +460,6 @@ where
                 let depth = self.subscription_rx.max_capacity() - self.subscription_rx.capacity();
                 with_stats(&self.stats, |stats| stats.subscription_depth = depth);
                 self.apply_event(RuntimeEvent::Message(message))?;
-            } else if let Some(timer) = self.take_due_timer(Instant::now()) {
-                with_stats(&self.stats, |stats| {
-                    stats.timers_delivered = stats.timers_delivered.saturating_add(1);
-                });
-                self.apply_event(RuntimeEvent::Timer(timer))?;
             } else {
                 break;
             }

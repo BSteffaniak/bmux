@@ -505,6 +505,32 @@ async fn terminal_input_is_serviced_during_application_flood() {
 }
 
 #[tokio::test]
+async fn due_timer_is_serviced_during_application_flood() {
+    let config = RuntimeConfig {
+        reliable_capacity: 20_000,
+        messages_per_turn: 4,
+        frame_interval: None,
+        ..RuntimeConfig::default()
+    };
+    let (runtime, handle) = Runtime::new(
+        RecordingProgram {
+            exit_after: Some(10_001),
+            ..RecordingProgram::default()
+        },
+        HeadlessPresenter::default(),
+        config,
+    );
+    for value in 0..10_000 {
+        handle.try_send(value).expect("flood fits configured bound");
+    }
+    handle.schedule_timer(TimerId::new("due"), Instant::now());
+    let output = runtime_output(runtime.run().await);
+    assert_eq!(output.program.timers, ["due"]);
+    assert_eq!(output.program.messages.len(), 10_000);
+    assert!(output.stats.scheduler_budget_exhausted > 0);
+}
+
+#[tokio::test]
 async fn keyed_timer_replacement_delivers_once() {
     let (runtime, handle) = Runtime::new(
         RecordingProgram {

@@ -62,3 +62,17 @@ branches.
 Components in this crate must remain domain-neutral. Generic UI panes, buttons,
 forms, lists, dialogs, and surfaces are in scope; product-specific BMUX behavior
 belongs in applications or plugins.
+
+## Application integration boundary
+
+Applications should compose these controls at their renderer boundary and request exact production
+features. Product-specific recipes and workflow semantics remain application/plugin-owned; do not
+move them into this crate to eliminate a thin adapter. Direct `bmux_tui` primitives remain
+appropriate for full-canvas underpaint, clipping/scratch-frame adaptation, terminal media placement,
+domain-specific drawing, and component implementation internals. Reusable controls, chrome, and
+interaction policy belong here rather than in application-local raw rendering.
+
+`bmux_tui` intentionally carries keyboard and text-editing in its baseline primitive API. Public
+event, focus, list, viewport, picker, palette, history, and text-input modules directly expose those
+types. Component-owned optional dependencies—including terminal-grid and Unicode helpers—remain
+isolated behind component features and the repository feature-matrix guard.
