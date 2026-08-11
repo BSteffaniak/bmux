@@ -13,6 +13,12 @@ pub struct InteractionRoute {
     pub event: Event,
     /// Target resolved for keyboard or pointer dispatch.
     pub target: Option<HitId>,
+    /// Pointer position relative to the resolved target's rendered bounds.
+    pub local_position: Option<crate::geometry::Point>,
+    /// Exact committed bounds of the resolved target.
+    pub bounds: Option<crate::geometry::Rect>,
+    /// Semantic role of the resolved committed target.
+    pub role: Option<crate::hit::HitRole>,
     /// Previously active hover target, when this event changed it.
     pub hover_left: Option<HitId>,
     /// Newly active hover target, when this event changed it.
@@ -57,7 +63,7 @@ pub struct InteractionRouter {
     scene: HitMap,
     focus: FocusTrap,
     focus_scope: Option<FocusScopeId>,
-    restore_focus: Option<FocusId>,
+    restore_focus: Vec<(Option<FocusScopeId>, Option<FocusId>)>,
     hovered: Option<HitId>,
     pressed: Option<HitId>,
 }
@@ -70,7 +76,7 @@ impl InteractionRouter {
             scene: HitMap::new(),
             focus: FocusTrap::new(),
             focus_scope: None,
-            restore_focus: None,
+            restore_focus: Vec::new(),
             hovered: None,
             pressed: None,
         }
@@ -98,11 +104,22 @@ impl InteractionRouter {
     pub fn commit_scene(&mut self, scene: HitMap, scope: Option<FocusScopeId>) {
         let previous_focus = self.focus.active().cloned();
         let scope_changed = self.focus_scope != scope;
-        if scope_changed && scope.is_some() {
-            self.restore_focus.clone_from(&previous_focus);
-        }
-        let preferred_focus = if scope_changed && scope.is_none() {
-            self.restore_focus.take().or(previous_focus)
+        let preferred_focus = if scope_changed {
+            if let Some(index) = self
+                .restore_focus
+                .iter()
+                .rposition(|(restore_scope, _)| restore_scope == &scope)
+            {
+                let restored = self.restore_focus.remove(index).1;
+                self.restore_focus.truncate(index);
+                restored.or(previous_focus)
+            } else {
+                if scope.is_some() {
+                    self.restore_focus
+                        .push((self.focus_scope.clone(), previous_focus.clone()));
+                }
+                previous_focus
+            }
         } else {
             previous_focus
         };
@@ -134,6 +151,15 @@ impl InteractionRouter {
         self.focus.set_active(id)
     }
 
+    /// Return the committed region for a stable target identifier.
+    #[must_use]
+    pub fn region(&self, id: &HitId) -> Option<&crate::hit::HitRegion> {
+        self.scene
+            .regions()
+            .iter()
+            .find(|region| region.enabled && &region.id == id)
+    }
+
     /// Route one event using generic webpage-like traversal semantics.
     pub fn route(&mut self, event: Event) -> InteractionRoute {
         if let Event::Key(stroke) = &event
@@ -146,6 +172,9 @@ impl InteractionRouter {
             return InteractionRoute {
                 event,
                 target: focus_changed.clone(),
+                local_position: None,
+                bounds: None,
+                role: None,
                 hover_left: None,
                 hover_entered: None,
                 traversal_consumed: focus_changed.is_some(),
@@ -155,10 +184,13 @@ impl InteractionRouter {
 
         match event {
             Event::Mouse(mouse) => {
-                let hit = self
+                let resolved = self
                     .scene
-                    .hit_mouse_in_scope(mouse, self.focus_scope.as_ref())
-                    .map(|hit| hit.id().clone());
+                    .hit_mouse_in_scope(mouse, self.focus_scope.as_ref());
+                let hit = resolved.map(|hit| hit.id().clone());
+                let local_position = resolved.map(|hit| hit.local);
+                let bounds = resolved.map(|hit| hit.region.area);
+                let role = resolved.map(|hit| hit.role());
                 let mut hover_left = None;
                 let mut hover_entered = None;
                 let mut focus_changed = None;
@@ -179,7 +211,6 @@ impl InteractionRouter {
                             focus_changed = Some(id.clone());
                         }
                     }
-                    MouseEventKind::Up(MouseButton::Left) => self.pressed = None,
                     MouseEventKind::Down(_)
                     | MouseEventKind::Up(_)
                     | MouseEventKind::Drag(_)
@@ -189,9 +220,22 @@ impl InteractionRouter {
                     | MouseEventKind::ScrollLeft
                     | MouseEventKind::ScrollRight => {}
                 }
+                let target = match mouse.kind {
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let pressed = self.pressed.take();
+                        (pressed.as_ref() == hit.as_ref()).then_some(hit).flatten()
+                    }
+                    _ => hit,
+                };
+                let local_position = target.as_ref().and(local_position);
+                let bounds = target.as_ref().and(bounds);
+                let role = target.as_ref().and(role);
                 InteractionRoute {
                     event: Event::Mouse(mouse),
-                    target: hit,
+                    target,
+                    local_position,
+                    bounds,
+                    role,
                     hover_left,
                     hover_entered,
                     focus_changed,
@@ -201,6 +245,9 @@ impl InteractionRouter {
             Event::Key(stroke) => InteractionRoute {
                 event: Event::Key(stroke),
                 target: self.focus.active().cloned(),
+                local_position: None,
+                bounds: None,
+                role: None,
                 hover_left: None,
                 hover_entered: None,
                 focus_changed: None,
@@ -210,6 +257,9 @@ impl InteractionRouter {
             Event::Paste(text) => InteractionRoute {
                 event: Event::Paste(text),
                 target: self.focus.active().cloned(),
+                local_position: None,
+                bounds: None,
+                role: None,
                 hover_left: None,
                 hover_entered: None,
                 focus_changed: None,
@@ -237,6 +287,9 @@ const fn untargeted(event: Event) -> InteractionRoute {
     InteractionRoute {
         event,
         target: None,
+        local_position: None,
+        bounds: None,
+        role: None,
         hover_left: None,
         hover_entered: None,
         focus_changed: None,
@@ -287,6 +340,96 @@ mod tests {
     }
 
     #[test]
+    fn scene_commit_preserves_stable_focus_across_reflow_and_skips_invalid_targets() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene(), None);
+        assert!(router.set_focused(&HitId::new("second")));
+
+        router.commit_scene(
+            HitMap::new()
+                .with_region(
+                    HitRegion::new("second", Rect::new(1, 8, 8, 1))
+                        .hoverable(true)
+                        .focusable(true),
+                )
+                .with_region(HitRegion::new("empty", Rect::new(0, 0, 0, 1)).focusable(true))
+                .with_region(
+                    HitRegion::new("disabled", Rect::new(1, 9, 8, 1))
+                        .focusable(true)
+                        .enabled(false),
+                )
+                .with_region(HitRegion::new("first", Rect::new(1, 10, 8, 1)).focusable(true)),
+            None,
+        );
+
+        assert_eq!(router.focused(), Some(&HitId::new("second")));
+        let next = router.route(Event::Key(KeyStroke::simple(KeyCode::Tab)));
+        assert_eq!(next.focus_changed, Some(HitId::new("first")));
+    }
+
+    #[test]
+    fn explicit_tab_order_overrides_render_order_without_including_invalid_targets() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(
+            HitMap::new()
+                .with_region(
+                    HitRegion::new("rendered-first", Rect::new(0, 0, 2, 1))
+                        .focusable(true)
+                        .tab_order(20),
+                )
+                .with_region(
+                    HitRegion::new("rendered-second", Rect::new(0, 1, 2, 1))
+                        .focusable(true)
+                        .tab_order(10),
+                )
+                .with_region(
+                    HitRegion::new("disabled", Rect::new(0, 2, 2, 1))
+                        .focusable(true)
+                        .enabled(false)
+                        .tab_order(0),
+                ),
+            None,
+        );
+
+        assert_eq!(router.focused(), Some(&HitId::new("rendered-second")));
+        let forward = router.route(Event::Key(KeyStroke::simple(KeyCode::Tab)));
+        assert_eq!(forward.focus_changed, Some(HitId::new("rendered-first")));
+    }
+
+    #[test]
+    fn pointer_activation_requires_press_and_release_on_same_target() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene(), None);
+
+        let unpressed_release = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(3, 3),
+        )));
+        assert_eq!(unpressed_release.target, None);
+        assert!(!unpressed_release.is_activation() || unpressed_release.target.is_none());
+
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(3, 3),
+        )));
+        let mismatched_release = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(11, 3),
+        )));
+        assert_eq!(mismatched_release.target, None);
+
+        router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(3, 3),
+        )));
+        let activation = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(3, 3),
+        )));
+        assert_eq!(activation.target, Some(HitId::new("first")));
+    }
+
+    #[test]
     fn one_move_reports_both_hover_leave_and_enter() {
         let mut router = InteractionRouter::new();
         router.commit_scene(scene(), None);
@@ -316,6 +459,15 @@ mod tests {
         )));
 
         assert_eq!(route.target, Some(HitId::new("second")));
+        assert_eq!(route.local_position, Some(Point::new(1, 0)));
+        assert_eq!(route.bounds, Some(Rect::new(10, 3, 5, 1)));
+        assert_eq!(route.role, Some(crate::hit::HitRole::Action));
+        assert_eq!(
+            router
+                .region(&HitId::new("second"))
+                .map(|region| region.area),
+            Some(Rect::new(10, 3, 5, 1))
+        );
         assert_eq!(route.focus_changed, Some(HitId::new("second")));
         assert_eq!(router.focused(), Some(&HitId::new("second")));
     }
@@ -347,6 +499,37 @@ mod tests {
         assert_eq!(blocked.target, None);
 
         router.commit_scene(HitMap::new().with_region(background), None);
+        assert_eq!(router.focused(), Some(&HitId::new("background")));
+    }
+
+    #[test]
+    fn nested_modal_scopes_restore_focus_one_level_at_a_time() {
+        let background = HitRegion::new("background", Rect::new(0, 0, 3, 1)).focusable(true);
+        let first_modal = HitRegion::new("first.close", Rect::new(0, 1, 3, 1))
+            .focusable(true)
+            .focus_scope("first");
+        let second_modal = HitRegion::new("second.close", Rect::new(0, 2, 3, 1))
+            .focusable(true)
+            .focus_scope("second");
+        let mut router = InteractionRouter::new();
+        let scene = HitMap::new()
+            .with_region(background)
+            .with_region(first_modal)
+            .with_region(second_modal);
+
+        router.commit_scene(scene.clone(), None);
+        router.commit_scene(scene.clone(), Some(HitId::new("first")));
+        router.commit_scene(scene.clone(), Some(HitId::new("second")));
+        assert_eq!(router.focused(), Some(&HitId::new("second.close")));
+
+        router.commit_scene(scene.clone(), Some(HitId::new("first")));
+        assert_eq!(router.focused(), Some(&HitId::new("first.close")));
+        router.commit_scene(scene.clone(), None);
+        assert_eq!(router.focused(), Some(&HitId::new("background")));
+
+        router.commit_scene(scene.clone(), Some(HitId::new("first")));
+        router.commit_scene(scene.clone(), Some(HitId::new("second")));
+        router.commit_scene(scene, None);
         assert_eq!(router.focused(), Some(&HitId::new("background")));
     }
 

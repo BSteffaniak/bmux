@@ -130,3 +130,74 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::io::{self, Write};
+    use std::rc::Rc;
+
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::hit::HitRegion;
+
+    use super::TerminalPresenter;
+    use crate::presenter::Presenter;
+
+    #[derive(Debug)]
+    struct FailOnFlush {
+        fail: Rc<RefCell<bool>>,
+    }
+
+    impl Write for FailOnFlush {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if *self.fail.borrow() {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn commit_observer_only_receives_successfully_flushed_scene() {
+        let fail = Rc::new(RefCell::new(false));
+        let terminal = bmux_tui::terminal::Terminal::new(
+            FailOnFlush {
+                fail: Rc::clone(&fail),
+            },
+            Rect::new(0, 0, 4, 1),
+        );
+        let committed = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&committed);
+        let mut presenter = TerminalPresenter::with_commit(
+            terminal,
+            |program: &mut &'static str, frame: &mut bmux_tui::frame::Frame<'_>| {
+                frame.push_hit(HitRegion::new(*program, frame.area()).focusable(true));
+            },
+            move |_: &mut &'static str,
+                  hits: &bmux_tui::hit::HitMap,
+                  _: &bmux_tui::focus::FocusTrap| {
+                observed
+                    .borrow_mut()
+                    .push(hits.regions()[0].id.as_str().to_owned());
+            },
+        );
+        let mut program = "committed";
+        presenter
+            .present(&mut program)
+            .expect("initial frame commits");
+
+        *fail.borrow_mut() = true;
+        program = "speculative";
+        assert!(presenter.present(&mut program).is_err());
+        assert_eq!(committed.borrow().as_slice(), ["committed"]);
+        assert_eq!(
+            presenter.interactions().regions()[0].id.as_str(),
+            "committed"
+        );
+    }
+}

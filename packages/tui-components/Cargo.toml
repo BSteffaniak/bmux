@@ -65,7 +65,7 @@ text-input = [
 ]
 text-input-box = ["text-input", "form-field"]
 text-view = ["keyboard-input", "scroll-area"]
-toast-stack = []
+toast-stack = ["keyboard-input"]
 tree-view = ["keyboard-input"]
 
 # Private dependency capability shared by keyboard-interactive controls.

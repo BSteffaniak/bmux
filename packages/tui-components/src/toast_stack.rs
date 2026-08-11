@@ -3,6 +3,7 @@
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion, HitRole};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::truncate_to_display_width;
@@ -246,7 +247,19 @@ impl<'a> ToastStack<'a> {
     }
 
     /// Render toast stack.
-    pub fn render(&self, area: Rect, _state: &ToastStackState, frame: &mut Frame<'_>) {
+    pub fn render(&self, area: Rect, state: &ToastStackState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("toast-stack");
+        self.render_with_id_prefix(area, state, frame, id.as_str());
+    }
+
+    /// Render toast stack with stable semantic close-control identifiers.
+    pub fn render_with_id_prefix(
+        &self,
+        area: Rect,
+        _state: &ToastStackState,
+        frame: &mut Frame<'_>,
+        id_prefix: &str,
+    ) {
         if area.is_empty() {
             return;
         }
@@ -254,8 +267,60 @@ impl<'a> ToastStack<'a> {
             let Some(rect) = self.toast_area(area, visible, toast) else {
                 continue;
             };
+            if self.policy.close_button && self.policy.mouse {
+                let close_area = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
+                frame.push_hit(
+                    HitRegion::new(
+                        HitId::new(format!("{id_prefix}.{}.close", toast.id)),
+                        close_area,
+                    )
+                    .role(HitRole::Action)
+                    .hoverable(true)
+                    .focusable(true),
+                );
+            }
             self.render_toast(rect, toast, frame);
         }
+    }
+
+    /// Handle activation routed from committed semantic interaction metadata.
+    pub fn handle_event_for_target(
+        &self,
+        area: Rect,
+        state: &mut ToastStackState,
+        event: &Event,
+        semantic_target: Option<&str>,
+        id_prefix: &str,
+    ) -> ToastStackOutcome<'a> {
+        if matches!(
+            event,
+            Event::Key(bmux_keyboard::KeyStroke {
+                key: bmux_keyboard::KeyCode::Enter
+                    | bmux_keyboard::KeyCode::Space
+                    | bmux_keyboard::KeyCode::Char(' '),
+                ..
+            }) | Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..
+            })
+        ) && let Some(target) = semantic_target
+            && let Some(id) = target
+                .strip_prefix(id_prefix)
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .and_then(|suffix| suffix.strip_suffix(".close"))
+            && let Some((index, toast)) = self
+                .toasts
+                .iter()
+                .take(self.visible_count())
+                .enumerate()
+                .find(|(_, toast)| toast.id == id)
+        {
+            return ToastStackOutcome::CloseRequested {
+                index,
+                id: toast.id,
+            };
+        }
+        self.handle_event(area, state, event)
     }
 
     /// Handle mouse close interaction.
@@ -481,6 +546,36 @@ mod tests {
                     MouseEventKind::Up(MouseButton::Left),
                     Point::new(23, 0)
                 )),
+            ),
+            ToastStackOutcome::CloseRequested {
+                index: 0,
+                id: "one"
+            }
+        );
+    }
+
+    #[test]
+    fn committed_semantic_close_target_uses_stable_toast_id() {
+        let toasts = [ToastItem::new("one", "Saved")];
+        let stack = ToastStack::new(&toasts);
+        let mut state = ToastStackState::default();
+        let area = Rect::new(8, 3, 24, 2);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        stack.render_with_id_prefix(area, &state, &mut frame, "notice");
+
+        assert_eq!(frame.hits().regions()[0].id.as_str(), "notice.one.close");
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(31, 3, 1, 1));
+        assert_eq!(
+            stack.handle_event_for_target(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(99, 99),
+                )),
+                Some("notice.one.close"),
+                "notice",
             ),
             ToastStackOutcome::CloseRequested {
                 index: 0,
