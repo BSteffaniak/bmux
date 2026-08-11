@@ -6,14 +6,25 @@ use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::interaction::InteractionRouter;
 use bmux_tui::terminal::Terminal;
-use bmux_tui_components_gallery::render_gallery_into;
+use bmux_tui_components_gallery::render_gallery_interactive;
 use bmux_tui_runtime::{
     Lifecycle, Program, Runtime, RuntimeConfig, RuntimeEvent, TerminalInput, TerminalPresenter,
     Update,
 };
 
-struct GalleryProgram;
+struct GalleryProgram {
+    interactions: InteractionRouter,
+}
+
+impl GalleryProgram {
+    fn new() -> Self {
+        Self {
+            interactions: InteractionRouter::new(),
+        }
+    }
+}
 
 impl Program for GalleryProgram {
     type Message = std::io::Error;
@@ -28,9 +39,20 @@ impl Program for GalleryProgram {
                 lifecycle: Lifecycle::Exit,
                 ..Update::none()
             }),
+            RuntimeEvent::Terminal(event) => {
+                let routed = self.interactions.route(event);
+                if routed.traversal_consumed
+                    || routed.focus_changed.is_some()
+                    || routed.hover_left.is_some()
+                    || routed.hover_entered.is_some()
+                {
+                    Ok(Update::reset())
+                } else {
+                    Ok(Update::none())
+                }
+            }
             RuntimeEvent::Message(error) => Err(error),
-            RuntimeEvent::Terminal(Event::Resize(_)) => Ok(Update::reset()),
-            RuntimeEvent::Terminal(_) | RuntimeEvent::Timer(_) => Ok(Update::none()),
+            RuntimeEvent::Timer(_) => Ok(Update::none()),
         }
     }
 }
@@ -42,9 +64,17 @@ async fn main() -> Result<()> {
         let writer = guard.writer_mut().expect("guard should own stdout");
         let size = terminal_size()?;
         let terminal = Terminal::new(writer, Rect::new(0, 0, size.width, size.height));
-        let presenter = TerminalPresenter::new(terminal, render_gallery_program);
+        let presenter = TerminalPresenter::with_commit(
+            terminal,
+            render_gallery_program,
+            |program: &mut GalleryProgram,
+             hits: &bmux_tui::hit::HitMap,
+             _focus: &bmux_tui::focus::FocusTrap| {
+                program.interactions.commit_scene(hits.clone(), None);
+            },
+        );
         let (runtime, handle) = Runtime::new(
-            GalleryProgram,
+            GalleryProgram::new(),
             presenter,
             RuntimeConfig {
                 frame_interval: None,
@@ -62,8 +92,14 @@ async fn main() -> Result<()> {
     result.map_err(Into::into)
 }
 
-fn render_gallery_program(_program: &mut GalleryProgram, frame: &mut Frame<'_>) {
-    render_gallery_into(frame);
+fn render_gallery_program(program: &mut GalleryProgram, frame: &mut Frame<'_>) {
+    render_gallery_interactive(
+        frame,
+        program
+            .interactions
+            .focused()
+            .map(bmux_tui::hit::HitId::as_str),
+    );
 }
 
 fn should_quit(stroke: KeyStroke) -> bool {

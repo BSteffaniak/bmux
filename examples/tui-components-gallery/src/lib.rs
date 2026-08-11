@@ -54,9 +54,14 @@ pub fn render_gallery() -> Buffer {
 }
 
 pub fn render_gallery_into(frame: &mut Frame<'_>) {
+    render_gallery_interactive(frame, None);
+}
+
+/// Render the gallery with focus styling driven by a committed semantic target.
+pub fn render_gallery_interactive(frame: &mut Frame<'_>, focused: Option<&str>) {
     let theme = ModalTheme::dark(Color::Cyan);
 
-    render_buttons(frame);
+    render_buttons(frame, focused);
     render_badges(frame);
     render_details(frame);
     render_field(frame);
@@ -74,22 +79,37 @@ pub fn render_gallery_into(frame: &mut Frame<'_>) {
     render_recent_text_polish(frame);
 }
 
-fn render_buttons(frame: &mut Frame<'_>) {
+fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
     let mut focused = ButtonState::new();
-    focused.interaction.focused = true;
-    Button::new("Save").render(Rect::new(1, 1, 10, 1), &focused, frame);
+    focused.interaction.focused = focused_id == Some("gallery.save");
+    Button::new("Save").render_with_id("gallery.save", Rect::new(1, 1, 10, 1), &focused, frame);
 
     let mut disabled = ButtonState::new();
     disabled.interaction.disabled = true;
-    Button::new("Disabled").render(Rect::new(13, 1, 14, 1), &disabled, frame);
+    Button::new("Disabled").render_with_id(
+        "gallery.disabled",
+        Rect::new(13, 1, 14, 1),
+        &disabled,
+        frame,
+    );
 
     let actions = [
         ActionButton::new("accept", "Accept"),
         ActionButton::new("cancel", "Cancel"),
     ];
     let mut state = ActionRowState::new();
-    state.set_focused(Some(0));
-    ActionRow::new(&actions).render_state(Rect::new(1, 3, 30, 1), &state, frame);
+    let action_focus = focused_id.and_then(|id| match id {
+        "gallery.actions.accept" => Some(0),
+        "gallery.actions.cancel" => Some(1),
+        _ => None,
+    });
+    state.set_focused(action_focus);
+    ActionRow::new(&actions).render_state_with_id_prefix(
+        Rect::new(1, 3, 30, 1),
+        &state,
+        frame,
+        "gallery.actions",
+    );
 }
 
 fn render_badges(frame: &mut Frame<'_>) {
@@ -363,7 +383,61 @@ pub fn rows(buffer: &Buffer) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_gallery, rows};
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::interaction::InteractionRouter;
+
+    use super::{HEIGHT, WIDTH, render_gallery, render_gallery_interactive, rows};
+
+    #[test]
+    fn gallery_committed_scene_supports_forward_and_reverse_traversal() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        let scene = {
+            let mut frame = Frame::new(&mut buffer);
+            render_gallery_interactive(&mut frame, None);
+            frame.hits().clone()
+        };
+        let targets = scene.focus_targets(None);
+        assert!(targets.len() >= 4);
+        assert_eq!(targets[0].as_str(), "gallery.save");
+        assert_eq!(targets[1].as_str(), "gallery.actions.accept");
+        assert_eq!(targets[2].as_str(), "gallery.actions.cancel");
+        assert!(!targets.iter().any(|id| id.as_str() == "gallery.disabled"));
+
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene, None);
+        assert_eq!(
+            router.focused().map(bmux_tui::hit::HitId::as_str),
+            Some("gallery.save")
+        );
+        let forward = router.route(bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab),
+        ));
+        assert!(forward.traversal_consumed);
+        assert_eq!(
+            forward
+                .focus_changed
+                .as_ref()
+                .map(bmux_tui::hit::HitId::as_str),
+            Some("gallery.actions.accept")
+        );
+        let reverse = router.route(bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Tab,
+            modifiers: bmux_keyboard::Modifiers {
+                shift: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        }));
+        assert!(reverse.traversal_consumed);
+        assert_eq!(
+            reverse
+                .focus_changed
+                .as_ref()
+                .map(bmux_tui::hit::HitId::as_str),
+            Some("gallery.save")
+        );
+    }
 
     #[test]
     fn gallery_renders_representative_components() {
