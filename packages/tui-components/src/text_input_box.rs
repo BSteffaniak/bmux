@@ -360,7 +360,9 @@ impl<'a> TextInputBox<'a> {
         state: &mut TextInputState,
         event: &Event,
     ) -> TextInputBoxOutcome {
-        if self.policy.disabled {
+        if self.policy.disabled
+            || matches!(event, Event::Key(_) | Event::Paste(_)) && !self.policy.focused
+        {
             return TextInputBoxOutcome::Ignored;
         }
         state.set_content_area(self.layout(area).content, &self.text_policy);
@@ -520,17 +522,19 @@ mod tests {
     fn handles_uppercase_input_through_text_control() {
         let policy = TextInputPolicy::chat_composer();
         let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let outcome = TextInputBox::new(policy).handle_event(
-            Rect::new(0, 0, 12, 3),
-            &mut state,
-            &Event::Key(KeyStroke::with_modifiers(
-                KeyCode::Char('b'),
-                Modifiers {
-                    shift: true,
-                    ..Modifiers::NONE
-                },
-            )),
-        );
+        let outcome = TextInputBox::new(policy)
+            .policy(TextInputBoxPolicy::field().focused(true))
+            .handle_event(
+                Rect::new(0, 0, 12, 3),
+                &mut state,
+                &Event::Key(KeyStroke::with_modifiers(
+                    KeyCode::Char('b'),
+                    Modifiers {
+                        shift: true,
+                        ..Modifiers::NONE
+                    },
+                )),
+            );
 
         assert_eq!(outcome, TextInputBoxOutcome::Edited);
         assert_eq!(state.buffer().text(), "AdaB");
@@ -558,6 +562,31 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_text_input_ignores_keyboard_and_paste() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
+        let input = TextInputBox::new(policy);
+
+        assert_eq!(
+            input.handle_event(
+                Rect::new(0, 0, 12, 3),
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Char('!'))),
+            ),
+            TextInputBoxOutcome::Ignored
+        );
+        assert_eq!(
+            input.handle_event(
+                Rect::new(0, 0, 12, 3),
+                &mut state,
+                &Event::Paste(" Lovelace".to_owned()),
+            ),
+            TextInputBoxOutcome::Ignored
+        );
+        assert_eq!(state.buffer().text(), "Ada");
+    }
+
+    #[test]
     fn disabled_policy_ignores_events() {
         let policy = TextInputPolicy::chat_composer();
         let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
@@ -577,11 +606,13 @@ mod tests {
     fn paste_events_delegate_to_text_control() {
         let policy = TextInputPolicy::chat_composer();
         let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let outcome = TextInputBox::new(policy).handle_event(
-            Rect::new(0, 0, 12, 3),
-            &mut state,
-            &Event::Paste(" Lovelace".to_owned()),
-        );
+        let outcome = TextInputBox::new(policy)
+            .policy(TextInputBoxPolicy::field().focused(true))
+            .handle_event(
+                Rect::new(0, 0, 12, 3),
+                &mut state,
+                &Event::Paste(" Lovelace".to_owned()),
+            );
 
         assert_eq!(outcome, TextInputBoxOutcome::Edited);
         assert_eq!(state.buffer().text(), "Ada Lovelace");

@@ -47,6 +47,7 @@ pub struct BreadcrumbsState {
     current: Option<usize>,
     hovered: Option<usize>,
     pressed: Option<usize>,
+    focused: bool,
 }
 
 impl BreadcrumbsState {
@@ -57,7 +58,13 @@ impl BreadcrumbsState {
             current,
             hovered: None,
             pressed: None,
+            focused: false,
         }
+    }
+
+    /// Set whether this composite currently owns keyboard focus.
+    pub const fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
     }
 
     /// Current item index.
@@ -233,15 +240,19 @@ impl<'a> Breadcrumbs<'a> {
         event: &Event,
     ) -> BreadcrumbsOutcome<'a> {
         match event {
-            Event::Key(stroke) if self.policy.keyboard => match stroke.key {
-                KeyCode::Left => self.move_current(state, -1),
-                KeyCode::Right => self.move_current(state, 1),
-                KeyCode::Enter => state
-                    .current
-                    .and_then(|index| self.activate(index))
-                    .unwrap_or(BreadcrumbsOutcome::Ignored),
-                _ => BreadcrumbsOutcome::Ignored,
-            },
+            Event::Key(stroke)
+                if state.focused && self.policy.keyboard && stroke.modifiers.is_empty() =>
+            {
+                match stroke.key {
+                    KeyCode::Left => self.move_current(state, -1),
+                    KeyCode::Right => self.move_current(state, 1),
+                    KeyCode::Enter => state
+                        .current
+                        .and_then(|index| self.activate(index))
+                        .unwrap_or(BreadcrumbsOutcome::Ignored),
+                    _ => BreadcrumbsOutcome::Ignored,
+                }
+            }
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
                 self.handle_mouse(area, state, *mouse)
             }
@@ -440,6 +451,7 @@ mod tests {
             BreadcrumbItem::new("docs", "Docs"),
         ];
         let mut state = BreadcrumbsState::new(Some(0));
+        state.set_focused(true);
 
         assert_eq!(
             Breadcrumbs::new(&items).handle_event(
@@ -453,12 +465,31 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_breadcrumbs_do_not_consume_keyboard_navigation() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let mut state = BreadcrumbsState::new(Some(0));
+
+        let outcome = Breadcrumbs::new(&items).handle_event(
+            Rect::new(0, 0, 16, 1),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Right)),
+        );
+
+        assert_eq!(outcome, BreadcrumbsOutcome::Ignored);
+        assert_eq!(state.current(), Some(0));
+    }
+
+    #[test]
     fn enter_activates_current_item() {
         let items = [
             BreadcrumbItem::new("home", "Home"),
             BreadcrumbItem::new("docs", "Docs"),
         ];
         let mut state = BreadcrumbsState::new(Some(1));
+        state.set_focused(true);
 
         assert_eq!(
             Breadcrumbs::new(&items).handle_event(
@@ -514,6 +545,7 @@ mod tests {
     fn disabled_items_do_not_activate() {
         let items = [BreadcrumbItem::new("home", "Home").disabled(true)];
         let mut state = BreadcrumbsState::new(Some(0));
+        state.set_focused(true);
 
         assert_eq!(
             Breadcrumbs::new(&items).handle_event(

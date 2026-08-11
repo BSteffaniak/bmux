@@ -136,6 +136,11 @@ impl MenuState {
         self.list.focused()
     }
 
+    /// Set focused item index, or clear keyboard focus.
+    pub const fn set_focused(&mut self, focused: Option<usize>) {
+        self.list.set_focused(focused);
+    }
+
     /// Set disabled state for the whole menu.
     pub const fn set_disabled(&mut self, disabled: bool) {
         self.list.set_disabled(disabled);
@@ -221,10 +226,13 @@ impl<'a> Menu<'a> {
 
     /// Handle one input event.
     pub fn handle_event(&self, area: Rect, state: &mut MenuState, event: &Event) -> MenuOutcome {
-        if matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
+        let keyboard_focused = state.list.interaction.focused;
+        if keyboard_focused && matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
             return MenuOutcome::Cancelled;
         }
-        if matches!(event, Event::Key(stroke) if Self::is_activation_key(*stroke)) {
+        if keyboard_focused
+            && matches!(event, Event::Key(stroke) if Self::is_activation_key(*stroke))
+        {
             return state
                 .focused()
                 .filter(|index| {
@@ -234,7 +242,8 @@ impl<'a> Menu<'a> {
                 })
                 .map_or(MenuOutcome::Ignored, |index| self.activate(index));
         }
-        if let Event::Key(stroke) = event
+        if keyboard_focused
+            && let Event::Key(stroke) = event
             && self.policy.typeahead
             && stroke.modifiers.is_empty()
             && let KeyCode::Char(ch) = stroke.key
@@ -336,6 +345,7 @@ mod tests {
         let items = items();
         let menu = Menu::new(&items);
         let mut state = MenuState::new(Some(0));
+        state.set_focused(state.selected());
 
         let outcome = menu.handle_event(
             Rect::new(0, 0, 12, 2),
@@ -353,10 +363,26 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_menu_does_not_consume_keyboard_activation() {
+        let items = items();
+        let menu = Menu::new(&items);
+        let mut state = MenuState::new(Some(0));
+
+        let outcome = menu.handle_event(
+            Rect::new(0, 0, 12, 2),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+        );
+
+        assert_eq!(outcome, MenuOutcome::Ignored);
+    }
+
+    #[test]
     fn escape_cancels_menu() {
         let items = items();
         let menu = Menu::new(&items);
         let mut state = MenuState::new(Some(0));
+        state.set_focused(state.selected());
 
         let outcome = menu.handle_event(
             Rect::new(0, 0, 12, 2),
@@ -430,6 +456,7 @@ mod tests {
         let items = [MenuItem::new("section", "File").section(true)];
         let menu = Menu::new(&items);
         let mut state = MenuState::new(Some(0));
+        state.set_focused(state.selected());
 
         let outcome = menu.handle_event(
             Rect::new(0, 0, 12, 1),
@@ -448,6 +475,7 @@ mod tests {
             ..MenuPolicy::default()
         });
         let mut state = MenuState::new(Some(0));
+        state.set_focused(state.selected());
 
         let outcome = menu.handle_event(
             Rect::new(0, 0, 12, 2),

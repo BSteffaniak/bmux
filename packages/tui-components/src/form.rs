@@ -104,7 +104,7 @@ impl FormState {
     #[must_use]
     pub const fn new(focused: Option<usize>) -> Self {
         Self {
-            interaction: InteractionState::new(),
+            interaction: InteractionState::new().focused(focused.is_some()),
             focused,
         }
     }
@@ -208,7 +208,8 @@ impl<'a> Form<'a> {
             return FormOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) => self.handle_key(state, *stroke),
+            Event::Key(stroke) if state.interaction.focused => self.handle_key(state, *stroke),
+            Event::Key(_) => FormOutcome::Ignored,
             Event::Mouse(mouse) => self.handle_mouse(state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 FormOutcome::Ignored
@@ -405,6 +406,20 @@ mod tests {
 
         assert_eq!(outcome, FormOutcome::Ignored);
         assert_eq!(state.focused(), Some(0));
+    }
+
+    #[test]
+    fn unfocused_form_does_not_consume_keyboard_actions() {
+        let fields = vec![FormFieldItem::new("name").required(true)];
+        let values = vec![Some("Ada")];
+        let form = Form::new(&fields, &values);
+        let mut state = FormState::new(None);
+
+        assert_eq!(
+            form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Enter)),),
+            FormOutcome::Ignored
+        );
+        assert_eq!(state.focused(), None);
     }
 
     #[test]

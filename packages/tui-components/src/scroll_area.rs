@@ -33,6 +33,11 @@ impl ScrollAreaState {
         }
     }
 
+    /// Set whether this scrollable composite currently owns keyboard focus.
+    pub const fn set_focused(&mut self, focused: bool) {
+        self.interaction.focused = focused;
+    }
+
     /// Return the current vertical content offset.
     #[must_use]
     pub const fn vertical_offset(self) -> u16 {
@@ -427,7 +432,9 @@ impl<'a> ScrollArea<'a> {
             return ScrollAreaOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if self.policy.keyboard => self.handle_key(area, state, *stroke),
+            Event::Key(stroke) if state.interaction.focused && self.policy.keyboard => {
+                self.handle_key(area, state, *stroke)
+            }
             Event::Mouse(mouse) if self.policy.mouse_wheel => {
                 self.handle_mouse(area, state, *mouse)
             }
@@ -823,6 +830,7 @@ mod tests {
         let lines = lines(&["zero", "one", "two", "three"]);
         let area = ScrollArea::new(&lines);
         let mut state = ScrollAreaState::new();
+        state.set_focused(true);
 
         let outcome = area.handle_event(
             Rect::new(0, 0, 8, 2),
@@ -839,6 +847,7 @@ mod tests {
         let lines = lines(&["zero", "one", "two", "three"]);
         let area = ScrollArea::new(&lines);
         let mut state = ScrollAreaState::new();
+        state.set_focused(true);
 
         let outcome = area.handle_event(
             Rect::new(0, 0, 8, 3),
@@ -894,6 +903,7 @@ mod tests {
         let lines = lines(&["abcdef"]);
         let area = ScrollArea::new(&lines);
         let mut state = ScrollAreaState::new();
+        state.set_focused(true);
 
         let outcome = area.handle_event(
             Rect::new(0, 0, 3, 1),
@@ -1089,6 +1099,22 @@ mod tests {
 
         assert_eq!(outcome, ScrollAreaOutcome::Ignored);
         assert!(state.drag().is_none());
+    }
+
+    #[test]
+    fn unfocused_scroll_area_does_not_consume_keyboard_navigation() {
+        let lines = lines(&["zero", "one", "two"]);
+        let area = ScrollArea::new(&lines);
+        let mut state = ScrollAreaState::new();
+
+        let outcome = area.handle_event(
+            Rect::new(0, 0, 8, 1),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Down)),
+        );
+
+        assert_eq!(outcome, ScrollAreaOutcome::Ignored);
+        assert_eq!(state.vertical_offset(), 0);
     }
 
     #[test]

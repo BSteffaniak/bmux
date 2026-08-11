@@ -19,6 +19,7 @@ pub struct TextViewState {
     vertical_scroll: usize,
     horizontal_scroll: usize,
     dragging_scrollbar: Option<TextViewScrollbarAxis>,
+    focused: bool,
 }
 
 impl TextViewState {
@@ -29,7 +30,13 @@ impl TextViewState {
             vertical_scroll: 0,
             horizontal_scroll: 0,
             dragging_scrollbar: None,
+            focused: false,
         }
+    }
+
+    /// Set whether this scrollable view currently owns keyboard focus.
+    pub const fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
     }
 
     /// Return vertical scroll offset in rendered rows.
@@ -566,20 +573,24 @@ impl<'a> TextView<'a> {
             return outcome;
         }
         match event {
-            Event::Key(stroke) if self.policy.keyboard => match stroke.key {
-                KeyCode::Up => self.scroll_by(area, state, -1),
-                KeyCode::Down => self.scroll_by(area, state, 1),
-                KeyCode::PageUp => self.scroll_by(area, state, -i32::from(area.height.max(1))),
-                KeyCode::PageDown => self.scroll_by(area, state, i32::from(area.height.max(1))),
-                KeyCode::Home => self.set_scroll(area, state, 0),
-                KeyCode::End => {
-                    let line_count = self.layout(area, state).lines.len();
-                    self.set_scroll(area, state, line_count)
+            Event::Key(stroke)
+                if state.focused && self.policy.keyboard && stroke.modifiers.is_empty() =>
+            {
+                match stroke.key {
+                    KeyCode::Up => self.scroll_by(area, state, -1),
+                    KeyCode::Down => self.scroll_by(area, state, 1),
+                    KeyCode::PageUp => self.scroll_by(area, state, -i32::from(area.height.max(1))),
+                    KeyCode::PageDown => self.scroll_by(area, state, i32::from(area.height.max(1))),
+                    KeyCode::Home => self.set_scroll(area, state, 0),
+                    KeyCode::End => {
+                        let line_count = self.layout(area, state).lines.len();
+                        self.set_scroll(area, state, line_count)
+                    }
+                    KeyCode::Left => self.scroll_horizontal_by(area, state, -1),
+                    KeyCode::Right => self.scroll_horizontal_by(area, state, 1),
+                    _ => TextViewOutcome::Ignored,
                 }
-                KeyCode::Left => self.scroll_horizontal_by(area, state, -1),
-                KeyCode::Right => self.scroll_horizontal_by(area, state, 1),
-                _ => TextViewOutcome::Ignored,
-            },
+            }
             Event::Mouse(mouse) if self.policy.mouse_wheel && area.contains(mouse.position) => {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.scroll_by(area, state, -1),
@@ -1095,6 +1106,7 @@ mod tests {
             ..TextViewPolicy::bare()
         });
         let mut state = TextViewState::new();
+        state.set_focused(true);
 
         assert_eq!(
             view.handle_event(
@@ -1159,6 +1171,7 @@ mod tests {
         let lines = [Line::from("one"), Line::from("two"), Line::from("three")];
         let view = TextView::new(&lines);
         let mut state = TextViewState::new();
+        state.set_focused(true);
 
         assert_eq!(
             view.handle_event(
@@ -1169,6 +1182,22 @@ mod tests {
             TextViewOutcome::Scrolled { vertical_scroll: 1 }
         );
         assert_eq!(state.vertical_scroll(), 1);
+    }
+
+    #[test]
+    fn unfocused_text_view_does_not_consume_keyboard_scrolling() {
+        let lines = [Line::from("one"), Line::from("two")];
+        let view = TextView::new(&lines);
+        let mut state = TextViewState::new();
+
+        let outcome = view.handle_event(
+            Rect::new(0, 0, 10, 1),
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Down)),
+        );
+
+        assert_eq!(outcome, TextViewOutcome::Ignored);
+        assert_eq!(state.vertical_scroll(), 0);
     }
 
     #[test]
