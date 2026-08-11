@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -240,9 +241,24 @@ impl<'a> SelectDropdown<'a> {
         )
     }
 
-    /// Render the select/dropdown control.
+    /// Render the select/dropdown and register it as one composite tab stop.
+    ///
+    /// Use [`Self::render_with_id`] when focus must survive responsive reflow
+    /// or callers route events by semantic identity.
     pub fn render(&self, area: Rect, state: &SelectDropdownState, frame: &mut Frame<'_>) {
-        self.render_with_fallback_style(area, state, frame, Style::new());
+        let id = frame.next_interaction_id("select-dropdown");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render the select/dropdown with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &SelectDropdownState,
+        frame: &mut Frame<'_>,
+    ) {
+        self.render_with_id_and_fallback_style(id, area, state, frame, Style::new());
     }
 
     /// Render the select/dropdown control with fallback style.
@@ -253,15 +269,41 @@ impl<'a> SelectDropdown<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
-        frame.write_line_with_fallback_style(
-            Rect::new(area.x, area.y, area.width, 1),
-            &self.closed_line(*state),
-            fallback,
+        let id = frame.next_interaction_id("select-dropdown");
+        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
+    }
+
+    /// Render with a stable interaction identifier and fallback style.
+    pub fn render_with_id_and_fallback_style(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &SelectDropdownState,
+        frame: &mut Frame<'_>,
+        fallback: Style,
+    ) {
+        let id = id.into();
+        let closed_area = Rect::new(area.x, area.y, area.width, 1);
+        frame.push_hit(
+            SceneRegion::new(id.clone(), closed_area)
+                .role(HitRole::ListItem)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
         );
+        frame.write_line_with_fallback_style(closed_area, &self.closed_line(*state), fallback);
         if state.open {
+            let list_area = self.list_area(area);
+            frame.push_hit(
+                SceneRegion::new(format!("{}.options", id.as_str()), list_area)
+                    .role(HitRole::ListItem)
+                    .hoverable(self.policy.mouse.hover)
+                    .focusable(false)
+                    .enabled(!state.interaction.disabled),
+            );
             let items = self.list_items();
             SelectableList::new(&items).render_with_fallback_style(
-                self.list_area(area),
+                list_area,
                 &state.list,
                 frame,
                 fallback,
@@ -559,6 +601,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
 
     use super::{SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption};
 
@@ -579,6 +622,52 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("Published ▾   ")
         );
+    }
+
+    #[test]
+    fn render_registers_closed_and_open_composite_geometry() {
+        let options = options();
+        let select = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        state.interaction.focused = true;
+        state.set_open(true);
+        let mut buffer = Buffer::empty(Rect::new(4, 3, 20, 6));
+        let mut frame = Frame::new(&mut buffer);
+
+        select.render_with_id_and_fallback_style(
+            "status",
+            Rect::new(7, 4, 14, 3),
+            &state,
+            &mut frame,
+            bmux_tui::style::Style::new(),
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].id.as_str(), "status");
+        assert_eq!(regions[0].area, Rect::new(7, 4, 14, 1));
+        assert_eq!(regions[0].role, HitRole::ListItem);
+        assert!(regions[0].focusable);
+        assert_eq!(regions[1].id.as_str(), "status.options");
+        assert_eq!(regions[1].area, Rect::new(7, 5, 14, 2));
+        assert!(!regions[1].focusable);
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+    }
+
+    #[test]
+    fn disabled_dropdown_is_excluded_from_traversal() {
+        let options = options();
+        let select = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        state.set_disabled(true);
+        let mut buffer = Buffer::empty(Rect::new(2, 2, 16, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        select.render_with_id("status", Rect::new(3, 2, 14, 1), &state, &mut frame);
+
+        assert_eq!(frame.hits().regions().len(), 1);
+        assert!(!frame.hits().regions()[0].enabled);
+        assert!(frame.hits().focus_targets(None).is_empty());
     }
 
     #[test]
