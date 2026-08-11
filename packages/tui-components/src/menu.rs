@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 
 use crate::selectable_list::{
@@ -204,9 +205,24 @@ impl<'a> Menu<'a> {
         SelectableList::new(&items).size()
     }
 
-    /// Render the menu.
+    /// Render the menu and register it as one composite tab stop.
+    ///
+    /// Use [`Self::render_with_id`] when focus must survive responsive reflow
+    /// or callers route events by semantic identity.
     pub fn render(&self, area: Rect, state: &MenuState, frame: &mut Frame<'_>) {
-        self.render_with_fallback_style(area, state, frame, Style::new());
+        let id = frame.next_interaction_id("menu");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render the menu with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &MenuState,
+        frame: &mut Frame<'_>,
+    ) {
+        self.render_with_id_and_fallback_style(id, area, state, frame, Style::new());
     }
 
     /// Render the menu with fallback style filling each item row.
@@ -217,6 +233,26 @@ impl<'a> Menu<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
+        let id = frame.next_interaction_id("menu");
+        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
+    }
+
+    /// Render with a stable interaction identifier and fallback style.
+    pub fn render_with_id_and_fallback_style(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &MenuState,
+        frame: &mut Frame<'_>,
+        fallback: Style,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::ListItem)
+                .hoverable(self.policy.list.mouse.hover)
+                .focusable(true)
+                .enabled(!state.list.interaction.disabled),
+        );
         let items = self.list_items();
         SelectableList::new(&items)
             .policy(self.policy.list)
@@ -316,6 +352,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
@@ -338,6 +375,38 @@ mod tests {
             frame.buffer().row_symbols(1).as_deref(),
             Some("  Close     ")
         );
+    }
+
+    #[test]
+    fn render_registers_exact_composite_geometry_and_disabled_state() {
+        let items = items();
+        let menu = Menu::new(&items);
+        let enabled = MenuState::new(Some(0));
+        let mut disabled = MenuState::new(Some(0));
+        disabled.set_disabled(true);
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 20, 5));
+        let mut frame = Frame::new(&mut buffer);
+
+        menu.render_with_id("file-menu", Rect::new(6, 3, 12, 2), &enabled, &mut frame);
+        menu.render_with_id_and_fallback_style(
+            "disabled-menu",
+            Rect::new(6, 5, 12, 2),
+            &disabled,
+            &mut frame,
+            Style::new(),
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].id.as_str(), "file-menu");
+        assert_eq!(regions[0].area, Rect::new(6, 3, 12, 2));
+        assert_eq!(regions[0].role, HitRole::ListItem);
+        assert!(regions[0].focusable);
+        assert!(regions[0].enabled);
+        assert_eq!(regions[1].id.as_str(), "disabled-menu");
+        assert_eq!(regions[1].area, Rect::new(6, 5, 12, 2));
+        assert!(!regions[1].enabled);
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 
@@ -273,12 +274,36 @@ impl Scrollbar {
         }
     }
 
-    /// Render scrollbar.
+    /// Render the scrollbar and register pointer interaction when enabled.
     pub fn render(&self, area: Rect, state: &ScrollbarState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("scrollbar");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render the scrollbar with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &ScrollbarState,
+        frame: &mut Frame<'_>,
+    ) {
         if area.is_empty() {
             return;
         }
-        let layout = self.layout(area, state);
+        if self.policy.mouse_drag {
+            frame.push_hit(
+                SceneRegion::new(id, area)
+                    .role(HitRole::Scroll)
+                    .hoverable(false)
+                    .focusable(false),
+            );
+        }
+        self.render_visual(area, *state, frame);
+    }
+
+    fn render_visual(&self, area: Rect, state: ScrollbarState, frame: &mut Frame<'_>) {
+        let layout = self.layout(area, &state);
         match self.policy.orientation {
             ScrollbarOrientation::Vertical => {
                 for y in 0..area.height {
@@ -421,6 +446,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
 
     use bmux_tui::style::{Color, Style};
 
@@ -444,6 +470,45 @@ mod tests {
         Scrollbar::new().render(Rect::new(0, 0, 1, 5), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("█"));
+    }
+
+    #[test]
+    fn draggable_render_registers_exact_pointer_region_without_tab_stop() {
+        let state = ScrollbarState::new(100, 20).offset(40);
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 8, 8));
+        let mut frame = Frame::new(&mut buffer);
+
+        Scrollbar::new().render_with_id(
+            "results.scroll",
+            Rect::new(9, 3, 1, 6),
+            &state,
+            &mut frame,
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id.as_str(), "results.scroll");
+        assert_eq!(regions[0].area, Rect::new(9, 3, 1, 6));
+        assert_eq!(regions[0].role, HitRole::Scroll);
+        assert!(!regions[0].focusable);
+        assert!(frame.hits().focus_targets(None).is_empty());
+    }
+
+    #[test]
+    fn noninteractive_or_empty_scrollbar_registers_no_pointer_region() {
+        let state = ScrollbarState::new(100, 20);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        Scrollbar::new()
+            .policy(ScrollbarPolicy {
+                mouse_drag: false,
+                ..ScrollbarPolicy::vertical()
+            })
+            .render_with_id("static", Rect::new(0, 0, 1, 4), &state, &mut frame);
+        Scrollbar::new().render_with_id("empty", Rect::new(0, 0, 0, 0), &state, &mut frame);
+
+        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
