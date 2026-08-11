@@ -320,6 +320,58 @@ mod tests {
     }
 
     #[test]
+    fn rendered_dialog_scene_traps_pointer_and_restores_background_focus() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::Point;
+        use bmux_tui::interaction::InteractionRouter;
+
+        let body = vec![Line::from("Proceed?")];
+        let actions = vec![
+            ActionButton::new("ok", "OK"),
+            ActionButton::new("cancel", "Cancel"),
+        ];
+        let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan));
+        let state = DialogState::new();
+        let background =
+            bmux_tui::hit::HitRegion::new("background.action", Rect::new(0, 0, 30, 10))
+                .focusable(true);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 10));
+        let mut frame = Frame::new(&mut buffer);
+        frame.push_hit(background.clone());
+        dialog.render_with_scope("confirm", Rect::new(0, 0, 30, 10), &state, &mut frame);
+        let scene = frame.hits().clone();
+        let mut router = InteractionRouter::new();
+
+        router.commit_scene(
+            bmux_tui::hit::HitMap::new().with_region(background.clone()),
+            None,
+        );
+        assert_eq!(
+            router.focused().map(bmux_tui::hit::HitId::as_str),
+            Some("background.action")
+        );
+        router.commit_scene(scene, Some(bmux_tui::hit::HitId::new("confirm")));
+        assert_eq!(
+            router.focused().map(bmux_tui::hit::HitId::as_str),
+            Some("confirm.ok")
+        );
+        assert_eq!(
+            router
+                .route(Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(0, 0),
+                )))
+                .target,
+            None
+        );
+        router.commit_scene(bmux_tui::hit::HitMap::new().with_region(background), None);
+        assert_eq!(
+            router.focused().map(bmux_tui::hit::HitId::as_str),
+            Some("background.action")
+        );
+    }
+
+    #[test]
     fn action_activation_returns_action_outcome() {
         let body = vec![Line::from("Proceed?")];
         let actions = vec![ActionButton::new("ok", "OK")];

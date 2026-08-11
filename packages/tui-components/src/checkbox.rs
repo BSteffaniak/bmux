@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -162,8 +163,24 @@ impl<'a> Checkbox<'a> {
             .saturating_add(4)
     }
 
-    /// Render the checkbox.
+    /// Render the checkbox and register its default interaction semantics.
+    ///
+    /// Use [`Self::render_with_id`] when focus must survive responsive reflow
+    /// or callers route events by semantic identity.
     pub fn render(&self, area: Rect, state: &CheckboxState, frame: &mut Frame<'_>) {
+        let id = frame.next_interaction_id("checkbox");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render the checkbox with a stable interaction identifier.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &CheckboxState,
+        frame: &mut Frame<'_>,
+    ) {
+        self.register_interaction(id, area, *state, frame);
         frame.write_line(area, &self.line(*state));
     }
 
@@ -175,7 +192,37 @@ impl<'a> Checkbox<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
+        let id = frame.next_interaction_id("checkbox");
+        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
+    }
+
+    /// Render with a stable interaction identifier and fallback style.
+    pub fn render_with_id_and_fallback_style(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &CheckboxState,
+        frame: &mut Frame<'_>,
+        fallback: Style,
+    ) {
+        self.register_interaction(id, area, *state, frame);
         frame.write_line_with_fallback_style(area, &self.line(*state), fallback);
+    }
+
+    fn register_interaction(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: CheckboxState,
+        frame: &mut Frame<'_>,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::Action)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
     }
 
     /// Handle one input event.
@@ -336,6 +383,7 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
 
     use super::{Checkbox, CheckboxOutcome, CheckboxState};
 
@@ -363,6 +411,55 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(1).as_deref(),
             Some("[x] Enable      ")
+        );
+    }
+
+    #[test]
+    fn render_registers_exact_interaction_geometry_and_state() {
+        let mut buffer = Buffer::empty(Rect::new(4, 3, 20, 4));
+        let mut frame = Frame::new(&mut buffer);
+        let checkbox = Checkbox::new("Enable");
+        let enabled = CheckboxState::new(false);
+        let mut disabled = CheckboxState::new(true);
+        disabled.set_disabled(true);
+
+        checkbox.render_with_id(
+            "settings.enable",
+            Rect::new(7, 4, 11, 1),
+            &enabled,
+            &mut frame,
+        );
+        checkbox.render_with_id_and_fallback_style(
+            "settings.disabled",
+            Rect::new(7, 5, 13, 1),
+            &disabled,
+            &mut frame,
+            bmux_tui::style::Style::new(),
+        );
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].id.as_str(), "settings.enable");
+        assert_eq!(regions[0].area, Rect::new(7, 4, 11, 1));
+        assert_eq!(regions[0].role, HitRole::Action);
+        assert!(regions[0].focusable);
+        assert!(regions[0].enabled);
+        assert_eq!(regions[1].id.as_str(), "settings.disabled");
+        assert_eq!(regions[1].area, Rect::new(7, 5, 13, 1));
+        assert!(!regions[1].enabled);
+        assert!(
+            frame
+                .hits()
+                .focus_targets(None)
+                .iter()
+                .any(|id| { id.as_str() == "settings.enable" })
+        );
+        assert!(
+            !frame
+                .hits()
+                .focus_targets(None)
+                .iter()
+                .any(|id| { id.as_str() == "settings.disabled" })
         );
     }
 

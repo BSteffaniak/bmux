@@ -4,6 +4,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -266,11 +267,48 @@ impl<'a> RadioGroup<'a> {
 
     /// Render the radio group.
     pub fn render(&self, area: Rect, state: &RadioGroupState, frame: &mut Frame<'_>) {
-        self.render_with_fallback_style(area, state, frame, Style::new());
+        let id = frame.next_interaction_id("radio-group");
+        self.render_with_id(id, area, state, frame);
+    }
+
+    /// Render and register this composite as one roving-focus tab stop.
+    pub fn render_with_id(
+        &self,
+        id: impl Into<HitId>,
+        area: Rect,
+        state: &RadioGroupState,
+        frame: &mut Frame<'_>,
+    ) {
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::ListItem)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        self.render_body(area, state, frame, Style::new());
     }
 
     /// Render the radio group with a fallback style filling each option row.
     pub fn render_with_fallback_style(
+        &self,
+        area: Rect,
+        state: &RadioGroupState,
+        frame: &mut Frame<'_>,
+        fallback: Style,
+    ) {
+        let id = frame.next_interaction_id("radio-group");
+        frame.push_hit(
+            SceneRegion::new(id, area)
+                .role(HitRole::ListItem)
+                .hoverable(self.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        self.render_body(area, state, frame, fallback);
+    }
+
+    fn render_body(
         &self,
         area: Rect,
         state: &RadioGroupState,
@@ -603,6 +641,8 @@ mod tests {
             &mut frame,
         );
 
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 12, 2));
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("( ) Small   ")
