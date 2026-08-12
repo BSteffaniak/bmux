@@ -133,7 +133,11 @@ pub fn build_attach_status_line(
     left.push_str(&tail);
 
     let composed = compose_status_line(width, &left, &right);
-    clamp_hitboxes_to_width(&mut tab_hitboxes, width);
+    // Clamp to the columns the left side actually kept, not the full terminal
+    // width: `compose_status_line` truncates tab text that collides with the
+    // right-hand modules, and a hitbox surviving past that point would be
+    // invisible yet still clickable.
+    clamp_hitboxes_to_visible_width(&mut tab_hitboxes, composed.left_visible_width);
 
     attach_status_line_from_composed(
         &composed,
@@ -566,6 +570,10 @@ fn append_right_segment(
 struct ComposedStatusLine {
     rendered: String,
     right_start_col: Option<usize>,
+    /// Columns the left side (tab strip and trailing left segments) actually
+    /// occupies in `rendered`. Left content beyond this was truncated away, so
+    /// hitboxes and styling must not extend past it.
+    left_visible_width: usize,
 }
 
 fn compose_status_line(width: u16, left: &str, right: &str) -> ComposedStatusLine {
@@ -574,6 +582,7 @@ fn compose_status_line(width: u16, left: &str, right: &str) -> ComposedStatusLin
         return ComposedStatusLine {
             rendered: String::new(),
             right_start_col: None,
+            left_visible_width: 0,
         };
     }
 
@@ -581,14 +590,17 @@ fn compose_status_line(width: u16, left: &str, right: &str) -> ComposedStatusLin
         return ComposedStatusLine {
             rendered: pad_or_truncate(left, width),
             right_start_col: None,
+            left_visible_width: width,
         };
     }
 
     let right_width = display_width(right);
     if right_width >= width {
+        // The right modules consume the whole line; no left content survives.
         return ComposedStatusLine {
             rendered: truncate_cells(right, width),
             right_start_col: Some(0),
+            left_visible_width: 0,
         };
     }
 
@@ -599,6 +611,7 @@ fn compose_status_line(width: u16, left: &str, right: &str) -> ComposedStatusLin
     ComposedStatusLine {
         rendered: format!("{left_trimmed}{spacer}{right}"),
         right_start_col: Some(width.saturating_sub(right_width)),
+        left_visible_width: available_left,
     }
 }
 
@@ -897,6 +910,10 @@ fn status_segments(
     right_start_col: Option<usize>,
 ) -> Vec<SegmentKind> {
     let mut segments = vec![SegmentKind::Base; width];
+    // Left-side ranges may never bleed into the right-hand module zone. Cap
+    // them at `right_start_col` so a stale or oversized range cannot repaint
+    // the mode/role/tab-position badges.
+    let left_limit = right_start_col.unwrap_or(width).min(width);
     if let Some(start) = right_start_col {
         for segment in &mut segments[start.min(width)..width] {
             *segment = SegmentKind::Module;
@@ -904,10 +921,10 @@ fn status_segments(
     }
 
     for (start, end) in overflow_ranges {
-        if *start >= width {
+        if *start >= left_limit {
             continue;
         }
-        for segment in &mut segments[*start..=(*end).min(width.saturating_sub(1))] {
+        for segment in &mut segments[*start..=(*end).min(left_limit.saturating_sub(1))] {
             *segment = SegmentKind::Overflow;
         }
     }
@@ -931,8 +948,13 @@ fn status_segments(
                     SegmentKind::InactiveTab
                 }
             });
-        let start = usize::from(hitbox.start_col).min(width.saturating_sub(1));
-        let end = usize::from(hitbox.end_col).min(width.saturating_sub(1));
+        let start = usize::from(hitbox.start_col);
+        if start >= left_limit {
+            // Out-of-range hitbox: skip it rather than folding it onto the
+            // last column, which would tint the module zone.
+            continue;
+        }
+        let end = usize::from(hitbox.end_col).min(left_limit.saturating_sub(1));
         for segment in &mut segments[start..=end] {
             *segment = kind;
         }
@@ -1045,12 +1067,17 @@ fn truncate_cells(value: &str, max_width: usize) -> String {
     out
 }
 
-fn clamp_hitboxes_to_width(hitboxes: &mut Vec<AttachStatusTabHitbox>, width: u16) {
-    if width == 0 {
+/// Drop or trim tab hitboxes so they only ever cover columns whose tab text is
+/// actually visible in the rendered line.
+fn clamp_hitboxes_to_visible_width(
+    hitboxes: &mut Vec<AttachStatusTabHitbox>,
+    visible_width: usize,
+) {
+    if visible_width == 0 {
         hitboxes.clear();
         return;
     }
-    let max = width - 1;
+    let max = u16::try_from(visible_width.saturating_sub(1)).unwrap_or(u16::MAX);
     hitboxes.retain_mut(|entry| {
         if entry.start_col > max {
             return false;
@@ -1255,6 +1282,154 @@ mod tests {
                 .any(|hitbox| hitbox.context_id == active_context),
             "active tab should keep a hitbox: {rendered:?}"
         );
+    }
+
+    /// Column where the right-hand module zone begins, located via the mode
+    /// badge text (preset-independent).
+    fn modules_start_col(plain: &str) -> Option<usize> {
+        let byte_index = plain.find("NORMAL")?;
+        Some(display_width(&plain[..byte_index]))
+    }
+
+    #[test]
+    fn tab_hitboxes_only_cover_visible_tab_text() {
+        let tabs = sim_tabs(12, 0);
+        for width in [10_u16, 14, 18, 24, 30, 45, 60, 80, 120, 200] {
+            let status = status_line_for(width, &StatusBarConfig::default(), &tabs);
+            let plain = plain_rendered(&status);
+            let cells = plain.chars().collect::<Vec<_>>();
+            for hitbox in &status.tab_hitboxes {
+                let start = usize::from(hitbox.start_col);
+                let end = usize::from(hitbox.end_col);
+                assert!(
+                    end < cells.len(),
+                    "width {width}: hitbox {start}..={end} outside rendered line {plain:?}"
+                );
+                let index = tabs
+                    .iter()
+                    .position(|tab| tab.context_id == Some(hitbox.context_id))
+                    .expect("hitbox should map to a tab");
+                let covered = cells[start..=end].iter().collect::<String>();
+                let full_token = format!("{}:win{index}", index + 1);
+                // The hitbox may cover a truncated prefix of the token, but
+                // whatever it covers must be real, visible tab text.
+                assert!(
+                    !covered.trim().is_empty() && full_token.starts_with(covered.trim()),
+                    "width {width}: hitbox {start}..={end} covered {covered:?}, \
+                     which is not visible text of {full_token:?} in {plain:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_hitboxes_never_reach_the_right_module_zone() {
+        // Long session/context tails push the tab strip toward the modules,
+        // which previously left invisible-but-clickable hitboxes underneath.
+        let tabs = sim_tabs(14, 13);
+        let config = StatusBarConfig {
+            show_session_name: true,
+            show_context_name: true,
+            ..StatusBarConfig::default()
+        };
+        for width in [24_u16, 32, 48, 64, 100] {
+            let status = build_attach_status_line(
+                width,
+                &config,
+                &RuntimeAppearance::default(),
+                "a-fairly-long-session-name",
+                4,
+                "a-fairly-long-context-name",
+                &tabs,
+                Some("tab:14/14"),
+                "NORMAL",
+                "write",
+                None,
+                "",
+            );
+            let plain = plain_rendered(&status);
+            let Some(modules_start) = modules_start_col(&plain) else {
+                continue;
+            };
+            for hitbox in &status.tab_hitboxes {
+                assert!(
+                    usize::from(hitbox.end_col) < modules_start,
+                    "width {width}: hitbox {}..={} overlaps modules at {modules_start} in {plain:?}",
+                    hitbox.start_col,
+                    hitbox.end_col
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_active_tab_does_not_leak_a_hitbox_under_modules() {
+        let tabs = vec![AttachTab {
+            label: "an-extremely-long-window-name-that-cannot-fit".to_string(),
+            active: true,
+            context_id: Some(Uuid::from_u128(1)),
+        }];
+        let config = StatusBarConfig {
+            tab_label_max_width: 60,
+            ..StatusBarConfig::default()
+        };
+        let status = status_line_for(30, &config, &tabs);
+        let plain = plain_rendered(&status);
+        let modules_start =
+            modules_start_col(&plain).expect("mode badge should be rendered at width 30");
+
+        for hitbox in &status.tab_hitboxes {
+            assert!(
+                usize::from(hitbox.end_col) < modules_start,
+                "truncated active tab leaked a hitbox into the module zone: {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_hitboxes_are_dropped_when_only_modules_fit() {
+        let tabs = sim_tabs(6, 0);
+        let status = status_line_for(6, &StatusBarConfig::default(), &tabs);
+
+        assert!(
+            status.tab_hitboxes.is_empty(),
+            "no tab text is visible, so no tab should be clickable: {:?}",
+            plain_rendered(&status)
+        );
+    }
+
+    #[test]
+    fn module_zone_keeps_module_styling_at_every_width() {
+        let tabs = sim_tabs(14, 13);
+        for width in [20_u16, 28, 40, 70, 140] {
+            let status = status_line_for(width, &StatusBarConfig::default(), &tabs);
+            let plain = plain_rendered(&status);
+            let Some(modules_start) = modules_start_col(&plain) else {
+                continue;
+            };
+            // Walk spans to find the style covering the mode badge and assert
+            // it is the mode style, not a tab style bleeding rightward.
+            let mut col = 0usize;
+            let mut mode_span_bg = None;
+            for span in &status.spans {
+                let span_width = display_width(&span.text);
+                if col <= modules_start && modules_start < col + span_width {
+                    mode_span_bg = Some(span.style.bg);
+                    break;
+                }
+                col += span_width;
+            }
+            let appearance = ResolvedStatusAppearance::resolve(
+                &StatusBarConfig::default(),
+                &RuntimeAppearance::default(),
+            );
+            let expected = render_style_from_status_segment(appearance.mode).bg;
+            assert_eq!(
+                mode_span_bg,
+                Some(expected),
+                "width {width}: mode badge should keep mode styling in {plain:?}"
+            );
+        }
     }
 
     #[test]
