@@ -91,6 +91,7 @@ show_mode = true\n\
 show_role = true\n\
 show_follow = true\n\
 show_hint = true\n\
+hover_highlight = true\n\
 hint_policy = \"scroll_only\"\n\
 \n\
 [status_bar.layout]\n\

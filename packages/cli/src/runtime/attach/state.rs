@@ -362,6 +362,8 @@ pub struct AttachMouseState {
     pub last_event_at: Option<Instant>,
     pub hover_started_at: Option<Instant>,
     pub hovered_pane_id: Option<Uuid>,
+    /// Context id of the status-bar tab currently under the pointer.
+    pub hovered_tab_context_id: Option<Uuid>,
     pub last_focused_pane_id: Option<Uuid>,
     pub resize_drag: Option<AttachMouseResizeDrag>,
     pub floating_drag: Option<AttachMouseFloatingDrag>,
@@ -422,6 +424,7 @@ impl AttachMouseState {
     pub(crate) fn clear_pointer_gestures(&mut self) {
         self.clear_plugin_pointer_capture();
         self.tab_drag = None;
+        self.hovered_tab_context_id = None;
         self.resize_drag = None;
         self.floating_drag = None;
         self.selection_drag = None;
@@ -484,6 +487,7 @@ impl Default for AttachMouseState {
             last_event_at: None,
             hover_started_at: None,
             hovered_pane_id: None,
+            hovered_tab_context_id: None,
             last_focused_pane_id: None,
             resize_drag: None,
             floating_drag: None,

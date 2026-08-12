@@ -31,6 +31,7 @@ const ATTACH_SIM_FIXTURES: &[&str] = &[
     "attach_sim_tab_drag_gap.dsl",
     "attach_sim_tab_drag_mru_noop.dsl",
     "attach_sim_tab_click_switch.dsl",
+    "attach_sim_tab_hover.dsl",
     "attach_sim_status_top.dsl",
     "attach_sim_status_snapshot.dsl",
     "attach_sim_status_wide_tabs.dsl",

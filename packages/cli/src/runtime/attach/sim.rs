@@ -150,7 +150,8 @@ impl AttachSimHarness {
             "sim",
             1,
             "sim",
-            &tabs,
+            &crate::status::AttachTabStripInput::new(&tabs)
+                .hovered(self.view_state.mouse.hovered_tab_context_id),
             None,
             mode_label,
             "write",
@@ -161,6 +162,8 @@ impl AttachSimHarness {
             .view_state
             .mouse
             .tab_drag
+            // Mirror production: the marker appears only for an active drag.
+            .filter(|drag| drag.active)
             .and_then(|drag| drag.drop_target)
             .and_then(|target| {
                 attach_tab_drop_marker_col(&status_line, target, self.geometry.cols)
@@ -1198,6 +1201,41 @@ mod tests {
         sim.set_status_position(StatusPosition::Top);
         let top = sim.locate_text("1:one").expect("top tab");
         assert_eq!(top.row, 0);
+    }
+
+    #[test]
+    fn attach_sim_drag_marker_only_appears_once_drag_is_active() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+        let one = sim.locate_text("1:one").expect("one tab");
+        let three = sim.locate_text("3:three").expect("three tab");
+
+        // Plain mouse-down must not paint a drop marker.
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            one.center_col,
+            one.row,
+        ));
+        assert_eq!(
+            sim.render().drag_marker_col,
+            None,
+            "mouse-down alone should not show a drag marker"
+        );
+
+        // Motion past the threshold starts the drag and shows the marker.
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Move,
+            three.end_col,
+            three.row,
+        ));
+        assert!(
+            sim.render().drag_marker_col.is_some(),
+            "active drag should show a drop marker"
+        );
+
+        // Releasing clears it again.
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, three.end_col, three.row));
+        assert_eq!(sim.render().drag_marker_col, None);
     }
 
     #[test]

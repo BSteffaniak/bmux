@@ -7005,7 +7005,8 @@ pub fn build_attach_status_line_for_draw(
         &session_label,
         session_count,
         &current_context_label,
-        &tabs,
+        &crate::status::AttachTabStripInput::new(&tabs)
+            .hovered(view_state.mouse.hovered_tab_context_id),
         tab_position_label.as_deref(),
         mode_label,
         role_label,
@@ -7016,6 +7017,9 @@ pub fn build_attach_status_line_for_draw(
         .mouse
         .tab_drag
         .as_ref()
+        // Only show the drop marker once motion has actually started a drag;
+        // a plain click must not paint a reorder indicator.
+        .filter(|drag| drag.active)
         .and_then(|drag| drag.drop_target)
         .and_then(|target| attach_tab_drop_marker_col(&status_line, target, geometry.cols));
     status_line
@@ -12610,7 +12614,8 @@ pub fn reduce_attach_status_tab_mouse_event(
         }
         (TerminalMousePhase::Drag | TerminalMousePhase::Move, _) => {
             if view_state.mouse.tab_drag.is_none() {
-                return AttachUiReduction::ignored();
+                // No drag in progress: motion over the strip only updates hover.
+                return reduce_attach_status_tab_hover(view_state, mouse_event, geometry);
             }
             let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event, geometry)
             {
@@ -12834,6 +12839,24 @@ pub(super) fn attach_tab_drop_marker_col(
         AttachTabDropPlacement::After => hitbox.end_col.saturating_add(1),
     };
     Some(col.min(cols.saturating_sub(1)))
+}
+
+/// Update the hovered status-bar tab from pointer motion.
+///
+/// Returns `Ignored` so unrelated pointer handling (pane hover focus, pane
+/// mouse forwarding) still runs; only the status repaint is triggered, and only
+/// when the hovered tab actually changes.
+fn reduce_attach_status_tab_hover(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
+) -> AttachUiReduction {
+    let hovered = attach_status_tab_context_at(view_state, mouse_event, geometry);
+    if view_state.mouse.hovered_tab_context_id != hovered {
+        view_state.mouse.hovered_tab_context_id = hovered;
+        view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
+    }
+    AttachUiReduction::ignored()
 }
 
 fn attach_tab_drag_motion_is_active(
@@ -14793,6 +14816,65 @@ mod tests {
                 meta: false,
             },
         }
+    }
+
+    #[test]
+    fn status_tab_hover_tracks_tab_under_pointer() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let hover = |view_state: &mut AttachViewState, col: u16, row: u16| {
+            let mut event = tab_mouse_event(TerminalMousePhase::Move, col, row);
+            event.button = None;
+            reduce_attach_status_tab_mouse_event(view_state, event, tab_reducer_geometry())
+        };
+
+        // Motion over a tab records hover and marks the status dirty, but stays
+        // unconsumed so pane hover focus still runs.
+        view_state.dirty.status_needs_redraw = false;
+        let reduction = hover(&mut view_state, 3, 23);
+        assert!(!reduction.consumed);
+        assert_eq!(view_state.mouse.hovered_tab_context_id, Some(first));
+        assert!(view_state.dirty.status_needs_redraw);
+
+        // Motion within the same tab must not request another repaint.
+        view_state.dirty.status_needs_redraw = false;
+        let _ = hover(&mut view_state, 4, 23);
+        assert_eq!(view_state.mouse.hovered_tab_context_id, Some(first));
+        assert!(
+            !view_state.dirty.status_needs_redraw,
+            "hover within the same tab should not re-dirty the status line"
+        );
+
+        // Moving to another tab updates hover and repaints.
+        let _ = hover(&mut view_state, 9, 23);
+        assert_eq!(view_state.mouse.hovered_tab_context_id, Some(second));
+        assert!(view_state.dirty.status_needs_redraw);
+
+        // Moving into a gap between tabs clears hover.
+        view_state.dirty.status_needs_redraw = false;
+        let _ = hover(&mut view_state, 7, 23);
+        assert_eq!(view_state.mouse.hovered_tab_context_id, None);
+        assert!(view_state.dirty.status_needs_redraw);
+
+        // Moving off the status row clears hover too.
+        let _ = hover(&mut view_state, 9, 23);
+        assert_eq!(view_state.mouse.hovered_tab_context_id, Some(second));
+        let _ = hover(&mut view_state, 9, 5);
+        assert_eq!(view_state.mouse.hovered_tab_context_id, None);
+    }
+
+    #[test]
+    fn clearing_pointer_gestures_clears_tab_hover() {
+        let mut view_state = tab_reducer_view_state();
+        let mut event = tab_mouse_event(TerminalMousePhase::Move, 3, 23);
+        event.button = None;
+        let _ =
+            reduce_attach_status_tab_mouse_event(&mut view_state, event, tab_reducer_geometry());
+        assert!(view_state.mouse.hovered_tab_context_id.is_some());
+
+        view_state.mouse.clear_pointer_gestures();
+        assert_eq!(view_state.mouse.hovered_tab_context_id, None);
     }
 
     #[test]

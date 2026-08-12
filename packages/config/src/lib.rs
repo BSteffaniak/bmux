@@ -2654,6 +2654,8 @@ pub struct StatusBarConfig {
     pub show_follow: bool,
     /// Display runtime hints on the right side.
     pub show_hint: bool,
+    /// Highlight the tab under the mouse cursor.
+    pub hover_highlight: bool,
     /// Hint visibility policy.
     pub hint_policy: StatusHintPolicy,
 }
@@ -2677,6 +2679,7 @@ impl Default for StatusBarConfig {
             show_role: true,
             show_follow: true,
             show_hint: true,
+            hover_highlight: true,
             hint_policy: StatusHintPolicy::ScrollOnly,
         }
     }
@@ -2697,6 +2700,16 @@ pub struct StatusBarColorConfig {
     pub tab_inactive_bg: Option<String>,
     /// Inactive tab foreground color (hex `#RRGGBB`).
     pub tab_inactive_fg: Option<String>,
+    /// Hovered inactive tab background color (hex `#RRGGBB`). Derived from
+    /// `tab_inactive_bg` when unset.
+    pub tab_hover_bg: Option<String>,
+    /// Hovered inactive tab foreground color (hex `#RRGGBB`).
+    pub tab_hover_fg: Option<String>,
+    /// Hovered active tab background color (hex `#RRGGBB`). Derived from
+    /// `tab_active_bg` when unset.
+    pub tab_active_hover_bg: Option<String>,
+    /// Hovered active tab foreground color (hex `#RRGGBB`).
+    pub tab_active_hover_fg: Option<String>,
     /// Right-side module background color (hex `#RRGGBB`).
     pub module_bg: Option<String>,
     /// Right-side module foreground color (hex `#RRGGBB`).

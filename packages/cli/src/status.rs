@@ -13,6 +13,31 @@ pub struct AttachTab {
     pub context_id: Option<Uuid>,
 }
 
+/// Tab-strip inputs for the status line: the tabs themselves plus transient
+/// pointer state that affects how they are drawn.
+#[derive(Default)]
+pub struct AttachTabStripInput<'a> {
+    pub tabs: &'a [AttachTab],
+    /// Context id of the tab currently under the mouse cursor, if any.
+    pub hovered_context_id: Option<Uuid>,
+}
+
+impl<'a> AttachTabStripInput<'a> {
+    #[must_use]
+    pub const fn new(tabs: &'a [AttachTab]) -> Self {
+        Self {
+            tabs,
+            hovered_context_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn hovered(mut self, hovered_context_id: Option<Uuid>) -> Self {
+        self.hovered_context_id = hovered_context_id;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AttachStatusTabHitbox {
     pub start_col: u16,
@@ -38,13 +63,19 @@ pub fn build_attach_status_line(
     session_label: &str,
     session_count: usize,
     current_context_label: &str,
-    tabs: &[AttachTab],
+    tab_strip: &AttachTabStripInput<'_>,
     tab_position_label: Option<&str>,
     mode_label: &str,
     role_label: &str,
     follow_label: Option<&str>,
     hint: &str,
 ) -> AttachStatusLine {
+    let tabs = tab_strip.tabs;
+    let hovered_context_id = if config.hover_highlight {
+        tab_strip.hovered_context_id
+    } else {
+        None
+    };
     if !config.enabled {
         return AttachStatusLine {
             rendered: String::new(),
@@ -145,6 +176,7 @@ pub fn build_attach_status_line(
         config,
         &resolved_appearance,
         tabs,
+        hovered_context_id,
         tab_hitboxes,
         &overflow_ranges,
         mode_range,
@@ -158,6 +190,7 @@ fn attach_status_line_from_composed(
     config: &StatusBarConfig,
     resolved_appearance: &ResolvedStatusAppearance,
     tabs: &[AttachTab],
+    hovered_context_id: Option<Uuid>,
     tab_hitboxes: Vec<AttachStatusTabHitbox>,
     overflow_ranges: &[(usize, usize)],
     mode_range: Option<(usize, usize)>,
@@ -175,6 +208,7 @@ fn attach_status_line_from_composed(
         config,
         resolved_appearance,
         tabs,
+        hovered_context_id,
         &tab_hitboxes,
         overflow_ranges,
         resolved_mode_range,
@@ -186,6 +220,7 @@ fn attach_status_line_from_composed(
         config,
         resolved_appearance,
         tabs,
+        hovered_context_id,
         &tab_hitboxes,
         overflow_ranges,
         resolved_mode_range,
@@ -620,6 +655,8 @@ enum SegmentKind {
     Base,
     ActiveTab,
     InactiveTab,
+    HoveredActiveTab,
+    HoveredInactiveTab,
     Mode,
     Module,
     Overflow,
@@ -645,6 +682,8 @@ struct ResolvedStatusAppearance {
     base: SegmentStyle,
     active_tab: SegmentStyle,
     inactive_tab: SegmentStyle,
+    hovered_active_tab: SegmentStyle,
+    hovered_inactive_tab: SegmentStyle,
     mode: SegmentStyle,
     module: SegmentStyle,
     overflow: SegmentStyle,
@@ -740,6 +779,32 @@ impl ResolvedStatusAppearance {
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(bar_fg);
+        // Hover is a subtle background lift over the tab's normal color, so it
+        // reads cohesively on both active and inactive tabs regardless of theme.
+        let hovered_inactive_bg = config
+            .colors
+            .tab_hover_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or_else(|| adjust_rgb(inactive_bg, 18));
+        let hovered_inactive_fg = config
+            .colors
+            .tab_hover_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(inactive_fg);
+        let hovered_active_bg = config
+            .colors
+            .tab_active_hover_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or_else(|| adjust_rgb(active_bg, 12));
+        let hovered_active_fg = config
+            .colors
+            .tab_active_hover_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(active_fg);
 
         Self {
             base: SegmentStyle {
@@ -761,6 +826,21 @@ impl ResolvedStatusAppearance {
                 bg: inactive_bg,
                 bold: false,
                 dim: config.style.dim_inactive,
+                underline: false,
+            },
+            hovered_active_tab: SegmentStyle {
+                fg: hovered_active_fg,
+                bg: hovered_active_bg,
+                bold: config.style.bold_active,
+                dim: false,
+                underline: config.style.underline_active,
+            },
+            hovered_inactive_tab: SegmentStyle {
+                fg: hovered_inactive_fg,
+                bg: hovered_inactive_bg,
+                bold: false,
+                // Undim on hover so the highlight is unmistakable.
+                dim: false,
                 underline: false,
             },
             mode: SegmentStyle {
@@ -795,6 +875,7 @@ fn stylize_status_line(
     config: &StatusBarConfig,
     appearance: &ResolvedStatusAppearance,
     tabs: &[AttachTab],
+    hovered_context_id: Option<Uuid>,
     hitboxes: &[AttachStatusTabHitbox],
     overflow_ranges: &[(usize, usize)],
     mode_range: Option<(usize, usize)>,
@@ -807,6 +888,7 @@ fn stylize_status_line(
     let segments = status_segments(
         width,
         tabs,
+        hovered_context_id,
         hitboxes,
         overflow_ranges,
         mode_range,
@@ -844,6 +926,7 @@ fn status_line_spans(
     config: &StatusBarConfig,
     appearance: &ResolvedStatusAppearance,
     tabs: &[AttachTab],
+    hovered_context_id: Option<Uuid>,
     hitboxes: &[AttachStatusTabHitbox],
     overflow_ranges: &[(usize, usize)],
     mode_range: Option<(usize, usize)>,
@@ -856,6 +939,7 @@ fn status_line_spans(
     let segments = status_segments(
         width,
         tabs,
+        hovered_context_id,
         hitboxes,
         overflow_ranges,
         mode_range,
@@ -904,6 +988,7 @@ fn status_line_spans(
 fn status_segments(
     width: usize,
     tabs: &[AttachTab],
+    hovered_context_id: Option<Uuid>,
     hitboxes: &[AttachStatusTabHitbox],
     overflow_ranges: &[(usize, usize)],
     mode_range: Option<(usize, usize)>,
@@ -938,14 +1023,16 @@ fn status_segments(
     }
 
     for hitbox in hitboxes {
+        let hovered = hovered_context_id == Some(hitbox.context_id);
         let kind = tabs
             .iter()
             .find(|tab| tab.context_id == Some(hitbox.context_id))
             .map_or(SegmentKind::InactiveTab, |tab| {
-                if tab.active {
-                    SegmentKind::ActiveTab
-                } else {
-                    SegmentKind::InactiveTab
+                match (tab.active, hovered) {
+                    (true, true) => SegmentKind::HoveredActiveTab,
+                    (true, false) => SegmentKind::ActiveTab,
+                    (false, true) => SegmentKind::HoveredInactiveTab,
+                    (false, false) => SegmentKind::InactiveTab,
                 }
             });
         let start = usize::from(hitbox.start_col);
@@ -993,6 +1080,8 @@ const fn style_for_segment(
         SegmentKind::Base => appearance.base,
         SegmentKind::ActiveTab => appearance.active_tab,
         SegmentKind::InactiveTab => appearance.inactive_tab,
+        SegmentKind::HoveredActiveTab => appearance.hovered_active_tab,
+        SegmentKind::HoveredInactiveTab => appearance.hovered_inactive_tab,
         SegmentKind::Mode => appearance.mode,
         SegmentKind::Module => appearance.module,
         SegmentKind::Overflow => appearance.overflow,
@@ -1109,7 +1198,7 @@ mod tests {
             "session",
             1,
             "context",
-            &[],
+            &AttachTabStripInput::new(&[]),
             None,
             "NORMAL",
             "write",
@@ -1151,7 +1240,7 @@ mod tests {
             "session",
             1,
             "context",
-            &[],
+            &AttachTabStripInput::new(&[]),
             None,
             "NORMAL",
             "write",
@@ -1178,6 +1267,15 @@ mod tests {
         config: &StatusBarConfig,
         tabs: &[AttachTab],
     ) -> AttachStatusLine {
+        status_line_hovering(width, config, tabs, None)
+    }
+
+    fn status_line_hovering(
+        width: u16,
+        config: &StatusBarConfig,
+        tabs: &[AttachTab],
+        hovered: Option<Uuid>,
+    ) -> AttachStatusLine {
         build_attach_status_line(
             width,
             config,
@@ -1185,13 +1283,24 @@ mod tests {
             "session",
             1,
             "context",
-            tabs,
+            &AttachTabStripInput::new(tabs).hovered(hovered),
             None,
             "NORMAL",
             "write",
             None,
             "",
         )
+    }
+
+    /// Background color of the span covering the given tab label.
+    fn tab_span_bg(status: &AttachStatusLine, label: &str) -> Option<RenderColor> {
+        status
+            .spans
+            .iter()
+            .find(|span| span.text.contains(label))
+            .expect("tab span should exist")
+            .style
+            .bg
     }
 
     fn plain_rendered(status: &AttachStatusLine) -> String {
@@ -1340,7 +1449,7 @@ mod tests {
                 "a-fairly-long-session-name",
                 4,
                 "a-fairly-long-context-name",
-                &tabs,
+                &AttachTabStripInput::new(&tabs),
                 Some("tab:14/14"),
                 "NORMAL",
                 "write",
@@ -1429,6 +1538,121 @@ mod tests {
                 Some(expected),
                 "width {width}: mode badge should keep mode styling in {plain:?}"
             );
+        }
+    }
+
+    #[test]
+    fn hovering_an_inactive_tab_lifts_its_background() {
+        let tabs = sim_tabs(4, 0);
+        let hovered_id = tabs[2].context_id;
+        let plain = status_line_for(120, &StatusBarConfig::default(), &tabs);
+        let hovered = status_line_hovering(120, &StatusBarConfig::default(), &tabs, hovered_id);
+
+        let normal_bg = tab_span_bg(&plain, "3:win2");
+        let hovered_bg = tab_span_bg(&hovered, "3:win2");
+        assert_ne!(
+            normal_bg, hovered_bg,
+            "hovered inactive tab should change background"
+        );
+        // Other tabs stay untouched.
+        assert_eq!(
+            tab_span_bg(&plain, "2:win1"),
+            tab_span_bg(&hovered, "2:win1"),
+            "non-hovered tabs should be unaffected"
+        );
+    }
+
+    #[test]
+    fn hovering_the_active_tab_lifts_its_background() {
+        let tabs = sim_tabs(4, 1);
+        let hovered_id = tabs[1].context_id;
+        let plain = status_line_for(120, &StatusBarConfig::default(), &tabs);
+        let hovered = status_line_hovering(120, &StatusBarConfig::default(), &tabs, hovered_id);
+
+        let normal_bg = tab_span_bg(&plain, "2:win1");
+        let hovered_bg = tab_span_bg(&hovered, "2:win1");
+        assert_ne!(
+            normal_bg, hovered_bg,
+            "hovered active tab should change background"
+        );
+    }
+
+    #[test]
+    fn hover_highlight_disabled_matches_unhovered_output() {
+        let tabs = sim_tabs(4, 0);
+        let hovered_id = tabs[2].context_id;
+        let config = StatusBarConfig {
+            hover_highlight: false,
+            ..StatusBarConfig::default()
+        };
+
+        let without_hover = status_line_for(120, &config, &tabs);
+        let with_hover = status_line_hovering(120, &config, &tabs, hovered_id);
+
+        assert_eq!(
+            without_hover.rendered, with_hover.rendered,
+            "hover_highlight=false should render identically"
+        );
+        assert_eq!(without_hover.spans.len(), with_hover.spans.len());
+    }
+
+    #[test]
+    fn hover_respects_explicit_color_overrides() {
+        let tabs = sim_tabs(3, 0);
+        let hovered_id = tabs[1].context_id;
+        let mut config = StatusBarConfig::default();
+        config.colors.tab_hover_bg = Some("#123456".to_string());
+
+        let hovered = status_line_hovering(120, &config, &tabs, hovered_id);
+
+        assert_eq!(
+            tab_span_bg(&hovered, "2:win1"),
+            Some(RenderColor::Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }),
+            "explicit hover background should win"
+        );
+    }
+
+    #[test]
+    fn hovering_an_unknown_context_changes_nothing() {
+        let tabs = sim_tabs(3, 0);
+        let plain = status_line_for(120, &StatusBarConfig::default(), &tabs);
+        let hovered =
+            status_line_hovering(120, &StatusBarConfig::default(), &tabs, Some(Uuid::nil()));
+
+        assert_eq!(plain.rendered, hovered.rendered);
+    }
+
+    #[test]
+    fn hover_styling_does_not_leak_into_the_module_zone() {
+        let tabs = sim_tabs(14, 13);
+        let hovered_id = tabs[13].context_id;
+        for width in [24_u16, 40, 70] {
+            let status =
+                status_line_hovering(width, &StatusBarConfig::default(), &tabs, hovered_id);
+            let plain = plain_rendered(&status);
+            let Some(modules_start) = modules_start_col(&plain) else {
+                continue;
+            };
+            let appearance = ResolvedStatusAppearance::resolve(
+                &StatusBarConfig::default(),
+                &RuntimeAppearance::default(),
+            );
+            let hover_bg = render_style_from_status_segment(appearance.hovered_active_tab).bg;
+            let mut col = 0usize;
+            for span in &status.spans {
+                let span_width = display_width(&span.text);
+                if col >= modules_start {
+                    assert_ne!(
+                        span.style.bg, hover_bg,
+                        "width {width}: hover styling leaked into modules in {plain:?}"
+                    );
+                }
+                col += span_width;
+            }
         }
     }
 
