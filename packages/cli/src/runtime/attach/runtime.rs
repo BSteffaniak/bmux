@@ -15,7 +15,7 @@ use bmux_attach_pipeline::reconcile::{
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
     FrameDamageStats, PaneScrollbackWindow, RetainedDamage, RetainedOpacity,
-    RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload,
+    RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload, ScrollbackViewportBase,
     frame_damage_from_retained_repaint_plan, merge_retained_damages,
     retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
     retained_layer_order, retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
@@ -6425,15 +6425,37 @@ pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
 }
 
 pub fn begin_attach_selection_for(view_state: &mut AttachViewState, pane_id: Uuid) -> bool {
-    let Some(view) = view_state.scrollback_for(pane_id) else {
+    let Some(anchor) = attach_scrollback_cursor_position(view_state, pane_id) else {
         return false;
     };
-    let anchor = view.cursor_absolute_position();
     if let Some(view) = view_state.scrollback_for_mut(pane_id) {
         view.selection_anchor = Some(anchor);
         return true;
     }
     false
+}
+
+/// Line numbering currently on screen for `pane_id`.
+///
+/// Selection endpoints are absolute history lines, so every conversion between
+/// a viewport row and a selection position must go through this base.
+fn attach_scrollback_viewport_base(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<ScrollbackViewportBase> {
+    let view = view_state.scrollback_for(pane_id);
+    let buffer = view_state.pane_buffers.get(&pane_id)?;
+    Some(buffer.scrollback_viewport_base(view.as_ref()))
+}
+
+/// Absolute history position of `pane_id`'s scrollback cursor.
+fn attach_scrollback_cursor_position(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<AttachScrollbackPosition> {
+    let base = attach_scrollback_viewport_base(view_state, pane_id)?;
+    let view = view_state.scrollback_for(pane_id)?;
+    Some(view.cursor_position(base))
 }
 
 pub fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
@@ -6463,7 +6485,19 @@ pub fn clear_attach_selection_at(
 pub fn attach_selection_bounds(
     view_state: &AttachViewState,
 ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
-    view_state.focused_scrollback()?.selection_bounds()
+    let pane_id = view_state.focused_pane_id()?;
+    let base = attach_scrollback_viewport_base(view_state, pane_id)?;
+    view_state.scrollback_for(pane_id)?.selection_bounds(base)
+}
+
+/// Drop every pane's selection anchor.
+///
+/// Used when history line numbering stops being comparable (terminal resize
+/// reflows the grid), where keeping an anchor would select unrelated text.
+pub fn clear_all_attach_selection_anchors(view_state: &mut AttachViewState) {
+    for view in view_state.pane_scrollback.values_mut() {
+        view.selection_anchor = None;
+    }
 }
 
 pub fn step_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uuid, delta: isize) {
@@ -6714,33 +6748,39 @@ pub fn extract_attach_text(
     start: AttachScrollbackPosition,
     end: AttachScrollbackPosition,
 ) -> Option<String> {
+    let pane_id = view_state.focused_pane_id()?;
+    let (_, inner_h) = attach_pane_inner_size(view_state, pane_id)?;
+    let view = view_state.scrollback_for(pane_id);
     let buffer = focused_attach_pane_buffer(view_state)?;
-    let grid = buffer.terminal_grid.grid();
-    let width = grid.width();
-    if width == 0 {
+    // Read exactly the rows the renderer drew, in the renderer's line
+    // numbering, so copied text always matches the highlight.
+    let (rows, base) = buffer.scrollback_render_window(view.as_ref(), inner_h);
+    let width = buffer.terminal_grid.grid().width();
+    if width == 0 || rows.is_empty() {
         return Some(String::new());
     }
-    let selected_rows = end.row.saturating_sub(start.row).saturating_add(1);
-    let main_row_count = grid.main_row_count();
-    if main_row_count == 0 {
+
+    // Clip the selection to the rows currently on screen. A selection can
+    // extend past the window when the view scrolled mid-drag.
+    let height = rows.len();
+    let first_line = start.line.max(base.top_line());
+    let last_line = end
+        .line
+        .min(base.line_for_viewport_row(height.saturating_sub(1)));
+    if last_line < first_line {
         return Some(String::new());
     }
-    let display_end = main_row_count.saturating_sub(start.row.min(main_row_count));
-    let display_start = display_end.saturating_sub(grid.height());
-    let rows = grid.display_rows(start.row, grid.height());
-    let rows = &rows[rows
-        .len()
-        .saturating_sub(display_end.saturating_sub(display_start))..];
-    if rows.is_empty() {
-        return Some(String::new());
-    }
-    let end_row = selected_rows
-        .saturating_sub(1)
-        .min(rows.len().saturating_sub(1));
-    let mut lines = Vec::with_capacity(end_row.saturating_add(1));
-    for (row_index, row) in rows.iter().enumerate().take(end_row.saturating_add(1)) {
-        let start_col = if row_index == 0 { start.col } else { 0 };
-        let end_col = if row_index == end_row {
+
+    let mut lines = Vec::new();
+    for line in first_line..=last_line {
+        let Some(row_index) = base.viewport_row_for_line(line, height) else {
+            continue;
+        };
+        let Some(row) = rows.get(row_index) else {
+            continue;
+        };
+        let start_col = if line == start.line { start.col } else { 0 };
+        let end_col = if line == end.line {
             end.col.saturating_add(1)
         } else {
             width
@@ -9353,7 +9393,7 @@ async fn ensure_pane_scrollback_windows(
     }
 
     let mut requests = Vec::new();
-    let mut requested_offsets = BTreeMap::new();
+    let mut requested_panes = BTreeSet::new();
     for (pane_id, view) in &view_state.pane_scrollback {
         let Some((_, rows)) = attach_pane_inner_size(view_state, *pane_id) else {
             continue;
@@ -9367,7 +9407,7 @@ async fn ensure_pane_scrollback_windows(
         {
             continue;
         }
-        requested_offsets.insert(*pane_id, view.offset);
+        requested_panes.insert(*pane_id);
         requests.push(PaneGridWindowRequest {
             pane_id: *pane_id,
             scrollback_offset: view.offset,
@@ -9385,9 +9425,9 @@ async fn ensure_pane_scrollback_windows(
 
     for window in windows {
         let pane_id = window.pane_id;
-        let Some(&requested_offset) = requested_offsets.get(&pane_id) else {
+        if !requested_panes.contains(&pane_id) {
             continue;
-        };
+        }
         let decoded = serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&window.encoded)
             .map_err(|error| ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
@@ -9403,21 +9443,28 @@ async fn ensure_pane_scrollback_windows(
         })?;
 
         // The server clamps/advances the offset to keep a scrolled view anchored
-        // as new output scrolls history. Re-apply that adjustment to this pane's
-        // view and to its selection anchor only.
+        // as new output scrolls history. Selection anchors are absolute history
+        // lines in the server's `total_scrolled_rows` numbering, so that
+        // re-anchoring needs no anchor adjustment at all. The one case that does
+        // need care is the *first* window for a pane: before it arrives the base
+        // is derived from the client's local grid counter, which can differ from
+        // the server's, so rebase the anchor onto the authoritative numbering.
         let adjusted_offset = window.scrollback_offset;
+        let previous_base = view_state
+            .pane_buffers
+            .get(&pane_id)
+            .filter(|buffer| buffer.scrollback_window.is_none())
+            .map(|buffer| {
+                buffer.scrollback_viewport_base(view_state.scrollback_for(pane_id).as_ref())
+            });
+        let next_base = bmux_attach_pipeline::ScrollbackViewportBase::from_scrolled_rows(
+            window.total_scrolled_rows,
+            adjusted_offset,
+        );
         if let Some(view) = view_state.scrollback_for_mut(pane_id) {
             view.offset = adjusted_offset;
-            if let Some(anchor) = view.selection_anchor.as_mut() {
-                if adjusted_offset > requested_offset {
-                    anchor.row = anchor
-                        .row
-                        .saturating_add(adjusted_offset - requested_offset);
-                } else if adjusted_offset < requested_offset {
-                    anchor.row = anchor
-                        .row
-                        .saturating_sub(requested_offset - adjusted_offset);
-                }
+            if let Some(previous_base) = previous_base {
+                view.rebase_selection_anchor(previous_base, next_base);
             }
         }
         if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
@@ -10360,6 +10407,10 @@ pub async fn handle_attach_terminal_event(
         _ => {}
     }
     if matches!(&raw_event, Event::Resize(_, _)) {
+        // Reflow renumbers history lines, so any in-flight selection no longer
+        // refers to the text it was anchored on. Drop it rather than copy the
+        // wrong region.
+        clear_all_attach_selection_anchors(view_state);
         update_attach_viewport_with_geometry(
             client,
             view_state.attached_id,
@@ -13276,11 +13327,9 @@ fn attach_mouse_scrollback_position_for_event(
     let local_row = row
         .saturating_sub(content.y)
         .min(content.h.saturating_sub(1));
+    let base = attach_scrollback_viewport_base(view_state, pane_id)?;
     Some(AttachScrollbackPosition {
-        row: view_state
-            .scrollback_for(pane_id)
-            .map_or(0, |view| view.offset)
-            .saturating_add(usize::from(local_row)),
+        line: base.line_for_viewport_row(usize::from(local_row)),
         col: usize::from(local_col),
     })
 }
@@ -13298,14 +13347,20 @@ fn set_attach_scrollback_cursor_to_position(
     if inner_w == 0 || inner_h == 0 {
         return false;
     }
+    let Some(base) = attach_scrollback_viewport_base(view_state, pane_id) else {
+        return false;
+    };
     let Some(view) = view_state.scrollback_for_mut(pane_id) else {
         return false;
     };
+    // Clamp into the visible window: a drag can leave the pane, and a position
+    // above the window top must land on the first row rather than wrap.
+    let row = position
+        .line
+        .saturating_sub(base.top_line())
+        .min(inner_h.saturating_sub(1) as u64);
     view.cursor = AttachScrollbackCursor {
-        row: position
-            .row
-            .saturating_sub(view.offset)
-            .min(inner_h.saturating_sub(1)),
+        row: usize::try_from(row).unwrap_or_else(|_| inner_h.saturating_sub(1)),
         col: position.col.min(inner_w.saturating_sub(1)),
     };
     true
@@ -14329,7 +14384,7 @@ mod tests {
         });
         view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
             pane_id: Uuid::from_u128(2),
-            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            anchor: AttachScrollbackPosition { line: 0, col: 0 },
             active: false,
         });
 
@@ -16580,9 +16635,11 @@ mod tests {
             Instant::now()
         ));
         assert!(view_state.scrollback_active());
+        // Fixture scrolled one row into history and the drag started on
+        // viewport row 1, so the anchor is history line 2.
         assert_eq!(
             test_selection_anchor(&view_state),
-            Some(AttachScrollbackPosition { row: 1, col: 1 })
+            Some(AttachScrollbackPosition { line: 2, col: 1 })
         );
         assert_eq!(
             test_scrollback_cursor(&view_state),
@@ -16643,12 +16700,12 @@ mod tests {
         let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
         view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
             pane_id,
-            anchor: AttachScrollbackPosition { row: 1, col: 1 },
+            anchor: AttachScrollbackPosition { line: 2, col: 1 },
             active: true,
         });
         assert!(enter_attach_scrollback(&mut view_state));
         if let Some(view) = view_state.focused_scrollback_mut() {
-            view.selection_anchor = Some(AttachScrollbackPosition { row: 1, col: 1 });
+            view.selection_anchor = Some(AttachScrollbackPosition { line: 2, col: 1 });
             view.cursor = AttachScrollbackCursor { row: 2, col: 4 };
         }
 
@@ -18387,15 +18444,17 @@ mod tests {
     }
 
     #[test]
-    fn begin_attach_selection_uses_absolute_cursor_position() {
+    fn begin_attach_selection_anchors_absolute_history_line() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         assert!(enter_attach_scrollback(&mut view_state));
-        test_set_scrollback_offset(&mut view_state, 2);
+        test_set_scrollback_offset(&mut view_state, 1);
 
         assert!(begin_attach_selection(&mut view_state));
+        // Fixture scrolled one row into history, so with offset 1 the window top
+        // is line 0 and the cursor sits on the last of four visible rows.
         assert_eq!(
             test_selection_anchor(&view_state),
-            Some(AttachScrollbackPosition { row: 5, col: 2 })
+            Some(AttachScrollbackPosition { line: 3, col: 2 })
         );
     }
 
@@ -18409,20 +18468,192 @@ mod tests {
         assert_eq!(test_selection_anchor(&view_state), None);
     }
 
+    /// The fixture writes `one`, `  four`, `     five`, `  six` into a 4-row
+    /// grid, so `one` has scrolled into history and the viewport holds
+    /// `  four`, `     five`, `  six`, and a trailing blank row on history
+    /// lines 1 through 4.
     #[test]
     fn selected_attach_text_extracts_multiline_range() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         assert!(enter_attach_scrollback(&mut view_state));
         if let Some(view) = view_state.focused_scrollback_mut() {
-            view.selection_anchor = Some(AttachScrollbackPosition { row: 2, col: 2 });
-            view.cursor = AttachScrollbackCursor { row: 3, col: 8 };
+            view.selection_anchor = Some(AttachScrollbackPosition { line: 2, col: 2 });
+            view.cursor = AttachScrollbackCursor { row: 2, col: 4 };
             view.offset = 0;
         }
 
         assert_eq!(
             selected_attach_text(&mut view_state),
-            Some("e\n  four".to_string())
+            Some("   five\n  six".to_string())
         );
+    }
+
+    /// Regression guard: selection start rows were previously passed to
+    /// `display_rows` as a *scrollback offset*, so copying text selected on
+    /// viewport row `r` returned text `2 * r` rows too far up the history.
+    #[test]
+    fn selected_attach_text_copies_bottom_viewport_row_not_rows_above() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(enter_attach_scrollback(&mut view_state));
+        // Last non-empty viewport row (`  six`) is history line 3.
+        if let Some(view) = view_state.focused_scrollback_mut() {
+            view.selection_anchor = Some(AttachScrollbackPosition { line: 3, col: 0 });
+            view.cursor = AttachScrollbackCursor { row: 2, col: 4 };
+            view.offset = 0;
+        }
+
+        assert_eq!(
+            selected_attach_text(&mut view_state),
+            Some("  six".to_string())
+        );
+    }
+
+    /// Selection endpoints are absolute history lines, so scrolling the view
+    /// must not change which text a live selection covers.
+    #[test]
+    fn selected_attach_text_is_stable_across_scrollback_steps() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(enter_attach_scrollback(&mut view_state));
+        if let Some(view) = view_state.focused_scrollback_mut() {
+            view.selection_anchor = Some(AttachScrollbackPosition { line: 2, col: 0 });
+            view.cursor = AttachScrollbackCursor { row: 1, col: 8 };
+            view.offset = 0;
+        }
+        let before = selected_attach_text(&mut view_state);
+        assert_eq!(before, Some("     five".to_string()));
+
+        // Scroll back one row (negative delta moves away from the live bottom);
+        // the anchor line and the head line must still resolve to the same
+        // text, now one row lower in the viewport.
+        step_attach_scrollback(&mut view_state, -1);
+        if let Some(view) = view_state.focused_scrollback_mut() {
+            view.cursor = AttachScrollbackCursor { row: 2, col: 8 };
+        }
+        assert_eq!(selected_attach_text(&mut view_state), before);
+    }
+
+    /// A selection served from the server scrollback window must read that
+    /// window's rows, in the window's line numbering.
+    #[test]
+    fn selected_attach_text_reads_server_scrollback_window_rows() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        assert!(enter_attach_scrollback(&mut view_state));
+
+        let window_rows = {
+            let mut source = PaneRenderBuffer {
+                terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                    20,
+                    4,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .expect("test grid dimensions are valid"),
+                ..PaneRenderBuffer::default()
+            };
+            append_pane_output(&mut source, b"WINDOW-A\r\nWINDOW-B\r\n");
+            source.terminal_grid.grid().display_rows(0, 4)
+        };
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.offset = 3;
+            view.cursor = AttachScrollbackCursor { row: 1, col: 7 };
+        }
+        if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
+            buffer.scrollback_window = Some(PaneScrollbackWindow {
+                scrollback_offset: 3,
+                max_scrollback_offset: 9,
+                total_scrolled_rows: 12,
+                rows: window_rows,
+            });
+        }
+        // Window top is line 12 - 3 = 9, so `WINDOW-B` is line 10.
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.selection_anchor = Some(AttachScrollbackPosition { line: 10, col: 0 });
+        }
+
+        assert_eq!(
+            selected_attach_text(&mut view_state),
+            Some("WINDOW-B".to_string())
+        );
+    }
+
+    /// Copied text must equal exactly the cells the renderer highlights.
+    #[test]
+    fn selected_attach_text_matches_rendered_selection_highlight() {
+        for (anchor_row, anchor_col, head_row, head_col) in [
+            (0_usize, 0_usize, 0_usize, 3_usize),
+            (0, 2, 1, 4),
+            (1, 0, 2, 4),
+            (2, 1, 2, 3),
+            (0, 0, 2, 4),
+        ] {
+            let mut view_state = attach_view_state_with_scrollback_fixture();
+            let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+            assert!(enter_attach_scrollback(&mut view_state));
+            let base = attach_scrollback_viewport_base(&view_state, pane_id).expect("base");
+            if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+                view.offset = 0;
+                view.selection_anchor = Some(AttachScrollbackPosition {
+                    line: base.line_for_viewport_row(anchor_row),
+                    col: anchor_col,
+                });
+                view.cursor = AttachScrollbackCursor {
+                    row: head_row,
+                    col: head_col,
+                };
+            }
+
+            let (start, end) = attach_selection_bounds(&view_state).expect("selection bounds");
+            let copied = selected_attach_text(&mut view_state).expect("selected text");
+
+            // Rebuild the expected text from the rows the renderer draws,
+            // keeping only the cells inside the selection bounds.
+            let (rows, base) = {
+                let view = view_state.scrollback_for(pane_id);
+                let buffer = view_state
+                    .pane_buffers
+                    .get(&pane_id)
+                    .expect("pane render buffer");
+                buffer.scrollback_render_window(view.as_ref(), 4)
+            };
+            let width = 20_usize;
+            let mut expected_lines = Vec::new();
+            for (row_index, row) in rows.iter().enumerate() {
+                let line = base.line_for_viewport_row(row_index);
+                if line < start.line || line > end.line {
+                    continue;
+                }
+                let start_col = if line == start.line { start.col } else { 0 };
+                let end_col = if line == end.line {
+                    end.col.saturating_add(1)
+                } else {
+                    width
+                };
+                expected_lines.push(grid_row_text_range(row, width, start_col, end_col));
+            }
+
+            assert_eq!(
+                copied,
+                expected_lines.join("\n"),
+                "copied text must match highlighted cells for \
+                 anchor ({anchor_row},{anchor_col}) head ({head_row},{head_col})"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_all_attach_selection_anchors_drops_every_pane_anchor() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        assert!(enter_attach_scrollback_for(&mut view_state, right_pane));
+        assert!(begin_attach_selection_for(&mut view_state, left_pane));
+        assert!(begin_attach_selection_for(&mut view_state, right_pane));
+
+        clear_all_attach_selection_anchors(&mut view_state);
+
+        assert!(view_state.scrollback_active_for(left_pane));
+        assert!(view_state.scrollback_active_for(right_pane));
+        assert!(!view_state.selection_active_for(left_pane));
+        assert!(!view_state.selection_active_for(right_pane));
     }
 
     #[test]
@@ -18975,7 +19206,7 @@ server_timeout = 1234
         let original_mode = processor.active_mode_id().map(ToString::to_string);
         view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
             pane_id: Uuid::from_u128(2),
-            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            anchor: AttachScrollbackPosition { line: 0, col: 0 },
             active: false,
         });
 
@@ -19025,7 +19256,7 @@ server_timeout = 2345
         });
         view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
             pane_id: Uuid::from_u128(2),
-            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            anchor: AttachScrollbackPosition { line: 0, col: 0 },
             active: false,
         });
 

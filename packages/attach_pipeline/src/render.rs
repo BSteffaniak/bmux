@@ -2690,7 +2690,8 @@ fn transparent_run_width(
 struct GridRowRenderContext<'a> {
     row: &'a PhysicalRow,
     selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
-    absolute_row: usize,
+    /// Absolute history line this row draws, for selection hit-testing.
+    selection_line: u64,
     runtime_appearance: &'a RuntimeAppearance,
     palette: &'a bmux_terminal_grid::StylePalette,
     before_content_cells: &'a BTreeMap<u16, RenderUnderCell>,
@@ -2711,7 +2712,7 @@ fn render_grid_row_segment(
         let raw_style = cell.map_or_else(CellStyle::default, |cell| {
             grid_cell_style(context.palette.get(cell.style()))
         });
-        let selected = cell_selected(context.selection, context.absolute_row, usize::from(col));
+        let selected = cell_selected(context.selection, context.selection_line, usize::from(col));
         let coverage = pane_cell_coverage(cell, raw_style, selected);
         if let Some(under_cell) = context.before_content_cells.get(&col) {
             match coverage {
@@ -2785,7 +2786,7 @@ fn render_grid_row_segment(
         let mut style = CellStyle::default();
         if cell_selected(
             context.selection,
-            context.absolute_row,
+            context.selection_line,
             usize::from(end_col),
         ) {
             style = selected_style(style);
@@ -2873,22 +2874,22 @@ fn merge_ranges(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
 
 const fn cell_selected(
     selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
-    row: usize,
+    line: u64,
     col: usize,
 ) -> bool {
     let Some((start, end)) = selection else {
         return false;
     };
-    if row < start.row || row > end.row {
+    if line < start.line || line > end.line {
         return false;
     }
-    if start.row == end.row {
-        return row == start.row && col >= start.col && col <= end.col;
+    if start.line == end.line {
+        return col >= start.col && col <= end.col;
     }
-    if row == start.row {
+    if line == start.line {
         return col >= start.col;
     }
-    if row == end.row {
+    if line == end.line {
         return col <= end.col;
     }
     true
@@ -4891,19 +4892,9 @@ fn queue_pane_content_for_surface<W: io::Write>(
         // pane was focused, leaking pane A's offset into pane B.
         let scrollback = stage.scrollback;
         let use_scrollback = scrollback.is_some();
-        let grid_rows = if let Some(view) = scrollback {
-            entry
-                .scrollback_window
-                .as_ref()
-                .filter(|window| window.scrollback_offset == view.offset)
-                .map_or_else(
-                    || vec![PhysicalRow::new(); inner_h],
-                    |window| window.rows.clone(),
-                )
-        } else {
-            entry.terminal_grid.grid().display_rows(0, inner_h)
-        };
-        let selection = scrollback.and_then(|view| view.selection_bounds());
+        let (grid_rows, viewport_base) =
+            entry.scrollback_render_window(scrollback.as_ref(), inner_h);
+        let selection = scrollback.and_then(|view| view.selection_bounds(viewport_base));
         if stage.focus {
             let (cursor_row, cursor_col) = if let Some(view) = scrollback {
                 let cursor = view.cursor;
@@ -4976,8 +4967,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                             GridRowRenderContext {
                                 row: &blank_row,
                                 selection,
-                                absolute_row: scrollback
-                                    .map_or(row, |view| view.offset.saturating_add(row)),
+                                selection_line: viewport_base.line_for_viewport_row(row),
                                 runtime_appearance: stage.runtime_appearance,
                                 palette: entry.terminal_grid.grid().palette(),
                                 before_content_cells: &before_cells,
@@ -4991,8 +4981,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                             GridRowRenderContext {
                                 row: grid_row,
                                 selection,
-                                absolute_row: scrollback
-                                    .map_or(row, |view| view.offset.saturating_add(row)),
+                                selection_line: viewport_base.line_for_viewport_row(row),
                                 runtime_appearance: stage.runtime_appearance,
                                 palette: entry.terminal_grid.grid().palette(),
                                 before_content_cells: &before_cells,
@@ -5019,9 +5008,8 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                         GridRowRenderContext {
                                             row: &blank_row,
                                             selection,
-                                            absolute_row: scrollback.map_or(row, |view| {
-                                                view.offset.saturating_add(row)
-                                            }),
+                                            selection_line: viewport_base
+                                                .line_for_viewport_row(row),
                                             runtime_appearance: stage.runtime_appearance,
                                             palette: entry.terminal_grid.grid().palette(),
                                             before_content_cells: &before_cells,
@@ -5035,9 +5023,8 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                         GridRowRenderContext {
                                             row: grid_row,
                                             selection,
-                                            absolute_row: scrollback.map_or(row, |view| {
-                                                view.offset.saturating_add(row)
-                                            }),
+                                            selection_line: viewport_base
+                                                .line_for_viewport_row(row),
                                             runtime_appearance: stage.runtime_appearance,
                                             palette: entry.terminal_grid.grid().palette(),
                                             before_content_cells: &before_cells,
@@ -5086,7 +5073,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 GridRowRenderContext {
                     row: &blank_row,
                     selection: None,
-                    absolute_row: row,
+                    selection_line: 0,
                     runtime_appearance: stage.runtime_appearance,
                     palette: &palette,
                     before_content_cells: &before_cells,
@@ -5368,7 +5355,7 @@ mod tests {
             GridRowRenderContext {
                 row,
                 selection: None,
-                absolute_row: 0,
+                selection_line: 0,
                 runtime_appearance: appearance,
                 palette: grid.palette(),
                 before_content_cells: &before_content_cells,
@@ -8875,7 +8862,7 @@ mod tests {
                 PaneScrollbackView {
                     offset: 0,
                     cursor: AttachScrollbackCursor { row: 0, col: 4 },
-                    selection_anchor: Some(AttachScrollbackPosition { row: 0, col: 1 }),
+                    selection_anchor: Some(AttachScrollbackPosition { line: 0, col: 1 }),
                 },
             ),
             false,

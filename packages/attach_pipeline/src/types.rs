@@ -28,10 +28,69 @@ pub struct AttachScrollbackCursor {
     pub col: usize,
 }
 
+/// A position in a pane's scrollback, addressed by absolute history line.
+///
+/// `line` counts rows from the very first row ever scrolled into this pane's
+/// history, in the numbering established by
+/// [`bmux_terminal_grid::TerminalGrid::total_scrolled_rows`]. It is therefore
+/// stable while the view scrolls and while new output arrives, which is what
+/// makes it usable as a selection endpoint. Converting to and from a viewport
+/// row always goes through [`ScrollbackViewportBase`]; never add a scrollback
+/// offset to a viewport row directly, because those two axes count in opposite
+/// directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AttachScrollbackPosition {
-    pub row: usize,
+    pub line: u64,
     pub col: usize,
+}
+
+/// Mapping between absolute history lines and viewport rows for one rendered
+/// pane window.
+///
+/// `top_line` is the absolute history line drawn on the window's first row.
+/// Both the renderer's selection highlight and the copy path must derive their
+/// row identity from the same base, or they will disagree about what is
+/// selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbackViewportBase {
+    top_line: u64,
+}
+
+impl ScrollbackViewportBase {
+    /// Base for a window showing `scrollback_offset` rows back from the live
+    /// bottom of a grid that has scrolled `total_scrolled_rows` rows into
+    /// history.
+    #[must_use]
+    pub fn from_scrolled_rows(total_scrolled_rows: u64, scrollback_offset: usize) -> Self {
+        Self {
+            top_line: total_scrolled_rows
+                .saturating_sub(u64::try_from(scrollback_offset).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// Absolute history line drawn on the window's first row.
+    #[must_use]
+    pub const fn top_line(self) -> u64 {
+        self.top_line
+    }
+
+    /// Absolute history line drawn on viewport row `row`.
+    #[must_use]
+    pub fn line_for_viewport_row(self, row: usize) -> u64 {
+        self.top_line
+            .saturating_add(u64::try_from(row).unwrap_or(u64::MAX))
+    }
+
+    /// Viewport row drawing absolute history line `line`, if it is within
+    /// `height` rows of this window's top.
+    #[must_use]
+    pub fn viewport_row_for_line(self, line: u64, height: usize) -> Option<usize> {
+        if line < self.top_line {
+            return None;
+        }
+        let row = usize::try_from(line.saturating_sub(self.top_line)).ok()?;
+        (row < height).then_some(row)
+    }
 }
 
 /// Per-pane scrollback view position.
@@ -47,30 +106,52 @@ pub struct PaneScrollbackView {
     pub offset: usize,
     /// Viewport-relative selection/navigation cursor.
     pub cursor: AttachScrollbackCursor,
-    /// Absolute (history-relative) selection anchor, when selecting.
+    /// Selection anchor as an absolute history line, when selecting.
     pub selection_anchor: Option<AttachScrollbackPosition>,
 }
 
 impl PaneScrollbackView {
-    /// Absolute history position of this view's cursor.
+    /// Absolute history position of this view's cursor, in `base`'s numbering.
     #[must_use]
-    pub const fn cursor_absolute_position(&self) -> AttachScrollbackPosition {
+    pub fn cursor_position(&self, base: ScrollbackViewportBase) -> AttachScrollbackPosition {
         AttachScrollbackPosition {
-            row: self.offset.saturating_add(self.cursor.row),
+            line: base.line_for_viewport_row(self.cursor.row),
             col: self.cursor.col,
         }
     }
 
     /// Ordered selection bounds, when a selection anchor is set.
     #[must_use]
-    pub fn selection_bounds(&self) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
+    pub fn selection_bounds(
+        &self,
+        base: ScrollbackViewportBase,
+    ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
         let anchor = self.selection_anchor?;
-        let head = self.cursor_absolute_position();
+        let head = self.cursor_position(base);
         Some(if anchor <= head {
             (anchor, head)
         } else {
             (head, anchor)
         })
+    }
+
+    /// Shift the selection anchor into a new line numbering.
+    ///
+    /// Used when the base a selection was created against is replaced by a
+    /// different one (for example when the first server scrollback window
+    /// arrives for a pane whose local grid started counting from zero).
+    pub fn rebase_selection_anchor(
+        &mut self,
+        from: ScrollbackViewportBase,
+        to: ScrollbackViewportBase,
+    ) {
+        if from == to {
+            return;
+        }
+        if let Some(anchor) = self.selection_anchor.as_mut() {
+            let offset_from_top = anchor.line.saturating_sub(from.top_line());
+            anchor.line = to.top_line().saturating_add(offset_from_top);
+        }
     }
 }
 
@@ -243,6 +324,75 @@ pub struct PaneScrollbackWindow {
     pub max_scrollback_offset: usize,
     pub total_scrolled_rows: u64,
     pub rows: Vec<PhysicalRow>,
+}
+
+impl PaneRenderBuffer {
+    /// Rows to draw for this pane, plus the line numbering they are drawn in.
+    ///
+    /// This is the single source of truth for "what is currently on screen for
+    /// this pane". Both the renderer's selection highlight and the selection
+    /// copy path must go through it, otherwise they can disagree about which
+    /// history line each viewport row holds.
+    ///
+    /// The server-provided window is authoritative when it matches the view's
+    /// offset. Otherwise the client's own grid is projected at that offset: it
+    /// mirrors the same output stream, so it is a far better approximation than
+    /// blank rows while the window request is in flight — which matters most at
+    /// offset 0, where a mouse selection enters scrollback with no window yet.
+    #[must_use]
+    pub fn scrollback_render_window(
+        &self,
+        view: Option<&PaneScrollbackView>,
+        height: usize,
+    ) -> (Vec<PhysicalRow>, ScrollbackViewportBase) {
+        let grid = self.terminal_grid.grid();
+        let offset = view.map_or(0, |view| view.offset);
+        self.scrollback_window
+            .as_ref()
+            .filter(|window| view.is_some() && window.scrollback_offset == offset)
+            .map_or_else(
+                || {
+                    (
+                        grid.display_rows(offset, height),
+                        ScrollbackViewportBase::from_scrolled_rows(
+                            grid.total_scrolled_rows(),
+                            offset,
+                        ),
+                    )
+                },
+                |window| {
+                    (
+                        window.rows.clone(),
+                        ScrollbackViewportBase::from_scrolled_rows(
+                            window.total_scrolled_rows,
+                            window.scrollback_offset,
+                        ),
+                    )
+                },
+            )
+    }
+
+    /// Line numbering currently on screen for this pane.
+    #[must_use]
+    pub fn scrollback_viewport_base(
+        &self,
+        view: Option<&PaneScrollbackView>,
+    ) -> ScrollbackViewportBase {
+        let grid = self.terminal_grid.grid();
+        let offset = view.map_or(0, |view| view.offset);
+        self.scrollback_window
+            .as_ref()
+            .filter(|window| view.is_some() && window.scrollback_offset == offset)
+            .map_or_else(
+                || ScrollbackViewportBase::from_scrolled_rows(grid.total_scrolled_rows(), offset),
+                |window| {
+                    ScrollbackViewportBase::from_scrolled_rows(
+                        window.total_scrolled_rows,
+                        window.scrollback_offset,
+                    )
+                },
+            )
+    }
 }
 
 impl Default for PaneRenderBuffer {

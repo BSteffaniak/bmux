@@ -12,4 +12,6 @@ send-attach key='v'
 send-attach key='k'
 assert-state path='selection.active' equals='true'
 assert-state path='scrollback.cursor' equals='[2,2]'
-assert-state path='selection.text' equals='"e\n  f"'
+# Anchor at row 3 col 2, head at row 2 col 2: covers `     five` from col 2
+# through `  six` col 2.
+assert-state path='selection.text' equals='"   five\n  s"'

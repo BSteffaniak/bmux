@@ -1280,7 +1280,9 @@ mod tests {
 
         assert!(sim.selection_active());
         assert_eq!(sim.scrollback_cursor(), Some((2, 2)));
-        assert_eq!(sim.selected_text(), Some("e\n  f".to_string()));
+        // Selection runs from the anchor at row 3 col 2 up to row 2 col 2, so it
+        // covers `     five` from col 2 and `  six` through col 2.
+        assert_eq!(sim.selected_text(), Some("   five\n  s".to_string()));
     }
 
     #[test]

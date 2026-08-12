@@ -888,7 +888,7 @@ mod tests {
     fn test_selection_drag() -> AttachMouseSelectionDrag {
         AttachMouseSelectionDrag {
             pane_id: Uuid::from_u128(4),
-            anchor: AttachScrollbackPosition { row: 0, col: 0 },
+            anchor: AttachScrollbackPosition { line: 0, col: 0 },
             active: false,
         }
     }
