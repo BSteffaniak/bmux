@@ -85,7 +85,6 @@ enabled = true\n\
 preset = \"tab_rail\"\n\
 tab_scope = \"all_contexts\"\n\
 tab_order = \"stable\"\n\
-max_tabs = 14\n\
 tab_label_max_width = 22\n\
 show_tab_index = true\n\
 show_mode = true\n\

@@ -56,30 +56,22 @@ pub fn build_attach_status_line(
 
     let style = StatusRenderStyle::from_config(config);
     let resolved_appearance = ResolvedStatusAppearance::resolve(config, runtime_appearance);
-    let mut left = String::new();
     let mut tab_hitboxes = Vec::new();
     let mut overflow_ranges = Vec::new();
-    left.push_str(&" ".repeat(config.layout.left_padding));
 
-    append_tabs(
-        &mut left,
-        &mut tab_hitboxes,
-        &mut overflow_ranges,
-        config,
-        tabs,
-        &style,
-    );
-
+    // Left-side segments that trail the tab strip are measured before the
+    // tabs are packed so the tab strip knows how much width it may use.
+    let mut tail = String::new();
     if config.show_session_name {
         append_segment(
-            &mut left,
+            &mut tail,
             &style.module_separator,
             &format!("session:{session_label} ({session_count})"),
         );
     }
     if config.show_context_name {
         append_segment(
-            &mut left,
+            &mut tail,
             &style.module_separator,
             &format!("ctx:{current_context_label}"),
         );
@@ -118,6 +110,27 @@ pub fn build_attach_status_line(
     if config.layout.right_padding > 0 {
         right.push_str(&" ".repeat(config.layout.right_padding));
     }
+
+    // Budget available to the tab strip: total width minus the right-aligned
+    // modules, the minimum one-column spacer `compose_status_line` reserves
+    // between the two sides, the left padding, and the trailing left segments.
+    let tab_budget = usize::from(width)
+        .saturating_sub(display_width(&right))
+        .saturating_sub(usize::from(!right.is_empty()))
+        .saturating_sub(config.layout.left_padding)
+        .saturating_sub(display_width(&tail));
+
+    let mut left = " ".repeat(config.layout.left_padding);
+    append_tabs(
+        &mut left,
+        &mut tab_hitboxes,
+        &mut overflow_ranges,
+        config,
+        tabs,
+        &style,
+        tab_budget,
+    );
+    left.push_str(&tail);
 
     let composed = compose_status_line(width, &left, &right);
     clamp_hitboxes_to_width(&mut tab_hitboxes, width);
@@ -198,14 +211,17 @@ fn append_tabs(
     config: &StatusBarConfig,
     tabs: &[AttachTab],
     style: &StatusRenderStyle,
+    budget: usize,
 ) {
     if tabs.is_empty() {
         out.push_str(&style.empty_tabs_label);
         return;
     }
 
-    let max_tabs = config.max_tabs.max(1);
-    let (visible, hidden_left, hidden_right) = visible_tabs_for_layout(tabs, max_tabs, config);
+    let tokens = tab_tokens(config, tabs, style);
+    let window = visible_tabs_for_layout(&tokens, config, style, budget);
+    let hidden_left = window.start;
+    let hidden_right = tokens.len().saturating_sub(window.end);
     let mut col = display_width(out);
 
     if hidden_left > 0 {
@@ -219,37 +235,21 @@ fn append_tabs(
         col = col.saturating_add(display_width(&style.tab_separator));
     }
 
-    for (index, tab) in visible.iter().enumerate() {
-        if index > 0 {
+    for (offset, token) in tokens[window.start..window.end].iter().enumerate() {
+        if offset > 0 {
             out.push_str(&style.tab_separator);
             col = col.saturating_add(display_width(&style.tab_separator));
         }
-        let label = truncate_cells(&tab.label, config.tab_label_max_width.max(1));
-        let global_index = tabs
-            .iter()
-            .position(|entry| entry.context_id == tab.context_id)
-            .unwrap_or(index);
-        let indexed = if config.show_tab_index {
-            format!("{}:{}", global_index + 1, label)
-        } else {
-            label
-        };
-        let token = if tab.active {
-            style.active_tab(&indexed)
-        } else {
-            style.inactive_tab(&indexed)
-        };
-        out.push_str(&token);
-        let token_width = display_width(&token);
-        if let Some(context_id) = tab.context_id {
+        out.push_str(&token.text);
+        if let Some(context_id) = token.context_id {
             hitboxes.push(AttachStatusTabHitbox {
                 start_col: u16::try_from(col).unwrap_or(u16::MAX),
-                end_col: u16::try_from(col.saturating_add(token_width.saturating_sub(1)))
+                end_col: u16::try_from(col.saturating_add(token.width.saturating_sub(1)))
                     .unwrap_or(u16::MAX),
                 context_id,
             });
         }
-        col = col.saturating_add(token_width);
+        col = col.saturating_add(token.width);
     }
 
     if hidden_right > 0 {
@@ -264,26 +264,171 @@ fn append_tabs(
     }
 }
 
-fn visible_tabs_for_layout<'a>(
-    tabs: &'a [AttachTab],
-    max_tabs: usize,
+/// One tab pre-rendered to its final status-bar token, so packing decisions
+/// can measure exact display widths without re-formatting.
+struct TabToken {
+    text: String,
+    width: usize,
+    active: bool,
+    context_id: Option<Uuid>,
+}
+
+fn tab_tokens(
     config: &StatusBarConfig,
-) -> (Vec<&'a AttachTab>, usize, usize) {
-    if tabs.len() <= max_tabs {
-        return (tabs.iter().collect(), 0, 0);
+    tabs: &[AttachTab],
+    style: &StatusRenderStyle,
+) -> Vec<TabToken> {
+    tabs.iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let label = truncate_cells(&tab.label, config.tab_label_max_width.max(1));
+            let indexed = if config.show_tab_index {
+                format!("{}:{}", index + 1, label)
+            } else {
+                label
+            };
+            let text = if tab.active {
+                style.active_tab(&indexed)
+            } else {
+                style.inactive_tab(&indexed)
+            };
+            TabToken {
+                width: display_width(&text),
+                text,
+                active: tab.active,
+                context_id: tab.context_id,
+            }
+        })
+        .collect()
+}
+
+/// Half-open range of tab indexes that will be rendered.
+struct TabWindow {
+    start: usize,
+    end: usize,
+}
+
+/// Choose the widest run of tabs that fits `budget` display columns while
+/// always keeping the active tab visible.
+///
+/// Width is the primary constraint; `status_bar.max_tabs`, when set, applies
+/// an additional hard cap on the number of visible tabs.
+fn visible_tabs_for_layout(
+    tokens: &[TabToken],
+    config: &StatusBarConfig,
+    style: &StatusRenderStyle,
+    budget: usize,
+) -> TabWindow {
+    let anchor = tokens
+        .iter()
+        .position(|token| token.active)
+        .unwrap_or(0)
+        .min(tokens.len().saturating_sub(1));
+    let cap = config.max_tabs.unwrap_or(usize::MAX).max(1);
+
+    // The anchor is always rendered, even when it alone exceeds the budget;
+    // `compose_status_line` truncates rather than dropping the active tab.
+    let mut window = TabWindow {
+        start: anchor,
+        end: anchor + 1,
+    };
+    let separator_width = display_width(&style.tab_separator);
+
+    // Alternate extension direction so `FocusBias` keeps the active tab
+    // centered, while `KeepVisible` fills to the left first and therefore
+    // parks the active tab at the right edge of the strip.
+    let mut prefer_left = match config.layout.align_active {
+        StatusAlignActive::KeepVisible => true,
+        StatusAlignActive::FocusBias => false,
+    };
+
+    while window.end - window.start < cap {
+        let can_extend_left = window.start > 0;
+        let can_extend_right = window.end < tokens.len();
+        if !can_extend_left && !can_extend_right {
+            break;
+        }
+
+        let extend_left = if prefer_left {
+            can_extend_left
+        } else {
+            !can_extend_right
+        };
+        let candidate = if extend_left {
+            TabWindow {
+                start: window.start - 1,
+                end: window.end,
+            }
+        } else {
+            TabWindow {
+                start: window.start,
+                end: window.end + 1,
+            }
+        };
+
+        if tab_strip_width(tokens, &candidate, style, separator_width) > budget {
+            // This direction is exhausted for good; try the other one and stop
+            // once neither can grow.
+            let other = if extend_left {
+                TabWindow {
+                    start: window.start,
+                    end: window.end + 1,
+                }
+            } else {
+                TabWindow {
+                    start: window.start.saturating_sub(1),
+                    end: window.end,
+                }
+            };
+            let other_fits = if extend_left {
+                window.end < tokens.len()
+            } else {
+                window.start > 0
+            } && tab_strip_width(tokens, &other, style, separator_width) <= budget;
+            if !other_fits {
+                break;
+            }
+            window = other;
+        } else {
+            window = candidate;
+        }
+
+        if matches!(config.layout.align_active, StatusAlignActive::FocusBias) {
+            prefer_left = !prefer_left;
+        }
     }
-    let active_index = tabs.iter().position(|tab| tab.active).unwrap_or(0);
-    let start = match config.layout.align_active {
-        StatusAlignActive::KeepVisible => active_index.saturating_sub(max_tabs.saturating_sub(1)),
-        StatusAlignActive::FocusBias => active_index.saturating_sub(max_tabs / 2),
+
+    window
+}
+
+/// Total display width of the rendered tab strip for `window`, including the
+/// inter-tab separators and whichever overflow markers would still be needed.
+fn tab_strip_width(
+    tokens: &[TabToken],
+    window: &TabWindow,
+    style: &StatusRenderStyle,
+    separator_width: usize,
+) -> usize {
+    let visible = window.end.saturating_sub(window.start);
+    let mut width = tokens[window.start..window.end]
+        .iter()
+        .map(|token| token.width)
+        .sum::<usize>()
+        .saturating_add(separator_width.saturating_mul(visible.saturating_sub(1)));
+
+    let hidden_left = window.start;
+    if hidden_left > 0 {
+        width = width
+            .saturating_add(display_width(&style.overflow_marker(hidden_left)))
+            .saturating_add(separator_width);
     }
-    .min(tabs.len().saturating_sub(max_tabs));
-    let end = (start + max_tabs).min(tabs.len());
-    (
-        tabs[start..end].iter().collect(),
-        start,
-        tabs.len().saturating_sub(end),
-    )
+    let hidden_right = tokens.len().saturating_sub(window.end);
+    if hidden_right > 0 {
+        width = width
+            .saturating_add(display_width(&style.overflow_marker(hidden_right)))
+            .saturating_add(separator_width);
+    }
+    width
 }
 
 struct StatusRenderStyle {
@@ -989,5 +1134,144 @@ mod tests {
 
         assert!(status.rendered.is_empty());
         assert!(status.spans.is_empty());
+    }
+
+    fn sim_tabs(count: usize, active: usize) -> Vec<AttachTab> {
+        (0..count)
+            .map(|index| AttachTab {
+                label: format!("win{index}"),
+                active: index == active,
+                context_id: Some(Uuid::from_u128(index as u128 + 1)),
+            })
+            .collect()
+    }
+
+    fn status_line_for(
+        width: u16,
+        config: &StatusBarConfig,
+        tabs: &[AttachTab],
+    ) -> AttachStatusLine {
+        build_attach_status_line(
+            width,
+            config,
+            &RuntimeAppearance::default(),
+            "session",
+            1,
+            "context",
+            tabs,
+            None,
+            "NORMAL",
+            "write",
+            None,
+            "",
+        )
+    }
+
+    fn plain_rendered(status: &AttachStatusLine) -> String {
+        status
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn wide_width_shows_every_tab_without_overflow_marker() {
+        let tabs = sim_tabs(20, 0);
+        let status = status_line_for(300, &StatusBarConfig::default(), &tabs);
+        let rendered = plain_rendered(&status);
+
+        for index in 0..20 {
+            assert!(
+                rendered.contains(&format!("{}:win{index}", index + 1)),
+                "tab {index} should be visible at width 300: {rendered:?}"
+            );
+        }
+        assert!(!rendered.contains('◀'), "{rendered:?}");
+        assert!(!rendered.contains('▶'), "{rendered:?}");
+        assert_eq!(status.tab_hitboxes.len(), 20);
+    }
+
+    #[test]
+    fn narrow_width_collapses_tabs_and_keeps_active_visible() {
+        let tabs = sim_tabs(20, 19);
+        let status = status_line_for(40, &StatusBarConfig::default(), &tabs);
+        let rendered = plain_rendered(&status);
+
+        assert_eq!(display_width(&rendered), 40, "{rendered:?}");
+        assert!(rendered.contains("20:win19"), "{rendered:?}");
+        assert!(rendered.contains('◀'), "{rendered:?}");
+        assert!(status.tab_hitboxes.len() < 20);
+    }
+
+    #[test]
+    fn explicit_max_tabs_caps_tab_count_on_wide_terminals() {
+        let tabs = sim_tabs(20, 0);
+        let config = StatusBarConfig {
+            max_tabs: Some(3),
+            ..StatusBarConfig::default()
+        };
+        let status = status_line_for(300, &config, &tabs);
+        let rendered = plain_rendered(&status);
+
+        assert_eq!(status.tab_hitboxes.len(), 3, "{rendered:?}");
+        assert!(rendered.contains("1:win0"), "{rendered:?}");
+        assert!(rendered.contains("3:win2"), "{rendered:?}");
+        assert!(!rendered.contains("4:win3"), "{rendered:?}");
+        assert!(rendered.contains('▶'), "{rendered:?}");
+    }
+
+    #[test]
+    fn hitboxes_match_rendered_tab_columns_at_wide_width() {
+        let tabs = sim_tabs(6, 2);
+        let status = status_line_for(200, &StatusBarConfig::default(), &tabs);
+        let rendered = plain_rendered(&status);
+        let cells = rendered.chars().collect::<Vec<_>>();
+
+        for (index, hitbox) in status.tab_hitboxes.iter().enumerate() {
+            let start = usize::from(hitbox.start_col);
+            let end = usize::from(hitbox.end_col);
+            let token = cells[start..=end].iter().collect::<String>();
+            assert_eq!(
+                token.trim(),
+                format!("{}:win{index}", index + 1),
+                "hitbox {index} should cover its token: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_tab_stays_visible_when_it_is_the_last_of_many() {
+        let tabs = sim_tabs(30, 29);
+        let status = status_line_for(60, &StatusBarConfig::default(), &tabs);
+        let rendered = plain_rendered(&status);
+
+        assert!(rendered.contains("30:win29"), "{rendered:?}");
+        let active_context = Uuid::from_u128(30);
+        assert!(
+            status
+                .tab_hitboxes
+                .iter()
+                .any(|hitbox| hitbox.context_id == active_context),
+            "active tab should keep a hitbox: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn tab_strip_never_overlaps_right_modules() {
+        let tabs = sim_tabs(12, 0);
+        for width in [30_u16, 45, 60, 80, 120] {
+            let status = status_line_for(width, &StatusBarConfig::default(), &tabs);
+            let rendered = plain_rendered(&status);
+            assert_eq!(
+                display_width(&rendered),
+                usize::from(width),
+                "width {width} should render exactly: {rendered:?}"
+            );
+            assert!(
+                rendered.contains("NORMAL"),
+                "width {width} should keep the mode badge: {rendered:?}"
+            );
+        }
     }
 }

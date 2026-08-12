@@ -33,6 +33,7 @@ const ATTACH_SIM_FIXTURES: &[&str] = &[
     "attach_sim_tab_click_switch.dsl",
     "attach_sim_status_top.dsl",
     "attach_sim_status_snapshot.dsl",
+    "attach_sim_status_wide_tabs.dsl",
     "attach_sim_scrollback_selection.dsl",
     "attach_sim_pane_resize.dsl",
     "attach_sim_floating_pane_drag.dsl",

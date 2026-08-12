@@ -2156,7 +2156,7 @@ fn validate_server_gateway_config(gateway: &ServerGatewayConfig) -> Result<()> {
 }
 
 fn validate_status_bar_config(status_bar: &StatusBarConfig) -> Result<()> {
-    if status_bar.max_tabs == 0 {
+    if status_bar.max_tabs == Some(0) {
         return Err(ConfigError::InvalidValue {
             field: "status_bar.max_tabs".to_string(),
             value: "0".to_string(),
@@ -2630,8 +2630,10 @@ pub struct StatusBarConfig {
     /// Optional status-specific color overrides.
     #[config_doc(nested)]
     pub colors: StatusBarColorConfig,
-    /// Maximum number of tabs shown in the tab strip before overflow is collapsed.
-    pub max_tabs: usize,
+    /// Optional hard cap on tabs shown in the tab strip before overflow is
+    /// collapsed. When unset, the tab strip fills the available status-bar
+    /// width and only collapses tabs that do not fit.
+    pub max_tabs: Option<usize>,
     /// Maximum display width for each tab label.
     pub tab_label_max_width: usize,
     /// Display 1-based tab indexes before labels.
@@ -2664,7 +2666,7 @@ impl Default for StatusBarConfig {
             layout: StatusBarLayoutConfig::default(),
             style: StatusBarStyleConfig::default(),
             colors: StatusBarColorConfig::default(),
-            max_tabs: 12,
+            max_tabs: None,
             tab_label_max_width: 20,
             show_tab_index: true,
             tab_scope: StatusTabScope::AllContexts,
@@ -3842,12 +3844,9 @@ impl BmuxConfig {
             ));
         }
 
-        if self.status_bar.max_tabs == 0 {
-            self.status_bar.max_tabs = StatusBarConfig::default().max_tabs;
-            repaired_fields.push(format!(
-                "status_bar.max_tabs=0 -> {}",
-                self.status_bar.max_tabs
-            ));
+        if self.status_bar.max_tabs == Some(0) {
+            self.status_bar.max_tabs = None;
+            repaired_fields.push("status_bar.max_tabs=0 -> auto".to_string());
         }
 
         if self.status_bar.tab_label_max_width == 0 {
@@ -4055,6 +4054,38 @@ key_file = "/tmp/gateway-key.pem"
         let mut config = BmuxConfig::default();
         config.plugins.native_service.buffer_resize_attempts = 0;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn status_bar_max_tabs_defaults_to_width_aware_auto() {
+        let config = BmuxConfig::default();
+        assert_eq!(config.status_bar.max_tabs, None);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn status_bar_max_tabs_validates_and_repairs_zero() {
+        let mut config = BmuxConfig::default();
+        config.status_bar.max_tabs = Some(0);
+        assert!(config.validate().is_err());
+
+        let repaired = config.sanitize_invalid_values();
+        assert_eq!(config.status_bar.max_tabs, None);
+        assert!(
+            repaired
+                .iter()
+                .any(|field| field == "status_bar.max_tabs=0 -> auto"),
+            "repair should report the auto fallback: {repaired:?}"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn status_bar_max_tabs_accepts_explicit_cap() {
+        let mut config = BmuxConfig::default();
+        config.status_bar.max_tabs = Some(6);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.status_bar.max_tabs, Some(6));
     }
 
     #[test]
