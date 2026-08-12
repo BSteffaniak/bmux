@@ -159,7 +159,9 @@ impl<W: Write> Terminal<W> {
     ///
     /// Region damage is valid only after a successful complete presentation. If no retained
     /// frame exists, the terminal safely promotes the draw to a complete presentation. Rendering
-    /// and metadata are staged and become authoritative only after terminal output flushes.
+    /// and metadata are staged and become authoritative only after terminal output flushes. A
+    /// regional render that does not emit cursor or focus-scope metadata retains the previously
+    /// committed values; emitting either value replaces it.
     ///
     /// # Errors
     ///
@@ -210,8 +212,16 @@ impl<W: Write> Terminal<W> {
                 Vec::new()
             };
             images.extend_from_slice(frame.images());
-            let cursor = frame.cursor();
-            let focus_scope = frame.focus_scope().cloned();
+            let cursor = frame.cursor().or_else(|| {
+                matches!(damage, Damage::Regions(_))
+                    .then_some(self.cursor)
+                    .flatten()
+            });
+            let focus_scope = frame.focus_scope().cloned().or_else(|| {
+                matches!(damage, Damage::Regions(_))
+                    .then(|| self.focus_scope.clone())
+                    .flatten()
+            });
             (cursor, hits, focus_scope, images)
         };
         if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
@@ -364,11 +374,13 @@ mod tests {
     #[test]
     fn region_draw_retains_undamaged_cells_and_metadata() {
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+        let scope = crate::hit::HitId::new("modal");
         terminal
             .draw(|frame| {
                 frame.fill(Rect::new(0, 0, 4, 2), "A", Style::new());
                 frame.push_hit(HitRegion::new("left", Rect::new(0, 0, 2, 2)));
                 frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 2)));
+                frame.set_focus_scope(Some(scope.clone()));
                 frame.set_cursor(Cursor::visible(Point::new(3, 1)));
             })
             .unwrap();
@@ -382,6 +394,8 @@ mod tests {
 
         assert_eq!(stats.changed_cells, 4);
         assert!(!stats.full_repaint);
+        assert_eq!(terminal.cursor(), Some(Cursor::visible(Point::new(3, 1))));
+        assert_eq!(terminal.focus().active_scope(), Some(&scope));
         assert_eq!(
             terminal
                 .hits()
