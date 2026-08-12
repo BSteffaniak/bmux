@@ -612,9 +612,7 @@ impl<'a> TextView<'a> {
             return outcome;
         }
         match event {
-            Event::Key(stroke)
-                if state.focused && self.policy.keyboard && stroke.modifiers.is_empty() =>
-            {
+            Event::Key(stroke) if self.policy.keyboard && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Up => self.scroll_by(area, state, -1),
                     KeyCode::Down => self.scroll_by(area, state, 1),
@@ -1290,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_text_view_does_not_consume_keyboard_scrolling() {
+    fn directly_dispatched_text_view_key_scrolls_without_visual_focus() {
         let lines = [Line::from("one"), Line::from("two")];
         let view = TextView::new(&lines);
         let mut state = TextViewState::new();
@@ -1301,8 +1299,8 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Down)),
         );
 
-        assert_eq!(outcome, TextViewOutcome::Ignored);
-        assert_eq!(state.vertical_scroll(), 0);
+        assert_eq!(outcome, TextViewOutcome::Scrolled { vertical_scroll: 1 });
+        assert_eq!(state.vertical_scroll(), 1);
     }
 
     #[test]

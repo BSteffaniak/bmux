@@ -260,7 +260,7 @@ impl<'a> Button<'a> {
             return ButtonOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) => self.handle_key(*state, *stroke),
+            Event::Key(stroke) => self.handle_key(*stroke),
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 ButtonOutcome::Ignored
@@ -279,8 +279,8 @@ impl<'a> Button<'a> {
         .resolve(state.interaction)
     }
 
-    const fn handle_key(&self, state: ButtonState, stroke: KeyStroke) -> ButtonOutcome {
-        if !state.interaction.focused || !stroke.modifiers.is_empty() {
+    const fn handle_key(&self, stroke: KeyStroke) -> ButtonOutcome {
+        if !stroke.modifiers.is_empty() {
             return ButtonOutcome::Ignored;
         }
         match stroke.key {

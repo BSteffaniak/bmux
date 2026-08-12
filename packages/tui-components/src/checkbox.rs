@@ -267,7 +267,7 @@ impl<'a> Checkbox<'a> {
     }
 
     const fn handle_key(&self, state: &mut CheckboxState, stroke: KeyStroke) -> CheckboxOutcome {
-        if !state.interaction.focused || !stroke.modifiers.is_empty() {
+        if !stroke.modifiers.is_empty() {
             return CheckboxOutcome::Ignored;
         }
         match stroke.key {

@@ -583,7 +583,7 @@ impl<'a> SelectableList<'a> {
         state: &mut SelectableListState,
         stroke: KeyStroke,
     ) -> SelectableListOutcome {
-        if state.focused.is_none() || !stroke.modifiers.is_empty() {
+        if !stroke.modifiers.is_empty() {
             return SelectableListOutcome::Ignored;
         }
         match stroke.key {
@@ -750,7 +750,11 @@ impl<'a> SelectableList<'a> {
         state: &mut SelectableListState,
         direction: Direction,
     ) -> SelectableListOutcome {
-        let Some(current) = state.focused else {
+        let current = state
+            .focused
+            .or(state.selected)
+            .or_else(|| self.items.iter().position(|item| !item.disabled));
+        let Some(current) = current else {
             return SelectableListOutcome::Ignored;
         };
         let Some(next) = self.next_enabled(current, direction) else {
@@ -788,7 +792,11 @@ impl<'a> SelectableList<'a> {
     }
 
     fn select_focused(&self, area: Rect, state: &mut SelectableListState) -> SelectableListOutcome {
-        let Some(index) = state.focused else {
+        let index = state
+            .focused
+            .or(state.selected)
+            .or_else(|| self.items.iter().position(|item| !item.disabled));
+        let Some(index) = index else {
             return SelectableListOutcome::Ignored;
         };
         self.select_index(area, state, index)

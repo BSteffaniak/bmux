@@ -382,11 +382,7 @@ impl<'a> TreeView<'a> {
             return TreeViewOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke)
-                if state.interaction.focused
-                    && self.policy.keyboard.enabled
-                    && stroke.modifiers.is_empty() =>
-            {
+            Event::Key(stroke) if self.policy.keyboard.enabled && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Up => self.move_selection(state, -1),
                     KeyCode::Down => self.move_selection(state, 1),
@@ -780,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_tree_does_not_consume_keyboard_navigation() {
+    fn directly_dispatched_tree_key_navigates_without_visual_focus() {
         let items = sample_items();
         let view = TreeView::new(&items);
         let mut state = TreeViewState::new(Some(0));
@@ -792,8 +788,14 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Down)),
         );
 
-        assert_eq!(outcome, TreeViewOutcome::Ignored);
-        assert_eq!(state.selected_visible(), Some(0));
+        assert_eq!(
+            outcome,
+            TreeViewOutcome::Focused {
+                visible: 1,
+                source: 1,
+            }
+        );
+        assert_eq!(state.selected_visible(), Some(1));
     }
 
     #[test]

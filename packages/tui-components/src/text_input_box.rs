@@ -353,16 +353,18 @@ impl<'a> TextInputBox<'a> {
         input.render(content, frame);
     }
 
-    /// Handle one event after updating state's content area for `area`.
+    /// Handle one input event already dispatched to this control.
+    ///
+    /// Global focus ownership belongs to the caller or [`bmux_tui::interaction::InteractionRouter`].
+    /// The local focus policy controls cursor and focused visual presentation; it does not veto an
+    /// event that was explicitly dispatched here.
     pub fn handle_event(
         &self,
         area: Rect,
         state: &mut TextInputState,
         event: &Event,
     ) -> TextInputBoxOutcome {
-        if self.policy.disabled
-            || matches!(event, Event::Key(_) | Event::Paste(_)) && !self.policy.focused
-        {
+        if self.policy.disabled {
             return TextInputBoxOutcome::Ignored;
         }
         state.set_content_area(self.layout(area).content, &self.text_policy);
@@ -459,6 +461,8 @@ mod tests {
     use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
+    use bmux_tui::hit::HitId;
+    use bmux_tui::interaction::InteractionRouter;
 
     use super::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
     use crate::text_input::{TextInputPolicy, TextInputState};
@@ -562,7 +566,47 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_text_input_ignores_keyboard_and_paste() {
+    fn router_dispatches_typing_only_to_the_default_focused_input() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut first = TextInputState::default();
+        let mut second = TextInputState::default();
+        let first_id = HitId::new("first");
+        let second_id = HitId::new("second");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
+        let mut frame = Frame::new(&mut buffer);
+        TextInputBox::new(policy).render_with_id(
+            first_id.clone(),
+            Rect::new(0, 0, 12, 3),
+            &mut first,
+            &mut frame,
+        );
+        TextInputBox::new(policy).render_with_id(
+            second_id.clone(),
+            Rect::new(0, 3, 12, 3),
+            &mut second,
+            &mut frame,
+        );
+        let mut router = InteractionRouter::new();
+        router.commit_scene(frame.hits().clone(), None);
+
+        let route = router.route(Event::Key(KeyStroke::simple(KeyCode::Char('x'))));
+        if let Some(event) = route.event_for(&first_id) {
+            assert_eq!(
+                TextInputBox::new(policy).handle_event(Rect::new(0, 0, 12, 3), &mut first, event,),
+                TextInputBoxOutcome::Edited
+            );
+        }
+        if let Some(event) = route.event_for(&second_id) {
+            let _outcome =
+                TextInputBox::new(policy).handle_event(Rect::new(0, 3, 12, 3), &mut second, event);
+        }
+
+        assert_eq!(first.buffer().text(), "x");
+        assert_eq!(second.buffer().text(), "");
+    }
+
+    #[test]
+    fn directly_dispatched_text_input_accepts_keyboard_and_paste_without_visual_focus() {
         let policy = TextInputPolicy::chat_composer();
         let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
         let input = TextInputBox::new(policy);
@@ -573,7 +617,7 @@ mod tests {
                 &mut state,
                 &Event::Key(KeyStroke::simple(KeyCode::Char('!'))),
             ),
-            TextInputBoxOutcome::Ignored
+            TextInputBoxOutcome::Edited
         );
         assert_eq!(
             input.handle_event(
@@ -581,9 +625,9 @@ mod tests {
                 &mut state,
                 &Event::Paste(" Lovelace".to_owned()),
             ),
-            TextInputBoxOutcome::Ignored
+            TextInputBoxOutcome::Edited
         );
-        assert_eq!(state.buffer().text(), "Ada");
+        assert_eq!(state.buffer().text(), "Ada! Lovelace");
     }
 
     #[test]

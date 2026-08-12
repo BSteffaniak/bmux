@@ -481,9 +481,7 @@ impl<'a> ScrollArea<'a> {
             return ScrollAreaOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if state.interaction.focused && self.policy.keyboard => {
-                self.handle_key(area, state, *stroke)
-            }
+            Event::Key(stroke) if self.policy.keyboard => self.handle_key(area, state, *stroke),
             Event::Mouse(mouse) if self.policy.mouse_wheel => {
                 self.handle_mouse(area, state, *mouse)
             }
@@ -1224,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_scroll_area_does_not_consume_keyboard_navigation() {
+    fn directly_dispatched_scroll_area_key_navigates_without_visual_focus() {
         let lines = lines(&["zero", "one", "two"]);
         let area = ScrollArea::new(&lines);
         let mut state = ScrollAreaState::new();
@@ -1235,8 +1233,8 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Down)),
         );
 
-        assert_eq!(outcome, ScrollAreaOutcome::Ignored);
-        assert_eq!(state.vertical_offset(), 0);
+        assert_eq!(outcome, ScrollAreaOutcome::Scrolled { vertical_offset: 1 });
+        assert_eq!(state.vertical_offset(), 1);
     }
 
     #[test]

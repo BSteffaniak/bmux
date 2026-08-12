@@ -208,8 +208,7 @@ impl<'a> Form<'a> {
             return FormOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke) if state.interaction.focused => self.handle_key(state, *stroke),
-            Event::Key(_) => FormOutcome::Ignored,
+            Event::Key(stroke) => self.handle_key(state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 FormOutcome::Ignored
@@ -409,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_form_does_not_consume_keyboard_actions() {
+    fn directly_dispatched_form_action_uses_internal_field_default() {
         let fields = vec![FormFieldItem::new("name").required(true)];
         let values = vec![Some("Ada")];
         let form = Form::new(&fields, &values);
@@ -417,7 +416,7 @@ mod tests {
 
         assert_eq!(
             form.handle_event(&mut state, &Event::Key(KeyStroke::simple(KeyCode::Enter)),),
-            FormOutcome::Ignored
+            FormOutcome::Submitted
         );
         assert_eq!(state.focused(), None);
     }

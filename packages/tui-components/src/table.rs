@@ -760,11 +760,7 @@ impl<'a> Table<'a> {
             return TableOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke)
-                if state.interaction.focused
-                    && self.policy.keyboard
-                    && stroke.modifiers.is_empty() =>
-            {
+            Event::Key(stroke) if self.policy.keyboard && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Up => self.move_selection(state, -1),
                     KeyCode::Down => self.move_selection(state, 1),
@@ -1871,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_table_does_not_consume_keyboard_navigation() {
+    fn directly_dispatched_table_key_navigates_without_visual_focus() {
         let columns = [TableColumn::new("Name")];
         let rows = [TableRow::new(vec!["alpha"]), TableRow::new(vec!["beta"])];
         let mut state = TableState::new(Some(0));
@@ -1882,8 +1878,8 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Down)),
         );
 
-        assert_eq!(outcome, TableOutcome::Ignored);
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(outcome, TableOutcome::Focused(1));
+        assert_eq!(state.selected(), Some(1));
     }
 
     #[test]

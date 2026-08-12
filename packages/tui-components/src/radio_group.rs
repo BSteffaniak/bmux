@@ -379,7 +379,7 @@ impl<'a> RadioGroup<'a> {
     }
 
     fn handle_key(&self, state: &mut RadioGroupState, stroke: KeyStroke) -> RadioGroupOutcome {
-        if !state.interaction.focused || !stroke.modifiers.is_empty() || self.options.is_empty() {
+        if !stroke.modifiers.is_empty() || self.options.is_empty() {
             return RadioGroupOutcome::Ignored;
         }
         match stroke.key {

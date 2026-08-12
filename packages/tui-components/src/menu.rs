@@ -262,12 +262,11 @@ impl<'a> Menu<'a> {
 
     /// Handle one input event.
     pub fn handle_event(&self, area: Rect, state: &mut MenuState, event: &Event) -> MenuOutcome {
-        let keyboard_focused = state.list.interaction.focused;
-        if keyboard_focused && matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
+        let keyboard_event = matches!(event, Event::Key(_));
+        if keyboard_event && matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
             return MenuOutcome::Cancelled;
         }
-        if keyboard_focused
-            && matches!(event, Event::Key(stroke) if Self::is_activation_key(*stroke))
+        if keyboard_event && matches!(event, Event::Key(stroke) if Self::is_activation_key(*stroke))
         {
             return state
                 .focused()
@@ -278,7 +277,7 @@ impl<'a> Menu<'a> {
                 })
                 .map_or(MenuOutcome::Ignored, |index| self.activate(index));
         }
-        if keyboard_focused
+        if keyboard_event
             && let Event::Key(stroke) = event
             && self.policy.typeahead
             && stroke.modifiers.is_empty()
@@ -432,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_menu_does_not_consume_keyboard_activation() {
+    fn directly_dispatched_menu_activation_uses_selected_item() {
         let items = items();
         let menu = Menu::new(&items);
         let mut state = MenuState::new(Some(0));
@@ -443,7 +442,13 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Enter)),
         );
 
-        assert_eq!(outcome, MenuOutcome::Ignored);
+        assert_eq!(
+            outcome,
+            MenuOutcome::Activated {
+                index: 0,
+                id: "open".to_string(),
+            }
+        );
     }
 
     #[test]

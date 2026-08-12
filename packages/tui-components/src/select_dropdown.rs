@@ -363,7 +363,7 @@ impl<'a> SelectDropdown<'a> {
         state: &mut SelectDropdownState,
         stroke: KeyStroke,
     ) -> SelectDropdownOutcome {
-        if !state.interaction.focused || !stroke.modifiers.is_empty() {
+        if !stroke.modifiers.is_empty() {
             return SelectDropdownOutcome::Ignored;
         }
         if state.open {

@@ -414,11 +414,7 @@ impl<'a> TabBar<'a> {
             return TabBarOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke)
-                if state.interaction.focused
-                    && self.policy.keyboard.enabled
-                    && stroke.modifiers.is_empty() =>
-            {
+            Event::Key(stroke) if self.policy.keyboard.enabled && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Left => self.select_relative(state, -1),
                     KeyCode::Right => self.select_relative(state, 1),
@@ -706,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_tab_bar_does_not_consume_keyboard_navigation() {
+    fn directly_dispatched_tab_key_navigates_without_visual_focus() {
         let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
         let mut state = TabBarState::new(Some(0));
 
@@ -716,8 +712,8 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Right)),
         );
 
-        assert_eq!(outcome, TabBarOutcome::Ignored);
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(outcome, TabBarOutcome::Selected(1));
+        assert_eq!(state.selected(), Some(1));
     }
 
     #[test]

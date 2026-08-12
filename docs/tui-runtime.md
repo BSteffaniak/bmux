@@ -24,8 +24,10 @@ Input follows this lifecycle:
 1. Render components into a `Frame`; standard controls register their exact bounds automatically.
 2. Successfully flush the frame, then publish its interaction scene and reconciled focus state.
 3. Commit that scene to an `InteractionRouter`.
-4. Route terminal input through the router. Pointer routes include the stable target, role, committed bounds, and target-local coordinates; keyboard and paste routes target current focus.
+4. Route terminal input through the router. Pointer routes include the stable target, role, committed bounds, and target-local coordinates; keyboard and paste routes target current focus. Use `InteractionRoute::event_for` (or compare `target`) to dispatch only to the resolved control.
 5. Apply the resulting semantic action to application state and redraw when routing or application state changed.
+
+Component `handle_event` methods accept events that have already been dispatched to that component. They continue to reject disabled input, but local `focused` fields control cursor/focused styling and internal roving-child selection rather than repeating the router's global target check. Applications that bypass `InteractionRouter` may therefore call one selected component directly without first setting a visual-focus boolean. Applications with multiple controls must not broadcast raw keyboard or paste events to every component; route once and dispatch only to the matching stable target.
 
 The router traverses enabled, visible, non-empty focusable regions with Tab/Shift-Tab, preserving stable focus IDs across redraw and responsive reflow. Explicit `tab_order` is only for exceptional visual order. Pointer presses transfer focus, activation requires press and release on the same target, one move reports both hover leave and enter, and the highest layer/latest rendered region wins overlaps.
 

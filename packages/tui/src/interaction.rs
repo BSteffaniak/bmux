@@ -30,6 +30,18 @@ pub struct InteractionRoute {
 }
 
 impl InteractionRoute {
+    /// Return whether this route targets `id` for component dispatch.
+    #[must_use]
+    pub fn targets(&self, id: &HitId) -> bool {
+        !self.traversal_consumed && self.target.as_ref() == Some(id)
+    }
+
+    /// Return the routed event when `id` is its resolved dispatch target.
+    #[must_use]
+    pub fn event_for(&self, id: &HitId) -> Option<&Event> {
+        self.targets(id).then_some(&self.event)
+    }
+
     /// Whether this event represents semantic control activation.
     #[must_use]
     pub const fn is_activation(&self) -> bool {
@@ -319,6 +331,56 @@ mod tests {
                     .hoverable(true)
                     .focusable(true),
             )
+    }
+
+    #[test]
+    fn default_focus_routes_keys_and_paste_only_to_the_first_target() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene(), None);
+        let first = HitId::new("first");
+        let second = HitId::new("second");
+
+        let key = router.route(Event::Key(KeyStroke::simple(KeyCode::Char('x'))));
+        assert!(matches!(key.event_for(&first), Some(Event::Key(_))));
+        assert!(key.event_for(&second).is_none());
+
+        let paste = router.route(Event::Paste("pasted".to_owned()));
+        assert_eq!(
+            paste.event_for(&first),
+            Some(&Event::Paste("pasted".to_owned()))
+        );
+        assert!(paste.event_for(&second).is_none());
+    }
+
+    #[test]
+    fn traversal_changes_focus_without_dispatching_the_tab_key() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene(), None);
+        let second = HitId::new("second");
+
+        let traversal = router.route(Event::Key(KeyStroke::simple(KeyCode::Tab)));
+        assert!(traversal.traversal_consumed);
+        assert!(traversal.event_for(&second).is_none());
+
+        let key = router.route(Event::Key(KeyStroke::simple(KeyCode::Char('x'))));
+        assert!(key.event_for(&second).is_some());
+    }
+
+    #[test]
+    fn clicking_a_focusable_target_routes_follow_up_keys_to_it() {
+        let mut router = InteractionRouter::new();
+        router.commit_scene(scene(), None);
+        let second = HitId::new("second");
+
+        let click = router.route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(11, 3),
+        )));
+        assert!(click.targets(&second));
+        assert_eq!(router.focused(), Some(&second));
+
+        let key = router.route(Event::Key(KeyStroke::simple(KeyCode::Char('x'))));
+        assert!(key.event_for(&second).is_some());
     }
 
     #[test]

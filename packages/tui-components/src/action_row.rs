@@ -398,11 +398,7 @@ impl<'a> ActionRow<'a> {
             return ActionRowOutcome::Ignored;
         }
         match event {
-            Event::Key(stroke)
-                if state.interaction.focused
-                    && stroke.modifiers.is_empty()
-                    && stroke.key != KeyCode::Tab =>
-            {
+            Event::Key(stroke) if stroke.modifiers.is_empty() && stroke.key != KeyCode::Tab => {
                 self.handle_key(state, stroke.key)
             }
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),

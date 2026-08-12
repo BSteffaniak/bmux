@@ -263,9 +263,7 @@ impl<'a> Breadcrumbs<'a> {
         event: &Event,
     ) -> BreadcrumbsOutcome<'a> {
         match event {
-            Event::Key(stroke)
-                if state.focused && self.policy.keyboard && stroke.modifiers.is_empty() =>
-            {
+            Event::Key(stroke) if self.policy.keyboard && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Left => self.move_current(state, -1),
                     KeyCode::Right => self.move_current(state, 1),
@@ -539,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_breadcrumbs_do_not_consume_keyboard_navigation() {
+    fn directly_dispatched_breadcrumbs_key_navigates_without_visual_focus() {
         let items = [
             BreadcrumbItem::new("home", "Home"),
             BreadcrumbItem::new("docs", "Docs"),
@@ -552,8 +550,8 @@ mod tests {
             &Event::Key(KeyStroke::simple(KeyCode::Right)),
         );
 
-        assert_eq!(outcome, BreadcrumbsOutcome::Ignored);
-        assert_eq!(state.current(), Some(0));
+        assert_eq!(outcome, BreadcrumbsOutcome::Redraw);
+        assert_eq!(state.current(), Some(1));
     }
 
     #[test]
