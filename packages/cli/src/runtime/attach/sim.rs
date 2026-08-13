@@ -116,6 +116,11 @@ impl AttachSimHarness {
         self.render();
     }
 
+    pub fn set_tab_template(&mut self, template: &str) {
+        self.status_config.tab_template = Some(template.to_string());
+        self.render();
+    }
+
     #[cfg(test)]
     pub fn set_mru_tab_order(&mut self) {
         self.set_tab_order(StatusTabOrder::Mru);
@@ -803,6 +808,32 @@ impl AttachSimHarness {
             .map(|window| window.name.as_str())
     }
 
+    /// Rendered text of each visible tab, taken from its hitbox columns so the
+    /// result reflects the resolved tab template.
+    pub fn rendered_tab_labels(&self) -> Vec<String> {
+        let Some(status_line) = self.view_state.cached_status_line.as_ref() else {
+            return Vec::new();
+        };
+        let plain = status_line
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        let cells = plain.chars().collect::<Vec<_>>();
+        let mut hitboxes = status_line.tab_hitboxes.iter().collect::<Vec<_>>();
+        hitboxes.sort_by_key(|hitbox| hitbox.start_col);
+        hitboxes
+            .into_iter()
+            .filter_map(|hitbox| {
+                let start = usize::from(hitbox.start_col);
+                let end = usize::from(hitbox.end_col);
+                cells
+                    .get(start..=end)
+                    .map(|token| token.iter().collect::<String>().trim().to_string())
+            })
+            .collect()
+    }
+
     pub fn scrollback_active(&self) -> bool {
         self.view_state.scrollback_active()
     }
@@ -836,8 +867,10 @@ impl AttachSimHarness {
     pub fn locate_text(&self, text: &str) -> Option<AttachSimLocatedText> {
         let status_line = self.view_state.cached_status_line.as_ref()?;
         for (index, window) in self.windows.iter().enumerate() {
+            // Accept either the bare window name or the legacy indexed form so
+            // fixtures keep working across tab-template changes.
             let indexed_label = format!("{}:{}", index + 1, window.name);
-            if text == indexed_label {
+            if text == indexed_label || text == window.name {
                 let hitbox = status_line
                     .tab_hitboxes
                     .iter()
@@ -1163,7 +1196,7 @@ mod tests {
     fn attach_sim_reorders_tabs_through_shared_reducer() {
         let mut sim = AttachSimHarness::new(100, 24);
         sim.seed_window_list(&["one", "two", "three"], "one");
-        assert!(sim.rendered().contains("1:one"));
+        assert!(sim.rendered().contains("one"));
 
         let one = sim.locate_text("1:one").expect("one tab");
         let three = sim.locate_text("3:three").expect("three tab");
@@ -1188,7 +1221,11 @@ mod tests {
             }]
         );
         assert_eq!(sim.window_names(), ["two", "three", "one"]);
+        // Indexes renumber after a reorder; assert that against an explicitly
+        // indexed template so the check survives tab-template default changes.
+        sim.set_tab_template("{index}:{name}");
         assert!(sim.rendered().contains("1:two"));
+        assert!(sim.rendered().contains("3:one"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ const ATTACH_SIM_FIXTURES: &[&str] = &[
     "attach_sim_tab_drag_mru_noop.dsl",
     "attach_sim_tab_click_switch.dsl",
     "attach_sim_tab_hover.dsl",
+    "attach_sim_tab_template.dsl",
     "attach_sim_status_top.dsl",
     "attach_sim_status_snapshot.dsl",
     "attach_sim_status_wide_tabs.dsl",
@@ -621,7 +622,7 @@ fn attach_sim_fixtures_run_without_sandbox() {
                 json["snapshots"][0]["panes"][0]["screen_text"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("1:one")
+                    .contains("one")
             );
         }
     }

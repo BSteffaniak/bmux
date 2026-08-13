@@ -2220,6 +2220,7 @@ fn execute_attach_sim_step(
             let actual = match path.as_str() {
                 "windows.names" => serde_json::to_string(&sim.window_names())?,
                 "windows.active_name" => serde_json::to_string(&sim.active_window_name())?,
+                "status.tab_labels" => serde_json::to_string(&sim.rendered_tab_labels())?,
                 "scrollback.active" => serde_json::to_string(&sim.scrollback_active())?,
                 "help_overlay.open" => serde_json::to_string(&sim.help_overlay_open())?,
                 "help_overlay.scroll" => serde_json::to_string(&sim.help_overlay_scroll())?,
@@ -2269,6 +2270,9 @@ fn execute_attach_sim_step(
                 }
                 ("appearance.status_position", "bottom") => {
                     sim.set_status_position(bmux_config::StatusPosition::Bottom);
+                }
+                ("status_bar.tab_template", template) => {
+                    sim.set_tab_template(template);
                 }
                 _ => bail!("unsupported attach-sim config {path}={value}"),
             }
@@ -4934,9 +4938,9 @@ mod tests {
 @viewport cols=100 rows=24
 seed-window-list names='one,two,three' active='one'
 render
-assert-rendered contains='1:one'
-locate id='one' text='1:one'
-locate id='three' text='3:three'
+assert-rendered contains='one'
+locate id='one' text='one'
+locate id='three' text='three'
 terminal-event kind=mouse phase=down button=left col='${one.center_col}' row='${one.row}'
 terminal-event kind=mouse phase=move button=left col='${three.end_col}' row='${three.row}'
 terminal-event kind=mouse phase=up button=left col='${three.end_col}' row='${three.row}'

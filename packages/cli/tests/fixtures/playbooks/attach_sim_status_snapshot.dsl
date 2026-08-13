@@ -4,4 +4,4 @@
 seed-window-list names='one,two,three' active='one'
 render
 snapshot id='initial-status'
-assert-rendered contains='1:one'
+assert-rendered contains='one'

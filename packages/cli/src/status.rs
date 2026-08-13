@@ -160,6 +160,7 @@ pub fn build_attach_status_line(
         tabs,
         &style,
         tab_budget,
+        session_label,
     );
     left.push_str(&tail);
 
@@ -243,6 +244,7 @@ fn hint_allowed(policy: StatusHintPolicy, mode_label: &str) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Tab packing needs config, style, budget, and template inputs.
 fn append_tabs(
     out: &mut String,
     hitboxes: &mut Vec<AttachStatusTabHitbox>,
@@ -251,13 +253,14 @@ fn append_tabs(
     tabs: &[AttachTab],
     style: &StatusRenderStyle,
     budget: usize,
+    session_label: &str,
 ) {
     if tabs.is_empty() {
         out.push_str(&style.empty_tabs_label);
         return;
     }
 
-    let tokens = tab_tokens(config, tabs, style);
+    let tokens = tab_tokens(config, tabs, style, session_label);
     let window = visible_tabs_for_layout(&tokens, config, style, budget);
     let hidden_left = window.start;
     let hidden_right = tokens.len().saturating_sub(window.end);
@@ -316,20 +319,29 @@ fn tab_tokens(
     config: &StatusBarConfig,
     tabs: &[AttachTab],
     style: &StatusRenderStyle,
+    session_label: &str,
 ) -> Vec<TabToken> {
+    let template = config.resolved_tab_template();
     tabs.iter()
         .enumerate()
         .map(|(index, tab)| {
+            // Truncate the variable-length name before substitution so
+            // `tab_label_max_width` bounds the name without ever clipping
+            // template chrome mid-token.
             let label = truncate_cells(&tab.label, config.tab_label_max_width.max(1));
-            let indexed = if config.show_tab_index {
-                format!("{}:{}", index + 1, label)
-            } else {
-                label
-            };
+            let rendered = render_tab_template(
+                template,
+                &TabTemplateFields {
+                    name: &label,
+                    index,
+                    session: session_label,
+                    active: tab.active,
+                },
+            );
             let text = if tab.active {
-                style.active_tab(&indexed)
+                style.active_tab(&rendered)
             } else {
-                style.inactive_tab(&indexed)
+                style.inactive_tab(&rendered)
             };
             TabToken {
                 width: display_width(&text),
@@ -339,6 +351,74 @@ fn tab_tokens(
             }
         })
         .collect()
+}
+
+/// Values substituted into [`StatusBarConfig::resolved_tab_template`].
+struct TabTemplateFields<'a> {
+    name: &'a str,
+    /// Zero-based position in the full tab list.
+    index: usize,
+    session: &'a str,
+    active: bool,
+}
+
+impl TabTemplateFields<'_> {
+    /// Resolve a placeholder name, or `None` when it is not recognized.
+    fn lookup(&self, placeholder: &str) -> Option<String> {
+        match placeholder {
+            "name" => Some(self.name.to_string()),
+            "index" => Some((self.index + 1).to_string()),
+            "index0" => Some(self.index.to_string()),
+            "session" => Some(self.session.to_string()),
+            "marker" => Some(if self.active { "*" } else { "" }.to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// Substitute `{placeholder}` tokens in `template`.
+///
+/// `{{` and `}}` produce literal braces. Unknown or unterminated placeholders
+/// are emitted verbatim so a malformed template degrades to visible text rather
+/// than breaking the status bar.
+fn render_tab_template(template: &str, fields: &TabTemplateFields<'_>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push('}');
+            }
+            '{' => {
+                let mut placeholder = String::new();
+                let mut terminated = false;
+                for next in chars.by_ref() {
+                    if next == '}' {
+                        terminated = true;
+                        break;
+                    }
+                    placeholder.push(next);
+                }
+                if let Some(value) = fields.lookup(&placeholder).filter(|_| terminated) {
+                    out.push_str(&value);
+                } else {
+                    // Unknown or unterminated: keep the original text.
+                    out.push('{');
+                    out.push_str(&placeholder);
+                    if terminated {
+                        out.push('}');
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Half-open range of tab indexes that will be rendered.
@@ -1262,6 +1342,15 @@ mod tests {
             .collect()
     }
 
+    /// Config using the legacy indexed template. Tab-packing and hitbox tests
+    /// prefer it because `N:winX` tokens are unambiguous substrings.
+    fn indexed_config() -> StatusBarConfig {
+        StatusBarConfig {
+            tab_template: Some("{index}:{name}".to_string()),
+            ..StatusBarConfig::default()
+        }
+    }
+
     fn status_line_for(
         width: u16,
         config: &StatusBarConfig,
@@ -1314,7 +1403,7 @@ mod tests {
     #[test]
     fn wide_width_shows_every_tab_without_overflow_marker() {
         let tabs = sim_tabs(20, 0);
-        let status = status_line_for(300, &StatusBarConfig::default(), &tabs);
+        let status = status_line_for(300, &indexed_config(), &tabs);
         let rendered = plain_rendered(&status);
 
         for index in 0..20 {
@@ -1331,7 +1420,7 @@ mod tests {
     #[test]
     fn narrow_width_collapses_tabs_and_keeps_active_visible() {
         let tabs = sim_tabs(20, 19);
-        let status = status_line_for(40, &StatusBarConfig::default(), &tabs);
+        let status = status_line_for(40, &indexed_config(), &tabs);
         let rendered = plain_rendered(&status);
 
         assert_eq!(display_width(&rendered), 40, "{rendered:?}");
@@ -1345,7 +1434,7 @@ mod tests {
         let tabs = sim_tabs(20, 0);
         let config = StatusBarConfig {
             max_tabs: Some(3),
-            ..StatusBarConfig::default()
+            ..indexed_config()
         };
         let status = status_line_for(300, &config, &tabs);
         let rendered = plain_rendered(&status);
@@ -1360,7 +1449,7 @@ mod tests {
     #[test]
     fn hitboxes_match_rendered_tab_columns_at_wide_width() {
         let tabs = sim_tabs(6, 2);
-        let status = status_line_for(200, &StatusBarConfig::default(), &tabs);
+        let status = status_line_for(200, &indexed_config(), &tabs);
         let rendered = plain_rendered(&status);
         let cells = rendered.chars().collect::<Vec<_>>();
 
@@ -1379,7 +1468,7 @@ mod tests {
     #[test]
     fn active_tab_stays_visible_when_it_is_the_last_of_many() {
         let tabs = sim_tabs(30, 29);
-        let status = status_line_for(60, &StatusBarConfig::default(), &tabs);
+        let status = status_line_for(60, &indexed_config(), &tabs);
         let rendered = plain_rendered(&status);
 
         assert!(rendered.contains("30:win29"), "{rendered:?}");
@@ -1404,7 +1493,7 @@ mod tests {
     fn tab_hitboxes_only_cover_visible_tab_text() {
         let tabs = sim_tabs(12, 0);
         for width in [10_u16, 14, 18, 24, 30, 45, 60, 80, 120, 200] {
-            let status = status_line_for(width, &StatusBarConfig::default(), &tabs);
+            let status = status_line_for(width, &indexed_config(), &tabs);
             let plain = plain_rendered(&status);
             let cells = plain.chars().collect::<Vec<_>>();
             for hitbox in &status.tab_hitboxes {
@@ -1498,7 +1587,7 @@ mod tests {
     #[test]
     fn tab_hitboxes_are_dropped_when_only_modules_fit() {
         let tabs = sim_tabs(6, 0);
-        let status = status_line_for(6, &StatusBarConfig::default(), &tabs);
+        let status = status_line_for(6, &indexed_config(), &tabs);
 
         assert!(
             status.tab_hitboxes.is_empty(),
@@ -1511,7 +1600,7 @@ mod tests {
     fn module_zone_keeps_module_styling_at_every_width() {
         let tabs = sim_tabs(14, 13);
         for width in [20_u16, 28, 40, 70, 140] {
-            let status = status_line_for(width, &StatusBarConfig::default(), &tabs);
+            let status = status_line_for(width, &indexed_config(), &tabs);
             let plain = plain_rendered(&status);
             let Some(modules_start) = modules_start_col(&plain) else {
                 continue;
@@ -1545,8 +1634,8 @@ mod tests {
     fn hovering_an_inactive_tab_lifts_its_background() {
         let tabs = sim_tabs(4, 0);
         let hovered_id = tabs[2].context_id;
-        let plain = status_line_for(120, &StatusBarConfig::default(), &tabs);
-        let hovered = status_line_hovering(120, &StatusBarConfig::default(), &tabs, hovered_id);
+        let plain = status_line_for(120, &indexed_config(), &tabs);
+        let hovered = status_line_hovering(120, &indexed_config(), &tabs, hovered_id);
 
         let normal_bg = tab_span_bg(&plain, "3:win2");
         let hovered_bg = tab_span_bg(&hovered, "3:win2");
@@ -1566,8 +1655,8 @@ mod tests {
     fn hovering_the_active_tab_lifts_its_background() {
         let tabs = sim_tabs(4, 1);
         let hovered_id = tabs[1].context_id;
-        let plain = status_line_for(120, &StatusBarConfig::default(), &tabs);
-        let hovered = status_line_hovering(120, &StatusBarConfig::default(), &tabs, hovered_id);
+        let plain = status_line_for(120, &indexed_config(), &tabs);
+        let hovered = status_line_hovering(120, &indexed_config(), &tabs, hovered_id);
 
         let normal_bg = tab_span_bg(&plain, "2:win1");
         let hovered_bg = tab_span_bg(&hovered, "2:win1");
@@ -1600,7 +1689,7 @@ mod tests {
     fn hover_respects_explicit_color_overrides() {
         let tabs = sim_tabs(3, 0);
         let hovered_id = tabs[1].context_id;
-        let mut config = StatusBarConfig::default();
+        let mut config = indexed_config();
         config.colors.tab_hover_bg = Some("#123456".to_string());
 
         let hovered = status_line_hovering(120, &config, &tabs, hovered_id);
@@ -1619,9 +1708,8 @@ mod tests {
     #[test]
     fn hovering_an_unknown_context_changes_nothing() {
         let tabs = sim_tabs(3, 0);
-        let plain = status_line_for(120, &StatusBarConfig::default(), &tabs);
-        let hovered =
-            status_line_hovering(120, &StatusBarConfig::default(), &tabs, Some(Uuid::nil()));
+        let plain = status_line_for(120, &indexed_config(), &tabs);
+        let hovered = status_line_hovering(120, &indexed_config(), &tabs, Some(Uuid::nil()));
 
         assert_eq!(plain.rendered, hovered.rendered);
     }
@@ -1631,8 +1719,7 @@ mod tests {
         let tabs = sim_tabs(14, 13);
         let hovered_id = tabs[13].context_id;
         for width in [24_u16, 40, 70] {
-            let status =
-                status_line_hovering(width, &StatusBarConfig::default(), &tabs, hovered_id);
+            let status = status_line_hovering(width, &indexed_config(), &tabs, hovered_id);
             let plain = plain_rendered(&status);
             let Some(modules_start) = modules_start_col(&plain) else {
                 continue;
@@ -1657,10 +1744,194 @@ mod tests {
     }
 
     #[test]
+    fn default_template_shows_only_the_tab_name() {
+        let tabs = sim_tabs(3, 0);
+        let status = status_line_for(120, &StatusBarConfig::default(), &tabs);
+        let rendered = plain_rendered(&status);
+
+        assert!(rendered.contains("win0"), "{rendered:?}");
+        assert!(
+            !rendered.contains("1:win0"),
+            "default template must not add an index prefix: {rendered:?}"
+        );
+        assert!(!rendered.contains("2:win1"), "{rendered:?}");
+    }
+
+    #[test]
+    fn indexed_template_reproduces_legacy_output() {
+        let tabs = sim_tabs(3, 0);
+        let status = status_line_for(120, &indexed_config(), &tabs);
+        let rendered = plain_rendered(&status);
+
+        assert!(rendered.contains("1:win0"), "{rendered:?}");
+        assert!(rendered.contains("3:win2"), "{rendered:?}");
+    }
+
+    #[test]
+    fn legacy_show_tab_index_still_selects_the_indexed_template() {
+        let config = StatusBarConfig {
+            show_tab_index: Some(true),
+            ..StatusBarConfig::default()
+        };
+        assert_eq!(config.resolved_tab_template(), "{index}:{name}");
+
+        let tabs = sim_tabs(2, 0);
+        let rendered = plain_rendered(&status_line_for(120, &config, &tabs));
+        assert!(rendered.contains("1:win0"), "{rendered:?}");
+    }
+
+    #[test]
+    fn explicit_template_overrides_legacy_show_tab_index() {
+        let config = StatusBarConfig {
+            tab_template: Some("{name}".to_string()),
+            show_tab_index: Some(true),
+            ..StatusBarConfig::default()
+        };
+        let tabs = sim_tabs(2, 0);
+        let rendered = plain_rendered(&status_line_for(120, &config, &tabs));
+
+        assert!(rendered.contains("win0"), "{rendered:?}");
+        assert!(!rendered.contains("1:win0"), "{rendered:?}");
+    }
+
+    #[test]
+    fn template_supports_all_documented_placeholders() {
+        let fields = TabTemplateFields {
+            name: "editor",
+            index: 3,
+            session: "work",
+            active: true,
+        };
+
+        assert_eq!(render_tab_template("{name}", &fields), "editor");
+        assert_eq!(render_tab_template("{index}", &fields), "4");
+        assert_eq!(render_tab_template("{index0}", &fields), "3");
+        assert_eq!(render_tab_template("{session}", &fields), "work");
+        assert_eq!(render_tab_template("{marker}", &fields), "*");
+        assert_eq!(
+            render_tab_template("[{index}] {name}{marker}", &fields),
+            "[4] editor*"
+        );
+    }
+
+    #[test]
+    fn template_marker_is_empty_for_inactive_tabs() {
+        let fields = TabTemplateFields {
+            name: "shell",
+            index: 0,
+            session: "work",
+            active: false,
+        };
+        assert_eq!(render_tab_template("{name}{marker}", &fields), "shell");
+    }
+
+    #[test]
+    fn template_renders_unknown_and_unterminated_placeholders_literally() {
+        let fields = TabTemplateFields {
+            name: "editor",
+            index: 0,
+            session: "work",
+            active: false,
+        };
+
+        assert_eq!(render_tab_template("{bogus}", &fields), "{bogus}");
+        assert_eq!(
+            render_tab_template("{name} {bogus} x", &fields),
+            "editor {bogus} x"
+        );
+        // Unterminated placeholder keeps its text without inventing a brace.
+        assert_eq!(render_tab_template("{name", &fields), "{name");
+    }
+
+    #[test]
+    fn template_escapes_double_braces() {
+        let fields = TabTemplateFields {
+            name: "editor",
+            index: 0,
+            session: "work",
+            active: false,
+        };
+
+        assert_eq!(render_tab_template("{{{name}}}", &fields), "{editor}");
+        assert_eq!(render_tab_template("{{literal}}", &fields), "{literal}");
+    }
+
+    #[test]
+    fn template_name_still_respects_tab_label_max_width() {
+        let tabs = vec![AttachTab {
+            label: "an-extremely-long-window-name".to_string(),
+            active: true,
+            context_id: Some(Uuid::from_u128(1)),
+        }];
+        let config = StatusBarConfig {
+            tab_template: Some("[{name}]".to_string()),
+            tab_label_max_width: 6,
+            ..StatusBarConfig::default()
+        };
+        let rendered = plain_rendered(&status_line_for(120, &config, &tabs));
+
+        // Template chrome survives; only the name is truncated.
+        assert!(rendered.contains("[an-ext]"), "{rendered:?}");
+    }
+
+    #[test]
+    fn template_width_feeds_the_packing_budget() {
+        let tabs = sim_tabs(12, 0);
+        let verbose = StatusBarConfig {
+            tab_template: Some("<<{index}::{name}>>".to_string()),
+            ..StatusBarConfig::default()
+        };
+
+        // Wide: every tab fits with the longer template.
+        let wide = plain_rendered(&status_line_for(300, &verbose, &tabs));
+        assert!(wide.contains("<<1::win0>>"), "{wide:?}");
+        assert!(wide.contains("<<12::win11>>"), "{wide:?}");
+
+        // Narrow: the longer template collapses more tabs than the plain one.
+        let narrow_verbose = status_line_for(70, &verbose, &tabs);
+        let narrow_plain = status_line_for(70, &StatusBarConfig::default(), &tabs);
+        assert!(
+            narrow_verbose.tab_hitboxes.len() < narrow_plain.tab_hitboxes.len(),
+            "verbose template should fit fewer tabs: {} vs {}",
+            narrow_verbose.tab_hitboxes.len(),
+            narrow_plain.tab_hitboxes.len()
+        );
+        assert_eq!(
+            display_width(&plain_rendered(&narrow_verbose)),
+            70,
+            "verbose template must still render exactly to width"
+        );
+    }
+
+    #[test]
+    // `{index}`/`{name}` are tab-template placeholders, not format arguments.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn hitboxes_track_template_widths() {
+        let tabs = sim_tabs(5, 0);
+        let config = StatusBarConfig {
+            tab_template: Some("[{index}] {name}".to_string()),
+            ..StatusBarConfig::default()
+        };
+        let status = status_line_for(200, &config, &tabs);
+        let plain = plain_rendered(&status);
+        let cells = plain.chars().collect::<Vec<_>>();
+
+        for (index, hitbox) in status.tab_hitboxes.iter().enumerate() {
+            let covered = cells[usize::from(hitbox.start_col)..=usize::from(hitbox.end_col)]
+                .iter()
+                .collect::<String>();
+            assert!(
+                covered.contains(&format!("[{}] win{index}", index + 1)),
+                "hitbox {index} should cover the templated token, got {covered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tab_strip_never_overlaps_right_modules() {
         let tabs = sim_tabs(12, 0);
         for width in [30_u16, 45, 60, 80, 120] {
-            let status = status_line_for(width, &StatusBarConfig::default(), &tabs);
+            let status = status_line_for(width, &indexed_config(), &tabs);
             let rendered = plain_rendered(&status);
             assert_eq!(
                 display_width(&rendered),

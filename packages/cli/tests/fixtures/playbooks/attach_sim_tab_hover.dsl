@@ -9,12 +9,12 @@ locate id='two' text='2:two'
 # Hovering a tab must not switch windows or start a reorder.
 terminal-event kind=mouse phase=move col='${two.center_col}' row='${two.row}'
 render
-assert-rendered contains='2:two'
+assert-rendered contains='two'
 assert-state path='windows.names' equals='["one","two","three"]'
 assert-state path='windows.active_name' equals='"one"'
 
 # Moving off the status row leaves the tab strip intact.
 terminal-event kind=mouse phase=move col='${two.center_col}' row='5'
 render
-assert-rendered contains='1:one'
+assert-rendered contains='one'
 assert-state path='windows.active_name' equals='"one"'

@@ -2636,8 +2636,19 @@ pub struct StatusBarConfig {
     pub max_tabs: Option<usize>,
     /// Maximum display width for each tab label.
     pub tab_label_max_width: usize,
-    /// Display 1-based tab indexes before labels.
-    pub show_tab_index: bool,
+    /// Template used to render each tab label.
+    ///
+    /// Supported placeholders: `{name}` (window name), `{index}` (1-based
+    /// position), `{index0}` (0-based position), `{session}` (session name),
+    /// and `{marker}` (`*` for the active tab). Unknown placeholders render
+    /// literally; use `{{` and `}}` for literal braces.
+    ///
+    /// When unset, defaults to `{name}`, or `{index}:{name}` if the deprecated
+    /// `show_tab_index` is enabled.
+    pub tab_template: Option<String>,
+    /// Deprecated: display 1-based tab indexes before labels. Prefer
+    /// `tab_template = "{index}:{name}"`.
+    pub show_tab_index: Option<bool>,
     /// Which context set to render as tabs.
     pub tab_scope: StatusTabScope,
     /// How tab entries are ordered when rendered.
@@ -2670,7 +2681,8 @@ impl Default for StatusBarConfig {
             colors: StatusBarColorConfig::default(),
             max_tabs: None,
             tab_label_max_width: 20,
-            show_tab_index: true,
+            tab_template: None,
+            show_tab_index: None,
             tab_scope: StatusTabScope::AllContexts,
             tab_order: StatusTabOrder::Stable,
             show_session_name: false,
@@ -2681,6 +2693,27 @@ impl Default for StatusBarConfig {
             show_hint: true,
             hover_highlight: true,
             hint_policy: StatusHintPolicy::ScrollOnly,
+        }
+    }
+}
+
+/// Default tab label template: just the window name.
+pub const DEFAULT_STATUS_TAB_TEMPLATE: &str = "{name}";
+/// Tab label template equivalent to the deprecated `show_tab_index = true`.
+pub const INDEXED_STATUS_TAB_TEMPLATE: &str = "{index}:{name}";
+
+impl StatusBarConfig {
+    /// Resolve the effective tab label template.
+    ///
+    /// An explicit `tab_template` always wins. Otherwise the deprecated
+    /// `show_tab_index` flag selects between the indexed and plain templates so
+    /// existing configurations keep their appearance.
+    #[must_use]
+    pub fn resolved_tab_template(&self) -> &str {
+        match self.tab_template.as_deref() {
+            Some(template) => template,
+            None if self.show_tab_index == Some(true) => INDEXED_STATUS_TAB_TEMPLATE,
+            None => DEFAULT_STATUS_TAB_TEMPLATE,
         }
     }
 }
@@ -3870,6 +3903,24 @@ impl BmuxConfig {
             ));
         }
 
+        // `show_tab_index` is superseded by `tab_template`. Migrate it in place
+        // so the rendered tab strip is unchanged and the user is told once.
+        if self.status_bar.tab_template.is_none()
+            && let Some(show_tab_index) = self.status_bar.show_tab_index
+        {
+            let template = if show_tab_index {
+                INDEXED_STATUS_TAB_TEMPLATE
+            } else {
+                DEFAULT_STATUS_TAB_TEMPLATE
+            };
+            self.status_bar.tab_template = Some(template.to_string());
+            self.status_bar.show_tab_index = None;
+            repaired_fields.push(format!(
+                "status_bar.show_tab_index={show_tab_index} is deprecated -> \
+                 status_bar.tab_template=\"{template}\""
+            ));
+        }
+
         repaired_fields
     }
 
@@ -4099,6 +4150,76 @@ key_file = "/tmp/gateway-key.pem"
         config.status_bar.max_tabs = Some(6);
         assert!(config.validate().is_ok());
         assert_eq!(config.status_bar.max_tabs, Some(6));
+    }
+
+    #[test]
+    fn status_bar_tab_template_defaults_to_name_only() {
+        let config = BmuxConfig::default();
+        assert_eq!(config.status_bar.tab_template, None);
+        assert_eq!(config.status_bar.show_tab_index, None);
+        assert_eq!(config.status_bar.resolved_tab_template(), "{name}");
+    }
+
+    #[test]
+    fn status_bar_legacy_show_tab_index_resolves_to_indexed_template() {
+        let mut config = BmuxConfig::default();
+        config.status_bar.show_tab_index = Some(true);
+        assert_eq!(config.status_bar.resolved_tab_template(), "{index}:{name}");
+
+        config.status_bar.show_tab_index = Some(false);
+        assert_eq!(config.status_bar.resolved_tab_template(), "{name}");
+    }
+
+    #[test]
+    fn status_bar_explicit_tab_template_wins_over_show_tab_index() {
+        let mut config = BmuxConfig::default();
+        config.status_bar.tab_template = Some("[{name}]".to_string());
+        config.status_bar.show_tab_index = Some(true);
+        assert_eq!(config.status_bar.resolved_tab_template(), "[{name}]");
+    }
+
+    #[test]
+    fn status_bar_show_tab_index_migrates_to_tab_template() {
+        let mut config = BmuxConfig::default();
+        config.status_bar.show_tab_index = Some(true);
+
+        let repaired = config.sanitize_invalid_values();
+
+        assert_eq!(
+            config.status_bar.tab_template.as_deref(),
+            Some("{index}:{name}")
+        );
+        assert_eq!(config.status_bar.show_tab_index, None);
+        assert!(
+            repaired
+                .iter()
+                .any(|field| field.contains("show_tab_index") && field.contains("deprecated")),
+            "migration should be reported: {repaired:?}"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn status_bar_tab_template_is_preserved_by_sanitize() {
+        let mut config = BmuxConfig::default();
+        config.status_bar.tab_template = Some("{name}{marker}".to_string());
+        config.status_bar.show_tab_index = Some(true);
+
+        let _ = config.sanitize_invalid_values();
+
+        assert_eq!(
+            config.status_bar.tab_template.as_deref(),
+            Some("{name}{marker}"),
+            "an explicit template must not be overwritten by migration"
+        );
+    }
+
+    #[test]
+    fn status_bar_tab_template_deserializes_from_toml() {
+        let config: BmuxConfig =
+            toml::from_str("[status_bar]\ntab_template = \"{index0} {name}\"\n")
+                .expect("config with tab_template should parse");
+        assert_eq!(config.status_bar.resolved_tab_template(), "{index0} {name}");
     }
 
     #[test]

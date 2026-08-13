@@ -3,7 +3,7 @@
 
 seed-window-list names='one,two,three' active='one'
 render
-assert-rendered contains='1:one'
+assert-rendered contains='one'
 
 locate id='one' text='1:one'
 locate id='three' text='3:three'
