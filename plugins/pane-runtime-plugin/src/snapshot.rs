@@ -21,6 +21,7 @@ use crate::runtime::{session_handle, session_runtime_handle};
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect,
     PaneCommandSource, PaneLaunchSpec, PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta,
+    RestoreRuntimeRequest,
 };
 
 /// Stable id for the pane-runtime plugin snapshot surface.
@@ -52,6 +53,10 @@ pub struct PaneRuntimeSessionSnapshotV1 {
     /// Currently-focused pane, if any.
     #[serde(default)]
     pub focused_pane_id: Option<Uuid>,
+    /// Pane zoomed to fill the viewport, if any. Additive/optional so
+    /// snapshots written before zoom persistence restore as unzoomed.
+    #[serde(default)]
+    pub zoomed_pane_id: Option<Uuid>,
     /// Layout tree. `None` indicates the session has been created but
     /// no layout is persisted yet.
     #[serde(default)]
@@ -268,6 +273,7 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
             session_id: session_info.id.0,
             panes,
             focused_pane_id: Some(runtime.focused_pane_id),
+            zoomed_pane_id: runtime.zoomed_pane_id,
             layout_root: runtime.layout_root.as_ref().map(layout_to_snapshot),
             attach_viewport: runtime.attach_viewport,
             floating_surfaces,
@@ -362,10 +368,13 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
         if let Err(error) = runtime_manager.0.restore_runtime(
             session_id,
             &runtime_panes,
-            entry.layout_root.as_ref().map(layout_from_snapshot),
-            focused_pane_id,
-            floating_surfaces,
-            entry.attach_viewport,
+            RestoreRuntimeRequest {
+                layout_root: entry.layout_root.as_ref().map(layout_from_snapshot),
+                focused_pane_id,
+                zoomed_pane_id: entry.zoomed_pane_id,
+                floating_surfaces,
+                attach_viewport: entry.attach_viewport,
+            },
         ) {
             warn!(
                 "failed restoring pane runtime for session {}: {error}",
@@ -463,6 +472,7 @@ mod tests {
                     last_known_cwd: Some("/tmp".into()),
                 }],
                 focused_pane_id: Some(pane_id),
+                zoomed_pane_id: Some(pane_id),
                 layout_root: Some(PaneRuntimeSnapshotV1Layout::Split {
                     direction: PaneRuntimeSnapshotV1SplitDirection::Vertical,
                     ratio: 0.5,
@@ -533,6 +543,7 @@ mod tests {
                     last_known_cwd: None,
                 }],
                 focused_pane_id: Some(pane_id),
+                zoomed_pane_id: None,
                 layout_root: Some(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
                 attach_viewport: None,
                 floating_surfaces: vec![],
@@ -586,6 +597,7 @@ mod tests {
                     last_known_cwd: Some("/tmp".into()),
                 }],
                 focused_pane_id: Some(pane_id),
+                zoomed_pane_id: None,
                 layout_root: Some(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
                 attach_viewport: None,
                 floating_surfaces: vec![],
@@ -600,5 +612,34 @@ mod tests {
             Some(PaneCommandSource::Verbatim)
         );
         assert!(decoded.sessions[0].panes[0].active_command.is_none());
+    }
+
+    /// `zoomed_pane_id` was added after v1 shipped, so it must be
+    /// optional on decode: snapshots written by older builds have no
+    /// such key and must restore as unzoomed rather than failing the
+    /// whole pane-runtime section.
+    #[test]
+    fn schema_decodes_legacy_payload_without_zoomed_pane_id() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "sessions": [{
+                "session_id": session_id,
+                "panes": [{
+                    "id": pane_id,
+                    "name": "pane-1",
+                    "shell": "/bin/sh",
+                }],
+                "focused_pane_id": pane_id,
+                "layout_root": { "kind": "leaf", "pane_id": pane_id },
+            }]
+        });
+        let decoded: PaneRuntimeSnapshotV1 =
+            serde_json::from_value(legacy).expect("legacy payload decodes without zoomed_pane_id");
+        assert_eq!(
+            decoded.sessions[0].zoomed_pane_id, None,
+            "absent zoomed_pane_id restores as unzoomed"
+        );
+        assert_eq!(decoded.sessions[0].focused_pane_id, Some(pane_id));
     }
 }

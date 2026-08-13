@@ -229,11 +229,7 @@ pub(crate) fn publish_focus_state_snapshot() {
             session_id.0,
             FocusSnapshot {
                 focused_pane_id: snapshot.focused_pane_id,
-                // Zoom state isn't exposed on the snapshot API today;
-                // a future trait method on `SessionRuntimeManagerApi`
-                // could thread this through. Consumers treat `None`
-                // as "not zoomed" and use `focused_pane_id` directly.
-                zoomed_pane_id: None,
+                zoomed_pane_id: snapshot.zoomed_pane_id,
             },
         );
     }

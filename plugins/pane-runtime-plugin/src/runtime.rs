@@ -17,7 +17,8 @@ use bmux_pane_runtime_plugin_api::{
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingPaneLayer, FloatingPaneRuntimeSummary, FloatingPaneScope,
     FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec, PaneLayoutNode,
-    PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta, SessionRuntimeError,
+    PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta, RestoreRuntimeRequest,
+    SessionRuntimeError,
 };
 use bmux_recording_protocol::{RecordingEventKind, RecordingPayload as ProtocolRecordingPayload};
 use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
@@ -1795,6 +1796,7 @@ struct PanePersistenceDataRef {
 
 struct PersistenceSnapshotParts {
     focused_pane_id: Uuid,
+    zoomed_pane_id: Option<Uuid>,
     layout_root: Option<PaneLayoutNode>,
     floating_surfaces: Vec<FloatingSurfaceRuntime>,
     attached_clients: BTreeSet<ClientId>,
@@ -3105,11 +3107,16 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         panes: &[PaneRuntimeMeta],
-        layout_root: Option<PaneLayoutNode>,
-        focused_pane_id: Uuid,
-        floating_surfaces: Vec<FloatingSurfaceRuntime>,
-        attach_viewport: Option<AttachViewport>,
+        request: RestoreRuntimeRequest,
     ) -> Result<()> {
+        let RestoreRuntimeRequest {
+            layout_root,
+            focused_pane_id,
+            zoomed_pane_id,
+            floating_surfaces,
+            attach_viewport,
+        } = request;
+
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
@@ -3122,16 +3129,39 @@ impl SessionRuntimeManager {
         }
 
         let runtime_layout_root = layout_root.or_else(|| layout_from_panes(panes));
+
+        // Re-validate the persisted zoom against the same invariants
+        // `toggle_zoom` enforces: the pane must be a tiled pane in this
+        // layout, and zoom is meaningless below two tiled panes. A
+        // snapshot written by an older build (or mutated offline) simply
+        // restores unzoomed rather than producing an inconsistent scene.
+        let mut tiled_pane_ids = Vec::new();
+        if let Some(layout_root) = &runtime_layout_root {
+            layout_root.pane_order(&mut tiled_pane_ids);
+        }
+        let restored_zoomed_pane_id = zoomed_pane_id
+            .filter(|zoomed_id| tiled_pane_ids.len() >= 2 && tiled_pane_ids.contains(zoomed_id));
+        if zoomed_pane_id.is_some() && restored_zoomed_pane_id.is_none() {
+            warn!(
+                session_id = %session_id.0,
+                "dropping persisted zoom that no longer satisfies zoom invariants"
+            );
+        }
+
         let mut initial_pane_sizes = BTreeMap::new();
         if let (Some(layout_root), Some(viewport)) = (&runtime_layout_root, attach_viewport) {
-            let mut rects = BTreeMap::new();
-            collect_layout_rects(
-                layout_root,
-                scene_root_from_viewport(Some(viewport)),
-                &mut rects,
-            );
-            for (pane_id, rect) in rects {
-                initial_pane_sizes.insert(pane_id, pane_pty_size(rect));
+            let scene_root = scene_root_from_viewport(Some(viewport));
+            if let Some(zoomed_id) = restored_zoomed_pane_id {
+                // A zoomed pane fills the scene root, mirroring the zoom
+                // branch of `resize_session_ptys`, so its PTY must start
+                // full-size instead of at its tiled rect.
+                initial_pane_sizes.insert(zoomed_id, pane_pty_size(scene_root));
+            } else {
+                let mut rects = BTreeMap::new();
+                collect_layout_rects(layout_root, scene_root, &mut rects);
+                for (pane_id, rect) in rects {
+                    initial_pane_sizes.insert(pane_id, pane_pty_size(rect));
+                }
             }
         }
 
@@ -3153,7 +3183,7 @@ impl SessionRuntimeManager {
                 panes: runtime_panes,
                 layout_root: runtime_layout_root,
                 focused_pane_id,
-                zoomed_pane_id: None,
+                zoomed_pane_id: restored_zoomed_pane_id,
                 floating_surfaces,
                 attached_clients: BTreeSet::new(),
                 attach_viewport,
@@ -4200,6 +4230,7 @@ impl SessionRuntimeManager {
         if session.zoomed_pane_id.is_some() {
             session.zoomed_pane_id = None;
             self.apply_stored_attach_viewport(session_id);
+            mark_snapshot_dirty_flag();
             Ok((focused, false))
         } else {
             // Only zoom if there are at least 2 tiled panes (zooming a single pane is a no-op).
@@ -4209,6 +4240,7 @@ impl SessionRuntimeManager {
             }
             session.zoomed_pane_id = Some(focused);
             self.apply_stored_attach_viewport(session_id);
+            mark_snapshot_dirty_flag();
             Ok((focused, true))
         }
     }
@@ -4738,6 +4770,7 @@ impl SessionRuntimeManager {
         }
         Ok(Some(PersistenceSnapshotParts {
             focused_pane_id: runtime.focused_pane_id,
+            zoomed_pane_id: runtime.zoomed_pane_id,
             layout_root: runtime.layout_root.clone(),
             floating_surfaces: runtime.floating_surfaces.clone(),
             attached_clients: runtime.attached_clients.clone(),
@@ -5454,22 +5487,10 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         &self,
         session_id: SessionId,
         panes: &[bmux_pane_runtime_state::PaneRuntimeMeta],
-        layout_root: Option<bmux_pane_runtime_state::PaneLayoutNode>,
-        focused_pane_id: Uuid,
-        floating_surfaces: Vec<bmux_pane_runtime_state::FloatingSurfaceRuntime>,
-        attach_viewport: Option<bmux_pane_runtime_state::AttachViewport>,
+        request: RestoreRuntimeRequest,
     ) -> anyhow::Result<()> {
-        self.with_lock(|m| {
-            m.restore_runtime(
-                session_id,
-                panes,
-                layout_root,
-                focused_pane_id,
-                floating_surfaces,
-                attach_viewport,
-            )
-        })
-        .ok_or_else(Self::lock_poisoned_anyhow)?
+        self.with_lock(|m| m.restore_runtime(session_id, panes, request))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 
     fn remove_runtime(
@@ -6524,6 +6545,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 session_id,
                 panes,
                 focused_pane_id: runtime.focused_pane_id,
+                zoomed_pane_id: runtime.zoomed_pane_id,
                 layout_root: runtime.layout_root.clone(),
                 floating_surfaces: runtime.floating_surfaces.clone(),
                 attached_clients: runtime.attached_clients.clone(),
@@ -6603,6 +6625,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             session_id,
             panes,
             focused_pane_id: parts.focused_pane_id,
+            zoomed_pane_id: parts.zoomed_pane_id,
             layout_root: parts.layout_root,
             floating_surfaces: parts.floating_surfaces,
             attached_clients: parts.attached_clients,
@@ -8519,7 +8542,11 @@ mod tests {
                 },
             });
             manager
-                .restore_runtime(session_id, &panes, None, pane_ids[0], Vec::new(), None)
+                .restore_runtime(
+                    session_id,
+                    &panes,
+                    RestoreRuntimeRequest::with_focus(pane_ids[0]),
+                )
                 .expect("restore stale pane metadata");
             expected_pane_ids.insert(session_id, pane_ids);
         }

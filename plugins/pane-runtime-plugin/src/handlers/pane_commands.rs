@@ -962,12 +962,11 @@ pub fn ensure_execution_pane(req: EnsureExecutionPaneArgs) -> Result<PaneAck, Pa
         .restore_runtime(
             session_id,
             &[pane],
-            Some(bmux_pane_runtime_state::PaneLayoutNode::Leaf {
-                pane_id: req.pane_id,
-            }),
-            req.pane_id,
-            Vec::new(),
-            None,
+            bmux_pane_runtime_state::RestoreRuntimeRequest::with_focus(req.pane_id).layout_root(
+                Some(bmux_pane_runtime_state::PaneLayoutNode::Leaf {
+                    pane_id: req.pane_id,
+                }),
+            ),
         )
         .map_err(|error| failed_command(error.to_string()))?;
     handle

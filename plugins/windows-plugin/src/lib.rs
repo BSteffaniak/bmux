@@ -3638,6 +3638,22 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     }
 }
 
+/// Read the zoomed pane for `session` from the pane-runtime plugin's
+/// `pane-runtime-focus` state channel.
+///
+/// The channel is a state (watch) channel, so the current value is
+/// available synchronously without a service round-trip. Returns `None`
+/// when the pane-runtime plugin hasn't registered the channel yet or
+/// the session isn't zoomed.
+fn zoomed_pane_id_for_session(session: Uuid) -> Option<Uuid> {
+    let (snapshot, _rx) = bmux_plugin::global_event_bus()
+        .subscribe_state::<bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap>(
+            &bmux_pane_runtime_plugin_api::pane_runtime_focus::STATE_KIND,
+        )
+        .ok()?;
+    snapshot.entries.get(&session)?.zoomed_pane_id
+}
+
 impl WindowsStateService for WindowsStateHandle {
     fn pane_state<'a>(
         &'a self,
@@ -3659,9 +3675,9 @@ impl WindowsStateService for WindowsStateHandle {
 
     fn zoomed_pane<'a>(
         &'a self,
-        _session: Uuid,
+        session: Uuid,
     ) -> Pin<Box<dyn Future<Output = Option<Uuid>> + Send + 'a>> {
-        Box::pin(async move { None })
+        Box::pin(async move { zoomed_pane_id_for_session(session) })
     }
 
     fn list_panes<'a>(
@@ -3673,6 +3689,7 @@ impl WindowsStateService for WindowsStateHandle {
             let Ok(response) = list_panes(&*caller, Some(session)) else {
                 return Vec::new();
             };
+            let zoomed_pane_id = zoomed_pane_id_for_session(session);
             response
                 .panes
                 .into_iter()
@@ -3680,7 +3697,7 @@ impl WindowsStateService for WindowsStateHandle {
                     id: pane.id,
                     session_id: session,
                     focused: pane.focused,
-                    zoomed: false,
+                    zoomed: zoomed_pane_id == Some(pane.id),
                     name: pane.name,
                     status: windows_state::PaneStatus::default(),
                 })

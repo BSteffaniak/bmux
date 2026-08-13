@@ -174,10 +174,51 @@ pub struct SessionRuntimeSnapshot {
     pub session_id: SessionId,
     pub panes: Vec<PaneRuntimeMeta>,
     pub focused_pane_id: Uuid,
+    /// Pane currently zoomed to fill the scene root, if any. `None`
+    /// means the session renders its normal tiled layout.
+    pub zoomed_pane_id: Option<Uuid>,
     pub layout_root: Option<PaneLayoutNode>,
     pub floating_surfaces: Vec<FloatingSurfaceRuntime>,
     pub attached_clients: BTreeSet<ClientId>,
     pub attach_viewport: Option<AttachViewport>,
+}
+
+/// Restore inputs for [`SessionRuntimeManagerApi::restore_runtime`].
+///
+/// Grouped into a struct so restoring additional view state (zoom,
+/// viewport) doesn't grow an already-wide positional signature.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreRuntimeRequest {
+    /// Layout tree to restore. `None` derives a layout from `panes`.
+    pub layout_root: Option<PaneLayoutNode>,
+    /// Pane that should hold focus after restore.
+    pub focused_pane_id: Uuid,
+    /// Pane that should be zoomed after restore. Implementations may
+    /// drop the zoom when it doesn't satisfy their zoom invariants.
+    pub zoomed_pane_id: Option<Uuid>,
+    /// Floating surfaces anchored in this session.
+    pub floating_surfaces: Vec<FloatingSurfaceRuntime>,
+    /// Last known attach viewport, used to size restored PTYs.
+    pub attach_viewport: Option<AttachViewport>,
+}
+
+impl RestoreRuntimeRequest {
+    /// Minimal request restoring only focus, letting the layout be
+    /// derived from the pane list.
+    #[must_use]
+    pub fn with_focus(focused_pane_id: Uuid) -> Self {
+        Self {
+            focused_pane_id,
+            ..Self::default()
+        }
+    }
+
+    /// Set the layout tree, builder-style.
+    #[must_use]
+    pub fn layout_root(mut self, layout_root: Option<PaneLayoutNode>) -> Self {
+        self.layout_root = layout_root;
+        self
+    }
 }
 
 /// Trait implemented by the pane-runtime plugin's
@@ -192,10 +233,7 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         &self,
         session_id: SessionId,
         panes: &[PaneRuntimeMeta],
-        layout_root: Option<PaneLayoutNode>,
-        focused_pane_id: Uuid,
-        floating_surfaces: Vec<FloatingSurfaceRuntime>,
-        attach_viewport: Option<AttachViewport>,
+        request: RestoreRuntimeRequest,
     ) -> anyhow::Result<()>;
 
     fn remove_runtime(&self, session_id: SessionId) -> Option<RemovedRuntimeInfo>;
@@ -662,10 +700,7 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         &self,
         _session_id: SessionId,
         _panes: &[PaneRuntimeMeta],
-        _layout_root: Option<PaneLayoutNode>,
-        _focused_pane_id: Uuid,
-        _floating_surfaces: Vec<FloatingSurfaceRuntime>,
-        _attach_viewport: Option<AttachViewport>,
+        _request: RestoreRuntimeRequest,
     ) -> anyhow::Result<()> {
         anyhow::bail!("pane-runtime plugin not active")
     }

@@ -40,7 +40,8 @@ pub use manager_handle::{
     AttachPaneGridDelta, AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneGridWindowRequest,
     AttachPaneSnapshotState, AttachSnapshotState, FloatingPaneRuntimeSummary,
     NoopSessionRuntimeManager, PaneProcessIdentity, PaneProcessSignal, RemovedRuntimeInfo,
-    SessionRuntimeManagerApi, SessionRuntimeManagerHandle, SessionRuntimeSnapshot,
+    RestoreRuntimeRequest, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
+    SessionRuntimeSnapshot,
 };
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};
 pub use output::{OutputRead, PaneOutputReader, PaneOutputReaderHandle};
