@@ -181,6 +181,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-state", "attach-pane-grid-window-state" => |req: attach_state::AttachPaneGridWindowArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_window_state(&req, ctx))
         },
+        "attach-runtime-state", "attach-pane-scrollback-pin" => |req: attach_state::AttachPaneScrollbackPinArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_scrollback_pin(&req, ctx))
+        },
+        "attach-runtime-state", "attach-pane-scrollback-unpin" => |req: attach_state::AttachPaneScrollbackUnpinArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_scrollback_unpin(&req, ctx))
+        },
         "attach-runtime-state", "attach-pane-grid-delta-state" => |req: attach_state::AttachPaneGridDeltaArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_delta_state(&req, ctx))
         },

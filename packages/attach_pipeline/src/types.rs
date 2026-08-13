@@ -93,6 +93,14 @@ impl ScrollbackViewportBase {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbackPin {
+    pub pin_id: u64,
+    pub total_scrolled_rows: u64,
+    pub max_scrollback_offset: usize,
+    pub stream_end: u64,
+}
+
 /// Per-pane scrollback view position.
 ///
 /// Scrollback history itself is owned by the server (the pane-runtime
@@ -108,6 +116,8 @@ pub struct PaneScrollbackView {
     pub cursor: AttachScrollbackCursor,
     /// Selection anchor as an absolute history line, when selecting.
     pub selection_anchor: Option<AttachScrollbackPosition>,
+    /// Immutable server-side history pin when this pane uses frozen scrollback.
+    pub pin: Option<ScrollbackPin>,
 }
 
 impl PaneScrollbackView {

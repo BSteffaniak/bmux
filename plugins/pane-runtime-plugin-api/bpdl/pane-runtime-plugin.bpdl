@@ -525,6 +525,21 @@ interface attach-runtime-state {
         scrollback_offset: u32,
         rows: u32,
         anchor_total_scrolled_rows: u64?,
+        pin_id: u64?,
+    }
+
+    record pane-scrollback-pin {
+        pane_id: uuid,
+        pin_id: u64,
+        total_scrolled_rows: u64,
+        max_scrollback_offset: u32,
+        stream_end: u64,
+    }
+
+    record pane-scrollback-unpin-ack {
+        pane_id: uuid,
+        pin_id: u64,
+        released: bool,
     }
 
     record pane-grid-window {
@@ -620,6 +635,17 @@ interface attach-runtime-state {
         session_id: uuid,
         windows: list<pane-grid-window-request>,
     ) -> result<attach-pane-grid-window, attach-state-error>;
+
+    query attach-pane-scrollback-pin(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<pane-scrollback-pin, attach-state-error>;
+
+    query attach-pane-scrollback-unpin(
+        session_id: uuid,
+        pane_id: uuid,
+        pin_id: u64,
+    ) -> result<pane-scrollback-unpin-ack, attach-state-error>;
 
     query attach-pane-grid-delta-state(
         session_id: uuid,

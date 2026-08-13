@@ -25,7 +25,7 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
-use bmux_terminal_grid::{GridDeltaBatch, GridLimits, TerminalGridStream};
+use bmux_terminal_grid::{GridDeltaBatch, GridLimits, TerminalGrid, TerminalGridStream};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -476,8 +476,19 @@ struct SessionRuntimeHandle {
     zoomed_pane_id: Option<Uuid>,
     floating_surfaces: Vec<FloatingSurfaceRuntime>,
     attached_clients: BTreeSet<ClientId>,
+    scrollback_pins: BTreeMap<(ClientId, Uuid), ScrollbackPin>,
+    next_scrollback_pin_id: u64,
     attach_viewport: Option<AttachViewport>,
     attach_view_revision: u64,
+}
+
+#[derive(Clone)]
+struct ScrollbackPin {
+    id: u64,
+    grid: TerminalGrid,
+    total_scrolled_rows: u64,
+    stream_end: u64,
+    encoded_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3096,6 +3107,8 @@ impl SessionRuntimeManager {
                 zoomed_pane_id: None,
                 floating_surfaces: Vec::new(),
                 attached_clients: BTreeSet::new(),
+                scrollback_pins: BTreeMap::new(),
+                next_scrollback_pin_id: 1,
                 attach_viewport: None,
                 attach_view_revision: 0,
             },
@@ -3186,6 +3199,8 @@ impl SessionRuntimeManager {
                 zoomed_pane_id: restored_zoomed_pane_id,
                 floating_surfaces,
                 attached_clients: BTreeSet::new(),
+                scrollback_pins: BTreeMap::new(),
+                next_scrollback_pin_id: 1,
                 attach_viewport,
                 attach_view_revision: 0,
             },
@@ -4064,6 +4079,9 @@ impl SessionRuntimeManager {
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
+        session
+            .scrollback_pins
+            .retain(|(_, pinned_pane_id), _| *pinned_pane_id != pane_id);
         if let Ok(mut index) = pane_input_index.write() {
             index.remove(&pane_id);
         }
@@ -4079,6 +4097,9 @@ impl SessionRuntimeManager {
         });
         for floating_pane_id in anchored_floating_panes {
             if let Some(floating_pane) = session.panes.remove(&floating_pane_id) {
+                session
+                    .scrollback_pins
+                    .retain(|(_, pinned_pane_id), _| *pinned_pane_id != floating_pane_id);
                 if let Ok(mut index) = pane_input_index.write() {
                     index.remove(&floating_pane_id);
                 }
@@ -5104,6 +5125,9 @@ impl SessionRuntimeManager {
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
             let removed = runtime.attached_clients.remove(&client_id);
             if removed {
+                runtime
+                    .scrollback_pins
+                    .retain(|(pin_client_id, _), _| *pin_client_id != client_id);
                 for pane in runtime.panes.values_mut() {
                     if let Ok(mut output) = pane.output_buffer.lock() {
                         output.unregister_client(client_id);
@@ -6307,13 +6331,44 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             let Some(pane) = pane_by_id.get(&window.pane_id) else {
                 continue;
             };
+            let pin = window.pin_id.map_or(Ok(None), |pin_id| {
+                self.with_lock_read_named("attach_grid_window_state.pin", |manager| {
+                    let runtime = manager
+                        .runtimes
+                        .get(&session_id)
+                        .ok_or(SessionRuntimeError::NotFound)?;
+                    let pin = runtime
+                        .scrollback_pins
+                        .get(&(client_id, window.pane_id))
+                        .filter(|pin| pin.id == pin_id)
+                        .cloned()
+                        .ok_or(SessionRuntimeError::NotFound)?;
+                    Ok(Some(pin))
+                })
+                .unwrap_or(Err(SessionRuntimeError::Closed))
+            })?;
             let (
                 snapshot,
                 max_scrollback_offset,
                 total_scrolled_rows,
                 adjusted_offset,
                 desired_offset,
-            ) = {
+                pinned_stream_end,
+            ) = if let Some(pin) = pin {
+                // A frozen pin is immutable: use the requested offset directly
+                // (bounded only by the captured history), never apply live
+                // anchor growth or live-history clamping.
+                let max_offset = pin.grid.max_scrollback_offset();
+                let offset = window.scrollback_offset.min(max_offset);
+                (
+                    pin.grid.snapshot(offset, window.rows),
+                    max_offset,
+                    pin.total_scrolled_rows,
+                    offset,
+                    window.scrollback_offset,
+                    Some(pin.stream_end),
+                )
+            } else {
                 let grid = pane
                     .terminal_grid
                     .lock()
@@ -6333,13 +6388,17 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     total_scrolled_rows,
                     adjusted_offset,
                     desired_offset,
+                    None,
                 )
             };
-            let stream_end = pane
-                .output_buffer
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?
-                .end_offset();
+            let stream_end = if let Some(stream_end) = pinned_stream_end {
+                stream_end
+            } else {
+                pane.output_buffer
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)?
+                    .end_offset()
+            };
             let encoded = serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
             snapshots.push(bmux_pane_runtime_state::AttachPaneGridWindow {
                 pane_id: window.pane_id,
@@ -6353,6 +6412,123 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             });
         }
         Ok(bmux_pane_runtime_state::AttachGridWindowState { windows: snapshots })
+    }
+
+    fn attach_scrollback_pin(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_id: Uuid,
+    ) -> Result<bmux_pane_runtime_state::AttachPaneScrollbackPin, SessionRuntimeError> {
+        let pane = self
+            .with_lock_read_named("attach_scrollback_pin.resolve", |manager| {
+                manager
+                    .attach_pane_data_refs_for_session_panes(session_id, client_id, &[pane_id])
+                    .and_then(|mut panes| panes.pop().ok_or(SessionRuntimeError::NotFound))
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let (captured_grid, total_scrolled_rows, max_scrollback_offset, encoded_bytes) = {
+            let grid = pane
+                .terminal_grid
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?;
+            let captured_grid = grid.grid().clone();
+            let total_scrolled_rows = captured_grid.total_scrolled_rows();
+            let max_scrollback_offset = captured_grid.max_scrollback_offset();
+            let full_snapshot = captured_grid.snapshot(0, captured_grid.main_row_count());
+            let encoded_bytes = serde_json::to_vec(&full_snapshot)
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .len();
+            (
+                captured_grid,
+                total_scrolled_rows,
+                max_scrollback_offset,
+                encoded_bytes,
+            )
+        };
+        let stream_end = pane
+            .output_buffer
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .end_offset();
+        self.with_lock_named("attach_scrollback_pin.store", |manager| {
+            let runtime = manager
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            if !runtime.attached_clients.contains(&client_id) {
+                return Err(SessionRuntimeError::NotAttached);
+            }
+            let pin_id = runtime.next_scrollback_pin_id;
+            runtime.next_scrollback_pin_id = runtime.next_scrollback_pin_id.saturating_add(1);
+            runtime.scrollback_pins.insert(
+                (client_id, pane_id),
+                ScrollbackPin {
+                    id: pin_id,
+                    grid: captured_grid,
+                    total_scrolled_rows,
+                    stream_end,
+                    encoded_bytes,
+                },
+            );
+            trace!(
+                %pane_id,
+                client_id = %client_id.0,
+                pin_id,
+                encoded_bytes,
+                "captured frozen scrollback pin"
+            );
+            Ok(bmux_pane_runtime_state::AttachPaneScrollbackPin {
+                pane_id,
+                pin_id,
+                total_scrolled_rows,
+                max_scrollback_offset,
+                stream_end,
+            })
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn attach_scrollback_unpin(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_id: Uuid,
+        pin_id: u64,
+    ) -> Result<bmux_pane_runtime_state::AttachPaneScrollbackUnpinAck, SessionRuntimeError> {
+        self.with_lock_named("attach_scrollback_unpin", |manager| {
+            let runtime = manager
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            if !runtime.attached_clients.contains(&client_id) {
+                return Err(SessionRuntimeError::NotAttached);
+            }
+            let removed_pin = runtime
+                .scrollback_pins
+                .get(&(client_id, pane_id))
+                .filter(|pin| pin.id == pin_id)
+                .map(|pin| pin.encoded_bytes);
+            let released = removed_pin.is_some()
+                && runtime
+                    .scrollback_pins
+                    .remove(&(client_id, pane_id))
+                    .is_some();
+            trace!(
+                %pane_id,
+                client_id = %client_id.0,
+                pin_id,
+                encoded_bytes = removed_pin,
+                released,
+                "released frozen scrollback pin"
+            );
+            Ok(bmux_pane_runtime_state::AttachPaneScrollbackUnpinAck {
+                pane_id,
+                pin_id,
+                released,
+            })
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
     }
 
     fn attach_grid_delta_state(
@@ -7223,6 +7399,8 @@ mod tests {
             zoomed_pane_id: None,
             floating_surfaces: Vec::new(),
             attached_clients: BTreeSet::new(),
+            scrollback_pins: BTreeMap::new(),
+            next_scrollback_pin_id: 1,
             attach_viewport: Some(AttachViewport {
                 cols: 120,
                 rows: 40,
@@ -7479,6 +7657,7 @@ mod tests {
                 scrollback_offset: 1,
                 rows: 2,
                 anchor_total_scrolled_rows: None,
+                pin_id: None,
             }],
         )
         .expect("attached client should receive grid window");
@@ -7531,6 +7710,7 @@ mod tests {
                 scrollback_offset: 1,
                 rows: 2,
                 anchor_total_scrolled_rows: None,
+                pin_id: None,
             }],
         )
         .expect("attached client should receive first window")
@@ -7564,6 +7744,7 @@ mod tests {
                 scrollback_offset: first.scrollback_offset,
                 rows: 2,
                 anchor_total_scrolled_rows: Some(first.total_scrolled_rows),
+                pin_id: None,
             }],
         )
         .expect("attached client should receive anchored window")
@@ -7584,6 +7765,123 @@ mod tests {
             second.scrollback_offset - first.scrollback_offset
         );
         assert!(!second.anchor_clamped);
+    }
+
+    #[tokio::test]
+    async fn frozen_scrollback_pin_serves_immutable_windows_while_live_grid_advances() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 8, 2);
+        pane.terminal_grid
+            .lock()
+            .expect("grid lock should be available")
+            .process(b"line-1\r\nline-2\r\nline-3");
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let pin = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        )
+        .expect("attached client should pin pane history");
+        let request = bmux_pane_runtime_state::AttachPaneGridWindowRequest {
+            pane_id,
+            scrollback_offset: 1,
+            rows: 2,
+            anchor_total_scrolled_rows: None,
+            pin_id: Some(pin.pin_id),
+        };
+        let before = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[request],
+        )
+        .expect("pinned window should be available")
+        .windows
+        .into_iter()
+        .next()
+        .expect("pinned window should exist");
+
+        {
+            let manager = adapter
+                .inner
+                .lock()
+                .expect("manager lock should be available");
+            let pane = manager
+                .runtimes
+                .get(&session_id)
+                .and_then(|runtime| runtime.panes.get(&pane_id))
+                .expect("pane should still exist");
+            pane.terminal_grid
+                .lock()
+                .expect("grid lock should be available")
+                .process(b"\r\nline-4\r\nline-5\r\nline-6");
+        }
+
+        let after = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[request],
+        )
+        .expect("pinned window should remain available")
+        .windows
+        .into_iter()
+        .next()
+        .expect("pinned window should exist");
+
+        assert_eq!(after.encoded, before.encoded);
+        assert_eq!(after.total_scrolled_rows, pin.total_scrolled_rows);
+        assert_eq!(after.max_scrollback_offset, pin.max_scrollback_offset);
+        assert_eq!(after.stream_end, pin.stream_end);
+        assert_eq!(after.scrollback_offset, 1);
+        assert_eq!(after.anchor_delta_rows, 0);
+        assert!(!after.anchor_clamped);
+    }
+
+    #[tokio::test]
+    async fn frozen_scrollback_pin_releases_explicitly_and_on_detach() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let first = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        )
+        .expect("first pin should succeed");
+        let ack = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_unpin(
+            &adapter,
+            session_id,
+            client_id,
+            pane_id,
+            first.pin_id,
+        )
+        .expect("unpin should succeed");
+        assert!(ack.released);
+
+        let second = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        )
+        .expect("second pin should succeed");
+        bmux_pane_runtime_state::SessionRuntimeManagerApi::end_attach(
+            &adapter, session_id, client_id,
+        );
+        let manager = adapter
+            .inner
+            .lock()
+            .expect("manager lock should be available");
+        let runtime = manager
+            .runtimes
+            .get(&session_id)
+            .expect("runtime should exist");
+        assert!(!runtime.scrollback_pins.contains_key(&(client_id, pane_id)));
+        assert!(second.pin_id > first.pin_id);
     }
 
     #[tokio::test]

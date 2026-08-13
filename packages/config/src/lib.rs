@@ -1964,6 +1964,66 @@ pub struct AppearanceConfig {
     pub window_title_format: String,
 }
 
+/// How pane history behaves while a client is in scrollback.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollbackMode {
+    /// Continue following live pane history while preserving the viewed
+    /// position as new output arrives.
+    #[default]
+    Live,
+    /// Pin an immutable pane-history snapshot for the duration of scrollback.
+    Frozen,
+}
+
+/// Per-pane default scrollback mode selected from pane metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "behavior.scrollback.pane_rules")]
+#[serde(default)]
+pub struct ScrollbackPaneRule {
+    /// Optional wildcard pattern matched against the active pane command.
+    pub match_command: Option<String>,
+    /// Optional wildcard pattern matched against the pane name.
+    pub match_name: Option<String>,
+    /// Optional wildcard pattern matched against the pane shell.
+    pub match_shell: Option<String>,
+    /// Scrollback mode selected when every configured matcher succeeds.
+    pub mode: ScrollbackMode,
+}
+
+/// Scrollback snapshot and per-pane mode behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "behavior.scrollback")]
+#[serde(default)]
+pub struct ScrollbackBehaviorConfig {
+    /// Default scrollback mode. LIVE preserves current streaming behavior;
+    /// FROZEN pins an immutable pane-history snapshot on entry.
+    pub mode: ScrollbackMode,
+    /// Maximum simultaneously frozen panes for one client. Zero is unlimited.
+    pub max_frozen_panes: usize,
+    /// Automatically leave frozen scrollback after this many seconds. Zero
+    /// disables automatic unfreeze.
+    pub auto_unfreeze_after: u64,
+    /// Persist runtime per-pane mode overrides in the XDG state directory.
+    pub persist_pane_modes: bool,
+    /// Ordered per-pane defaults. The first rule whose configured matchers all
+    /// succeed wins.
+    #[config_doc(nested, list_index = "<index>")]
+    pub pane_rules: Vec<ScrollbackPaneRule>,
+}
+
+impl Default for ScrollbackBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            mode: ScrollbackMode::Live,
+            max_frozen_panes: 0,
+            auto_unfreeze_after: 0,
+            persist_pane_modes: true,
+            pane_rules: Vec::new(),
+        }
+    }
+}
+
 /// Runtime behavior toggles for terminal protocol handling, layout persistence,
 /// and build compatibility
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
@@ -2037,6 +2097,9 @@ pub struct BehaviorConfig {
     /// (e.g. after exiting zoom). SNAPSHOT re-fetches from the server for
     /// guaranteed accuracy. RETAIN keeps parsers in memory for instant restore.
     pub pane_restore_method: PaneRestoreMethod,
+    /// Scrollback snapshot and per-pane mode behavior.
+    #[config_doc(nested)]
+    pub scrollback: ScrollbackBehaviorConfig,
     /// Mouse interaction settings for attach mode (focus/scroll gestures).
     #[config_doc(nested)]
     pub mouse: MouseBehaviorConfig,
@@ -2074,6 +2137,7 @@ impl Default for BehaviorConfig {
             kitty_keyboard: true,
             bracketed_paste: true,
             pane_restore_method: PaneRestoreMethod::Snapshot,
+            scrollback: ScrollbackBehaviorConfig::default(),
             mouse: MouseBehaviorConfig::default(),
             damage: DamageBehaviorConfig::default(),
             event_coalescing: EventCoalescingBehaviorConfig::default(),
@@ -3953,7 +4017,7 @@ mod tests {
         AlternateScreenWheelBehavior, BMUX_CONFIG_ENV, BmuxConfig, ConfigLoadOverrides,
         ConfigScopeTarget, MouseClickPropagation, MouseSelectionReleaseBehavior,
         MouseWheelPropagation, ResolvedTimeout, SandboxCleanupSource, ScopedConfigLoadRequest,
-        StaleBuildAction, push_process_config_overrides,
+        ScrollbackMode, StaleBuildAction, push_process_config_overrides,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5693,6 +5757,38 @@ timeout_profile = "missing"
             super::StatusPosition::Top
         ));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn scrollback_behavior_defaults_to_live_without_limits_or_timeout() {
+        let config = BmuxConfig::default();
+        assert_eq!(config.behavior.scrollback.mode, ScrollbackMode::Live);
+        assert_eq!(config.behavior.scrollback.max_frozen_panes, 0);
+        assert_eq!(config.behavior.scrollback.auto_unfreeze_after, 0);
+        assert!(config.behavior.scrollback.persist_pane_modes);
+        assert!(config.behavior.scrollback.pane_rules.is_empty());
+    }
+
+    #[test]
+    fn scrollback_behavior_parses_frozen_mode_and_preserves_zero_sentinels() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            "[behavior.scrollback]\nmode = 'frozen'\nmax_frozen_panes = 0\nauto_unfreeze_after = 0\npersist_pane_modes = true\n\n[[behavior.scrollback.pane_rules]]\nmatch_command = 'journal*'\nmatch_name = 'logs*'\nmatch_shell = '*/fish'\nmode = 'frozen'\n",
+        )
+        .expect("write scrollback config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("load scrollback config");
+        assert_eq!(config.behavior.scrollback.mode, ScrollbackMode::Frozen);
+        assert_eq!(config.behavior.scrollback.max_frozen_panes, 0);
+        assert_eq!(config.behavior.scrollback.auto_unfreeze_after, 0);
+        assert_eq!(config.behavior.scrollback.pane_rules.len(), 1);
+        let rule = &config.behavior.scrollback.pane_rules[0];
+        assert_eq!(rule.match_command.as_deref(), Some("journal*"));
+        assert_eq!(rule.match_name.as_deref(), Some("logs*"));
+        assert_eq!(rule.match_shell.as_deref(), Some("*/fish"));
+        assert_eq!(rule.mode, ScrollbackMode::Frozen);
+        std::fs::remove_dir_all(path.parent().expect("temp config parent")).ok();
     }
 
     #[test]

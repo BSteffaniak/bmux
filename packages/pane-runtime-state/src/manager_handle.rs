@@ -92,6 +92,25 @@ pub struct AttachPaneGridWindowRequest {
     pub scrollback_offset: usize,
     pub rows: usize,
     pub anchor_total_scrolled_rows: Option<u64>,
+    pub pin_id: Option<u64>,
+}
+
+/// Immutable per-client pane-history capture used by frozen scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachPaneScrollbackPin {
+    pub pane_id: Uuid,
+    pub pin_id: u64,
+    pub total_scrolled_rows: u64,
+    pub max_scrollback_offset: usize,
+    pub stream_end: u64,
+}
+
+/// Result of releasing one frozen-scrollback pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachPaneScrollbackUnpinAck {
+    pub pane_id: Uuid,
+    pub pin_id: u64,
+    pub released: bool,
 }
 
 /// Bounded structured terminal-grid scrollback window for one pane.
@@ -478,6 +497,21 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         client_id: ClientId,
         windows: &[AttachPaneGridWindowRequest],
     ) -> Result<AttachGridWindowState, SessionRuntimeError>;
+
+    fn attach_scrollback_pin(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_id: Uuid,
+    ) -> Result<AttachPaneScrollbackPin, SessionRuntimeError>;
+
+    fn attach_scrollback_unpin(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_id: Uuid,
+        pin_id: u64,
+    ) -> Result<AttachPaneScrollbackUnpinAck, SessionRuntimeError>;
 
     fn attach_grid_delta_state(
         &self,
@@ -965,6 +999,23 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _client_id: ClientId,
         _windows: &[AttachPaneGridWindowRequest],
     ) -> Result<AttachGridWindowState, SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+    fn attach_scrollback_pin(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _pane_id: Uuid,
+    ) -> Result<AttachPaneScrollbackPin, SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+    fn attach_scrollback_unpin(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _pane_id: Uuid,
+        _pin_id: u64,
+    ) -> Result<AttachPaneScrollbackUnpinAck, SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
 

@@ -406,13 +406,14 @@ use super::state::{
     AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachPointerOwner,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
     AttachTabMenu, AttachTabMenuAction, AttachTabRename, AttachUiEffect, AttachUiMode,
-    AttachUiReduction, AttachViewState, PaneRenderBuffer, PaneScrollbackView,
+    AttachUiReduction, AttachViewState, PaneRenderBuffer, PaneScrollbackView, ScrollbackPin,
 };
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
     attach_pane_grid_delta_state_streaming, attach_pane_grid_snapshot_state_streaming,
-    attach_pane_grid_window_state_streaming,
+    attach_pane_grid_window_state_streaming, attach_pane_scrollback_pin_streaming,
+    attach_pane_scrollback_unpin_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use bmux_plugin::{BorderGlyphs, RenderDamage, RenderOp, RenderStyle};
@@ -4205,7 +4206,14 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         // Pure redraw dirty flags (layout/status/overlay) must not trigger
         // pane-output IPC on their own.
         if pane_output_pending {
-            let pane_ids = visible_scene_pane_ids(&layout_state.scene);
+            let pane_ids = visible_scene_pane_ids(&layout_state.scene)
+                .into_iter()
+                .filter(|pane_id| {
+                    !view_state
+                        .scrollback_for(*pane_id)
+                        .is_some_and(|view| view.pin.is_some())
+                })
+                .collect::<Vec<_>>();
             let active_pane_ids = attach_layout_pane_id_set(&layout_state);
             view_state
                 .pane_buffers
@@ -6413,6 +6421,7 @@ pub fn enter_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uu
                 col: cursor.col.min(inner_w.saturating_sub(1)),
             },
             selection_anchor: None,
+            pin: None,
         },
     );
     true
@@ -6821,6 +6830,12 @@ pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset:
 }
 
 pub fn max_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uuid) -> usize {
+    if let Some(max_offset) = view_state
+        .scrollback_for(pane_id)
+        .and_then(|view| view.pin.map(|pin| pin.max_scrollback_offset))
+    {
+        return max_offset;
+    }
     let Some(buffer) = attach_pane_buffer_mut(view_state, pane_id) else {
         return 0;
     };
@@ -9493,7 +9508,12 @@ async fn ensure_pane_scrollback_windows(
             pane_id: *pane_id,
             scrollback_offset: view.offset,
             rows,
-            anchor_total_scrolled_rows: cached_window.map(|window| window.total_scrolled_rows),
+            anchor_total_scrolled_rows: if view.pin.is_some() {
+                None
+            } else {
+                cached_window.map(|window| window.total_scrolled_rows)
+            },
+            pin_id: view.pin.map(|pin| pin.pin_id),
         });
     }
 
@@ -9598,12 +9618,87 @@ async fn handle_attach_mouse_scrollback_with_window(
     Ok(true)
 }
 
+async fn pin_focused_scrollback_if_configured(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    config: &BmuxConfig,
+    now: Instant,
+) {
+    if config.behavior.scrollback.mode != bmux_config::ScrollbackMode::Frozen {
+        return;
+    }
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return;
+    };
+    if view_state
+        .scrollback_for(pane_id)
+        .is_some_and(|view| view.pin.is_some())
+    {
+        return;
+    }
+    if config.behavior.scrollback.max_frozen_panes != 0
+        && view_state
+            .pane_scrollback
+            .values()
+            .filter(|view| view.pin.is_some())
+            .count()
+            >= config.behavior.scrollback.max_frozen_panes
+    {
+        view_state.set_transient_status(
+            "frozen scrollback pane limit reached; using live scrollback",
+            now,
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return;
+    }
+    match attach_pane_scrollback_pin_streaming(client, view_state.attached_id, pane_id).await {
+        Ok(pin) => {
+            if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+                view.pin = Some(ScrollbackPin {
+                    pin_id: pin.pin_id,
+                    total_scrolled_rows: pin.total_scrolled_rows,
+                    max_scrollback_offset: pin.max_scrollback_offset,
+                    stream_end: pin.stream_end,
+                });
+            }
+        }
+        Err(error) => view_state.set_transient_status(
+            format!("frozen scrollback unavailable; using live scrollback: {error}"),
+            now,
+            ATTACH_TRANSIENT_STATUS_TTL,
+        ),
+    }
+}
+
+async fn unpin_focused_scrollback(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) {
+    let Some(pane_id) = view_state.focused_pane_id() else {
+        return;
+    };
+    let Some(pin) = view_state.scrollback_for(pane_id).and_then(|view| view.pin) else {
+        return;
+    };
+    let _ =
+        attach_pane_scrollback_unpin_streaming(client, view_state.attached_id, pane_id, pin.pin_id)
+            .await;
+}
+
 async fn handle_attach_ui_action_with_scrollback(
     client: &mut StreamingBmuxClient,
     action: &RuntimeAction,
     view_state: &mut AttachViewState,
     now: Instant,
 ) -> std::result::Result<(), ClientError> {
+    let entering =
+        matches!(action, RuntimeAction::EnterScrollMode) && !view_state.scrollback_active();
+    let exiting = matches!(action, RuntimeAction::ExitScrollMode)
+        && view_state.scrollback_active()
+        && !view_state.selection_active();
+    if exiting {
+        unpin_focused_scrollback(client, view_state).await;
+    }
     let needs_max_before = matches!(
         action,
         RuntimeAction::ScrollUpLine
@@ -9617,6 +9712,10 @@ async fn handle_attach_ui_action_with_scrollback(
 
     handle_attach_ui_action_at(action, view_state, now);
 
+    if entering && view_state.scrollback_active() {
+        let config = BmuxConfig::load().unwrap_or_default();
+        pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
+    }
     if !view_state.pane_scrollback.is_empty() {
         ensure_pane_scrollback_windows(client, view_state, false).await?;
     }

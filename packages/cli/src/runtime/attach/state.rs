@@ -6,7 +6,7 @@ use bmux_attach_layout_protocol::{
 };
 pub use bmux_attach_pipeline::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect,
-    PaneRenderBuffer, PaneScrollbackView, PaneScrollbackViews,
+    PaneRenderBuffer, PaneScrollbackView, PaneScrollbackViews, ScrollbackPin,
 };
 use bmux_attach_pipeline::{FrameDamage, RetainedCompositor, TerminalGraphicsCache};
 use bmux_client::AttachLayoutState;

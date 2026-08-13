@@ -46,6 +46,7 @@ pub struct PaneGridWindowRequest {
     pub scrollback_offset: usize,
     pub rows: usize,
     pub anchor_total_scrolled_rows: Option<u64>,
+    pub pin_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,15 @@ pub struct PaneGridWindowResult {
     pub anchor_clamped: bool,
     pub stream_end: u64,
     pub encoded: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneScrollbackPinResult {
+    pub pane_id: Uuid,
+    pub pin_id: u64,
+    pub total_scrolled_rows: u64,
+    pub max_scrollback_offset: usize,
+    pub stream_end: u64,
 }
 
 #[allow(
@@ -138,6 +148,7 @@ pub async fn attach_pane_grid_window_state_streaming(
             scrollback_offset: u32::try_from(window.scrollback_offset).unwrap_or(u32::MAX),
             rows: u32::try_from(window.rows).unwrap_or(u32::MAX),
             anchor_total_scrolled_rows: window.anchor_total_scrolled_rows,
+            pin_id: window.pin_id,
         })
         .collect::<Vec<_>>();
     match AttachState::client::attach_pane_grid_window_state(client, session_id, windows).await {
@@ -157,6 +168,39 @@ pub async fn attach_pane_grid_window_state_streaming(
             .collect()),
         Ok(Err(err)) => typed_server_error("attach-pane-grid-window-state", err),
         Err(err) => typed_dispatch_error("attach-pane-grid-window-state", err),
+    }
+}
+
+pub async fn attach_pane_scrollback_pin_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_id: Uuid,
+) -> ClientResult<PaneScrollbackPinResult> {
+    match AttachState::client::attach_pane_scrollback_pin(client, session_id, pane_id).await {
+        Ok(Ok(pin)) => Ok(PaneScrollbackPinResult {
+            pane_id: pin.pane_id,
+            pin_id: pin.pin_id,
+            total_scrolled_rows: pin.total_scrolled_rows,
+            max_scrollback_offset: pin.max_scrollback_offset as usize,
+            stream_end: pin.stream_end,
+        }),
+        Ok(Err(err)) => typed_server_error("attach-pane-scrollback-pin", err),
+        Err(err) => typed_dispatch_error("attach-pane-scrollback-pin", err),
+    }
+}
+
+pub async fn attach_pane_scrollback_unpin_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_id: Uuid,
+    pin_id: u64,
+) -> ClientResult<bool> {
+    match AttachState::client::attach_pane_scrollback_unpin(client, session_id, pane_id, pin_id)
+        .await
+    {
+        Ok(Ok(ack)) => Ok(ack.released),
+        Ok(Err(err)) => typed_server_error("attach-pane-scrollback-unpin", err),
+        Err(err) => typed_dispatch_error("attach-pane-scrollback-unpin", err),
     }
 }
 

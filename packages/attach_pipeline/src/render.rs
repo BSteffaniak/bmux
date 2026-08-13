@@ -8714,6 +8714,7 @@ mod tests {
                 offset: 1,
                 cursor: AttachScrollbackCursor { row: 0, col: 0 },
                 selection_anchor: None,
+                pin: None,
             },
         );
 
@@ -8797,6 +8798,7 @@ mod tests {
                     offset: 1,
                     cursor: AttachScrollbackCursor { row: 0, col: 0 },
                     selection_anchor: None,
+                    pin: None,
                 },
             ),
             false,
@@ -8863,6 +8865,7 @@ mod tests {
                     offset: 0,
                     cursor: AttachScrollbackCursor { row: 0, col: 4 },
                     selection_anchor: Some(AttachScrollbackPosition { line: 0, col: 1 }),
+                    pin: None,
                 },
             ),
             false,

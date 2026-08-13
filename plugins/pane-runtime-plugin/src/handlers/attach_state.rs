@@ -16,6 +16,7 @@ use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
     AttachStateError, PaneChunk, PaneGridDelta, PaneGridSnapshot, PaneGridWindow,
     PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol, PaneOutputCursorRead,
+    PaneScrollbackPin, PaneScrollbackUnpinAck,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -73,6 +74,19 @@ pub struct AttachPaneGridSnapshotArgs {
 pub struct AttachPaneGridWindowArgs {
     pub session_id: Uuid,
     pub windows: Vec<PaneGridWindowRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneScrollbackPinArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneScrollbackUnpinArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub pin_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +339,7 @@ pub fn attach_pane_grid_window_state(
                 scrollback_offset: window.scrollback_offset as usize,
                 rows: window.rows as usize,
                 anchor_total_scrolled_rows: window.anchor_total_scrolled_rows,
+                pin_id: window.pin_id,
             },
         )
         .collect::<Vec<_>>();
@@ -348,6 +363,51 @@ pub fn attach_pane_grid_window_state(
                 encoded: window.encoded,
             })
             .collect(),
+    })
+}
+
+pub fn attach_pane_scrollback_pin(
+    req: &AttachPaneScrollbackPinArgs,
+    ctx: &NativeServiceContext,
+) -> Result<PaneScrollbackPin, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let pin = handle
+        .0
+        .attach_scrollback_pin(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            req.pane_id,
+        )
+        .map_err(|_| AttachStateError::NotAttached)?;
+    Ok(PaneScrollbackPin {
+        pane_id: pin.pane_id,
+        pin_id: pin.pin_id,
+        total_scrolled_rows: pin.total_scrolled_rows,
+        max_scrollback_offset: u32::try_from(pin.max_scrollback_offset).unwrap_or(u32::MAX),
+        stream_end: pin.stream_end,
+    })
+}
+
+pub fn attach_pane_scrollback_unpin(
+    req: &AttachPaneScrollbackUnpinArgs,
+    ctx: &NativeServiceContext,
+) -> Result<PaneScrollbackUnpinAck, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let ack = handle
+        .0
+        .attach_scrollback_unpin(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            req.pane_id,
+            req.pin_id,
+        )
+        .map_err(|_| AttachStateError::NotAttached)?;
+    Ok(PaneScrollbackUnpinAck {
+        pane_id: ack.pane_id,
+        pin_id: ack.pin_id,
+        released: ack.released,
     })
 }
 
