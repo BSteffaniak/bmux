@@ -405,8 +405,8 @@ use super::state::{
     AttachInputHookCapture, AttachMouseFloatingDrag, AttachMouseResizeAxisDrag,
     AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachPointerOwner,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
-    AttachTabRename, AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState,
-    PaneRenderBuffer, PaneScrollbackView,
+    AttachTabMenu, AttachTabMenuAction, AttachTabRename, AttachUiEffect, AttachUiMode,
+    AttachUiReduction, AttachViewState, PaneRenderBuffer, PaneScrollbackView,
 };
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
@@ -442,6 +442,7 @@ const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
 const STATUS_SURFACE_ID: Uuid = Uuid::from_u128(3);
 const DAMAGE_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(4);
+const TAB_MENU_SURFACE_ID: Uuid = Uuid::from_u128(5);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -7670,6 +7671,29 @@ fn retained_help_overlay_surface(
     )
 }
 
+/// Retained surface for the tab context menu overlay.
+fn retained_tab_menu_surface(
+    menu: &AttachTabMenu,
+    appearance: &RuntimeAppearance,
+    geometry: TerminalGeometry,
+) -> Option<RetainedSurface> {
+    if geometry.cols == 0 || geometry.rows == 0 {
+        return None;
+    }
+    let rect = attach_tab_menu_rect(menu, geometry);
+    if rect.w == 0 || rect.h == 0 {
+        return None;
+    }
+    Some(
+        RetainedSurface::builder(TAB_MENU_SURFACE_ID, rect)
+            .layer(retained_layer_order(SurfaceLayer::Status))
+            .z(i32::MAX)
+            .opaque()
+            .render_ops(attach_tab_menu_render_ops(menu, rect, appearance))
+            .build(),
+    )
+}
+
 fn retained_prompt_overlay_surface(render: &AttachPromptOverlayRender) -> RetainedSurface {
     retained_surface_from_attach_surface(
         &render.surface,
@@ -7867,6 +7891,7 @@ struct RetainedFramePlan {
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
     prompt_surface: Option<RetainedSurface>,
+    tab_menu_surface: Option<RetainedSurface>,
     damage: RetainedDamagePlan,
     repaint_plan: Vec<RetainedRepaintSurface>,
 }
@@ -7892,6 +7917,7 @@ fn build_retained_frame_plan(
     status_surface: Option<RetainedSurface>,
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
+    tab_menu_surface: Option<RetainedSurface>,
     viewport: DamageRect,
     damage_policy: DamageCoalescingPolicy,
 ) -> RetainedFramePlan {
@@ -7917,6 +7943,9 @@ fn build_retained_frame_plan(
         if let Some(surface) = prompt_surface.as_ref() {
             explicit_ui_damage_rects.push(surface.rect);
         }
+        if let Some(surface) = tab_menu_surface.as_ref() {
+            explicit_ui_damage_rects.push(surface.rect);
+        }
     }
     let explicit_ui_damage =
         retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
@@ -7924,6 +7953,7 @@ fn build_retained_frame_plan(
     retained_surfaces.extend(status_surface.iter().cloned());
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
+    retained_surfaces.extend(tab_menu_surface.iter().cloned());
     let graph_damage = view_state.retained_compositor.replace_surfaces(
         retained_surfaces.clone(),
         viewport,
@@ -7949,6 +7979,7 @@ fn build_retained_frame_plan(
         help_surface,
         prompt_overlay_render,
         prompt_surface,
+        tab_menu_surface,
         damage: RetainedDamagePlan {
             frame: frame_retained_damage,
             explicit_ui: explicit_ui_damage,
@@ -8060,6 +8091,10 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     } else {
         None
     };
+    let tab_menu_surface = view_state
+        .tab_menu
+        .as_ref()
+        .and_then(|menu| retained_tab_menu_surface(menu, runtime_appearance, geometry));
     let retained_plan = build_retained_frame_plan(
         view_state,
         layout_state,
@@ -8067,6 +8102,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         status_surface,
         help_retained_surface,
         prompt_overlay_render,
+        tab_menu_surface,
         viewport,
         damage_policy,
     );
@@ -8240,6 +8276,13 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         });
     }
 
+    if let Some(menu_surface) = frame_plan.retained.tab_menu_surface.as_ref()
+        && let Some(repaint) = retained_repaint_by_id.get(&menu_surface.id)
+        && queue_retained_render_ops(&mut frame_bytes, menu_surface, repaint)?
+    {
+        overlay_rendered = true;
+    }
+
     if damage_config.visualize
         && let Some(damage_surface) = retained_damage_overlay_surface(
             &layout_state.scene,
@@ -8272,6 +8315,14 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         apply_attach_cursor_state(
             &mut frame_bytes,
             overlay_cursor_state,
+            &mut view_state.last_cursor_state,
+            false,
+        )?;
+    } else if view_state.tab_menu.is_some() {
+        // The menu has no text entry; keep the caret hidden while it is open.
+        apply_attach_cursor_state(
+            &mut frame_bytes,
+            None,
             &mut view_state.last_cursor_state,
             false,
         )?;
@@ -10450,6 +10501,33 @@ pub async fn handle_attach_terminal_event(
         .await?;
     }
 
+    if view_state.tab_menu.is_some() {
+        // The context menu owns input while open, ahead of the inline editor,
+        // prompt overlay, and pane forwarding.
+        let menu_reduction = match &normalized_event {
+            Some(TerminalInputEvent::Key(key)) => handle_attach_tab_menu_key_event(view_state, key),
+            Some(TerminalInputEvent::Mouse(mouse)) => {
+                handle_attach_tab_menu_mouse_event(view_state, *mouse, geometry)
+            }
+            Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
+                let _ = close_attach_tab_menu(view_state);
+                Some(AttachUiReduction::consumed())
+            }
+            _ => None,
+        };
+        if let Some(reduction) = menu_reduction {
+            execute_attach_ui_effects(
+                client,
+                view_state,
+                reduction.effects,
+                kernel_client_factory,
+                now,
+            )
+            .await?;
+            return Ok(AttachLoopControl::Continue);
+        }
+    }
+
     if view_state.tab_rename.is_some() {
         // The inline tab editor owns keyboard input while open, ahead of the
         // prompt overlay and pane forwarding.
@@ -10958,6 +11036,28 @@ pub async fn handle_attach_prompt_completion_at(
                 } else {
                     view_state.set_transient_status(
                         "quit canceled",
+                        now,
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            }
+            AttachInternalPromptAction::CloseWindow { context_id } => {
+                if prompt_response_is_confirmed(&completion.response) {
+                    match close_attach_window_by_id(client, context_id).await {
+                        Ok(()) => {
+                            view_state.set_transient_status(
+                                "window closed",
+                                now,
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            optimistically_remove_attach_window_list_entry(view_state, context_id);
+                            requires_layout_refresh = true;
+                        }
+                        Err(error) => set_close_prompt_error_at(view_state, error, now),
+                    }
+                } else {
+                    view_state.set_transient_status(
+                        "close window canceled",
                         now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
@@ -12889,6 +12989,330 @@ fn reduce_attach_status_tab_press(
     AttachUiReduction::consumed()
 }
 
+/// Open the tab context menu for a right-click on the status tab strip.
+fn reduce_attach_status_tab_context_menu_press(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
+) -> AttachUiReduction {
+    let Some(context_id) = attach_status_tab_context_at(view_state, mouse_event, geometry) else {
+        // Right-click off the strip dismisses an open menu, otherwise it is not
+        // ours to handle (pane content keeps its own right-click semantics).
+        if close_attach_tab_menu(view_state) {
+            return AttachUiReduction::consumed();
+        }
+        return AttachUiReduction::ignored();
+    };
+
+    // An open inline editor is abandoned when the menu takes over.
+    let _ = cancel_attach_tab_rename(view_state);
+
+    let (index, count) = attach_tab_position_for_context(view_state, context_id);
+    view_state.tab_menu = Some(AttachTabMenu::new(
+        context_id,
+        mouse_event.col,
+        mouse_event.row,
+        index,
+        count,
+    ));
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::UserAction);
+    view_state
+        .dirty
+        .mark_overlay_dirty(AttachDirtySource::UserAction);
+    AttachUiReduction::consumed()
+}
+
+/// Position of `context_id` within the current tab ordering, and the tab count.
+fn attach_tab_position_for_context(
+    view_state: &AttachViewState,
+    context_id: Uuid,
+) -> (usize, usize) {
+    if let Some(snapshot) = view_state.cached_window_list.as_ref() {
+        let count = snapshot.windows.len();
+        let index = snapshot
+            .windows
+            .iter()
+            .position(|entry| entry.id == context_id)
+            .unwrap_or(0);
+        return (index, count);
+    }
+    let count = view_state.cached_contexts.len();
+    let index = view_state
+        .cached_contexts
+        .iter()
+        .position(|context| context.id == context_id)
+        .unwrap_or(0);
+    (index, count)
+}
+
+/// Dismiss the tab context menu. Returns whether one was open.
+fn close_attach_tab_menu(view_state: &mut AttachViewState) -> bool {
+    if view_state.tab_menu.take().is_some() {
+        view_state
+            .dirty
+            .mark_status_dirty(AttachDirtySource::UserAction);
+        view_state
+            .dirty
+            .mark_overlay_dirty(AttachDirtySource::UserAction);
+        return true;
+    }
+    false
+}
+
+/// Neighbor context id for a positional move, if one exists.
+fn attach_tab_move_target(
+    view_state: &AttachViewState,
+    context_id: Uuid,
+    action: AttachTabMenuAction,
+) -> Option<(Uuid, AttachTabDropPlacement)> {
+    let ordered: Vec<Uuid> = view_state.cached_window_list.as_ref().map_or_else(
+        || {
+            view_state
+                .cached_contexts
+                .iter()
+                .map(|context| context.id)
+                .collect()
+        },
+        |snapshot| snapshot.windows.iter().map(|entry| entry.id).collect(),
+    );
+    let index = ordered.iter().position(|id| *id == context_id)?;
+    match action {
+        AttachTabMenuAction::MoveLeft => index
+            .checked_sub(1)
+            .and_then(|target| ordered.get(target).copied())
+            .map(|target| (target, AttachTabDropPlacement::Before)),
+        AttachTabMenuAction::MoveRight => ordered
+            .get(index + 1)
+            .copied()
+            .map(|target| (target, AttachTabDropPlacement::After)),
+        AttachTabMenuAction::MoveToFirst => ordered
+            .first()
+            .copied()
+            .filter(|first| *first != context_id)
+            .map(|target| (target, AttachTabDropPlacement::Before)),
+        AttachTabMenuAction::MoveToLast => ordered
+            .last()
+            .copied()
+            .filter(|last| *last != context_id)
+            .map(|target| (target, AttachTabDropPlacement::After)),
+        _ => None,
+    }
+}
+
+/// Activate the focused menu entry, closing the menu.
+fn activate_attach_tab_menu(view_state: &mut AttachViewState) -> AttachUiReduction {
+    let Some(menu) = view_state.tab_menu.as_ref() else {
+        return AttachUiReduction::ignored();
+    };
+    let Some(action) = menu.focused_action() else {
+        return AttachUiReduction::consumed();
+    };
+    let context_id = menu.context_id;
+    let _ = close_attach_tab_menu(view_state);
+
+    match action {
+        AttachTabMenuAction::Rename => begin_attach_tab_rename(view_state, context_id),
+        AttachTabMenuAction::Close => {
+            if view_state.can_write {
+                AttachUiReduction::with_effect(AttachUiEffect::CloseWindow { context_id })
+            } else {
+                AttachUiReduction::with_effect(AttachUiEffect::ShowTransientStatus {
+                    message: "closing windows is unavailable in read-only attach".to_string(),
+                })
+            }
+        }
+        AttachTabMenuAction::NewWindow => {
+            if view_state.can_write {
+                AttachUiReduction::with_effect(AttachUiEffect::NewWindow)
+            } else {
+                AttachUiReduction::with_effect(AttachUiEffect::ShowTransientStatus {
+                    message: "creating windows is unavailable in read-only attach".to_string(),
+                })
+            }
+        }
+        AttachTabMenuAction::MoveLeft
+        | AttachTabMenuAction::MoveRight
+        | AttachTabMenuAction::MoveToFirst
+        | AttachTabMenuAction::MoveToLast => {
+            if !view_state.can_write {
+                return AttachUiReduction::with_effect(AttachUiEffect::ShowTransientStatus {
+                    message: "tab reorder unavailable in read-only attach".to_string(),
+                });
+            }
+            attach_tab_move_target(view_state, context_id, action).map_or_else(
+                AttachUiReduction::consumed,
+                |(target_context_id, placement)| {
+                    AttachUiReduction::with_effect(AttachUiEffect::MoveWindow {
+                        source_context_id: context_id,
+                        target_context_id,
+                        placement,
+                    })
+                },
+            )
+        }
+    }
+}
+
+/// Route a key event into the open tab context menu.
+pub fn handle_attach_tab_menu_key_event(
+    view_state: &mut AttachViewState,
+    key: &TerminalKeyEvent,
+) -> Option<AttachUiReduction> {
+    use super::input::{TerminalKeyCode, TerminalKeyPhase};
+
+    view_state.tab_menu.as_ref()?;
+    if !matches!(key.kind, TerminalKeyPhase::Press | TerminalKeyPhase::Repeat) {
+        return Some(AttachUiReduction::consumed());
+    }
+
+    match key.code {
+        TerminalKeyCode::Esc => {
+            let _ = close_attach_tab_menu(view_state);
+            return Some(AttachUiReduction::consumed());
+        }
+        TerminalKeyCode::Enter => return Some(activate_attach_tab_menu(view_state)),
+        _ => {}
+    }
+
+    let menu = view_state.tab_menu.as_mut()?;
+    match key.code {
+        TerminalKeyCode::Up | TerminalKeyCode::Char('k') => menu.move_focus(-1),
+        TerminalKeyCode::Down | TerminalKeyCode::Char('j') => menu.move_focus(1),
+        TerminalKeyCode::Home => menu.focus_edge(false),
+        TerminalKeyCode::End => menu.focus_edge(true),
+        // Swallow anything else so stray keys do not reach the focused pane.
+        _ => {}
+    }
+    view_state
+        .dirty
+        .mark_overlay_dirty(AttachDirtySource::UserAction);
+    Some(AttachUiReduction::consumed())
+}
+
+/// Route a mouse event into the open tab context menu.
+pub fn handle_attach_tab_menu_mouse_event(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
+) -> Option<AttachUiReduction> {
+    let menu = view_state.tab_menu.as_ref()?;
+    let rect = attach_tab_menu_rect(menu, geometry);
+    let inside = mouse_event.col >= rect.x
+        && mouse_event.col < rect.x.saturating_add(rect.w)
+        && mouse_event.row >= rect.y
+        && mouse_event.row < rect.y.saturating_add(rect.h);
+    // Item rows sit inside the border.
+    let item_index = (mouse_event.row > rect.y
+        && mouse_event.row < rect.y.saturating_add(rect.h).saturating_sub(1))
+    .then(|| usize::from(mouse_event.row - rect.y - 1));
+
+    match (mouse_event.phase, mouse_event.button) {
+        (TerminalMousePhase::Move | TerminalMousePhase::Drag, _) => {
+            if let Some(index) = item_index
+                && view_state
+                    .tab_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.items.get(index).is_some_and(|item| item.enabled))
+                && let Some(menu) = view_state.tab_menu.as_mut()
+                && menu.focused != index
+            {
+                menu.focused = index;
+                view_state
+                    .dirty
+                    .mark_overlay_dirty(AttachDirtySource::Mouse);
+            }
+            Some(AttachUiReduction::consumed())
+        }
+        (TerminalMousePhase::Down, Some(TerminalMouseButton::Left)) => {
+            if !inside {
+                let _ = close_attach_tab_menu(view_state);
+                return Some(AttachUiReduction::consumed());
+            }
+            if let Some(index) = item_index
+                && let Some(menu) = view_state.tab_menu.as_mut()
+                && menu.items.get(index).is_some_and(|item| item.enabled)
+            {
+                menu.focused = index;
+                return Some(activate_attach_tab_menu(view_state));
+            }
+            Some(AttachUiReduction::consumed())
+        }
+        // Any other press dismisses; releases inside the menu are swallowed.
+        (TerminalMousePhase::Down, _) => {
+            let _ = close_attach_tab_menu(view_state);
+            Some(AttachUiReduction::consumed())
+        }
+        _ => Some(AttachUiReduction::consumed()),
+    }
+}
+
+/// Placement of the menu overlay, flipped and clamped to stay on screen.
+fn attach_tab_menu_rect(menu: &AttachTabMenu, geometry: TerminalGeometry) -> DamageRect {
+    let width = menu.width().min(geometry.cols.max(1));
+    let height = menu.height().min(geometry.rows.max(1));
+    // Prefer opening upward from the anchor: with a bottom status bar there is
+    // rarely room below it.
+    let y = if menu.anchor_row >= height {
+        menu.anchor_row.saturating_sub(height)
+    } else {
+        menu.anchor_row
+            .saturating_add(1)
+            .min(geometry.rows.saturating_sub(height))
+    };
+    let x = menu.anchor_col.min(geometry.cols.saturating_sub(width));
+    DamageRect::new(x, y, width, height)
+}
+
+/// Render ops for the tab context menu overlay.
+fn attach_tab_menu_render_ops(
+    menu: &AttachTabMenu,
+    rect: DamageRect,
+    appearance: &RuntimeAppearance,
+) -> Vec<RenderOp> {
+    let _ = appearance;
+    let style = RenderStyle::new();
+    let surface_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
+    let interior = ExtensionRect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.w.saturating_sub(2),
+        rect.h.saturating_sub(2),
+    );
+    let text_width = usize::from(rect.w.saturating_sub(2));
+    let mut ops = vec![
+        RenderOp::clear_rect(interior, style),
+        RenderOp::border(surface_rect, BorderGlyphs::ascii(), style),
+    ];
+    for (index, item) in menu.items.iter().enumerate() {
+        let row = rect
+            .y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        if row >= rect.y.saturating_add(rect.h).saturating_sub(1) {
+            break;
+        }
+        let focused = index == menu.focused && item.enabled;
+        let marker = if focused { '>' } else { ' ' };
+        let label = format!("{marker} {}", item.action.label());
+        let mut row_style = style;
+        if !item.enabled {
+            row_style.dim = true;
+        }
+        if focused {
+            row_style.reverse = true;
+        }
+        ops.push(RenderOp::text_run(
+            rect.x.saturating_add(1),
+            row,
+            opaque_row_text(&label, text_width),
+            row_style,
+        ));
+    }
+    ops
+}
+
 pub fn reduce_attach_status_tab_mouse_event(
     view_state: &mut AttachViewState,
     mouse_event: TerminalMouseEvent,
@@ -12898,6 +13322,9 @@ pub fn reduce_attach_status_tab_mouse_event(
     match (mouse_event.phase, mouse_event.button) {
         (TerminalMousePhase::Down, Some(TerminalMouseButton::Left)) => {
             reduce_attach_status_tab_press(view_state, mouse_event, geometry, now)
+        }
+        (TerminalMousePhase::Down, Some(TerminalMouseButton::Right)) => {
+            reduce_attach_status_tab_context_menu_press(view_state, mouse_event, geometry)
         }
         (TerminalMousePhase::Drag | TerminalMousePhase::Move, _) => {
             if view_state.mouse.tab_drag.is_none() {
@@ -13010,6 +13437,41 @@ async fn execute_attach_ui_effects(
                 view_state
                     .dirty
                     .mark_status_dirty(AttachDirtySource::UserAction);
+            }
+            AttachUiEffect::CloseWindow { context_id } => {
+                // Route through the shared confirm overlay rather than killing
+                // the window outright.
+                view_state.mouse.clear_pointer_gestures();
+                let label = attach_tab_label_for_context(view_state, context_id)
+                    .unwrap_or_else(|| "this window".to_string());
+                view_state.prompt.enqueue_internal(
+                    PromptRequest::confirm(format!("Close window {label}?"))
+                        .message("This will stop every pane in the window.")
+                        .submit_label("Close")
+                        .cancel_label("Cancel")
+                        .confirm_default(false)
+                        .policy(prompt::PromptPolicy::RejectIfBusy),
+                    AttachInternalPromptAction::CloseWindow { context_id },
+                );
+                view_state
+                    .dirty
+                    .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+                view_state
+                    .dirty
+                    .mark_status_dirty(AttachDirtySource::PromptOverlay);
+            }
+            AttachUiEffect::NewWindow => {
+                if let Err(error) = create_new_window_and_retarget(client, view_state).await {
+                    tracing::warn!(%error, "attach.tab_menu.new_window_failed");
+                    view_state.set_transient_status(
+                        "new window failed",
+                        now,
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+                view_state
+                    .dirty
+                    .mark_layout_frame_and_status_dirty(AttachDirtySource::UserAction);
             }
             AttachUiEffect::ResizePane {
                 pane_id,
@@ -13193,6 +13655,37 @@ async fn move_attach_status_tab(
     )
     .await?;
     Ok(())
+}
+
+/// Close a window by context id through the windows plugin.
+async fn close_attach_window_by_id(
+    client: &mut StreamingBmuxClient,
+    context_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    let _ack: windows_commands::WindowAck = invoke_windows_command(
+        client,
+        "kill-window",
+        &windows_commands::client::KillWindowRequest {
+            target: context_id.to_string(),
+            force_local: false,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Drop a closed window from the cached list so the tab strip updates before
+/// the plugin's next `window-list` snapshot arrives.
+fn optimistically_remove_attach_window_list_entry(
+    view_state: &mut AttachViewState,
+    context_id: Uuid,
+) {
+    let Some(snapshot) = view_state.cached_window_list.as_ref() else {
+        return;
+    };
+    let mut next = snapshot.as_ref().clone();
+    next.windows.retain(|entry| entry.id != context_id);
+    view_state.cached_window_list = Some(Arc::new(next));
 }
 
 /// Rename a specific window through the windows plugin, independent of which
@@ -15152,6 +15645,108 @@ mod tests {
                 meta: false,
             },
         }
+    }
+
+    #[test]
+    fn tab_menu_rect_opens_upward_from_a_bottom_status_bar() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 1, 3);
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+
+        let rect = attach_tab_menu_rect(&menu, geometry);
+
+        assert!(
+            rect.y + rect.h <= 23,
+            "menu should sit above a bottom status row: {rect:?}"
+        );
+        assert_eq!(rect.x, 4);
+        assert_eq!(rect.h, menu.height());
+    }
+
+    #[test]
+    fn tab_menu_rect_opens_downward_from_a_top_status_bar() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 2, 0, 0, 2);
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+
+        let rect = attach_tab_menu_rect(&menu, geometry);
+
+        assert!(
+            rect.y >= 1,
+            "menu should drop below a top status row: {rect:?}"
+        );
+        assert!(rect.y + rect.h <= geometry.rows, "{rect:?}");
+    }
+
+    #[test]
+    fn tab_menu_rect_clamps_to_the_right_edge() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 78, 23, 0, 2);
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+
+        let rect = attach_tab_menu_rect(&menu, geometry);
+
+        assert!(
+            rect.x + rect.w <= geometry.cols,
+            "menu must stay on screen: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn tab_menu_rect_fits_within_a_tiny_viewport() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 1, 1, 0, 1);
+        let geometry = TerminalGeometry { cols: 6, rows: 3 };
+
+        let rect = attach_tab_menu_rect(&menu, geometry);
+
+        assert!(rect.x + rect.w <= geometry.cols, "{rect:?}");
+        assert!(rect.y + rect.h <= geometry.rows, "{rect:?}");
+    }
+
+    #[test]
+    fn tab_menu_render_ops_mark_focus_and_disabled_items() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 0, 3);
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        let rect = attach_tab_menu_rect(&menu, geometry);
+
+        let ops = attach_tab_menu_render_ops(&menu, rect, &RuntimeAppearance::default());
+
+        let runs: Vec<(String, RenderStyle)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                RenderOp::TextRun { text, style, .. } => Some((text.clone(), *style)),
+                _ => None,
+            })
+            .collect();
+        let focused = runs
+            .iter()
+            .find(|(text, _)| text.contains("Rename"))
+            .expect("rename row should render");
+        assert!(
+            focused.0.starts_with("> "),
+            "focused row marker: {:?}",
+            focused.0
+        );
+        assert!(focused.1.reverse, "focused row should be highlighted");
+
+        let disabled = runs
+            .iter()
+            .find(|(text, _)| text.contains("Move left"))
+            .expect("move-left row should render");
+        assert!(disabled.1.dim, "disabled row should be dimmed");
+        assert!(!disabled.1.reverse, "disabled row should not be focused");
+    }
+
+    #[test]
+    fn retained_tab_menu_surface_uses_render_ops_payload() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 0, 2);
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+
+        let surface = retained_tab_menu_surface(&menu, &RuntimeAppearance::default(), geometry)
+            .expect("menu surface should build");
+
+        assert_eq!(surface.id, TAB_MENU_SURFACE_ID);
+        assert!(matches!(
+            surface.payload,
+            RetainedSurfacePayload::RenderOps(_)
+        ));
     }
 
     #[test]

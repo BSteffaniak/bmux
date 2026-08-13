@@ -299,6 +299,8 @@ pub struct AttachViewState {
     pub mouse: AttachMouseState,
     /// Active inline tab rename editor, when a tab label is being edited.
     pub tab_rename: Option<AttachTabRename>,
+    /// Open tab context menu, when one has been summoned.
+    pub tab_menu: Option<AttachTabMenu>,
     pub visual_projection_updates: Vec<AttachVisualProjectionUpdate>,
     pub dirty: AttachDirtyFlags,
 
@@ -353,6 +355,180 @@ pub enum AttachPointerOwner {
     Resize,
     Floating,
     Selection,
+}
+
+/// Action a tab context-menu item performs when activated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachTabMenuAction {
+    Rename,
+    Close,
+    MoveLeft,
+    MoveRight,
+    MoveToFirst,
+    MoveToLast,
+    NewWindow,
+}
+
+impl AttachTabMenuAction {
+    /// Stable identifier, used by tests and playbook assertions.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Rename => "rename",
+            Self::Close => "close",
+            Self::MoveLeft => "move-left",
+            Self::MoveRight => "move-right",
+            Self::MoveToFirst => "move-to-first",
+            Self::MoveToLast => "move-to-last",
+            Self::NewWindow => "new-window",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rename => "Rename",
+            Self::Close => "Close",
+            Self::MoveLeft => "Move left",
+            Self::MoveRight => "Move right",
+            Self::MoveToFirst => "Move to first",
+            Self::MoveToLast => "Move to last",
+            Self::NewWindow => "New window",
+        }
+    }
+}
+
+/// One entry in the tab context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachTabMenuItem {
+    pub action: AttachTabMenuAction,
+    /// Disabled entries render dimmed and cannot be activated. Position-based
+    /// moves are disabled (not hidden) at the ends so the menu keeps a stable
+    /// shape across tabs.
+    pub enabled: bool,
+}
+
+/// Open tab context menu, anchored at the click that opened it.
+#[derive(Debug, Clone)]
+pub struct AttachTabMenu {
+    /// Context (window) the menu acts on. Not necessarily the active window.
+    pub context_id: Uuid,
+    pub anchor_col: u16,
+    pub anchor_row: u16,
+    pub items: Vec<AttachTabMenuItem>,
+    pub focused: usize,
+}
+
+impl AttachTabMenu {
+    /// Build the menu for `context_id` given its position in the tab strip.
+    #[must_use]
+    pub fn new(
+        context_id: Uuid,
+        anchor_col: u16,
+        anchor_row: u16,
+        index: usize,
+        count: usize,
+    ) -> Self {
+        let first = index == 0;
+        let last = index + 1 >= count;
+        let items = vec![
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::Rename,
+                enabled: true,
+            },
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::Close,
+                enabled: true,
+            },
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::MoveLeft,
+                enabled: !first,
+            },
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::MoveRight,
+                enabled: !last,
+            },
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::MoveToFirst,
+                enabled: !first,
+            },
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::MoveToLast,
+                enabled: !last,
+            },
+            AttachTabMenuItem {
+                action: AttachTabMenuAction::NewWindow,
+                enabled: true,
+            },
+        ];
+        let focused = items
+            .iter()
+            .position(|item| item.enabled)
+            .unwrap_or_default();
+        Self {
+            context_id,
+            anchor_col,
+            anchor_row,
+            items,
+            focused,
+        }
+    }
+
+    /// Move focus by `delta`, skipping disabled entries and wrapping.
+    pub fn move_focus(&mut self, delta: isize) {
+        let len = self.items.len();
+        if len == 0 || !self.items.iter().any(|item| item.enabled) {
+            return;
+        }
+        let mut index = self.focused;
+        for _ in 0..len {
+            let next = isize::try_from(index).unwrap_or(0) + delta;
+            index = next.rem_euclid(isize::try_from(len).unwrap_or(1)) as usize;
+            if self.items.get(index).is_some_and(|item| item.enabled) {
+                self.focused = index;
+                return;
+            }
+        }
+    }
+
+    /// Focus the first or last enabled entry.
+    pub fn focus_edge(&mut self, last: bool) {
+        let found = if last {
+            self.items.iter().rposition(|item| item.enabled)
+        } else {
+            self.items.iter().position(|item| item.enabled)
+        };
+        if let Some(index) = found {
+            self.focused = index;
+        }
+    }
+
+    /// Currently focused action, when it is enabled.
+    #[must_use]
+    pub fn focused_action(&self) -> Option<AttachTabMenuAction> {
+        self.items
+            .get(self.focused)
+            .filter(|item| item.enabled)
+            .map(|item| item.action)
+    }
+
+    /// Rendered width, including borders and padding.
+    #[must_use]
+    pub fn width(&self) -> u16 {
+        let widest = self
+            .items
+            .iter()
+            .map(|item| item.action.label().chars().count())
+            .max()
+            .unwrap_or(0);
+        u16::try_from(widest.saturating_add(4)).unwrap_or(u16::MAX)
+    }
+
+    /// Rendered height, including borders.
+    #[must_use]
+    pub fn height(&self) -> u16 {
+        u16::try_from(self.items.len().saturating_add(2)).unwrap_or(u16::MAX)
+    }
 }
 
 /// Inline tab-label editor state.
@@ -475,6 +651,10 @@ impl AttachMouseState {
         self.clear_plugin_pointer_capture();
         self.tab_drag = None;
         self.hovered_tab_context_id = None;
+        // `last_click` is deliberately preserved: it is click *history* used for
+        // double-click detection, not an in-flight gesture. Clearing it here
+        // would break double-click, because arming a drag on the first press
+        // routes through this function.
         self.resize_drag = None;
         self.floating_drag = None;
         self.selection_drag = None;
@@ -646,6 +826,10 @@ pub enum AttachUiEffect {
         context_id: Uuid,
         name: String,
     },
+    CloseWindow {
+        context_id: Uuid,
+    },
+    NewWindow,
     ResizePane {
         pane_id: Uuid,
         direction: PaneResizeDirection,
@@ -746,6 +930,7 @@ impl AttachViewState {
                 ..AttachMouseState::default()
             },
             tab_rename: None,
+            tab_menu: None,
             visual_projection_updates: Vec::new(),
             dirty: AttachDirtyFlags::default(),
             #[cfg(any(

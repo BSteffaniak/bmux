@@ -166,6 +166,72 @@ impl AttachSimHarness {
     /// Feed a chord (or literal text) into the inline tab rename editor.
     ///
     /// Returns the number of key events applied.
+    /// Whether the tab context menu is open.
+    pub const fn tab_menu_active(&self) -> bool {
+        self.view_state.tab_menu.is_some()
+    }
+
+    /// Enabled menu item ids, in display order.
+    pub fn tab_menu_items(&self) -> Vec<String> {
+        self.view_state
+            .tab_menu
+            .as_ref()
+            .map_or_else(Vec::new, |menu| {
+                menu.items
+                    .iter()
+                    .map(|item| {
+                        if item.enabled {
+                            item.action.id().to_string()
+                        } else {
+                            format!("{}:disabled", item.action.id())
+                        }
+                    })
+                    .collect()
+            })
+    }
+
+    /// Id of the focused menu item.
+    pub fn tab_menu_focused(&self) -> Option<String> {
+        let menu = self.view_state.tab_menu.as_ref()?;
+        menu.items
+            .get(menu.focused)
+            .map(|item| item.action.id().to_string())
+    }
+
+    /// Feed a chord into the open context menu.
+    pub fn send_menu_chord(&mut self, chord: &str) -> bool {
+        use super::input::TerminalKeyCode;
+        let code = match chord {
+            "Enter" | "enter" => TerminalKeyCode::Enter,
+            "Esc" | "esc" | "Escape" => TerminalKeyCode::Esc,
+            "Up" | "up" => TerminalKeyCode::Up,
+            "Down" | "down" => TerminalKeyCode::Down,
+            "Home" | "home" => TerminalKeyCode::Home,
+            "End" | "end" => TerminalKeyCode::End,
+            other => {
+                let Some(ch) = other.chars().next().filter(|_| other.chars().count() == 1) else {
+                    return false;
+                };
+                TerminalKeyCode::Char(ch)
+            }
+        };
+        let key = super::input::TerminalKeyEvent {
+            code,
+            modifiers: super::input::TerminalModifiers::default(),
+            kind: super::input::TerminalKeyPhase::Press,
+        };
+        let Some(reduction) =
+            super::runtime::handle_attach_tab_menu_key_event(&mut self.view_state, &key)
+        else {
+            return false;
+        };
+        for effect in reduction.effects {
+            self.apply_effect(effect);
+        }
+        self.render();
+        true
+    }
+
     pub fn send_rename_chord(&mut self, chord: &str) -> usize {
         use super::input::TerminalKeyCode;
 
@@ -312,6 +378,21 @@ impl AttachSimHarness {
         }
         if !self.view_state.can_write {
             self.view_state.mouse.clear_mutation_pointer_gestures();
+        }
+
+        // An open context menu owns the pointer, matching production ordering.
+        if self.view_state.tab_menu.is_some()
+            && let Some(reduction) = super::runtime::handle_attach_tab_menu_mouse_event(
+                &mut self.view_state,
+                event,
+                self.geometry,
+            )
+        {
+            for effect in reduction.effects {
+                self.apply_effect(effect);
+            }
+            self.render();
+            return;
         }
 
         let mut reduction = match self.view_state.mouse.pointer_owner() {
@@ -1043,6 +1124,37 @@ impl AttachSimHarness {
                 }
                 self.sync_cached_window_list();
             }
+            AttachUiEffect::CloseWindow { context_id } => {
+                self.windows.retain(|window| window.id != context_id);
+                if !self.windows.iter().any(|window| window.active)
+                    && let Some(first) = self.windows.first_mut()
+                {
+                    first.active = true;
+                }
+                self.view_state.attached_context_id = self
+                    .windows
+                    .iter()
+                    .find(|window| window.active)
+                    .map(|window| window.id);
+                self.sync_cached_window_list();
+            }
+            AttachUiEffect::NewWindow => {
+                let id = Uuid::from_u128(
+                    u128::try_from(self.windows.len())
+                        .unwrap_or(0)
+                        .saturating_add(1000),
+                );
+                for window in &mut self.windows {
+                    window.active = false;
+                }
+                self.windows.push(AttachSimWindow {
+                    id,
+                    name: format!("tab-{}", self.windows.len().saturating_add(1)),
+                    active: true,
+                });
+                self.view_state.attached_context_id = Some(id);
+                self.sync_cached_window_list();
+            }
             AttachUiEffect::ResizePane { .. } | AttachUiEffect::ShowTransientStatus { .. } => {}
             AttachUiEffect::FocusPane { pane_id } => {
                 if let Some(layout_state) = &mut self.view_state.cached_layout_state {
@@ -1383,6 +1495,243 @@ mod tests {
             tab.center_col,
             tab.row,
         ));
+    }
+
+    fn right_mouse(phase: TerminalMousePhase, col: u16, row: u16) -> TerminalMouseEvent {
+        TerminalMouseEvent {
+            phase,
+            button: Some(super::super::input::TerminalMouseButton::Right),
+            col,
+            row,
+            modifiers: TerminalModifiers::default(),
+        }
+    }
+
+    fn open_tab_menu(sim: &mut AttachSimHarness, name: &str) -> super::AttachSimLocatedText {
+        let tab = sim.locate_text(name).expect("tab should be located");
+        sim.send_mouse(right_mouse(
+            TerminalMousePhase::Down,
+            tab.center_col,
+            tab.row,
+        ));
+        tab
+    }
+
+    #[test]
+    fn attach_sim_right_click_opens_tab_menu_without_switching() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        open_tab_menu(&mut sim, "two");
+
+        assert!(sim.tab_menu_active(), "right-click should open the menu");
+        assert_eq!(
+            sim.active_window_name(),
+            Some("one"),
+            "opening the menu must not switch windows"
+        );
+        assert_eq!(
+            sim.render().drag_marker_col,
+            None,
+            "no drag should be armed"
+        );
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_disables_position_moves_at_the_edges() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        open_tab_menu(&mut sim, "one");
+        let items = sim.tab_menu_items();
+        assert!(
+            items.contains(&"move-left:disabled".to_string()),
+            "first tab cannot move left: {items:?}"
+        );
+        assert!(
+            items.contains(&"move-to-first:disabled".to_string()),
+            "{items:?}"
+        );
+        assert!(items.contains(&"move-right".to_string()), "{items:?}");
+
+        sim.send_menu_chord("Esc");
+        open_tab_menu(&mut sim, "three");
+        let items = sim.tab_menu_items();
+        assert!(
+            items.contains(&"move-right:disabled".to_string()),
+            "last tab cannot move right: {items:?}"
+        );
+        assert!(items.contains(&"move-left".to_string()), "{items:?}");
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_focus_skips_disabled_items_and_wraps() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        open_tab_menu(&mut sim, "one");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("rename"));
+
+        sim.send_menu_chord("Down");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("close"));
+        // move-left / move-to-first are disabled on the first tab.
+        sim.send_menu_chord("Down");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("move-right"));
+
+        // Wrapping upward returns to the first enabled entry.
+        sim.send_menu_chord("Up");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("close"));
+
+        sim.send_menu_chord("End");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("new-window"));
+        sim.send_menu_chord("Home");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("rename"));
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_escape_dismisses() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        open_tab_menu(&mut sim, "two");
+        assert!(sim.tab_menu_active());
+        sim.send_menu_chord("Esc");
+        assert!(!sim.tab_menu_active());
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_rename_opens_inline_editor_for_clicked_tab() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        open_tab_menu(&mut sim, "three");
+        sim.send_menu_chord("Enter");
+
+        assert!(!sim.tab_menu_active());
+        assert!(sim.tab_rename_active(), "rename should open the editor");
+        assert_eq!(
+            sim.tab_rename_text(),
+            Some("three"),
+            "editor should target the right-clicked tab"
+        );
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_close_targets_the_clicked_tab() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        open_tab_menu(&mut sim, "three");
+        sim.send_menu_chord("Down");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("close"));
+        sim.send_menu_chord("Enter");
+
+        let closed = sim
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                AttachUiEffect::CloseWindow { context_id } => Some(*context_id),
+                _ => None,
+            })
+            .expect("close should emit a CloseWindow effect");
+        assert_eq!(
+            closed,
+            Uuid::from_u128(3),
+            "close must target the clicked tab, not the active one"
+        );
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_move_right_emits_move_after_neighbor() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        open_tab_menu(&mut sim, "one");
+        // rename -> close -> move-right (move-left disabled on first tab)
+        sim.send_menu_chord("Down");
+        sim.send_menu_chord("Down");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("move-right"));
+        sim.send_menu_chord("Enter");
+
+        assert_eq!(sim.window_names(), ["two", "one", "three"]);
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_move_to_last_moves_to_the_end() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        open_tab_menu(&mut sim, "one");
+        sim.send_menu_chord("End");
+        sim.send_menu_chord("Up");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("move-to-last"));
+        sim.send_menu_chord("Enter");
+
+        assert_eq!(sim.window_names(), ["two", "three", "one"]);
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_new_window_appends_and_activates() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        open_tab_menu(&mut sim, "one");
+        sim.send_menu_chord("End");
+        assert_eq!(sim.tab_menu_focused().as_deref(), Some("new-window"));
+        sim.send_menu_chord("Enter");
+
+        assert_eq!(sim.window_names().len(), 3);
+        assert_eq!(sim.active_window_name(), Some("tab-3"));
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_click_outside_dismisses() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        let tab = open_tab_menu(&mut sim, "two");
+        assert!(sim.tab_menu_active());
+        // Click far from the menu overlay.
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, tab.center_col, 2));
+        assert!(!sim.tab_menu_active());
+    }
+
+    #[test]
+    fn attach_sim_tab_menu_ignores_disabled_item_activation() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one"], "one");
+
+        open_tab_menu(&mut sim, "one");
+        // Only rename, close, and new-window are enabled for a lone tab.
+        let items = sim.tab_menu_items();
+        assert!(
+            items.contains(&"move-left:disabled".to_string()),
+            "{items:?}"
+        );
+        assert!(
+            items.contains(&"move-right:disabled".to_string()),
+            "{items:?}"
+        );
+
+        // Focus can never land on a disabled entry, so Enter cannot activate it.
+        for _ in 0..items.len() {
+            sim.send_menu_chord("Down");
+            let focused = sim.tab_menu_focused();
+            assert!(
+                matches!(focused.as_deref(), Some("rename" | "close" | "new-window")),
+                "focus landed on a disabled entry: {focused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_sim_right_click_off_the_strip_is_ignored() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        // Right-click in pane content: bmux must not open a tab menu there.
+        sim.send_mouse(right_mouse(TerminalMousePhase::Down, 10, 5));
+        assert!(!sim.tab_menu_active());
     }
 
     #[test]

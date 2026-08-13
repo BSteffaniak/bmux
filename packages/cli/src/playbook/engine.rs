@@ -2191,6 +2191,12 @@ fn execute_attach_sim_step(
         }
         Action::SendAttach { key } => {
             let key = runtime_vars.resolve_opt(key);
+            // Overlays own keyboard input while open: the context menu first,
+            // then the inline tab editor, before keybindings.
+            if sim.tab_menu_active() {
+                let consumed = sim.send_menu_chord(&key);
+                return Ok(Some(format!("tab menu consumed key: {consumed}")));
+            }
             // While the inline tab editor is open it owns keyboard input, so
             // route chords into the editor instead of the keybinding layer.
             if sim.tab_rename_active() {
@@ -2229,6 +2235,9 @@ fn execute_attach_sim_step(
                 "status.tab_labels" => serde_json::to_string(&sim.rendered_tab_labels())?,
                 "tab_rename.active" => serde_json::to_string(&sim.tab_rename_active())?,
                 "tab_rename.text" => serde_json::to_string(&sim.tab_rename_text())?,
+                "tab_menu.open" => serde_json::to_string(&sim.tab_menu_active())?,
+                "tab_menu.items" => serde_json::to_string(&sim.tab_menu_items())?,
+                "tab_menu.focused" => serde_json::to_string(&sim.tab_menu_focused())?,
                 "scrollback.active" => serde_json::to_string(&sim.scrollback_active())?,
                 "help_overlay.open" => serde_json::to_string(&sim.help_overlay_open())?,
                 "help_overlay.scroll" => serde_json::to_string(&sim.help_overlay_scroll())?,
@@ -2346,6 +2355,8 @@ const fn attach_sim_effect_operation(
         crate::runtime::attach::state::AttachUiEffect::SwitchWindow { .. } => "switch-window",
         crate::runtime::attach::state::AttachUiEffect::MoveWindow { .. } => "move-window",
         crate::runtime::attach::state::AttachUiEffect::RenameWindow { .. } => "rename-window",
+        crate::runtime::attach::state::AttachUiEffect::CloseWindow { .. } => "close-window",
+        crate::runtime::attach::state::AttachUiEffect::NewWindow => "new-window",
         crate::runtime::attach::state::AttachUiEffect::ResizePane { .. } => "resize-pane",
         crate::runtime::attach::state::AttachUiEffect::FocusPane { .. } => "focus-pane",
         crate::runtime::attach::state::AttachUiEffect::MoveFloatingPane { .. } => {
