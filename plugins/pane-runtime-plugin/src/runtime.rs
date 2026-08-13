@@ -5784,6 +5784,28 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 
+    fn pane_scrollback_metadata(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Option<bmux_pane_runtime_state::PaneScrollbackMetadata> {
+        self.with_lock_read(|manager| {
+            let pane = manager.runtimes.get(&session_id)?.panes.get(&pane_id)?;
+            let active_command = pane
+                .resurrection_state
+                .lock()
+                .ok()
+                .and_then(|state| state.active_command.clone());
+            Some(bmux_pane_runtime_state::PaneScrollbackMetadata {
+                pane_id,
+                name: pane.meta.name.clone(),
+                shell: pane.meta.shell.clone(),
+                active_command,
+            })
+        })
+        .flatten()
+    }
+
     fn list_pane_processes(&self) -> Vec<bmux_pane_runtime_state::PaneProcessIdentity> {
         self.with_lock_read(|m| {
             let mut identities = Vec::new();
@@ -6471,11 +6493,18 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     encoded_bytes,
                 },
             );
+            let client_pinned_bytes = runtime
+                .scrollback_pins
+                .iter()
+                .filter(|((pin_client_id, _), _)| *pin_client_id == client_id)
+                .map(|(_, pin)| pin.encoded_bytes)
+                .sum::<usize>();
             trace!(
                 %pane_id,
                 client_id = %client_id.0,
                 pin_id,
                 encoded_bytes,
+                client_pinned_bytes,
                 "captured frozen scrollback pin"
             );
             Ok(bmux_pane_runtime_state::AttachPaneScrollbackPin {
@@ -8888,6 +8917,36 @@ mod tests {
             handle.send_input(b"ignored".to_vec()),
             Err(SessionRuntimeError::Closed)
         );
+    }
+
+    #[test]
+    fn output_cursor_replays_bytes_withheld_while_frozen() {
+        let client_id = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(4096);
+        output.register_client_at_tail(client_id);
+        output.push_chunk(b"before-freeze");
+
+        // A frozen pane is omitted from output-batch requests, so its cursor is
+        // deliberately not read or advanced while these bytes arrive.
+        output.push_chunk(b"-during-freeze");
+        let replay = output.read_for_client(client_id, 4096);
+
+        assert_eq!(replay.bytes, b"before-freeze-during-freeze");
+        assert!(!replay.stream_gap);
+        assert_eq!(replay.stream_end, output.end_offset());
+    }
+
+    #[test]
+    fn output_cursor_reports_gap_when_frozen_replay_exceeds_retention() {
+        let client_id = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(8);
+        output.register_client_at_tail(client_id);
+        output.push_chunk(b"more-than-eight-bytes");
+
+        let replay = output.read_for_client(client_id, 4096);
+
+        assert!(replay.stream_gap);
+        assert!(replay.stream_start >= output.start_offset);
     }
 
     #[test]

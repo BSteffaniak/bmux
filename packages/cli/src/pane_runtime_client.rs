@@ -12,7 +12,7 @@ use bmux_context_state::ContextSelector;
 use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as AttachCommands, attach_runtime_state as AttachState,
-    pane_runtime_commands as PaneCommands,
+    pane_runtime_commands as PaneCommands, pane_runtime_state as PaneState,
 };
 use bmux_session_models::SessionSelector;
 use std::future::Future;
@@ -68,6 +68,13 @@ pub struct PaneScrollbackPinResult {
     pub total_scrolled_rows: u64,
     pub max_scrollback_offset: usize,
     pub stream_end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneScrollbackRuleMetadata {
+    pub name: Option<String>,
+    pub shell: String,
+    pub active_command: Option<String>,
 }
 
 #[allow(
@@ -168,6 +175,22 @@ pub async fn attach_pane_grid_window_state_streaming(
             .collect()),
         Ok(Err(err)) => typed_server_error("attach-pane-grid-window-state", err),
         Err(err) => typed_dispatch_error("attach-pane-grid-window-state", err),
+    }
+}
+
+pub async fn pane_scrollback_rule_metadata_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_id: Uuid,
+) -> ClientResult<PaneScrollbackRuleMetadata> {
+    match PaneState::client::get_pane(client, session_id, pane_id).await {
+        Ok(Ok(pane)) => Ok(PaneScrollbackRuleMetadata {
+            name: pane.name,
+            shell: pane.shell,
+            active_command: pane.active_command,
+        }),
+        Ok(Err(err)) => typed_server_error("get-pane", err),
+        Err(err) => typed_dispatch_error("get-pane", err),
     }
 }
 

@@ -113,6 +113,15 @@ pub struct AttachPaneScrollbackUnpinAck {
     pub released: bool,
 }
 
+/// Pane metadata used to resolve client scrollback-mode rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneScrollbackMetadata {
+    pub pane_id: Uuid,
+    pub name: Option<String>,
+    pub shell: String,
+    pub active_command: Option<String>,
+}
+
 /// Bounded structured terminal-grid scrollback window for one pane.
 #[derive(Debug, Clone)]
 pub struct AttachPaneGridWindow {
@@ -410,6 +419,12 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     // ── Pane I/O ───────────────────────────────────────────────────
 
     fn list_panes(&self, session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>>;
+
+    fn pane_scrollback_metadata(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Option<PaneScrollbackMetadata>;
 
     fn list_pane_processes(&self) -> Vec<PaneProcessIdentity>;
     fn pane_process_identity(
@@ -911,6 +926,13 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
     }
     fn list_panes(&self, _session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>> {
         Ok(Vec::new())
+    }
+    fn pane_scrollback_metadata(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+    ) -> Option<PaneScrollbackMetadata> {
+        None
     }
     fn list_pane_processes(&self) -> Vec<PaneProcessIdentity> {
         Vec::new()

@@ -92,6 +92,7 @@ pub fn build_attach_status_line(
     mode_label: &str,
     role_label: &str,
     follow_label: Option<&str>,
+    mode_modifier: Option<&str>,
     hint: &str,
 ) -> AttachStatusLine {
     let tabs = tab_strip.tabs;
@@ -140,6 +141,7 @@ pub fn build_attach_status_line(
         mode_label,
         role_label,
         follow_label,
+        mode_modifier,
         hint,
     );
 
@@ -206,6 +208,10 @@ pub fn build_attach_status_line(
 
 /// Assemble the right-aligned status modules, returning the rendered text and
 /// the mode badge's column range within it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "status modules are independently configurable inputs"
+)]
 fn build_right_modules(
     config: &StatusBarConfig,
     style: &StatusRenderStyle,
@@ -213,6 +219,7 @@ fn build_right_modules(
     mode_label: &str,
     role_label: &str,
     follow_label: Option<&str>,
+    mode_modifier: Option<&str>,
     hint: &str,
 ) -> (String, Option<(usize, usize)>) {
     let mut right_segments = Vec::new();
@@ -224,6 +231,9 @@ fn build_right_modules(
             style.badge(mode_label),
             Some(&mut mode_range),
         );
+        if let Some(modifier) = mode_modifier {
+            append_right_segment(&mut right_segments, style, style.badge(modifier), None);
+        }
     }
     if config.show_role {
         append_right_segment(&mut right_segments, style, style.badge(role_label), None);
@@ -1447,6 +1457,7 @@ mod tests {
             "NORMAL",
             "write",
             None,
+            None,
             "",
         );
 
@@ -1473,6 +1484,33 @@ mod tests {
     }
 
     #[test]
+    fn frozen_modifier_preserves_scroll_mode_badge_and_hint() {
+        let config = StatusBarConfig {
+            hint_policy: StatusHintPolicy::ScrollOnly,
+            ..StatusBarConfig::default()
+        };
+        let status = build_attach_status_line(
+            100,
+            &config,
+            &RuntimeAppearance::default(),
+            "session",
+            1,
+            "context",
+            &AttachTabStripInput::new(&[]),
+            None,
+            "SCROLL",
+            "write",
+            None,
+            Some("FROZEN"),
+            "scroll hint",
+        );
+        let rendered = plain_rendered(&status);
+        assert!(rendered.contains("SCROLL"));
+        assert!(rendered.contains("FROZEN"));
+        assert!(rendered.contains("scroll hint"));
+    }
+
+    #[test]
     fn disabled_status_line_has_no_declarative_spans() {
         let status = build_attach_status_line(
             80,
@@ -1488,6 +1526,7 @@ mod tests {
             None,
             "NORMAL",
             "write",
+            None,
             None,
             "",
         );
@@ -1540,6 +1579,7 @@ mod tests {
             None,
             "NORMAL",
             "write",
+            None,
             None,
             "",
         )
@@ -1706,6 +1746,7 @@ mod tests {
                 Some("tab:14/14"),
                 "NORMAL",
                 "write",
+                None,
                 None,
                 "",
             );

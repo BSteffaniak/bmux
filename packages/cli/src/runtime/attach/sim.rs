@@ -339,6 +339,9 @@ impl AttachSimHarness {
             mode_label,
             "write",
             None,
+            self.view_state
+                .focused_scrollback()
+                .and_then(|view| view.pin.map(|_| "FROZEN")),
             hint,
         );
         status_line.drag_marker_col = self

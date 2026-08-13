@@ -8,5 +8,6 @@ pub mod prompt_ui;
 pub mod provider;
 pub mod render;
 pub mod runtime;
+mod scrollback_modes;
 pub mod sim;
 pub mod state;

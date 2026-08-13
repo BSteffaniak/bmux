@@ -29,6 +29,7 @@ interface pane-runtime-state {
         id: uuid,
         name: string?,
         shell: string,
+        active_command: string?,
         focused: bool,
     }
 

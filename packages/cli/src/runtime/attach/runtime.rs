@@ -68,7 +68,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -400,6 +400,7 @@ use super::render::{
     frame_damage_overlay_render_ops, opaque_row_text, queue_render_ops,
     render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
 };
+use super::scrollback_modes::ScrollbackModeStateFile;
 use super::state::{
     AttachDirtyFlags, AttachDirtySource, AttachEventAction, AttachExitReason,
     AttachInputHookCapture, AttachMouseFloatingDrag, AttachMouseResizeAxisDrag,
@@ -413,7 +414,7 @@ use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
     attach_pane_grid_delta_state_streaming, attach_pane_grid_snapshot_state_streaming,
     attach_pane_grid_window_state_streaming, attach_pane_scrollback_pin_streaming,
-    attach_pane_scrollback_unpin_streaming,
+    attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use bmux_plugin::{BorderGlyphs, RenderDamage, RenderOp, RenderStyle};
@@ -3968,6 +3969,32 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
 
+        let scrollback_config = &attach_config.behavior.scrollback;
+        if scrollback_config.auto_unfreeze_after != 0 {
+            let now = Instant::now();
+            let expired = view_state
+                .pane_scrollback
+                .iter()
+                .filter_map(|(pane_id, view)| {
+                    view.pin
+                        .filter(|pin| {
+                            now.duration_since(pin.created_at).as_secs()
+                                >= scrollback_config.auto_unfreeze_after
+                        })
+                        .map(|pin| (*pane_id, pin))
+                })
+                .collect::<Vec<_>>();
+            for (pane_id, pin) in expired {
+                unpin_scrollback(&mut client, view_state.attached_id, pane_id, pin).await;
+                view_state.exit_scrollback_for(pane_id);
+                view_state.set_transient_status(
+                    "frozen scrollback expired; resumed live output",
+                    now,
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+
         let dirty_layout_frame =
             view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none();
         let mut frame_needs_render = view_state.dirty.needs_render();
@@ -4209,9 +4236,9 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             let pane_ids = visible_scene_pane_ids(&layout_state.scene)
                 .into_iter()
                 .filter(|pane_id| {
-                    !view_state
+                    view_state
                         .scrollback_for(*pane_id)
-                        .is_some_and(|view| view.pin.is_some())
+                        .is_none_or(|view| view.pin.is_none())
                 })
                 .collect::<Vec<_>>();
             let active_pane_ids = attach_layout_pane_id_set(&layout_state);
@@ -5671,6 +5698,78 @@ pub async fn handle_attach_plugin_command_action(
     kernel_client_factory: Option<&KernelClientFactory>,
     active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
 ) -> std::result::Result<(), ClientError> {
+    if plugin_id == "bmux.pane_runtime" && command_name == "scrollback-mode-set" {
+        let Some(pane_id) = view_state.focused_pane_id() else {
+            view_state.set_transient_status(
+                "no focused pane",
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            return Ok(());
+        };
+        let config = BmuxConfig::load().unwrap_or_default();
+        let paths = ConfigPaths::default();
+        let mut state = ScrollbackModeStateFile::load(&paths);
+        let current = state
+            .get(view_state.attached_id, pane_id)
+            .unwrap_or(config.behavior.scrollback.mode);
+        let requested = args.first().map_or("toggle", String::as_str);
+        let mode = match requested {
+            "live" => bmux_config::ScrollbackMode::Live,
+            "frozen" => bmux_config::ScrollbackMode::Frozen,
+            "toggle" => match current {
+                bmux_config::ScrollbackMode::Live => bmux_config::ScrollbackMode::Frozen,
+                bmux_config::ScrollbackMode::Frozen => bmux_config::ScrollbackMode::Live,
+            },
+            _ => {
+                view_state.set_transient_status(
+                    "scrollback-mode-set expects live, frozen, or toggle",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
+            }
+        };
+        if config.behavior.scrollback.persist_pane_modes {
+            state.set(view_state.attached_id, pane_id, mode);
+            let active_panes =
+                view_state
+                    .cached_layout_state
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |layout| {
+                        BTreeMap::from([(
+                            view_state.attached_id,
+                            layout.panes.iter().map(|pane| pane.id).collect(),
+                        )])
+                    });
+            state.prune(
+                &active_panes,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+            );
+            if let Err(error) = state.save_atomic(&paths) {
+                view_state.set_transient_status(
+                    format!("failed persisting scrollback mode: {error}"),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
+            }
+        }
+        view_state.set_transient_status(
+            format!(
+                "scrollback mode: {}",
+                match mode {
+                    bmux_config::ScrollbackMode::Live => "live",
+                    bmux_config::ScrollbackMode::Frozen => "frozen",
+                }
+            ),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return Ok(());
+    }
     let total_started = Instant::now();
     let before_started = Instant::now();
     let before_context_id = typed_current_context_attach(client)
@@ -7077,6 +7176,10 @@ pub fn build_attach_status_line_for_draw(
         mode_label,
         role_label,
         follow_label.as_deref(),
+        scrollback_active
+            .then(|| view_state.focused_scrollback())
+            .flatten()
+            .and_then(|view| view.pin.map(|_| "FROZEN")),
         &hint,
     );
     status_line.drag_marker_col = view_state
@@ -9592,6 +9695,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         return Ok(false);
     };
     let was_active = view_state.scrollback_active_for(pane_id);
+    let previous_pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
     let before_offset = view_state
         .scrollback_for(pane_id)
         .map_or(0, |view| view.offset);
@@ -9600,6 +9704,43 @@ async fn handle_attach_mouse_scrollback_with_window(
     let consumed = handle_attach_mouse_scrollback_for(view_state, pane_id, kind);
     if !consumed {
         return Ok(false);
+    }
+    if was_active
+        && !view_state.scrollback_active_for(pane_id)
+        && let Some(pin) = previous_pin
+    {
+        unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
+    }
+
+    if matches!(kind, MouseEventKind::ScrollUp)
+        && !was_active
+        && view_state.scrollback_active_for(pane_id)
+    {
+        let config = BmuxConfig::load().unwrap_or_default();
+        if effective_scrollback_mode(client, &config, view_state.attached_id, pane_id).await
+            == bmux_config::ScrollbackMode::Frozen
+        {
+            match attach_pane_scrollback_pin_streaming(client, view_state.attached_id, pane_id)
+                .await
+            {
+                Ok(pin) => {
+                    if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+                        view.pin = Some(ScrollbackPin {
+                            pin_id: pin.pin_id,
+                            total_scrolled_rows: pin.total_scrolled_rows,
+                            max_scrollback_offset: pin.max_scrollback_offset,
+                            stream_end: pin.stream_end,
+                            created_at: Instant::now(),
+                        });
+                    }
+                }
+                Err(error) => view_state.set_transient_status(
+                    format!("frozen scrollback unavailable; using live scrollback: {error}"),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                ),
+            }
+        }
     }
 
     ensure_pane_scrollback_windows(client, view_state, false).await?;
@@ -9618,18 +9759,96 @@ async fn handle_attach_mouse_scrollback_with_window(
     Ok(true)
 }
 
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0_usize, 0_usize);
+    let (mut star_index, mut star_value_index) = (None, 0_usize);
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            star_value_index = value_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn scrollback_rule_mode(
+    rules: &[bmux_config::ScrollbackPaneRule],
+    metadata: &crate::pane_runtime_client::PaneScrollbackRuleMetadata,
+) -> Option<bmux_config::ScrollbackMode> {
+    rules.iter().find_map(|rule| {
+        let command_matches = rule.match_command.as_ref().is_none_or(|pattern| {
+            metadata
+                .active_command
+                .as_deref()
+                .is_some_and(|value| wildcard_matches(pattern, value))
+        });
+        let name_matches = rule.match_name.as_ref().is_none_or(|pattern| {
+            metadata
+                .name
+                .as_deref()
+                .is_some_and(|value| wildcard_matches(pattern, value))
+        });
+        let shell_matches = rule
+            .match_shell
+            .as_ref()
+            .is_none_or(|pattern| wildcard_matches(pattern, &metadata.shell));
+        (command_matches && name_matches && shell_matches).then_some(rule.mode)
+    })
+}
+
+async fn effective_scrollback_mode(
+    client: &mut StreamingBmuxClient,
+    config: &BmuxConfig,
+    session_id: Uuid,
+    pane_id: Uuid,
+) -> bmux_config::ScrollbackMode {
+    if config.behavior.scrollback.persist_pane_modes {
+        let state = ScrollbackModeStateFile::load(&ConfigPaths::default());
+        if let Some(mode) = state.get(session_id, pane_id) {
+            return mode;
+        }
+    }
+    if !config.behavior.scrollback.pane_rules.is_empty()
+        && let Ok(metadata) =
+            pane_scrollback_rule_metadata_streaming(client, session_id, pane_id).await
+        && let Some(mode) = scrollback_rule_mode(&config.behavior.scrollback.pane_rules, &metadata)
+    {
+        return mode;
+    }
+    config.behavior.scrollback.mode
+}
+
 async fn pin_focused_scrollback_if_configured(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     config: &BmuxConfig,
     now: Instant,
 ) {
-    if config.behavior.scrollback.mode != bmux_config::ScrollbackMode::Frozen {
-        return;
-    }
     let Some(pane_id) = view_state.focused_pane_id() else {
         return;
     };
+    if effective_scrollback_mode(client, config, view_state.attached_id, pane_id).await
+        != bmux_config::ScrollbackMode::Frozen
+    {
+        return;
+    }
     if view_state
         .scrollback_for(pane_id)
         .is_some_and(|view| view.pin.is_some())
@@ -9659,6 +9878,7 @@ async fn pin_focused_scrollback_if_configured(
                     total_scrolled_rows: pin.total_scrolled_rows,
                     max_scrollback_offset: pin.max_scrollback_offset,
                     stream_end: pin.stream_end,
+                    created_at: now,
                 });
             }
         }
@@ -9670,19 +9890,13 @@ async fn pin_focused_scrollback_if_configured(
     }
 }
 
-async fn unpin_focused_scrollback(
+async fn unpin_scrollback(
     client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
+    session_id: Uuid,
+    pane_id: Uuid,
+    pin: ScrollbackPin,
 ) {
-    let Some(pane_id) = view_state.focused_pane_id() else {
-        return;
-    };
-    let Some(pin) = view_state.scrollback_for(pane_id).and_then(|view| view.pin) else {
-        return;
-    };
-    let _ =
-        attach_pane_scrollback_unpin_streaming(client, view_state.attached_id, pane_id, pin.pin_id)
-            .await;
+    let _ = attach_pane_scrollback_unpin_streaming(client, session_id, pane_id, pin.pin_id).await;
 }
 
 async fn handle_attach_ui_action_with_scrollback(
@@ -9691,14 +9905,14 @@ async fn handle_attach_ui_action_with_scrollback(
     view_state: &mut AttachViewState,
     now: Instant,
 ) -> std::result::Result<(), ClientError> {
+    let active_pin_before = view_state.focused_pane_id().and_then(|pane_id| {
+        view_state
+            .scrollback_for(pane_id)
+            .and_then(|view| view.pin)
+            .map(|pin| (pane_id, pin))
+    });
     let entering =
         matches!(action, RuntimeAction::EnterScrollMode) && !view_state.scrollback_active();
-    let exiting = matches!(action, RuntimeAction::ExitScrollMode)
-        && view_state.scrollback_active()
-        && !view_state.selection_active();
-    if exiting {
-        unpin_focused_scrollback(client, view_state).await;
-    }
     let needs_max_before = matches!(
         action,
         RuntimeAction::ScrollUpLine
@@ -9712,6 +9926,11 @@ async fn handle_attach_ui_action_with_scrollback(
 
     handle_attach_ui_action_at(action, view_state, now);
 
+    if let Some((pane_id, pin)) = active_pin_before
+        && !view_state.scrollback_active_for(pane_id)
+    {
+        unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
+    }
     if entering && view_state.scrollback_active() {
         let config = BmuxConfig::load().unwrap_or_default();
         pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
@@ -12027,6 +12246,12 @@ async fn handle_attach_mouse_event_at(
             return Ok(());
         }
         Some(_) => {
+            let pinned_before = view_state.focused_pane_id().and_then(|pane_id| {
+                view_state
+                    .scrollback_for(pane_id)
+                    .and_then(|view| view.pin)
+                    .map(|pin| (pane_id, pin))
+            });
             if let AttachPointerContinuation::Owned(reduction) =
                 continue_attach_builtin_pointer_owner(
                     view_state,
@@ -12043,6 +12268,11 @@ async fn handle_attach_mouse_event_at(
                     now,
                 )
                 .await?;
+            }
+            if let Some((pane_id, pin)) = pinned_before
+                && !view_state.scrollback_active_for(pane_id)
+            {
+                unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
             }
             return Ok(());
         }
@@ -19445,6 +19675,46 @@ mod tests {
             test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 3, col: 0 })
         );
+    }
+
+    #[test]
+    fn pane_rules_use_and_semantics_and_first_match_wins() {
+        let metadata = crate::pane_runtime_client::PaneScrollbackRuleMetadata {
+            name: Some("logs-main".to_string()),
+            shell: "/bin/fish".to_string(),
+            active_command: Some("journalctl -f".to_string()),
+        };
+        let rules = vec![
+            bmux_config::ScrollbackPaneRule {
+                match_command: Some("journalctl*".to_string()),
+                match_name: Some("other*".to_string()),
+                match_shell: None,
+                mode: bmux_config::ScrollbackMode::Live,
+            },
+            bmux_config::ScrollbackPaneRule {
+                match_command: Some("journalctl*".to_string()),
+                match_name: Some("logs*".to_string()),
+                match_shell: Some("*/fish".to_string()),
+                mode: bmux_config::ScrollbackMode::Frozen,
+            },
+            bmux_config::ScrollbackPaneRule {
+                match_command: None,
+                match_name: None,
+                match_shell: None,
+                mode: bmux_config::ScrollbackMode::Live,
+            },
+        ];
+        assert_eq!(
+            scrollback_rule_mode(&rules, &metadata),
+            Some(bmux_config::ScrollbackMode::Frozen)
+        );
+    }
+
+    #[test]
+    fn wildcard_matching_supports_star_and_question_mark() {
+        assert!(wildcard_matches("journal*", "journalctl -f"));
+        assert!(wildcard_matches("logs-?", "logs-a"));
+        assert!(!wildcard_matches("logs-?", "logs-main"));
     }
 
     #[test]

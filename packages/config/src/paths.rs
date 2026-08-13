@@ -207,6 +207,14 @@ impl ConfigPaths {
         self.state_dir().join("runtime").join("last-layout.json")
     }
 
+    /// Get persisted per-pane scrollback-mode override file path.
+    #[must_use]
+    pub fn scrollback_mode_state_file(&self) -> PathBuf {
+        self.state_dir()
+            .join("runtime")
+            .join("scrollback-modes.json")
+    }
+
     /// Get persisted protocol trace file path
     #[must_use]
     pub fn protocol_trace_file(&self) -> PathBuf {

@@ -83,6 +83,10 @@ pub struct AttachPaneScrollbackPinArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields mirror the generated BPDL request contract"
+)]
 pub struct AttachPaneScrollbackUnpinArgs {
     pub session_id: Uuid,
     pub pane_id: Uuid,

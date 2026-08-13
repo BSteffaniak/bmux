@@ -99,6 +99,7 @@ pub struct ScrollbackPin {
     pub total_scrolled_rows: u64,
     pub max_scrollback_offset: usize,
     pub stream_end: u64,
+    pub created_at: std::time::Instant,
 }
 
 /// Per-pane scrollback view position.
