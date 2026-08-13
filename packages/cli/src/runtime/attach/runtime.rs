@@ -400,7 +400,7 @@ use super::render::{
     frame_damage_overlay_render_ops, opaque_row_text, queue_render_ops,
     render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
 };
-use super::scrollback_modes::ScrollbackModeStateFile;
+use super::scrollback_modes::{cached_mode, set_cached_mode_debounced, set_runtime_mode};
 use super::state::{
     AttachDirtyFlags, AttachDirtySource, AttachEventAction, AttachExitReason,
     AttachInputHookCapture, AttachMouseFloatingDrag, AttachMouseResizeAxisDrag,
@@ -2570,8 +2570,14 @@ pub async fn run_session_attach_with_client(
             },
         )
         .await?;
-    run_session_attach_with_provider_session(session, target, follow, global, kernel_client_factory)
-        .await
+    Box::pin(run_session_attach_with_provider_session(
+        session,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+    ))
+    .await
 }
 
 pub async fn run_session_attach_with_provider_session(
@@ -3970,29 +3976,20 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         let _ = view_state.clear_expired_transient_status(Instant::now());
 
         let scrollback_config = &attach_config.behavior.scrollback;
-        if scrollback_config.auto_unfreeze_after != 0 {
-            let now = Instant::now();
-            let expired = view_state
-                .pane_scrollback
-                .iter()
-                .filter_map(|(pane_id, view)| {
-                    view.pin
-                        .filter(|pin| {
-                            now.duration_since(pin.created_at).as_secs()
-                                >= scrollback_config.auto_unfreeze_after
-                        })
-                        .map(|pin| (*pane_id, pin))
-                })
-                .collect::<Vec<_>>();
-            for (pane_id, pin) in expired {
-                unpin_scrollback(&mut client, view_state.attached_id, pane_id, pin).await;
-                view_state.exit_scrollback_for(pane_id);
-                view_state.set_transient_status(
-                    "frozen scrollback expired; resumed live output",
-                    now,
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            }
+        let now = Instant::now();
+        for (pane_id, pin) in expired_scrollback_pins(
+            &view_state,
+            epoch_secs_now(),
+            scrollback_config.auto_unfreeze_after,
+        ) {
+            unpin_scrollback(&mut client, view_state.attached_id, pane_id, pin).await;
+            view_state.scrollback_replay_pending = true;
+            view_state.exit_scrollback_for(pane_id);
+            view_state.set_transient_status(
+                "frozen scrollback expired; resumed live output",
+                now,
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
         }
 
         let dirty_layout_frame =
@@ -4229,18 +4226,13 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             geometry.rows,
         );
 
-        // Only fetch pane output when new pane bytes are pending.
+        // Only fetch pane output when new pane bytes are pending or leaving a
+        // frozen view explicitly requested replay from its preserved cursor.
         // Pure redraw dirty flags (layout/status/overlay) must not trigger
         // pane-output IPC on their own.
-        if pane_output_pending {
-            let pane_ids = visible_scene_pane_ids(&layout_state.scene)
-                .into_iter()
-                .filter(|pane_id| {
-                    view_state
-                        .scrollback_for(*pane_id)
-                        .is_none_or(|view| view.pin.is_none())
-                })
-                .collect::<Vec<_>>();
+        if pane_output_pending || view_state.scrollback_replay_pending {
+            view_state.scrollback_replay_pending = false;
+            let pane_ids = output_batch_pane_ids(&layout_state.scene, &view_state);
             let active_pane_ids = attach_layout_pane_id_set(&layout_state);
             view_state
                 .pane_buffers
@@ -5709,10 +5701,13 @@ pub async fn handle_attach_plugin_command_action(
         };
         let config = BmuxConfig::load().unwrap_or_default();
         let paths = ConfigPaths::default();
-        let mut state = ScrollbackModeStateFile::load(&paths);
-        let current = state
-            .get(view_state.attached_id, pane_id)
-            .unwrap_or(config.behavior.scrollback.mode);
+        let current = cached_mode(
+            &paths,
+            view_state.attached_id,
+            pane_id,
+            config.behavior.scrollback.persist_pane_modes,
+        )
+        .unwrap_or(config.behavior.scrollback.mode);
         let requested = args.first().map_or("toggle", String::as_str);
         let mode = match requested {
             "live" => bmux_config::ScrollbackMode::Live,
@@ -5731,7 +5726,6 @@ pub async fn handle_attach_plugin_command_action(
             }
         };
         if config.behavior.scrollback.persist_pane_modes {
-            state.set(view_state.attached_id, pane_id, mode);
             let active_panes =
                 view_state
                     .cached_layout_state
@@ -5742,13 +5736,13 @@ pub async fn handle_attach_plugin_command_action(
                             layout.panes.iter().map(|pane| pane.id).collect(),
                         )])
                     });
-            state.prune(
+            if let Err(error) = set_cached_mode_debounced(
+                paths,
+                view_state.attached_id,
+                pane_id,
+                mode,
                 &active_panes,
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_secs()),
-            );
-            if let Err(error) = state.save_atomic(&paths) {
+            ) {
                 view_state.set_transient_status(
                     format!("failed persisting scrollback mode: {error}"),
                     Instant::now(),
@@ -5756,6 +5750,13 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 return Ok(());
             }
+        } else if let Err(error) = set_runtime_mode(&paths, view_state.attached_id, pane_id, mode) {
+            view_state.set_transient_status(
+                format!("failed setting scrollback mode: {error}"),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            return Ok(());
         }
         view_state.set_transient_status(
             format!(
@@ -6274,6 +6275,20 @@ fn next_session_fallback(view_state: &AttachViewState) -> Option<AttachCloseFall
 
 fn next_close_fallback(view_state: &AttachViewState) -> Option<AttachCloseFallback> {
     next_context_fallback(view_state).or_else(|| next_session_fallback(view_state))
+}
+
+fn output_batch_pane_ids(
+    scene: &bmux_attach_layout_protocol::AttachScene,
+    view_state: &AttachViewState,
+) -> Vec<Uuid> {
+    visible_scene_pane_ids(scene)
+        .into_iter()
+        .filter(|pane_id| {
+            view_state
+                .scrollback_for(*pane_id)
+                .is_none_or(|view| view.pin.is_none())
+        })
+        .collect()
 }
 
 fn enqueue_final_pane_action_prompt(
@@ -9710,6 +9725,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         && let Some(pin) = previous_pin
     {
         unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
+        view_state.scrollback_replay_pending = true;
     }
 
     if matches!(kind, MouseEventKind::ScrollUp)
@@ -9730,7 +9746,7 @@ async fn handle_attach_mouse_scrollback_with_window(
                             total_scrolled_rows: pin.total_scrolled_rows,
                             max_scrollback_offset: pin.max_scrollback_offset,
                             stream_end: pin.stream_end,
-                            created_at: Instant::now(),
+                            created_epoch_secs: epoch_secs_now(),
                         });
                     }
                 }
@@ -9819,11 +9835,13 @@ async fn effective_scrollback_mode(
     session_id: Uuid,
     pane_id: Uuid,
 ) -> bmux_config::ScrollbackMode {
-    if config.behavior.scrollback.persist_pane_modes {
-        let state = ScrollbackModeStateFile::load(&ConfigPaths::default());
-        if let Some(mode) = state.get(session_id, pane_id) {
-            return mode;
-        }
+    if let Some(mode) = cached_mode(
+        &ConfigPaths::default(),
+        session_id,
+        pane_id,
+        config.behavior.scrollback.persist_pane_modes,
+    ) {
+        return mode;
     }
     if !config.behavior.scrollback.pane_rules.is_empty()
         && let Ok(metadata) =
@@ -9878,7 +9896,7 @@ async fn pin_focused_scrollback_if_configured(
                     total_scrolled_rows: pin.total_scrolled_rows,
                     max_scrollback_offset: pin.max_scrollback_offset,
                     stream_end: pin.stream_end,
-                    created_at: now,
+                    created_epoch_secs: epoch_secs_now(),
                 });
             }
         }
@@ -9888,6 +9906,31 @@ async fn pin_focused_scrollback_if_configured(
             ATTACH_TRANSIENT_STATUS_TTL,
         ),
     }
+}
+
+fn epoch_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn expired_scrollback_pins(
+    view_state: &AttachViewState,
+    now_epoch_secs: u64,
+    timeout_secs: u64,
+) -> Vec<(Uuid, ScrollbackPin)> {
+    if timeout_secs == 0 {
+        return Vec::new();
+    }
+    view_state
+        .pane_scrollback
+        .iter()
+        .filter_map(|(pane_id, view)| {
+            let pin = view.pin?;
+            (now_epoch_secs.saturating_sub(pin.created_epoch_secs) >= timeout_secs)
+                .then_some((*pane_id, pin))
+        })
+        .collect()
 }
 
 async fn unpin_scrollback(
@@ -9930,6 +9973,7 @@ async fn handle_attach_ui_action_with_scrollback(
         && !view_state.scrollback_active_for(pane_id)
     {
         unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
+        view_state.scrollback_replay_pending = true;
     }
     if entering && view_state.scrollback_active() {
         let config = BmuxConfig::load().unwrap_or_default();
@@ -12246,7 +12290,10 @@ async fn handle_attach_mouse_event_at(
             return Ok(());
         }
         Some(_) => {
-            let pinned_before = view_state.focused_pane_id().and_then(|pane_id| {
+            let focused_pane_before = view_state.focused_pane_id();
+            let scrollback_active_before = focused_pane_before
+                .is_some_and(|pane_id| view_state.scrollback_active_for(pane_id));
+            let pinned_before = focused_pane_before.and_then(|pane_id| {
                 view_state
                     .scrollback_for(pane_id)
                     .and_then(|view| view.pin)
@@ -12273,6 +12320,15 @@ async fn handle_attach_mouse_event_at(
                 && !view_state.scrollback_active_for(pane_id)
             {
                 unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
+                view_state.scrollback_replay_pending = true;
+            }
+            if !scrollback_active_before
+                && let Some(pane_id) = focused_pane_before
+                && view_state.scrollback_active_for(pane_id)
+            {
+                let config = BmuxConfig::load().unwrap_or_default();
+                pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
+                ensure_pane_scrollback_windows(client, view_state, false).await?;
             }
             return Ok(());
         }
@@ -19675,6 +19731,61 @@ mod tests {
             test_scrollback_cursor(&view_state),
             Some(AttachScrollbackCursor { row: 3, col: 0 })
         );
+    }
+
+    #[test]
+    fn auto_unfreeze_selects_only_expired_pins_and_zero_disables_it() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        assert!(enter_attach_scrollback_for(&mut view_state, right_pane));
+        let now = 100_u64;
+        if let Some(view) = view_state.scrollback_for_mut(left_pane) {
+            view.pin = Some(ScrollbackPin {
+                pin_id: 1,
+                total_scrolled_rows: 10,
+                max_scrollback_offset: 8,
+                stream_end: 42,
+                created_epoch_secs: now - 10,
+            });
+        }
+        if let Some(view) = view_state.scrollback_for_mut(right_pane) {
+            view.pin = Some(ScrollbackPin {
+                pin_id: 2,
+                total_scrolled_rows: 10,
+                max_scrollback_offset: 8,
+                stream_end: 42,
+                created_epoch_secs: now - 2,
+            });
+        }
+        assert!(expired_scrollback_pins(&view_state, now, 0).is_empty());
+        assert_eq!(
+            expired_scrollback_pins(&view_state, now, 5)
+                .into_iter()
+                .map(|(pane_id, _)| pane_id)
+                .collect::<Vec<_>>(),
+            vec![left_pane]
+        );
+    }
+
+    #[test]
+    fn output_batches_exclude_only_frozen_panes() {
+        let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
+        assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
+        if let Some(view) = view_state.scrollback_for_mut(left_pane) {
+            view.pin = Some(ScrollbackPin {
+                pin_id: 1,
+                total_scrolled_rows: 10,
+                max_scrollback_offset: 8,
+                stream_end: 42,
+                created_epoch_secs: 100,
+            });
+        }
+        let scene = &view_state
+            .cached_layout_state
+            .as_ref()
+            .expect("layout state")
+            .scene;
+        assert_eq!(output_batch_pane_ids(scene, &view_state), vec![right_pane]);
     }
 
     #[test]

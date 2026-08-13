@@ -7796,6 +7796,24 @@ mod tests {
         assert!(!second.anchor_clamped);
     }
 
+    #[test]
+    fn terminal_grid_clone_preserves_frozen_history_after_live_eviction_and_clear() {
+        let mut live = bmux_terminal_grid::TerminalGrid::new(
+            8,
+            2,
+            bmux_terminal_grid::GridLimits { scrollback_rows: 2 },
+        )
+        .expect("grid dimensions are valid");
+        live.process(b"line-1\r\nline-2\r\nline-3");
+        let frozen = live.clone();
+        let frozen_before = frozen.snapshot(1, 2);
+
+        live.process(b"\r\nline-4\r\nline-5\r\nline-6\x1b[3J");
+
+        assert_eq!(frozen.snapshot(1, 2), frozen_before);
+        assert_ne!(live.snapshot(1, 2), frozen_before);
+    }
+
     #[tokio::test]
     async fn frozen_scrollback_pin_serves_immutable_windows_while_live_grid_advances() {
         let session_id = SessionId(Uuid::new_v4());
@@ -7911,6 +7929,57 @@ mod tests {
             .expect("runtime should exist");
         assert!(!runtime.scrollback_pins.contains_key(&(client_id, pane_id)));
         assert!(second.pin_id > first.pin_id);
+    }
+
+    #[tokio::test]
+    async fn frozen_scrollback_pins_are_removed_with_panes_and_sessions() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let other_pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id, other_pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let pin = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        )
+        .expect("pin should succeed");
+        bmux_pane_runtime_state::SessionRuntimeManagerApi::close_pane(
+            &adapter,
+            session_id,
+            Some(PaneSelector::ById(pane_id)),
+        )
+        .expect("pane close should succeed");
+        {
+            let manager = adapter
+                .inner
+                .lock()
+                .expect("manager lock should be available");
+            let runtime = manager
+                .runtimes
+                .get(&session_id)
+                .expect("runtime should remain");
+            assert!(!runtime.scrollback_pins.contains_key(&(client_id, pane_id)));
+        }
+
+        let remaining_pin =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+                &adapter,
+                session_id,
+                client_id,
+                other_pane_id,
+            )
+            .expect("remaining pane pin should succeed");
+        assert!(remaining_pin.pin_id > pin.pin_id);
+        let removed =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::remove_runtime(&adapter, session_id);
+        assert!(removed.is_some());
+        let manager = adapter
+            .inner
+            .lock()
+            .expect("manager lock should be available");
+        assert!(!manager.runtimes.contains_key(&session_id));
     }
 
     #[tokio::test]

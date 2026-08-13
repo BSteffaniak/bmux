@@ -266,6 +266,10 @@ pub struct AttachViewState {
     /// Scrollback history itself lives on the server (pane-runtime plugin);
     /// these are just this client's per-pane view offsets into that history.
     pub pane_scrollback: PaneScrollbackViews,
+    /// Set when leaving frozen scrollback so the next post-event pass drains
+    /// output from the preserved per-client server cursor even if the pane has
+    /// gone quiet and no fresh output event arrives.
+    pub scrollback_replay_pending: bool,
     pub help_overlay_open: bool,
     pub help_overlay_scroll: usize,
     pub prompt: AttachPromptState,
@@ -901,6 +905,7 @@ impl AttachViewState {
             active_mode_id: "normal".to_string(),
             active_mode_label: "NORMAL".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
+            scrollback_replay_pending: false,
             help_overlay_open: false,
             help_overlay_scroll: 0,
             prompt: AttachPromptState::default(),

@@ -570,12 +570,12 @@ pub(super) async fn run_connect(
             } else {
                 resolve_local_attach_session().await?
             };
-            let status = run_session_attach(
+            let status = Box::pin(run_session_attach(
                 target_session.as_deref(),
                 follow,
                 global,
                 ConnectionContext::new(Some("local")),
-            )
+            ))
             .await?;
             if status == 0
                 && let Err(error) = remember_recent_selection("local", target_session.as_deref())

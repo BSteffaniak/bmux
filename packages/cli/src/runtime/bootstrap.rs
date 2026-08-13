@@ -756,8 +756,10 @@ pub(super) async fn run_session_attach(
                 },
             )
             .await?;
-        return super::attach::runtime::run_session_attach_with_provider_session(
-            session, target, follow, global, None,
+        return Box::pin(
+            super::attach::runtime::run_session_attach_with_provider_session(
+                session, target, follow, global, None,
+            ),
         )
         .await
         .map(|outcome| outcome.status_code);

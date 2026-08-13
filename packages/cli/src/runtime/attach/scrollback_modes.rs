@@ -2,12 +2,28 @@ use anyhow::{Context, Result};
 use bmux_config::{ConfigPaths, ScrollbackMode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const SCROLLBACK_MODE_STATE_VERSION: u32 = 1;
 const ABSENT_SESSION_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct CachedState {
+    state: ScrollbackModeStateFile,
+    runtime_overrides: BTreeMap<(std::path::PathBuf, Uuid, Uuid), ScrollbackMode>,
+    loaded_path: Option<std::path::PathBuf>,
+    generation: u64,
+}
+
+fn cached_state() -> &'static Mutex<CachedState> {
+    static STATE: OnceLock<Mutex<CachedState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(CachedState::default()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,9 +112,26 @@ impl ScrollbackModeStateFile {
         })?;
         let temporary = temporary_path(&path);
         let bytes = serde_json::to_vec_pretty(self).context("encoding scrollback mode state")?;
-        std::fs::write(&temporary, bytes).with_context(|| {
+        let mut temporary_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "opening temporary scrollback mode state {}",
+                    temporary.display()
+                )
+            })?;
+        temporary_file.write_all(&bytes).with_context(|| {
             format!(
                 "writing temporary scrollback mode state {}",
+                temporary.display()
+            )
+        })?;
+        temporary_file.sync_all().with_context(|| {
+            format!(
+                "syncing temporary scrollback mode state {}",
                 temporary.display()
             )
         })?;
@@ -108,8 +141,89 @@ impl ScrollbackModeStateFile {
                 path.display(),
                 temporary.display()
             )
-        })
+        })?;
+        if let Ok(parent_dir) = std::fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+        Ok(())
     }
+}
+
+pub fn cached_mode(
+    paths: &ConfigPaths,
+    session_id: Uuid,
+    pane_id: Uuid,
+    load_persisted: bool,
+) -> Option<ScrollbackMode> {
+    let path = paths.scrollback_mode_state_file();
+    let mut cache = cached_state().lock().ok()?;
+    if let Some(mode) = cache
+        .runtime_overrides
+        .get(&(path.clone(), session_id, pane_id))
+        .copied()
+    {
+        return Some(mode);
+    }
+    if !load_persisted {
+        return None;
+    }
+    if cache.loaded_path.as_ref() != Some(&path) {
+        cache.state = ScrollbackModeStateFile::load(paths);
+        cache.loaded_path = Some(path);
+    }
+    cache.state.get(session_id, pane_id)
+}
+
+pub fn set_runtime_mode(
+    paths: &ConfigPaths,
+    session_id: Uuid,
+    pane_id: Uuid,
+    mode: ScrollbackMode,
+) -> Result<()> {
+    let path = paths.scrollback_mode_state_file();
+    cached_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scrollback mode state cache poisoned"))?
+        .runtime_overrides
+        .insert((path, session_id, pane_id), mode);
+    Ok(())
+}
+
+pub fn set_cached_mode_debounced(
+    paths: ConfigPaths,
+    session_id: Uuid,
+    pane_id: Uuid,
+    mode: ScrollbackMode,
+    active_panes: &BTreeMap<Uuid, BTreeSet<Uuid>>,
+) -> Result<()> {
+    let path = paths.scrollback_mode_state_file();
+    set_runtime_mode(&paths, session_id, pane_id, mode)?;
+    let generation = {
+        let mut cache = cached_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scrollback mode state cache poisoned"))?;
+        if cache.loaded_path.as_ref() != Some(&path) {
+            cache.state = ScrollbackModeStateFile::load(&paths);
+            cache.loaded_path = Some(path);
+        }
+        cache.state.set(session_id, pane_id, mode);
+        cache.state.prune(active_panes, epoch_secs());
+        cache.generation = cache.generation.saturating_add(1);
+        cache.generation
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(SAVE_DEBOUNCE);
+        let state = cached_state()
+            .lock()
+            .ok()
+            .and_then(|cache| (cache.generation == generation).then(|| cache.state.clone()));
+        if let Some(state) = state
+            && let Err(error) = state.save_atomic(&paths)
+        {
+            tracing::warn!(%error, "failed persisting debounced scrollback mode state");
+        }
+    });
+    Ok(())
 }
 
 fn temporary_path(path: &Path) -> std::path::PathBuf {
@@ -144,6 +258,50 @@ mod tests {
             root.join("data"),
             root.join("state"),
         )
+    }
+
+    #[test]
+    fn runtime_override_works_without_loading_or_writing_persisted_state() {
+        let paths = test_paths();
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        set_runtime_mode(&paths, session_id, pane_id, ScrollbackMode::Frozen)
+            .expect("set runtime override");
+        assert_eq!(
+            cached_mode(&paths, session_id, pane_id, false),
+            Some(ScrollbackMode::Frozen)
+        );
+        assert!(!paths.scrollback_mode_state_file().exists());
+    }
+
+    #[test]
+    fn debounced_updates_persist_only_the_latest_mode() {
+        let paths = test_paths();
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let active = BTreeMap::from([(session_id, BTreeSet::from([pane_id]))]);
+        set_cached_mode_debounced(
+            paths.clone(),
+            session_id,
+            pane_id,
+            ScrollbackMode::Frozen,
+            &active,
+        )
+        .expect("queue frozen state");
+        set_cached_mode_debounced(
+            paths.clone(),
+            session_id,
+            pane_id,
+            ScrollbackMode::Live,
+            &active,
+        )
+        .expect("queue live state");
+        std::thread::sleep(SAVE_DEBOUNCE + Duration::from_millis(100));
+        assert_eq!(
+            ScrollbackModeStateFile::load(&paths).get(session_id, pane_id),
+            Some(ScrollbackMode::Live)
+        );
+        std::fs::remove_dir_all(paths.state_dir()).ok();
     }
 
     #[test]

@@ -468,12 +468,12 @@ pub(super) async fn dispatch_built_in_command(
                 global,
             },
         ) => {
-            run_session_attach(
+            Box::pin(run_session_attach(
                 target.as_deref(),
                 follow.as_deref(),
                 *global,
                 connection_context,
-            )
+            ))
             .await
         }
         (BuiltInHandlerId::Detach, Command::Detach) => run_session_detach(connection_context).await,
@@ -530,12 +530,12 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => {
-            run_session_attach(
+            Box::pin(run_session_attach(
                 target.as_deref(),
                 follow.as_deref(),
                 *global,
                 connection_context,
-            )
+            ))
             .await
         }
         (
