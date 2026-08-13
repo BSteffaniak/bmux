@@ -167,6 +167,16 @@ pub trait Program {
     /// Application update error.
     type Error;
 
+    /// Apply application state changes that depend on one successful presentation commit.
+    ///
+    /// The runtime invokes this exactly once after [`crate::Presenter::present`] succeeds. Updates
+    /// returned here use the normal cadence, reset, command, subscription, and lifecycle paths.
+    /// A failed presentation does not invoke this hook.
+    #[must_use]
+    fn presentation_committed(&mut self, _report: crate::PresentReport) -> Update<Self::Message> {
+        Update::none()
+    }
+
     /// Apply one event to application state.
     ///
     /// # Errors

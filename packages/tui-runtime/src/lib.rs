@@ -6,7 +6,10 @@
 //!
 //! The runtime serializes application updates while independently bounding reliable terminal and
 //! application admission, keyed latest-value updates, timers, commands, and cadence-limited
-//! presentation. Product state and semantics remain application-owned.
+//! presentation. Product state and semantics remain application-owned. After each successful
+//! presentation, the application receives one neutral commit callback; any update returned by that
+//! callback is scheduled through the same bounded cadence and lifecycle machinery as an ordinary
+//! event update.
 
 pub mod command;
 mod command_scheduler;

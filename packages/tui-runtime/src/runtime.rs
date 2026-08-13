@@ -588,12 +588,18 @@ where
 
     fn present(&mut self) -> Result<(), R::Error> {
         let (reset, scheduled_at) = {
-            let state = lock_unpoisoned(&self.control.state);
+            let mut state = lock_unpoisoned(&self.control.state);
             let scheduled_at = state
                 .frame_interval
                 .and_then(|interval| self.last_presented.map(|last| last + interval))
                 .unwrap_or_else(Instant::now);
-            (state.reset, scheduled_at)
+            let reset = state.reset;
+            // Consume only the invalidation represented by this frame. Requests made while the
+            // presenter or successful-commit hook runs remain pending for a later frame.
+            state.dirty = false;
+            state.reset = false;
+            drop(state);
+            (reset, scheduled_at)
         };
         if reset {
             self.presenter.reset(ResetReason::Application);
@@ -608,11 +614,6 @@ where
         )
         .unwrap_or(u64::MAX);
         self.last_presented = Some(presented_at);
-        {
-            let mut state = lock_unpoisoned(&self.control.state);
-            state.dirty = false;
-            state.reset = false;
-        }
         let delay = presented_at.saturating_duration_since(scheduled_at);
         with_stats(&self.stats, |stats| {
             stats.frames_presented = stats.frames_presented.saturating_add(1);
@@ -629,6 +630,8 @@ where
                 .presentation_time_us
                 .saturating_add(presentation_time_us);
         });
+        let update = self.program.presentation_committed(report);
+        self.apply_update(update);
         Ok(())
     }
 
