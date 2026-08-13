@@ -20,6 +20,21 @@ pub struct AttachTabStripInput<'a> {
     pub tabs: &'a [AttachTab],
     /// Context id of the tab currently under the mouse cursor, if any.
     pub hovered_context_id: Option<Uuid>,
+    /// Inline label editor state, when a tab is being renamed.
+    pub editing: Option<AttachTabEdit<'a>>,
+}
+
+/// In-progress inline tab rename, projected for rendering.
+#[derive(Clone, Copy)]
+pub struct AttachTabEdit<'a> {
+    /// Context being edited.
+    pub context_id: Uuid,
+    /// Raw editor text, rendered in place of the templated label.
+    pub text: &'a str,
+    /// Cursor position as a byte index into `text`.
+    pub cursor: usize,
+    /// Selected byte range, if any.
+    pub selection: Option<(usize, usize)>,
 }
 
 impl<'a> AttachTabStripInput<'a> {
@@ -28,12 +43,19 @@ impl<'a> AttachTabStripInput<'a> {
         Self {
             tabs,
             hovered_context_id: None,
+            editing: None,
         }
     }
 
     #[must_use]
     pub const fn hovered(mut self, hovered_context_id: Option<Uuid>) -> Self {
         self.hovered_context_id = hovered_context_id;
+        self
+    }
+
+    #[must_use]
+    pub const fn editing(mut self, editing: Option<AttachTabEdit<'a>>) -> Self {
+        self.editing = editing;
         self
     }
 }
@@ -53,6 +75,8 @@ pub struct AttachStatusLine {
     pub spans: Vec<RenderTextSpan>,
     pub tab_hitboxes: Vec<AttachStatusTabHitbox>,
     pub drag_marker_col: Option<u16>,
+    /// Column of the inline rename cursor, when a tab is being edited.
+    pub edit_cursor_col: Option<u16>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
@@ -82,6 +106,7 @@ pub fn build_attach_status_line(
             spans: Vec::new(),
             tab_hitboxes: Vec::new(),
             drag_marker_col: None,
+            edit_cursor_col: None,
         };
     }
 
@@ -108,39 +133,15 @@ pub fn build_attach_status_line(
         );
     }
 
-    let mut right_segments = Vec::new();
-    let mut mode_range = None;
-    if config.show_mode {
-        append_right_segment(
-            &mut right_segments,
-            &style,
-            style.badge(mode_label),
-            Some(&mut mode_range),
-        );
-    }
-    if config.show_role {
-        append_right_segment(&mut right_segments, &style, style.badge(role_label), None);
-    }
-    if let Some(tab_position_label) = tab_position_label {
-        append_right_segment(
-            &mut right_segments,
-            &style,
-            style.badge(tab_position_label),
-            None,
-        );
-    }
-    if config.show_follow
-        && let Some(follow) = follow_label
-    {
-        append_right_segment(&mut right_segments, &style, style.badge(follow), None);
-    }
-    if config.show_hint && hint_allowed(config.hint_policy, mode_label) {
-        append_right_segment(&mut right_segments, &style, style.badge(hint), None);
-    }
-    let mut right = right_segments.concat();
-    if config.layout.right_padding > 0 {
-        right.push_str(&" ".repeat(config.layout.right_padding));
-    }
+    let (right, mode_range) = build_right_modules(
+        config,
+        &style,
+        tab_position_label,
+        mode_label,
+        role_label,
+        follow_label,
+        hint,
+    );
 
     // Budget available to the tab strip: total width minus the right-aligned
     // modules, the minimum one-column spacer `compose_status_line` reserves
@@ -152,6 +153,7 @@ pub fn build_attach_status_line(
         .saturating_sub(display_width(&tail));
 
     let mut left = " ".repeat(config.layout.left_padding);
+    let mut edit_ranges = None;
     append_tabs(
         &mut left,
         &mut tab_hitboxes,
@@ -161,6 +163,8 @@ pub fn build_attach_status_line(
         &style,
         tab_budget,
         session_label,
+        tab_strip.editing,
+        &mut edit_ranges,
     );
     left.push_str(&tail);
 
@@ -170,6 +174,20 @@ pub fn build_attach_status_line(
     // right-hand modules, and a hitbox surviving past that point would be
     // invisible yet still clickable.
     clamp_hitboxes_to_visible_width(&mut tab_hitboxes, composed.left_visible_width);
+
+    // Drop editor decorations that were truncated away by composition.
+    let edit_ranges = edit_ranges.filter(|edit| edit.cursor_col < composed.left_visible_width);
+    let edit_cursor_col = edit_ranges
+        .as_ref()
+        .and_then(|edit| u16::try_from(edit.cursor_col).ok());
+    let edit_selection = edit_ranges.as_ref().and_then(|edit| {
+        edit.selection.map(|(start, end)| {
+            (
+                start,
+                end.min(composed.left_visible_width.saturating_sub(1)),
+            )
+        })
+    });
 
     attach_status_line_from_composed(
         &composed,
@@ -181,7 +199,56 @@ pub fn build_attach_status_line(
         tab_hitboxes,
         &overflow_ranges,
         mode_range,
+        edit_cursor_col,
+        edit_selection,
     )
+}
+
+/// Assemble the right-aligned status modules, returning the rendered text and
+/// the mode badge's column range within it.
+fn build_right_modules(
+    config: &StatusBarConfig,
+    style: &StatusRenderStyle,
+    tab_position_label: Option<&str>,
+    mode_label: &str,
+    role_label: &str,
+    follow_label: Option<&str>,
+    hint: &str,
+) -> (String, Option<(usize, usize)>) {
+    let mut right_segments = Vec::new();
+    let mut mode_range = None;
+    if config.show_mode {
+        append_right_segment(
+            &mut right_segments,
+            style,
+            style.badge(mode_label),
+            Some(&mut mode_range),
+        );
+    }
+    if config.show_role {
+        append_right_segment(&mut right_segments, style, style.badge(role_label), None);
+    }
+    if let Some(tab_position_label) = tab_position_label {
+        append_right_segment(
+            &mut right_segments,
+            style,
+            style.badge(tab_position_label),
+            None,
+        );
+    }
+    if config.show_follow
+        && let Some(follow) = follow_label
+    {
+        append_right_segment(&mut right_segments, style, style.badge(follow), None);
+    }
+    if config.show_hint && hint_allowed(config.hint_policy, mode_label) {
+        append_right_segment(&mut right_segments, style, style.badge(hint), None);
+    }
+    let mut right = right_segments.concat();
+    if config.layout.right_padding > 0 {
+        right.push_str(&" ".repeat(config.layout.right_padding));
+    }
+    (right, mode_range)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,6 +262,8 @@ fn attach_status_line_from_composed(
     tab_hitboxes: Vec<AttachStatusTabHitbox>,
     overflow_ranges: &[(usize, usize)],
     mode_range: Option<(usize, usize)>,
+    edit_cursor_col: Option<u16>,
+    edit_selection: Option<(usize, usize)>,
 ) -> AttachStatusLine {
     let resolved_mode_range = mode_range.map(|(start, end)| {
         let right_start = composed.right_start_col.unwrap_or(0);
@@ -203,29 +272,28 @@ fn attach_status_line_from_composed(
             right_start.saturating_add(end),
         )
     });
+    let segment_input = StatusSegmentInput {
+        tabs,
+        hovered_context_id,
+        hitboxes: &tab_hitboxes,
+        overflow_ranges,
+        mode_range: resolved_mode_range,
+        right_start_col: composed.right_start_col,
+        edit_selection,
+    };
     let rendered = stylize_status_line(
         &composed.rendered,
         width,
         config,
         resolved_appearance,
-        tabs,
-        hovered_context_id,
-        &tab_hitboxes,
-        overflow_ranges,
-        resolved_mode_range,
-        composed.right_start_col,
+        &segment_input,
     );
     let spans = status_line_spans(
         &composed.rendered,
         width,
         config,
         resolved_appearance,
-        tabs,
-        hovered_context_id,
-        &tab_hitboxes,
-        overflow_ranges,
-        resolved_mode_range,
-        composed.right_start_col,
+        &segment_input,
     );
 
     AttachStatusLine {
@@ -233,7 +301,20 @@ fn attach_status_line_from_composed(
         spans,
         tab_hitboxes,
         drag_marker_col: None,
+        edit_cursor_col,
     }
+}
+
+/// Inputs that determine per-column styling of the status line.
+struct StatusSegmentInput<'a> {
+    tabs: &'a [AttachTab],
+    hovered_context_id: Option<Uuid>,
+    hitboxes: &'a [AttachStatusTabHitbox],
+    overflow_ranges: &'a [(usize, usize)],
+    mode_range: Option<(usize, usize)>,
+    right_start_col: Option<usize>,
+    /// Inclusive column range selected in the inline tab editor.
+    edit_selection: Option<(usize, usize)>,
 }
 
 fn hint_allowed(policy: StatusHintPolicy, mode_label: &str) -> bool {
@@ -254,13 +335,15 @@ fn append_tabs(
     style: &StatusRenderStyle,
     budget: usize,
     session_label: &str,
+    editing: Option<AttachTabEdit<'_>>,
+    edit_ranges: &mut Option<AppendedTabEdit>,
 ) {
     if tabs.is_empty() {
         out.push_str(&style.empty_tabs_label);
         return;
     }
 
-    let tokens = tab_tokens(config, tabs, style, session_label);
+    let tokens = tab_tokens(config, tabs, style, session_label, editing);
     let window = visible_tabs_for_layout(&tokens, config, style, budget);
     let hidden_left = window.start;
     let hidden_right = tokens.len().saturating_sub(window.end);
@@ -291,6 +374,18 @@ fn append_tabs(
                 context_id,
             });
         }
+        // Translate editor offsets within the token into absolute columns.
+        if let Some(cursor_offset) = token.edit_cursor_offset {
+            *edit_ranges = Some(AppendedTabEdit {
+                cursor_col: col.saturating_add(cursor_offset),
+                selection: token.edit_selection.and_then(|(start, end)| {
+                    (end > start).then_some((
+                        col.saturating_add(start),
+                        col.saturating_add(end).saturating_sub(1),
+                    ))
+                }),
+            });
+        }
         col = col.saturating_add(token.width);
     }
 
@@ -306,6 +401,13 @@ fn append_tabs(
     }
 }
 
+/// Absolute columns of the inline editor within the composed left side.
+struct AppendedTabEdit {
+    cursor_col: usize,
+    /// Inclusive selected column range.
+    selection: Option<(usize, usize)>,
+}
+
 /// One tab pre-rendered to its final status-bar token, so packing decisions
 /// can measure exact display widths without re-formatting.
 struct TabToken {
@@ -313,6 +415,11 @@ struct TabToken {
     width: usize,
     active: bool,
     context_id: Option<Uuid>,
+    /// Cursor offset in display cells from the token start, when this tab is
+    /// the one being edited inline.
+    edit_cursor_offset: Option<usize>,
+    /// Selected display-cell range within the token, when editing.
+    edit_selection: Option<(usize, usize)>,
 }
 
 fn tab_tokens(
@@ -320,11 +427,19 @@ fn tab_tokens(
     tabs: &[AttachTab],
     style: &StatusRenderStyle,
     session_label: &str,
+    editing: Option<AttachTabEdit<'_>>,
 ) -> Vec<TabToken> {
     let template = config.resolved_tab_template();
     tabs.iter()
         .enumerate()
         .map(|(index, tab)| {
+            let edit = editing.filter(|edit| Some(edit.context_id) == tab.context_id);
+            if let Some(edit) = edit {
+                // While editing, the raw buffer replaces the templated label so
+                // the user sees exactly the text they are typing. Template
+                // chrome is restored on commit or cancel.
+                return editing_tab_token(tab, style, edit);
+            }
             // Truncate the variable-length name before substitution so
             // `tab_label_max_width` bounds the name without ever clipping
             // template chrome mid-token.
@@ -348,9 +463,58 @@ fn tab_tokens(
                 text,
                 active: tab.active,
                 context_id: tab.context_id,
+                edit_cursor_offset: None,
+                edit_selection: None,
             }
         })
         .collect()
+}
+
+/// Build the token for the tab currently being renamed.
+///
+/// The editor is never truncated by `tab_label_max_width`: the packing pass
+/// keeps it whole so typing a long name pushes other tabs into overflow rather
+/// than hiding the text being entered.
+fn editing_tab_token(
+    tab: &AttachTab,
+    style: &StatusRenderStyle,
+    edit: AttachTabEdit<'_>,
+) -> TabToken {
+    let text = if tab.active {
+        style.active_tab(edit.text)
+    } else {
+        style.inactive_tab(edit.text)
+    };
+    // Affix width offsets cursor/selection positions inside the token.
+    let prefix_width = display_width(if tab.active {
+        style.active_prefix
+    } else {
+        style.inactive_prefix
+    });
+    let cursor_offset = prefix_width.saturating_add(byte_prefix_width(edit.text, edit.cursor));
+    let selection = edit.selection.map(|(start, end)| {
+        (
+            prefix_width.saturating_add(byte_prefix_width(edit.text, start)),
+            prefix_width.saturating_add(byte_prefix_width(edit.text, end)),
+        )
+    });
+    TabToken {
+        width: display_width(&text),
+        text,
+        active: tab.active,
+        context_id: tab.context_id,
+        edit_cursor_offset: Some(cursor_offset),
+        edit_selection: selection,
+    }
+}
+
+/// Display width of `text` up to `byte_index`, clamped to a char boundary.
+fn byte_prefix_width(text: &str, byte_index: usize) -> usize {
+    let mut end = byte_index.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    display_width(&text[..end])
 }
 
 /// Values substituted into [`StatusBarConfig::resolved_tab_template`].
@@ -438,9 +602,12 @@ fn visible_tabs_for_layout(
     style: &StatusRenderStyle,
     budget: usize,
 ) -> TabWindow {
+    // The tab being edited anchors the window so its text is never scrolled
+    // out from under the cursor; otherwise the active tab anchors it.
     let anchor = tokens
         .iter()
-        .position(|token| token.active)
+        .position(|token| token.edit_cursor_offset.is_some())
+        .or_else(|| tokens.iter().position(|token| token.active))
         .unwrap_or(0)
         .min(tokens.len().saturating_sub(1));
     let cap = config.max_tabs.unwrap_or(usize::MAX).max(1);
@@ -737,6 +904,8 @@ enum SegmentKind {
     InactiveTab,
     HoveredActiveTab,
     HoveredInactiveTab,
+    /// Selected text inside the inline tab rename editor.
+    EditSelection,
     Mode,
     Module,
     Overflow,
@@ -764,6 +933,7 @@ struct ResolvedStatusAppearance {
     inactive_tab: SegmentStyle,
     hovered_active_tab: SegmentStyle,
     hovered_inactive_tab: SegmentStyle,
+    edit_selection: SegmentStyle,
     mode: SegmentStyle,
     module: SegmentStyle,
     overflow: SegmentStyle,
@@ -930,6 +1100,15 @@ impl ResolvedStatusAppearance {
                 dim: false,
                 underline: false,
             },
+            // Selected editor text: swap fg/bg for an unmistakable, theme-
+            // independent reverse-video look.
+            edit_selection: SegmentStyle {
+                fg: active_bg,
+                bg: active_fg,
+                bold: false,
+                dim: false,
+                underline: false,
+            },
             module: SegmentStyle {
                 fg: module_fg,
                 bg: module_bg,
@@ -948,32 +1127,18 @@ impl ResolvedStatusAppearance {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn stylize_status_line(
     rendered_plain: &str,
     width: u16,
     config: &StatusBarConfig,
     appearance: &ResolvedStatusAppearance,
-    tabs: &[AttachTab],
-    hovered_context_id: Option<Uuid>,
-    hitboxes: &[AttachStatusTabHitbox],
-    overflow_ranges: &[(usize, usize)],
-    mode_range: Option<(usize, usize)>,
-    right_start_col: Option<usize>,
+    input: &StatusSegmentInput<'_>,
 ) -> String {
     let width = usize::from(width);
     if width == 0 {
         return String::new();
     }
-    let segments = status_segments(
-        width,
-        tabs,
-        hovered_context_id,
-        hitboxes,
-        overflow_ranges,
-        mode_range,
-        right_start_col,
-    );
+    let segments = status_segments(width, input);
 
     let mut rendered = String::new();
     let mut current_style = None;
@@ -999,32 +1164,18 @@ fn stylize_status_line(
     rendered
 }
 
-#[allow(clippy::too_many_arguments)]
 fn status_line_spans(
     rendered_plain: &str,
     width: u16,
     config: &StatusBarConfig,
     appearance: &ResolvedStatusAppearance,
-    tabs: &[AttachTab],
-    hovered_context_id: Option<Uuid>,
-    hitboxes: &[AttachStatusTabHitbox],
-    overflow_ranges: &[(usize, usize)],
-    mode_range: Option<(usize, usize)>,
-    right_start_col: Option<usize>,
+    input: &StatusSegmentInput<'_>,
 ) -> Vec<RenderTextSpan> {
     let width = usize::from(width);
     if width == 0 {
         return Vec::new();
     }
-    let segments = status_segments(
-        width,
-        tabs,
-        hovered_context_id,
-        hitboxes,
-        overflow_ranges,
-        mode_range,
-        right_start_col,
-    );
+    let segments = status_segments(width, input);
     let mut spans = Vec::new();
     let mut current_kind = None;
     let mut current_text = String::new();
@@ -1065,15 +1216,16 @@ fn status_line_spans(
     spans
 }
 
-fn status_segments(
-    width: usize,
-    tabs: &[AttachTab],
-    hovered_context_id: Option<Uuid>,
-    hitboxes: &[AttachStatusTabHitbox],
-    overflow_ranges: &[(usize, usize)],
-    mode_range: Option<(usize, usize)>,
-    right_start_col: Option<usize>,
-) -> Vec<SegmentKind> {
+fn status_segments(width: usize, input: &StatusSegmentInput<'_>) -> Vec<SegmentKind> {
+    let StatusSegmentInput {
+        tabs,
+        hovered_context_id,
+        hitboxes,
+        overflow_ranges,
+        mode_range,
+        right_start_col,
+        edit_selection,
+    } = *input;
     let mut segments = vec![SegmentKind::Base; width];
     // Left-side ranges may never bleed into the right-hand module zone. Cap
     // them at `right_start_col` so a stale or oversized range cannot repaint
@@ -1126,6 +1278,17 @@ fn status_segments(
             *segment = kind;
         }
     }
+
+    // Editor selection paints last so it reads clearly over tab styling, and is
+    // still capped to the left region.
+    if let Some((start, end)) = edit_selection
+        && start < left_limit
+    {
+        let end = end.min(left_limit.saturating_sub(1));
+        for segment in &mut segments[start..=end] {
+            *segment = SegmentKind::EditSelection;
+        }
+    }
     segments
 }
 
@@ -1162,6 +1325,7 @@ const fn style_for_segment(
         SegmentKind::InactiveTab => appearance.inactive_tab,
         SegmentKind::HoveredActiveTab => appearance.hovered_active_tab,
         SegmentKind::HoveredInactiveTab => appearance.hovered_inactive_tab,
+        SegmentKind::EditSelection => appearance.edit_selection,
         SegmentKind::Mode => appearance.mode,
         SegmentKind::Module => appearance.module,
         SegmentKind::Overflow => appearance.overflow,

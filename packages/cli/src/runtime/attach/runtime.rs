@@ -405,8 +405,8 @@ use super::state::{
     AttachInputHookCapture, AttachMouseFloatingDrag, AttachMouseResizeAxisDrag,
     AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachPointerOwner,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
-    AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState, PaneRenderBuffer,
-    PaneScrollbackView,
+    AttachTabRename, AttachUiEffect, AttachUiMode, AttachUiReduction, AttachViewState,
+    PaneRenderBuffer, PaneScrollbackView,
 };
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
@@ -6953,6 +6953,7 @@ pub fn build_attach_status_line_for_draw(
             spans: Vec::new(),
             tab_hitboxes: Vec::new(),
             drag_marker_col: None,
+            edit_cursor_col: None,
         };
     }
 
@@ -7046,7 +7047,16 @@ pub fn build_attach_status_line_for_draw(
         session_count,
         &current_context_label,
         &crate::status::AttachTabStripInput::new(&tabs)
-            .hovered(view_state.mouse.hovered_tab_context_id),
+            .hovered(view_state.mouse.hovered_tab_context_id)
+            .editing(view_state.tab_rename.as_ref().map(|rename| {
+                let selection = rename.buffer.selection();
+                crate::status::AttachTabEdit {
+                    context_id: rename.context_id,
+                    text: rename.text(),
+                    cursor: rename.buffer.cursor_byte_index(),
+                    selection: selection.map(|range| (range.start, range.end)),
+                }
+            })),
         tab_position_label.as_deref(),
         mode_label,
         role_label,
@@ -8264,6 +8274,26 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             overlay_cursor_state,
             &mut view_state.last_cursor_state,
             false,
+        )?;
+    } else if let Some(edit_cursor_col) = view_state
+        .tab_rename
+        .as_ref()
+        .and(view_state.cached_status_line.as_ref())
+        .and_then(|status_line| status_line.edit_cursor_col)
+        && let Some(status_row) =
+            status_row_for_position(view_state.status_position, terminal_size.1)
+    {
+        // Park the terminal cursor in the inline tab editor so the caret is
+        // visible where the user is typing.
+        apply_attach_cursor_state(
+            &mut frame_bytes,
+            Some(super::state::AttachCursorState {
+                x: edit_cursor_col,
+                y: status_row,
+                visible: true,
+            }),
+            &mut view_state.last_cursor_state,
+            true,
         )?;
     } else {
         let force_cursor_move = std::mem::take(&mut view_state.force_cursor_move_next_frame);
@@ -10420,6 +10450,36 @@ pub async fn handle_attach_terminal_event(
         .await?;
     }
 
+    if view_state.tab_rename.is_some() {
+        // The inline tab editor owns keyboard input while open, ahead of the
+        // prompt overlay and pane forwarding.
+        let rename_reduction = match &normalized_event {
+            Some(TerminalInputEvent::Key(key)) => {
+                handle_attach_tab_rename_key_event(view_state, key)
+            }
+            Some(TerminalInputEvent::Paste(text)) => {
+                handle_attach_tab_rename_paste(view_state, text)
+            }
+            Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
+                // Cancel rather than silently commit on focus loss or resize.
+                let _ = cancel_attach_tab_rename(view_state);
+                Some(AttachUiReduction::consumed())
+            }
+            _ => None,
+        };
+        if let Some(reduction) = rename_reduction {
+            execute_attach_ui_effects(
+                client,
+                view_state,
+                reduction.effects,
+                kernel_client_factory,
+                now,
+            )
+            .await?;
+            return Ok(AttachLoopControl::Continue);
+        }
+    }
+
     if view_state.prompt.is_active() {
         let prompt_disposition = match &normalized_event {
             Some(TerminalInputEvent::Key(key))
@@ -11684,7 +11744,7 @@ pub fn continue_attach_builtin_pointer_owner(
                 (TerminalMousePhase::Drag | TerminalMousePhase::Move, _)
                     | (TerminalMousePhase::Up, Some(TerminalMouseButton::Left))
             ) {
-                reduce_attach_status_tab_mouse_event(view_state, mouse_event, geometry)
+                reduce_attach_status_tab_mouse_event(view_state, mouse_event, geometry, now)
             } else {
                 AttachUiReduction::consumed()
             }
@@ -12610,6 +12670,7 @@ async fn handle_attach_status_tab_mouse_event_at(
         view_state,
         TerminalMouseEvent::from(mouse_event),
         geometry,
+        now,
     );
     if !reduction.consumed {
         return Ok(false);
@@ -12625,43 +12686,218 @@ async fn handle_attach_status_tab_mouse_event_at(
     Ok(true)
 }
 
+/// Route a key event into the inline tab rename editor.
+///
+/// Returns `Some(reduction)` when the editor consumed the key, so callers stop
+/// further handling (pane forwarding, keybindings) while editing.
+pub fn handle_attach_tab_rename_key_event(
+    view_state: &mut AttachViewState,
+    key: &TerminalKeyEvent,
+) -> Option<AttachUiReduction> {
+    use super::input::{TerminalKeyCode, TerminalKeyPhase};
+    use bmux_text_edit::{TextBoundary, TextBoundaryPolicy, TextMotion};
+
+    view_state.tab_rename.as_ref()?;
+    if !matches!(key.kind, TerminalKeyPhase::Press | TerminalKeyPhase::Repeat) {
+        // Ignore key releases without leaking them to the pane.
+        return Some(AttachUiReduction::consumed());
+    }
+
+    match key.code {
+        TerminalKeyCode::Enter => return Some(commit_attach_tab_rename(view_state)),
+        TerminalKeyCode::Esc => {
+            let _ = cancel_attach_tab_rename(view_state);
+            return Some(AttachUiReduction::consumed());
+        }
+        _ => {}
+    }
+
+    let rename = view_state.tab_rename.as_mut()?;
+    let word = key.modifiers.alt || key.modifiers.control;
+    match key.code {
+        TerminalKeyCode::Char(ch) if !key.modifiers.control && !key.modifiers.alt => {
+            rename.buffer.insert_char(ch);
+        }
+        TerminalKeyCode::Backspace if word => {
+            rename
+                .buffer
+                .delete(bmux_text_edit::TextDelete::WordBackward);
+        }
+        TerminalKeyCode::Backspace => rename.buffer.delete_backward(),
+        TerminalKeyCode::Delete if word => {
+            rename
+                .buffer
+                .delete(bmux_text_edit::TextDelete::WordForward);
+        }
+        TerminalKeyCode::Delete => rename.buffer.delete_forward(),
+        TerminalKeyCode::Left if word => rename.buffer.move_cursor(TextMotion::WordLeft),
+        TerminalKeyCode::Left => rename.buffer.move_cursor(TextMotion::Left),
+        TerminalKeyCode::Right if word => rename.buffer.move_cursor(TextMotion::WordRight),
+        TerminalKeyCode::Right => rename.buffer.move_cursor(TextMotion::Right),
+        TerminalKeyCode::Home => rename
+            .buffer
+            .move_to_boundary(TextBoundaryPolicy::Line, TextBoundary::Start),
+        TerminalKeyCode::End => rename
+            .buffer
+            .move_to_boundary(TextBoundaryPolicy::Line, TextBoundary::End),
+        // Swallow everything else so stray keys neither edit the name nor reach
+        // the focused pane while the editor is open.
+        _ => {}
+    }
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::UserAction);
+    Some(AttachUiReduction::consumed())
+}
+
+/// Route pasted text into the inline tab rename editor.
+pub fn handle_attach_tab_rename_paste(
+    view_state: &mut AttachViewState,
+    text: &str,
+) -> Option<AttachUiReduction> {
+    let rename = view_state.tab_rename.as_mut()?;
+    // Names are single-line; collapse pasted newlines.
+    let sanitized = text.replace(['\n', '\r'], " ");
+    rename.buffer.paste(&sanitized);
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::UserAction);
+    Some(AttachUiReduction::consumed())
+}
+
+/// Open the inline rename editor for `context_id`, seeded with its current
+/// label and fully selected.
+fn begin_attach_tab_rename(
+    view_state: &mut AttachViewState,
+    context_id: Uuid,
+) -> AttachUiReduction {
+    let Some(label) = attach_tab_label_for_context(view_state, context_id) else {
+        return AttachUiReduction::ignored();
+    };
+    if !view_state.can_write {
+        return AttachUiReduction::with_effect(AttachUiEffect::ShowTransientStatus {
+            message: "tab rename unavailable in read-only attach".to_string(),
+        });
+    }
+    view_state.tab_rename = Some(AttachTabRename::new(context_id, label));
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::UserAction);
+    AttachUiReduction::consumed()
+}
+
+/// Discard an in-progress rename. Returns whether an editor was open.
+fn cancel_attach_tab_rename(view_state: &mut AttachViewState) -> bool {
+    if view_state.tab_rename.take().is_some() {
+        view_state
+            .dirty
+            .mark_status_dirty(AttachDirtySource::UserAction);
+        return true;
+    }
+    false
+}
+
+/// Commit an in-progress rename, emitting a rename effect when the name
+/// actually changed.
+fn commit_attach_tab_rename(view_state: &mut AttachViewState) -> AttachUiReduction {
+    let Some(rename) = view_state.tab_rename.take() else {
+        return AttachUiReduction::ignored();
+    };
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::UserAction);
+    match rename.committed_name() {
+        Some(name) => AttachUiReduction::with_effect(AttachUiEffect::RenameWindow {
+            context_id: rename.context_id,
+            name,
+        }),
+        None => AttachUiReduction::consumed(),
+    }
+}
+
+/// Current label for a context, preferring the authoritative plugin window
+/// list and falling back to the contexts catalog.
+fn attach_tab_label_for_context(view_state: &AttachViewState, context_id: Uuid) -> Option<String> {
+    if let Some(snapshot) = view_state.cached_window_list.as_ref()
+        && let Some(entry) = snapshot.windows.iter().find(|entry| entry.id == context_id)
+    {
+        return Some(entry.name.clone());
+    }
+    view_state
+        .cached_contexts
+        .iter()
+        .find(|context| context.id == context_id)
+        .and_then(|context| context.name.clone())
+}
+
+/// Handle a left press on the status tab strip: double-click opens the inline
+/// rename editor, a single press arms a drag (or switches windows when drag is
+/// disabled).
+fn reduce_attach_status_tab_press(
+    view_state: &mut AttachViewState,
+    mouse_event: TerminalMouseEvent,
+    geometry: TerminalGeometry,
+    now: Instant,
+) -> AttachUiReduction {
+    let Some(source_context_id) = attach_status_tab_context_at(view_state, mouse_event, geometry)
+    else {
+        view_state.mouse.tab_drag = None;
+        view_state.mouse.last_click = None;
+        // Clicking off the tab strip dismisses an open rename editor.
+        if cancel_attach_tab_rename(view_state) {
+            return AttachUiReduction::consumed();
+        }
+        return AttachUiReduction::ignored();
+    };
+
+    // A second press on the same tab cell opens the inline editor. Checked
+    // before drag arming so a double-click never starts a drag.
+    if view_state
+        .mouse
+        .record_click_and_detect_double(mouse_event.col, mouse_event.row, now)
+    {
+        view_state.mouse.tab_drag = None;
+        return begin_attach_tab_rename(view_state, source_context_id);
+    }
+
+    if view_state.tab_rename.is_some() {
+        // A single click while editing abandons the edit and resumes normal
+        // tab behavior.
+        let _ = cancel_attach_tab_rename(view_state);
+    }
+
+    if !view_state.mouse.tab_drag_enabled {
+        trace!("attach.status_tab_drag.disabled.mru_order");
+        return AttachUiReduction::with_effect(AttachUiEffect::SwitchWindow {
+            target_context_id: source_context_id,
+        });
+    }
+
+    view_state.mouse.prepare_pointer_owner_acquisition();
+    let drop_target = view_state
+        .cached_status_line
+        .as_ref()
+        .and_then(|status_line| resolve_attach_tab_drop_target(status_line, mouse_event.col));
+    view_state.mouse.tab_drag = Some(AttachMouseTabDrag {
+        source_context_id,
+        started_col: mouse_event.col,
+        started_row: mouse_event.row,
+        active: false,
+        drop_target,
+    });
+    view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
+    AttachUiReduction::consumed()
+}
+
 pub fn reduce_attach_status_tab_mouse_event(
     view_state: &mut AttachViewState,
     mouse_event: TerminalMouseEvent,
     geometry: TerminalGeometry,
+    now: Instant,
 ) -> AttachUiReduction {
     match (mouse_event.phase, mouse_event.button) {
         (TerminalMousePhase::Down, Some(TerminalMouseButton::Left)) => {
-            let Some(source_context_id) =
-                attach_status_tab_context_at(view_state, mouse_event, geometry)
-            else {
-                view_state.mouse.tab_drag = None;
-                return AttachUiReduction::ignored();
-            };
-
-            if !view_state.mouse.tab_drag_enabled {
-                trace!("attach.status_tab_drag.disabled.mru_order");
-                return AttachUiReduction::with_effect(AttachUiEffect::SwitchWindow {
-                    target_context_id: source_context_id,
-                });
-            }
-
-            view_state.mouse.prepare_pointer_owner_acquisition();
-            let drop_target = view_state
-                .cached_status_line
-                .as_ref()
-                .and_then(|status_line| {
-                    resolve_attach_tab_drop_target(status_line, mouse_event.col)
-                });
-            view_state.mouse.tab_drag = Some(AttachMouseTabDrag {
-                source_context_id,
-                started_col: mouse_event.col,
-                started_row: mouse_event.row,
-                active: false,
-                drop_target,
-            });
-            view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
-            AttachUiReduction::consumed()
+            reduce_attach_status_tab_press(view_state, mouse_event, geometry, now)
         }
         (TerminalMousePhase::Drag | TerminalMousePhase::Move, _) => {
             if view_state.mouse.tab_drag.is_none() {
@@ -12767,6 +13003,13 @@ async fn execute_attach_ui_effects(
                     target_context_id,
                     placement,
                 );
+            }
+            AttachUiEffect::RenameWindow { context_id, name } => {
+                rename_attach_status_tab(client, context_id, &name).await?;
+                optimistically_rename_attach_window_list(view_state, context_id, &name);
+                view_state
+                    .dirty
+                    .mark_status_dirty(AttachDirtySource::UserAction);
             }
             AttachUiEffect::ResizePane {
                 pane_id,
@@ -12950,6 +13193,43 @@ async fn move_attach_status_tab(
     )
     .await?;
     Ok(())
+}
+
+/// Rename a specific window through the windows plugin, independent of which
+/// window is currently focused.
+async fn rename_attach_status_tab(
+    client: &mut StreamingBmuxClient,
+    context_id: Uuid,
+    name: &str,
+) -> std::result::Result<(), ClientError> {
+    let _ack: windows_commands::WindowAck = invoke_windows_command(
+        client,
+        "rename-window-by-id",
+        &windows_commands::client::RenameWindowByIdRequest {
+            id: context_id,
+            name: name.to_string(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Reflect a rename in the cached window list so the tab strip updates before
+/// the plugin's next `window-list` snapshot arrives.
+fn optimistically_rename_attach_window_list(
+    view_state: &mut AttachViewState,
+    context_id: Uuid,
+    name: &str,
+) {
+    let Some(snapshot) = view_state.cached_window_list.as_ref() else {
+        return;
+    };
+    let mut next = snapshot.as_ref().clone();
+    let Some(entry) = next.windows.iter_mut().find(|entry| entry.id == context_id) else {
+        return;
+    };
+    entry.name = name.to_string();
+    view_state.cached_window_list = Some(Arc::new(next));
 }
 
 fn optimistically_reorder_attach_window_list(
@@ -14679,6 +14959,7 @@ mod tests {
             spans: Vec::new(),
             tab_hitboxes: hitboxes,
             drag_marker_col: None,
+            edit_cursor_col: None,
         }
     }
 
@@ -14881,7 +15162,12 @@ mod tests {
         let hover = |view_state: &mut AttachViewState, col: u16, row: u16| {
             let mut event = tab_mouse_event(TerminalMousePhase::Move, col, row);
             event.button = None;
-            reduce_attach_status_tab_mouse_event(view_state, event, tab_reducer_geometry())
+            reduce_attach_status_tab_mouse_event(
+                view_state,
+                event,
+                tab_reducer_geometry(),
+                Instant::now(),
+            )
         };
 
         // Motion over a tab records hover and marks the status dirty, but stays
@@ -14924,8 +15210,12 @@ mod tests {
         let mut view_state = tab_reducer_view_state();
         let mut event = tab_mouse_event(TerminalMousePhase::Move, 3, 23);
         event.button = None;
-        let _ =
-            reduce_attach_status_tab_mouse_event(&mut view_state, event, tab_reducer_geometry());
+        let _ = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            event,
+            tab_reducer_geometry(),
+            Instant::now(),
+        );
         assert!(view_state.mouse.hovered_tab_context_id.is_some());
 
         view_state.mouse.clear_pointer_gestures();
@@ -14941,6 +15231,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 9, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
         assert!(down.effects.is_empty());
@@ -14949,6 +15240,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 9, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -14969,6 +15261,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
         assert!(down.effects.is_empty());
@@ -14977,6 +15270,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Move, 17, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(motion.consumed);
         assert!(motion.effects.is_empty());
@@ -14986,6 +15280,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 17, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15008,6 +15303,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
 
@@ -15015,6 +15311,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 17, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15035,6 +15332,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
 
@@ -15042,6 +15340,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15061,6 +15360,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 15, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
 
@@ -15068,6 +15368,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 2, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15089,6 +15390,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
 
@@ -15096,6 +15398,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 11, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15117,6 +15420,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
 
@@ -15124,6 +15428,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 79, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15145,6 +15450,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(down.consumed);
 
@@ -15152,6 +15458,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Move, 8, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(motion.consumed);
         let drag = view_state.mouse.tab_drag.expect("active tab drag");
@@ -15172,6 +15479,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 8, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             up.effects,
@@ -15194,6 +15502,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Down, 3, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert_eq!(
             down.effects,
@@ -15207,6 +15516,7 @@ mod tests {
             &mut view_state,
             tab_mouse_event(TerminalMousePhase::Up, 17, 23),
             tab_reducer_geometry(),
+            Instant::now(),
         );
         assert!(!up.consumed);
         assert!(up.effects.is_empty());
@@ -18967,6 +19277,7 @@ mod tests {
             )],
             tab_hitboxes: Vec::new(),
             drag_marker_col: Some(3),
+            edit_cursor_col: None,
         };
 
         let surface = retained_status_surface(&status_line, StatusPosition::Bottom, (20, 5))

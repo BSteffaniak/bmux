@@ -5,6 +5,7 @@ owns_namespaces = [
     "window",
     "new-window",
     "rename-window",
+    "rename-window-by-id",
     "list-windows",
     "kill-window",
     "kill-all-windows",
@@ -108,6 +109,26 @@ expose_in_cli = true
 name          = "rename-window"
 path          = ["rename-window"]
 summary       = "Rename the current workspace window"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+value_name = "NAME"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "rename-window-by-id"
+path          = ["rename-window-by-id"]
+summary       = "Rename a specific workspace window by id"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "id"
+name       = "id"
+value_name = "ID"
 
 [[commands.arguments]]
 kind       = "string"

@@ -297,6 +297,8 @@ pub struct AttachViewState {
     pub last_cursor_state: Option<AttachCursorState>,
     pub force_cursor_move_next_frame: bool,
     pub mouse: AttachMouseState,
+    /// Active inline tab rename editor, when a tab label is being edited.
+    pub tab_rename: Option<AttachTabRename>,
     pub visual_projection_updates: Vec<AttachVisualProjectionUpdate>,
     pub dirty: AttachDirtyFlags,
 
@@ -353,6 +355,52 @@ pub enum AttachPointerOwner {
     Selection,
 }
 
+/// Inline tab-label editor state.
+///
+/// While active, the edited tab renders the raw buffer text instead of its
+/// templated label, and keyboard input is routed to the buffer rather than the
+/// focused pane.
+#[derive(Debug, Clone)]
+pub struct AttachTabRename {
+    /// Context (window) being renamed.
+    pub context_id: Uuid,
+    /// Editable name buffer. Opens with the whole name selected so typing
+    /// replaces it, while arrow keys move to an insertion point instead.
+    pub buffer: bmux_text_edit::TextEditBuffer,
+    /// Name to restore when the edit is cancelled.
+    pub original: String,
+}
+
+impl AttachTabRename {
+    #[must_use]
+    pub fn new(context_id: Uuid, name: impl Into<String>) -> Self {
+        let original = name.into();
+        let mut buffer = bmux_text_edit::TextEditBuffer::from_text(original.clone());
+        buffer.select_all();
+        Self {
+            context_id,
+            buffer,
+            original,
+        }
+    }
+
+    /// Current buffer text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        self.buffer.text()
+    }
+
+    /// Trimmed committed name, or `None` when it is blank or unchanged.
+    #[must_use]
+    pub fn committed_name(&self) -> Option<String> {
+        let trimmed = self.buffer.text().trim();
+        if trimmed.is_empty() || trimmed == self.original {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
@@ -364,6 +412,8 @@ pub struct AttachMouseState {
     pub hovered_pane_id: Option<Uuid>,
     /// Context id of the status-bar tab currently under the pointer.
     pub hovered_tab_context_id: Option<Uuid>,
+    /// Most recent left-button press cell and time, used to detect double clicks.
+    pub last_click: Option<(u16, u16, Instant)>,
     pub last_focused_pane_id: Option<Uuid>,
     pub resize_drag: Option<AttachMouseResizeDrag>,
     pub floating_drag: Option<AttachMouseFloatingDrag>,
@@ -442,6 +492,31 @@ impl AttachMouseState {
         debug_assert!(self.pointer_owner().is_none());
     }
 
+    /// Record a left-button press and report whether it completes a
+    /// double-click: the same cell pressed twice within
+    /// `behavior.mouse.double_click_ms`.
+    ///
+    /// A detected double-click consumes the stored click so a third press
+    /// starts a fresh sequence rather than chaining.
+    pub(crate) fn record_click_and_detect_double(
+        &mut self,
+        col: u16,
+        row: u16,
+        now: Instant,
+    ) -> bool {
+        let window = Duration::from_millis(self.config.double_click_ms);
+        let is_double = !window.is_zero()
+            && self.last_click.is_some_and(|(last_col, last_row, at)| {
+                last_col == col && last_row == row && now.saturating_duration_since(at) <= window
+            });
+        self.last_click = if is_double {
+            None
+        } else {
+            Some((col, row, now))
+        };
+        is_double
+    }
+
     pub(crate) fn debug_assert_single_pointer_owner(&self) {
         debug_assert!(self.has_single_pointer_owner());
     }
@@ -488,6 +563,7 @@ impl Default for AttachMouseState {
             hover_started_at: None,
             hovered_pane_id: None,
             hovered_tab_context_id: None,
+            last_click: None,
             last_focused_pane_id: None,
             resize_drag: None,
             floating_drag: None,
@@ -565,6 +641,10 @@ pub enum AttachUiEffect {
         source_context_id: Uuid,
         target_context_id: Uuid,
         placement: AttachTabDropPlacement,
+    },
+    RenameWindow {
+        context_id: Uuid,
+        name: String,
     },
     ResizePane {
         pane_id: Uuid,
@@ -665,6 +745,7 @@ impl AttachViewState {
                 config: MouseBehaviorConfig::default(),
                 ..AttachMouseState::default()
             },
+            tab_rename: None,
             visual_projection_updates: Vec::new(),
             dirty: AttachDirtyFlags::default(),
             #[cfg(any(

@@ -2242,6 +2242,9 @@ pub struct MouseBehaviorConfig {
     /// Minimum interval in milliseconds between resize requests while dragging pane borders.
     /// Set to 0 to apply every drag event. Mouse release always applies the final position.
     pub resize_drag_throttle_ms: u64,
+    /// Maximum interval in milliseconds between two clicks for them to count as
+    /// a double-click (for example, to rename a status-bar tab inline).
+    pub double_click_ms: u64,
     /// Optional mouse gesture overrides mapped to action names.
     ///
     /// Supported keys in the current core runtime are `click_left`,
@@ -2267,6 +2270,7 @@ impl Default for MouseBehaviorConfig {
             selection_release: MouseSelectionReleaseBehavior::default(),
             resize_borders: true,
             resize_drag_throttle_ms: 32,
+            double_click_ms: 400,
             gesture_actions: BTreeMap::new(),
         }
     }

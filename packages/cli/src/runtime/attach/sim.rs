@@ -102,7 +102,28 @@ impl AttachSimHarness {
             .iter()
             .find(|window| window.active)
             .map(|window| window.id);
+        self.sync_cached_window_list();
         self.render();
+    }
+
+    /// Mirror the simulated window list into `cached_window_list`, matching what
+    /// the windows plugin publishes in production so code reading the cache
+    /// (such as the inline rename editor) behaves the same under simulation.
+    fn sync_cached_window_list(&mut self) {
+        use bmux_windows_plugin_api::windows_list::{WindowListEntry, WindowListSnapshot};
+        let snapshot = WindowListSnapshot {
+            windows: self
+                .windows
+                .iter()
+                .map(|window| WindowListEntry {
+                    id: window.id,
+                    name: window.name.clone(),
+                    active: window.active,
+                })
+                .collect(),
+            revision: 0,
+        };
+        self.view_state.cached_window_list = Some(std::sync::Arc::new(snapshot));
     }
 
     pub fn set_tab_order(&mut self, order: StatusTabOrder) {
@@ -119,6 +140,88 @@ impl AttachSimHarness {
     pub fn set_tab_template(&mut self, template: &str) {
         self.status_config.tab_template = Some(template.to_string());
         self.render();
+    }
+
+    /// Text currently shown in the inline tab rename editor, if open.
+    pub fn tab_rename_text(&self) -> Option<&str> {
+        self.view_state
+            .tab_rename
+            .as_ref()
+            .map(super::state::AttachTabRename::text)
+    }
+
+    pub const fn tab_rename_active(&self) -> bool {
+        self.view_state.tab_rename.is_some()
+    }
+
+    /// Column of the inline editor cursor in the last rendered status line.
+    #[cfg(test)]
+    pub fn tab_rename_cursor_col(&self) -> Option<u16> {
+        self.view_state
+            .cached_status_line
+            .as_ref()
+            .and_then(|line| line.edit_cursor_col)
+    }
+
+    /// Feed a chord (or literal text) into the inline tab rename editor.
+    ///
+    /// Returns the number of key events applied.
+    pub fn send_rename_chord(&mut self, chord: &str) -> usize {
+        use super::input::TerminalKeyCode;
+
+        let code = match chord {
+            "Enter" | "enter" => Some(TerminalKeyCode::Enter),
+            "Esc" | "esc" | "Escape" => Some(TerminalKeyCode::Esc),
+            "Backspace" | "backspace" => Some(TerminalKeyCode::Backspace),
+            "Delete" | "delete" => Some(TerminalKeyCode::Delete),
+            "Left" | "left" => Some(TerminalKeyCode::Left),
+            "Right" | "right" => Some(TerminalKeyCode::Right),
+            "Home" | "home" => Some(TerminalKeyCode::Home),
+            "End" | "end" => Some(TerminalKeyCode::End),
+            _ => None,
+        };
+        let mut applied = 0usize;
+        if let Some(code) = code {
+            self.send_rename_key(&super::input::TerminalKeyEvent {
+                code,
+                modifiers: super::input::TerminalModifiers::default(),
+                kind: super::input::TerminalKeyPhase::Press,
+            });
+            return 1;
+        }
+        // Otherwise treat the chord as literal text to type.
+        for ch in chord.chars() {
+            self.send_rename_key(&super::input::TerminalKeyEvent {
+                code: TerminalKeyCode::Char(ch),
+                modifiers: super::input::TerminalModifiers::default(),
+                kind: super::input::TerminalKeyPhase::Press,
+            });
+            applied += 1;
+        }
+        applied
+    }
+
+    pub fn send_rename_key(&mut self, key: &super::input::TerminalKeyEvent) {
+        if let Some(reduction) =
+            super::runtime::handle_attach_tab_rename_key_event(&mut self.view_state, key)
+        {
+            for effect in reduction.effects {
+                self.apply_effect(effect);
+            }
+            self.render();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn send_rename_paste(&mut self, text: &str) {
+        if let Some(reduction) =
+            super::runtime::handle_attach_tab_rename_paste(&mut self.view_state, text)
+        {
+            for effect in reduction.effects {
+                self.apply_effect(effect);
+            }
+            self.render();
+        }
     }
 
     #[cfg(test)]
@@ -156,7 +259,16 @@ impl AttachSimHarness {
             1,
             "sim",
             &crate::status::AttachTabStripInput::new(&tabs)
-                .hovered(self.view_state.mouse.hovered_tab_context_id),
+                .hovered(self.view_state.mouse.hovered_tab_context_id)
+                .editing(self.view_state.tab_rename.as_ref().map(|rename| {
+                    let selection = rename.buffer.selection();
+                    crate::status::AttachTabEdit {
+                        context_id: rename.context_id,
+                        text: rename.text(),
+                        cursor: rename.buffer.cursor_byte_index(),
+                        selection: selection.map(|range| (range.start, range.end)),
+                    }
+                })),
             None,
             mode_label,
             "write",
@@ -211,9 +323,12 @@ impl AttachSimHarness {
                 self.geometry,
             ) {
                 AttachPointerContinuation::Owned(reduction) => reduction,
-                AttachPointerContinuation::Unowned => {
-                    reduce_attach_status_tab_mouse_event(&mut self.view_state, event, self.geometry)
-                }
+                AttachPointerContinuation::Unowned => reduce_attach_status_tab_mouse_event(
+                    &mut self.view_state,
+                    event,
+                    self.geometry,
+                    self.clock.now(),
+                ),
             },
         };
         if !reduction.consumed {
@@ -920,6 +1035,13 @@ impl AttachSimHarness {
                     target_context_id,
                     placement,
                 );
+                self.sync_cached_window_list();
+            }
+            AttachUiEffect::RenameWindow { context_id, name } => {
+                if let Some(window) = self.windows.iter_mut().find(|w| w.id == context_id) {
+                    window.name = name;
+                }
+                self.sync_cached_window_list();
             }
             AttachUiEffect::ResizePane { .. } | AttachUiEffect::ShowTransientStatus { .. } => {}
             AttachUiEffect::FocusPane { pane_id } => {
@@ -1238,6 +1360,220 @@ mod tests {
         sim.set_status_position(StatusPosition::Top);
         let top = sim.locate_text("1:one").expect("top tab");
         assert_eq!(top.row, 0);
+    }
+
+    fn key(code: super::super::input::TerminalKeyCode) -> super::super::input::TerminalKeyEvent {
+        super::super::input::TerminalKeyEvent {
+            code,
+            modifiers: TerminalModifiers::default(),
+            kind: super::super::input::TerminalKeyPhase::Press,
+        }
+    }
+
+    fn double_click_tab(sim: &mut AttachSimHarness, name: &str) {
+        let tab = sim.locate_text(name).expect("tab should be located");
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            tab.center_col,
+            tab.row,
+        ));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, tab.center_col, tab.row));
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            tab.center_col,
+            tab.row,
+        ));
+    }
+
+    #[test]
+    fn attach_sim_double_click_opens_inline_rename_with_name_selected() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        double_click_tab(&mut sim, "two");
+
+        assert!(
+            sim.tab_rename_active(),
+            "double-click should open the editor"
+        );
+        assert_eq!(sim.tab_rename_text(), Some("two"));
+        // Whole name selected: typing replaces it outright.
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('x')));
+        assert_eq!(sim.tab_rename_text(), Some("x"));
+    }
+
+    #[test]
+    fn attach_sim_single_click_does_not_open_rename() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+        let tab = sim.locate_text("two").expect("tab");
+
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            tab.center_col,
+            tab.row,
+        ));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, tab.center_col, tab.row));
+
+        assert!(!sim.tab_rename_active());
+    }
+
+    #[test]
+    fn attach_sim_slow_second_click_does_not_open_rename() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+        let tab = sim.locate_text("two").expect("tab");
+
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            tab.center_col,
+            tab.row,
+        ));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, tab.center_col, tab.row));
+        // Past the double-click window.
+        sim.advance_clock(std::time::Duration::from_secs(1));
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Down,
+            tab.center_col,
+            tab.row,
+        ));
+
+        assert!(!sim.tab_rename_active());
+    }
+
+    #[test]
+    fn attach_sim_rename_commit_renames_window_and_restores_template() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+        sim.set_tab_template("[{name}]");
+
+        double_click_tab(&mut sim, "two");
+        // Raw editor text replaces the template while editing.
+        assert!(sim.rendered().contains("two"), "{:?}", sim.rendered());
+
+        for ch in "dev".chars() {
+            sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char(ch)));
+        }
+        assert_eq!(sim.tab_rename_text(), Some("dev"));
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Enter));
+
+        assert!(!sim.tab_rename_active());
+        assert_eq!(sim.window_names(), ["one", "dev", "three"]);
+        // Template chrome is restored after commit.
+        assert!(sim.rendered().contains("[dev]"), "{:?}", sim.rendered());
+    }
+
+    #[test]
+    fn attach_sim_rename_escape_restores_original_name() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        double_click_tab(&mut sim, "two");
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('z')));
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Esc));
+
+        assert!(!sim.tab_rename_active());
+        assert_eq!(sim.window_names(), ["one", "two"]);
+        assert!(
+            !sim.effects()
+                .iter()
+                .any(|effect| matches!(effect, AttachUiEffect::RenameWindow { .. })),
+            "escape must not emit a rename"
+        );
+    }
+
+    #[test]
+    fn attach_sim_rename_arrow_key_appends_instead_of_replacing() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        double_click_tab(&mut sim, "two");
+        // Right arrow collapses the selection to the end, so typing appends.
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Right));
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('!')));
+
+        assert_eq!(sim.tab_rename_text(), Some("two!"));
+    }
+
+    #[test]
+    fn attach_sim_rename_backspace_and_home_behave_like_a_text_input() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "alpha"], "one");
+
+        double_click_tab(&mut sim, "alpha");
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::End));
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Backspace));
+        assert_eq!(sim.tab_rename_text(), Some("alph"));
+
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Home));
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('_')));
+        assert_eq!(sim.tab_rename_text(), Some("_alph"));
+    }
+
+    #[test]
+    fn attach_sim_rename_blank_name_is_not_committed() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        double_click_tab(&mut sim, "two");
+        // Selection covers the whole name, so a space replaces it entirely.
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char(' ')));
+        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Enter));
+
+        assert!(!sim.tab_rename_active());
+        assert_eq!(
+            sim.window_names(),
+            ["one", "two"],
+            "blank names must be rejected"
+        );
+    }
+
+    #[test]
+    fn attach_sim_rename_paste_collapses_newlines() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        double_click_tab(&mut sim, "two");
+        sim.send_rename_paste("multi\nline");
+
+        assert_eq!(sim.tab_rename_text(), Some("multi line"));
+    }
+
+    #[test]
+    fn attach_sim_rename_cursor_column_is_reported_for_rendering() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+
+        double_click_tab(&mut sim, "two");
+        let cursor = sim
+            .tab_rename_cursor_col()
+            .expect("editor should expose a cursor column");
+        let tab = sim.locate_text("two").expect("tab");
+        assert!(
+            cursor >= tab.start_col && cursor <= tab.end_col.saturating_add(1),
+            "cursor {cursor} should sit within the edited tab {}..={}",
+            tab.start_col,
+            tab.end_col
+        );
+    }
+
+    #[test]
+    fn attach_sim_double_click_does_not_start_a_tab_drag() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two", "three"], "one");
+
+        double_click_tab(&mut sim, "two");
+        assert_eq!(sim.render().drag_marker_col, None);
+
+        // Moving after the double-click edits text, it must not reorder tabs.
+        let three = sim.locate_text("three").expect("three tab");
+        sim.send_mouse(left_mouse(
+            TerminalMousePhase::Move,
+            three.end_col,
+            three.row,
+        ));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, three.end_col, three.row));
+        assert_eq!(sim.window_names(), ["one", "two", "three"]);
     }
 
     #[test]

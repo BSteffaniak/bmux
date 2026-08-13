@@ -2191,6 +2191,12 @@ fn execute_attach_sim_step(
         }
         Action::SendAttach { key } => {
             let key = runtime_vars.resolve_opt(key);
+            // While the inline tab editor is open it owns keyboard input, so
+            // route chords into the editor instead of the keybinding layer.
+            if sim.tab_rename_active() {
+                let consumed = sim.send_rename_chord(&key);
+                return Ok(Some(format!("tab rename consumed {consumed} key(s)")));
+            }
             let emitted = sim.send_attach_chord(&key)?;
             Ok(Some(format!("emitted {} attach actions", emitted.len())))
         }
@@ -2221,6 +2227,8 @@ fn execute_attach_sim_step(
                 "windows.names" => serde_json::to_string(&sim.window_names())?,
                 "windows.active_name" => serde_json::to_string(&sim.active_window_name())?,
                 "status.tab_labels" => serde_json::to_string(&sim.rendered_tab_labels())?,
+                "tab_rename.active" => serde_json::to_string(&sim.tab_rename_active())?,
+                "tab_rename.text" => serde_json::to_string(&sim.tab_rename_text())?,
                 "scrollback.active" => serde_json::to_string(&sim.scrollback_active())?,
                 "help_overlay.open" => serde_json::to_string(&sim.help_overlay_open())?,
                 "help_overlay.scroll" => serde_json::to_string(&sim.help_overlay_scroll())?,
@@ -2337,6 +2345,7 @@ const fn attach_sim_effect_operation(
     match effect {
         crate::runtime::attach::state::AttachUiEffect::SwitchWindow { .. } => "switch-window",
         crate::runtime::attach::state::AttachUiEffect::MoveWindow { .. } => "move-window",
+        crate::runtime::attach::state::AttachUiEffect::RenameWindow { .. } => "rename-window",
         crate::runtime::attach::state::AttachUiEffect::ResizePane { .. } => "resize-pane",
         crate::runtime::attach::state::AttachUiEffect::FocusPane { .. } => "focus-pane",
         crate::runtime::attach::state::AttachUiEffect::MoveFloatingPane { .. } => {

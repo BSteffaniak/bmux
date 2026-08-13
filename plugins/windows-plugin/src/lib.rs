@@ -1104,6 +1104,10 @@ impl RustPlugin for WindowsPlugin {
                 rename_window(ctx, &self.runtime_state, &req.name)
                     .map_err(|e| ServiceResponse::error("rename_failed", e))
             },
+            "windows-commands", "rename-window-by-id" => |req: RenameWindowByIdArgs, ctx| {
+                rename_window_by_id(ctx, &self.runtime_state, req.id, &req.name)
+                    .map_err(|e| ServiceResponse::error("rename_failed", e))
+            },
             "windows-commands", "kill-window" => |req: KillWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
@@ -1639,6 +1643,18 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 );
             }
             spawn_rename_window_prompt(context.clone(), Arc::clone(&plugin.runtime_state))?;
+            Ok(())
+        }
+        "rename-window-by-id" => {
+            let id = option_value(&context.arguments, "id")
+                .ok_or_else(|| "rename-window-by-id requires --id".to_string())?;
+            let id = Uuid::parse_str(&id).map_err(|error| format!("invalid --id: {error}"))?;
+            let name = option_value(&context.arguments, "name")
+                .ok_or_else(|| "rename-window-by-id requires --name".to_string())?;
+            let ack = rename_window_by_id(context, &plugin.runtime_state, id, &name)?;
+            if emit_to_stdout && let Some(context_id) = ack.id {
+                println!("renamed window context: {context_id}");
+            }
             Ok(())
         }
         "list-windows" => {
@@ -2203,6 +2219,32 @@ fn rename_window(
     let context_id =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
             .ok_or_else(|| "no current window to rename".to_string())?;
+    rename_window_context(caller, runtime_state, context_id, name)
+}
+
+/// Rename a specific window by id, regardless of which window is current.
+fn rename_window_by_id(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &WindowRuntimeStateHandle,
+    id: Uuid,
+    name: &str,
+) -> Result<WindowAck, String> {
+    let name = normalize_window_name(name)?;
+    let contexts = list_contexts(caller)?;
+    if !contexts.iter().any(|context| context.id == id) {
+        return Err(format!("unknown window {id}"));
+    }
+    rename_window_context(caller, runtime_state, id, name)
+}
+
+/// Shared rename tail: apply the context rename, refresh the local cache, and
+/// republish the window list so subscribers (the attach tab bar) see the change.
+fn rename_window_context(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &WindowRuntimeStateHandle,
+    context_id: Uuid,
+    name: String,
+) -> Result<WindowAck, String> {
     let renamed_id = rename_context(caller, context_selector_by_id(context_id), name.clone())?;
     cache_known_context(runtime_state, renamed_id, Some(name));
     publish_window_list_snapshot(caller, runtime_state);
@@ -3573,6 +3615,18 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         })
     }
 
+    fn rename_window_by_id<'a>(
+        &'a self,
+        id: Uuid,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            rename_window_by_id(&*caller, &self.shared.runtime_state, id, &name)
+                .map_err(|reason| WindowError::Failed { reason })
+        })
+    }
+
     fn kill_window<'a>(
         &'a self,
         target: String,
@@ -3883,6 +3937,12 @@ struct NewWindowArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RenameWindowArgs {
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RenameWindowByIdArgs {
+    id: Uuid,
     name: String,
 }
 
@@ -4374,6 +4434,7 @@ mod tests {
         creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<ContextCloseRequest>>,
         selects: Mutex<Vec<Uuid>>,
+        renames: Mutex<Vec<(Uuid, String)>>,
         storage: Mutex<BTreeMap<String, Vec<u8>>>,
     }
 
@@ -4391,6 +4452,7 @@ mod tests {
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
+                renames: Mutex::new(Vec::new()),
                 storage: Mutex::new(BTreeMap::new()),
             }
         }
@@ -4409,6 +4471,7 @@ mod tests {
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
+                renames: Mutex::new(Vec::new()),
                 storage: Mutex::new(BTreeMap::new()),
             }
         }
@@ -4427,6 +4490,7 @@ mod tests {
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
+                renames: Mutex::new(Vec::new()),
                 storage: Mutex::new(BTreeMap::new()),
             }
         }
@@ -4603,6 +4667,47 @@ mod tests {
                         bmux_contexts_plugin_api::contexts_commands::CloseContextError,
                     > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                         id: resolved_id,
+                        session_id: None,
+                    });
+                    encode_service_message(&ok)
+                }
+                ("contexts-commands", "rename-context") => {
+                    #[derive(Deserialize)]
+                    struct RenameSelectorPayload {
+                        id: Option<Uuid>,
+                        name: Option<String>,
+                    }
+                    #[derive(Deserialize)]
+                    struct RenameArgs {
+                        selector: RenameSelectorPayload,
+                        name: String,
+                    }
+                    let request: RenameArgs = decode_service_message(&payload)?;
+                    let id = match (request.selector.id, request.selector.name.as_ref()) {
+                        (Some(id), _) => id,
+                        (None, Some(name)) => self
+                            .sessions
+                            .iter()
+                            .find(|session| session.name.as_deref() == Some(name.as_str()))
+                            .map(|session| session.id)
+                            .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                                details: "mock rename target not found".to_string(),
+                            })?,
+                        (None, None) => {
+                            return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                                details: "mock rename missing selector".to_string(),
+                            });
+                        }
+                    };
+                    self.renames
+                        .lock()
+                        .expect("renames lock should succeed")
+                        .push((id, request.name.clone()));
+                    let ok: Result<
+                        bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                        bmux_contexts_plugin_api::contexts_commands::RenameContextError,
+                    > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                        id,
                         session_id: None,
                     });
                     encode_service_message(&ok)
@@ -4845,6 +4950,86 @@ mod tests {
             .expect("list by id should succeed");
         assert_eq!(by_id.len(), 1);
         assert_eq!(by_id[0].id, beta_id.to_string());
+    }
+
+    #[test]
+    fn rename_window_by_id_targets_the_requested_window() {
+        let sessions = sample_sessions_three();
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+        // Current window is the first; rename the third instead.
+        let target = sessions[2].id;
+
+        let ack = rename_window_by_id(&host, &runtime_state, target, "renamed")
+            .expect("rename by id should succeed");
+
+        assert!(ack.ok);
+        let renames = host.renames.lock().expect("renames lock").clone();
+        assert_eq!(renames.as_slice(), &[(target, "renamed".to_string())]);
+    }
+
+    #[test]
+    fn rename_window_by_id_rejects_unknown_window() {
+        let sessions = sample_sessions();
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+
+        let error = rename_window_by_id(&host, &runtime_state, Uuid::new_v4(), "nope")
+            .expect_err("unknown window should fail");
+
+        assert!(error.contains("unknown window"), "{error}");
+        assert!(
+            host.renames.lock().expect("renames lock").is_empty(),
+            "no rename should be issued"
+        );
+    }
+
+    #[test]
+    fn rename_window_by_id_rejects_blank_names() {
+        let sessions = sample_sessions();
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+
+        for blank in ["", "   ", "\t"] {
+            let error = rename_window_by_id(&host, &runtime_state, sessions[0].id, blank)
+                .expect_err("blank name should fail");
+            assert!(error.contains("must not be empty"), "{error}");
+        }
+        assert!(host.renames.lock().expect("renames lock").is_empty());
+    }
+
+    #[test]
+    fn rename_window_by_id_trims_surrounding_whitespace() {
+        let sessions = sample_sessions();
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+
+        let _ = rename_window_by_id(&host, &runtime_state, sessions[1].id, "  spaced  ")
+            .expect("rename should succeed");
+
+        let renames = host.renames.lock().expect("renames lock").clone();
+        assert_eq!(
+            renames.as_slice(),
+            &[(sessions[1].id, "spaced".to_string())]
+        );
+    }
+
+    #[test]
+    fn rename_window_renames_the_current_window() {
+        let sessions = sample_sessions_three();
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+
+        let _ = rename_window(&host, &runtime_state, "current").expect("rename should succeed");
+
+        let renames = host.renames.lock().expect("renames lock").clone();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].1, "current");
     }
 
     #[test]

@@ -301,6 +301,9 @@ interface windows-commands {
     // Window-level commands.
     command new-window(name: string?) -> result<window-ack, window-error>;
     command rename-window(name: string) -> result<window-ack, window-error>;
+    // Rename a specific window by id, independent of which window is current.
+    command rename-window-by-id(id: uuid, name: string)
+        -> result<window-ack, window-error>;
     command kill-window(target: string, force-local: bool) -> result<window-ack, window-error>;
     command kill-all-windows(force-local: bool) -> result<window-ack, window-error>;
     command switch-window(target: string) -> result<window-ack, window-error>;
