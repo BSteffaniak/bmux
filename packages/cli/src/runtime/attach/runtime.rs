@@ -8006,7 +8006,7 @@ impl RenderFramePlan {
             "merged retained damage should preserve at least one damage source"
         );
         let damage_stats = frame_damage.stats();
-        let render_scene = frame_damage.scene_damaged() || retained.graph_damaged();
+        let render_scene = retained.scene_repaint || frame_damage.extension_query_requested();
         let use_synchronized_update = frame_uses_synchronized_update(frame_damage)
             || retained.graph_damaged()
             || visualize_damage;
@@ -8025,6 +8025,7 @@ struct RetainedFramePlan {
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
     prompt_surface: Option<RetainedSurface>,
     tab_menu_surface: Option<RetainedSurface>,
+    scene_repaint: bool,
     damage: RetainedDamagePlan,
     repaint_plan: Vec<RetainedRepaintSurface>,
 }
@@ -8102,6 +8103,15 @@ fn build_retained_frame_plan(
         damage_policy,
     );
     let repaint_plan = view_state.retained_compositor.repaint_plan(&merged_damage);
+    let scene_surface_ids = layout_state
+        .scene
+        .surfaces
+        .iter()
+        .map(|surface| surface.id)
+        .collect::<BTreeSet<_>>();
+    let scene_repaint = repaint_plan
+        .iter()
+        .any(|repaint| scene_surface_ids.contains(&repaint.surface_id));
     frame_damage.merge_from(&frame_damage_from_retained_repaint_plan(
         &layout_state.scene,
         &repaint_plan,
@@ -8113,6 +8123,7 @@ fn build_retained_frame_plan(
         prompt_overlay_render,
         prompt_surface,
         tab_menu_surface,
+        scene_repaint,
         damage: RetainedDamagePlan {
             frame: frame_retained_damage,
             explicit_ui: explicit_ui_damage,
@@ -16707,6 +16718,106 @@ mod tests {
         });
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(!damage.is_full_frame());
+    }
+
+    #[test]
+    fn opaque_prompt_prunes_pane_repaint_for_fully_covered_damage() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let surface = test_pane_surface(
+            pane_id,
+            AttachRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        );
+        let layout_state = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![surface],
+            },
+            zoomed: false,
+        };
+        let prompt_render = AttachPromptOverlayRender {
+            surface: AttachSurface {
+                id: Uuid::from_u128(2),
+                kind: AttachSurfaceKind::Modal,
+                layer: SurfaceLayer::Overlay,
+                z: i32::MAX,
+                rect: AttachRect {
+                    x: 20,
+                    y: 8,
+                    w: 40,
+                    h: 8,
+                },
+                content_rect: AttachRect {
+                    x: 20,
+                    y: 8,
+                    w: 40,
+                    h: 8,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: false,
+                pane_id: None,
+            },
+            ops: vec![RenderOp::text_run(
+                20,
+                8,
+                "opaque prompt",
+                RenderStyle::default(),
+            )],
+            cursor_state: None,
+        };
+        let prompt_surface = retained_prompt_overlay_surface(&prompt_render);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        let _ = view_state.retained_compositor.replace_surfaces(
+            retained_surfaces_from_attach_scene(&layout_state.scene)
+                .into_iter()
+                .chain(std::iter::once(prompt_surface.clone())),
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut frame_damage = bmux_attach_pipeline::FrameDamage::default();
+        frame_damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(20, 8, 40, 8),
+            (80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+
+        let plan = build_retained_frame_plan(
+            &mut view_state,
+            &layout_state,
+            &mut frame_damage,
+            None,
+            None,
+            Some(prompt_render),
+            None,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert!(!plan.scene_repaint);
+        assert!(
+            plan.repaint_plan
+                .iter()
+                .all(|repaint| repaint.surface_id != layout_state.scene.surfaces[0].id)
+        );
     }
 
     #[test]

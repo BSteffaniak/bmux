@@ -1975,6 +1975,11 @@ impl FrameDamage {
     }
 
     #[must_use]
+    pub fn extension_query_requested(&self) -> bool {
+        self.extension_query || !self.extension_query_surfaces.is_empty()
+    }
+
+    #[must_use]
     pub const fn status_damaged(&self) -> bool {
         self.full_frame || self.status
     }

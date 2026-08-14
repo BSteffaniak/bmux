@@ -1,6 +1,6 @@
 use crate::render::{DamageCoalescingPolicy, DamageRect, FrameDamage};
 use bmux_attach_layout_protocol::{AttachLayer, AttachRect, AttachScene};
-use bmux_plugin::RenderOp;
+use bmux_plugin::{RenderOp, render_text_width_u16};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -603,6 +603,9 @@ fn retained_scene_damage_between(
     for surface_id in surface_ids {
         match (previous.get(&surface_id), next.get(&surface_id)) {
             (Some(prev), Some(next)) if prev == next => {}
+            (Some(prev), Some(next)) if retained_surface_metadata_equal(prev, next) => {
+                damaged.extend(render_ops_damage_between(prev, next));
+            }
             (Some(prev), Some(next)) => {
                 damaged.push(prev.rect);
                 damaged.push(next.rect);
@@ -613,6 +616,83 @@ fn retained_scene_damage_between(
         }
     }
     coalesce_absolute_damage(damaged, viewport, policy)
+}
+
+fn retained_surface_metadata_equal(previous: &RetainedSurface, next: &RetainedSurface) -> bool {
+    previous.id == next.id
+        && previous.rect == next.rect
+        && previous.layer == next.layer
+        && previous.z == next.z
+        && previous.opaque == next.opaque
+        && previous.opacity == next.opacity
+        && previous.clip_rect == next.clip_rect
+        && previous.interactive_regions == next.interactive_regions
+}
+
+fn render_ops_damage_between(
+    previous: &RetainedSurface,
+    next: &RetainedSurface,
+) -> Vec<DamageRect> {
+    let (
+        RetainedSurfacePayload::RenderOps(previous_ops),
+        RetainedSurfacePayload::RenderOps(next_ops),
+    ) = (&previous.payload, &next.payload)
+    else {
+        return vec![previous.rect, next.rect];
+    };
+    let previous_rows = render_ops_row_signatures(previous_ops, previous.rect);
+    let next_rows = render_ops_row_signatures(next_ops, next.rect);
+    (previous.rect.y..previous.rect.bottom())
+        .filter(|row| previous_rows.get(row) != next_rows.get(row))
+        .map(|row| DamageRect::new(previous.rect.x, row, previous.rect.w, 1))
+        .collect()
+}
+
+fn render_ops_row_signatures(
+    ops: &[RenderOp],
+    surface_rect: DamageRect,
+) -> BTreeMap<u16, Vec<&RenderOp>> {
+    let mut rows = BTreeMap::new();
+    for op in ops {
+        let bounds = render_op_damage_bounds(op);
+        let Some(bounds) = intersect_rects(bounds, surface_rect) else {
+            continue;
+        };
+        for row in bounds.y..bounds.bottom() {
+            rows.entry(row).or_insert_with(Vec::new).push(op);
+        }
+    }
+    rows
+}
+
+fn render_op_damage_bounds(op: &RenderOp) -> DamageRect {
+    match op {
+        RenderOp::TextRun { x, y, text, .. } => {
+            DamageRect::new(*x, *y, render_text_width_u16(text), 1)
+        }
+        RenderOp::StyledText { x, y, spans } => DamageRect::new(
+            *x,
+            *y,
+            spans.iter().fold(0_u16, |width, span| {
+                width.saturating_add(render_text_width_u16(&span.text))
+            }),
+            1,
+        ),
+        RenderOp::ClearRect { rect, .. }
+        | RenderOp::FillRect { rect, .. }
+        | RenderOp::Border { rect, .. } => DamageRect::new(rect.x, rect.y, rect.w, rect.h),
+        RenderOp::EraseRowSegment { x, y, width, .. } => DamageRect::new(*x, *y, *width, 1),
+        RenderOp::CellGrid { x, y, rows } => DamageRect::new(
+            *x,
+            *y,
+            rows.iter()
+                .map(Vec::len)
+                .max()
+                .and_then(|width| u16::try_from(width).ok())
+                .unwrap_or(u16::MAX),
+            u16::try_from(rows.len()).unwrap_or(u16::MAX),
+        ),
+    }
 }
 
 fn coalesce_absolute_damage(
@@ -739,6 +819,78 @@ mod tests {
             surface.interactive_regions,
             vec![DamageRect::new(1, 2, 1, 1)]
         );
+    }
+
+    #[test]
+    fn replace_surfaces_limits_render_op_changes_to_changed_rows() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let rect = DamageRect::new(10, 5, 12, 4);
+        let rows = |middle: &str| {
+            vec![
+                RenderOp::text_run(10, 5, "top", RenderStyle::default()),
+                RenderOp::text_run(10, 6, middle, RenderStyle::default()),
+                RenderOp::text_run(10, 7, "bottom", RenderStyle::default()),
+                RenderOp::text_run(10, 8, "footer", RenderStyle::default()),
+            ]
+        };
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            [RetainedSurface::builder(Uuid::from_u128(1), rect)
+                .opaque()
+                .render_ops(rows("before"))
+                .build()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        let damage = compositor.replace_surfaces(
+            [RetainedSurface::builder(Uuid::from_u128(1), rect)
+                .opaque()
+                .render_ops(rows("after"))
+                .build()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(damage.rects(), &[DamageRect::new(10, 6, 12, 1)]);
+    }
+
+    #[test]
+    fn replace_surfaces_render_op_geometry_changes_damage_old_and_new_bounds() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let rect = DamageRect::new(10, 5, 12, 3);
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            [RetainedSurface::builder(Uuid::from_u128(1), rect)
+                .opaque()
+                .render_ops(vec![RenderOp::text_run(
+                    10,
+                    5,
+                    "before",
+                    RenderStyle::default(),
+                )])
+                .build()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        let damage = compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(1), DamageRect::new(20, 8, 12, 3))
+                    .opaque()
+                    .render_ops(vec![RenderOp::text_run(
+                        20,
+                        8,
+                        "after",
+                        RenderStyle::default(),
+                    )])
+                    .build(),
+            ],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(damage.rects(), &[DamageRect::new(10, 5, 22, 6)]);
     }
 
     #[test]
