@@ -13618,10 +13618,7 @@ pub fn handle_attach_tab_menu_mouse_event(
         && mouse_event.col < rect.x.saturating_add(rect.w)
         && mouse_event.row >= rect.y
         && mouse_event.row < rect.y.saturating_add(rect.h);
-    // Item rows sit inside the border.
-    let item_index = (mouse_event.row > rect.y
-        && mouse_event.row < rect.y.saturating_add(rect.h).saturating_sub(1))
-    .then(|| usize::from(mouse_event.row - rect.y - 1));
+    let item_index = attach_tab_menu_item_index_at(menu, rect, mouse_event.col, mouse_event.row);
 
     match (mouse_event.phase, mouse_event.button) {
         (TerminalMousePhase::Move | TerminalMousePhase::Drag, _) => {
@@ -13680,15 +13677,7 @@ fn attach_tab_menu_rect(menu: &AttachTabMenu, geometry: TerminalGeometry) -> Dam
     DamageRect::new(x, y, width, height)
 }
 
-/// Render ops for the tab context menu overlay.
-fn attach_tab_menu_render_ops(
-    menu: &AttachTabMenu,
-    rect: DamageRect,
-    appearance: &RuntimeAppearance,
-) -> Vec<RenderOp> {
-    let area = TuiRect::new(rect.x, rect.y, rect.w, rect.h);
-    let theme = component_theme(appearance)
-        .for_surface(bmux_tui_components::theme::ComponentSurfaceDepth::Overlay);
+fn attach_tab_menu_components(menu: &AttachTabMenu) -> (Vec<MenuItem>, MenuState) {
     let items = menu
         .items
         .iter()
@@ -13703,6 +13692,34 @@ fn attach_tab_menu_render_ops(
         .collect::<Vec<_>>();
     let mut state = MenuState::new(Some(menu.focused));
     state.set_focused(Some(menu.focused));
+    (items, state)
+}
+
+fn attach_tab_menu_item_index_at(
+    menu: &AttachTabMenu,
+    rect: DamageRect,
+    col: u16,
+    row: u16,
+) -> Option<usize> {
+    let (items, state) = attach_tab_menu_components(menu);
+    let component = Menu::new(&items);
+    component.item_index_at(
+        TuiRect::new(rect.x, rect.y, rect.w, rect.h),
+        &state,
+        bmux_tui::geometry::Point::new(col, row),
+    )
+}
+
+/// Render ops for the tab context menu overlay.
+fn attach_tab_menu_render_ops(
+    menu: &AttachTabMenu,
+    rect: DamageRect,
+    appearance: &RuntimeAppearance,
+) -> Vec<RenderOp> {
+    let area = TuiRect::new(rect.x, rect.y, rect.w, rect.h);
+    let theme = component_theme(appearance)
+        .for_surface(bmux_tui_components::theme::ComponentSurfaceDepth::Overlay);
+    let (items, state) = attach_tab_menu_components(menu);
     let mut buffer = surface_buffer(area);
     let mut frame = TuiFrame::new(&mut buffer);
     frame.fill(area, " ", theme.surfaces.overlay);
@@ -16109,6 +16126,28 @@ mod tests {
 
         assert!(rect.x + rect.w <= geometry.cols, "{rect:?}");
         assert!(rect.y + rect.h <= geometry.rows, "{rect:?}");
+    }
+
+    #[test]
+    fn tab_menu_component_hit_geometry_matches_rendered_rows() {
+        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 0, 3);
+        let rect = attach_tab_menu_rect(&menu, TerminalGeometry { cols: 80, rows: 24 });
+
+        for (index, item) in menu.items.iter().enumerate() {
+            let row = rect
+                .y
+                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+            assert_eq!(
+                attach_tab_menu_item_index_at(&menu, rect, rect.x, row),
+                Some(index),
+                "{} should resolve from component geometry",
+                item.action.id()
+            );
+        }
+        assert_eq!(
+            attach_tab_menu_item_index_at(&menu, rect, rect.x, rect.bottom()),
+            None
+        );
     }
 
     #[test]
@@ -20398,6 +20437,46 @@ mod tests {
                     == "plugin:bmux.windows:focus-pane-in-direction --direction left"
                 && entry.action == focus_action("left")
         }));
+    }
+
+    #[test]
+    fn help_overlay_render_ops_match_component_golden() {
+        let surface = help_overlay_surface(
+            &[
+                "scope  chord  action".to_owned(),
+                "normal Ctrl-A Help".to_owned(),
+            ],
+            TerminalGeometry { cols: 48, rows: 12 },
+        )
+        .expect("help surface");
+
+        let ops = help_overlay_render_ops(
+            &surface,
+            &[
+                "scope  chord  action".to_owned(),
+                "normal Ctrl-A Help".to_owned(),
+            ],
+            0,
+            &RuntimeAppearance::default(),
+        );
+        let rows = ops
+            .iter()
+            .filter_map(|op| match op {
+                RenderOp::TextRun { y, text, .. } => Some((*y, text.clone())),
+                _ => None,
+            })
+            .fold(BTreeMap::<u16, String>::new(), |mut rows, (y, text)| {
+                rows.entry(y).or_default().push_str(&text);
+                rows
+            });
+
+        let top = rows.get(&surface.rect.y).expect("top row");
+        assert!(top.starts_with('╭') && top.ends_with('╮'), "{top:?}");
+        assert!(
+            rows.values()
+                .any(|row| row.contains("scope  chord  action"))
+        );
+        assert!(rows.values().any(|row| row.contains("↑↓")));
     }
 
     #[test]

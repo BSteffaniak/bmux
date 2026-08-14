@@ -239,7 +239,6 @@ impl From<ComponentTheme> for InteractionStyles {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "all")]
     use bmux_tui::style::Style;
     use bmux_tui::style::{Color, Modifier};
 

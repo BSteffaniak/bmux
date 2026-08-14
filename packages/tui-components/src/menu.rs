@@ -260,6 +260,20 @@ impl<'a> Menu<'a> {
             .render_with_fallback_style(area, &state.list, frame, fallback);
     }
 
+    /// Return the menu item index at a terminal point using the same
+    /// component layout used for rendering and event handling.
+    #[must_use]
+    pub fn item_index_at(
+        &self,
+        area: Rect,
+        state: &MenuState,
+        point: bmux_tui::geometry::Point,
+    ) -> Option<usize> {
+        let items = self.list_items();
+        let id = SelectableList::new(&items).semantic_id_at(area, &state.list, point)?;
+        self.items.iter().position(|item| item.id == id)
+    }
+
     /// Handle one input event.
     pub fn handle_event(&self, area: Rect, state: &mut MenuState, event: &Event) -> MenuOutcome {
         let keyboard_event = matches!(event, Event::Key(_));

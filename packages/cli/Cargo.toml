@@ -58,6 +58,7 @@ bmux_tui_components = { workspace = true, features = [
     "menu",
     "modal-frame",
     "scrollbar",
+    "selectable-list",
     "text-view",
 ] }
 bmux_windows_plugin_api = { workspace = true }

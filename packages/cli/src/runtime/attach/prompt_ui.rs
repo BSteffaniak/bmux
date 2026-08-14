@@ -21,6 +21,9 @@ use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
+};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1032,13 +1035,15 @@ impl AttachPromptState {
             } else {
                 false
             };
+        let rendered_single_select =
+            !rendered_palette && render_single_select(active, content, &mut frame, theme);
         if rendered_palette {
             component_cursor = frame.cursor().map(|cursor| AttachCursorState {
                 x: cursor.position.x,
                 y: cursor.position.y,
                 visible: cursor.visible,
             });
-        } else {
+        } else if !rendered_single_select {
             for (index, line) in body.lines.iter().take(body_rows).enumerate() {
                 let row = content
                     .y
@@ -1117,6 +1122,52 @@ impl AttachPromptState {
             response,
         })
     }
+}
+
+fn render_single_select(
+    active: &mut ActivePrompt,
+    content: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    let PromptField::SingleSelect { options, .. } = &active.envelope.request.field else {
+        return false;
+    };
+    let PromptWidgetState::SingleSelect { selected, scroll } = &mut active.state else {
+        return false;
+    };
+    let items = options
+        .iter()
+        .map(|option| {
+            SelectableListItem::rich(
+                option.value.clone(),
+                Line::from_spans(vec![
+                    Span::styled(option.label.clone(), theme.text),
+                    Span::styled(
+                        option
+                            .detail
+                            .as_ref()
+                            .map_or_else(String::new, |detail| format!("  —  {detail}")),
+                        theme.muted,
+                    ),
+                ]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut state = SelectableListState::new((!items.is_empty()).then_some(*selected));
+    state.set_focused((!items.is_empty()).then_some(*selected));
+    state.set_vertical_scroll(*scroll);
+    SelectableList::new(&items)
+        .styles(SelectableListStyles {
+            normal: theme.text,
+            focused: theme.focused,
+            selected: theme.focused,
+            hovered: theme.focused,
+            pressed: theme.focused,
+            disabled: theme.muted,
+        })
+        .render_with_fallback_style(content, &state, frame, theme.background);
+    true
 }
 
 #[allow(clippy::too_many_lines)] // Palette composition keeps one layout source for rendering, hits, cursor, footer, and scrollbar.
