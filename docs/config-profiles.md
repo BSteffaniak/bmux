@@ -25,7 +25,7 @@ Built-in intent:
 
 - `vim`: richer modal defaults (normal/insert/visual/command mode baseline)
 - `tmux_compat`: tmux-like `ctrl+b` prefix flow and common pane/window keys
-- `zellij_compat`: zellij-style global `alt+...` pane management layered on top of `vim`
+- `zellij_compat`: zellij-style global `alt+...` pane management with passthrough input
 
 Built-in patch content is sourced from regular TOML profile files in
 `packages/config/profiles/` and merged through the same deep-merge logic as
@@ -114,8 +114,8 @@ common pane/window keys) as your active profile.
 active_profile = "zellij_compat"
 ```
 
-This enables the built-in zellij-style profile (which also layers on top of
-`vim` defaults).
+This enables the built-in zellij-style profile with passthrough terminal input
+and global `alt+...` pane management.
 
 ## Compose tmux + zellij + local overrides
 

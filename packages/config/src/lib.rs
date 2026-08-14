@@ -466,7 +466,7 @@ fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
     profiles.insert(
         "zellij_compat".to_string(),
         CompositionProfile {
-            extends: vec!["vim".to_string()],
+            extends: vec![],
             patch: parse_builtin_patch(
                 "zellij_compat",
                 include_str!("../profiles/zellij_compat.toml"),
@@ -4490,7 +4490,7 @@ extends = ["tmux_compat", "zellij_compat"]
         .expect("write temp config");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        assert_eq!(config.keybindings.initial_mode, "normal");
+        assert_eq!(config.keybindings.initial_mode, "insert");
         assert_eq!(config.keybindings.prefix, "ctrl+b");
         assert_eq!(
             config
@@ -4507,7 +4507,7 @@ extends = ["tmux_compat", "zellij_compat"]
     }
 
     #[test]
-    fn composition_built_in_zellij_extends_built_in_vim_profile() {
+    fn composition_built_in_zellij_uses_passthrough_defaults() {
         let path = temp_config_path();
         std::fs::write(
             &path,
@@ -4519,14 +4519,16 @@ active_profile = "zellij_compat"
         .expect("write temp config");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        assert_eq!(
+        assert_eq!(config.keybindings.initial_mode, "insert");
+        assert!(
             config
                 .keybindings
                 .modes
-                .get("normal")
-                .and_then(|mode| mode.bindings.get(":")),
-            Some(&"enter_mode command".to_string())
+                .get("insert")
+                .is_some_and(|mode| mode.passthrough)
         );
+        assert!(!config.keybindings.modes.contains_key("visual"));
+        assert!(!config.keybindings.modes.contains_key("command"));
         assert_eq!(
             config.keybindings.global.get("alt+n"),
             Some(&"split_focused_horizontal".to_string())

@@ -76,7 +76,7 @@ impl Default for ModeBindingConfig {
 impl Default for KeyBindingConfig {
     fn default() -> Self {
         Self {
-            initial_mode: "normal".to_string(),
+            initial_mode: "insert".to_string(),
             modes: default_modal_modes(),
             prefix: "ctrl+a".to_string(),
             timeout_ms: None,
@@ -545,6 +545,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn defaults_to_passthrough_insert_mode() {
+        let config = KeyBindingConfig::default();
+
+        assert_eq!(config.initial_mode, "insert");
+        assert!(
+            config
+                .modes
+                .get("insert")
+                .is_some_and(|mode| mode.passthrough)
+        );
+    }
+
+    #[test]
     fn validate_modes_rejects_case_insensitive_duplicate_mode_ids() {
         let mut config = KeyBindingConfig {
             initial_mode: "normal".to_string(),
@@ -564,6 +577,7 @@ mod tests {
     #[test]
     fn validate_modes_rejects_unknown_enter_mode_target() {
         let config = KeyBindingConfig {
+            initial_mode: "normal".to_string(),
             modes: BTreeMap::from([(
                 "normal".to_string(),
                 ModeBindingConfig {
