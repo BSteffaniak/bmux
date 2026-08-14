@@ -45,6 +45,12 @@ impl Default for PromptWidth {
 pub struct PromptOption {
     pub value: String,
     pub label: String,
+    /// Optional secondary description rendered with muted styling by capable hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Optional active keybinding or shortcut hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_hint: Option<String>,
 }
 
 impl PromptOption {
@@ -53,7 +59,23 @@ impl PromptOption {
         Self {
             value: value.into(),
             label: label.into(),
+            detail: None,
+            key_hint: None,
         }
+    }
+
+    /// Set optional secondary descriptive text.
+    #[must_use]
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Set an optional active keybinding or shortcut hint.
+    #[must_use]
+    pub fn key_hint(mut self, key_hint: impl Into<String>) -> Self {
+        self.key_hint = Some(key_hint.into());
+        self
     }
 }
 
@@ -762,6 +784,19 @@ mod tests {
             panic!("expected TextInput");
         };
         assert_eq!(validation, &Some(PromptValidation::PositiveInteger));
+    }
+
+    #[test]
+    fn prompt_option_metadata_round_trips_through_service_codec() {
+        let option = PromptOption::new("quit", "Quit")
+            .detail("Close the current client")
+            .key_hint("Ctrl-A q");
+
+        let payload = crate::encode_service_message(&option).expect("encode prompt option");
+        let decoded: PromptOption =
+            crate::decode_service_message(&payload).expect("decode prompt option");
+
+        assert_eq!(decoded, option);
     }
 
     #[test]

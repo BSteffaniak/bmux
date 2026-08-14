@@ -15,7 +15,7 @@ use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::Line;
+use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
@@ -992,7 +992,7 @@ impl AttachPromptState {
             }
             frame.write_line_with_fallback_style(
                 Rect::new(content.x, row, content.width, 1),
-                &Line::raw(line.clone()),
+                &prompt_body_line(&active.envelope.request, active, index, line, theme),
                 theme.text,
             );
         }
@@ -1057,6 +1057,42 @@ impl AttachPromptState {
             origin: active.envelope.origin,
             response,
         })
+    }
+}
+
+fn prompt_body_line(
+    request: &PromptRequest,
+    active: &ActivePrompt,
+    index: usize,
+    rendered: &str,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> Line {
+    let is_palette = request.modal_id.as_deref() == Some("command-palette");
+    if !is_palette {
+        return Line::raw(rendered.to_owned());
+    }
+    let message_rows = request
+        .message
+        .as_ref()
+        .map_or(0, |message| message.lines().count().max(1));
+    let list_row = index.checked_sub(message_rows.saturating_add(1));
+    let selected = matches!(
+        (&active.state, list_row),
+        (
+            PromptWidgetState::SearchSelect {
+                selected,
+                scroll,
+                ..
+            },
+            Some(row)
+        ) if row == selected.saturating_sub(*scroll)
+    );
+    if selected {
+        Line::from_spans(vec![Span::styled(rendered.to_owned(), theme.focused)])
+    } else if index < message_rows {
+        Line::from_spans(vec![Span::styled(rendered.to_owned(), theme.muted)])
+    } else {
+        Line::raw(rendered.to_owned())
     }
 }
 
@@ -1504,7 +1540,12 @@ fn prompt_overlay_layout(
         .max(7)
         .min((geometry.rows as usize).saturating_sub(2));
     let x = ((geometry.cols as usize).saturating_sub(width)) / 2;
-    let y = ((geometry.rows as usize).saturating_sub(height)) / 2;
+    let centered_y = ((geometry.rows as usize).saturating_sub(height)) / 2;
+    let y = if request.modal_id.as_deref() == Some("command-palette") {
+        ((geometry.rows as usize).saturating_sub(height)) / 3
+    } else {
+        centered_y
+    };
 
     Some(PromptOverlayLayout {
         surface: AttachSurface {
@@ -2065,6 +2106,33 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn command_palette_uses_upper_third_placement() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select("Command Palette", vec![PromptOption::new("one", "One")])
+                .modal_id("command-palette"),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry {
+                    cols: 120,
+                    rows: 60,
+                },
+                &RuntimeAppearance::default(),
+            )
+            .expect("palette should render");
+        let centered_y = (60_u16.saturating_sub(render.surface.rect.h)) / 2;
+
+        assert!(render.surface.rect.y < centered_y);
+        assert_eq!(
+            render.surface.rect.y,
+            (60_u16.saturating_sub(render.surface.rect.h)) / 3
+        );
     }
 
     #[test]

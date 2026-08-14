@@ -8007,7 +8007,8 @@ impl RenderFramePlan {
         );
         let damage_stats = frame_damage.stats();
         let render_scene = retained.scene_repaint || frame_damage.extension_query_requested();
-        let use_synchronized_update = frame_uses_synchronized_update(frame_damage)
+        let use_synchronized_update = retained.damage.merged_damaged()
+            || frame_uses_synchronized_update(frame_damage)
             || retained.graph_damaged()
             || visualize_damage;
         Self {
@@ -8070,7 +8071,7 @@ fn build_retained_frame_plan(
     {
         explicit_ui_damage_rects.push(surface.rect);
     }
-    if frame_damage.overlay_damaged() {
+    if frame_damage.overlay_damaged() || frame_damage.extension_query_requested() {
         if let Some(surface) = help_surface.as_ref() {
             explicit_ui_damage_rects.push(surface.rect);
         }
@@ -16818,6 +16819,9 @@ mod tests {
                 .iter()
                 .all(|repaint| repaint.surface_id != layout_state.scene.surfaces[0].id)
         );
+        let frame_plan = RenderFramePlan::from_damage(plan, &frame_damage, false);
+        assert!(frame_plan.use_synchronized_update);
+        assert!(!frame_plan.render_scene);
     }
 
     #[test]

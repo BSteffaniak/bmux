@@ -70,7 +70,15 @@ async fn run_command_palette(context: NativeCommandContext) {
     let options = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| PromptOption::new(index.to_string(), option_label(entry)))
+        .map(|(index, entry)| {
+            let option = PromptOption::new(index.to_string(), entry.label.clone())
+                .detail(entry.detail.clone());
+            if let Some(key_hint) = &entry.key_hint {
+                option.key_hint(key_hint.clone())
+            } else {
+                option
+            }
+        })
         .collect::<Vec<_>>();
 
     let request = PromptRequest::search_select("Command Palette", options)
@@ -195,13 +203,6 @@ fn command_label(plugin: &RegisteredPluginInfo, command: &PluginCommand) -> Stri
     } else {
         format!("{}: {}", plugin.display_name, command.summary)
     }
-}
-
-fn option_label(entry: &PaletteEntry) -> String {
-    entry.key_hint.as_ref().map_or_else(
-        || format!("{}  —  {}", entry.label, entry.detail),
-        |key_hint| format!("{}  [{key_hint}]  —  {}", entry.label, entry.detail),
-    )
 }
 
 fn bindable_action_key_hint(
@@ -477,10 +478,10 @@ bmux_plugin_sdk::export_plugin!(CommandPalettePlugin, include_str!("../plugin.to
 #[cfg(test)]
 mod tests {
     use super::{
-        PaletteEntry, PaletteEntryKind, bindable_action_key_hint, option_label,
-        plugin_action_string, plugin_command_key_hint, shell_quote,
+        PaletteEntry, PaletteEntryKind, bindable_action_key_hint, plugin_action_string,
+        plugin_command_key_hint, shell_quote,
     };
-    use bmux_plugin_sdk::ActiveKeybinding;
+    use bmux_plugin_sdk::{ActiveKeybinding, PromptOption};
 
     #[test]
     fn shell_quote_leaves_simple_values_unquoted() {
@@ -502,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn option_label_includes_key_hint_when_available() {
+    fn prompt_option_preserves_palette_metadata() {
         let entry = PaletteEntry {
             label: "Quit".to_string(),
             detail: "keybind: quit".to_string(),
@@ -512,8 +513,13 @@ mod tests {
                 argument: None,
             },
         };
+        let option = PromptOption::new("0", entry.label.clone())
+            .detail(entry.detail.clone())
+            .key_hint(entry.key_hint.expect("key hint"));
 
-        assert_eq!(option_label(&entry), "Quit  [Ctrl-A q]  —  keybind: quit");
+        assert_eq!(option.label, "Quit");
+        assert_eq!(option.detail.as_deref(), Some("keybind: quit"));
+        assert_eq!(option.key_hint.as_deref(), Some("Ctrl-A q"));
     }
 
     #[test]
