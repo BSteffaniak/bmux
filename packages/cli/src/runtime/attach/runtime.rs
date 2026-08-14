@@ -12356,19 +12356,23 @@ async fn handle_attach_mouse_event_at(
     if view_state.can_write {
         let target_context =
             attach_mouse_target_context(view_state, mouse_event.column, mouse_event.row);
-        if pane_mouse_protocol_reports_event(
-            view_state,
-            target_context.focus_target,
-            mouse_event.kind,
-        ) && maybe_forward_attach_mouse_event(
-            client,
-            view_state,
-            mouse_event,
-            target_context.focus_target,
-            target_context.in_focused,
-            true,
-        )
-        .await?
+        if !target_context
+            .focus_target
+            .is_some_and(|pane_id| view_state.scrollback_active_for(pane_id))
+            && pane_mouse_protocol_reports_event(
+                view_state,
+                target_context.focus_target,
+                mouse_event.kind,
+            )
+            && maybe_forward_attach_mouse_event(
+                client,
+                view_state,
+                mouse_event,
+                target_context.focus_target,
+                target_context.in_focused,
+                true,
+            )
+            .await?
         {
             return Ok(());
         }
@@ -14346,8 +14350,13 @@ pub fn maybe_begin_attach_mouse_selection_drag(
     if focused_attach_pane_id(view_state) != Some(focus_target) {
         return false;
     }
-    if pane_mouse_protocol_reports_event(view_state, Some(focus_target), mouse_event.kind)
-        || attach_pane_uses_alternate_screen(view_state, focus_target)
+    // A live alternate-screen application owns pointer interaction. Once this
+    // pane is explicitly in bmux scrollback, however, the frozen/history view
+    // owns navigation and selection even though the protocol tracker still
+    // reports the application's alternate-screen and mouse modes.
+    if !view_state.scrollback_active_for(focus_target)
+        && (pane_mouse_protocol_reports_event(view_state, Some(focus_target), mouse_event.kind)
+            || attach_pane_uses_alternate_screen(view_state, focus_target))
     {
         return false;
     }
@@ -18034,6 +18043,35 @@ mod tests {
             Some(pane_id),
             down,
         ));
+    }
+
+    #[test]
+    fn mouse_selection_drag_starts_in_alternate_screen_after_entering_scrollback() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1049h\x1b[?1000h");
+        assert!(attach_pane_uses_alternate_screen(&view_state, pane_id));
+        assert!(enter_attach_scrollback_for(&mut view_state, pane_id));
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert!(maybe_begin_attach_mouse_selection_drag(
+            &mut view_state,
+            Some(pane_id),
+            down,
+        ));
+        assert_eq!(
+            view_state.mouse.selection_drag.map(|drag| drag.pane_id),
+            Some(pane_id)
+        );
     }
 
     #[test]
