@@ -50,6 +50,13 @@ use bmux_plugin_sdk::{
 use bmux_recording_plugin_api::recording_state;
 use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
+use bmux_tui::frame::Frame as TuiFrame;
+use bmux_tui::geometry::{Insets as TuiInsets, Rect as TuiRect, Size as TuiSize};
+use bmux_tui::prelude::Line as TuiLine;
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::menu::{Menu, MenuItem, MenuState, MenuStyles};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
+use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -397,7 +404,7 @@ use super::prompt_ui::{
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
     append_pane_output, collect_visual_projection_updates, frame_damage_overlay_rects,
-    frame_damage_overlay_render_ops, opaque_row_text, queue_render_ops,
+    frame_damage_overlay_render_ops, queue_render_ops,
     render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
 };
 use super::scrollback_modes::{cached_mode, set_cached_mode_debounced, set_runtime_mode};
@@ -409,6 +416,7 @@ use super::state::{
     AttachTabMenu, AttachTabMenuAction, AttachTabRename, AttachUiEffect, AttachUiMode,
     AttachUiReduction, AttachViewState, PaneRenderBuffer, PaneScrollbackView, ScrollbackPin,
 };
+use super::tui_surface::{buffer_render_ops, component_theme, surface_buffer};
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
@@ -417,7 +425,7 @@ use crate::pane_runtime_client::{
     attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
-use bmux_plugin::{BorderGlyphs, RenderDamage, RenderOp, RenderStyle};
+use bmux_plugin::{RenderDamage, RenderOp, RenderStyle};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
@@ -7702,72 +7710,75 @@ fn help_overlay_render_ops(
     surface_meta: &AttachSurface,
     lines: &[String],
     scroll: usize,
+    appearance: &RuntimeAppearance,
 ) -> Vec<RenderOp> {
-    let width = usize::from(surface_meta.rect.w);
-    let height = usize::from(surface_meta.rect.h);
-    let x = usize::from(surface_meta.rect.x);
-    let y = usize::from(surface_meta.rect.y);
-    let body_rows = height.saturating_sub(4).max(1);
-    let text_width = width.saturating_sub(4);
-    let style = RenderStyle::new();
-    let rect = ExtensionRect::new(
+    let area = TuiRect::new(
         surface_meta.rect.x,
         surface_meta.rect.y,
         surface_meta.rect.w,
         surface_meta.rect.h,
     );
-    let interior = ExtensionRect::new(
-        surface_meta.rect.x.saturating_add(1),
-        surface_meta.rect.y.saturating_add(1),
-        surface_meta.rect.w.saturating_sub(2),
-        surface_meta.rect.h.saturating_sub(2),
+    let component_theme = component_theme(appearance);
+    let modal_theme = component_theme.modal_theme();
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(
+            TuiSize::new(surface_meta.rect.w, surface_meta.rect.h),
+            TuiInsets::new(0, 0, 0, 0),
+        ),
+        modal_theme,
+    )
+    .title(TuiLine::raw("bmux help"))
+    .padding(TuiInsets::new(0, 1, 0, 1));
+    let mut buffer = surface_buffer(area);
+    let mut frame = TuiFrame::new(&mut buffer);
+    modal.render(area, &mut frame);
+    let content = modal.content_area(area);
+    let hints_height = u16::from(content.height > 2);
+    let body_area = TuiRect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(hints_height),
     );
-
-    let mut ops = vec![
-        RenderOp::clear_rect(interior, style),
-        RenderOp::border(rect, BorderGlyphs::ascii(), style),
-    ];
-
-    let title = " bmux help ";
-    let title_x = x + ((width.saturating_sub(title.len())) / 2);
-    ops.push(RenderOp::text_run(title_x as u16, y as u16, title, style));
-
-    let header = "scope    chord                action";
-    ops.push(RenderOp::text_run(
-        (x + 2) as u16,
-        (y + 1) as u16,
-        opaque_row_text(header, text_width),
-        style,
-    ));
-
-    let start = scroll.min(lines.len().saturating_sub(body_rows));
-    let end = (start + body_rows).min(lines.len());
-    for (idx, line) in lines.iter().skip(start).take(body_rows).enumerate() {
-        let row = y + 2 + idx;
-        if row >= y + height - 1 {
-            break;
-        }
-        ops.push(RenderOp::text_run(
-            (x + 2) as u16,
-            row as u16,
-            opaque_row_text(line, text_width),
-            style,
-        ));
+    let rich_lines = lines
+        .iter()
+        .map(|line| TuiLine::raw(line.clone()))
+        .collect::<Vec<_>>();
+    let mut state = TextViewState::new();
+    state.set_vertical_scroll(scroll);
+    TextView::new(&rich_lines)
+        .policy(TextViewPolicy::scrollable())
+        .styles(TextViewStyles {
+            text: component_theme.text,
+            empty: component_theme.muted,
+            background: component_theme.surfaces.overlay,
+        })
+        .render(body_area, &state, &mut frame);
+    if hints_height > 0 {
+        let hints = [
+            KeyHint::new("↑↓", "scroll"),
+            KeyHint::new("PgUp/PgDn", "page"),
+            KeyHint::new("Esc", "close"),
+        ];
+        KeyHintBar::new(&hints)
+            .styles(KeyHintBarStyles {
+                key: component_theme.focused,
+                label: component_theme.muted,
+                separator: component_theme.muted,
+                disabled: component_theme.disabled,
+                background: component_theme.surfaces.overlay,
+            })
+            .render(
+                TuiRect::new(
+                    content.x,
+                    content.bottom().saturating_sub(1),
+                    content.width,
+                    1,
+                ),
+                &mut frame,
+            );
     }
-
-    let footer = format!(
-        "j/k or ↑/↓ scroll | PgUp/PgDn | Esc close | {}-{} / {}",
-        if lines.is_empty() { 0 } else { start + 1 },
-        end,
-        lines.len()
-    );
-    ops.push(RenderOp::text_run(
-        (x + 2) as u16,
-        (y + height - 2) as u16,
-        opaque_row_text(&footer, text_width),
-        style,
-    ));
-    ops
+    buffer_render_ops(&buffer)
 }
 
 const fn attach_surface_damage_rect(surface: &AttachSurface) -> DamageRect {
@@ -7796,11 +7807,12 @@ fn retained_help_overlay_surface(
     surface: &AttachSurface,
     lines: &[String],
     scroll: usize,
+    appearance: &RuntimeAppearance,
 ) -> RetainedSurface {
     retained_surface_from_attach_surface(
         surface,
         RetainedOpacity::Opaque,
-        help_overlay_render_ops(surface, lines, scroll),
+        help_overlay_render_ops(surface, lines, scroll, appearance),
     )
 }
 
@@ -8228,9 +8240,9 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         .and_then(|status_line| {
             retained_status_surface(status_line, view_state.status_position, terminal_size)
         });
-    let help_retained_surface = current_help_overlay_surface
-        .as_ref()
-        .map(|surface| retained_help_overlay_surface(surface, help_lines, help_scroll));
+    let help_retained_surface = current_help_overlay_surface.as_ref().map(|surface| {
+        retained_help_overlay_surface(surface, help_lines, help_scroll, runtime_appearance)
+    });
     let prompt_overlay_render = if view_state.prompt.is_active() {
         view_state
             .prompt
@@ -13674,46 +13686,37 @@ fn attach_tab_menu_render_ops(
     rect: DamageRect,
     appearance: &RuntimeAppearance,
 ) -> Vec<RenderOp> {
-    let _ = appearance;
-    let style = RenderStyle::new();
-    let surface_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
-    let interior = ExtensionRect::new(
-        rect.x.saturating_add(1),
-        rect.y.saturating_add(1),
-        rect.w.saturating_sub(2),
-        rect.h.saturating_sub(2),
-    );
-    let text_width = usize::from(rect.w.saturating_sub(2));
-    let mut ops = vec![
-        RenderOp::clear_rect(interior, style),
-        RenderOp::border(surface_rect, BorderGlyphs::ascii(), style),
-    ];
-    for (index, item) in menu.items.iter().enumerate() {
-        let row = rect
-            .y
-            .saturating_add(1)
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-        if row >= rect.y.saturating_add(rect.h).saturating_sub(1) {
-            break;
-        }
-        let focused = index == menu.focused && item.enabled;
-        let marker = if focused { '>' } else { ' ' };
-        let label = format!("{marker} {}", item.action.label());
-        let mut row_style = style;
-        if !item.enabled {
-            row_style.dim = true;
-        }
-        if focused {
-            row_style.reverse = true;
-        }
-        ops.push(RenderOp::text_run(
-            rect.x.saturating_add(1),
-            row,
-            opaque_row_text(&label, text_width),
-            row_style,
-        ));
-    }
-    ops
+    let area = TuiRect::new(rect.x, rect.y, rect.w, rect.h);
+    let theme = component_theme(appearance)
+        .for_surface(bmux_tui_components::theme::ComponentSurfaceDepth::Overlay);
+    let items = menu
+        .items
+        .iter()
+        .map(|item| {
+            let component = MenuItem::new(item.action.id(), item.action.label());
+            if item.enabled {
+                component
+            } else {
+                component.disabled(true)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut state = MenuState::new(Some(menu.focused));
+    state.set_focused(Some(menu.focused));
+    let mut buffer = surface_buffer(area);
+    let mut frame = TuiFrame::new(&mut buffer);
+    frame.fill(area, " ", theme.surfaces.overlay);
+    Menu::new(&items)
+        .styles(MenuStyles {
+            normal: theme.text,
+            focused: theme.selected,
+            selected: theme.selected,
+            hovered: theme.focused,
+            pressed: theme.selected,
+            disabled: theme.disabled,
+        })
+        .render_with_fallback_style(area, &state, &mut frame, theme.surfaces.overlay);
+    buffer_render_ops(&buffer)
 }
 
 pub fn reduce_attach_status_tab_mouse_event(
@@ -16128,11 +16131,9 @@ mod tests {
             .find(|(text, _)| text.contains("Rename"))
             .expect("rename row should render");
         assert!(
-            focused.0.starts_with("> "),
-            "focused row marker: {:?}",
-            focused.0
+            focused.1.bg.is_some() || focused.1.reverse,
+            "focused row should use selected styling"
         );
-        assert!(focused.1.reverse, "focused row should be highlighted");
 
         let disabled = runs
             .iter()
@@ -20549,7 +20550,12 @@ mod tests {
             pane_id: None,
         };
 
-        let retained = retained_help_overlay_surface(&surface, &["line".to_owned()], 0);
+        let retained = retained_help_overlay_surface(
+            &surface,
+            &["line".to_owned()],
+            0,
+            &RuntimeAppearance::default(),
+        );
 
         assert_eq!(retained.id, HELP_OVERLAY_SURFACE_ID);
         assert_eq!(retained.rect, DamageRect::new(2, 3, 20, 6));
@@ -20557,7 +20563,10 @@ mod tests {
         let RetainedSurfacePayload::RenderOps(ops) = retained.payload else {
             panic!("help overlay should lower to render ops");
         };
-        assert!(ops.iter().any(|op| matches!(op, RenderOp::Border { .. })));
+        assert!(ops.iter().any(|op| {
+            matches!(op, RenderOp::TextRun { text, .. } if text.contains('╭') || text.contains('│'))
+        }));
+        assert!(!ops.iter().any(|op| matches!(op, RenderOp::Border { .. })));
     }
 
     #[test]

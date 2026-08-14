@@ -1,7 +1,7 @@
 use super::input::{TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent};
 use super::render::opaque_row_text;
 use super::state::AttachCursorState;
-use super::tui_surface::{buffer_render_ops, surface_buffer};
+use super::tui_surface::{buffer_render_ops, component_theme, surface_buffer};
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
     PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
@@ -19,10 +19,8 @@ use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::HitMap;
 use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
-use bmux_tui::style::{Color, Style};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
-use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1293,45 +1291,6 @@ fn prompt_body_line(
     }
 }
 
-fn component_theme(appearance: &RuntimeAppearance) -> ComponentTheme {
-    let foreground = parse_tui_color(&appearance.foreground).unwrap_or(Color::BrightWhite);
-    let background = parse_tui_color(&appearance.background).unwrap_or(Color::Black);
-    let selection = parse_tui_color(&appearance.selection_background).unwrap_or(Color::Cyan);
-    let cursor = parse_tui_color(&appearance.cursor).unwrap_or(Color::BrightCyan);
-    ComponentTheme {
-        canvas: Style::new().fg(foreground).bg(background),
-        surfaces: ComponentSurfaces {
-            normal: Style::new().bg(background),
-            raised: Style::new().bg(background),
-            overlay: Style::new().bg(background),
-            scrim: None,
-        },
-        text: Style::new().fg(foreground),
-        focused: Style::new().fg(cursor),
-        selected: Style::new().fg(background).bg(selection),
-        disabled: Style::new()
-            .fg(Color::BrightBlack)
-            .add_modifier(bmux_tui::style::Modifier::DIM),
-        muted: Style::new().fg(Color::BrightBlack),
-        info: Style::new().fg(cursor),
-        success: Style::new().fg(Color::Green),
-        warning: Style::new().fg(Color::Yellow),
-        error: Style::new().fg(Color::Red),
-        border: Style::new().fg(cursor),
-    }
-}
-
-fn parse_tui_color(value: &str) -> Option<Color> {
-    let hex = value.strip_prefix('#')?;
-    if hex.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    Some(Color::Rgb(r, g, b))
-}
-
 pub const fn prompt_accepts_key_kind(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
@@ -2288,9 +2247,10 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
-        component_theme, parse_tui_color, render_prompt_body,
+        render_prompt_body,
     };
     use crate::runtime::attach::input::TerminalGeometry;
+    use crate::runtime::attach::tui_surface::{component_theme, parse_tui_color};
     use crate::runtime::prompt::{
         PromptFormField, PromptFormFieldKind, PromptFormSection, PromptFormValue, PromptOption,
         PromptRequest, PromptResponse, PromptValidation, PromptValue,
