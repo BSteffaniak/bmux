@@ -13,8 +13,11 @@ use bmux_attach_layout_protocol::{
 };
 use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
+use bmux_tui::chrome::Panel;
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::geometry::{Insets, Point, Rect, Size};
+use bmux_tui::hit::HitMap;
+use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
@@ -97,9 +100,7 @@ enum PromptWidgetState {
         scroll: usize,
     },
     SearchSelect {
-        query: TextEditBuffer,
-        selected: usize,
-        scroll: usize,
+        palette: CommandPaletteState,
     },
     MultiToggle {
         cursor: usize,
@@ -121,6 +122,7 @@ struct ActivePrompt {
     state: PromptWidgetState,
     message_wrap_width: Option<usize>,
     message_wrapped_lines: Vec<String>,
+    hits: HitMap,
 }
 
 impl ActivePrompt {
@@ -158,11 +160,9 @@ impl ActivePrompt {
                 } else {
                     (*default_index).min(options.len().saturating_sub(1))
                 };
-                PromptWidgetState::SearchSelect {
-                    query: TextEditBuffer::new(),
-                    selected,
-                    scroll: 0,
-                }
+                let mut palette = CommandPaletteState::default();
+                palette.list.selected = Some(selected);
+                PromptWidgetState::SearchSelect { palette }
             }
             PromptField::MultiToggle {
                 options,
@@ -193,6 +193,7 @@ impl ActivePrompt {
             state,
             message_wrap_width: None,
             message_wrapped_lines: Vec::new(),
+            hits: HitMap::new(),
         }
     }
 }
@@ -271,16 +272,17 @@ impl AttachPromptState {
             }
             (
                 PromptField::SearchSelect { options, .. },
-                PromptWidgetState::SearchSelect {
-                    query,
-                    selected,
-                    scroll,
-                },
+                PromptWidgetState::SearchSelect { palette },
             ) => {
-                query.paste(text);
-                let len = filtered_option_indices(options, query.text()).len();
-                *selected = (*selected).min(len.saturating_sub(1));
-                *scroll = (*scroll).min(*selected);
+                palette.query.paste(text);
+                let len = filtered_option_indices(options, palette.query.text()).len();
+                let selected = palette
+                    .list
+                    .selected
+                    .unwrap_or(0)
+                    .min(len.saturating_sub(1));
+                palette.list.selected = (!options.is_empty()).then_some(selected);
+                palette.list.offset = palette.list.offset.min(selected);
             }
             (
                 PromptField::Form {
@@ -492,12 +494,11 @@ impl AttachPromptState {
                         live_preview,
                         ..
                     },
-                    PromptWidgetState::SearchSelect {
-                        query,
-                        selected,
-                        scroll,
-                    },
+                    PromptWidgetState::SearchSelect { palette },
                 ) => {
+                    let query = &mut palette.query;
+                    let selected = palette.list.selected.get_or_insert(0);
+                    let scroll = &mut palette.list.offset;
                     let previous_selected_value = filtered_option_indices(options, query.text())
                         .get(*selected)
                         .and_then(|index| options.get(*index))
@@ -875,6 +876,43 @@ impl AttachPromptState {
             return PromptKeyDisposition::NotActive;
         };
 
+        if active.envelope.request.modal_id.as_deref() == Some("command-palette") {
+            let Some(hit) = active.hits.hit_test(Point::new(mouse.column, mouse.row)) else {
+                return PromptKeyDisposition::Consumed;
+            };
+            let Some(source_index) = CommandPalette::hit_item_index(hit.id(), "command") else {
+                return PromptKeyDisposition::Consumed;
+            };
+            let PromptField::SearchSelect {
+                options,
+                live_preview,
+                ..
+            } = &active.envelope.request.field
+            else {
+                return PromptKeyDisposition::Consumed;
+            };
+            let PromptWidgetState::SearchSelect { palette } = &mut active.state else {
+                return PromptKeyDisposition::Consumed;
+            };
+            let filtered = filtered_option_indices(options, palette.query.text());
+            let Some(filtered_index) = filtered.iter().position(|index| *index == source_index)
+            else {
+                return PromptKeyDisposition::Consumed;
+            };
+            let previous = palette.list.selected;
+            palette.list.selected = Some(filtered_index);
+            if *live_preview && previous != Some(filtered_index) {
+                emit_selection_changed(&active.envelope, source_index);
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let value = options
+                    .get(source_index)
+                    .map_or_else(String::new, |option| option.value.clone());
+                return self.complete_active(PromptResponse::Submitted(PromptValue::Single(value)));
+            }
+            return PromptKeyDisposition::Consumed;
+        }
+
         let PromptField::SingleSelect {
             options,
             live_preview,
@@ -983,31 +1021,48 @@ impl AttachPromptState {
         let mut frame = Frame::new(&mut buffer);
         modal.render(area, &mut frame);
         let content = modal.content_area(area);
-        for (index, line) in body.lines.iter().take(body_rows).enumerate() {
-            let row = content
-                .y
-                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            if row >= content.bottom().saturating_sub(1) {
-                break;
+        let mut component_cursor = None;
+        let rendered_palette =
+            if active.envelope.request.modal_id.as_deref() == Some("command-palette") {
+                render_command_palette(active, content, &mut frame, theme)
+            } else {
+                false
+            };
+        if rendered_palette {
+            component_cursor = frame.cursor().map(|cursor| AttachCursorState {
+                x: cursor.position.x,
+                y: cursor.position.y,
+                visible: cursor.visible,
+            });
+        } else {
+            for (index, line) in body.lines.iter().take(body_rows).enumerate() {
+                let row = content
+                    .y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+                if row >= content.bottom().saturating_sub(1) {
+                    break;
+                }
+                frame.write_line_with_fallback_style(
+                    Rect::new(content.x, row, content.width, 1),
+                    &prompt_body_line(&active.envelope.request, active, index, line, theme),
+                    theme.text,
+                );
             }
+            let footer_y = content.bottom().saturating_sub(1);
             frame.write_line_with_fallback_style(
-                Rect::new(content.x, row, content.width, 1),
-                &prompt_body_line(&active.envelope.request, active, index, line, theme),
-                theme.text,
+                Rect::new(content.x, footer_y, content.width, 1),
+                &Line::raw(opaque_row_text(&footer, usize::from(content.width))),
+                theme.muted,
             );
         }
-        let footer_y = content.bottom().saturating_sub(1);
-        frame.write_line_with_fallback_style(
-            Rect::new(content.x, footer_y, content.width, 1),
-            &Line::raw(opaque_row_text(&footer, usize::from(content.width))),
-            theme.muted,
-        );
         let ops = buffer_render_ops(&buffer);
 
-        let cursor_state = body.cursor.map(|(row, col)| AttachCursorState {
-            x: (usize::from(content.x) + col).min(u16::MAX as usize) as u16,
-            y: (usize::from(content.y) + row).min(u16::MAX as usize) as u16,
-            visible: true,
+        let cursor_state = component_cursor.or_else(|| {
+            body.cursor.map(|(row, col)| AttachCursorState {
+                x: (usize::from(content.x) + col).min(u16::MAX as usize) as u16,
+                y: (usize::from(content.y) + row).min(u16::MAX as usize) as u16,
+                visible: true,
+            })
         });
 
         Some(AttachPromptOverlayRender {
@@ -1060,6 +1115,111 @@ impl AttachPromptState {
     }
 }
 
+fn render_command_palette(
+    active: &mut ActivePrompt,
+    content: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    let PromptField::SearchSelect {
+        options,
+        placeholder,
+        ..
+    } = &active.envelope.request.field
+    else {
+        return false;
+    };
+    let PromptWidgetState::SearchSelect { palette } = &mut active.state else {
+        return false;
+    };
+    let items = options
+        .iter()
+        .map(|option| {
+            let mut spans = vec![Span::styled(option.label.clone(), theme.text)];
+            if let Some(key_hint) = &option.key_hint {
+                spans.push(Span::styled(format!("  {key_hint}"), theme.focused));
+            }
+            if let Some(detail) = &option.detail {
+                spans.push(Span::styled(format!("  —  {detail}"), theme.muted));
+            }
+            PaletteItem::new(option.value.clone(), Line::from_spans(spans)).search_text(format!(
+                "{} {} {}",
+                option.label,
+                option.detail.as_deref().unwrap_or_default(),
+                option.key_hint.as_deref().unwrap_or_default()
+            ))
+        })
+        .collect::<Vec<_>>();
+    let filtered = filtered_option_indices(options, palette.query.text());
+    let message_rows = active
+        .envelope
+        .request
+        .message
+        .as_ref()
+        .map_or(0, |message| {
+            wrap_lines(message, usize::from(content.width)).len()
+        });
+    let footer_rows = u16::from(content.height > 2);
+    let palette_y = content
+        .y
+        .saturating_add(u16::try_from(message_rows).unwrap_or(u16::MAX));
+    let palette_height = content
+        .bottom()
+        .saturating_sub(palette_y)
+        .saturating_sub(footer_rows);
+    if let Some(message) = &active.envelope.request.message {
+        for (row, line) in wrap_lines(message, usize::from(content.width))
+            .into_iter()
+            .enumerate()
+        {
+            let Ok(row) = u16::try_from(row) else {
+                break;
+            };
+            frame.write_line_with_fallback_style(
+                Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
+                &Line::raw(line),
+                theme.muted,
+            );
+        }
+    }
+    let palette_area = Rect::new(content.x, palette_y, content.width, palette_height);
+    let component = CommandPalette::new(&items)
+        .panel(Panel::new().background(theme.background))
+        .placeholder(
+            placeholder
+                .clone()
+                .unwrap_or_else(|| "Search commands".to_owned()),
+        )
+        .list_styles(theme.text, theme.focused);
+    active.hits = HitMap::new();
+    component.register_projected_hits(
+        palette_area,
+        palette,
+        &filtered,
+        &mut active.hits,
+        "command",
+    );
+    component.render_projected(palette_area, frame, palette, &filtered);
+    if footer_rows > 0 {
+        let selected = palette.list.selected.map_or(0, |index| index + 1);
+        let footer = format!(
+            "{selected}/{} matches  •  ↑↓ navigate  •  Enter run  •  Esc close",
+            filtered.len()
+        );
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                content.x,
+                content.bottom().saturating_sub(1),
+                content.width,
+                1,
+            ),
+            &Line::raw(footer),
+            theme.muted,
+        );
+    }
+    true
+}
+
 fn prompt_body_line(
     request: &PromptRequest,
     active: &ActivePrompt,
@@ -1079,13 +1239,13 @@ fn prompt_body_line(
     let selected = matches!(
         (&active.state, list_row),
         (
-            PromptWidgetState::SearchSelect {
-                selected,
-                scroll,
-                ..
-            },
+            PromptWidgetState::SearchSelect { palette },
             Some(row)
-        ) if row == selected.saturating_sub(*scroll)
+        ) if row == palette
+            .list
+            .selected
+            .unwrap_or(0)
+            .saturating_sub(palette.list.offset)
     );
     if selected {
         Line::from_spans(vec![Span::styled(rendered.to_owned(), theme.focused)])
@@ -1762,12 +1922,11 @@ fn render_prompt_body(
                 placeholder,
                 ..
             },
-            PromptWidgetState::SearchSelect {
-                query,
-                selected,
-                scroll,
-            },
+            PromptWidgetState::SearchSelect { palette },
         ) => {
+            let query = &palette.query;
+            let selected = palette.list.selected.get_or_insert(0);
+            let scroll = &mut palette.list.offset;
             let visible_width = text_width.saturating_sub(2).max(1);
             let viewport = query.line_viewport(visible_width);
             let rendered = if viewport.text.is_empty() {
@@ -2092,7 +2251,10 @@ mod tests {
     };
     use bmux_appearance::RuntimeAppearance;
     use bmux_tui::style::Color;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use uuid::Uuid;
 
     fn key_event(code: KeyCode) -> KeyEvent {
@@ -2106,6 +2268,44 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn command_palette_mouse_uses_component_hit_map() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Command Palette",
+                vec![
+                    PromptOption::new("one", "One"),
+                    PromptOption::new("two", "Two"),
+                ],
+            )
+            .modal_id("command-palette"),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        let _ = state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default())
+            .expect("palette should render");
+        let active = state.active.as_ref().expect("active prompt");
+        let hit = active.hits.regions().get(1).expect("second option hit");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.area.x,
+            row: hit.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let PromptKeyDisposition::Completed(completion) = state.handle_mouse_event(mouse, geometry)
+        else {
+            panic!("palette click should complete");
+        };
+
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Single("two".to_owned()))
+        );
     }
 
     #[test]

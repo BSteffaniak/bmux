@@ -10,6 +10,7 @@ use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::input::{TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use crate::layout::{Direction, split_leading};
 use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
+use crate::style::Style;
 use crate::text::Line;
 use crate::widget::{StatefulWidget, Widget};
 
@@ -89,6 +90,9 @@ pub struct CommandPalette<'items> {
     empty: Line,
     input_height: u16,
     gap: u16,
+    placeholder: Line,
+    list_style: Style,
+    selected_style: Style,
 }
 
 impl<'items> CommandPalette<'items> {
@@ -101,6 +105,9 @@ impl<'items> CommandPalette<'items> {
             empty: Line::raw("No matches"),
             input_height: 1,
             gap: 1,
+            placeholder: Line::raw("Search"),
+            list_style: Style::new(),
+            selected_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
         }
     }
 
@@ -118,6 +125,21 @@ impl<'items> CommandPalette<'items> {
         self
     }
 
+    /// Set input placeholder text.
+    #[must_use]
+    pub fn placeholder(mut self, placeholder: impl Into<Line>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    /// Set base and selected list-row styles.
+    #[must_use]
+    pub const fn list_styles(mut self, style: Style, selected_style: Style) -> Self {
+        self.list_style = style;
+        self.selected_style = selected_style;
+        self
+    }
+
     /// Return source item indices matching a query.
     #[must_use]
     pub fn filtered_indices(&self, query: &str) -> Vec<usize> {
@@ -126,6 +148,48 @@ impl<'items> CommandPalette<'items> {
             .enumerate()
             .filter_map(|(index, item)| item.matches(query).then_some(index))
             .collect()
+    }
+
+    /// Render using a caller-provided source-index projection.
+    ///
+    /// This supports hosts with a domain-specific ranking algorithm while
+    /// retaining this component's input, list, cursor, and viewport rendering.
+    pub fn render_projected(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        state: &mut CommandPaletteState,
+        filtered: &[usize],
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        self.panel.render(area, frame);
+        let areas = self.areas(area);
+        TextInput::new(&state.query)
+            .placeholder(self.placeholder.clone())
+            .render(areas.input, frame);
+
+        let valid = filtered
+            .iter()
+            .copied()
+            .filter(|index| *index < self.items.len())
+            .collect::<Vec<_>>();
+        if valid.is_empty() {
+            state.list.selected = None;
+            state.list.offset = 0;
+            frame.write_line(areas.list, &self.empty);
+            return;
+        }
+        let items = valid
+            .iter()
+            .map(|index| ListItem::new(self.items[*index].label.clone()))
+            .collect::<Vec<_>>();
+        List::new(&items)
+            .style(self.list_style)
+            .selected_style(self.selected_style)
+            .highlight_symbol("> ")
+            .render(areas.list, frame, &mut state.list);
     }
 
     /// Handle a key for query/list palette interaction.
@@ -200,11 +264,28 @@ impl<'items> CommandPalette<'items> {
         if area.is_empty() {
             return;
         }
-        let areas = self.areas(area);
         let filtered = self.filtered_indices(state.query.text());
+        self.register_projected_hits(area, state, &filtered, hits, id_prefix);
+    }
+
+    /// Register visible command-row hits for a caller-provided source projection.
+    pub fn register_projected_hits(
+        &self,
+        area: Rect,
+        state: &CommandPaletteState,
+        filtered: &[usize],
+        hits: &mut HitMap,
+        id_prefix: &str,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        let areas = self.areas(area);
         let visible_count = usize::from(areas.list.height);
         for (row, source_index) in filtered
-            .into_iter()
+            .iter()
+            .copied()
+            .filter(|index| *index < self.items.len())
             .skip(state.list.offset)
             .take(visible_count)
             .enumerate()
@@ -252,27 +333,8 @@ impl StatefulWidget for CommandPalette<'_> {
     type State = CommandPaletteState;
 
     fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
-        if area.is_empty() {
-            return;
-        }
-        self.panel.render(area, frame);
-        let areas = self.areas(area);
-        TextInput::new(&state.query)
-            .placeholder("Search")
-            .render(areas.input, frame);
-
         let filtered = self.filtered_indices(state.query.text());
-        if filtered.is_empty() {
-            frame.write_line(areas.list, &self.empty);
-            return;
-        }
-        let items = filtered
-            .iter()
-            .map(|index| ListItem::new(self.items[*index].label.clone()))
-            .collect::<Vec<_>>();
-        List::new(&items)
-            .highlight_symbol("> ")
-            .render(areas.list, frame, &mut state.list);
+        self.render_projected(area, frame, state, &filtered);
     }
 }
 
