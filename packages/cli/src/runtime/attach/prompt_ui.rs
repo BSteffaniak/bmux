@@ -1,16 +1,24 @@
 use super::input::{TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent};
 use super::render::opaque_row_text;
 use super::state::AttachCursorState;
+use super::tui_surface::{buffer_render_ops, surface_buffer};
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
     PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
 };
 use anyhow::Result;
+use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{
     AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind,
 };
-use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderOp, RenderStyle};
+use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::prelude::Line;
+use bmux_tui::style::{Color, Style};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
+use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -940,6 +948,7 @@ impl AttachPromptState {
     pub fn attach_prompt_overlay_render(
         &mut self,
         geometry: TerminalGeometry,
+        appearance: &RuntimeAppearance,
     ) -> Option<AttachPromptOverlayRender> {
         let layout = prompt_overlay_layout(
             self.active.as_ref().map(|active| &active.envelope.request),
@@ -949,55 +958,55 @@ impl AttachPromptState {
 
         let width = usize::from(layout.surface.rect.w);
         let height = usize::from(layout.surface.rect.h);
-        let x = usize::from(layout.surface.rect.x);
-        let y = usize::from(layout.surface.rect.y);
         let body_rows = height.saturating_sub(4).max(1);
         let text_width = width.saturating_sub(4);
 
         let body = render_prompt_body(active, text_width, body_rows);
         let footer = prompt_footer_text(&active.envelope.request);
-        let style = RenderStyle::new();
-        let surface_rect = ExtensionRect::new(
+        let area = Rect::new(
             layout.surface.rect.x,
             layout.surface.rect.y,
             layout.surface.rect.w,
             layout.surface.rect.h,
         );
-        let interior = ExtensionRect::new(
-            layout.surface.rect.x.saturating_add(1),
-            layout.surface.rect.y.saturating_add(1),
-            layout.surface.rect.w.saturating_sub(2),
-            layout.surface.rect.h.saturating_sub(2),
-        );
-        let title = format!(
-            " {} ",
-            truncate_chars(&active.envelope.request.title, text_width)
-        );
-        let title_x = x + ((width.saturating_sub(title.len())) / 2);
-        let mut ops = vec![
-            RenderOp::clear_rect(interior, style),
-            RenderOp::border(surface_rect, BorderGlyphs::ascii(), style),
-            RenderOp::text_run(title_x as u16, y as u16, title, style),
-        ];
+        let theme = component_theme(appearance).modal_theme();
+        let modal = ModalFrame::new(
+            ModalSizing::fixed(
+                Size::new(layout.surface.rect.w, layout.surface.rect.h),
+                Insets::new(0, 0, 0, 0),
+            ),
+            theme,
+        )
+        .title(Line::raw(active.envelope.request.title.clone()))
+        .padding(Insets::new(0, 1, 0, 1));
+        let mut buffer = surface_buffer(area);
+        let mut frame = Frame::new(&mut buffer);
+        modal.render(area, &mut frame);
+        let content = modal.content_area(area);
         for (index, line) in body.lines.iter().take(body_rows).enumerate() {
-            let row = y + 1 + index;
-            ops.push(RenderOp::text_run(
-                (x + 2) as u16,
-                row as u16,
-                line.clone(),
-                style,
-            ));
+            let row = content
+                .y
+                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+            if row >= content.bottom().saturating_sub(1) {
+                break;
+            }
+            frame.write_line_with_fallback_style(
+                Rect::new(content.x, row, content.width, 1),
+                &Line::raw(line.clone()),
+                theme.text,
+            );
         }
-        ops.push(RenderOp::text_run(
-            (x + 2) as u16,
-            (y + height - 2) as u16,
-            opaque_row_text(&footer, text_width),
-            style,
-        ));
+        let footer_y = content.bottom().saturating_sub(1);
+        frame.write_line_with_fallback_style(
+            Rect::new(content.x, footer_y, content.width, 1),
+            &Line::raw(opaque_row_text(&footer, usize::from(content.width))),
+            theme.muted,
+        );
+        let ops = buffer_render_ops(&buffer);
 
         let cursor_state = body.cursor.map(|(row, col)| AttachCursorState {
-            x: (x + 2 + col).min(u16::MAX as usize) as u16,
-            y: (y + 1 + row).min(u16::MAX as usize) as u16,
+            x: (usize::from(content.x) + col).min(u16::MAX as usize) as u16,
+            y: (usize::from(content.y) + row).min(u16::MAX as usize) as u16,
             visible: true,
         });
 
@@ -1049,6 +1058,45 @@ impl AttachPromptState {
             response,
         })
     }
+}
+
+fn component_theme(appearance: &RuntimeAppearance) -> ComponentTheme {
+    let foreground = parse_tui_color(&appearance.foreground).unwrap_or(Color::BrightWhite);
+    let background = parse_tui_color(&appearance.background).unwrap_or(Color::Black);
+    let selection = parse_tui_color(&appearance.selection_background).unwrap_or(Color::Cyan);
+    let cursor = parse_tui_color(&appearance.cursor).unwrap_or(Color::BrightCyan);
+    ComponentTheme {
+        canvas: Style::new().fg(foreground).bg(background),
+        surfaces: ComponentSurfaces {
+            normal: Style::new().bg(background),
+            raised: Style::new().bg(background),
+            overlay: Style::new().bg(background),
+            scrim: None,
+        },
+        text: Style::new().fg(foreground),
+        focused: Style::new().fg(cursor),
+        selected: Style::new().fg(background).bg(selection),
+        disabled: Style::new()
+            .fg(Color::BrightBlack)
+            .add_modifier(bmux_tui::style::Modifier::DIM),
+        muted: Style::new().fg(Color::BrightBlack),
+        info: Style::new().fg(cursor),
+        success: Style::new().fg(Color::Green),
+        warning: Style::new().fg(Color::Yellow),
+        error: Style::new().fg(Color::Red),
+        border: Style::new().fg(cursor),
+    }
+}
+
+fn parse_tui_color(value: &str) -> Option<Color> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
 }
 
 pub const fn prompt_accepts_key_kind(kind: KeyEventKind) -> bool {
@@ -1994,12 +2042,15 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
-        render_prompt_body,
+        component_theme, parse_tui_color, render_prompt_body,
     };
+    use crate::runtime::attach::input::TerminalGeometry;
     use crate::runtime::prompt::{
         PromptFormField, PromptFormFieldKind, PromptFormSection, PromptFormValue, PromptOption,
         PromptRequest, PromptResponse, PromptValidation, PromptValue,
     };
+    use bmux_appearance::RuntimeAppearance;
+    use bmux_tui::style::Color;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use uuid::Uuid;
 
@@ -2014,6 +2065,85 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn prompt_overlay_uses_rounded_tui_chrome_and_opaque_rows() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::text_input("Name"),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+            )
+            .expect("prompt should render");
+        let top_y = render.surface.rect.y;
+        let top_x = render.surface.rect.x;
+        let top = render.ops.iter().find_map(|op| match op {
+            bmux_plugin::RenderOp::TextRun { x, y, text, .. } if *x == top_x && *y == top_y => {
+                Some(text.as_str())
+            }
+            _ => None,
+        });
+
+        assert!(top.is_some_and(|line| line.starts_with('╭') && line.ends_with('╮')));
+        assert!(
+            !render
+                .ops
+                .iter()
+                .any(|op| matches!(op, bmux_plugin::RenderOp::Border { .. }))
+        );
+        assert!(
+            (top_y..top_y.saturating_add(render.surface.rect.h)).all(|row| {
+                render
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, bmux_plugin::RenderOp::TextRun { y, .. } if *y == row))
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_appearance_maps_to_opaque_component_theme() {
+        let appearance = RuntimeAppearance {
+            foreground: "#112233".to_owned(),
+            background: "#040506".to_owned(),
+            cursor: "#aabbcc".to_owned(),
+            selection_background: "#778899".to_owned(),
+            ..RuntimeAppearance::default()
+        };
+
+        let theme = component_theme(&appearance);
+
+        assert_eq!(theme.text.fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
+        assert_eq!(theme.surfaces.overlay.bg, Some(Color::Rgb(4, 5, 6)));
+        assert_eq!(theme.focused.fg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
+        assert_eq!(theme.selected.bg, Some(Color::Rgb(0x77, 0x88, 0x99)));
+        assert!(theme.surfaces.scrim.is_none());
+    }
+
+    #[test]
+    fn invalid_runtime_colors_use_safe_fallbacks() {
+        assert_eq!(parse_tui_color("nope"), None);
+        assert_eq!(parse_tui_color("#123"), None);
+        let appearance = RuntimeAppearance {
+            foreground: "invalid".to_owned(),
+            background: "invalid".to_owned(),
+            cursor: "invalid".to_owned(),
+            selection_background: "invalid".to_owned(),
+            ..RuntimeAppearance::default()
+        };
+
+        let theme = component_theme(&appearance);
+
+        assert_eq!(theme.text.fg, Some(Color::BrightWhite));
+        assert_eq!(theme.surfaces.overlay.bg, Some(Color::Black));
+        assert_eq!(theme.focused.fg, Some(Color::BrightCyan));
+        assert_eq!(theme.selected.bg, Some(Color::Cyan));
     }
 
     #[test]

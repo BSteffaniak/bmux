@@ -8220,7 +8220,9 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         .as_ref()
         .map(|surface| retained_help_overlay_surface(surface, help_lines, help_scroll));
     let prompt_overlay_render = if view_state.prompt.is_active() {
-        view_state.prompt.attach_prompt_overlay_render(geometry)
+        view_state
+            .prompt
+            .attach_prompt_overlay_render(geometry, runtime_appearance)
     } else {
         None
     };

@@ -11,3 +11,4 @@ pub mod runtime;
 mod scrollback_modes;
 pub mod sim;
 pub mod state;
+mod tui_surface;

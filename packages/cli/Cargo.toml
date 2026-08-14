@@ -52,6 +52,8 @@ bmux_snapshot_plugin_api        = { workspace = true }
 bmux_terminal_grid              = { workspace = true }
 bmux_terminal_protocol          = { workspace = true }
 bmux_text_edit                  = { workspace = true }
+bmux_tui                        = { workspace = true }
+bmux_tui_components             = { workspace = true, features = ["modal-frame"] }
 bmux_windows_plugin_api         = { workspace = true }
 sshenv_vault                    = { workspace = true }
 
