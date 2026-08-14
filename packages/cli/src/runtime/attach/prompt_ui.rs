@@ -21,6 +21,7 @@ use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
+use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
 use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1008,6 +1009,7 @@ impl AttachPromptState {
             layout.surface.rect.h,
         );
         let theme = component_theme(appearance).modal_theme();
+        let compact = layout.surface.rect.w < 24 || layout.surface.rect.h < 8;
         let modal = ModalFrame::new(
             ModalSizing::fixed(
                 Size::new(layout.surface.rect.w, layout.surface.rect.h),
@@ -1016,7 +1018,11 @@ impl AttachPromptState {
             theme,
         )
         .title(Line::raw(active.envelope.request.title.clone()))
-        .padding(Insets::new(0, 1, 0, 1));
+        .padding(if compact {
+            Insets::new(0, 0, 0, 0)
+        } else {
+            Insets::new(0, 1, 0, 1)
+        });
         let mut buffer = surface_buffer(area);
         let mut frame = Frame::new(&mut buffer);
         modal.render(area, &mut frame);
@@ -1115,6 +1121,7 @@ impl AttachPromptState {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Palette composition keeps one layout source for rendering, hits, cursor, footer, and scrollbar.
 fn render_command_palette(
     active: &mut ActivePrompt,
     content: Rect,
@@ -1159,7 +1166,7 @@ fn render_command_palette(
         .map_or(0, |message| {
             wrap_lines(message, usize::from(content.width)).len()
         });
-    let footer_rows = u16::from(content.height > 2);
+    let footer_rows = u16::from(content.height > 4);
     let palette_y = content
         .y
         .saturating_add(u16::try_from(message_rows).unwrap_or(u16::MAX));
@@ -1183,6 +1190,14 @@ fn render_command_palette(
         }
     }
     let palette_area = Rect::new(content.x, palette_y, content.width, palette_height);
+    let list_viewport = palette_height.saturating_sub(2);
+    let show_scrollbar = filtered.len() > usize::from(list_viewport) && content.width > 1;
+    let component_area = Rect::new(
+        palette_area.x,
+        palette_area.y,
+        palette_area.width.saturating_sub(u16::from(show_scrollbar)),
+        palette_area.height,
+    );
     let component = CommandPalette::new(&items)
         .panel(Panel::new().background(theme.background))
         .placeholder(
@@ -1193,13 +1208,35 @@ fn render_command_palette(
         .list_styles(theme.text, theme.focused);
     active.hits = HitMap::new();
     component.register_projected_hits(
-        palette_area,
+        component_area,
         palette,
         &filtered,
         &mut active.hits,
         "command",
     );
-    component.render_projected(palette_area, frame, palette, &filtered);
+    component.render_projected(component_area, frame, palette, &filtered);
+    if show_scrollbar {
+        let scrollbar_area = Rect::new(
+            palette_area.right().saturating_sub(1),
+            palette_area.y.saturating_add(2),
+            1,
+            list_viewport,
+        );
+        let scrollbar_state = ScrollbarState::new(
+            u16::try_from(filtered.len()).unwrap_or(u16::MAX),
+            list_viewport,
+        )
+        .offset(u16::try_from(palette.list.offset).unwrap_or(u16::MAX));
+        Scrollbar::new()
+            .policy(ScrollbarPolicy::bare())
+            .styles(ScrollbarStyles {
+                begin: theme.muted,
+                track: theme.muted,
+                thumb: theme.focused,
+                end: theme.muted,
+            })
+            .render(scrollbar_area, &scrollbar_state, frame);
+    }
     if footer_rows > 0 {
         let selected = palette.list.selected.map_or(0, |index| index + 1);
         let footer = format!(
@@ -1685,20 +1722,29 @@ fn prompt_overlay_layout(
     geometry: TerminalGeometry,
 ) -> Option<PromptOverlayLayout> {
     let request = request?;
-    if geometry.cols < 24 || geometry.rows < 8 {
+    if geometry.cols < 8 || geometry.rows < 4 {
         return None;
     }
+    let compact = geometry.cols < 24 || geometry.rows < 8;
 
     let content_width = prompt_estimated_width(request);
     let capped_max = request.width.max.max(request.width.min);
-    let width = (content_width + 4)
-        .max(usize::from(request.width.min.max(24)))
-        .min(usize::from(capped_max.max(24)))
-        .min((geometry.cols as usize).saturating_sub(2));
+    let width = if compact {
+        geometry.cols as usize
+    } else {
+        (content_width + 4)
+            .max(usize::from(request.width.min.max(24)))
+            .min(usize::from(capped_max.max(24)))
+            .min((geometry.cols as usize).saturating_sub(2))
+    };
     let estimated_lines = prompt_estimated_lines(request);
-    let height = (estimated_lines + 4)
-        .max(7)
-        .min((geometry.rows as usize).saturating_sub(2));
+    let height = if compact {
+        geometry.rows as usize
+    } else {
+        (estimated_lines + 4)
+            .max(7)
+            .min((geometry.rows as usize).saturating_sub(2))
+    };
     let x = ((geometry.cols as usize).saturating_sub(width)) / 2;
     let centered_y = ((geometry.rows as usize).saturating_sub(height)) / 2;
     let y = if request.modal_id.as_deref() == Some("command-palette") {
@@ -2268,6 +2314,49 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn command_palette_degrades_to_full_viewport_on_small_terminal() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select("Command Palette", vec![PromptOption::new("one", "One")])
+                .modal_id("command-palette"),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 20, rows: 6 };
+
+        let render = state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default())
+            .expect("compact palette should render");
+
+        assert_eq!(render.surface.rect.x, 0);
+        assert_eq!(render.surface.rect.y, 0);
+        assert_eq!(render.surface.rect.w, 20);
+        assert_eq!(render.surface.rect.h, 6);
+    }
+
+    #[test]
+    fn command_palette_renders_scrollbar_for_long_results() {
+        let mut state = AttachPromptState::default();
+        let options = (0..40)
+            .map(|index| PromptOption::new(index.to_string(), format!("Command {index}")))
+            .collect();
+        state.enqueue_internal(
+            PromptRequest::search_select("Command Palette", options).modal_id("command-palette"),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+            )
+            .expect("palette should render");
+
+        assert!(render.ops.iter().any(|op| {
+            matches!(op, bmux_plugin::RenderOp::TextRun { text, .. } if text.contains('█'))
+        }));
     }
 
     #[test]

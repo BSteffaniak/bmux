@@ -16,46 +16,49 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal bmux packages
-bmux_appearance                 = { workspace = true }
-bmux_attach_image_protocol      = { workspace = true }
-bmux_attach_layout_protocol     = { workspace = true }
-bmux_attach_pipeline            = { workspace = true }
-bmux_attach_token_state         = { workspace = true }
-bmux_attach_view_protocol       = { workspace = true }
-bmux_cli_schema                 = { workspace = true }
-bmux_client                     = { workspace = true }
-bmux_clients_plugin_api         = { workspace = true }
-bmux_codec                      = { workspace = true }
-bmux_config                     = { workspace = true }
-bmux_context_state              = { workspace = true }
-bmux_contexts_plugin_api        = { workspace = true }
+bmux_appearance = { workspace = true }
+bmux_attach_image_protocol = { workspace = true }
+bmux_attach_layout_protocol = { workspace = true }
+bmux_attach_pipeline = { workspace = true }
+bmux_attach_token_state = { workspace = true }
+bmux_attach_view_protocol = { workspace = true }
+bmux_cli_schema = { workspace = true }
+bmux_client = { workspace = true }
+bmux_clients_plugin_api = { workspace = true }
+bmux_codec = { workspace = true }
+bmux_config = { workspace = true }
+bmux_context_state = { workspace = true }
+bmux_contexts_plugin_api = { workspace = true }
 bmux_control_catalog_plugin_api = { workspace = true }
-bmux_diagnostic_log             = { workspace = true }
-bmux_env                        = { workspace = true }
-bmux_ipc                        = { workspace = true }
-bmux_keybind                    = { workspace = true }
-bmux_keyboard                   = { workspace = true, features = ["crossterm"] }
-bmux_pane_runtime_plugin_api    = { workspace = true }
-bmux_performance_plugin_api     = { workspace = true }
-bmux_performance_state          = { workspace = true }
-bmux_permissions_plugin_api     = { workspace = true }
-bmux_plugin                     = { workspace = true }
-bmux_plugin_sdk                 = { workspace = true }
-bmux_recording_plugin_api       = { workspace = true }
-bmux_recording_protocol         = { workspace = true }
-bmux_scene_protocol             = { workspace = true }
-bmux_server                     = { workspace = true }
-bmux_session_models             = { workspace = true, features = ["serde"] }
-bmux_sessions_plugin_api        = { workspace = true }
-bmux_slots                      = { workspace = true }
-bmux_snapshot_plugin_api        = { workspace = true }
-bmux_terminal_grid              = { workspace = true }
-bmux_terminal_protocol          = { workspace = true }
-bmux_text_edit                  = { workspace = true }
-bmux_tui                        = { workspace = true }
-bmux_tui_components             = { workspace = true, features = ["modal-frame"] }
-bmux_windows_plugin_api         = { workspace = true }
-sshenv_vault                    = { workspace = true }
+bmux_diagnostic_log = { workspace = true }
+bmux_env = { workspace = true }
+bmux_ipc = { workspace = true }
+bmux_keybind = { workspace = true }
+bmux_keyboard = { workspace = true, features = ["crossterm"] }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_performance_plugin_api = { workspace = true }
+bmux_performance_state = { workspace = true }
+bmux_permissions_plugin_api = { workspace = true }
+bmux_plugin = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+bmux_recording_plugin_api = { workspace = true }
+bmux_recording_protocol = { workspace = true }
+bmux_scene_protocol = { workspace = true }
+bmux_server = { workspace = true }
+bmux_session_models = { workspace = true, features = ["serde"] }
+bmux_sessions_plugin_api = { workspace = true }
+bmux_slots = { workspace = true }
+bmux_snapshot_plugin_api = { workspace = true }
+bmux_terminal_grid = { workspace = true }
+bmux_terminal_protocol = { workspace = true }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "modal-frame",
+    "scrollbar",
+] }
+bmux_windows_plugin_api = { workspace = true }
+sshenv_vault = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
 bmux_clients_plugin = { workspace = true, optional = true, features = [

@@ -30,12 +30,39 @@ impl RustPlugin for CommandPalettePlugin {
 }
 
 fn show_command_palette(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+    let entries = build_palette_entries(context);
+    if entries.is_empty() {
+        warn!("command palette: no actions available");
+        return Ok(EXIT_OK);
+    }
+    let options = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let option = PromptOption::new(index.to_string(), entry.label.clone())
+                .detail(entry.detail.clone());
+            if let Some(key_hint) = &entry.key_hint {
+                option.key_hint(key_hint.clone())
+            } else {
+                option
+            }
+        })
+        .collect::<Vec<_>>();
+    let request = PromptRequest::search_select("Command Palette", options)
+        .message("Type to fuzzy-search actions and commands")
+        .modal_id("command-palette")
+        .owner_plugin_id("bmux.command_palette")
+        .width_range(64, 120)
+        .search_placeholder("Search commands");
+    let response = prompt::submit(request).map_err(|error| {
+        PluginCommandError::unavailable(format!("command palette prompt unavailable: {error}"))
+    })?;
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
         PluginCommandError::unavailable(
             "no tokio runtime available — command palette requires the attach runtime",
         )
     })?;
-    handle.spawn(run_command_palette(context.clone()));
+    handle.spawn(handle_command_palette_response(entries, response));
     Ok(EXIT_OK)
 }
 
@@ -60,43 +87,16 @@ struct PaletteEntry {
     kind: PaletteEntryKind,
 }
 
-async fn run_command_palette(context: NativeCommandContext) {
-    let entries = build_palette_entries(&context);
-    if entries.is_empty() {
-        warn!("command palette: no actions available");
-        return;
-    }
-
-    let options = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let option = PromptOption::new(index.to_string(), entry.label.clone())
-                .detail(entry.detail.clone());
-            if let Some(key_hint) = &entry.key_hint {
-                option.key_hint(key_hint.clone())
-            } else {
-                option
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let request = PromptRequest::search_select("Command Palette", options)
-        .message("Type to fuzzy-search actions and commands")
-        .modal_id("command-palette")
-        .owner_plugin_id("bmux.command_palette")
-        .width_range(64, 120)
-        .search_placeholder("Search commands");
-
-    let selected = match prompt::request(request).await {
+async fn handle_command_palette_response(
+    entries: Vec<PaletteEntry>,
+    response: tokio::sync::oneshot::Receiver<PromptResponse>,
+) {
+    let selected = match response.await {
         Ok(PromptResponse::Submitted(PromptValue::Single(value))) => value,
         Ok(
             PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_),
-        ) => return,
-        Err(error) => {
-            warn!(%error, "command palette: prompt failed");
-            return;
-        }
+        )
+        | Err(_) => return,
     };
 
     let Ok(index) = selected.parse::<usize>() else {
