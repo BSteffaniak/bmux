@@ -19,11 +19,16 @@ use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::HitMap;
 use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui_components::action_row::{ActionButton, ActionRowState};
+use bmux_tui_components::checkbox::{Checkbox, CheckboxState, CheckboxStyles};
+use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
 };
+use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy, TextInputBoxStyles};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -984,7 +989,7 @@ impl AttachPromptState {
         .map(|layout| layout.surface)
     }
 
-    #[allow(clippy::cast_possible_truncation)] // Overlay coordinates are bounded by explicit terminal geometry.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)] // Overlay composition keeps one source for component selection, cursor, footer, and retained output.
     pub fn attach_prompt_overlay_render(
         &mut self,
         geometry: TerminalGeometry,
@@ -1037,13 +1042,29 @@ impl AttachPromptState {
             };
         let rendered_single_select =
             !rendered_palette && render_single_select(active, content, &mut frame, theme);
-        if rendered_palette {
+        let rendered_text_input = !rendered_palette
+            && !rendered_single_select
+            && render_text_input(active, content, &mut frame, theme);
+        let rendered_confirm = !rendered_palette
+            && !rendered_single_select
+            && !rendered_text_input
+            && render_confirm(active, area, &mut frame, theme);
+        let rendered_multi_toggle = !rendered_palette
+            && !rendered_single_select
+            && !rendered_text_input
+            && !rendered_confirm
+            && render_multi_toggle(active, content, &mut frame, theme);
+        if rendered_palette || rendered_text_input {
             component_cursor = frame.cursor().map(|cursor| AttachCursorState {
                 x: cursor.position.x,
                 y: cursor.position.y,
                 visible: cursor.visible,
             });
-        } else if !rendered_single_select {
+        } else if !rendered_single_select
+            && !rendered_text_input
+            && !rendered_confirm
+            && !rendered_multi_toggle
+        {
             for (index, line) in body.lines.iter().take(body_rows).enumerate() {
                 let row = content
                     .y
@@ -1122,6 +1143,142 @@ impl AttachPromptState {
             response,
         })
     }
+}
+
+fn render_multi_toggle(
+    active: &ActivePrompt,
+    content: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    let PromptField::MultiToggle { options, .. } = &active.envelope.request.field else {
+        return false;
+    };
+    let PromptWidgetState::MultiToggle {
+        cursor,
+        selected,
+        scroll,
+    } = &active.state
+    else {
+        return false;
+    };
+    let visible = usize::from(content.height);
+    let start = (*scroll).min(options.len().saturating_sub(visible));
+    let end = start.saturating_add(visible).min(options.len());
+    for (visible_row, (index, option)) in
+        options.iter().enumerate().take(end).skip(start).enumerate()
+    {
+        let Ok(row) = u16::try_from(visible_row) else {
+            break;
+        };
+        let mut state = CheckboxState::new(selected.contains(&index));
+        state.set_focused(index == *cursor);
+        Checkbox::new(&option.label)
+            .styles(CheckboxStyles {
+                normal: theme.text,
+                focused: theme.focused,
+                hovered: theme.focused,
+                pressed: theme.focused,
+                disabled: theme.muted,
+            })
+            .render_with_fallback_style(
+                Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
+                &state,
+                frame,
+                theme.background,
+            );
+    }
+    true
+}
+
+fn render_confirm(
+    active: &ActivePrompt,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    let PromptField::Confirm {
+        yes_label,
+        no_label,
+        ..
+    } = &active.envelope.request.field
+    else {
+        return false;
+    };
+    let PromptWidgetState::Confirm { selected_yes } = active.state else {
+        return false;
+    };
+    let body = active
+        .envelope
+        .request
+        .message
+        .as_ref()
+        .map(|message| message.lines().map(Line::raw).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let actions = [
+        ActionButton::new("yes", yes_label.clone()),
+        ActionButton::new("no", no_label.clone()),
+    ];
+    let mut actions_state = ActionRowState::new();
+    actions_state.set_focused(Some(usize::from(!selected_yes)));
+    Dialog::new(&body, &actions, theme)
+        .title(active.envelope.request.title.clone())
+        .sizing(ModalSizing::fixed(
+            Size::new(area.width, area.height),
+            Insets::new(0, 0, 0, 0),
+        ))
+        .padding(Insets::new(0, 1, 0, 1))
+        .render(
+            area,
+            &DialogState {
+                actions: actions_state,
+            },
+            frame,
+        );
+    true
+}
+
+fn render_text_input(
+    active: &ActivePrompt,
+    content: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    let PromptField::TextInput {
+        placeholder,
+        required,
+        ..
+    } = &active.envelope.request.field
+    else {
+        return false;
+    };
+    let PromptWidgetState::TextInput { buffer, error } = &active.state else {
+        return false;
+    };
+    let mut state = TextInputState::new(buffer.clone());
+    let mut component = TextInputBox::new(TextInputPolicy::chat_composer())
+        .required(*required)
+        .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)))
+        .styles(TextInputBoxStyles {
+            text: theme.text,
+            focused_text: theme.text,
+            disabled_text: theme.muted,
+            placeholder: theme.muted,
+            selection: theme.focused,
+            border: theme.border,
+            focused_border: theme.focused,
+            background: theme.background,
+            focused_background: theme.background,
+            disabled_background: theme.background,
+        });
+    if let Some(placeholder) = placeholder {
+        component = component.placeholder(placeholder);
+    }
+    if let Some(error) = error {
+        component = component.error(error);
+    }
+    component.render(content, &mut state, frame);
+    true
 }
 
 fn render_single_select(
