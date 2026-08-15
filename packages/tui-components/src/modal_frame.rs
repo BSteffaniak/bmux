@@ -233,6 +233,15 @@ impl ModalFrame {
         self.panel().render(self.panel_area(parent), frame);
     }
 
+    /// Render this frame without outer chrome while preserving the same
+    /// border-reserved content geometry for extension-owned decoration.
+    pub fn render_without_chrome(&self, parent: Rect, frame: &mut Frame<'_>) {
+        if let Some(scrim) = self.theme.scrim {
+            frame.fill(parent, " ", scrim);
+        }
+        frame.fill(self.panel_area(parent), " ", self.theme.background);
+    }
+
     /// Render one line inside this modal using the theme text style as an
     /// opaque fallback.
     pub fn render_line(&self, area: Rect, line: &Line, frame: &mut Frame<'_>) {

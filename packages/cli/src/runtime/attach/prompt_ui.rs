@@ -993,6 +993,7 @@ impl AttachPromptState {
         &mut self,
         geometry: TerminalGeometry,
         appearance: &RuntimeAppearance,
+        extension_chrome: bool,
     ) -> Option<AttachPromptOverlayRender> {
         let layout = prompt_overlay_layout(
             self.active.as_ref().map(|active| &active.envelope.request),
@@ -1024,7 +1025,11 @@ impl AttachPromptState {
         });
         let mut buffer = surface_buffer(area);
         let mut frame = Frame::new(&mut buffer);
-        modal.render(area, &mut frame);
+        if extension_chrome {
+            modal.render_without_chrome(area, &mut frame);
+        } else {
+            modal.render(area, &mut frame);
+        }
         let content = modal.content_area(area);
         let mut component_cursor = None;
         let rendered_palette = render_command_palette(active, content, &mut frame, theme);
@@ -2460,7 +2465,7 @@ mod tests {
         let geometry = TerminalGeometry { cols: 20, rows: 6 };
 
         let render = state
-            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default())
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
             .expect("compact palette should render");
 
         assert_eq!(render.surface.rect.x, 0);
@@ -2484,6 +2489,7 @@ mod tests {
             .attach_prompt_overlay_render(
                 TerminalGeometry { cols: 80, rows: 24 },
                 &RuntimeAppearance::default(),
+                false,
             )
             .expect("palette should render");
 
@@ -2508,7 +2514,7 @@ mod tests {
         );
         let geometry = TerminalGeometry { cols: 80, rows: 24 };
         let _ = state
-            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default())
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
             .expect("palette should render");
         let active = state.active.as_ref().expect("active prompt");
         let hit = active.hits.regions().get(1).expect("second option hit");
@@ -2546,6 +2552,7 @@ mod tests {
                     rows: 60,
                 },
                 &RuntimeAppearance::default(),
+                false,
             )
             .expect("palette should render");
         let centered_y = (60_u16.saturating_sub(render.surface.rect.h)) / 2;
@@ -2555,6 +2562,30 @@ mod tests {
             render.surface.rect.y,
             (60_u16.saturating_sub(render.surface.rect.h)) / 3
         );
+    }
+
+    #[test]
+    fn extension_owned_prompt_chrome_suppresses_fallback_border() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::text_input("Name"),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+                true,
+            )
+            .expect("prompt should render");
+        let top_y = render.surface.rect.y;
+        let top = render.ops.iter().find_map(|op| match op {
+            bmux_plugin::RenderOp::TextRun { y, text, .. } if *y == top_y => Some(text.as_str()),
+            _ => None,
+        });
+
+        assert!(top.is_some_and(|line| !line.contains('╭') && !line.contains('╮')));
     }
 
     #[test]
@@ -2569,6 +2600,7 @@ mod tests {
             .attach_prompt_overlay_render(
                 TerminalGeometry { cols: 80, rows: 24 },
                 &RuntimeAppearance::default(),
+                false,
             )
             .expect("prompt should render");
         let top_y = render.surface.rect.y;
@@ -2763,6 +2795,7 @@ mod tests {
             .attach_prompt_overlay_render(
                 TerminalGeometry { cols: 80, rows: 24 },
                 &RuntimeAppearance::default(),
+                false,
             )
             .expect("confirm should render");
         let text = render
@@ -2868,12 +2901,14 @@ mod tests {
             .attach_prompt_overlay_render(
                 TerminalGeometry { cols: 24, rows: 8 },
                 &RuntimeAppearance::default(),
+                false,
             )
             .expect("narrow input should render");
         let wide = state
             .attach_prompt_overlay_render(
                 TerminalGeometry { cols: 80, rows: 24 },
                 &RuntimeAppearance::default(),
+                false,
             )
             .expect("wide input should render");
 

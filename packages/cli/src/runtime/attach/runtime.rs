@@ -8027,6 +8027,23 @@ fn queue_retained_extension_ops(
     Ok(wrote)
 }
 
+fn retained_surface_extension_chrome_owned(
+    surface_id: Uuid,
+    rect: DamageRect,
+    extensions: &[Arc<dyn bmux_plugin::AttachRenderExtension>],
+    capabilities: bmux_plugin::TerminalRenderCapabilities,
+) -> bool {
+    let extension_rect = ExtensionRect::new(rect.x, rect.y, rect.w, rect.h);
+    let context = RenderExtensionContext {
+        capabilities,
+        surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+    };
+    extensions.iter().any(|extension| {
+        extension.surface_chrome_with_context(surface_id, &extension_rect, &context)
+            == bmux_plugin::RenderSurfaceChrome::Extension
+    })
+}
+
 fn frame_uses_synchronized_update(frame_damage: &bmux_attach_pipeline::FrameDamage) -> bool {
     frame_damage.scene_damaged() || frame_damage.overlay_damaged()
 }
@@ -8333,9 +8350,21 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         retained_help_overlay_surface(surface, help_lines, help_scroll, runtime_appearance)
     });
     let prompt_overlay_render = if view_state.prompt.is_active() {
-        view_state
-            .prompt
-            .attach_prompt_overlay_render(geometry, runtime_appearance)
+        let extensions = bmux_plugin::registered_render_extensions();
+        let prompt_surface = view_state.prompt.overlay_surface(geometry);
+        let extension_chrome = prompt_surface.as_ref().is_some_and(|surface| {
+            retained_surface_extension_chrome_owned(
+                surface.id,
+                attach_surface_damage_rect(surface),
+                &extensions,
+                terminal_render_capabilities(view_state),
+            )
+        });
+        view_state.prompt.attach_prompt_overlay_render(
+            geometry,
+            runtime_appearance,
+            extension_chrome,
+        )
     } else {
         None
     };
