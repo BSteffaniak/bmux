@@ -5,8 +5,16 @@ use bmux_terminal_grid::{
     TerminalGridStream,
 };
 use bmux_tui::ansi::ansi_to_lines;
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Color, Line, Span, Style};
+use bmux_tui::selection::SelectionCapture;
 use bmux_tui::style::Modifier;
+
+use crate::selection::{
+    ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
+    register_component_scope,
+};
 
 /// Default maximum number of terminal rows rendered inline.
 pub const MAX_INLINE_TERMINAL_ROWS: usize = 28;
@@ -46,6 +54,72 @@ pub enum TerminalViewerSizing {
         visible_rows: usize,
         max_rows: usize,
     },
+}
+
+/// Register an isolated selection scope over decoded terminal grid text.
+///
+/// The logical document is the terminal emulator's visible text projection,
+/// not the raw ANSI/control stream. Status and truncation chrome are excluded.
+pub fn register_terminal_viewer_selection(
+    input: TerminalViewerInput<'_>,
+    area: Rect,
+    selection: &ComponentSelectionState,
+    policy: &ComponentSelectionPolicy,
+    frame: &mut Frame<'_>,
+) -> ComponentSelectionOutcome {
+    let isolated_policy = ComponentSelectionPolicy {
+        enabled: policy.enabled,
+        content_capture: policy.content_capture,
+        chrome_capture: SelectionCapture::Disabled,
+        auto_scroll: policy.auto_scroll,
+    };
+    let content_start = terminal_viewer_chrome_row_count(&input, area.width);
+    let content_area = Rect::new(
+        area.x,
+        area.y.saturating_add(content_start),
+        area.width,
+        area.height.saturating_sub(content_start),
+    );
+    let scope_outcome =
+        register_component_scope(frame, selection, &isolated_policy, area, content_area);
+    if !policy.enabled || content_area.is_empty() {
+        return scope_outcome;
+    }
+    let lines = terminal_output_lines(&input);
+    let mut source_offset = 0_usize;
+    let mut fragments = 0_usize;
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .take(usize::from(content_area.height))
+    {
+        let text = line.plain_text();
+        for fragment in bmux_tui::selection::plain_text_fragments(
+            selection.scope_id.clone(),
+            format!("{}.grid", selection.scope_id.as_str()),
+            Rect::new(
+                content_area.x.saturating_add(4),
+                content_area
+                    .y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                content_area.width.saturating_sub(4),
+                1,
+            ),
+            u64::try_from(index).unwrap_or(u64::MAX),
+            &text,
+            source_offset,
+            selection.revision,
+        ) {
+            frame.push_selection_fragment(fragment);
+            fragments = fragments.saturating_add(1);
+        }
+        source_offset = source_offset.saturating_add(text.len().saturating_add(1));
+    }
+    if fragments == 0 {
+        scope_outcome
+    } else {
+        ComponentSelectionOutcome::ContentRegistered { fragments }
+    }
 }
 
 /// Input used to render terminal transcript rows.
@@ -138,6 +212,31 @@ fn terminal_truncation_status(input: &TerminalViewerInput<'_>) -> String {
         }
         _ => "output truncated".to_owned(),
     }
+}
+
+fn terminal_viewer_chrome_row_count(input: &TerminalViewerInput<'_>, width: u16) -> u16 {
+    let mut rows = Vec::new();
+    if input.show_status {
+        push_wrapped_styled_text(
+            &mut rows,
+            vec![Span::styled("  ", muted_style())],
+            &terminal_status(input),
+            width,
+            terminal_status_style(input),
+            muted_style(),
+        );
+    }
+    if input.output_truncated {
+        push_wrapped_styled_text(
+            &mut rows,
+            vec![Span::styled("  ", muted_style())],
+            &terminal_truncation_status(input),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    u16::try_from(rows.len()).unwrap_or(u16::MAX)
 }
 
 fn terminal_output_lines(input: &TerminalViewerInput<'_>) -> Vec<Line> {
@@ -364,6 +463,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui::buffer::Buffer;
 
     fn rendered_text(rows: &[Line]) -> String {
         rows.iter()
@@ -522,5 +622,108 @@ mod tests {
 
         assert_eq!(rows.len(), 3);
         assert!(rendered_text(&rows).contains("one"));
+    }
+
+    #[test]
+    fn terminal_selection_can_explicitly_delegate_to_parent() {
+        let input = TerminalViewerInput {
+            output: "text\n",
+            columns: 80,
+            rows: 24,
+            exit_code: None,
+            timed_out: None,
+            elapsed: None,
+            show_status: false,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 4));
+        let mut frame = Frame::new(&mut buffer);
+        let state = ComponentSelectionState::new("terminal").parent("transcript");
+        let policy = ComponentSelectionPolicy {
+            content_capture: SelectionCapture::Delegate,
+            ..ComponentSelectionPolicy::content()
+        };
+
+        register_terminal_viewer_selection(
+            input,
+            Rect::new(0, 0, 40, 4),
+            &state,
+            &policy,
+            &mut frame,
+        );
+
+        let scope = &frame.selection().scopes()[0];
+        assert_eq!(scope.capture, SelectionCapture::Delegate);
+        assert_eq!(
+            scope
+                .parent
+                .as_ref()
+                .map(bmux_tui::selection::SelectionScopeId::as_str),
+            Some("transcript")
+        );
+    }
+
+    #[test]
+    fn selection_is_isolated_and_maps_decoded_grid_text() {
+        let input = TerminalViewerInput {
+            output: "first\rsecond\nwide界\n",
+            columns: 80,
+            rows: 24,
+            exit_code: Some(0),
+            timed_out: Some(false),
+            elapsed: None,
+            show_status: true,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 8));
+        let mut frame = Frame::new(&mut buffer);
+        let state = ComponentSelectionState::new("terminal").parent("transcript");
+
+        let outcome = register_terminal_viewer_selection(
+            input,
+            Rect::new(0, 0, 40, 8),
+            &state,
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+
+        assert!(matches!(
+            outcome,
+            ComponentSelectionOutcome::ContentRegistered { .. }
+        ));
+        let scope = &frame.selection().scopes()[0];
+        assert_eq!(scope.capture, SelectionCapture::Capture);
+        assert_eq!(scope.initiation_area.y, 1);
+        let fragments = frame.selection().fragments();
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.scope_id.as_str() == "terminal")
+        );
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.content_id.as_str() == "terminal.grid")
+        );
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.source_range == (0..1))
+        );
+        let decoded_len = terminal_output_lines(&input)
+            .iter()
+            .map(|line| line.plain_text().len().saturating_add(1))
+            .sum::<usize>();
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.source_range.end <= decoded_len)
+        );
     }
 }

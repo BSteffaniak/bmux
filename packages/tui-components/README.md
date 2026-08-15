@@ -37,6 +37,19 @@ background, or modifier wins, while omitted values inherit from that surface. Ov
 also carry a scrim. `terminal_default()` preserves `Color::Default` at every depth; `opaque_dark()`
 and `opaque_light()` provide neutral gallery/reference palettes rather than product theme policy.
 
+## Logical content selection
+
+`selection` provides opt-in `ComponentSelectionPolicy`, `ComponentSelectionState`, styles, outcomes,
+and bounded autoscroll cadence. Components register caller-owned logical identities and source
+boundaries; they never derive copied text from terminal cells. Pane content captures locally while
+chrome delegates by default, PanelGroup supplies deterministic sibling ordering without consuming
+divider handles, and TextView maps wrapped/scrolled visible graphemes to original UTF-8 offsets.
+SourceViewer and unified DiffViewer map visible rows to canonical source bytes; DiffViewer declines
+ambiguous side-by-side projections. TerminalViewer deliberately selects its decoded terminal-grid
+text document rather than claiming ANSI/control bytes as source provenance. Editable TextInput
+remains isolated from outer selection unless explicitly configured to delegate. Consumers retain
+the BMUX selection controller and own viewport mutation, source resolution, and clipboard behavior.
+
 The feature-gated `compact` helpers provide grapheme-safe width truncation, rich metadata header
 wrapping, and compact byte formatting. The feature-gated `terminal-viewer` owns bounded generic
 terminal-grid decoding and ANSI preservation; applications remain responsible for process, shell,

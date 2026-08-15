@@ -1052,7 +1052,7 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
-    use bmux_tui::prelude::{Alignment, Line};
+    use bmux_tui::prelude::{Alignment, Line, TextWrap};
     use bmux_tui::style::{Color, Style};
 
     use super::{
@@ -1456,6 +1456,39 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("Nothing here  ")
         );
+    }
+
+    #[test]
+    fn transformed_selection_offsets_survive_wrap_scroll_and_horizontal_clipping() {
+        let lines = [Line::from("a界e\u{301}z"), Line::from("second")];
+        let mut state = TextViewState::new();
+        state.set_vertical_scroll(1);
+        let view = TextView::new(&lines).policy(TextViewPolicy {
+            wrap: TextWrap::None,
+            trim: false,
+            ..TextViewPolicy::bare()
+        });
+        state.set_horizontal_scroll(3);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let selection = crate::selection::ComponentSelectionState::new("text");
+
+        view.register_selection(
+            Rect::new(0, 0, 3, 1),
+            &state,
+            &selection,
+            &crate::selection::ComponentSelectionPolicy::content(),
+            "document",
+            &mut frame,
+        );
+
+        let fragments = frame.selection().fragments();
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.source_range.start >= 9)
+        );
+        assert!(fragments.iter().all(|fragment| fragment.area.right() <= 3));
     }
 
     #[test]

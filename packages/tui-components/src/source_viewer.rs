@@ -1,6 +1,13 @@
 //! Generic source-code card and gutter rendering.
 
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Color, Line, Span, Style};
+
+use crate::selection::{
+    ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
+    register_component_scope,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -60,6 +67,114 @@ impl Default for SourceViewerStyle {
             gutter: muted,
             truncated: muted,
         }
+    }
+}
+
+/// Register exact source-content mappings for a rendered source card.
+///
+/// Border, gutters, and truncation messages remain non-source chrome. Wrapped
+/// source rows retain original UTF-8 byte offsets.
+pub fn register_source_viewer_selection(
+    input: SourceViewerInput<'_>,
+    area: Rect,
+    selection: &ComponentSelectionState,
+    policy: &ComponentSelectionPolicy,
+    frame: &mut Frame<'_>,
+) -> ComponentSelectionOutcome {
+    let scope_outcome = register_component_scope(frame, selection, policy, area, area);
+    if !policy.enabled || area.is_empty() {
+        return scope_outcome;
+    }
+    let lines = input
+        .contents
+        .lines()
+        .take(input.max_lines)
+        .collect::<Vec<_>>();
+    let last_line = input
+        .start_line
+        .saturating_add(lines.len().saturating_sub(1));
+    let number_width = usize::from(input.line_numbers) * last_line.to_string().len().max(1);
+    let body_width = usize::from(area.width.saturating_sub(2))
+        .saturating_sub(source_card_chrome_width(number_width))
+        .max(1);
+    let content_x = area
+        .x
+        .saturating_add(4)
+        .saturating_add(u16::try_from(number_width).unwrap_or(u16::MAX))
+        .saturating_add(u16::from(number_width > 0) * 3);
+    let mut source_offset = 0_usize;
+    let mut screen_y = area.y.saturating_add(1);
+    let mut fragments = 0_usize;
+    for (line_index, source) in lines.into_iter().enumerate() {
+        let mut chunk = String::new();
+        let mut chunk_width = 0_usize;
+        let mut chunk_offset = source_offset;
+        for grapheme in source.graphemes(true).chain(std::iter::once("")) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if !chunk.is_empty()
+                && (grapheme.is_empty() || chunk_width.saturating_add(grapheme_width) > body_width)
+            {
+                for fragment in bmux_tui::selection::plain_text_fragments(
+                    selection.scope_id.clone(),
+                    format!(
+                        "{}.line.{}",
+                        selection.scope_id.as_str(),
+                        input.start_line + line_index
+                    ),
+                    Rect::new(
+                        content_x,
+                        screen_y,
+                        u16::try_from(body_width).unwrap_or(u16::MAX),
+                        1,
+                    ),
+                    u64::try_from(line_index).unwrap_or(u64::MAX),
+                    &chunk,
+                    chunk_offset,
+                    selection.revision,
+                ) {
+                    frame.push_selection_fragment(fragment);
+                    fragments = fragments.saturating_add(1);
+                }
+                chunk_offset = chunk_offset.saturating_add(chunk.len());
+                chunk.clear();
+                chunk_width = 0;
+                screen_y = screen_y.saturating_add(1);
+            }
+            if !grapheme.is_empty() {
+                chunk.push_str(grapheme);
+                chunk_width = chunk_width.saturating_add(grapheme_width);
+            }
+        }
+        if source.is_empty() {
+            for fragment in bmux_tui::selection::plain_text_fragments(
+                selection.scope_id.clone(),
+                format!(
+                    "{}.line.{}",
+                    selection.scope_id.as_str(),
+                    input.start_line + line_index
+                ),
+                Rect::new(
+                    content_x,
+                    screen_y,
+                    u16::try_from(body_width).unwrap_or(u16::MAX),
+                    1,
+                ),
+                u64::try_from(line_index).unwrap_or(u64::MAX),
+                "",
+                source_offset,
+                selection.revision,
+            ) {
+                frame.push_selection_fragment(fragment);
+                fragments = fragments.saturating_add(1);
+            }
+            screen_y = screen_y.saturating_add(1);
+        }
+        source_offset = source_offset.saturating_add(source.len().saturating_add(1));
+    }
+    if fragments == 0 {
+        scope_outcome
+    } else {
+        ComponentSelectionOutcome::ContentRegistered { fragments }
     }
 }
 
@@ -250,6 +365,7 @@ fn spans_width(spans: &[Span]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui::buffer::Buffer;
 
     fn rendered(rows: &[Line]) -> String {
         rows.iter()
@@ -448,5 +564,46 @@ mod tests {
             40,
         ));
         assert!(!output.contains("1 │"), "{output}");
+    }
+
+    #[test]
+    fn selection_wraps_unicode_at_grapheme_boundaries_with_source_offsets() {
+        let input = SourceViewerInput {
+            styled_lines: None,
+            label: "unicode",
+            contents: "a界e\u{301}z",
+            start_line: 1,
+            max_lines: 30,
+            truncated_message: "truncated",
+            line_numbers: false,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 6));
+        let mut frame = Frame::new(&mut buffer);
+        let state = ComponentSelectionState::new("source");
+
+        register_source_viewer_selection(
+            input,
+            Rect::new(0, 0, 10, 6),
+            &state,
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+
+        let fragments = frame.selection().fragments();
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.source_range == (1..4))
+        );
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.source_range == (4..7))
+        );
+        assert!(fragments.iter().all(|fragment| {
+            input.contents.is_char_boundary(fragment.source_range.start)
+                && input.contents.is_char_boundary(fragment.source_range.end)
+        }));
+        assert!(fragments.iter().any(|fragment| fragment.area.y > 1));
     }
 }

@@ -771,10 +771,12 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::selection::SelectionCapture;
 
     use super::{
         Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
     };
+    use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
 
     #[test]
     fn inner_area_accounts_for_border_and_padding() {
@@ -1008,6 +1010,47 @@ mod tests {
         let outcome = pane.handle_event(&mut state, &mouse(MouseEventKind::ScrollDown, 0, 0));
 
         assert_eq!(outcome, PaneOutcome::Ignored);
+    }
+
+    #[test]
+    fn resize_handles_keep_precedence_over_nested_selection_scope() {
+        let pane = Pane::new().padding(Insets::all(1)).policy(PanePolicy {
+            mouse: PaneMousePolicy {
+                enabled: true,
+                click_to_focus: true,
+                title_bar_drag: false,
+                scroll_wheel: false,
+                resize_handles: ResizeHandles::ALL,
+            },
+            bounds: PaneBoundsPolicy::default(),
+        });
+        let mut state = PaneState::new(Rect::new(0, 0, 10, 5));
+        let mut buffer = Buffer::empty(state.area);
+        let mut frame = Frame::new(&mut buffer);
+        let selection = ComponentSelectionState::new("pane").parent("workspace");
+
+        pane.register_selection(
+            &state,
+            &selection,
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+        pane.render_with_id("pane", &state, &mut frame);
+
+        let scope = &frame.selection().scopes()[0];
+        assert_eq!(scope.initiation_area, pane.inner_area(&state));
+        assert_eq!(scope.capture, SelectionCapture::Capture);
+        assert!(frame.hits().regions().iter().any(|region| {
+            region.role == HitRole::ResizeHandle && region.area.contains(Point::new(9, 4))
+        }));
+        assert_eq!(
+            pane.handle_event(
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left), 9, 4),
+            ),
+            PaneOutcome::FocusRequested
+        );
+        assert!(state.is_dragging());
     }
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {

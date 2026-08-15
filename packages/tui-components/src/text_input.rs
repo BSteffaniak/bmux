@@ -922,6 +922,28 @@ mod tests {
     }
 
     #[test]
+    fn outer_selection_is_isolated_by_default_and_requires_explicit_delegation() {
+        assert_eq!(
+            TextInputOuterSelectionPolicy::default(),
+            TextInputOuterSelectionPolicy::Isolated
+        );
+        assert_eq!(
+            TextInputPolicy::raw().outer_selection,
+            TextInputOuterSelectionPolicy::Isolated
+        );
+        assert_eq!(
+            TextInputPolicy::chat_composer().outer_selection,
+            TextInputOuterSelectionPolicy::Isolated
+        );
+        assert_eq!(
+            TextInputPolicy::raw()
+                .outer_selection(TextInputOuterSelectionPolicy::Delegate)
+                .outer_selection,
+            TextInputOuterSelectionPolicy::Delegate
+        );
+    }
+
+    #[test]
     fn raw_policy_ignores_keyboard_and_mouse() {
         let policy = TextInputPolicy::raw();
         let control = TextInputControl::new(&policy);

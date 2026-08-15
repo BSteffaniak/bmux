@@ -1,6 +1,12 @@
 //! Generic diff models, layout, and rendering.
 
+use crate::selection::{
+    ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
+    register_component_scope,
+};
 use crate::source_viewer::pad_card_spans;
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -79,6 +85,112 @@ pub struct DiffDocument {
     pub lines: Vec<DiffLine>,
     pub added: u32,
     pub removed: u32,
+}
+
+/// Register exact old/new source mappings for visible unified diff rows.
+///
+/// Diff chrome, gutters, omission rows, and side-by-side projections are not
+/// falsely represented as contiguous source. Each visible content row owns a
+/// stable side-specific content identity and original UTF-8 line byte range.
+pub fn register_diff_viewer_selection(
+    input: DiffViewerInput<'_>,
+    area: Rect,
+    selection: &ComponentSelectionState,
+    policy: &ComponentSelectionPolicy,
+    frame: &mut Frame<'_>,
+) -> ComponentSelectionOutcome {
+    let scope_outcome = register_component_scope(frame, selection, policy, area, area);
+    if !policy.enabled || area.is_empty() {
+        return scope_outcome;
+    }
+    let diff = diff_from_text_at_lines(
+        input.label,
+        input.old_text,
+        input.new_text,
+        input.old_start_line,
+        input.new_start_line,
+    );
+    let visible_lines = diff
+        .lines
+        .iter()
+        .filter(|line| is_preview_content_line(line.kind))
+        .cloned()
+        .collect::<Vec<_>>();
+    if visible_lines.is_empty() {
+        return scope_outcome;
+    }
+    let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
+    let layout = resolved_layout(input.layout, area.width, diff.added, diff.removed);
+    if layout == DiffViewerLayout::SideBySide {
+        return scope_outcome;
+    }
+    let card_width = card_width(&preview, area.width.saturating_sub(2));
+    let body_width = usize::from(card_width)
+        .saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
+        .max(1);
+    let content_x = area
+        .x
+        .saturating_add(u16::try_from(INLINE_DIFF_BODY_CHROME_WIDTH).unwrap_or(u16::MAX));
+    let mut screen_y = area
+        .y
+        .saturating_add(u16::try_from(diff_viewer_header_rows(&input)).unwrap_or(u16::MAX))
+        .saturating_add(1);
+    let old_offsets = line_offsets(input.old_text);
+    let new_offsets = line_offsets(input.new_text);
+    let mut rendered_rows = 0_usize;
+    let mut fragments = 0_usize;
+    for row in preview {
+        let PreviewRow::Line(line) = row else {
+            screen_y = screen_y.saturating_add(1);
+            rendered_rows = rendered_rows.saturating_add(1);
+            continue;
+        };
+        let chunks = wrapped_source_chunks(&line.content, body_width);
+        for (chunk_index, (offset, chunk)) in chunks.into_iter().enumerate() {
+            if rendered_rows >= MAX_INLINE_DIFF_RENDER_ROWS {
+                break;
+            }
+            let Some((content_id, source_base)) = diff_line_source(
+                line,
+                input.old_start_line,
+                input.new_start_line,
+                &old_offsets,
+                &new_offsets,
+                &selection.scope_id,
+            ) else {
+                screen_y = screen_y.saturating_add(1);
+                rendered_rows = rendered_rows.saturating_add(1);
+                continue;
+            };
+            for fragment in bmux_tui::selection::plain_text_fragments(
+                selection.scope_id.clone(),
+                content_id,
+                Rect::new(
+                    content_x,
+                    screen_y,
+                    u16::try_from(body_width).unwrap_or(u16::MAX),
+                    1,
+                ),
+                diff_line_order(line, chunk_index),
+                chunk,
+                source_base.saturating_add(offset),
+                selection.revision,
+            ) {
+                frame.push_selection_fragment(fragment);
+                fragments = fragments.saturating_add(1);
+            }
+            screen_y = screen_y.saturating_add(1);
+            rendered_rows = rendered_rows.saturating_add(1);
+        }
+        if rendered_rows >= MAX_INLINE_DIFF_RENDER_ROWS {
+            break;
+        }
+    }
+    if fragments == 0 {
+        scope_outcome
+    } else {
+        ComponentSelectionOutcome::ContentRegistered { fragments }
+    }
 }
 
 /// Build a diff document from old and new text.
@@ -946,6 +1058,74 @@ const fn is_preview_content_line(kind: DiffLineKind) -> bool {
     )
 }
 
+fn diff_viewer_header_rows(input: &DiffViewerInput<'_>) -> usize {
+    4_usize
+        .saturating_add(usize::from(input.argument_bytes.is_some()))
+        .saturating_add(usize::from(input.subtitle.is_some()))
+        .saturating_add(usize::from(input.truncated))
+}
+
+fn line_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    offsets.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index.saturating_add(1))),
+    );
+    offsets
+}
+
+fn diff_line_source(
+    line: &DiffLine,
+    old_start_line: u32,
+    new_start_line: u32,
+    old_offsets: &[usize],
+    new_offsets: &[usize],
+    scope_id: &bmux_tui::selection::SelectionScopeId,
+) -> Option<(String, usize)> {
+    let (side, number, start_line, offsets) = match line.kind {
+        DiffLineKind::Removed => ("old", line.old_line?, old_start_line, old_offsets),
+        DiffLineKind::Added | DiffLineKind::Context => {
+            ("new", line.new_line?, new_start_line, new_offsets)
+        }
+        DiffLineKind::FileHeader | DiffLineKind::HunkHeader => return None,
+    };
+    let index = usize::try_from(number.saturating_sub(start_line)).ok()?;
+    let offset = *offsets.get(index)?;
+    Some((
+        format!("{}.diff.{side}.line.{number}", scope_id.as_str()),
+        offset,
+    ))
+}
+
+fn diff_line_order(line: &DiffLine, chunk_index: usize) -> u64 {
+    let number = line.new_line.or(line.old_line).unwrap_or_default();
+    u64::from(number)
+        .saturating_mul(2)
+        .saturating_add(u64::from(line.kind == DiffLineKind::Added))
+        .saturating_mul(1_000)
+        .saturating_add(u64::try_from(chunk_index).unwrap_or(u64::MAX))
+}
+
+fn wrapped_source_chunks(source: &str, width: usize) -> Vec<(usize, &str)> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+    let mut start = 0_usize;
+    let mut display_width = 0_usize;
+    for (offset, grapheme) in source.grapheme_indices(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if display_width > 0 && display_width.saturating_add(grapheme_width) > width {
+            output.push((start, &source[start..offset]));
+            start = offset;
+            display_width = 0;
+        }
+        display_width = display_width.saturating_add(grapheme_width);
+    }
+    output.push((start, &source[start..]));
+    output
+}
+
 fn inline_preview(lines: &[DiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
     if lines.len() <= max_rows || max_rows < 4 {
         return lines.iter().map(PreviewRow::Line).collect();
@@ -1552,6 +1732,7 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui::buffer::Buffer;
 
     fn test_diff_viewer_rows_with_layout(
         label: &str,
@@ -2007,6 +2188,86 @@ mod tests {
         );
         let rendered = format!("{rows:?}");
         assert!(rendered.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn unified_selection_maps_old_and_new_source_lines_without_chrome() {
+        let input = DiffViewerInput {
+            label: "src/lib.rs",
+            old_text: "same\nold界\n",
+            new_text: "same\nnew界\n",
+            old_start_line: 10,
+            new_start_line: 20,
+            line_numbers_known: true,
+            title: "Diff",
+            subtitle: None,
+            argument_bytes: None,
+            truncated: false,
+            layout: DiffViewerLayout::Unified,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 14));
+        let mut frame = Frame::new(&mut buffer);
+        let state = ComponentSelectionState::new("diff");
+
+        let outcome = register_diff_viewer_selection(
+            input,
+            Rect::new(0, 0, 24, 14),
+            &state,
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+
+        assert!(matches!(
+            outcome,
+            ComponentSelectionOutcome::ContentRegistered { .. }
+        ));
+        let fragments = frame.selection().fragments();
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.content_id.as_str() == "diff.diff.old.line.11")
+        );
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.content_id.as_str() == "diff.diff.new.line.21")
+        );
+        assert!(fragments.iter().all(|fragment| fragment.area.x >= 14));
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.source_range == (8..11))
+        );
+    }
+
+    #[test]
+    fn side_by_side_selection_refuses_false_contiguous_projection() {
+        let input = DiffViewerInput {
+            label: "src/lib.rs",
+            old_text: "old\n",
+            new_text: "new\n",
+            old_start_line: 1,
+            new_start_line: 1,
+            line_numbers_known: true,
+            title: "Diff",
+            subtitle: None,
+            argument_bytes: None,
+            truncated: false,
+            layout: DiffViewerLayout::SideBySide,
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 12));
+        let mut frame = Frame::new(&mut buffer);
+
+        let outcome = register_diff_viewer_selection(
+            input,
+            Rect::new(0, 0, 120, 12),
+            &ComponentSelectionState::new("diff"),
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+
+        assert_eq!(outcome, ComponentSelectionOutcome::ScopeRegistered);
+        assert!(frame.selection().fragments().is_empty());
     }
 
     fn line_width(line: &Line) -> usize {

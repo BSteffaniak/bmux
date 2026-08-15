@@ -1,5 +1,7 @@
 //! Shared opt-in content-selection integration for reusable components.
 
+use std::time::{Duration, Instant};
+
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::selection::{
@@ -7,6 +9,49 @@ use bmux_tui::selection::{
     SelectionScope, SelectionScopeId,
 };
 use bmux_tui::style::Style;
+
+/// Bounded cadence state for repeated edge-autoscroll requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionAutoScrollCadence {
+    interval: Duration,
+    next_due: Option<Instant>,
+}
+
+impl SelectionAutoScrollCadence {
+    /// Create cadence with a minimum interval between applied scroll steps.
+    #[must_use]
+    pub const fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_due: None,
+        }
+    }
+
+    /// Return whether one active request may be applied at `now`.
+    pub fn admit(&mut self, active: bool, now: Instant) -> bool {
+        if !active {
+            self.next_due = None;
+            return false;
+        }
+        if self.next_due.is_some_and(|due| now < due) {
+            return false;
+        }
+        self.next_due = Some(now.checked_add(self.interval).unwrap_or(now));
+        true
+    }
+
+    /// Return the next due instant while active.
+    #[must_use]
+    pub const fn next_due(&self) -> Option<Instant> {
+        self.next_due
+    }
+}
+
+impl Default for SelectionAutoScrollCadence {
+    fn default() -> Self {
+        Self::new(Duration::from_millis(50))
+    }
+}
 
 /// Component behavior for hierarchical logical content selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,8 +188,13 @@ pub fn register_component_scope(
     } else {
         policy.content_capture
     };
+    let initiation_area = if policy.chrome_capture == SelectionCapture::Capture {
+        outer_area
+    } else {
+        content_area
+    };
     let mut scope = SelectionScope::new(state.scope_id.clone(), outer_area)
-        .initiation_area(content_area)
+        .initiation_area(initiation_area)
         .capture(capture)
         .order(state.order)
         .revision(state.revision)
@@ -192,6 +242,49 @@ mod tests {
         assert_eq!(policy.content_capture, SelectionCapture::Capture);
         assert_eq!(policy.chrome_capture, SelectionCapture::Delegate);
         assert!(policy.auto_scroll.enabled);
+    }
+
+    #[test]
+    fn autoscroll_cadence_is_bounded_and_resets_when_inactive() {
+        let started = Instant::now();
+        let mut cadence = SelectionAutoScrollCadence::new(Duration::from_millis(20));
+        assert!(cadence.admit(true, started));
+        assert!(!cadence.admit(true, started + Duration::from_millis(10)));
+        assert!(cadence.admit(true, started + Duration::from_millis(20)));
+        assert!(!cadence.admit(false, started + Duration::from_millis(21)));
+        assert_eq!(cadence.next_due(), None);
+        assert!(cadence.admit(true, started + Duration::from_millis(22)));
+    }
+
+    #[test]
+    fn configured_chrome_capture_expands_initiation_to_outer_area() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
+        let mut frame = Frame::new(&mut buffer);
+        let policy = ComponentSelectionPolicy {
+            chrome_capture: SelectionCapture::Capture,
+            ..ComponentSelectionPolicy::content()
+        };
+
+        register_component_scope(
+            &mut frame,
+            &ComponentSelectionState::new("child").parent("root"),
+            &policy,
+            Rect::new(0, 0, 10, 4),
+            Rect::new(1, 1, 8, 2),
+        );
+
+        let scope = &frame.selection().scopes()[0];
+        assert_eq!(scope.initiation_area, Rect::new(0, 0, 10, 4));
+        assert_eq!(scope.capture, SelectionCapture::Capture);
+    }
+
+    #[test]
+    fn policy_defaults_are_explicitly_disabled() {
+        let policy = ComponentSelectionPolicy::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.content_capture, SelectionCapture::Disabled);
+        assert_eq!(policy.chrome_capture, SelectionCapture::Disabled);
+        assert!(!policy.auto_scroll.enabled);
     }
 
     #[test]

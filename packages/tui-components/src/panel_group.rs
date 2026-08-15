@@ -843,11 +843,13 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::selection::SelectionCapture;
 
     use super::{
         PanelGroup, PanelGroupAxis, PanelGroupConstraints, PanelGroupOutcome, PanelGroupPolicy,
         PanelGroupState, PanelSize,
     };
+    use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
 
     #[test]
     fn horizontal_layout_allocates_fixed_and_flex_panels() {
@@ -1021,6 +1023,54 @@ mod tests {
         group.render_dividers(Rect::new(0, 0, 5, 1), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  │  "));
+    }
+
+    #[test]
+    fn nested_panel_scopes_exclude_dividers_and_keep_resize_precedence() {
+        let group =
+            PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::resize_only());
+        let mut state = PanelGroupState::new([PanelSize::fixed(4), PanelSize::fixed(4)]);
+        let area = Rect::new(0, 0, 9, 3);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+
+        group.register_selection(
+            area,
+            &state,
+            &ComponentSelectionState::new("group"),
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+        group.render_dividers_with_id("group", area, &state, &mut frame);
+
+        let scopes = frame.selection().scopes();
+        assert_eq!(scopes.len(), 3);
+        assert_eq!(scopes[0].capture, SelectionCapture::Capture);
+        assert_eq!(
+            scopes[1]
+                .parent
+                .as_ref()
+                .map(bmux_tui::selection::SelectionScopeId::as_str),
+            Some("group")
+        );
+        assert_eq!(scopes[1].initiation_area, Rect::new(0, 0, 4, 3));
+        assert_eq!(scopes[2].initiation_area, Rect::new(5, 0, 4, 3));
+        assert!(
+            scopes[1..]
+                .iter()
+                .all(|scope| !scope.initiation_area.contains(Point::new(4, 1)))
+        );
+        assert!(frame.hits().regions().iter().any(|region| {
+            region.role == HitRole::ResizeHandle && region.area.contains(Point::new(4, 1))
+        }));
+        assert!(matches!(
+            group.handle_event(
+                area,
+                &mut state,
+                &mouse_event(MouseEventKind::Down(MouseButton::Left), 4, 1),
+            ),
+            PanelGroupOutcome::DividerDragStarted { divider: 0 }
+        ));
     }
 
     fn mouse_event(kind: MouseEventKind, x: u16, y: u16) -> Event {

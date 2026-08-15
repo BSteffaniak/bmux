@@ -1229,6 +1229,7 @@ mod tests {
     use super::*;
     use crate::event::MouseEvent;
     use crate::style::{Color, Modifier};
+    use std::time::Instant;
 
     fn two_child_scene() -> SelectionScene {
         let mut scene = SelectionScene::new();
@@ -1266,6 +1267,118 @@ mod tests {
             scene.push_fragment(fragment);
         }
         scene
+    }
+
+    #[test]
+    fn large_scene_routing_and_highlight_projection_remain_bounded() {
+        const ROWS: usize = 2_000;
+        const COLUMNS: usize = 80;
+        let columns = u16::try_from(COLUMNS).expect("test columns fit u16");
+        let rows = u16::try_from(ROWS).expect("test rows fit u16");
+        let mut scene = SelectionScene::new();
+        scene.push_scope(SelectionScope::new(
+            "document",
+            Rect::new(0, 0, columns, rows),
+        ));
+        let row = "x".repeat(COLUMNS);
+        for index in 0..ROWS {
+            for fragment in plain_text_fragments(
+                "document",
+                "content",
+                Rect::new(
+                    0,
+                    u16::try_from(index).expect("test row fits u16"),
+                    columns,
+                    1,
+                ),
+                u64::try_from(index).expect("test row fits u64"),
+                &row,
+                index.saturating_mul(COLUMNS),
+                1,
+            ) {
+                scene.push_fragment(fragment);
+            }
+        }
+
+        let started = Instant::now();
+        let anchor = scene
+            .endpoint_at(
+                &SelectionScopeId::new("document"),
+                Point::new(0, 0),
+                SelectionAffinity::Before,
+            )
+            .expect("anchor");
+        let focus = scene
+            .endpoint_at(
+                &SelectionScopeId::new("document"),
+                Point::new(columns.saturating_sub(1), rows.saturating_sub(1)),
+                SelectionAffinity::After,
+            )
+            .expect("focus");
+        let snapshot = scene.snapshot(&anchor, &focus).expect("snapshot");
+
+        assert_eq!(snapshot.slices.len(), 1);
+        assert_eq!(snapshot.slices[0].source_range, 0..ROWS * COLUMNS);
+        assert_eq!(snapshot.visible_highlights.len(), ROWS);
+        assert!(started.elapsed().as_secs() < 10);
+    }
+
+    #[test]
+    fn later_overlay_scope_prevents_background_scope_initiation() {
+        let mut scene = SelectionScene::new();
+        let area = Rect::new(0, 0, 8, 3);
+        scene.push_scope(SelectionScope::new("background", area));
+        for fragment in plain_text_fragments(
+            "background",
+            "background-content",
+            Rect::new(0, 1, 8, 1),
+            0,
+            "behind!!",
+            0,
+            1,
+        ) {
+            scene.push_fragment(fragment);
+        }
+        scene.push_scope(SelectionScope::new("overlay", area));
+        for fragment in plain_text_fragments(
+            "overlay",
+            "overlay-content",
+            Rect::new(0, 1, 8, 1),
+            0,
+            "visible!",
+            0,
+            1,
+        ) {
+            scene.push_fragment(fragment);
+        }
+
+        let scope = scene
+            .initiation_scope(Point::new(1, 1))
+            .expect("overlay scope");
+        assert_eq!(scope.id.as_str(), "overlay");
+
+        let mut controller = SelectionController::new();
+        assert_eq!(
+            controller.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 1)),
+            ),
+            SelectionOutcome::Armed
+        );
+        assert!(matches!(
+            controller.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(5, 1)),
+            ),
+            SelectionOutcome::Changed { .. }
+        ));
+        let snapshot = controller.snapshot(&scene).expect("overlay selection");
+        assert!(
+            snapshot
+                .slices
+                .iter()
+                .all(|slice| slice.content_id.as_str() == "overlay-content")
+        );
     }
 
     #[test]
@@ -1369,6 +1482,50 @@ mod tests {
             SelectionOutcome::Click
         );
         assert_eq!(controller.phase(), SelectionGesturePhase::Idle);
+    }
+
+    #[test]
+    fn autoscroll_respects_disabled_policy_and_stops_outside_edge_threshold() {
+        let mut disabled = two_child_scene();
+        disabled.push_scope(
+            SelectionScope::new("left", Rect::new(0, 1, 5, 3))
+                .parent("root")
+                .auto_scroll(SelectionAutoScrollPolicy::disabled()),
+        );
+        let mut controller = SelectionController::new();
+        controller.handle_mouse(
+            &disabled,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 1)),
+        );
+        assert!(matches!(
+            controller.handle_mouse(
+                &disabled,
+                MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(4, 1)),
+            ),
+            SelectionOutcome::Changed { auto_scroll: None }
+        ));
+
+        let mut away_from_edge = two_child_scene();
+        away_from_edge.push_scope(
+            SelectionScope::new("left", Rect::new(0, 0, 5, 5))
+                .parent("root")
+                .auto_scroll(SelectionAutoScrollPolicy {
+                    enabled: true,
+                    edge_threshold: 1,
+                }),
+        );
+        let mut controller = SelectionController::new();
+        controller.handle_mouse(
+            &away_from_edge,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 1)),
+        );
+        assert!(matches!(
+            controller.handle_mouse(
+                &away_from_edge,
+                MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(3, 2)),
+            ),
+            SelectionOutcome::Changed { auto_scroll: None }
+        ));
     }
 
     #[test]
