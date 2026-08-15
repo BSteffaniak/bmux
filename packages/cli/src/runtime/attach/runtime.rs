@@ -425,7 +425,9 @@ use crate::pane_runtime_client::{
     attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
-use bmux_plugin::{RenderDamage, RenderOp, RenderStyle};
+use bmux_plugin::{
+    RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp, RenderStyle,
+};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
@@ -7938,6 +7940,38 @@ fn queue_retained_render_ops(
         .context("failed queueing retained render ops")
 }
 
+fn queue_retained_extension_ops(
+    stdout: &mut impl Write,
+    surface: &RetainedSurface,
+    repaint: &RetainedRepaintSurface,
+    extensions: &[Arc<dyn bmux_plugin::AttachRenderExtension>],
+    capabilities: bmux_plugin::TerminalRenderCapabilities,
+) -> Result<bool> {
+    let surface_rect = ExtensionRect::new(
+        surface.rect.x,
+        surface.rect.y,
+        surface.rect.w,
+        surface.rect.h,
+    );
+    let damage = render_damage_from_retained_damage_rects(&repaint.damage);
+    let context = RenderExtensionContext { capabilities };
+    let mut wrote = false;
+    for extension in extensions {
+        let Some(ops) = extension.render_layer_ops_with_context(
+            surface.id,
+            &surface_rect,
+            &damage,
+            RenderExtensionLayer::AfterPaneContent,
+            &context,
+        ) else {
+            continue;
+        };
+        wrote |= queue_render_ops(stdout, surface_rect, &damage, &ops)
+            .with_context(|| format!("failed queueing retained extension {}", extension.name()))?;
+    }
+    Ok(wrote)
+}
+
 fn frame_uses_synchronized_update(frame_damage: &bmux_attach_pipeline::FrameDamage) -> bool {
     frame_damage.scene_damaged() || frame_damage.overlay_damaged()
 }
@@ -8396,6 +8430,11 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     }
 
     let previous_cursor_state = view_state.last_cursor_state;
+    let retained_extensions = bmux_plugin::registered_render_extensions();
+    for extension in &retained_extensions {
+        extension.refresh_state();
+    }
+    let retained_capabilities = terminal_render_capabilities(view_state);
     let mut overlay_rendered = false;
     let mut overlay_cursor_state = None;
     if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
@@ -8410,6 +8449,13 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             });
         }
         overlay_rendered = true;
+        overlay_rendered |= queue_retained_extension_ops(
+            &mut frame_bytes,
+            help_surface,
+            repaint,
+            &retained_extensions,
+            retained_capabilities,
+        )?;
     }
     if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
@@ -8428,6 +8474,13 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             });
         }
         overlay_rendered = true;
+        overlay_rendered |= queue_retained_extension_ops(
+            &mut frame_bytes,
+            prompt_surface,
+            repaint,
+            &retained_extensions,
+            retained_capabilities,
+        )?;
     } else if view_state.prompt.is_active() {
         overlay_cursor_state = cursor_state_before_forced_hide.map(|mut cursor| {
             cursor.visible = true;
@@ -8440,6 +8493,13 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         && queue_retained_render_ops(&mut frame_bytes, menu_surface, repaint)?
     {
         overlay_rendered = true;
+        overlay_rendered |= queue_retained_extension_ops(
+            &mut frame_bytes,
+            menu_surface,
+            repaint,
+            &retained_extensions,
+            retained_capabilities,
+        )?;
     }
 
     if damage_config.visualize
@@ -15253,7 +15313,9 @@ mod tests {
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
-    use bmux_plugin::{AttachInputEndpoint, AttachInputHook, AttachInputHookFilter};
+    use bmux_plugin::{
+        AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
+    };
 
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
@@ -15262,6 +15324,65 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    struct RetainedOverlayExtension;
+
+    impl AttachRenderExtension for RetainedOverlayExtension {
+        fn name(&self) -> &str {
+            "test.retained-overlay"
+        }
+
+        fn render_surface(
+            &self,
+            _stdout: &mut dyn Write,
+            _surface_id: Uuid,
+            _surface_rect: &ExtensionRect,
+            _damage: &RenderDamage,
+        ) -> io::Result<bool> {
+            Ok(false)
+        }
+
+        fn render_layer_ops_with_context(
+            &self,
+            _surface_id: Uuid,
+            surface_rect: &ExtensionRect,
+            _damage: &RenderDamage,
+            layer: RenderExtensionLayer,
+            _context: &RenderExtensionContext,
+        ) -> Option<Vec<RenderOp>> {
+            (layer == RenderExtensionLayer::AfterPaneContent).then(|| {
+                vec![RenderOp::border(
+                    *surface_rect,
+                    bmux_plugin::BorderGlyphs::rounded(),
+                    RenderStyle::new().bold(),
+                )]
+            })
+        }
+    }
+
+    #[test]
+    fn retained_non_pane_surface_runs_generic_render_extensions() {
+        let surface = RetainedSurface::builder(Uuid::from_u128(99), DamageRect::new(2, 3, 12, 5))
+            .opaque()
+            .render_ops(Vec::new())
+            .build();
+        let repaint = retained_full_surface_repaint(&surface);
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(RetainedOverlayExtension)];
+        let mut output = Vec::new();
+
+        let wrote = queue_retained_extension_ops(
+            &mut output,
+            &surface,
+            &repaint,
+            &extensions,
+            bmux_plugin::TerminalRenderCapabilities::default(),
+        )
+        .expect("extension render");
+
+        assert!(wrote);
+        assert!(!output.is_empty());
+    }
 
     #[test]
     fn native_provider_key_encoding_respects_focused_application_cursor_mode() {

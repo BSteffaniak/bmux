@@ -127,8 +127,6 @@ enum PromptWidgetState {
 struct ActivePrompt {
     envelope: AttachPromptEnvelope,
     state: PromptWidgetState,
-    message_wrap_width: Option<usize>,
-    message_wrapped_lines: Vec<String>,
     hits: HitMap,
 }
 
@@ -198,8 +196,6 @@ impl ActivePrompt {
         Self {
             envelope,
             state,
-            message_wrap_width: None,
-            message_wrapped_lines: Vec::new(),
             hits: HitMap::new(),
         }
     }
@@ -1001,15 +997,6 @@ impl AttachPromptState {
         )?;
         let active = self.active.as_mut()?;
 
-        let width = usize::from(layout.surface.rect.w);
-        let height = usize::from(layout.surface.rect.h);
-        let body_rows = height.saturating_sub(4).max(1);
-        let text_width = width.saturating_sub(4);
-
-        let mut body = PromptBodyRender {
-            lines: Vec::new(),
-            cursor: None,
-        };
         let footer = prompt_footer_text(&active.envelope.request);
         let area = Rect::new(
             layout.surface.rect.x,
@@ -1058,35 +1045,23 @@ impl AttachPromptState {
             && !rendered_confirm
             && !rendered_multi_toggle
             && render_form(active, content, &mut frame, theme);
-        let uses_legacy_body = !rendered_palette
-            && !rendered_single_select
-            && !rendered_text_input
-            && !rendered_confirm
-            && !rendered_multi_toggle
-            && !rendered_form;
-        if uses_legacy_body {
-            body = render_prompt_body(active, text_width, body_rows);
-        }
         if rendered_palette || rendered_text_input {
             component_cursor = frame.cursor().map(|cursor| AttachCursorState {
                 x: cursor.position.x,
                 y: cursor.position.y,
                 visible: cursor.visible,
             });
-        } else if uses_legacy_body {
-            for (index, line) in body.lines.iter().take(body_rows).enumerate() {
-                let row = content
-                    .y
-                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-                if row >= content.bottom().saturating_sub(1) {
-                    break;
-                }
-                frame.write_line_with_fallback_style(
-                    Rect::new(content.x, row, content.width, 1),
-                    &prompt_body_line(&active.envelope.request, active, index, line, theme),
-                    theme.text,
-                );
-            }
+        }
+        debug_assert!(
+            rendered_palette
+                || rendered_single_select
+                || rendered_text_input
+                || rendered_confirm
+                || rendered_multi_toggle
+                || rendered_form,
+            "every prompt field must have a component renderer"
+        );
+        if !rendered_palette && !rendered_confirm && content.height > 1 {
             let footer_y = content.bottom().saturating_sub(1);
             frame.write_line_with_fallback_style(
                 Rect::new(content.x, footer_y, content.width, 1),
@@ -1096,13 +1071,7 @@ impl AttachPromptState {
         }
         let ops = buffer_render_ops(&buffer);
 
-        let cursor_state = component_cursor.or_else(|| {
-            body.cursor.map(|(row, col)| AttachCursorState {
-                x: (usize::from(content.x) + col).min(u16::MAX as usize) as u16,
-                y: (usize::from(content.y) + row).min(u16::MAX as usize) as u16,
-                visible: true,
-            })
-        });
+        let cursor_state = component_cursor;
 
         Some(AttachPromptOverlayRender {
             surface: layout.surface,
@@ -1534,42 +1503,6 @@ fn render_command_palette(
     true
 }
 
-fn prompt_body_line(
-    request: &PromptRequest,
-    active: &ActivePrompt,
-    index: usize,
-    rendered: &str,
-    theme: bmux_tui_components::modal_frame::ModalTheme,
-) -> Line {
-    let is_palette = request.modal_id.as_deref() == Some("command-palette");
-    if !is_palette {
-        return Line::raw(rendered.to_owned());
-    }
-    let message_rows = request
-        .message
-        .as_ref()
-        .map_or(0, |message| message.lines().count().max(1));
-    let list_row = index.checked_sub(message_rows.saturating_add(1));
-    let selected = matches!(
-        (&active.state, list_row),
-        (
-            PromptWidgetState::SearchSelect { palette },
-            Some(row)
-        ) if row == palette
-            .list
-            .selected
-            .unwrap_or(0)
-            .saturating_sub(palette.list.offset)
-    );
-    if selected {
-        Line::from_spans(vec![Span::styled(rendered.to_owned(), theme.focused)])
-    } else if index < message_rows {
-        Line::from_spans(vec![Span::styled(rendered.to_owned(), theme.muted)])
-    } else {
-        Line::raw(rendered.to_owned())
-    }
-}
-
 pub const fn prompt_accepts_key_kind(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
@@ -1882,7 +1815,6 @@ fn validate_form_field(
 
 struct FormRenderRow {
     text: String,
-    selectable: bool,
 }
 
 fn form_render_rows(
@@ -1907,7 +1839,6 @@ fn form_render_rows(
             };
             rows.push(FormRenderRow {
                 text: format!("{}: {value}{suffix}", field.label),
-                selectable: !field.disabled,
             });
         }
     }
@@ -2102,241 +2033,6 @@ fn prompt_estimated_lines(request: &PromptRequest) -> usize {
     lines.max(1)
 }
 
-struct PromptBodyRender {
-    lines: Vec<String>,
-    cursor: Option<(usize, usize)>,
-}
-
-#[allow(clippy::too_many_lines)] // Field-specific rendering keeps prompt variants in one place.
-fn render_prompt_body(
-    active: &mut ActivePrompt,
-    text_width: usize,
-    body_rows: usize,
-) -> PromptBodyRender {
-    let mut lines = Vec::new();
-
-    if let Some(message) = &active.envelope.request.message {
-        if active.message_wrap_width != Some(text_width) {
-            active.message_wrapped_lines = wrap_lines(message, text_width);
-            active.message_wrap_width = Some(text_width);
-        }
-        lines.extend(
-            active
-                .message_wrapped_lines
-                .iter()
-                .map(|line| opaque_row_text(line, text_width)),
-        );
-    }
-
-    let mut cursor = None;
-    let mut field_lines = Vec::new();
-    match (&active.envelope.request.field, &mut active.state) {
-        (
-            PromptField::Confirm {
-                yes_label,
-                no_label,
-                ..
-            },
-            PromptWidgetState::Confirm { selected_yes },
-        ) => {
-            let yes = if *selected_yes {
-                format!("> {yes_label}")
-            } else {
-                format!("  {yes_label}")
-            };
-            let no = if *selected_yes {
-                format!("  {no_label}")
-            } else {
-                format!("> {no_label}")
-            };
-            let row = format!("{yes}    {no}");
-            field_lines.push(opaque_row_text(
-                &truncate_chars(&row, text_width),
-                text_width,
-            ));
-        }
-        (
-            PromptField::TextInput { placeholder, .. },
-            PromptWidgetState::TextInput { buffer, error },
-        ) => {
-            let visible_width = text_width.saturating_sub(2).max(1);
-            let viewport = buffer.line_viewport(visible_width);
-            let rendered = if viewport.text.is_empty() {
-                placeholder
-                    .as_ref()
-                    .map_or_else(String::new, |hint| truncate_chars(hint, visible_width))
-            } else {
-                viewport.text
-            };
-            let row = format!("> {}", opaque_row_text(&rendered, visible_width));
-            cursor = Some((lines.len(), 2 + viewport.cursor_col));
-            field_lines.push(row);
-            if let Some(err_msg) = error {
-                let err_display = format!(
-                    "! {}",
-                    truncate_chars(err_msg, text_width.saturating_sub(2))
-                );
-                field_lines.push(opaque_row_text(&err_display, text_width));
-            }
-        }
-        (
-            PromptField::SingleSelect { options, .. },
-            PromptWidgetState::SingleSelect { selected, scroll },
-        ) => {
-            if options.is_empty() {
-                field_lines.push(opaque_row_text("(no options)", text_width));
-            } else {
-                let visible_rows = body_rows.saturating_sub(lines.len()).max(1);
-                *selected = (*selected).min(options.len().saturating_sub(1));
-                *scroll = adjust_scroll(*scroll, *selected, options.len(), visible_rows);
-                let end = (*scroll).saturating_add(visible_rows).min(options.len());
-                for (index, option) in options.iter().enumerate().take(end).skip(*scroll) {
-                    let marker = if index == *selected { ">" } else { " " };
-                    let row = format!(
-                        "{marker} {}",
-                        truncate_chars(&option.label, text_width.saturating_sub(2))
-                    );
-                    field_lines.push(opaque_row_text(&row, text_width));
-                }
-            }
-        }
-        (
-            PromptField::SearchSelect {
-                options,
-                placeholder,
-                ..
-            },
-            PromptWidgetState::SearchSelect { palette },
-        ) => {
-            let query = &palette.query;
-            let selected = palette.list.selected.get_or_insert(0);
-            let scroll = &mut palette.list.offset;
-            let visible_width = text_width.saturating_sub(2).max(1);
-            let viewport = query.line_viewport(visible_width);
-            let rendered = if viewport.text.is_empty() {
-                placeholder.as_deref().map_or_else(
-                    || "Type to search".to_string(),
-                    |hint| truncate_chars(hint, visible_width),
-                )
-            } else {
-                viewport.text
-            };
-            let query_row = format!("> {}", opaque_row_text(&rendered, visible_width));
-            cursor = Some((lines.len() + field_lines.len(), 2 + viewport.cursor_col));
-            field_lines.push(query_row);
-            let filtered = filtered_option_indices(options, query.text());
-            if filtered.is_empty() {
-                field_lines.push(opaque_row_text("(no matches)", text_width));
-            } else {
-                let visible_rows = body_rows
-                    .saturating_sub(lines.len())
-                    .saturating_sub(field_lines.len())
-                    .max(1);
-                *selected = (*selected).min(filtered.len().saturating_sub(1));
-                *scroll = adjust_scroll(*scroll, *selected, filtered.len(), visible_rows);
-                let end = (*scroll).saturating_add(visible_rows).min(filtered.len());
-                for (filtered_index, option_index) in
-                    filtered.iter().enumerate().take(end).skip(*scroll)
-                {
-                    let Some(option) = options.get(*option_index) else {
-                        continue;
-                    };
-                    let marker = if filtered_index == *selected {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    let row = format!(
-                        "{marker} {}",
-                        truncate_chars(&option.label, text_width.saturating_sub(2))
-                    );
-                    field_lines.push(opaque_row_text(&row, text_width));
-                }
-            }
-        }
-        (
-            PromptField::MultiToggle { options, .. },
-            PromptWidgetState::MultiToggle {
-                cursor: index,
-                selected,
-                scroll,
-            },
-        ) => {
-            if options.is_empty() {
-                field_lines.push(opaque_row_text("(no options)", text_width));
-            } else {
-                let visible_rows = body_rows.saturating_sub(lines.len()).max(1);
-                *index = (*index).min(options.len().saturating_sub(1));
-                *scroll = adjust_scroll(*scroll, *index, options.len(), visible_rows);
-                let end = (*scroll).saturating_add(visible_rows).min(options.len());
-                for (row_index, option) in options.iter().enumerate().take(end).skip(*scroll) {
-                    let active_marker = if row_index == *index { ">" } else { " " };
-                    let checked = if selected.contains(&row_index) {
-                        "[x]"
-                    } else {
-                        "[ ]"
-                    };
-                    let row = format!(
-                        "{active_marker} {checked} {}",
-                        truncate_chars(&option.label, text_width.saturating_sub(6))
-                    );
-                    field_lines.push(opaque_row_text(&row, text_width));
-                }
-            }
-        }
-        (
-            PromptField::Form { sections, .. },
-            PromptWidgetState::Form {
-                cursor: index,
-                scroll,
-                values,
-                editors,
-                errors,
-            },
-        ) => {
-            let rows = form_render_rows(sections, values, editors, errors);
-            if rows.is_empty() {
-                field_lines.push(opaque_row_text("(no fields)", text_width));
-            } else {
-                let visible_rows = body_rows.saturating_sub(lines.len()).max(1);
-                *index = (*index).min(rows.len().saturating_sub(1));
-                *scroll = adjust_scroll(*scroll, *index, rows.len(), visible_rows);
-                let end = (*scroll).saturating_add(visible_rows).min(rows.len());
-                for (row_index, row) in rows.iter().enumerate().take(end).skip(*scroll) {
-                    let marker = if row.selectable && row_index == *index {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    let line = format!("{marker} {}", row.text);
-                    field_lines.push(opaque_row_text(
-                        &truncate_chars(&line, text_width),
-                        text_width,
-                    ));
-                }
-            }
-        }
-        _ => {
-            field_lines.push(opaque_row_text("invalid prompt state", text_width));
-        }
-    }
-
-    if lines.len().saturating_add(field_lines.len()) > body_rows {
-        let max_prefix = body_rows.saturating_sub(field_lines.len());
-        lines.truncate(max_prefix);
-    }
-    lines.extend(field_lines);
-
-    if lines.len() > body_rows {
-        lines.truncate(body_rows);
-    }
-    while lines.len() < body_rows {
-        lines.push(" ".repeat(text_width));
-    }
-
-    PromptBodyRender { lines, cursor }
-}
-
 fn prompt_footer_text(request: &PromptRequest) -> String {
     match request.field {
         PromptField::Confirm { .. } => format!(
@@ -2526,7 +2222,6 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
-        render_prompt_body,
     };
     use crate::runtime::attach::input::TerminalGeometry;
     use crate::runtime::attach::tui_surface::{component_theme, parse_tui_color};
@@ -2856,7 +2551,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_prompt_render_uses_caret_without_checkbox_markers() {
+    fn confirm_prompt_renders_dialog_actions() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
             PromptRequest::confirm("Prompt Showcase")
@@ -2865,32 +2560,25 @@ mod tests {
             AttachInternalPromptAction::QuitSession,
         );
 
-        let active = state.active.as_mut().expect("prompt should be active");
-        let initial = render_prompt_body(active, 64, 2);
-        let initial_row = &initial.lines[0];
-        assert!(
-            initial_row.contains("> Continue"),
-            "initial row: {initial_row:?}"
-        );
-        assert!(
-            initial_row.contains("  Stop"),
-            "initial row: {initial_row:?}"
-        );
-        assert!(!initial_row.contains("[x]"));
-        assert!(!initial_row.contains("[ ]"));
-
-        let _ = state.handle_key_event(&key_event(KeyCode::Right));
-        let active = state.active.as_mut().expect("prompt should remain active");
-        let switched = render_prompt_body(active, 64, 2);
-        let switched_row = &switched.lines[0];
-        assert!(
-            switched_row.contains("  Continue"),
-            "switched row: {switched_row:?}"
-        );
-        assert!(
-            switched_row.contains("> Stop"),
-            "switched row: {switched_row:?}"
-        );
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+            )
+            .expect("confirm should render");
+        let text = render
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                bmux_plugin::RenderOp::TextRun { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("Continue"), "rendered: {text:?}");
+        assert!(text.contains("Stop"));
+        assert!(!text.contains("[x]"));
+        assert!(!text.contains("[ ]"));
     }
 
     #[test]
@@ -2966,7 +2654,7 @@ mod tests {
     }
 
     #[test]
-    fn pasted_text_reflows_cursor_and_prompt_render() {
+    fn pasted_text_preserves_component_cursor_across_widths() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
             PromptRequest::text_input("Value"),
@@ -2977,14 +2665,25 @@ mod tests {
             PromptKeyDisposition::Consumed
         ));
 
-        let active = state.active.as_mut().expect("prompt should be active");
-        let narrow = render_prompt_body(active, 6, 2);
-        assert_eq!(narrow.cursor, Some((0, 5)));
-        assert!(narrow.lines[0].contains("hij"));
+        let narrow = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 24, rows: 8 },
+                &RuntimeAppearance::default(),
+            )
+            .expect("narrow input should render");
+        let wide = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+            )
+            .expect("wide input should render");
 
-        let wide = render_prompt_body(active, 14, 2);
-        assert_eq!(wide.cursor, Some((0, 12)));
-        assert!(wide.lines[0].contains("abcdefghij"));
+        assert!(narrow.cursor_state.is_some());
+        assert!(wide.cursor_state.is_some());
+        assert!(
+            wide.cursor_state.expect("wide cursor").x
+                >= narrow.cursor_state.expect("narrow cursor").x
+        );
     }
 
     #[test]
