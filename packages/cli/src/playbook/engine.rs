@@ -1539,7 +1539,8 @@ fn validate_render_assertion(
 
 impl AttachInputRuntime {
     fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
-        let config = bmux_config::BmuxConfig::default();
+        let mut config = bmux_config::BmuxConfig::default();
+        "normal".clone_into(&mut config.keybindings.initial_mode);
         let timeout_ms = config
             .keybindings
             .resolve_timeout()

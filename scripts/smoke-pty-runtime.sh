@@ -116,6 +116,8 @@ run_case() {
     "$shell_name startup" \
     "$shell_bin" \
     "        sleep 1
+        printf '\\001\\033'
+        sleep 0.2
         printf '\\001d'" \
     "${shell_name} startup smoke failed (status"
 }
@@ -132,6 +134,8 @@ run_keybind_case() {
     "keybind" \
     "$shell_bin" \
     "        sleep 1
+        printf '\\001\\033'
+        sleep 0.2
         printf '\\001t'
         sleep 0.2
         printf '\\001d'" \

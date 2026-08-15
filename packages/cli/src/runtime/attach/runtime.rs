@@ -15412,6 +15412,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 
+    fn normal_mode_input_processor() -> InputProcessor {
+        let mut config = BmuxConfig::default();
+        config.keybindings.initial_mode = "normal".to_owned();
+        InputProcessor::new(attach_keymap_from_config(&config), false)
+    }
+
     struct RetainedOverlayExtension;
 
     impl AttachRenderExtension for RetainedOverlayExtension {
@@ -17927,8 +17933,7 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_detaches_on_prefix_d() {
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
         let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
@@ -17956,8 +17961,7 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_ctrl_d_forwards_to_pane() {
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
         let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('d'),
@@ -18010,8 +18014,7 @@ mod tests {
     fn repeat_event_drops_plugin_command_action() {
         // Binding `c` resolves to plugin:bmux.windows:new-window. A
         // Repeat event for `c` must not emit a PluginCommand action.
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
         // First simulate a Press so the InputProcessor is primed.
         let press = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -19709,8 +19712,7 @@ mod tests {
     #[cfg(feature = "bundled-plugin-windows")]
     #[allow(clippy::too_many_lines)]
     fn attach_key_event_action_maps_prefixed_runtime_defaults() {
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
 
         let new_window = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -19855,8 +19857,7 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_h_to_focus_left_in_normal_mode() {
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
 
         let normal_actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -19915,8 +19916,7 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_enter_scroll_mode_to_ui() {
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
 
         let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -19973,8 +19973,7 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_n_to_pane_in_normal_mode() {
-        let mut processor =
-            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut processor = normal_mode_input_processor();
 
         let normal_actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -20576,9 +20575,7 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_maps_show_help_to_ui() {
-        let config = BmuxConfig::default();
-        let keymap = attach_keymap_from_config(&config);
-        let mut processor = InputProcessor::new(keymap, false);
+        let mut processor = normal_mode_input_processor();
 
         let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(

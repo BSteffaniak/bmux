@@ -480,6 +480,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // End-to-end provider fixture verifies action dedupe, modal input, rendering, paste, and detach lifecycle.
     async fn synthetic_provider_runs_through_domain_neutral_cli_path() {
         install();
         let state = Arc::new(Mutex::new(SyntheticState::default()));
@@ -526,6 +527,22 @@ mod tests {
         .expect_err("duplicate action must be rejected");
         assert!(duplicate.to_string().contains("duplicate attach action"));
         let (mut terminal, handle) = super::super::runtime::HeadlessAttachTerminal::new(80, 24);
+        handle
+            .send_event(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('a'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+            ))
+            .unwrap();
+        handle
+            .send_event(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            ))
+            .unwrap();
         handle
             .send_event(crossterm::event::Event::Key(
                 crossterm::event::KeyEvent::new(
