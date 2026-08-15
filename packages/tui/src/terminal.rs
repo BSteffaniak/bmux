@@ -11,6 +11,7 @@ use crate::geometry::Rect;
 use crate::hit::HitMap;
 use crate::image::ImageContribution;
 use crate::image_scene::{ImageScene, ImageSceneDelta};
+use crate::selection::SelectionScene;
 
 /// Statistics from one terminal draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub struct Terminal<W> {
     image_scene: ImageScene,
     image_delta: ImageSceneDelta,
     cursor: Option<crate::frame::Cursor>,
+    selection: SelectionScene,
 }
 
 impl<W: Write> Terminal<W> {
@@ -71,6 +73,7 @@ impl<W: Write> Terminal<W> {
             image_scene: ImageScene::default(),
             image_delta: ImageSceneDelta::default(),
             cursor: None,
+            selection: SelectionScene::new(),
         }
     }
 
@@ -96,6 +99,12 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn hits(&self) -> &HitMap {
         &self.hits
+    }
+
+    /// Return the selection scene from the last successfully committed draw.
+    #[must_use]
+    pub const fn selection(&self) -> &SelectionScene {
+        &self.selection
     }
 
     /// Return ordered focus state derived from the last committed scene.
@@ -134,6 +143,11 @@ impl<W: Write> Terminal<W> {
     }
 
     /// Reset retained terminal presentation state so the next draw repaints fully.
+    ///
+    /// Committed interaction and selection scenes remain authoritative until a
+    /// later successful draw replaces them. This lets consumers continue to
+    /// route input against what is still visibly committed after an output
+    /// failure or backend reset.
     pub fn reset(&mut self) {
         self.previous = None;
     }
@@ -166,7 +180,7 @@ impl<W: Write> Terminal<W> {
     /// # Errors
     ///
     /// Returns any I/O error reported by the backend writer. Failed output does not advance the
-    /// retained buffer, hit map, cursor, or image scene.
+    /// retained buffer, hit map, selection scene, cursor, or image scene.
     pub fn draw_damage(
         &mut self,
         damage: Damage,
@@ -185,7 +199,7 @@ impl<W: Write> Terminal<W> {
         }
         let regions = damage.retained_regions();
         let mut buffer = Buffer::empty(self.area);
-        let (cursor, hits, focus_scope, images) = {
+        let (cursor, hits, focus_scope, images, selection) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
             let mut hits = if matches!(damage, Damage::Regions(_)) {
@@ -222,7 +236,12 @@ impl<W: Write> Terminal<W> {
                     .then(|| self.focus_scope.clone())
                     .flatten()
             });
-            (cursor, hits, focus_scope, images)
+            let selection = if matches!(damage, Damage::Regions(_)) {
+                self.selection.merge_regions(frame.selection(), regions)
+            } else {
+                frame.selection().clone()
+            };
+            (cursor, hits, focus_scope, images, selection)
         };
         if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
             buffer.restore_outside(previous, regions);
@@ -259,6 +278,7 @@ impl<W: Write> Terminal<W> {
         self.image_delta = image_delta;
         self.images = images;
         self.cursor = cursor;
+        self.selection = selection;
         self.previous = Some(buffer);
         Ok(stats)
     }
@@ -288,6 +308,7 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::hit::HitRegion;
     use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
+    use crate::selection::{SelectionFragment, SelectionScope};
     use crate::style::Style;
     use std::io::{self, Write};
 
@@ -313,6 +334,40 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn failed_draw_does_not_commit_speculative_selection_scene() {
+        let mut terminal = Terminal::new(
+            FailingWriter {
+                bytes: Vec::new(),
+                fail: false,
+            },
+            Rect::new(0, 0, 4, 1),
+        );
+        terminal
+            .draw(|frame| {
+                frame.push_selection_scope(SelectionScope::new("committed", frame.area()));
+                frame.push_selection_fragment(SelectionFragment::new(
+                    "committed",
+                    "content",
+                    Rect::new(0, 0, 1, 1),
+                    0,
+                    0..1,
+                ));
+            })
+            .expect("initial selection scene commits");
+
+        terminal.writer_mut().fail = true;
+        assert!(
+            terminal
+                .draw(|frame| {
+                    frame.push_selection_scope(SelectionScope::new("speculative", frame.area()));
+                })
+                .is_err()
+        );
+
+        assert_eq!(terminal.selection().scopes()[0].id.as_str(), "committed");
     }
 
     #[test]

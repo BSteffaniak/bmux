@@ -37,6 +37,7 @@ pub mod palette;
 pub mod picker;
 pub mod retained_list;
 pub mod retained_sectioned_list;
+pub mod selection;
 pub mod style;
 pub mod terminal;
 pub mod text;
@@ -101,6 +102,14 @@ pub mod prelude {
     pub use crate::retained_list::{RetainedListLayout, RetainedListLine, RetainedListSignature};
     pub use crate::retained_sectioned_list::{
         RetainedSectionedListLayout, RetainedSectionedListLine,
+    };
+    pub use crate::selection::{
+        SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,
+        SelectionContentId, SelectionController, SelectionEndpoint, SelectionFragment,
+        SelectionFragmentId, SelectionGesturePhase, SelectionOutcome, SelectionScene,
+        SelectionSceneError, SelectionScope, SelectionScopeId, SelectionScrollAxis,
+        SelectionScrollDirection, SelectionSlice, SelectionSnapshot, paint_selection_highlights,
+        plain_text_fragments, plain_text_fragments_with_tabs,
     };
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};

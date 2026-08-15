@@ -4,6 +4,8 @@
 //! from the last successfully flushed frame. Applications should update their
 //! [`bmux_tui::interaction::InteractionRouter`] from this callback and route
 //! subsequent input through that committed scene instead of recomputing layout.
+//! The committed selection scene is available through [`TerminalPresenter::selection`]
+//! without changing the existing callback signature.
 
 use std::io::{self, Write};
 
@@ -11,6 +13,7 @@ use bmux_tui::focus::FocusTrap;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::hit::HitMap;
+use bmux_tui::selection::SelectionScene;
 use bmux_tui::terminal::Terminal;
 
 use crate::presenter::{PresentReport, Presenter, ResetReason};
@@ -68,6 +71,12 @@ impl<W: Write, R, C> TerminalPresenter<W, R, C> {
     #[must_use]
     pub const fn interactions(&self) -> &HitMap {
         self.terminal.hits()
+    }
+
+    /// Return the selection scene from the last successfully committed frame.
+    #[must_use]
+    pub const fn selection(&self) -> &SelectionScene {
+        self.terminal.selection()
     }
 
     /// Return ordered focus state from the last successfully committed frame.

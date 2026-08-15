@@ -13,6 +13,26 @@ application/plugin        product state, semantic updates, effects, navigation, 
 
 `bmux_tui_runtime` depends on `bmux_tui`. It does not depend on `bmux_tui_components`, and neither lower layer depends on the runtime. The runtime must not interpret BMUX or consumer product domains such as windows, sessions, panes, clients, contexts, permissions, model turns, or tools.
 
+## Logical content-selection contract
+
+Content selection is separate from ordinary hit routing. During rendering, components register a
+hierarchical `SelectionScene` containing caller-owned scope/content identities and visible fragments
+mapped to logical UTF-8 source boundaries. A caller-owned `SelectionController` resolves pointer
+gestures against the last committed scene, locks the deepest eligible initiation scope, and retains
+logical anchor/focus endpoints across redraws. Applications remain responsible for canonical source
+content, scrolling, copy/export formatting, and clipboard effects.
+
+`Frame::paint_selection` is the deterministic overlay stage: consumers call it after normal content
+rendering with a snapshot from their controller. It patches only explicit selection style fields over
+the selected cells and never rewrites symbols. `Terminal::draw` commits the rendered selection scene
+transactionally with output, hits, focus, cursor, and images. Failed output and reset retain the prior
+scene as the authority corresponding to the last visible frame; resize forces a full redraw, whose
+successful commit replaces the old geometry. Regional draws retain selection fragments outside the
+damaged regions and replace emitted metadata inside them.
+
+Selection scopes and fragments are generic renderer metadata. Runtime code must not interpret source
+identities, ranges, selection meaning, or autoscroll requests.
+
 ## Automatic interaction contract
 
 Interactive geometry is frame metadata, not application state. A standard component registers a `HitRegion` while it renders, using the exact terminal-cell `Rect` it painted. A region has a caller-owned stable ID, semantic role, layer, visibility, enabled state, pointer/hover acceptance, focusability, optional explicit tab order, and optional focus scope. Render order is the default tie-breaker, so ordinary controls need no parallel focus list.

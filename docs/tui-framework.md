@@ -172,6 +172,21 @@ Important properties:
 
 This retained state is process-local terminal presentation state. It does not define transport retention, acknowledgment, replay, conflict handling, reconnect safety, or durable resume.
 
+## Logical content selection
+
+`bmux_tui::selection` models selection as logical document interaction rather than framebuffer text
+extraction. Renderers register hierarchical scopes and visible fragments that map terminal geometry
+to caller-owned UTF-8 source boundaries. A caller-owned controller locks the deepest eligible scope
+at pointer-down, supports parent delegation and cross-descendant ordering, and exposes snapshots of
+logical source slices plus current visible highlights.
+
+Selection metadata follows the same transactional frame boundary as hits and images. Applications
+paint a current snapshot with `Frame::paint_selection` after ordinary content rendering, then retain
+the controller independently of frame geometry. Applications and components own viewport mutation
+for generic autoscroll requests; product consumers own canonical source resolution, copy formatting,
+and clipboard effects. Core selection types remain domain-neutral and do not interpret panes,
+transcripts, Markdown, tools, sessions, or plugins.
+
 ## Performance direction
 
 The framework should be designed for high-churn terminal applications, large transcripts, and large diffs.

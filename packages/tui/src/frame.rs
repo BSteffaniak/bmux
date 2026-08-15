@@ -5,6 +5,10 @@ use crate::focus::FocusScopeId;
 use crate::geometry::{Point, Rect};
 use crate::hit::{HitMap, HitRegion};
 use crate::image::ImageContribution;
+use crate::selection::{
+    SelectionFragment, SelectionScene, SelectionScope, SelectionSnapshot,
+    paint_selection_highlights,
+};
 use crate::style::Style;
 use crate::text::Line;
 
@@ -45,6 +49,7 @@ pub struct Frame<'buffer> {
     automatic_hit_index: usize,
     focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
+    selection: SelectionScene,
 }
 
 impl<'buffer> Frame<'buffer> {
@@ -57,6 +62,7 @@ impl<'buffer> Frame<'buffer> {
             automatic_hit_index: 0,
             focus_scope: None,
             images: Vec::new(),
+            selection: SelectionScene::new(),
         }
     }
 
@@ -132,6 +138,31 @@ impl<'buffer> Frame<'buffer> {
     /// Add an image lifecycle contribution to this frame.
     pub fn push_image(&mut self, contribution: ImageContribution) {
         self.images.push(contribution);
+    }
+
+    /// Return selection metadata registered for this frame.
+    #[must_use]
+    pub const fn selection(&self) -> &SelectionScene {
+        &self.selection
+    }
+
+    /// Add or replace one hierarchical selection scope.
+    pub fn push_selection_scope(&mut self, scope: SelectionScope) {
+        self.selection.push_scope(scope);
+    }
+
+    /// Add one visible logical selection fragment.
+    pub fn push_selection_fragment(&mut self, fragment: SelectionFragment) {
+        self.selection.push_fragment(fragment);
+    }
+
+    /// Paint one logical selection snapshot over content already rendered.
+    ///
+    /// Calling this after component rendering gives selection a deterministic
+    /// overlay stage while preserving every underlying cell symbol and
+    /// semantic style field not replaced by `style`.
+    pub fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
+        paint_selection_highlights(self.buffer, &snapshot.visible_highlights, style);
     }
 
     /// Fill a rectangular area with a symbol and style.
