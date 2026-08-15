@@ -406,7 +406,8 @@ use super::render::{
     append_pane_output, collect_visual_projection_updates, frame_damage_overlay_rects,
     frame_damage_overlay_render_ops, plugin_scene_items_to_render_items,
     queue_render_items_for_surface, queue_render_ops,
-    render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
+    render_attach_scene_with_stats_and_trace_with_capabilities,
+    suppress_terminal_graphics_intersecting, visible_scene_pane_ids,
 };
 use super::scrollback_modes::{cached_mode, set_cached_mode_debounced, set_runtime_mode};
 use super::state::{
@@ -8514,12 +8515,35 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     }
 
     let previous_cursor_state = view_state.last_cursor_state;
+    let mut overlay_rendered = false;
+    let opaque_overlay_rects = [
+        frame_plan.retained.help_surface.as_ref(),
+        frame_plan.retained.prompt_surface.as_ref(),
+        frame_plan.retained.tab_menu_surface.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|surface| {
+        ExtensionRect::new(
+            surface.rect.x,
+            surface.rect.y,
+            surface.rect.w,
+            surface.rect.h,
+        )
+    })
+    .collect::<Vec<_>>();
+    let overlay_capabilities = terminal_render_capabilities(view_state);
+    overlay_rendered |= suppress_terminal_graphics_intersecting(
+        &mut frame_bytes,
+        &opaque_overlay_rects,
+        &mut view_state.terminal_graphics_cache,
+        overlay_capabilities,
+    )?;
     let retained_extensions = bmux_plugin::registered_render_extensions();
     for extension in &retained_extensions {
         extension.refresh_state();
     }
     let retained_capabilities = terminal_render_capabilities(view_state);
-    let mut overlay_rendered = false;
     let mut overlay_cursor_state = None;
     if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)

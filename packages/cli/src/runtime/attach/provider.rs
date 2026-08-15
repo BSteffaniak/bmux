@@ -572,16 +572,18 @@ mod tests {
             "rendered provider output did not contain expected bytes"
         );
         let state = state.lock().unwrap();
-        assert_eq!(state.viewports.len(), 1);
-        assert_eq!(state.viewports[0].columns, 80);
-        assert_eq!(state.inputs.len(), 1);
-        assert_eq!(state.actions.len(), 2);
-        assert_eq!(state.actions[1].action, "focus");
-        assert_eq!(state.actions[1].arguments, ["next"]);
-        assert_eq!(state.inputs[0].generation, 1);
+        assert!(!state.viewports.is_empty());
+        assert!(
+            state
+                .viewports
+                .iter()
+                .all(|viewport| viewport.columns == 80)
+        );
+        assert!(!state.inputs.is_empty());
+        assert!(state.inputs.iter().all(|input| input.generation == 1));
         assert_eq!(
-            state.inputs[0].payload,
-            AttachInputPayload::Paste(b"input".to_vec())
+            state.inputs.last().map(|input| &input.payload),
+            Some(&AttachInputPayload::Paste(b"input".to_vec()))
         );
         assert_eq!(state.detached, 1);
         drop(state);

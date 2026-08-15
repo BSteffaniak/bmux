@@ -449,6 +449,58 @@ fn flush_render_item_ops<W: io::Write>(
     wrote
 }
 
+/// Suppress cached terminal-graphics placements intersecting higher opaque
+/// surfaces without deleting their transmitted image sources.
+///
+/// The cache entry remains with `placement = None`, so the normal graphics
+/// reconciler restores the placement when the occluder moves or closes without
+/// retransmitting image pixels.
+///
+/// # Errors
+///
+/// Returns an error if terminal protocol bytes cannot be written.
+#[cfg_attr(not(feature = "image-kitty"), allow(clippy::unnecessary_wraps))]
+pub fn suppress_terminal_graphics_intersecting<W: io::Write>(
+    stdout: &mut W,
+    opaque_rects: &[ExtensionRect],
+    graphics_cache: &mut TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+) -> Result<bool> {
+    #[cfg(feature = "image-kitty")]
+    {
+        if !terminal_graphic_can_render(capabilities) || opaque_rects.is_empty() {
+            return Ok(false);
+        }
+        let suppressed = graphics_cache
+            .iter()
+            .filter_map(|(key, entry)| {
+                let placement = entry.placement?;
+                opaque_rects
+                    .iter()
+                    .any(|rect| placement.cell_rect.intersects(*rect))
+                    .then_some((*key, entry.host_image_id))
+            })
+            .collect::<Vec<_>>();
+        for (key, host_image_id) in &suppressed {
+            stdout.write_all(b"\x1b_")?;
+            stdout.write_all(&bmux_image::codec::kitty::encode_delete_placement(
+                *host_image_id,
+                *host_image_id,
+            ))?;
+            stdout.write_all(b"\x1b\\")?;
+            if let Some(entry) = graphics_cache.get_mut(key) {
+                entry.placement = None;
+            }
+        }
+        Ok(!suppressed.is_empty())
+    }
+    #[cfg(not(feature = "image-kitty"))]
+    {
+        let _ = (stdout, opaque_rects, graphics_cache, capabilities);
+        Ok(false)
+    }
+}
+
 /// Queue declarative text/cell render operations.
 ///
 /// # Errors
@@ -5297,7 +5349,7 @@ mod tests {
         AttachSceneRenderStats, TerminalGraphicsCleanupPlan, TerminalGraphicsFrameResources,
         TerminalGraphicsStaleCleanupPolicy, queue_render_items, queue_render_items_for_frame,
         queue_render_items_for_surface, render_attach_scene_with_stats_and_trace_with_capabilities,
-        terminal_graphic_placement_signature,
+        suppress_terminal_graphics_intersecting, terminal_graphic_placement_signature,
     };
     #[cfg(feature = "image-kitty")]
     use crate::types::TerminalGraphicsCache;
@@ -7136,6 +7188,61 @@ mod tests {
         assert_eq!(moved_stats.terminal_graphic_transmits, 0);
         assert_eq!(moved_stats.terminal_graphic_places, 1);
         assert_eq!(moved_stats.terminal_graphic_deletes, 0);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn suppress_intersecting_graphics_deletes_placement_but_keeps_source_cached() {
+        let capabilities = test_kitty_capabilities();
+        let surface_rect = ExtensionRect::new(0, 0, 10, 4);
+        let graphic = test_graphic_overlay(2);
+        let items = [RenderLayerItem::Graphic(graphic.clone())];
+        let mut cache = TerminalGraphicsCache::new();
+        queue_render_items(
+            &mut Vec::new(),
+            Uuid::from_u128(7),
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &items,
+            &mut cache,
+            capabilities,
+            None,
+        )
+        .expect("initial graphic");
+
+        let mut suppressed = Vec::new();
+        assert!(
+            suppress_terminal_graphics_intersecting(
+                &mut suppressed,
+                &[graphic.cell_rect],
+                &mut cache,
+                capabilities,
+            )
+            .expect("suppress graphic")
+        );
+        let suppressed = String::from_utf8(suppressed).expect("kitty output");
+        assert!(suppressed.contains("Ga=d,d=p,"), "{suppressed:?}");
+        assert!(!suppressed.contains("Ga=d,d=i,"), "{suppressed:?}");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.values().all(|entry| entry.placement.is_none()));
+
+        let mut restored = Vec::new();
+        assert!(
+            queue_render_items_for_surface(
+                &mut restored,
+                Uuid::from_u128(7),
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &items,
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("restore graphic")
+        );
+        let restored = String::from_utf8(restored).expect("kitty output");
+        assert!(restored.contains("Ga=p,"), "{restored:?}");
+        assert!(!restored.contains("Ga=t,"), "{restored:?}");
     }
 
     #[cfg(feature = "image-kitty")]
