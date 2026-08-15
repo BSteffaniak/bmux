@@ -12,6 +12,10 @@ use bmux_tui::style::Modifier;
 use bmux_tui::widget::Widget;
 
 use crate::common::{DragState, InteractionState};
+use crate::selection::{
+    ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
+    register_component_scope,
+};
 
 /// Visual styles for a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +344,20 @@ impl Pane<'_> {
     #[must_use]
     pub fn inner_area(&self, state: &PaneState) -> Rect {
         self.panel(state).inner_area(state.area)
+    }
+
+    /// Register pane selection geometry using the exact rendered outer and inner areas.
+    ///
+    /// The content area follows `content_capture`; pane border/title/padding remain
+    /// outside initiation and therefore naturally delegate to a parent scope.
+    pub fn register_selection(
+        &self,
+        state: &PaneState,
+        selection: &ComponentSelectionState,
+        policy: &ComponentSelectionPolicy,
+        frame: &mut Frame<'_>,
+    ) -> ComponentSelectionOutcome {
+        register_component_scope(frame, selection, policy, state.area, self.inner_area(state))
     }
 
     /// Render pane chrome/background and register enabled pane interaction.

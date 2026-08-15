@@ -73,6 +73,7 @@ pub mod scrollbar_layout;
 pub mod select_dropdown;
 #[cfg(feature = "selectable-list")]
 pub mod selectable_list;
+pub mod selection;
 #[cfg(feature = "source-viewer")]
 pub mod source_viewer;
 #[cfg(feature = "sparkline")]

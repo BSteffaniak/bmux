@@ -7,6 +7,10 @@ use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::style::{Color, Modifier, Style};
 
 use crate::common::DragState;
+use crate::selection::{
+    ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
+    register_component_scope,
+};
 
 /// Direction panels are laid out in a [`PanelGroup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +432,52 @@ impl PanelGroup {
         let available = primary_len(self.axis, area).saturating_sub(u16_saturating(dividers));
         let lengths = allocated_lengths(available, state);
         self.rects_from_lengths(area, &lengths)
+    }
+
+    /// Register a parent selection scope and deterministic child panel scopes.
+    ///
+    /// Divider cells are excluded from child initiation areas, so resize handles
+    /// retain pointer precedence while a parent scope can still order content
+    /// across sibling panels.
+    pub fn register_selection(
+        &self,
+        area: Rect,
+        state: &PanelGroupState,
+        selection: &ComponentSelectionState,
+        child_policy: &ComponentSelectionPolicy,
+        frame: &mut Frame<'_>,
+    ) -> Vec<ComponentSelectionOutcome> {
+        let layout = self.layout(area, state);
+        let parent_policy = ComponentSelectionPolicy {
+            enabled: child_policy.enabled,
+            content_capture: bmux_tui::selection::SelectionCapture::Capture,
+            chrome_capture: bmux_tui::selection::SelectionCapture::Capture,
+            auto_scroll: child_policy.auto_scroll,
+        };
+        let mut outcomes = vec![register_component_scope(
+            frame,
+            selection,
+            &parent_policy,
+            area,
+            area,
+        )];
+        for (index, panel) in layout.panels.iter().copied().enumerate() {
+            let child = ComponentSelectionState::new(format!(
+                "{}.panel.{index}",
+                selection.scope_id.as_str()
+            ))
+            .parent(selection.scope_id.clone())
+            .order(u64::try_from(index).unwrap_or(u64::MAX))
+            .revision(selection.revision);
+            outcomes.push(register_component_scope(
+                frame,
+                &child,
+                child_policy,
+                panel,
+                panel,
+            ));
+        }
+        outcomes
     }
 
     /// Render dividers and register enabled divider/panel interaction regions.

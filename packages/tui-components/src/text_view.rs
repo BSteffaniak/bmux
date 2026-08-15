@@ -13,6 +13,10 @@ use bmux_tui::widget::Widget;
 use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
+use crate::selection::{
+    ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
+    register_component_scope,
+};
 
 /// Runtime state for [`TextView`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -268,6 +272,14 @@ pub struct TextViewLayout {
     pub vertical_scroll: usize,
 }
 
+/// One rendered `TextView` row with its original source boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextViewSelectionRow {
+    text: String,
+    source_offset: usize,
+    order: u64,
+}
+
 /// Read-only rich text/paragraph viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextView<'a> {
@@ -478,6 +490,115 @@ impl<'a> TextView<'a> {
             content_area.height,
             self.max_horizontal_scroll(area),
         );
+    }
+
+    /// Register logical source mappings for the visible text projection.
+    ///
+    /// Mappings are derived from the same wrapping and viewport primitives used
+    /// by rendering, while source offsets always refer to the original caller-
+    /// owned lines. Graphemes clipped by a horizontal viewport edge are omitted
+    /// exactly as they are by [`line_viewport`].
+    pub fn register_selection(
+        &self,
+        area: Rect,
+        state: &TextViewState,
+        selection: &ComponentSelectionState,
+        policy: &ComponentSelectionPolicy,
+        content_id: impl Into<bmux_tui::selection::SelectionContentId>,
+        frame: &mut Frame<'_>,
+    ) -> ComponentSelectionOutcome {
+        let content_area = self.content_area(area);
+        let scope_outcome = register_component_scope(frame, selection, policy, area, content_area);
+        if !policy.enabled || content_area.is_empty() {
+            return scope_outcome;
+        }
+        let content_id = content_id.into();
+        let projected = self.selection_projection(content_area.width);
+        let first_row = state.vertical_scroll.min(projected.len());
+        let horizontal_scroll = self.clamped_horizontal_scroll(area, state);
+        let mut count = 0_usize;
+        for (visible_row, row) in projected
+            .iter()
+            .skip(first_row)
+            .take(usize::from(content_area.height))
+            .enumerate()
+        {
+            let row_area = Rect::new(
+                content_area.x,
+                content_area
+                    .y
+                    .saturating_add(u16::try_from(visible_row).unwrap_or(u16::MAX)),
+                content_area.width,
+                1,
+            );
+            let fragments = bmux_tui::selection::plain_text_fragments(
+                selection.scope_id.clone(),
+                content_id.clone(),
+                Rect::new(0, row_area.y, u16::MAX, 1),
+                row.order,
+                &row.text,
+                row.source_offset,
+                selection.revision,
+            );
+            for mut fragment in fragments {
+                let start = usize::from(fragment.area.x);
+                let end = start.saturating_add(usize::from(fragment.area.width));
+                let viewport_end = horizontal_scroll.saturating_add(usize::from(row_area.width));
+                if start < horizontal_scroll || end > viewport_end {
+                    continue;
+                }
+                fragment.area.x = row_area.x.saturating_add(
+                    u16::try_from(start.saturating_sub(horizontal_scroll)).unwrap_or(u16::MAX),
+                );
+                frame.push_selection_fragment(fragment);
+                count = count.saturating_add(1);
+            }
+        }
+        if count == 0 {
+            scope_outcome
+        } else {
+            ComponentSelectionOutcome::ContentRegistered { fragments: count }
+        }
+    }
+
+    fn selection_projection(&self, width: u16) -> Vec<TextViewSelectionRow> {
+        let width = usize::from(width.max(1));
+        let mut source_base = 0_usize;
+        let mut output = Vec::new();
+        for (line_index, line) in self.lines.iter().enumerate() {
+            let source = line.plain_text();
+            let rendered = match self.policy.wrap {
+                TextWrap::None => vec![line.clone()],
+                TextWrap::Character => wrap_line_character(line, width),
+                TextWrap::Word => wrap_line_word(line, width),
+            };
+            let mut search_start = 0_usize;
+            for rendered_row in rendered {
+                let mut text = rendered_row.plain_text();
+                if self.policy.trim {
+                    text.truncate(text.trim_end().len());
+                }
+                let relative = if text.is_empty() {
+                    search_start
+                } else {
+                    source
+                        .get(search_start..)
+                        .and_then(|remaining| remaining.find(&text))
+                        .map_or(search_start, |found| search_start.saturating_add(found))
+                };
+                output.push(TextViewSelectionRow {
+                    text: text.clone(),
+                    source_offset: source_base.saturating_add(relative),
+                    order: u64::try_from(output.len()).unwrap_or(u64::MAX),
+                });
+                search_start = relative.saturating_add(text.len());
+            }
+            source_base = source_base.saturating_add(source.len());
+            if line_index + 1 < self.lines.len() {
+                source_base = source_base.saturating_add(1);
+            }
+        }
+        output
     }
 
     /// Render text view and register it when scrolling is possible.

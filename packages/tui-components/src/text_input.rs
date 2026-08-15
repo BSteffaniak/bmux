@@ -312,9 +312,21 @@ impl<'policy> TextInputControl<'policy> {
     }
 }
 
+/// Whether editable text participates in an enclosing content-selection scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TextInputOuterSelectionPolicy {
+    /// Editable text owns pointer selection and blocks outer content selection.
+    #[default]
+    Isolated,
+    /// The containing application may register the input as delegated content.
+    Delegate,
+}
+
 /// Configurable text-input behavior policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextInputPolicy {
+    /// Participation in an outer logical content-selection scope.
+    pub outer_selection: TextInputOuterSelectionPolicy,
     /// Keyboard behavior.
     pub keyboard: KeyboardPolicy,
     /// Mouse behavior.
@@ -336,6 +348,7 @@ impl TextInputPolicy {
     #[must_use]
     pub const fn raw() -> Self {
         Self {
+            outer_selection: TextInputOuterSelectionPolicy::Isolated,
             keyboard: KeyboardPolicy::disabled(),
             mouse: MousePolicy::disabled(),
             viewport: ViewportPolicy::raw(),
@@ -343,10 +356,18 @@ impl TextInputPolicy {
         }
     }
 
+    /// Return this policy with outer selection participation changed.
+    #[must_use]
+    pub const fn outer_selection(mut self, policy: TextInputOuterSelectionPolicy) -> Self {
+        self.outer_selection = policy;
+        self
+    }
+
     /// Common chat-composer policy.
     #[must_use]
     pub const fn chat_composer() -> Self {
         Self {
+            outer_selection: TextInputOuterSelectionPolicy::Isolated,
             keyboard: KeyboardPolicy::chat_composer(),
             mouse: MousePolicy::text_selection(),
             viewport: ViewportPolicy {
