@@ -70,6 +70,18 @@ use visible_segments::{
     render_ops_to_cells, render_ops_to_visible_segments, render_ops_visible_segment_safe,
 };
 
+/// Lower one plugin retained scene into z-ordered render items.
+#[must_use]
+pub fn plugin_scene_items_to_render_items(
+    scene: &bmux_plugin::RenderLayerScene,
+) -> Vec<RenderLayerItem> {
+    let snapshot = extension_retained::retained_snapshot_from_plugin_scene(
+        ExtensionRect::new(0, 0, u16::MAX, u16::MAX),
+        scene,
+    );
+    extension_retained::retained_scene_items_to_render_items(&snapshot.items)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DamageCoalescingPolicy {
     pub max_rects: usize,
@@ -3327,6 +3339,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
     let mut stats = AttachSceneRenderStats::default();
     let render_context = RenderExtensionContext {
         capabilities: terminal_capabilities,
+        surface_role: bmux_plugin::RenderSurfaceRole::Content,
     };
     let cursor_state = render_attach_scene_inner(
         stdout,
@@ -6130,6 +6143,7 @@ mod tests {
         );
         let render_context = RenderExtensionContext {
             capabilities: bmux_plugin::TerminalRenderCapabilities::default(),
+            ..RenderExtensionContext::default()
         };
 
         let plan = build_before_content_extension_output_plan(
@@ -6220,6 +6234,7 @@ mod tests {
         );
         let render_context = RenderExtensionContext {
             capabilities: bmux_plugin::TerminalRenderCapabilities::default(),
+            ..RenderExtensionContext::default()
         };
 
         let plan = build_after_content_extension_output_plan(

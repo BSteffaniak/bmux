@@ -19,7 +19,7 @@ use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::HitMap;
 use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
-use bmux_tui_components::action_row::{ActionButton, ActionRowState};
+use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::checkbox::{Checkbox, CheckboxState, CheckboxStyles};
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
@@ -1126,7 +1126,7 @@ impl AttachPromptState {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Rendering one field needs canonical form values, editor/error state, focus, geometry, and theme.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Rendering one field keeps all concrete control projections together over canonical form state.
 fn render_form_control(
     field: &PromptFormField,
     values: &BTreeMap<String, PromptFormValue>,
@@ -1210,6 +1210,57 @@ fn render_form_control(
                 .render_with_fallback_style(area, &state, frame, theme.background);
             true
         }
+        (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
+            let mut state = TextInputState::new(
+                editors
+                    .get(&field.id)
+                    .cloned()
+                    .unwrap_or_else(|| TextEditBuffer::from_text(value.to_string())),
+            );
+            let mut component = TextInputBox::new(TextInputPolicy::chat_composer())
+                .label(&field.label)
+                .required(field.required)
+                .policy(
+                    TextInputBoxPolicy::bare()
+                        .focused(focused)
+                        .disabled(field.disabled)
+                        .rows(1, Some(1)),
+                )
+                .styles(form_text_input_styles(theme));
+            if let Some(error) = errors.get(&field.id) {
+                component = component.error(error);
+            }
+            component.render(area, &mut state, frame);
+            true
+        }
+        (
+            PromptFormFieldKind::MultiToggle { options, .. },
+            Some(PromptFormValue::Multi(selected)),
+        ) => {
+            let summary = if selected.is_empty() {
+                "None".to_owned()
+            } else {
+                options
+                    .iter()
+                    .filter(|option| selected.contains(&option.value))
+                    .map(|option| option.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut state = CheckboxState::new(!selected.is_empty());
+            state.set_focused(focused);
+            state.set_disabled(field.disabled);
+            Checkbox::new(&format!("{}: {summary}", field.label))
+                .styles(CheckboxStyles {
+                    normal: theme.text,
+                    focused: theme.focused,
+                    hovered: theme.focused,
+                    pressed: theme.focused,
+                    disabled: theme.muted,
+                })
+                .render_with_fallback_style(area, &state, frame, theme.background);
+            true
+        }
         _ => false,
     }
 }
@@ -1252,7 +1303,14 @@ fn render_form(
     };
     let fields = flatten_form_fields(sections);
     let rows = form_render_rows(sections, values, editors, errors);
-    let visible_rows = usize::from(content.height).max(1);
+    let actions_height = u16::from(content.height > 1);
+    let fields_area = Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(actions_height),
+    );
+    let visible_rows = usize::from(fields_area.height).max(1);
     let start = (*scroll).min(rows.len().saturating_sub(visible_rows));
     let end = start.saturating_add(visible_rows).min(rows.len());
     for (visible_row, row) in rows.iter().take(end).skip(start).enumerate() {
@@ -1260,10 +1318,10 @@ fn render_form(
         let Ok(visible_row) = u16::try_from(visible_row) else {
             break;
         };
-        let field_area = Rect::new(
-            content.x,
-            content.y.saturating_add(visible_row),
-            content.width,
+        let control_area = Rect::new(
+            fields_area.x,
+            fields_area.y.saturating_add(visible_row),
+            fields_area.width,
             1,
         );
         let field = fields[index];
@@ -1273,7 +1331,7 @@ fn render_form(
             editors,
             errors,
             index == *cursor,
-            field_area,
+            control_area,
             frame,
             theme,
         ) {
@@ -1287,9 +1345,28 @@ fn render_form(
             theme.text
         };
         frame.write_line_with_fallback_style(
-            field_area,
+            control_area,
             &Line::raw(row.text.clone()),
             theme.background.patch(style),
+        );
+    }
+    if actions_height > 0 {
+        let actions = [
+            ActionButton::new("submit", active.envelope.request.submit_label.clone()),
+            ActionButton::new("cancel", active.envelope.request.cancel_label.clone()),
+        ];
+        let mut state = ActionRowState::new();
+        state.set_focused(Some(0));
+        ActionRow::new(&actions).render_state_with_fallback_style(
+            Rect::new(
+                content.x,
+                content.bottom().saturating_sub(1),
+                content.width,
+                1,
+            ),
+            &state,
+            frame,
+            theme.background,
         );
     }
     true

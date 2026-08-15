@@ -350,6 +350,19 @@ impl AttachRenderExtension for DecorationRenderExtension {
         &self.name
     }
 
+    fn surface_chrome_with_context(
+        &self,
+        _surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        context: &RenderExtensionContext,
+    ) -> bmux_plugin::RenderSurfaceChrome {
+        if context.surface_role == bmux_plugin::RenderSurfaceRole::Overlay {
+            bmux_plugin::RenderSurfaceChrome::Extension
+        } else {
+            bmux_plugin::RenderSurfaceChrome::Fallback
+        }
+    }
+
     fn refresh_state(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.refresh_from_state_channel();
@@ -456,7 +469,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
     fn render_layer_scene_with_context(
         &self,
         surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
+        surface_rect: &ExtensionRect,
         layer: RenderExtensionLayer,
         context: &RenderExtensionContext,
     ) -> Option<RenderLayerScene> {
@@ -464,6 +477,21 @@ impl AttachRenderExtension for DecorationRenderExtension {
             return Some(RenderLayerScene::new(None, Vec::new()));
         };
         let Some(surface) = cache.surface(&surface_id) else {
+            if context.surface_role == bmux_plugin::RenderSurfaceRole::Overlay
+                && layer == RenderExtensionLayer::AfterPaneContent
+            {
+                return Some(RenderLayerScene::new(
+                    None,
+                    vec![bmux_plugin::RenderSceneItem::border(
+                        bmux_plugin::RenderSceneItemKey::new("overlay-border"),
+                        0,
+                        *surface_rect,
+                        bmux_plugin::BorderGlyphs::rounded(),
+                        bmux_plugin::RenderStyle::new()
+                            .named_foreground(bmux_plugin::RenderNamedColor::BrightCyan),
+                    )],
+                ));
+            }
             return Some(RenderLayerScene::new(None, Vec::new()));
         };
         let scene_capabilities = scene_capabilities_from_terminal(context.capabilities);
@@ -2409,6 +2437,30 @@ mod tests {
         (extension, cache)
     }
 
+    #[test]
+    fn overlay_role_uses_plugin_owned_fallback_border() {
+        let (extension, _) = extension_with_visual_request();
+        let rect = ExtensionRect::new(2, 3, 20, 8);
+
+        let scene = extension
+            .render_layer_scene_with_context(
+                Uuid::from_u128(42),
+                &rect,
+                RenderExtensionLayer::AfterPaneContent,
+                &RenderExtensionContext {
+                    surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+                    ..RenderExtensionContext::default()
+                },
+            )
+            .expect("overlay scene");
+
+        assert!(matches!(
+            &scene.items[0].kind,
+            bmux_plugin::RenderSceneItemKind::Border { rect: actual, glyphs, .. }
+                if *actual == rect && *glyphs == bmux_plugin::BorderGlyphs::rounded()
+        ));
+    }
+
     fn kitty_capabilities() -> TerminalRenderCapabilities {
         TerminalRenderCapabilities {
             kitty_graphics: true,
@@ -2721,6 +2773,7 @@ mod tests {
                 RenderExtensionLayer::AfterPaneContent,
                 &RenderExtensionContext {
                     capabilities: kitty_capabilities(),
+                    ..RenderExtensionContext::default()
                 },
             )
             .expect("retained scene should be available");
@@ -2772,6 +2825,7 @@ mod tests {
                 RenderExtensionLayer::AfterPaneContent,
                 &RenderExtensionContext {
                     capabilities: kitty_capabilities(),
+                    ..RenderExtensionContext::default()
                 },
             )
             .expect("retained scene should be available");
@@ -3180,6 +3234,7 @@ mod tests {
                 RenderExtensionLayer::AfterPaneContent,
                 &RenderExtensionContext {
                     capabilities: kitty_capabilities,
+                    ..RenderExtensionContext::default()
                 },
             )
             .expect("operation path remains a deterministic text fallback");
@@ -3200,6 +3255,7 @@ mod tests {
                         graphics_alpha: true,
                         ..kitty_capabilities
                     },
+                    ..RenderExtensionContext::default()
                 },
             )
             .expect("kitty alpha terminals should use graphics items");
@@ -3554,6 +3610,7 @@ mod tests {
                 cell_pixel_height: 16,
                 ..TerminalRenderCapabilities::default()
             },
+            ..RenderExtensionContext::default()
         }
     }
 

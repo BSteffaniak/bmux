@@ -159,6 +159,23 @@ mod tests {
     }
 
     #[test]
+    fn preserves_wide_and_combining_text_cells() {
+        let area = Rect::new(0, 0, 5, 1);
+        let mut buffer = Buffer::empty(area);
+        let style = Style::new().fg(Color::Cyan);
+        buffer.set_cell(Point::new(0, 0), "界", style);
+        buffer.set_cell(Point::new(1, 0), "", style);
+        buffer.set_cell(Point::new(2, 0), "e\u{301}", style);
+
+        let ops = buffer_render_ops(&buffer);
+
+        assert!(matches!(
+            &ops[0],
+            RenderOp::TextRun { x: 0, y: 0, text, .. } if text.starts_with("界e\u{301}")
+        ));
+    }
+
+    #[test]
     fn converts_all_style_fields() {
         let style = Style::new()
             .fg(Color::Rgb(1, 2, 3))

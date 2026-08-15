@@ -404,8 +404,9 @@ use super::prompt_ui::{
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
     append_pane_output, collect_visual_projection_updates, frame_damage_overlay_rects,
-    frame_damage_overlay_render_ops, queue_render_ops,
-    render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
+    frame_damage_overlay_render_ops, plugin_scene_items_to_render_items, queue_render_items,
+    queue_render_ops, render_attach_scene_with_stats_and_trace_with_capabilities,
+    visible_scene_pane_ids,
 };
 use super::scrollback_modes::{cached_mode, set_cached_mode_debounced, set_runtime_mode};
 use super::state::{
@@ -7946,6 +7947,7 @@ fn queue_retained_extension_ops(
     repaint: &RetainedRepaintSurface,
     extensions: &[Arc<dyn bmux_plugin::AttachRenderExtension>],
     capabilities: bmux_plugin::TerminalRenderCapabilities,
+    graphics_cache: &mut TerminalGraphicsCache,
 ) -> Result<bool> {
     let surface_rect = ExtensionRect::new(
         surface.rect.x,
@@ -7954,9 +7956,62 @@ fn queue_retained_extension_ops(
         surface.rect.h,
     );
     let damage = render_damage_from_retained_damage_rects(&repaint.damage);
-    let context = RenderExtensionContext { capabilities };
+    let context = RenderExtensionContext {
+        capabilities,
+        surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+    };
     let mut wrote = false;
     for extension in extensions {
+        if let Some(scene) = extension.render_layer_scene_with_context(
+            surface.id,
+            &surface_rect,
+            RenderExtensionLayer::AfterPaneContent,
+            &context,
+        ) {
+            let items = plugin_scene_items_to_render_items(&scene);
+            wrote |= queue_render_items(
+                stdout,
+                surface.id,
+                surface_rect,
+                &damage,
+                &items,
+                graphics_cache,
+                capabilities,
+                None,
+            )
+            .with_context(|| {
+                format!(
+                    "failed queueing retained extension scene {}",
+                    extension.name()
+                )
+            })?;
+            continue;
+        }
+        if let Some(items) = extension.render_layer_items_with_context(
+            surface.id,
+            &surface_rect,
+            &damage,
+            RenderExtensionLayer::AfterPaneContent,
+            &context,
+        ) {
+            wrote |= queue_render_items(
+                stdout,
+                surface.id,
+                surface_rect,
+                &damage,
+                &items,
+                graphics_cache,
+                capabilities,
+                None,
+            )
+            .with_context(|| {
+                format!(
+                    "failed queueing retained extension items {}",
+                    extension.name()
+                )
+            })?;
+            continue;
+        }
         let Some(ops) = extension.render_layer_ops_with_context(
             surface.id,
             &surface_rect,
@@ -8455,6 +8510,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             repaint,
             &retained_extensions,
             retained_capabilities,
+            &mut view_state.terminal_graphics_cache,
         )?;
     }
     if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
@@ -8480,6 +8536,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             repaint,
             &retained_extensions,
             retained_capabilities,
+            &mut view_state.terminal_graphics_cache,
         )?;
     } else if view_state.prompt.is_active() {
         overlay_cursor_state = cursor_state_before_forced_hide.map(|mut cursor| {
@@ -8499,6 +8556,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             repaint,
             &retained_extensions,
             retained_capabilities,
+            &mut view_state.terminal_graphics_cache,
         )?;
     }
 
@@ -15328,7 +15386,7 @@ mod tests {
     struct RetainedOverlayExtension;
 
     impl AttachRenderExtension for RetainedOverlayExtension {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "test.retained-overlay"
         }
 
@@ -15370,6 +15428,7 @@ mod tests {
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(RetainedOverlayExtension)];
         let mut output = Vec::new();
+        let mut graphics_cache = TerminalGraphicsCache::new();
 
         let wrote = queue_retained_extension_ops(
             &mut output,
@@ -15377,6 +15436,7 @@ mod tests {
             &repaint,
             &extensions,
             bmux_plugin::TerminalRenderCapabilities::default(),
+            &mut graphics_cache,
         )
         .expect("extension render");
 
@@ -16950,7 +17010,7 @@ mod tests {
         let _ = view_state.retained_compositor.replace_surfaces(
             retained_surfaces_from_attach_scene(&layout_state.scene)
                 .into_iter()
-                .chain(std::iter::once(prompt_surface.clone())),
+                .chain(std::iter::once(prompt_surface)),
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );

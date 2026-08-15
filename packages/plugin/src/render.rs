@@ -1362,10 +1362,27 @@ impl RenderLayerSceneBuilder {
     }
 }
 
+/// Generic presentation role supplied to render extensions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RenderSurfaceRole {
+    #[default]
+    Content,
+    Overlay,
+}
+
+/// Extension-owned chrome disposition for one generic surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderSurfaceChrome {
+    #[default]
+    Fallback,
+    Extension,
+}
+
 /// Context supplied to render extensions for one render pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RenderExtensionContext {
     pub capabilities: TerminalRenderCapabilities,
+    pub surface_role: RenderSurfaceRole,
 }
 
 /// Host-supplied trait objects that plugins implement to paint
@@ -1379,6 +1396,16 @@ pub trait AttachRenderExtension: Send + Sync {
     /// messages. Convention: `<plugin-id>.<extension-kind>` (e.g.
     /// `"bmux.decoration.renderer"`).
     fn name(&self) -> &str;
+
+    /// Declare whether this extension owns outer chrome for a generic surface.
+    fn surface_chrome_with_context(
+        &self,
+        _surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        _context: &RenderExtensionContext,
+    ) -> RenderSurfaceChrome {
+        RenderSurfaceChrome::Fallback
+    }
 
     /// Refresh any retained state that the extension consumes before a
     /// frame is rendered.
