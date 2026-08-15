@@ -4530,6 +4530,14 @@ active_profile = "zellij_compat"
         assert!(!config.keybindings.modes.contains_key("visual"));
         assert!(!config.keybindings.modes.contains_key("command"));
         assert_eq!(
+            config
+                .keybindings
+                .modes
+                .get("insert")
+                .and_then(|mode| mode.bindings.get("ctrl+a c")),
+            Some(&"plugin:bmux.windows:new-window".to_string())
+        );
+        assert_eq!(
             config.keybindings.global.get("alt+n"),
             Some(&"split_focused_horizontal".to_string())
         );

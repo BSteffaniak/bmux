@@ -512,10 +512,8 @@ fn default_normal_bindings() -> BTreeMap<String, String> {
     bindings
 }
 
-fn default_insert_bindings() -> BTreeMap<String, String> {
-    let mut bindings = BTreeMap::new();
-    bindings.insert("ctrl+a escape".to_string(), "enter_mode normal".to_string());
-    bindings
+const fn default_insert_bindings() -> BTreeMap<String, String> {
+    BTreeMap::new()
 }
 
 fn default_modal_modes() -> BTreeMap<String, ModeBindingConfig> {
@@ -554,6 +552,14 @@ mod tests {
                 .modes
                 .get("insert")
                 .is_some_and(|mode| mode.passthrough)
+        );
+        assert!(
+            !config
+                .modes
+                .get("insert")
+                .expect("insert mode should exist")
+                .bindings
+                .contains_key("ctrl+a escape")
         );
     }
 
