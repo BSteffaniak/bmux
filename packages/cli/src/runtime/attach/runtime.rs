@@ -404,9 +404,9 @@ use super::prompt_ui::{
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
     append_pane_output, collect_visual_projection_updates, frame_damage_overlay_rects,
-    frame_damage_overlay_render_ops, plugin_scene_items_to_render_items, queue_render_items,
-    queue_render_ops, render_attach_scene_with_stats_and_trace_with_capabilities,
-    visible_scene_pane_ids,
+    frame_damage_overlay_render_ops, plugin_scene_items_to_render_items,
+    queue_render_items_for_surface, queue_render_ops,
+    render_attach_scene_with_stats_and_trace_with_capabilities, visible_scene_pane_ids,
 };
 use super::scrollback_modes::{cached_mode, set_cached_mode_debounced, set_runtime_mode};
 use super::state::{
@@ -7834,7 +7834,7 @@ fn retained_tab_menu_surface(
     }
     Some(
         RetainedSurface::builder(TAB_MENU_SURFACE_ID, rect)
-            .layer(retained_layer_order(SurfaceLayer::Status))
+            .layer(retained_layer_order(SurfaceLayer::Overlay))
             .z(i32::MAX)
             .opaque()
             .render_ops(attach_tab_menu_render_ops(menu, rect, appearance))
@@ -7969,7 +7969,7 @@ fn queue_retained_extension_ops(
             &context,
         ) {
             let items = plugin_scene_items_to_render_items(&scene);
-            wrote |= queue_render_items(
+            wrote |= queue_render_items_for_surface(
                 stdout,
                 surface.id,
                 surface_rect,
@@ -7994,7 +7994,7 @@ fn queue_retained_extension_ops(
             RenderExtensionLayer::AfterPaneContent,
             &context,
         ) {
-            wrote |= queue_render_items(
+            wrote |= queue_render_items_for_surface(
                 stdout,
                 surface.id,
                 surface_rect,
@@ -16407,6 +16407,7 @@ mod tests {
             .expect("menu surface should build");
 
         assert_eq!(surface.id, TAB_MENU_SURFACE_ID);
+        assert_eq!(surface.layer, retained_layer_order(SurfaceLayer::Overlay));
         assert!(matches!(
             surface.payload,
             RetainedSurfacePayload::RenderOps(_)

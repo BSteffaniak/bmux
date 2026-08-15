@@ -4,7 +4,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 

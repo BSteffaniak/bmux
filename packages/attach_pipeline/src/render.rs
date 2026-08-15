@@ -311,6 +311,45 @@ pub fn queue_render_items<W: io::Write>(
     Ok(wrote)
 }
 
+/// Queue render items while reconciling terminal graphics only for the target
+/// surface. Graphics owned by unrelated pane or overlay surfaces remain active.
+///
+/// Use this when rendering one retained surface outside the full attach-scene
+/// graphics frame. [`queue_render_items`] retains its full-frame cleanup
+/// semantics for callers that own the complete active graphics set.
+///
+/// # Errors
+///
+/// Returns an error if writing terminal control bytes fails.
+#[allow(clippy::too_many_arguments)] // Explicit render state keeps scoped reconciliation unambiguous.
+pub fn queue_render_items_for_surface<W: io::Write>(
+    stdout: &mut W,
+    surface_id: Uuid,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    items: &[RenderLayerItem],
+    graphics_cache: &mut TerminalGraphicsCache,
+    capabilities: TerminalRenderCapabilities,
+    render_stats: Option<&mut AttachSceneRenderStats>,
+) -> Result<bool> {
+    let mut terminal_graphics = TerminalGraphicsFrameResources::default();
+    let wrote = queue_render_items_for_frame(
+        stdout,
+        surface_id,
+        surface_id,
+        surface_rect,
+        damage,
+        items,
+        graphics_cache,
+        &mut terminal_graphics,
+        capabilities,
+    )?;
+    if let Some(stats) = render_stats {
+        terminal_graphics.stats.apply_to(stats);
+    }
+    Ok(wrote)
+}
+
 #[allow(clippy::too_many_arguments)] // Explicit hot-path render state keeps call sites allocation-free.
 fn queue_render_items_for_frame<W: io::Write>(
     stdout: &mut W,
@@ -5257,7 +5296,7 @@ mod tests {
     use super::{
         AttachSceneRenderStats, TerminalGraphicsCleanupPlan, TerminalGraphicsFrameResources,
         TerminalGraphicsStaleCleanupPolicy, queue_render_items, queue_render_items_for_frame,
-        render_attach_scene_with_stats_and_trace_with_capabilities,
+        queue_render_items_for_surface, render_attach_scene_with_stats_and_trace_with_capabilities,
         terminal_graphic_placement_signature,
     };
     #[cfg(feature = "image-kitty")]
@@ -7097,6 +7136,52 @@ mod tests {
         assert_eq!(moved_stats.terminal_graphic_transmits, 0);
         assert_eq!(moved_stats.terminal_graphic_places, 1);
         assert_eq!(moved_stats.terminal_graphic_deletes, 0);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn surface_scoped_render_items_preserve_unrelated_kitty_graphics() {
+        let capabilities = test_kitty_capabilities();
+        let pane_surface_id = Uuid::from_u128(7);
+        let menu_surface_id = Uuid::from_u128(8);
+        let surface_rect = ExtensionRect::new(0, 0, 10, 4);
+        let pane_items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
+        let mut cache = TerminalGraphicsCache::new();
+        queue_render_items(
+            &mut Vec::new(),
+            pane_surface_id,
+            surface_rect,
+            &RenderDamage::FullSurface,
+            &pane_items,
+            &mut cache,
+            capabilities,
+            None,
+        )
+        .expect("initial pane graphic should queue");
+        let cached_keys = cache.keys().copied().collect::<BTreeSet<_>>();
+
+        let mut menu_output = Vec::new();
+        assert!(
+            queue_render_items_for_surface(
+                &mut menu_output,
+                menu_surface_id,
+                surface_rect,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Op(RenderOp::text_run(
+                    0,
+                    0,
+                    "menu",
+                    RenderStyle::new(),
+                ))],
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("menu surface should render without global cleanup")
+        );
+        let menu_output = String::from_utf8(menu_output).expect("terminal output should be utf8");
+        assert!(!menu_output.contains("Ga=d,"), "{menu_output:?}");
+        assert_eq!(cache.keys().copied().collect::<BTreeSet<_>>(), cached_keys);
     }
 
     #[cfg(feature = "image-kitty")]
