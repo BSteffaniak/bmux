@@ -25,7 +25,8 @@ Built-in intent:
 
 - `vim`: richer modal defaults (normal/insert/visual/command mode baseline)
 - `tmux_compat`: tmux-like `ctrl+b` prefix flow and common pane/window keys
-- `zellij_compat`: zellij-style `ctrl+a` command chords and global `alt+...` pane management with passthrough input
+- `zellij_compat`: supported equivalents of canonical Zellij pane, tab, resize,
+  scroll, and global `alt+...` bindings with passthrough input
 
 Built-in patch content is sourced from regular TOML profile files in
 `packages/config/profiles/` and merged through the same deep-merge logic as
@@ -114,8 +115,19 @@ common pane/window keys) as your active profile.
 active_profile = "zellij_compat"
 ```
 
-This enables the built-in zellij-style profile with passthrough terminal input,
-`ctrl+a` command chords, and global `alt+...` pane management.
+This enables supported equivalents of Zellij's canonical keybindings while
+keeping terminal input in passthrough mode. Zellij's temporary pane, tab,
+resize, and scroll modes are represented as sequential bmux chords such as
+`ctrl+p h`, `ctrl+t n`, `ctrl+n +`, and `ctrl+s`. Direct global bindings such
+as `alt+h` and `alt+n` remain global.
+
+The profile follows Zellij's upstream `zellij-utils/assets/config/default.kdl`
+as its source of truth. Actions without a meaningful bmux equivalent are
+omitted rather than mapped to unrelated behavior. These currently include
+locked mode, pane/tab renaming, floating and stacked panes, pane movement and
+groups, synchronized tabs, scrollback editing/search, session-manager UI, and
+writing a literal mode-prefix key. Personal prefix schemes such as `ctrl+a`
+belong in user configuration, not this compatibility profile.
 
 ## Compose tmux + zellij + local overrides
 

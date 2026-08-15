@@ -530,24 +530,8 @@ mod tests {
         handle
             .send_event(crossterm::event::Event::Key(
                 crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('a'),
-                    crossterm::event::KeyModifiers::CONTROL,
-                ),
-            ))
-            .unwrap();
-        handle
-            .send_event(crossterm::event::Event::Key(
-                crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Esc,
-                    crossterm::event::KeyModifiers::NONE,
-                ),
-            ))
-            .unwrap();
-        handle
-            .send_event(crossterm::event::Event::Key(
-                crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('o'),
-                    crossterm::event::KeyModifiers::NONE,
+                    crossterm::event::KeyCode::Char('t'),
+                    crossterm::event::KeyModifiers::ALT,
                 ),
             ))
             .unwrap();

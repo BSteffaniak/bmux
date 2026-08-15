@@ -137,11 +137,11 @@ fn parse_key_token(value: &str) -> Result<KeyCode, ParseKeyError> {
         "plus" => Ok(KeyCode::Char('+')),
         "minus" => Ok(KeyCode::Char('-')),
         "question" => Ok(KeyCode::Char('?')),
+        token if token.len() == 1 => Ok(KeyCode::Char(token.chars().next().unwrap_or_default())),
         token if token.starts_with('f') => token[1..]
             .parse::<u8>()
             .map(KeyCode::F)
             .map_err(|_| ParseKeyError::new(format!("invalid function key '{token}'"))),
-        token if token.len() == 1 => Ok(KeyCode::Char(token.chars().next().unwrap_or_default())),
         _ => Err(ParseKeyError::new(format!("unknown key '{value}'"))),
     }
 }
@@ -174,5 +174,17 @@ mod tests {
         let stroke = parse_key_stroke("option+pageup").expect("parse option-pageup");
         assert_eq!(stroke.key, KeyCode::PageUp);
         assert!(stroke.modifiers.alt);
+    }
+
+    #[test]
+    fn parses_literal_f_without_treating_it_as_a_function_key() {
+        assert_eq!(
+            parse_key_stroke("f").expect("parse literal f").key,
+            KeyCode::Char('f')
+        );
+        assert_eq!(
+            parse_key_stroke("f12").expect("parse function key").key,
+            KeyCode::F(12)
+        );
     }
 }

@@ -4529,22 +4529,36 @@ active_profile = "zellij_compat"
         );
         assert!(!config.keybindings.modes.contains_key("visual"));
         assert!(!config.keybindings.modes.contains_key("command"));
+        let insert_bindings = &config
+            .keybindings
+            .modes
+            .get("insert")
+            .expect("insert mode should exist")
+            .bindings;
+        assert!(insert_bindings.keys().all(|key| !key.starts_with("ctrl+a")));
         assert_eq!(
-            config
-                .keybindings
-                .modes
-                .get("insert")
-                .and_then(|mode| mode.bindings.get("ctrl+a c")),
+            insert_bindings.get("ctrl+p h"),
+            Some(&"focus_left_pane".to_string())
+        );
+        assert_eq!(
+            insert_bindings.get("ctrl+t n"),
             Some(&"plugin:bmux.windows:new-window".to_string())
+        );
+        assert_eq!(
+            insert_bindings.get("ctrl+n plus"),
+            Some(&"increase_split".to_string())
+        );
+        assert_eq!(
+            config.keybindings.global.get("ctrl+s"),
+            Some(&"enter_scroll_mode".to_string())
         );
         assert_eq!(
             config.keybindings.global.get("alt+n"),
             Some(&"split_focused_horizontal".to_string())
         );
-        assert_eq!(
-            config.keybindings.global.get("alt+v"),
-            Some(&"split_focused_vertical".to_string())
-        );
+        assert!(!config.keybindings.global.contains_key("alt+v"));
+        assert!(!config.keybindings.global.contains_key("alt+x"));
+        assert!(!config.keybindings.global.contains_key("alt+z"));
     }
 
     #[test]
