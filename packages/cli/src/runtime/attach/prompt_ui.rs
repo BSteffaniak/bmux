@@ -1006,7 +1006,10 @@ impl AttachPromptState {
         let body_rows = height.saturating_sub(4).max(1);
         let text_width = width.saturating_sub(4);
 
-        let body = render_prompt_body(active, text_width, body_rows);
+        let mut body = PromptBodyRender {
+            lines: Vec::new(),
+            cursor: None,
+        };
         let footer = prompt_footer_text(&active.envelope.request);
         let area = Rect::new(
             layout.surface.rect.x,
@@ -1034,12 +1037,7 @@ impl AttachPromptState {
         modal.render(area, &mut frame);
         let content = modal.content_area(area);
         let mut component_cursor = None;
-        let rendered_palette =
-            if active.envelope.request.modal_id.as_deref() == Some("command-palette") {
-                render_command_palette(active, content, &mut frame, theme)
-            } else {
-                false
-            };
+        let rendered_palette = render_command_palette(active, content, &mut frame, theme);
         let rendered_single_select =
             !rendered_palette && render_single_select(active, content, &mut frame, theme);
         let rendered_text_input = !rendered_palette
@@ -1054,17 +1052,28 @@ impl AttachPromptState {
             && !rendered_text_input
             && !rendered_confirm
             && render_multi_toggle(active, content, &mut frame, theme);
+        let rendered_form = !rendered_palette
+            && !rendered_single_select
+            && !rendered_text_input
+            && !rendered_confirm
+            && !rendered_multi_toggle
+            && render_form(active, content, &mut frame, theme);
+        let uses_legacy_body = !rendered_palette
+            && !rendered_single_select
+            && !rendered_text_input
+            && !rendered_confirm
+            && !rendered_multi_toggle
+            && !rendered_form;
+        if uses_legacy_body {
+            body = render_prompt_body(active, text_width, body_rows);
+        }
         if rendered_palette || rendered_text_input {
             component_cursor = frame.cursor().map(|cursor| AttachCursorState {
                 x: cursor.position.x,
                 y: cursor.position.y,
                 visible: cursor.visible,
             });
-        } else if !rendered_single_select
-            && !rendered_text_input
-            && !rendered_confirm
-            && !rendered_multi_toggle
-        {
+        } else if uses_legacy_body {
             for (index, line) in body.lines.iter().take(body_rows).enumerate() {
                 let row = content
                     .y
@@ -1143,6 +1152,56 @@ impl AttachPromptState {
             response,
         })
     }
+}
+
+fn render_form(
+    active: &ActivePrompt,
+    content: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    let PromptField::Form { sections, .. } = &active.envelope.request.field else {
+        return false;
+    };
+    let PromptWidgetState::Form {
+        cursor,
+        scroll,
+        values,
+        editors,
+        errors,
+    } = &active.state
+    else {
+        return false;
+    };
+    let fields = flatten_form_fields(sections);
+    let rows = form_render_rows(sections, values, editors, errors);
+    let visible_rows = usize::from(content.height).max(1);
+    let start = (*scroll).min(rows.len().saturating_sub(visible_rows));
+    let end = start.saturating_add(visible_rows).min(rows.len());
+    for (visible_row, row) in rows.iter().take(end).skip(start).enumerate() {
+        let index = start.saturating_add(visible_row);
+        let Ok(visible_row) = u16::try_from(visible_row) else {
+            break;
+        };
+        let style = if fields.get(index).is_some_and(|field| field.disabled) {
+            theme.muted
+        } else if index == *cursor || errors.contains_key(&fields[index].id) {
+            theme.focused
+        } else {
+            theme.text
+        };
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                content.x,
+                content.y.saturating_add(visible_row),
+                content.width,
+                1,
+            ),
+            &Line::raw(row.text.clone()),
+            theme.background.patch(style),
+        );
+    }
+    true
 }
 
 fn render_multi_toggle(
@@ -1345,11 +1404,14 @@ fn render_command_palette(
     let PromptWidgetState::SearchSelect { palette } = &mut active.state else {
         return false;
     };
+    let is_command_palette = active.envelope.request.modal_id.as_deref() == Some("command-palette");
     let items = options
         .iter()
         .map(|option| {
             let mut spans = vec![Span::styled(option.label.clone(), theme.text)];
-            if let Some(key_hint) = &option.key_hint {
+            if let Some(key_hint) = &option.key_hint
+                && is_command_palette
+            {
                 spans.push(Span::styled(format!("  {key_hint}"), theme.focused));
             }
             if let Some(detail) = &option.detail {
@@ -1406,11 +1468,13 @@ fn render_command_palette(
     );
     let component = CommandPalette::new(&items)
         .panel(Panel::new().background(theme.background))
-        .placeholder(
-            placeholder
-                .clone()
-                .unwrap_or_else(|| "Search commands".to_owned()),
-        )
+        .placeholder(placeholder.clone().unwrap_or_else(|| {
+            if is_command_palette {
+                "Search commands".to_owned()
+            } else {
+                "Search options".to_owned()
+            }
+        }))
         .list_styles(theme.text, theme.focused);
     active.hits = HitMap::new();
     component.register_projected_hits(
@@ -1445,10 +1509,17 @@ fn render_command_palette(
     }
     if footer_rows > 0 {
         let selected = palette.list.selected.map_or(0, |index| index + 1);
-        let footer = format!(
-            "{selected}/{} matches  •  ↑↓ navigate  •  Enter run  •  Esc close",
-            filtered.len()
-        );
+        let footer = if is_command_palette {
+            format!(
+                "{selected}/{} matches  •  ↑↓ navigate  •  Enter run  •  Esc close",
+                filtered.len()
+            )
+        } else {
+            format!(
+                "{selected}/{} matches  •  ↑↓ navigate  •  Enter select  •  Esc cancel",
+                filtered.len()
+            )
+        };
         frame.write_line_with_fallback_style(
             Rect::new(
                 content.x,
