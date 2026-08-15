@@ -24,6 +24,9 @@ use bmux_tui_components::checkbox::{Checkbox, CheckboxState, CheckboxStyles};
 use bmux_tui_components::dialog::{Dialog, DialogState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
+use bmux_tui_components::select_dropdown::{
+    SelectDropdown, SelectDropdownState, SelectDropdownStyles, SelectOption,
+};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
 };
@@ -1123,6 +1126,111 @@ impl AttachPromptState {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Rendering one field needs canonical form values, editor/error state, focus, geometry, and theme.
+fn render_form_control(
+    field: &PromptFormField,
+    values: &BTreeMap<String, PromptFormValue>,
+    editors: &BTreeMap<String, TextEditBuffer>,
+    errors: &BTreeMap<String, String>,
+    focused: bool,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> bool {
+    match (&field.kind, values.get(&field.id)) {
+        (PromptFormFieldKind::Bool { .. }, Some(PromptFormValue::Bool(value))) => {
+            let mut state = CheckboxState::new(*value);
+            state.set_focused(focused);
+            state.set_disabled(field.disabled);
+            Checkbox::new(&field.label)
+                .styles(CheckboxStyles {
+                    normal: theme.text,
+                    focused: theme.focused,
+                    hovered: theme.focused,
+                    pressed: theme.focused,
+                    disabled: theme.muted,
+                })
+                .render_with_fallback_style(area, &state, frame, theme.background);
+            true
+        }
+        (
+            PromptFormFieldKind::Text { .. } | PromptFormFieldKind::Number { .. },
+            Some(PromptFormValue::Text(_) | PromptFormValue::Number(_)),
+        ) => {
+            let display = form_field_display(field, values, editors);
+            let mut state = TextInputState::new(
+                editors
+                    .get(&field.id)
+                    .cloned()
+                    .unwrap_or_else(|| TextEditBuffer::from_text(display)),
+            );
+            let mut component = TextInputBox::new(TextInputPolicy::chat_composer())
+                .label(&field.label)
+                .required(field.required)
+                .policy(
+                    TextInputBoxPolicy::bare()
+                        .focused(focused)
+                        .disabled(field.disabled)
+                        .rows(1, Some(1)),
+                )
+                .styles(form_text_input_styles(theme));
+            if let PromptFormFieldKind::Text {
+                placeholder: Some(placeholder),
+                ..
+            } = &field.kind
+            {
+                component = component.placeholder(placeholder);
+            }
+            if let Some(error) = errors.get(&field.id) {
+                component = component.error(error);
+            }
+            component.render(area, &mut state, frame);
+            true
+        }
+        (
+            PromptFormFieldKind::SingleSelect { options, .. },
+            Some(PromptFormValue::Single(value)),
+        ) => {
+            let component_options = options
+                .iter()
+                .map(|option| SelectOption::new(option.value.clone(), option.label.clone()))
+                .collect::<Vec<_>>();
+            let selected = options.iter().position(|option| option.value == *value);
+            let mut state = SelectDropdownState::new(selected);
+            state.interaction.focused = focused;
+            state.set_disabled(field.disabled);
+            SelectDropdown::new(&component_options)
+                .styles(SelectDropdownStyles {
+                    normal: theme.text,
+                    focused: theme.focused,
+                    hovered: theme.focused,
+                    pressed: theme.focused,
+                    disabled: theme.muted,
+                })
+                .render_with_fallback_style(area, &state, frame, theme.background);
+            true
+        }
+        _ => false,
+    }
+}
+
+const fn form_text_input_styles(
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> TextInputBoxStyles {
+    TextInputBoxStyles {
+        text: theme.text,
+        focused_text: theme.text,
+        disabled_text: theme.muted,
+        placeholder: theme.muted,
+        selection: theme.focused,
+        border: theme.border,
+        focused_border: theme.focused,
+        background: theme.background,
+        focused_background: theme.background,
+        disabled_background: theme.background,
+    }
+}
+
 fn render_form(
     active: &ActivePrompt,
     content: Rect,
@@ -1152,20 +1260,34 @@ fn render_form(
         let Ok(visible_row) = u16::try_from(visible_row) else {
             break;
         };
-        let style = if fields.get(index).is_some_and(|field| field.disabled) {
+        let field_area = Rect::new(
+            content.x,
+            content.y.saturating_add(visible_row),
+            content.width,
+            1,
+        );
+        let field = fields[index];
+        if render_form_control(
+            field,
+            values,
+            editors,
+            errors,
+            index == *cursor,
+            field_area,
+            frame,
+            theme,
+        ) {
+            continue;
+        }
+        let style = if field.disabled {
             theme.muted
-        } else if index == *cursor || errors.contains_key(&fields[index].id) {
+        } else if index == *cursor || errors.contains_key(&field.id) {
             theme.focused
         } else {
             theme.text
         };
         frame.write_line_with_fallback_style(
-            Rect::new(
-                content.x,
-                content.y.saturating_add(visible_row),
-                content.width,
-                1,
-            ),
+            field_area,
             &Line::raw(row.text.clone()),
             theme.background.patch(style),
         );
