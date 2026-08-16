@@ -118,6 +118,11 @@ debug    = true
 inherits = "release"
 strip    = "none"
 
+[profile.profiling]
+debug    = 1
+inherits = "release"
+strip    = "none"
+
 [profile.release-lto]
 inherits = "release"
 lto      = "fat"
