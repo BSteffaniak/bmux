@@ -407,7 +407,8 @@ use super::render::{
     frame_damage_overlay_render_ops, plugin_scene_items_to_render_items,
     queue_render_items_for_surface, queue_render_ops,
     render_attach_scene_with_stats_and_trace_with_capabilities,
-    suppress_terminal_graphics_intersecting, visible_scene_pane_ids,
+    render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders,
+    visible_scene_pane_ids,
 };
 use super::scrollback_modes::{cached_mode, set_cached_mode_debounced, set_runtime_mode};
 use super::state::{
@@ -7960,6 +7961,7 @@ fn queue_retained_extension_ops(
     let context = RenderExtensionContext {
         capabilities,
         surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+        opaque_occluders: Vec::new(),
     };
     let mut wrote = false;
     for extension in extensions {
@@ -8038,6 +8040,7 @@ fn retained_surface_extension_chrome_owned(
     let context = RenderExtensionContext {
         capabilities,
         surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+        opaque_occluders: Vec::new(),
     };
     extensions.iter().any(|extension| {
         extension.surface_chrome_with_context(surface_id, &extension_rect, &context)
@@ -8213,6 +8216,13 @@ fn build_retained_frame_plan(
         viewport,
         damage_policy,
     );
+    // Overlay graph transitions must re-plan pane extension graphics against
+    // the new opaque coverage before terminal output is emitted. This is an
+    // extension query rather than pane-content damage: pane cells remain
+    // occlusion-pruned while decoration graphics split/restore atomically.
+    if !graph_damage.is_empty() && frame_damage.overlay_damaged() {
+        frame_damage.mark_extension_query();
+    }
     let merged_damage = merge_retained_damages(
         [
             frame_retained_damage.clone(),
@@ -8438,6 +8448,22 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     } else {
         view_state.active_mode_id.as_str()
     };
+    let opaque_overlay_rects = [
+        frame_plan.retained.help_surface.as_ref(),
+        frame_plan.retained.prompt_surface.as_ref(),
+        frame_plan.retained.tab_menu_surface.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|surface| {
+        ExtensionRect::new(
+            surface.rect.x,
+            surface.rect.y,
+            surface.rect.w,
+            surface.rect.h,
+        )
+    })
+    .collect::<Vec<_>>();
     let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
     let mut scene_render_stats = AttachSceneRenderStats::default();
     let cursor_state = if frame_plan.render_scene {
@@ -8454,24 +8480,26 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
                 &extensions,
             ));
         let terminal_render_capabilities = terminal_render_capabilities(view_state);
-        let (cursor_state, stats) = render_attach_scene_with_stats_and_trace_with_capabilities(
-            &mut frame_bytes,
-            &layout_state.scene,
-            &layout_state.panes,
-            &mut view_state.pane_buffers,
-            &mut view_state.terminal_graphics_cache,
-            &frame_damage,
-            status_top_inset,
-            status_bottom_inset,
-            &view_state.pane_scrollback,
-            layout_state.zoomed,
-            terminal_size,
-            &active_runtime_appearance,
-            damage_policy,
-            &extensions,
-            terminal_render_capabilities,
-            render_trace.as_deref_mut(),
-        )?;
+        let (cursor_state, stats) =
+            render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+                &mut frame_bytes,
+                &layout_state.scene,
+                &layout_state.panes,
+                &mut view_state.pane_buffers,
+                &mut view_state.terminal_graphics_cache,
+                &frame_damage,
+                status_top_inset,
+                status_bottom_inset,
+                &view_state.pane_scrollback,
+                layout_state.zoomed,
+                terminal_size,
+                &active_runtime_appearance,
+                damage_policy,
+                &extensions,
+                terminal_render_capabilities,
+                &opaque_overlay_rects,
+                render_trace.as_deref_mut(),
+            )?;
         scene_render_stats = stats;
         cursor_state
     } else {
@@ -8516,29 +8544,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
 
     let previous_cursor_state = view_state.last_cursor_state;
     let mut overlay_rendered = false;
-    let opaque_overlay_rects = [
-        frame_plan.retained.help_surface.as_ref(),
-        frame_plan.retained.prompt_surface.as_ref(),
-        frame_plan.retained.tab_menu_surface.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|surface| {
-        ExtensionRect::new(
-            surface.rect.x,
-            surface.rect.y,
-            surface.rect.w,
-            surface.rect.h,
-        )
-    })
-    .collect::<Vec<_>>();
-    let overlay_capabilities = terminal_render_capabilities(view_state);
-    overlay_rendered |= suppress_terminal_graphics_intersecting(
-        &mut frame_bytes,
-        &opaque_overlay_rects,
-        &mut view_state.terminal_graphics_cache,
-        overlay_capabilities,
-    )?;
     let retained_extensions = bmux_plugin::registered_render_extensions();
     for extension in &retained_extensions {
         extension.refresh_state();

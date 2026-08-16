@@ -1379,10 +1379,11 @@ pub enum RenderSurfaceChrome {
 }
 
 /// Context supplied to render extensions for one render pass.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderExtensionContext {
     pub capabilities: TerminalRenderCapabilities,
     pub surface_role: RenderSurfaceRole,
+    pub opaque_occluders: Vec<ExtensionRect>,
 }
 
 /// Host-supplied trait objects that plugins implement to paint

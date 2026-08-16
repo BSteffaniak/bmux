@@ -449,58 +449,6 @@ fn flush_render_item_ops<W: io::Write>(
     wrote
 }
 
-/// Suppress cached terminal-graphics placements intersecting higher opaque
-/// surfaces without deleting their transmitted image sources.
-///
-/// The cache entry remains with `placement = None`, so the normal graphics
-/// reconciler restores the placement when the occluder moves or closes without
-/// retransmitting image pixels.
-///
-/// # Errors
-///
-/// Returns an error if terminal protocol bytes cannot be written.
-#[cfg_attr(not(feature = "image-kitty"), allow(clippy::unnecessary_wraps))]
-pub fn suppress_terminal_graphics_intersecting<W: io::Write>(
-    stdout: &mut W,
-    opaque_rects: &[ExtensionRect],
-    graphics_cache: &mut TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
-) -> Result<bool> {
-    #[cfg(feature = "image-kitty")]
-    {
-        if !terminal_graphic_can_render(capabilities) || opaque_rects.is_empty() {
-            return Ok(false);
-        }
-        let suppressed = graphics_cache
-            .iter()
-            .filter_map(|(key, entry)| {
-                let placement = entry.placement?;
-                opaque_rects
-                    .iter()
-                    .any(|rect| placement.cell_rect.intersects(*rect))
-                    .then_some((*key, entry.host_image_id))
-            })
-            .collect::<Vec<_>>();
-        for (key, host_image_id) in &suppressed {
-            stdout.write_all(b"\x1b_")?;
-            stdout.write_all(&bmux_image::codec::kitty::encode_delete_placement(
-                *host_image_id,
-                *host_image_id,
-            ))?;
-            stdout.write_all(b"\x1b\\")?;
-            if let Some(entry) = graphics_cache.get_mut(key) {
-                entry.placement = None;
-            }
-        }
-        Ok(!suppressed.is_empty())
-    }
-    #[cfg(not(feature = "image-kitty"))]
-    {
-        let _ = (stdout, opaque_rects, graphics_cache, capabilities);
-        Ok(false)
-    }
-}
-
 /// Queue declarative text/cell render operations.
 ///
 /// # Errors
@@ -3427,10 +3375,62 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
     terminal_capabilities: TerminalRenderCapabilities,
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
+    render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+        stdout,
+        scene,
+        panes,
+        pane_buffers,
+        terminal_graphics_cache,
+        frame_damage,
+        status_top_inset,
+        status_bottom_inset,
+        scrollback_views,
+        zoomed,
+        terminal_size,
+        runtime_appearance,
+        damage_policy,
+        render_extensions,
+        terminal_capabilities,
+        &[],
+        render_trace,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::fn_params_excessive_bools
+)]
+/// Render a composed attach scene while excluding graphics under higher opaque surfaces.
+///
+/// # Errors
+///
+/// Returns an error when queueing frame bytes fails.
+pub fn render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    panes: &[PaneSummary],
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: &mut TerminalGraphicsCache,
+    frame_damage: &FrameDamage,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    scrollback_views: &PaneScrollbackViews,
+    zoomed: bool,
+    terminal_size: (u16, u16),
+    runtime_appearance: &RuntimeAppearance,
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    terminal_capabilities: TerminalRenderCapabilities,
+    opaque_occluders: &[ExtensionRect],
+    render_trace: Option<&mut AttachRenderTrace>,
+) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
     let mut stats = AttachSceneRenderStats::default();
     let render_context = RenderExtensionContext {
         capabilities: terminal_capabilities,
         surface_role: bmux_plugin::RenderSurfaceRole::Content,
+        opaque_occluders: opaque_occluders.to_vec(),
     };
     let cursor_state = render_attach_scene_inner(
         stdout,
@@ -5349,7 +5349,7 @@ mod tests {
         AttachSceneRenderStats, TerminalGraphicsCleanupPlan, TerminalGraphicsFrameResources,
         TerminalGraphicsStaleCleanupPolicy, queue_render_items, queue_render_items_for_frame,
         queue_render_items_for_surface, render_attach_scene_with_stats_and_trace_with_capabilities,
-        suppress_terminal_graphics_intersecting, terminal_graphic_placement_signature,
+        terminal_graphic_placement_signature,
     };
     #[cfg(feature = "image-kitty")]
     use crate::types::TerminalGraphicsCache;
@@ -7188,61 +7188,6 @@ mod tests {
         assert_eq!(moved_stats.terminal_graphic_transmits, 0);
         assert_eq!(moved_stats.terminal_graphic_places, 1);
         assert_eq!(moved_stats.terminal_graphic_deletes, 0);
-    }
-
-    #[cfg(feature = "image-kitty")]
-    #[test]
-    fn suppress_intersecting_graphics_deletes_placement_but_keeps_source_cached() {
-        let capabilities = test_kitty_capabilities();
-        let surface_rect = ExtensionRect::new(0, 0, 10, 4);
-        let graphic = test_graphic_overlay(2);
-        let items = [RenderLayerItem::Graphic(graphic.clone())];
-        let mut cache = TerminalGraphicsCache::new();
-        queue_render_items(
-            &mut Vec::new(),
-            Uuid::from_u128(7),
-            surface_rect,
-            &RenderDamage::FullSurface,
-            &items,
-            &mut cache,
-            capabilities,
-            None,
-        )
-        .expect("initial graphic");
-
-        let mut suppressed = Vec::new();
-        assert!(
-            suppress_terminal_graphics_intersecting(
-                &mut suppressed,
-                &[graphic.cell_rect],
-                &mut cache,
-                capabilities,
-            )
-            .expect("suppress graphic")
-        );
-        let suppressed = String::from_utf8(suppressed).expect("kitty output");
-        assert!(suppressed.contains("Ga=d,d=p,"), "{suppressed:?}");
-        assert!(!suppressed.contains("Ga=d,d=i,"), "{suppressed:?}");
-        assert_eq!(cache.len(), 1);
-        assert!(cache.values().all(|entry| entry.placement.is_none()));
-
-        let mut restored = Vec::new();
-        assert!(
-            queue_render_items_for_surface(
-                &mut restored,
-                Uuid::from_u128(7),
-                surface_rect,
-                &RenderDamage::FullSurface,
-                &items,
-                &mut cache,
-                capabilities,
-                None,
-            )
-            .expect("restore graphic")
-        );
-        let restored = String::from_utf8(restored).expect("kitty output");
-        assert!(restored.contains("Ga=p,"), "{restored:?}");
-        assert!(!restored.contains("Ga=t,"), "{restored:?}");
     }
 
     #[cfg(feature = "image-kitty")]

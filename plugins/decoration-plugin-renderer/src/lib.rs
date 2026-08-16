@@ -501,6 +501,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
             layer,
             context.capabilities,
             scene_capabilities,
+            &context.opaque_occluders,
         ))
     }
 
@@ -529,17 +530,19 @@ impl AttachRenderExtension for DecorationRenderExtension {
         }
 
         let scene_capabilities = scene_capabilities_from_terminal(context.capabilities);
+        let global_occluders = &context.opaque_occluders;
         let previous_used_graphics = previous_surface.as_ref().is_some_and(|previous| {
             layer_paint_commands(previous, layer)
                 .iter()
                 .enumerate()
                 .any(|(semantic_index, command)| {
-                    raster_border::semantic_border_graphic_items(
+                    raster_border::semantic_border_graphic_items_with_occlusion(
                         surface_id,
                         u64::try_from(semantic_index).unwrap_or(u64::MAX),
                         command,
                         context.capabilities,
                         scene_capabilities,
+                        global_occluders,
                     )
                     .is_some()
                 })
@@ -552,12 +555,13 @@ impl AttachRenderExtension for DecorationRenderExtension {
         let mut used_graphics = previous_used_graphics;
         let mut items = Vec::new();
         for (command_index, command) in ordered {
-            if let Some(graphics) = raster_border::semantic_border_graphic_items(
+            if let Some(graphics) = raster_border::semantic_border_graphic_items_with_occlusion(
                 surface_id,
                 u64::try_from(command_index).unwrap_or(u64::MAX),
                 command,
                 context.capabilities,
                 scene_capabilities,
+                global_occluders,
             ) {
                 used_graphics = true;
                 items.extend(graphics);
@@ -1430,6 +1434,7 @@ fn render_scene_for_surface_layer_with_capabilities(
     layer: RenderExtensionLayer,
     terminal_capabilities: TerminalRenderCapabilities,
     scene_capabilities: SceneRenderCapabilities,
+    global_occluders: &[ExtensionRect],
 ) -> RenderLayerScene {
     let commands = layer_paint_commands(surface, layer);
     let mut ordered: Vec<(usize, &PaintCommand)> = commands.iter().enumerate().collect();
@@ -1445,6 +1450,7 @@ fn render_scene_for_surface_layer_with_capabilities(
         layer_key_prefix,
         terminal_capabilities,
         scene_capabilities,
+        global_occluders,
     };
     let mut items = Vec::new();
     for (command_index, command) in ordered {
@@ -1460,6 +1466,7 @@ struct RenderSceneCommandContext<'a> {
     layer_key_prefix: &'a str,
     terminal_capabilities: TerminalRenderCapabilities,
     scene_capabilities: SceneRenderCapabilities,
+    global_occluders: &'a [ExtensionRect],
 }
 
 fn push_render_scene_items_for_command(
@@ -1470,7 +1477,8 @@ fn push_render_scene_items_for_command(
 ) {
     let z = paint_command_z(command);
     let key_prefix = format!("{}:cmd-{command_index:06}", context.layer_key_prefix);
-    let occluders = terminal_cell_occluders_after(context.commands, command_index, command);
+    let mut occluders = terminal_cell_occluders_after(context.commands, command_index, command);
+    occluders.extend_from_slice(context.global_occluders);
     if let Some(graphics) = raster_border::semantic_border_graphic_items_with_occlusion(
         context.surface_id,
         u64::try_from(command_index).unwrap_or(u64::MAX),

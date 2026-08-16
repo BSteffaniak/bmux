@@ -22,6 +22,7 @@ const TOP_SEGMENT_KEY_BASE: u64 = 0;
 const BOTTOM_SEGMENT_KEY_BASE: u64 = SEGMENT_KEY_STRIDE;
 const LEFT_SEGMENT_KEY_BASE: u64 = SEGMENT_KEY_STRIDE * 2;
 const RIGHT_SEGMENT_KEY_BASE: u64 = SEGMENT_KEY_STRIDE * 3;
+const SEGMENT_COORD_SHIFT: u32 = 16;
 
 #[derive(Clone, Copy, Debug)]
 struct RasterSegment {
@@ -138,7 +139,7 @@ fn raster_border_segments(
     thickness_px: u16,
     _radius_px: u16,
     capabilities: TerminalRenderCapabilities,
-    _occluders: &[ExtensionRect],
+    occluders: &[ExtensionRect],
 ) -> Vec<RasterSegment> {
     let cell_w = capabilities.cell_pixel_width;
     let cell_h = capabilities.cell_pixel_height;
@@ -148,7 +149,7 @@ fn raster_border_segments(
     let thickness = thickness_px.clamp(1, cell_w.min(cell_h));
     let pixel_width = u32::from(cell_w);
     let pixel_height = u32::from(cell_h);
-    vec![
+    let base_segments = [
         RasterSegment {
             key_slot: TOP_SEGMENT_KEY_BASE,
             col: rect.x,
@@ -197,7 +198,74 @@ fn raster_border_segments(
                 thickness_px: thickness,
             },
         },
-    ]
+    ];
+    base_segments
+        .into_iter()
+        .flat_map(|segment| subtract_occluders(segment, occluders))
+        .collect()
+}
+
+fn subtract_occluders(segment: RasterSegment, occluders: &[ExtensionRect]) -> Vec<RasterSegment> {
+    let horizontal = segment.cell_height == 1;
+    let fixed = if horizontal { segment.row } else { segment.col };
+    let start = if horizontal { segment.col } else { segment.row };
+    let len = if horizontal {
+        segment.cell_width
+    } else {
+        segment.cell_height
+    };
+    let end = start.saturating_add(len);
+    let mut visible = vec![(start, end)];
+    for occluder in occluders {
+        let crosses_fixed = if horizontal {
+            fixed >= occluder.y && fixed < occluder.bottom()
+        } else {
+            fixed >= occluder.x && fixed < occluder.right()
+        };
+        if !crosses_fixed {
+            continue;
+        }
+        let cut_start = if horizontal { occluder.x } else { occluder.y };
+        let cut_end = if horizontal {
+            occluder.right()
+        } else {
+            occluder.bottom()
+        };
+        visible = visible
+            .into_iter()
+            .flat_map(|(visible_start, visible_end)| {
+                if cut_end <= visible_start || cut_start >= visible_end {
+                    return vec![(visible_start, visible_end)];
+                }
+                let mut pieces = Vec::with_capacity(2);
+                if cut_start > visible_start {
+                    pieces.push((visible_start, cut_start.min(visible_end)));
+                }
+                if cut_end < visible_end {
+                    pieces.push((cut_end.max(visible_start), visible_end));
+                }
+                pieces
+            })
+            .collect();
+    }
+    visible
+        .into_iter()
+        .filter(|(visible_start, visible_end)| visible_start < visible_end)
+        .map(|(visible_start, visible_end)| {
+            let mut visible_segment = segment;
+            if horizontal {
+                visible_segment.col = visible_start;
+                visible_segment.cell_width = visible_end.saturating_sub(visible_start);
+            } else {
+                visible_segment.row = visible_start;
+                visible_segment.cell_height = visible_end.saturating_sub(visible_start);
+            }
+            visible_segment.key_slot = segment.key_slot
+                | (u64::from(visible_start) << SEGMENT_COORD_SHIFT)
+                | u64::from(visible_end);
+            visible_segment
+        })
+        .collect()
 }
 
 fn raster_color_from_style(style: &SceneStyle) -> TerminalRgba {
@@ -411,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_border_graphics_keep_stable_under_text_placements_with_occluders() {
+    fn semantic_border_graphics_split_around_global_occluders() {
         let command = PaintCommand::SemanticBorder {
             rect: SceneRect {
                 x: 10,
@@ -443,7 +511,7 @@ mod tests {
             cell_pixel_height: 16,
             ..TerminalRenderCapabilities::default()
         };
-        let with_header = semantic_border_graphic_items_with_occlusion(
+        let top_split = semantic_border_graphic_items_with_occlusion(
             Uuid::from_u128(1),
             0,
             &command,
@@ -452,7 +520,7 @@ mod tests {
             &[ExtensionRect::new(12, 20, 4, 1)],
         )
         .expect("semantic border should lower to graphics");
-        let with_paddle = semantic_border_graphic_items_with_occlusion(
+        let left_split = semantic_border_graphic_items_with_occlusion(
             Uuid::from_u128(1),
             0,
             &command,
@@ -475,20 +543,37 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let header_signature = graphic_signature(with_header);
-        let paddle_signature = graphic_signature(with_paddle);
-        assert_eq!(header_signature, paddle_signature);
-        assert_eq!(
-            header_signature
+        let top_signature = graphic_signature(top_split);
+        let left_signature = graphic_signature(left_split);
+        assert!(
+            top_signature
                 .iter()
-                .map(|(_, rect)| *rect)
-                .collect::<Vec<_>>(),
-            vec![
-                ExtensionRect::new(10, 20, 10, 1),
-                ExtensionRect::new(10, 25, 10, 1),
-                ExtensionRect::new(10, 20, 1, 6),
-                ExtensionRect::new(19, 20, 1, 6),
-            ]
+                .any(|(_, rect)| *rect == ExtensionRect::new(10, 20, 2, 1))
+        );
+        assert!(
+            top_signature
+                .iter()
+                .any(|(_, rect)| *rect == ExtensionRect::new(16, 20, 4, 1))
+        );
+        assert!(
+            !top_signature
+                .iter()
+                .any(|(_, rect)| rect.intersects(ExtensionRect::new(12, 20, 4, 1)))
+        );
+        assert!(
+            left_signature
+                .iter()
+                .any(|(_, rect)| *rect == ExtensionRect::new(10, 20, 1, 2))
+        );
+        assert!(
+            left_signature
+                .iter()
+                .any(|(_, rect)| *rect == ExtensionRect::new(10, 24, 1, 2))
+        );
+        assert!(
+            !left_signature
+                .iter()
+                .any(|(_, rect)| rect.intersects(ExtensionRect::new(10, 22, 1, 2)))
         );
     }
 }
