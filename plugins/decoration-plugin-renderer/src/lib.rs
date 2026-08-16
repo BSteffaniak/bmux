@@ -1609,8 +1609,9 @@ fn push_render_scene_items_for_command(
 ) {
     let z = paint_command_z(command);
     let key_prefix = format!("{}:cmd-{command_index:06}", context.layer_key_prefix);
-    let terminal_cell_occluders =
+    let mut terminal_cell_occluders =
         command_regions_after(context.terminal_cell_regions, command_index, command);
+    terminal_cell_occluders.extend_from_slice(context.global_occluders);
     let mut graphic_occluders =
         command_regions_after(context.opaque_commands, command_index, command);
     graphic_occluders.extend_from_slice(context.global_occluders);
@@ -3876,21 +3877,77 @@ mod tests {
 
         let mut snake = vec![semantic_border_command(&rect)];
         snake.extend(snake_commands(1..19));
+        let global_occluder = ExtensionRect::new(7, 0, 6, 4);
         let global_scene = render_scene_for_surface_layer_with_capabilities(
             surface_id,
             &surface(surface_id, snake),
             RenderExtensionLayer::AfterPaneContent,
             kitty_capabilities(),
             SceneRenderCapabilities::default(),
-            &[ExtensionRect::new(7, 0, 6, 4)],
+            &[global_occluder],
         );
         let global_graphics = terminal_graphic_signature(&global_scene);
         assert!(global_graphics.len() > 4);
         assert!(
-            global_graphics.iter().all(|(_, graphic_rect)| {
-                !graphic_rect.intersects(ExtensionRect::new(7, 0, 6, 4))
-            })
+            global_graphics
+                .iter()
+                .all(|(_, graphic_rect)| !graphic_rect.intersects(global_occluder))
         );
+        let snake_columns = global_scene
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                bmux_plugin::RenderSceneItemKind::Text { x, y, text, .. }
+                    if text == "◆" && *y == 0 =>
+                {
+                    Some(*x)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(snake_columns.iter().all(|column| !(7..13).contains(column)));
+        assert!(snake_columns.iter().any(|column| *column < 7));
+        assert!(snake_columns.iter().any(|column| *column >= 13));
+    }
+
+    #[test]
+    fn global_overlay_clips_ascii_border_fallback_and_snake_text() {
+        let surface_id = Uuid::from_u128(108);
+        let rect = SceneRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let mut commands = vec![semantic_border_command(&rect)];
+        commands.extend(snake_commands(1..19));
+        let occluder = ExtensionRect::new(7, 0, 6, 4);
+        let scene = render_scene_for_surface_layer_with_capabilities(
+            surface_id,
+            &surface(surface_id, commands),
+            RenderExtensionLayer::AfterPaneContent,
+            TerminalRenderCapabilities::default(),
+            SceneRenderCapabilities::default(),
+            &[occluder],
+        );
+
+        assert!(scene.items.iter().all(|item| match &item.kind {
+            bmux_plugin::RenderSceneItemKind::Text { x, y, text, .. } => {
+                !ExtensionRect::new(*x, *y, render_text_width_u16(text), 1).intersects(occluder)
+            }
+            bmux_plugin::RenderSceneItemKind::StyledText { x, y, spans } => {
+                let width = spans
+                    .iter()
+                    .map(|span| render_text_width_u16(&span.text))
+                    .fold(0, u16::saturating_add);
+                !ExtensionRect::new(*x, *y, width, 1).intersects(occluder)
+            }
+            _ => true,
+        }));
+        assert!(scene.items.iter().any(|item| matches!(
+            &item.kind,
+            bmux_plugin::RenderSceneItemKind::Text { text, .. } if text == "◆"
+        )));
     }
 
     fn kitty_alpha_context() -> RenderExtensionContext {
