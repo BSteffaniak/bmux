@@ -1276,21 +1276,21 @@ fn paint_command_sort_key(index: usize, command: &PaintCommand) -> (i16, usize) 
     (paint_command_z(command), index)
 }
 
-fn terminal_cell_occluders_after(
-    commands: &[PaintCommand],
-    command_index: usize,
-    command: &PaintCommand,
-) -> Vec<ExtensionRect> {
-    let command_key = paint_command_sort_key(command_index, command);
+#[derive(Clone, Debug)]
+struct PaintCommandRegions {
+    sort_key: (i16, usize),
+    regions: Vec<ExtensionRect>,
+}
+
+fn collect_terminal_cell_regions(commands: &[PaintCommand]) -> Vec<PaintCommandRegions> {
     commands
         .iter()
         .enumerate()
-        .filter(|(index, candidate)| {
-            *index != command_index
-                && paint_command_sort_key(*index, candidate) > command_key
-                && paint_command_paints_terminal_cells(candidate)
+        .filter(|(_, command)| paint_command_paints_terminal_cells(command))
+        .map(|(index, command)| PaintCommandRegions {
+            sort_key: paint_command_sort_key(index, command),
+            regions: paint_command_damage(command).collect(),
         })
-        .flat_map(|(_, candidate)| paint_command_damage(candidate))
         .collect()
 }
 
@@ -1310,6 +1310,133 @@ fn paint_command_paints_terminal_cells(command: &PaintCommand) -> bool {
         }
         PaintCommand::SemanticBorder { .. } => false,
     }
+}
+
+fn collect_paint_command_opaque_regions(commands: &[PaintCommand]) -> Vec<PaintCommandRegions> {
+    commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            let regions = paint_command_opaque_regions(command);
+            (!regions.is_empty()).then(|| PaintCommandRegions {
+                sort_key: paint_command_sort_key(index, command),
+                regions,
+            })
+        })
+        .collect()
+}
+
+fn command_regions_after(
+    commands: &[PaintCommandRegions],
+    command_index: usize,
+    command: &PaintCommand,
+) -> Vec<ExtensionRect> {
+    let command_key = paint_command_sort_key(command_index, command);
+    commands
+        .iter()
+        .filter(|candidate| candidate.sort_key > command_key)
+        .flat_map(|candidate| candidate.regions.iter().copied())
+        .collect()
+}
+
+fn paint_command_opaque_regions(command: &PaintCommand) -> Vec<ExtensionRect> {
+    match command {
+        PaintCommand::Text {
+            col,
+            row,
+            text,
+            style,
+            ..
+        } if style_paints_opaque_background(style) && !text.is_empty() => {
+            vec![ExtensionRect::new(
+                *col,
+                *row,
+                render_text_width_u16(text),
+                1,
+            )]
+        }
+        PaintCommand::GradientRun {
+            col,
+            row,
+            text,
+            from_style,
+            to_style,
+            ..
+        } if style_paints_opaque_background(from_style)
+            && style_paints_opaque_background(to_style)
+            && !text.is_empty() =>
+        {
+            vec![ExtensionRect::new(
+                *col,
+                *row,
+                render_text_width_u16(text),
+                1,
+            )]
+        }
+        PaintCommand::FilledRect { rect, style, .. }
+            if style_paints_opaque_background(style) && rect.w > 0 && rect.h > 0 =>
+        {
+            vec![render_rect_from_scene(rect)]
+        }
+        PaintCommand::CellGrid {
+            origin_col,
+            origin_row,
+            cols,
+            cells,
+            ..
+        } if *cols > 0 => cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| style_paints_opaque_background(&cell.style))
+            .filter_map(|(index, _)| {
+                let index = u16::try_from(index).ok()?;
+                Some(ExtensionRect::new(
+                    origin_col.saturating_add(index % *cols),
+                    origin_row.saturating_add(index / *cols),
+                    1,
+                    1,
+                ))
+            })
+            .collect(),
+        PaintCommand::BoxBorder { rect, style, .. }
+            if style_paints_opaque_background(style) && rect.w >= 2 && rect.h >= 2 =>
+        {
+            border_cell_regions(rect)
+        }
+        PaintCommand::Text { .. }
+        | PaintCommand::FilledRect { .. }
+        | PaintCommand::GradientRun { .. }
+        | PaintCommand::CellGrid { .. }
+        | PaintCommand::BoxBorder { .. }
+        | PaintCommand::SemanticBorder { .. } => Vec::new(),
+    }
+}
+
+const fn style_paints_opaque_background(style: &SceneStyle) -> bool {
+    style.bg.is_some() || style.reverse
+}
+
+fn border_cell_regions(rect: &SceneRect) -> Vec<ExtensionRect> {
+    vec![
+        ExtensionRect::new(rect.x, rect.y, rect.w, 1),
+        ExtensionRect::new(
+            rect.x,
+            rect.y.saturating_add(rect.h.saturating_sub(1)),
+            rect.w,
+            1,
+        ),
+        ExtensionRect::new(rect.x, rect.y, 1, rect.h),
+        ExtensionRect::new(
+            rect.x.saturating_add(rect.w.saturating_sub(1)),
+            rect.y,
+            1,
+            rect.h,
+        ),
+    ]
+}
+
+const fn render_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
+    ExtensionRect::new(rect.x, rect.y, rect.w, rect.h)
 }
 
 fn cell_occluded(col: u16, row: u16, occluders: &[ExtensionRect]) -> bool {
@@ -1420,9 +1547,10 @@ pub fn render_ops_for_paint_commands_with_capabilities(
     let mut ordered: Vec<(usize, &PaintCommand)> = paint_commands.iter().enumerate().collect();
     ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
 
+    let terminal_cell_regions = collect_terminal_cell_regions(paint_commands);
     let mut ops = Vec::new();
     for (command_index, command) in ordered {
-        let occluders = terminal_cell_occluders_after(paint_commands, command_index, command);
+        let occluders = command_regions_after(&terminal_cell_regions, command_index, command);
         push_render_ops_for_command_with_occluders(&mut ops, command, capabilities, &occluders)?;
     }
     Some(ops)
@@ -1444,9 +1572,12 @@ fn render_scene_for_surface_layer_with_capabilities(
         RenderExtensionLayer::BeforePaneContent => "before",
         RenderExtensionLayer::AfterPaneContent => "after",
     };
+    let terminal_cell_regions = collect_terminal_cell_regions(commands);
+    let opaque_commands = collect_paint_command_opaque_regions(commands);
     let context = RenderSceneCommandContext {
         surface_id,
-        commands,
+        terminal_cell_regions: &terminal_cell_regions,
+        opaque_commands: &opaque_commands,
         layer_key_prefix,
         terminal_capabilities,
         scene_capabilities,
@@ -1462,7 +1593,8 @@ fn render_scene_for_surface_layer_with_capabilities(
 #[derive(Clone, Copy)]
 struct RenderSceneCommandContext<'a> {
     surface_id: Uuid,
-    commands: &'a [PaintCommand],
+    terminal_cell_regions: &'a [PaintCommandRegions],
+    opaque_commands: &'a [PaintCommandRegions],
     layer_key_prefix: &'a str,
     terminal_capabilities: TerminalRenderCapabilities,
     scene_capabilities: SceneRenderCapabilities,
@@ -1477,15 +1609,18 @@ fn push_render_scene_items_for_command(
 ) {
     let z = paint_command_z(command);
     let key_prefix = format!("{}:cmd-{command_index:06}", context.layer_key_prefix);
-    let mut occluders = terminal_cell_occluders_after(context.commands, command_index, command);
-    occluders.extend_from_slice(context.global_occluders);
+    let terminal_cell_occluders =
+        command_regions_after(context.terminal_cell_regions, command_index, command);
+    let mut graphic_occluders =
+        command_regions_after(context.opaque_commands, command_index, command);
+    graphic_occluders.extend_from_slice(context.global_occluders);
     if let Some(graphics) = raster_border::semantic_border_graphic_items_with_occlusion(
         context.surface_id,
         u64::try_from(command_index).unwrap_or(u64::MAX),
         command,
         context.terminal_capabilities,
         context.scene_capabilities,
-        &occluders,
+        &graphic_occluders,
     ) {
         for (graphic_index, item) in graphics.into_iter().enumerate() {
             let RenderLayerItem::Graphic(graphic) = item else {
@@ -1505,7 +1640,7 @@ fn push_render_scene_items_for_command(
         &mut ops,
         command,
         context.scene_capabilities,
-        &occluders,
+        &terminal_cell_occluders,
     ) else {
         return;
     };
@@ -3606,6 +3741,155 @@ mod tests {
                 ExtensionRect::new(0, 0, 1, 8),
                 ExtensionRect::new(19, 0, 1, 8),
             ]
+        );
+    }
+
+    fn terminal_graphic_signature(
+        scene: &RenderLayerScene,
+    ) -> Vec<(RenderSceneItemKey, ExtensionRect)> {
+        scene
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                bmux_plugin::RenderSceneItemKind::TerminalGraphic { graphic } => {
+                    Some((item.key.clone(), graphic.cell_rect))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn semantic_border_command(rect: &SceneRect) -> PaintCommand {
+        PaintCommand::SemanticBorder {
+            rect: rect.clone(),
+            z: 0,
+            style: scene_style(),
+            fallback_glyphs: SceneBorderGlyphs::Rounded,
+            thickness_px: 3,
+            radius_px: 0,
+            when: None,
+        }
+    }
+
+    fn snake_commands(columns: impl IntoIterator<Item = u16>) -> Vec<PaintCommand> {
+        columns
+            .into_iter()
+            .map(|col| PaintCommand::Text {
+                col,
+                row: 0,
+                z: 20,
+                text: "◆".to_string(),
+                style: scene_style(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moving_foreground_only_snake_keeps_stable_kitty_border_graphics() {
+        let surface_id = Uuid::from_u128(106);
+        let rect = SceneRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let mut first_commands = vec![semantic_border_command(&rect)];
+        first_commands.extend(snake_commands(1..19));
+        let first = render_scene_for_surface_layer_with_capabilities(
+            surface_id,
+            &surface(surface_id, first_commands),
+            RenderExtensionLayer::AfterPaneContent,
+            kitty_capabilities(),
+            SceneRenderCapabilities::default(),
+            &[],
+        );
+
+        let mut moved_commands = vec![semantic_border_command(&rect)];
+        moved_commands.extend(snake_commands((1..19).rev()));
+        let moved = render_scene_for_surface_layer_with_capabilities(
+            surface_id,
+            &surface(surface_id, moved_commands),
+            RenderExtensionLayer::AfterPaneContent,
+            kitty_capabilities(),
+            SceneRenderCapabilities::default(),
+            &[],
+        );
+
+        let expected = vec![
+            ExtensionRect::new(0, 0, 20, 1),
+            ExtensionRect::new(0, 9, 20, 1),
+            ExtensionRect::new(0, 0, 1, 10),
+            ExtensionRect::new(19, 0, 1, 10),
+        ];
+        assert_eq!(
+            terminal_graphic_signature(&first)
+                .iter()
+                .map(|(_, rect)| *rect)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            terminal_graphic_signature(&first),
+            terminal_graphic_signature(&moved)
+        );
+    }
+
+    #[test]
+    fn opaque_text_and_global_overlay_still_split_kitty_border_graphics() {
+        let surface_id = Uuid::from_u128(107);
+        let rect = SceneRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let mut opaque_style = scene_style();
+        opaque_style.bg = Some(SceneColor::Rgb { r: 1, g: 2, b: 3 });
+        let local_opaque = surface(
+            surface_id,
+            vec![
+                semantic_border_command(&rect),
+                PaintCommand::Text {
+                    col: 5,
+                    row: 0,
+                    z: 20,
+                    text: "opaque".to_string(),
+                    style: opaque_style,
+                },
+            ],
+        );
+        let local_scene = render_scene_for_surface_layer_with_capabilities(
+            surface_id,
+            &local_opaque,
+            RenderExtensionLayer::AfterPaneContent,
+            kitty_capabilities(),
+            SceneRenderCapabilities::default(),
+            &[],
+        );
+        let local_graphics = terminal_graphic_signature(&local_scene);
+        assert!(local_graphics.len() > 4);
+        assert!(
+            local_graphics.iter().all(|(_, graphic_rect)| {
+                !graphic_rect.intersects(ExtensionRect::new(5, 0, 6, 1))
+            })
+        );
+
+        let mut snake = vec![semantic_border_command(&rect)];
+        snake.extend(snake_commands(1..19));
+        let global_scene = render_scene_for_surface_layer_with_capabilities(
+            surface_id,
+            &surface(surface_id, snake),
+            RenderExtensionLayer::AfterPaneContent,
+            kitty_capabilities(),
+            SceneRenderCapabilities::default(),
+            &[ExtensionRect::new(7, 0, 6, 4)],
+        );
+        let global_graphics = terminal_graphic_signature(&global_scene);
+        assert!(global_graphics.len() > 4);
+        assert!(
+            global_graphics.iter().all(|(_, graphic_rect)| {
+                !graphic_rect.intersects(ExtensionRect::new(7, 0, 6, 4))
+            })
         );
     }
 

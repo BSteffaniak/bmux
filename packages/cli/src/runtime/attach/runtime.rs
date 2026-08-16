@@ -17138,6 +17138,84 @@ mod tests {
     }
 
     #[test]
+    fn opaque_prompt_coverage_change_queries_extensions_once() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let surface = test_pane_surface(
+            pane_id,
+            AttachRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        );
+        let layout_state = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![surface],
+            },
+            zoomed: false,
+        };
+        let prompt_render = test_prompt_overlay_render(
+            AttachRect {
+                x: 20,
+                y: 8,
+                w: 40,
+                h: 8,
+            },
+            "opaque prompt",
+        );
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.dirty.clear_frame_damage();
+        let mut frame_damage = bmux_attach_pipeline::FrameDamage::default();
+
+        let _ = build_retained_frame_plan(
+            &mut view_state,
+            &layout_state,
+            &mut frame_damage,
+            None,
+            None,
+            Some(prompt_render.clone()),
+            None,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert!(frame_damage.extension_query_requested());
+        assert_eq!(
+            view_state.opaque_overlay_rects,
+            vec![ExtensionRect::new(20, 8, 40, 8)]
+        );
+
+        let mut unchanged_damage = bmux_attach_pipeline::FrameDamage::default();
+        unchanged_damage.mark_overlay();
+        let _ = build_retained_frame_plan(
+            &mut view_state,
+            &layout_state,
+            &mut unchanged_damage,
+            None,
+            None,
+            Some(prompt_render),
+            None,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert!(!unchanged_damage.extension_query_requested());
+    }
+
+    #[test]
     fn pane_surface_dirty_marks_extension_damage_without_content_damage() {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
