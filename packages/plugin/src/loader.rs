@@ -1729,15 +1729,14 @@ impl LoadedPlugin {
         match &self.backend {
             PluginBackend::Static(vtable) => (vtable.register_contributions)(),
             PluginBackend::Dynamic(library) => {
-                let symbol: Symbol<'_, NativeRegisterContributionsFn> =
-                    match lookup_dynamic_symbol_with_bcode_fallback(
-                        library,
-                        self.declaration.id.as_str(),
-                        DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL,
-                    ) {
-                        Ok(symbol) => symbol,
-                        Err(_) => return Ok(Vec::new()),
-                    };
+                let symbol: Symbol<'_, NativeRegisterContributionsFn> = match lookup_dynamic_symbol(
+                    library,
+                    self.declaration.id.as_str(),
+                    DEFAULT_NATIVE_REGISTER_CONTRIBUTIONS_SYMBOL,
+                ) {
+                    Ok(symbol) => symbol,
+                    Err(_) => return Ok(Vec::new()),
+                };
                 let (bytes, _) = invoke_native_service_resizing_output(
                     self.declaration.id.as_str(),
                     self.native_service_buffers,
@@ -1746,7 +1745,6 @@ impl LoadedPlugin {
                     },
                 )?;
                 decode_service_message(&bytes)
-                    .or_else(|_| crate::bcode_compat::decode_bcode_command_contributions(&bytes))
             }
             PluginBackend::Process(_) => Ok(Vec::new()),
         }
@@ -2123,12 +2121,11 @@ impl LoadedPlugin {
         let status = match &self.backend {
             PluginBackend::Static(vtable) => (vtable.handle_event)(payload.as_ptr(), payload.len()),
             PluginBackend::Dynamic(library) => {
-                let event_symbol: Symbol<'_, NativeEventFn> =
-                    lookup_dynamic_symbol_with_bcode_fallback(
-                        library,
-                        self.declaration.id.as_str(),
-                        DEFAULT_NATIVE_EVENT_SYMBOL,
-                    )?;
+                let event_symbol: Symbol<'_, NativeEventFn> = lookup_dynamic_symbol(
+                    library,
+                    self.declaration.id.as_str(),
+                    DEFAULT_NATIVE_EVENT_SYMBOL,
+                )?;
                 unsafe { event_symbol(payload.as_ptr(), payload.len()) }
             }
             PluginBackend::Process(runtime) => {
@@ -2293,22 +2290,19 @@ impl LoadedPlugin {
                     DEFAULT_NATIVE_SERVICE_SYMBOL
                 };
                 let sym: Symbol<'_, NativeInvokeServiceFn> =
-                    lookup_dynamic_symbol_with_bcode_fallback(
-                        library,
-                        self.declaration.id.as_str(),
-                        symbol,
-                    )
-                    .or_else(|error| {
-                        if streaming {
-                            lookup_dynamic_symbol_with_bcode_fallback(
-                                library,
-                                self.declaration.id.as_str(),
-                                DEFAULT_NATIVE_SERVICE_SYMBOL,
-                            )
-                        } else {
-                            Err(error)
-                        }
-                    })?;
+                    lookup_dynamic_symbol(library, self.declaration.id.as_str(), symbol).or_else(
+                        |error| {
+                            if streaming {
+                                lookup_dynamic_symbol(
+                                    library,
+                                    self.declaration.id.as_str(),
+                                    DEFAULT_NATIVE_SERVICE_SYMBOL,
+                                )
+                            } else {
+                                Err(error)
+                            }
+                        },
+                    )?;
                 Some(sym)
             }
             PluginBackend::Static(_) | PluginBackend::Process(_) => None,
@@ -2435,16 +2429,15 @@ impl LoadedPlugin {
                 func(payload.as_ptr(), payload.len())
             }
             PluginBackend::Dynamic(library) => {
-                let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> =
-                    lookup_dynamic_symbol_with_bcode_fallback(
-                        library,
-                        self.declaration.id.as_str(),
-                        if symbol == DEFAULT_NATIVE_ACTIVATE_SYMBOL {
-                            DEFAULT_NATIVE_ACTIVATE_SYMBOL
-                        } else {
-                            DEFAULT_NATIVE_DEACTIVATE_SYMBOL
-                        },
-                    )?;
+                let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> = lookup_dynamic_symbol(
+                    library,
+                    self.declaration.id.as_str(),
+                    if symbol == DEFAULT_NATIVE_ACTIVATE_SYMBOL {
+                        DEFAULT_NATIVE_ACTIVATE_SYMBOL
+                    } else {
+                        DEFAULT_NATIVE_DEACTIVATE_SYMBOL
+                    },
+                )?;
                 unsafe { lifecycle_symbol(payload.as_ptr(), payload.len()) }
             }
             PluginBackend::Process(runtime) => {
@@ -2865,36 +2858,15 @@ pub fn load_trusted_static_plugin_with_native_service_buffer_config(
     })
 }
 
-fn lookup_dynamic_symbol_with_bcode_fallback<'lib, T>(
+fn lookup_dynamic_symbol<'lib, T>(
     library: &'lib Library,
     plugin_id: &str,
     canonical: &'static str,
 ) -> Result<Symbol<'lib, T>> {
-    unsafe { library.get(canonical.as_bytes()) }.or_else(|canonical_error| {
-        let Some(fallback) = crate::bcode_compat::symbol_fallback(canonical) else {
-            return Err(PluginError::NativeServiceSymbol {
-                plugin_id: plugin_id.to_string(),
-                symbol: canonical.to_string(),
-                details: canonical_error.to_string(),
-            });
-        };
-        let symbol = unsafe { library.get(fallback.bcode.as_bytes()) }.map_err(|fallback_error| {
-            PluginError::NativeServiceSymbol {
-                plugin_id: plugin_id.to_string(),
-                symbol: canonical.to_string(),
-                details: format!(
-                    "canonical symbol '{}' missing ({canonical_error}); bcode fallback '{}' missing ({fallback_error})",
-                    fallback.canonical, fallback.bcode
-                ),
-            }
-        })?;
-        warn!(
-            plugin_id,
-            canonical = fallback.canonical,
-            bcode = fallback.bcode,
-            "using temporary Bcode plugin symbol compatibility fallback"
-        );
-        Ok(symbol)
+    unsafe { library.get(canonical.as_bytes()) }.map_err(|error| PluginError::NativeServiceSymbol {
+        plugin_id: plugin_id.to_string(),
+        symbol: canonical.to_string(),
+        details: error.to_string(),
     })
 }
 
@@ -2918,7 +2890,7 @@ fn load_native_declaration(
 
     let descriptor_symbol: Symbol<'_, PluginEntryFn> =
         if symbol == bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL {
-            lookup_dynamic_symbol_with_bcode_fallback(
+            lookup_dynamic_symbol(
                 library,
                 registered_plugin.declaration.id.as_str(),
                 bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL,

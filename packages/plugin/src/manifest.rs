@@ -64,7 +64,7 @@ impl PluginManifestCompatibility {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifestExtension {
-    /// Namespaced and versioned extension point, e.g. `bcode.tui_surface/v1`.
+    /// Namespaced and versioned extension point, e.g. `vendor.surface/v1`.
     pub extension_point: String,
     /// Typed-stable payload bytes owned by the extension adapter.
     #[serde(default)]
@@ -305,16 +305,13 @@ name = "Extension"
 version = "0.1.0"
 
 [[extensions]]
-extension_point = "bcode.tui_surface/v1"
+extension_point = "vendor.surface/v1"
 payload = [1, 2, 3]
 "#,
         )
         .expect("manifest should parse");
         assert_eq!(manifest.extensions.len(), 1);
-        assert_eq!(
-            manifest.extensions[0].extension_point,
-            "bcode.tui_surface/v1"
-        );
+        assert_eq!(manifest.extensions[0].extension_point, "vendor.surface/v1");
         assert_eq!(manifest.extensions[0].payload, vec![1, 2, 3]);
         manifest
             .to_declaration()

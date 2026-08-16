@@ -14,7 +14,6 @@
 //! in the host-side dependencies.
 
 pub mod action_dispatch;
-pub mod bcode_compat;
 mod declaration;
 mod discovery;
 mod event_bus;
