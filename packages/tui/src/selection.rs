@@ -1529,6 +1529,69 @@ mod tests {
     }
 
     #[test]
+    fn reverse_drag_during_autoscroll_preserves_direction_and_canonical_order() {
+        let mut scene = two_child_scene();
+        scene.push_scope(
+            SelectionScope::new("left", Rect::new(0, 1, 5, 1))
+                .parent("root")
+                .capture(SelectionCapture::Delegate),
+        );
+        scene.push_scope(
+            SelectionScope::new("right", Rect::new(7, 1, 5, 1))
+                .parent("root")
+                .capture(SelectionCapture::Delegate),
+        );
+        let mut controller = SelectionController::new();
+        controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(10, 1)),
+        );
+        let outcome = controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(0, 1)),
+        );
+        assert!(matches!(
+            outcome,
+            SelectionOutcome::Changed {
+                auto_scroll: Some(_)
+            }
+        ));
+        let snapshot = controller.snapshot(&scene).expect("selection");
+        assert!(snapshot.reversed);
+        assert_eq!(snapshot.slices[0].content_id.as_str(), "left-content");
+        assert_eq!(snapshot.slices[1].content_id.as_str(), "right-content");
+    }
+
+    #[test]
+    fn large_scene_routing_and_snapshot_remain_bounded() {
+        let mut scene = SelectionScene::new();
+        scene.push_scope(SelectionScope::new("root", Rect::new(0, 0, 120, 40)));
+        for index in 0..10_000_u64 {
+            let x = u16::try_from(index % 100).expect("x");
+            let y = u16::try_from((index / 100) % 40).expect("y");
+            scene.push_fragment(SelectionFragment::new(
+                "root",
+                format!("content-{index}"),
+                Rect::new(x, y, 1, 1),
+                index,
+                0..1,
+            ));
+        }
+        let started = Instant::now();
+        let endpoint = scene
+            .endpoint_at(
+                &SelectionScopeId::new("root"),
+                Point::new(99, 39),
+                SelectionAffinity::After,
+            )
+            .expect("endpoint");
+        let elapsed = started.elapsed();
+
+        assert!(endpoint.order < 10_000);
+        assert!(elapsed.as_millis() < 500, "routing took {elapsed:?}");
+    }
+
+    #[test]
     fn edge_drag_requests_default_autoscroll() {
         let scene = two_child_scene();
         let mut controller = SelectionController::new();
@@ -1613,6 +1676,85 @@ mod tests {
         assert_eq!(selected.style.fg, Some(Color::Green));
         assert_eq!(selected.style.bg, Some(Color::Blue));
         assert!(selected.style.modifiers.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn resize_reprojects_highlights_without_changing_logical_endpoints() {
+        let scene = two_child_scene();
+        let mut controller = SelectionController::new();
+        controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 1)),
+        );
+        controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(4, 1)),
+        );
+        let before = controller.snapshot(&scene).expect("selection");
+        let mut resized = SelectionScene::new();
+        resized.push_scope(SelectionScope::new("root", Rect::new(0, 0, 30, 10)));
+        resized.push_scope(
+            SelectionScope::new("left", Rect::new(3, 4, 10, 1))
+                .parent("root")
+                .order(0),
+        );
+        for fragment in plain_text_fragments(
+            "left",
+            "left-content",
+            Rect::new(3, 4, 10, 1),
+            0,
+            "left",
+            0,
+            1,
+        ) {
+            resized.push_fragment(fragment);
+        }
+        assert_eq!(controller.reconcile(&resized), SelectionOutcome::Ignored);
+        let after = controller
+            .snapshot(&resized)
+            .expect("reprojected selection");
+
+        assert_eq!(before.anchor.offset, after.anchor.offset);
+        assert_eq!(before.focus.offset, after.focus.offset);
+        assert_ne!(before.visible_highlights, after.visible_highlights);
+    }
+
+    #[test]
+    fn deletion_and_revision_replacement_invalidate_retained_selection() {
+        let scene = two_child_scene();
+        let mut controller = SelectionController::new();
+        controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 1)),
+        );
+        controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(4, 1)),
+        );
+        let mut replaced = SelectionScene::new();
+        replaced.push_scope(SelectionScope::new("root", Rect::new(0, 0, 12, 3)));
+        replaced.push_scope(
+            SelectionScope::new("left", Rect::new(0, 1, 5, 1))
+                .parent("root")
+                .revision(2),
+        );
+        for fragment in plain_text_fragments(
+            "left",
+            "replacement",
+            Rect::new(0, 1, 5, 1),
+            0,
+            "other",
+            0,
+            2,
+        ) {
+            replaced.push_fragment(fragment);
+        }
+
+        assert_eq!(
+            controller.reconcile(&replaced),
+            SelectionOutcome::Invalidated
+        );
+        assert!(controller.snapshot(&replaced).is_none());
     }
 
     #[test]
