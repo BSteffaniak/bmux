@@ -843,7 +843,10 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
-    use bmux_tui::selection::SelectionCapture;
+    use bmux_tui::selection::{
+        SelectionCapture, SelectionController, SelectionFragment, SelectionGesturePhase,
+        SelectionOutcome,
+    };
 
     use super::{
         PanelGroup, PanelGroupAxis, PanelGroupConstraints, PanelGroupOutcome, PanelGroupPolicy,
@@ -1071,6 +1074,89 @@ mod tests {
             ),
             PanelGroupOutcome::DividerDragStarted { divider: 0 }
         ));
+    }
+
+    #[test]
+    fn nested_sibling_panels_lock_local_or_delegate_to_parent_by_initiation_scope() {
+        let group = PanelGroup::new(PanelGroupAxis::Horizontal);
+        let state = PanelGroupState::new([PanelSize::fixed(4), PanelSize::fixed(4)]);
+        let area = Rect::new(0, 0, 9, 2);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+
+        group.register_selection(
+            area,
+            &state,
+            &ComponentSelectionState::new("workspace"),
+            &ComponentSelectionPolicy::content(),
+            &mut frame,
+        );
+        for (index, panel) in group.layout(area, &state).panels.into_iter().enumerate() {
+            let scope = format!("workspace.panel.{index}");
+            frame.push_selection_fragment(SelectionFragment::new(
+                scope,
+                format!("panel-{index}"),
+                panel,
+                u64::try_from(index).expect("panel index"),
+                0..4,
+            ));
+        }
+        let scene = frame.selection().clone();
+
+        let mut local = SelectionController::new();
+        assert_eq!(
+            local.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(1, 0))
+            ),
+            SelectionOutcome::Armed
+        );
+        assert_eq!(
+            local
+                .scope_id()
+                .map(bmux_tui::selection::SelectionScopeId::as_str),
+            Some("workspace.panel.0")
+        );
+        assert!(matches!(
+            local.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(7, 0))
+            ),
+            SelectionOutcome::Changed { .. }
+        ));
+        assert_eq!(
+            local
+                .scope_id()
+                .map(bmux_tui::selection::SelectionScopeId::as_str),
+            Some("workspace.panel.0")
+        );
+        assert_eq!(local.phase(), SelectionGesturePhase::Dragging);
+
+        let mut parent = SelectionController::new();
+        assert_eq!(
+            parent.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(4, 0))
+            ),
+            SelectionOutcome::Armed
+        );
+        assert_eq!(
+            parent
+                .scope_id()
+                .map(bmux_tui::selection::SelectionScopeId::as_str),
+            Some("workspace")
+        );
+        assert!(matches!(
+            parent.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(7, 0))
+            ),
+            SelectionOutcome::Changed { .. }
+        ));
+        let snapshot = parent.snapshot(&scene).expect("cross-panel selection");
+        assert_eq!(snapshot.slices.len(), 2);
+        assert_eq!(snapshot.slices[0].content_id.as_str(), "panel-0");
+        assert_eq!(snapshot.slices[1].content_id.as_str(), "panel-1");
     }
 
     fn mouse_event(kind: MouseEventKind, x: u16, y: u16) -> Event {

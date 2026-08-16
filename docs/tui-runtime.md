@@ -22,6 +22,19 @@ gestures against the last committed scene, locks the deepest eligible initiation
 logical anchor/focus endpoints across redraws. Applications remain responsible for canonical source
 content, scrolling, copy/export formatting, and clipboard effects.
 
+Selection scope is fixed where the drag begins. Initiation in a capturing child remains constrained
+to that child even when the pointer leaves it; delegated child chrome may instead select through an
+ancestor across ordered sibling content. Renderers can explicitly provide word and line ranges;
+item and whole-scope expansion use registered logical ordering. Missing semantic boundaries are
+rejected rather than inferred from terminal cells.
+
+Only visible geometry belongs in a scene. Source text remains caller-owned, and snapshots contain
+logical source ranges rather than copied content. Reconcile controllers after each successful scene
+commit so content revision/removal invalidates stale endpoints. During modal or focus-trap
+activation, callers use `set_obscured`: active gestures are cancelled, while completed selections
+may be cleared or hidden and restored according to policy. Optional diagnostics deliberately expose
+only bounded phase, granularity, obscuration, and endpoint-presence state.
+
 `Frame::paint_selection` is the deterministic overlay stage: consumers call it after normal content
 rendering with a snapshot from their controller. It patches only explicit selection style fields over
 the selected cells and never rewrites symbols. `Terminal::draw` commits the rendered selection scene

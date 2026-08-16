@@ -247,6 +247,22 @@ impl SelectionScope {
     }
 }
 
+/// Logical selection expansion applied while resolving pointer endpoints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelectionGranularity {
+    /// Select individual rendered grapheme or semantic fragments.
+    #[default]
+    Grapheme,
+    /// Expand endpoints to caller-provided word boundaries.
+    Word,
+    /// Expand endpoints to caller-provided logical line boundaries.
+    Line,
+    /// Expand endpoints across all registered fragments for one content item.
+    Item,
+    /// Expand endpoints to the first or last fragment in the locked scope.
+    Scope,
+}
+
 /// One visible grapheme or semantic visual unit mapped to source bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionFragment {
@@ -262,6 +278,10 @@ pub struct SelectionFragment {
     pub order: u64,
     /// Source byte range represented by the complete visual unit.
     pub source_range: Range<usize>,
+    /// Optional caller-provided word boundary containing this fragment.
+    pub word_range: Option<Range<usize>>,
+    /// Optional caller-provided logical line boundary containing this fragment.
+    pub line_range: Option<Range<usize>>,
     /// Caller-owned content revision.
     pub revision: u64,
 }
@@ -290,6 +310,8 @@ impl SelectionFragment {
             area,
             order,
             source_range,
+            word_range: None,
+            line_range: None,
             revision: 0,
         }
     }
@@ -298,6 +320,20 @@ impl SelectionFragment {
     #[must_use]
     pub fn id(mut self, id: impl Into<SelectionFragmentId>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// Set the word boundary represented by this fragment.
+    #[must_use]
+    pub const fn word_range(mut self, range: Range<usize>) -> Self {
+        self.word_range = Some(range);
+        self
+    }
+
+    /// Set the logical line boundary represented by this fragment.
+    #[must_use]
+    pub const fn line_range(mut self, range: Range<usize>) -> Self {
+        self.line_range = Some(range);
         self
     }
 
@@ -405,6 +441,32 @@ pub enum SelectionGesturePhase {
     Dragging,
     /// A completed logical selection remains active.
     Complete,
+}
+
+/// Policy applied when an overlay, modal, or focus trap obscures selectable content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelectionObscurationPolicy {
+    /// Preserve a completed logical selection for restoration after the surface closes.
+    #[default]
+    PreserveCompleted,
+    /// Clear every selection when the obscuring surface opens.
+    Clear,
+}
+
+/// Bounded, allocation-free selection state suitable for diagnostics and status surfaces.
+///
+/// This intentionally excludes scope/content identifiers, source text, geometry, and offsets so
+/// callers cannot accidentally emit high-cardinality or sensitive selection data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionDiagnostics {
+    /// Current gesture phase.
+    pub phase: SelectionGesturePhase,
+    /// Configured endpoint expansion.
+    pub granularity: SelectionGranularity,
+    /// Whether interaction and painting are suppressed by an obscuring surface.
+    pub obscured: bool,
+    /// Whether logical endpoints are retained.
+    pub has_selection: bool,
 }
 
 /// Result of handling one pointer event.
@@ -652,13 +714,14 @@ impl SelectionScene {
         }
     }
 
-    /// Resolve a logical endpoint within `scope_id`, clamping outside geometry.
+    /// Resolve a logical endpoint at configurable granularity within `scope_id`.
     #[must_use]
-    pub fn endpoint_at(
+    pub fn endpoint_at_granularity(
         &self,
         scope_id: &SelectionScopeId,
         point: Point,
         affinity: SelectionAffinity,
+        granularity: SelectionGranularity,
     ) -> Option<SelectionEndpoint> {
         let fragments = self.ordered_fragments(scope_id);
         let fragment = fragments
@@ -667,18 +730,61 @@ impl SelectionScene {
             .rev()
             .find(|fragment| fragment.area.contains(point))
             .or_else(|| nearest_fragment(&fragments, point))?;
-        let offset = match affinity {
-            SelectionAffinity::Before => fragment.source_range.start,
-            SelectionAffinity::After => fragment.source_range.end,
+        let range = match granularity {
+            SelectionGranularity::Grapheme => &fragment.source_range,
+            SelectionGranularity::Word => fragment.word_range.as_ref()?,
+            SelectionGranularity::Line => fragment.line_range.as_ref()?,
+            SelectionGranularity::Item => {
+                let matching = fragments
+                    .iter()
+                    .copied()
+                    .filter(|candidate| candidate.content_id == fragment.content_id)
+                    .collect::<Vec<_>>();
+                let first = matching.first()?;
+                let last = matching.last()?;
+                return Some(endpoint_from_fragment(
+                    scope_id,
+                    if affinity == SelectionAffinity::Before {
+                        first
+                    } else {
+                        last
+                    },
+                    affinity,
+                    first.source_range.start..last.source_range.end,
+                ));
+            }
+            SelectionGranularity::Scope => {
+                let first = fragments.first()?;
+                let last = fragments.last()?;
+                return Some(endpoint_from_fragment(
+                    scope_id,
+                    if affinity == SelectionAffinity::Before {
+                        first
+                    } else {
+                        last
+                    },
+                    affinity,
+                    first.source_range.start..last.source_range.end,
+                ));
+            }
         };
-        Some(SelectionEndpoint {
-            scope_id: scope_id.clone(),
-            content_id: fragment.content_id.clone(),
-            offset,
-            order: fragment.order,
+        Some(endpoint_from_fragment(
+            scope_id,
+            fragment,
             affinity,
-            revision: fragment.revision,
-        })
+            range.clone(),
+        ))
+    }
+
+    /// Resolve a logical endpoint within `scope_id`, clamping outside geometry.
+    #[must_use]
+    pub fn endpoint_at(
+        &self,
+        scope_id: &SelectionScopeId,
+        point: Point,
+        affinity: SelectionAffinity,
+    ) -> Option<SelectionEndpoint> {
+        self.endpoint_at_granularity(scope_id, point, affinity, SelectionGranularity::Grapheme)
     }
 
     /// Rebuild a snapshot against this scene.
@@ -868,6 +974,8 @@ pub struct SelectionController {
     anchor: Option<SelectionEndpoint>,
     focus: Option<SelectionEndpoint>,
     anchor_point: Option<Point>,
+    granularity: SelectionGranularity,
+    obscured: bool,
 }
 
 impl SelectionController {
@@ -879,7 +987,72 @@ impl SelectionController {
             anchor: None,
             focus: None,
             anchor_point: None,
+            granularity: SelectionGranularity::Grapheme,
+            obscured: false,
         }
+    }
+
+    /// Configure expansion for subsequently resolved gesture endpoints.
+    #[must_use]
+    pub const fn with_granularity(mut self, granularity: SelectionGranularity) -> Self {
+        self.granularity = granularity;
+        self
+    }
+
+    /// Set expansion for subsequently resolved gesture endpoints.
+    pub const fn set_granularity(&mut self, granularity: SelectionGranularity) {
+        self.granularity = granularity;
+    }
+
+    /// Return the configured endpoint expansion.
+    #[must_use]
+    pub const fn granularity(&self) -> SelectionGranularity {
+        self.granularity
+    }
+
+    /// Return bounded, low-cardinality state for optional diagnostics.
+    #[must_use]
+    pub const fn diagnostics(&self) -> SelectionDiagnostics {
+        SelectionDiagnostics {
+            phase: self.phase,
+            granularity: self.granularity,
+            obscured: self.obscured,
+            has_selection: self.anchor.is_some(),
+        }
+    }
+
+    /// Return whether an overlay or focus trap currently suppresses interaction and painting.
+    #[must_use]
+    pub const fn is_obscured(&self) -> bool {
+        self.obscured
+    }
+
+    /// Apply overlay/modal activation policy.
+    ///
+    /// Active pointer gestures are always cancelled because their capture scene is no longer
+    /// current. Completed logical selections may be preserved while obscured and become visible
+    /// again after deactivation.
+    pub fn set_obscured(
+        &mut self,
+        obscured: bool,
+        policy: SelectionObscurationPolicy,
+    ) -> SelectionOutcome {
+        if self.obscured == obscured {
+            return SelectionOutcome::Ignored;
+        }
+        self.obscured = obscured;
+        if !obscured {
+            return SelectionOutcome::Ignored;
+        }
+        if policy == SelectionObscurationPolicy::Clear
+            || matches!(
+                self.phase,
+                SelectionGesturePhase::Armed | SelectionGesturePhase::Dragging
+            )
+        {
+            return self.clear();
+        }
+        SelectionOutcome::Ignored
     }
 
     /// Return the current gesture phase.
@@ -909,6 +1082,9 @@ impl SelectionController {
     /// Return the current selection snapshot in `scene`.
     #[must_use]
     pub fn snapshot(&self, scene: &SelectionScene) -> Option<SelectionSnapshot> {
+        if self.obscured {
+            return None;
+        }
         scene.snapshot(self.anchor.as_ref()?, self.focus.as_ref()?)
     }
 
@@ -916,6 +1092,21 @@ impl SelectionController {
     pub fn reconcile(&mut self, scene: &SelectionScene) -> SelectionOutcome {
         if self.anchor.is_none() {
             return SelectionOutcome::Ignored;
+        }
+        if self.obscured {
+            let retained_resolves = self
+                .anchor
+                .as_ref()
+                .zip(self.focus.as_ref())
+                .is_some_and(|(anchor, focus)| scene.snapshot(anchor, focus).is_some());
+            if self.phase == SelectionGesturePhase::Complete && retained_resolves {
+                return SelectionOutcome::Ignored;
+            }
+            self.phase = SelectionGesturePhase::Idle;
+            self.anchor = None;
+            self.focus = None;
+            self.anchor_point = None;
+            return SelectionOutcome::Invalidated;
         }
         if self.snapshot(scene).is_some() || self.phase == SelectionGesturePhase::Armed {
             SelectionOutcome::Ignored
@@ -930,6 +1121,9 @@ impl SelectionController {
 
     /// Handle one terminal mouse event against a committed scene.
     pub fn handle_mouse(&mut self, scene: &SelectionScene, mouse: MouseEvent) -> SelectionOutcome {
+        if self.obscured {
+            return SelectionOutcome::Ignored;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.arm(scene, mouse.position),
             MouseEventKind::Drag(MouseButton::Left) => self.drag(scene, mouse.position),
@@ -949,7 +1143,12 @@ impl SelectionController {
         let Some(scope) = scene.initiation_scope(point) else {
             return SelectionOutcome::Ignored;
         };
-        let Some(endpoint) = scene.endpoint_at(&scope.id, point, SelectionAffinity::Before) else {
+        let Some(endpoint) = scene.endpoint_at_granularity(
+            &scope.id,
+            point,
+            SelectionAffinity::Before,
+            self.granularity,
+        ) else {
             return SelectionOutcome::Ignored;
         };
         self.phase = SelectionGesturePhase::Armed;
@@ -977,7 +1176,9 @@ impl SelectionController {
         } else {
             SelectionAffinity::After
         };
-        let Some(endpoint) = scene.endpoint_at(&anchor.scope_id, point, affinity) else {
+        let Some(endpoint) =
+            scene.endpoint_at_granularity(&anchor.scope_id, point, affinity, self.granularity)
+        else {
             return SelectionOutcome::Ignored;
         };
         if endpoint.compare_position(anchor).is_eq() {
@@ -1119,6 +1320,25 @@ pub fn paint_selection_highlights(
                 }
             }
         }
+    }
+}
+
+fn endpoint_from_fragment(
+    scope_id: &SelectionScopeId,
+    fragment: &SelectionFragment,
+    affinity: SelectionAffinity,
+    range: Range<usize>,
+) -> SelectionEndpoint {
+    SelectionEndpoint {
+        scope_id: scope_id.clone(),
+        content_id: fragment.content_id.clone(),
+        offset: match affinity {
+            SelectionAffinity::Before => range.start,
+            SelectionAffinity::After => range.end,
+        },
+        order: fragment.order,
+        affinity,
+        revision: fragment.revision,
     }
 }
 
@@ -1267,6 +1487,213 @@ mod tests {
             scene.push_fragment(fragment);
         }
         scene
+    }
+
+    #[test]
+    fn diagnostics_expose_only_bounded_controller_state() {
+        let scene = two_child_scene();
+        let mut controller =
+            SelectionController::new().with_granularity(SelectionGranularity::Word);
+        assert_eq!(
+            controller.diagnostics(),
+            SelectionDiagnostics {
+                phase: SelectionGesturePhase::Idle,
+                granularity: SelectionGranularity::Word,
+                obscured: false,
+                has_selection: false,
+            }
+        );
+        let _ = controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(0, 1)),
+        );
+        assert_eq!(
+            controller.diagnostics(),
+            SelectionDiagnostics {
+                phase: SelectionGesturePhase::Idle,
+                granularity: SelectionGranularity::Word,
+                obscured: false,
+                has_selection: false,
+            }
+        );
+        controller.set_granularity(SelectionGranularity::Grapheme);
+        let _ = controller.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(0, 1)),
+        );
+        assert_eq!(
+            controller.diagnostics(),
+            SelectionDiagnostics {
+                phase: SelectionGesturePhase::Armed,
+                granularity: SelectionGranularity::Grapheme,
+                obscured: false,
+                has_selection: true,
+            }
+        );
+    }
+
+    #[test]
+    fn obscuring_focus_surface_suppresses_and_restores_completed_selection() {
+        let scene = two_child_scene();
+        let mut controller = SelectionController::new();
+        assert_eq!(
+            controller.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(0, 1)),
+            ),
+            SelectionOutcome::Armed
+        );
+        assert!(matches!(
+            controller.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(4, 1)),
+            ),
+            SelectionOutcome::Changed { .. }
+        ));
+        assert_eq!(
+            controller.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Up(MouseButton::Left), Point::new(4, 1)),
+            ),
+            SelectionOutcome::Completed
+        );
+        let retained = controller.snapshot(&scene).expect("completed selection");
+
+        assert_eq!(
+            controller.set_obscured(true, SelectionObscurationPolicy::PreserveCompleted),
+            SelectionOutcome::Ignored
+        );
+        assert!(controller.is_obscured());
+        assert!(controller.snapshot(&scene).is_none());
+        assert_eq!(controller.reconcile(&scene), SelectionOutcome::Ignored);
+        assert_eq!(
+            controller.handle_mouse(
+                &scene,
+                MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(7, 1)),
+            ),
+            SelectionOutcome::Ignored
+        );
+        assert_eq!(
+            controller.set_obscured(false, SelectionObscurationPolicy::PreserveCompleted),
+            SelectionOutcome::Ignored
+        );
+        assert_eq!(controller.snapshot(&scene), Some(retained));
+    }
+
+    #[test]
+    fn obscuring_modal_clears_active_gesture_or_completed_selection_by_policy() {
+        let scene = two_child_scene();
+        let mut active = SelectionController::new();
+        let _ = active.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(0, 1)),
+        );
+        assert_eq!(
+            active.set_obscured(true, SelectionObscurationPolicy::PreserveCompleted),
+            SelectionOutcome::Cleared
+        );
+        assert_eq!(active.phase(), SelectionGesturePhase::Idle);
+
+        let mut completed = SelectionController::new();
+        let _ = completed.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(0, 1)),
+        );
+        let _ = completed.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), Point::new(4, 1)),
+        );
+        let _ = completed.handle_mouse(
+            &scene,
+            MouseEvent::new(MouseEventKind::Up(MouseButton::Left), Point::new(4, 1)),
+        );
+        assert_eq!(
+            completed.set_obscured(true, SelectionObscurationPolicy::Clear),
+            SelectionOutcome::Cleared
+        );
+        let _ = completed.set_obscured(false, SelectionObscurationPolicy::Clear);
+        assert!(completed.snapshot(&scene).is_none());
+    }
+
+    #[test]
+    fn configurable_granularity_expands_to_declared_semantic_boundaries() {
+        let mut scene = SelectionScene::new();
+        scene.push_scope(SelectionScope::new("document", Rect::new(0, 0, 11, 2)));
+        for (index, grapheme) in plain_text_fragments(
+            "document",
+            "first",
+            Rect::new(0, 0, 11, 1),
+            0,
+            "hello world",
+            0,
+            1,
+        )
+        .into_iter()
+        .enumerate()
+        {
+            let word = if index < 5 { 0..5 } else { 6..11 };
+            scene.push_fragment(grapheme.word_range(word).line_range(0..11));
+        }
+        for fragment in
+            plain_text_fragments("document", "second", Rect::new(0, 1, 3, 1), 1, "bye", 0, 1)
+        {
+            scene.push_fragment(fragment.word_range(0..3).line_range(0..3));
+        }
+        let scope = SelectionScopeId::new("document");
+
+        let word = scene
+            .endpoint_at_granularity(
+                &scope,
+                Point::new(7, 0),
+                SelectionAffinity::Before,
+                SelectionGranularity::Word,
+            )
+            .expect("word endpoint");
+        assert_eq!(word.offset, 6);
+        let line = scene
+            .endpoint_at_granularity(
+                &scope,
+                Point::new(7, 0),
+                SelectionAffinity::After,
+                SelectionGranularity::Line,
+            )
+            .expect("line endpoint");
+        assert_eq!(line.offset, 11);
+        let item = scene
+            .endpoint_at_granularity(
+                &scope,
+                Point::new(7, 0),
+                SelectionAffinity::Before,
+                SelectionGranularity::Item,
+            )
+            .expect("item endpoint");
+        assert_eq!(item.offset, 0);
+        assert_eq!(item.content_id.as_str(), "first");
+        let whole_scope = scene
+            .endpoint_at_granularity(
+                &scope,
+                Point::new(1, 0),
+                SelectionAffinity::After,
+                SelectionGranularity::Scope,
+            )
+            .expect("scope endpoint");
+        assert_eq!(whole_scope.content_id.as_str(), "second");
+        assert_eq!(whole_scope.offset, 3);
+    }
+
+    #[test]
+    fn unsupported_semantic_granularity_refuses_to_guess_boundaries() {
+        let scene = two_child_scene();
+        assert!(
+            scene
+                .endpoint_at_granularity(
+                    &SelectionScopeId::new("left"),
+                    Point::new(1, 1),
+                    SelectionAffinity::Before,
+                    SelectionGranularity::Word,
+                )
+                .is_none()
+        );
     }
 
     #[test]
