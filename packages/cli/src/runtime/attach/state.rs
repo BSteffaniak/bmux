@@ -14,7 +14,7 @@ use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
-use bmux_plugin::{AttachInputHook, AttachVisualProjectionUpdate};
+use bmux_plugin::{AttachInputHook, AttachVisualProjectionUpdate, ExtensionRect};
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
@@ -296,6 +296,10 @@ pub struct AttachViewState {
     pub cached_status_line: Option<AttachStatusLine>,
     pub cached_layout_state: Option<AttachLayoutState>,
     pub retained_compositor: RetainedCompositor,
+    /// Opaque overlay coverage used to occlude pane terminal graphics on the
+    /// previous retained frame. Content-only edits within stable bounds must
+    /// not invalidate every pane extension.
+    pub opaque_overlay_rects: Vec<ExtensionRect>,
     pub last_help_overlay_surface: Option<AttachSurface>,
     pub last_prompt_overlay_surface: Option<AttachSurface>,
     pub last_cursor_state: Option<AttachCursorState>,
@@ -926,6 +930,7 @@ impl AttachViewState {
             cached_status_line: None,
             cached_layout_state: None,
             retained_compositor: RetainedCompositor::new(),
+            opaque_overlay_rects: Vec::new(),
             last_help_overlay_surface: None,
             last_prompt_overlay_surface: None,
             last_cursor_state: None,

@@ -8181,6 +8181,30 @@ fn build_retained_frame_plan(
     let prompt_surface = prompt_overlay_render
         .as_ref()
         .map(retained_prompt_overlay_surface);
+    let opaque_overlay_rects = [
+        help_surface.as_ref(),
+        prompt_surface.as_ref(),
+        tab_menu_surface.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|surface| {
+        ExtensionRect::new(
+            surface.rect.x,
+            surface.rect.y,
+            surface.rect.w,
+            surface.rect.h,
+        )
+    })
+    .collect::<Vec<_>>();
+    // Pane terminal graphics only need re-planning when opaque overlay
+    // coverage changes. Prompt text edits commonly change retained graph
+    // content while preserving these bounds; globally querying extensions for
+    // those edits makes each keystroke regenerate every decorated pane.
+    if opaque_overlay_rects != view_state.opaque_overlay_rects {
+        frame_damage.mark_extension_query();
+        view_state.opaque_overlay_rects = opaque_overlay_rects;
+    }
     let frame_retained_damage = retained_frame_damage_from_frame_damage(
         &layout_state.scene,
         frame_damage,
@@ -8216,13 +8240,6 @@ fn build_retained_frame_plan(
         viewport,
         damage_policy,
     );
-    // Overlay graph transitions must re-plan pane extension graphics against
-    // the new opaque coverage before terminal output is emitted. This is an
-    // extension query rather than pane-content damage: pane cells remain
-    // occlusion-pruned while decoration graphics split/restore atomically.
-    if !graph_damage.is_empty() && frame_damage.overlay_damaged() {
-        frame_damage.mark_extension_query();
-    }
     let merged_damage = merge_retained_damages(
         [
             frame_retained_damage.clone(),
@@ -16986,6 +17003,32 @@ mod tests {
         }
     }
 
+    fn test_prompt_overlay_render(rect: AttachRect, text: &str) -> AttachPromptOverlayRender {
+        AttachPromptOverlayRender {
+            surface: AttachSurface {
+                id: Uuid::from_u128(2),
+                kind: AttachSurfaceKind::Modal,
+                layer: SurfaceLayer::Overlay,
+                z: i32::MAX,
+                rect,
+                content_rect: rect,
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: false,
+                pane_id: None,
+            },
+            ops: vec![RenderOp::text_run(
+                rect.x,
+                rect.y,
+                text,
+                RenderStyle::default(),
+            )],
+            cursor_state: None,
+        }
+    }
+
     #[test]
     fn view_change_components_request_reconcile_without_full_frame_damage() {
         let session_id = Uuid::new_v4();
@@ -17008,7 +17051,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_prompt_prunes_pane_repaint_for_fully_covered_damage() {
+    fn opaque_prompt_content_edit_prunes_pane_repaint_without_extension_query() {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let surface = test_pane_surface(
@@ -17033,40 +17076,22 @@ mod tests {
             },
             zoomed: false,
         };
-        let prompt_render = AttachPromptOverlayRender {
-            surface: AttachSurface {
-                id: Uuid::from_u128(2),
-                kind: AttachSurfaceKind::Modal,
-                layer: SurfaceLayer::Overlay,
-                z: i32::MAX,
-                rect: AttachRect {
-                    x: 20,
-                    y: 8,
-                    w: 40,
-                    h: 8,
-                },
-                content_rect: AttachRect {
-                    x: 20,
-                    y: 8,
-                    w: 40,
-                    h: 8,
-                },
-                interactive_regions: Vec::new(),
-                opaque: true,
-                visible: true,
-                accepts_input: true,
-                cursor_owner: false,
-                pane_id: None,
+        let prompt_render = test_prompt_overlay_render(
+            AttachRect {
+                x: 20,
+                y: 8,
+                w: 40,
+                h: 8,
             },
-            ops: vec![RenderOp::text_run(
-                20,
-                8,
-                "opaque prompt",
-                RenderStyle::default(),
-            )],
-            cursor_state: None,
-        };
+            "opaque prompt",
+        );
         let prompt_surface = retained_prompt_overlay_surface(&prompt_render);
+        let prompt_rect = ExtensionRect::new(
+            prompt_surface.rect.x,
+            prompt_surface.rect.y,
+            prompt_surface.rect.w,
+            prompt_surface.rect.h,
+        );
         let mut view_state = AttachViewState::new(AttachOpenInfo {
             context_id: None,
             session_id,
@@ -17079,6 +17104,7 @@ mod tests {
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );
+        view_state.opaque_overlay_rects = vec![prompt_rect];
         let mut frame_damage = bmux_attach_pipeline::FrameDamage::default();
         frame_damage.mark_content_surface_rect(
             pane_id,
@@ -17099,6 +17125,7 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
 
+        assert!(!frame_damage.extension_query_requested());
         assert!(!plan.scene_repaint);
         assert!(
             plan.repaint_plan
