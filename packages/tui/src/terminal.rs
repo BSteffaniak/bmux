@@ -181,6 +181,7 @@ impl<W: Write> Terminal<W> {
     ///
     /// Returns any I/O error reported by the backend writer. Failed output does not advance the
     /// retained buffer, hit map, selection scene, cursor, or image scene.
+    #[allow(clippy::too_many_lines)]
     pub fn draw_damage(
         &mut self,
         damage: Damage,
@@ -197,14 +198,14 @@ impl<W: Write> Terminal<W> {
                 full_repaint: false,
             });
         }
-        let regions = damage.retained_regions();
+        let requested_regions = damage.retained_regions();
         let mut buffer = Buffer::empty(self.area);
         let (cursor, hits, focus_scope, images, selection) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
             let mut hits = if matches!(damage, Damage::Regions(_)) {
                 let mut retained = self.hits.clone();
-                for region in regions {
+                for region in requested_regions {
                     retained.retain_outside(*region);
                 }
                 retained
@@ -213,7 +214,7 @@ impl<W: Write> Terminal<W> {
             };
             for hit in frame.hits().regions() {
                 if !matches!(damage, Damage::Regions(_))
-                    || regions
+                    || requested_regions
                         .iter()
                         .any(|region| !hit.area.intersection(*region).is_empty())
                 {
@@ -221,7 +222,7 @@ impl<W: Write> Terminal<W> {
                 }
             }
             let mut images = if matches!(damage, Damage::Regions(_)) {
-                self.image_scene.contributions_outside(regions)
+                self.image_scene.contributions_outside(requested_regions)
             } else {
                 Vec::new()
             };
@@ -237,15 +238,23 @@ impl<W: Write> Terminal<W> {
                     .flatten()
             });
             let selection = if matches!(damage, Damage::Regions(_)) {
-                self.selection.merge_regions(frame.selection(), regions)
+                self.selection
+                    .merge_regions(frame.selection(), requested_regions)
             } else {
                 frame.selection().clone()
             };
             (cursor, hits, focus_scope, images, selection)
         };
+        let retained_regions =
+            if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
+                buffer.expand_regions_to_cell_spans(previous, requested_regions)
+            } else {
+                requested_regions.to_vec()
+            };
         if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
-            buffer.restore_outside(previous, regions);
+            buffer.restore_outside(previous, &retained_regions);
         }
+        buffer.debug_assert_valid_wide_spans();
 
         let output = (|| {
             let stats = if let Some(previous) = &self.previous {
@@ -368,6 +377,29 @@ mod tests {
         );
 
         assert_eq!(terminal.selection().scopes()[0].id.as_str(), "committed");
+    }
+
+    #[test]
+    fn terminal_diff_scrolls_zwj_text_without_independent_continuation_writes() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 8, 2));
+        terminal
+            .draw(|frame| {
+                frame.write_line(Rect::new(0, 0, 8, 1), &crate::text::Line::raw("A👩🏽‍💻│"));
+                frame.write_line(Rect::new(0, 1, 8, 1), &crate::text::Line::raw("bottom│"));
+            })
+            .unwrap();
+        let first_len = terminal.writer().len();
+
+        terminal
+            .draw(|frame| {
+                frame.write_line(Rect::new(0, 0, 8, 1), &crate::text::Line::raw("bottom│"));
+                frame.write_line(Rect::new(0, 1, 8, 1), &crate::text::Line::raw("B👩🏽‍💻│"));
+            })
+            .unwrap();
+        let output = String::from_utf8(terminal.writer()[first_len..].to_vec()).unwrap();
+
+        assert!(output.contains("👩🏽‍💻"));
+        assert!(!output.contains("\x1b[2;3H "));
     }
 
     #[test]

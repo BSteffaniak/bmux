@@ -164,7 +164,6 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let style = Style::new().fg(Color::Cyan);
         buffer.set_cell(Point::new(0, 0), "界", style);
-        buffer.set_cell(Point::new(1, 0), "", style);
         buffer.set_cell(Point::new(2, 0), "e\u{301}", style);
 
         let ops = buffer_render_ops(&buffer);

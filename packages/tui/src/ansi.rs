@@ -7,6 +7,7 @@ use crate::frame::Cursor;
 use crate::geometry::Point;
 use crate::style::{Color, Modifier, Style};
 use crate::text::{Line, Span};
+use crate::text_width::display_width;
 
 /// Write a full buffer frame using ANSI escape sequences.
 ///
@@ -25,20 +26,7 @@ pub fn write_ansi_frame(
     let mut active_style = Style::new();
     write!(writer, "\x1b[?25l")?;
     for y in area.y..area.bottom() {
-        write_ansi_move_to(writer, Point::new(area.x, y))?;
-        for x in area.x..area.right() {
-            let Some(cell) = buffer.get(Point::new(x, y)) else {
-                continue;
-            };
-            if cell.style != active_style {
-                write_ansi_style(writer, cell.style)?;
-                active_style = cell.style;
-            }
-            if cell.symbol.is_empty() {
-                continue;
-            }
-            writer.write_all(cell.symbol.as_bytes())?;
-        }
+        emit_row_span(writer, buffer, y, area.x, area.right(), &mut active_style)?;
     }
     write_ansi_style(writer, Style::new())?;
     if let Some(cursor) = cursor {
@@ -88,28 +76,11 @@ pub fn write_ansi_frame_diff(
     let mut changed_cells = 0usize;
     write!(writer, "\x1b[?25l")?;
     for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            let point = Point::new(x, y);
-            let Some(previous_cell) = previous.get(point) else {
-                continue;
-            };
-            let Some(current_cell) = current.get(point) else {
-                continue;
-            };
-            if previous_cell == current_cell {
-                continue;
-            }
-            write_ansi_move_to(writer, point)?;
-            if current_cell.style != active_style {
-                write_ansi_style(writer, current_cell.style)?;
-                active_style = current_cell.style;
-            }
-            if current_cell.symbol.is_empty() {
-                writer.write_all(b" ")?;
-            } else {
-                writer.write_all(current_cell.symbol.as_bytes())?;
-            }
-            changed_cells = changed_cells.saturating_add(1);
+        let mut intervals = changed_row_intervals(previous, current, y);
+        merge_intervals(&mut intervals);
+        for (start, end) in intervals {
+            emit_row_span(writer, current, y, start, end, &mut active_style)?;
+            changed_cells = changed_cells.saturating_add(usize::from(end.saturating_sub(start)));
         }
     }
     write_ansi_style(writer, Style::new())?;
@@ -125,6 +96,101 @@ pub fn write_ansi_frame_diff(
         changed_cells,
         full_repaint: false,
     })
+}
+
+fn changed_row_intervals(previous: &Buffer, current: &Buffer, y: u16) -> Vec<(u16, u16)> {
+    let area = current.area();
+    let mut intervals = Vec::new();
+    for x in area.x..area.right() {
+        let point = Point::new(x, y);
+        let Some(previous_cell) = previous.get(point) else {
+            continue;
+        };
+        let Some(current_cell) = current.get(point) else {
+            continue;
+        };
+        if previous_cell == current_cell {
+            continue;
+        }
+        let mut start = x;
+        let mut end = x.saturating_add(1).min(area.right());
+        for (buffer, cell) in [(previous, previous_cell), (current, current_cell)] {
+            if cell.is_wide_continuation() && x > area.x {
+                start = start.min(x - 1);
+            }
+            if cell.is_wide_leader() {
+                end = end.max(x.saturating_add(2).min(area.right()));
+            }
+            if x > area.x
+                && buffer
+                    .get(Point::new(x - 1, y))
+                    .is_some_and(crate::buffer::Cell::is_wide_leader)
+            {
+                start = start.min(x - 1);
+            }
+        }
+        intervals.push((start, end));
+    }
+    intervals
+}
+
+fn merge_intervals(intervals: &mut Vec<(u16, u16)>) {
+    intervals.sort_unstable();
+    let mut merged = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals.drain(..) {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    *intervals = merged;
+}
+
+fn emit_row_span(
+    writer: &mut impl Write,
+    buffer: &Buffer,
+    y: u16,
+    start: u16,
+    end: u16,
+    active_style: &mut Style,
+) -> io::Result<()> {
+    if start >= end {
+        return Ok(());
+    }
+    write_ansi_move_to(writer, Point::new(start, y))?;
+    let mut x = start;
+    while x < end {
+        let Some(cell) = buffer.get(Point::new(x, y)) else {
+            break;
+        };
+        if cell.is_wide_continuation() {
+            // A valid span never starts on a continuation. If malformed input reaches here, clear
+            // the physical column rather than emitting an empty symbol without cursor progress.
+            writer.write_all(b" ")?;
+            x = x.saturating_add(1);
+            continue;
+        }
+        if cell.style != *active_style {
+            write_ansi_style(writer, cell.style)?;
+            *active_style = cell.style;
+        }
+        if cell.symbol.is_empty() {
+            writer.write_all(b" ")?;
+            x = x.saturating_add(1);
+            continue;
+        }
+        writer.write_all(cell.symbol.as_bytes())?;
+        let width = u16::from(cell.width()).max(
+            u16::try_from(display_width(&cell.symbol))
+                .unwrap_or(u16::MAX)
+                .min(2),
+        );
+        x = x.saturating_add(width.max(1));
+    }
+    Ok(())
 }
 
 /// Convert ANSI-styled terminal output into BMUX styled text lines.
@@ -450,6 +516,7 @@ mod tests {
     use crate::frame::Cursor;
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
+    use crate::text::Line;
 
     #[test]
     fn ansi_to_lines_preserves_sgr_styles() {
@@ -468,6 +535,39 @@ mod tests {
         let lines = ansi_to_lines("before\x1b]0;title\x07after\x1b[2K");
 
         assert_eq!(lines[0].plain_text(), "beforeafter");
+    }
+
+    fn wide_buffer(text: &str, width: u16) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+        buffer.write_line(Rect::new(0, 0, width, 1), &Line::raw(text));
+        buffer
+    }
+
+    #[test]
+    fn ansi_diff_emits_wide_graphemes_atomically_without_targeting_continuations() {
+        let previous = wide_buffer(" A👩🏽‍💻B ", 7);
+        let current = wide_buffer(" 👩🏽‍💻AB ", 7);
+        let mut out = Vec::new();
+
+        let stats = write_ansi_frame_diff(&mut out, &previous, &current, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(!stats.full_repaint);
+        assert!(output.contains("👩🏽‍💻"));
+        assert!(!output.contains("\x1b[1;3H "));
+    }
+
+    #[test]
+    fn ansi_diff_clears_complete_old_wide_span_before_border() {
+        let previous = wide_buffer("A👩🏽‍💻│", 4);
+        let current = wide_buffer("AB │", 4);
+        let mut out = Vec::new();
+
+        let stats = write_ansi_frame_diff(&mut out, &previous, &current, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        assert_eq!(stats.changed_cells, 2);
+        assert!(output.contains("B "), "{output:?}");
     }
 
     #[test]

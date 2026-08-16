@@ -10,10 +10,12 @@ use crate::text::Line;
 /// One render-buffer cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
-    /// Cell symbol. Wide continuation cells are represented as an empty string.
+    /// Cell symbol.
     pub symbol: String,
     /// Cell style.
     pub style: Style,
+    width: u8,
+    wide_continuation: bool,
 }
 
 impl Default for Cell {
@@ -21,6 +23,8 @@ impl Default for Cell {
         Self {
             symbol: " ".to_owned(),
             style: Style::new(),
+            width: 1,
+            wide_continuation: false,
         }
     }
 }
@@ -29,16 +33,47 @@ impl Cell {
     /// Create a cell from a single-cell symbol and style.
     #[must_use]
     pub fn new(symbol: impl Into<String>, style: Style) -> Self {
+        let symbol = symbol.into();
         Self {
-            symbol: symbol.into(),
+            width: u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2),
+            symbol,
             style,
+            wide_continuation: false,
         }
     }
 
-    /// Set this cell's symbol and style.
+    /// Set this cell's symbol and style as a standalone logical cell.
     pub fn set(&mut self, symbol: impl Into<String>, style: Style) {
-        self.symbol = symbol.into();
+        let symbol = symbol.into();
+        self.width = u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2);
+        self.symbol = symbol;
         self.style = style;
+        self.wide_continuation = false;
+    }
+
+    /// Return this logical cell's terminal width.
+    #[must_use]
+    pub const fn width(&self) -> u8 {
+        self.width
+    }
+
+    /// Return whether this physical cell continues the wide leader to its left.
+    #[must_use]
+    pub const fn is_wide_continuation(&self) -> bool {
+        self.wide_continuation
+    }
+
+    /// Return whether this cell leads a width-two grapheme.
+    #[must_use]
+    pub const fn is_wide_leader(&self) -> bool {
+        self.width == 2 && !self.wide_continuation
+    }
+
+    fn set_continuation(&mut self, style: Style) {
+        self.symbol.clear();
+        self.style = style;
+        self.width = 0;
+        self.wide_continuation = true;
     }
 }
 
@@ -90,6 +125,69 @@ impl Buffer {
             .and_then(|index| self.cells.get_mut(index))
     }
 
+    /// Expand rectangles to include every old/new wide span they touch.
+    #[must_use]
+    pub fn expand_regions_to_cell_spans(&self, other: &Self, regions: &[Rect]) -> Vec<Rect> {
+        regions
+            .iter()
+            .map(|region| {
+                let mut expanded = region.intersection(self.area);
+                if expanded.is_empty() || self.area != other.area {
+                    return expanded;
+                }
+                for y in expanded.y..expanded.bottom() {
+                    let left = expanded.x;
+                    if [self, other].iter().any(|buffer| {
+                        buffer
+                            .get(Point::new(left, y))
+                            .is_some_and(Cell::is_wide_continuation)
+                    }) {
+                        expanded.x = expanded.x.saturating_sub(1).max(self.area.x);
+                        expanded.width = expanded.right().saturating_sub(expanded.x);
+                    }
+                    let right = expanded.right().saturating_sub(1);
+                    if [self, other].iter().any(|buffer| {
+                        buffer
+                            .get(Point::new(right, y))
+                            .is_some_and(Cell::is_wide_leader)
+                    }) {
+                        expanded.width = expanded
+                            .width
+                            .saturating_add(1)
+                            .min(self.area.right().saturating_sub(expanded.x));
+                    }
+                }
+                expanded
+            })
+            .collect()
+    }
+
+    /// Assert wide-span topology in debug/test builds.
+    pub fn debug_assert_valid_wide_spans(&self) {
+        for y in self.area.y..self.area.bottom() {
+            for x in self.area.x..self.area.right() {
+                let point = Point::new(x, y);
+                let Some(cell) = self.get(point) else {
+                    continue;
+                };
+                if cell.is_wide_leader() {
+                    debug_assert!(x.saturating_add(1) < self.area.right());
+                    debug_assert!(
+                        self.get(Point::new(x.saturating_add(1), y))
+                            .is_some_and(Cell::is_wide_continuation)
+                    );
+                }
+                if cell.is_wide_continuation() {
+                    debug_assert!(x > self.area.x);
+                    debug_assert!(
+                        self.get(Point::new(x - 1, y))
+                            .is_some_and(Cell::is_wide_leader)
+                    );
+                }
+            }
+        }
+    }
+
     /// Restore cells outside `regions` from `retained`, leaving region cells as rendered.
     pub fn restore_outside(&mut self, retained: &Self, regions: &[Rect]) {
         if self.area != retained.area {
@@ -110,10 +208,47 @@ impl Buffer {
         }
     }
 
-    /// Set a cell if the point is inside this buffer.
+    /// Set a standalone cell if the point is inside this buffer.
+    ///
+    /// Existing wide spans touching the destination are cleared first. Width-two graphemes are
+    /// installed atomically with an explicit continuation cell when room remains.
     pub fn set_cell(&mut self, point: Point, symbol: impl Into<String>, style: Style) {
-        if let Some(cell) = self.get_mut(point) {
+        if !self.area.contains(point) {
+            return;
+        }
+        self.clear_span_at(point);
+        let symbol = symbol.into();
+        let width = grapheme_width(&symbol);
+        if width == 2 && point.x.saturating_add(1) < self.area.right() {
+            self.clear_span_at(Point::new(point.x.saturating_add(1), point.y));
+            if let Some(cell) = self.get_mut(point) {
+                cell.set(symbol, style);
+                cell.width = 2;
+            }
+            if let Some(cell) = self.get_mut(Point::new(point.x.saturating_add(1), point.y)) {
+                cell.set_continuation(style);
+            }
+        } else if let Some(cell) = self.get_mut(point) {
             cell.set(symbol, style);
+            cell.width = 1;
+        }
+    }
+
+    fn clear_span_at(&mut self, point: Point) {
+        let Some(cell) = self.get(point) else {
+            return;
+        };
+        let (start, width) = if cell.is_wide_continuation() && point.x > self.area.x {
+            (Point::new(point.x - 1, point.y), 2)
+        } else if cell.is_wide_leader() {
+            (point, 2)
+        } else {
+            (point, 1)
+        };
+        for offset in 0..width {
+            if let Some(cell) = self.get_mut(Point::new(start.x.saturating_add(offset), start.y)) {
+                *cell = Cell::default();
+            }
         }
     }
 
@@ -149,9 +284,6 @@ impl Buffer {
                 }
                 if x >= clip.x && x < clip.right() {
                     self.set_cell(Point::new(x, area.y), grapheme.to_owned(), span.style);
-                    if width == 2 && x.saturating_add(1) < clip.right() {
-                        self.set_cell(Point::new(x.saturating_add(1), area.y), "", span.style);
-                    }
                 }
                 x = x.saturating_add(width);
             }
@@ -270,6 +402,34 @@ mod tests {
         assert_eq!(
             buffer.get(Point::new(1, 0)).map(|cell| cell.style),
             Some(fallback)
+        );
+    }
+
+    #[test]
+    fn overwriting_either_half_of_wide_span_clears_complete_topology() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buffer.write_line(Rect::new(0, 0, 4, 1), &Line::raw("A👩🏽‍💻B"));
+        buffer.set_cell(Point::new(2, 0), "X", Style::new());
+        buffer.debug_assert_valid_wide_spans();
+
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("A XB"));
+        assert!(!buffer.get(Point::new(1, 0)).unwrap().is_wide_leader());
+        assert!(!buffer.get(Point::new(2, 0)).unwrap().is_wide_continuation());
+    }
+
+    #[test]
+    fn damage_regions_expand_over_wide_leader_and_continuation() {
+        let previous = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut current = previous.clone();
+        current.write_line(Rect::new(0, 0, 4, 1), &Line::raw("A👩🏽‍💻B"));
+
+        assert_eq!(
+            current.expand_regions_to_cell_spans(&previous, &[Rect::new(2, 0, 1, 1)]),
+            [Rect::new(1, 0, 2, 1)]
+        );
+        assert_eq!(
+            current.expand_regions_to_cell_spans(&previous, &[Rect::new(1, 0, 1, 1)]),
+            [Rect::new(1, 0, 2, 1)]
         );
     }
 
