@@ -1694,6 +1694,68 @@ mod tests {
     }
 
     #[test]
+    fn hovering_a_later_tab_undims_it_in_declarative_spans() {
+        // Regression for a renderer-level attribute leak: with dim_inactive on,
+        // hovering any tab after the first used to keep rendering dim because
+        // the dim attribute from an earlier tab was never cleared.
+        let tabs = sim_tabs(6, 0);
+        let config = StatusBarConfig {
+            hover_highlight: true,
+            ..StatusBarConfig::default()
+        };
+        assert!(
+            config.style.dim_inactive,
+            "test relies on the default dim_inactive"
+        );
+
+        for hovered_index in [0_usize, 1, 2, 4, 5] {
+            let hovered_id = tabs[hovered_index].context_id;
+            let status = status_line_hovering(200, &config, &tabs, hovered_id);
+            let label = format!("win{hovered_index}");
+            let span = status
+                .spans
+                .iter()
+                .find(|span| span.text.contains(&label))
+                .unwrap_or_else(|| panic!("tab {hovered_index} should render a span"));
+            assert!(
+                !span.style.dim,
+                "hovered tab {hovered_index} should not be dim: {:?}",
+                span.style
+            );
+        }
+    }
+
+    #[test]
+    fn hovered_tab_ansi_output_clears_dim_from_earlier_tabs() {
+        // The ANSI string is what terminals actually receive, so assert the
+        // hovered token is not left dim by a preceding inactive tab.
+        let tabs = sim_tabs(6, 0);
+        let hovered_id = tabs[3].context_id;
+        let status = status_line_hovering(200, &StatusBarConfig::default(), &tabs, hovered_id);
+
+        let hovered_at = status
+            .rendered
+            .find("win3")
+            .expect("hovered tab should be rendered");
+        // Find the SGR sequence introducing the hovered token.
+        let prefix = &status.rendered[..hovered_at];
+        let sgr_start = prefix
+            .rfind("\u{1b}[")
+            .expect("hovered token should be preceded by an SGR sequence");
+        let sgr = &prefix[sgr_start..];
+        assert!(
+            !sgr.split('m').next().unwrap_or_default().contains(";2;") || !sgr.contains(";2;38"),
+            "hovered token SGR should not enable dim: {sgr:?}"
+        );
+        // The status line builds each cell's SGR from scratch with a leading 0
+        // reset, so the hovered run must start from a cleared state.
+        assert!(
+            sgr.starts_with("\u{1b}[0"),
+            "hovered token SGR should reset before styling: {sgr:?}"
+        );
+    }
+
+    #[test]
     fn tab_hitboxes_only_cover_visible_tab_text() {
         let tabs = sim_tabs(12, 0);
         for width in [10_u16, 14, 18, 24, 30, 45, 60, 80, 120, 200] {

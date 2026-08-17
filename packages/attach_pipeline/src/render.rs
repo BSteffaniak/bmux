@@ -665,6 +665,14 @@ fn flush_pending_text_run_to_commands(
     )
 }
 
+/// Emit SGR sequences that fully specify `style`.
+///
+/// Attributes are emitted in both directions: a `false` flag emits the negating
+/// SGR code rather than being skipped. Terminal attributes are sticky and the
+/// surface-level `ResetStyle` is only emitted once at the end of a surface, so
+/// skipping the "off" codes would let an earlier span's `Dim`/`Bold`/etc. leak
+/// into every following span (for example, a dimmed inactive tab making later
+/// hovered tabs render dim as well).
 fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Result<()> {
     if let Some(fg) = style.fg {
         queue!(stdout, SetForegroundColor(render_color_to_crossterm(fg)))
@@ -674,6 +682,12 @@ fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Resul
         queue!(stdout, SetBackgroundColor(render_color_to_crossterm(bg)))
             .context("failed setting render op background color")?;
     }
+    // Bold and dim share a single reset code (SGR 22, `NormalIntensity`), so
+    // clear once when neither is wanted and then apply whichever are.
+    if !style.bold || !style.dim {
+        queue!(stdout, SetAttribute(Attribute::NormalIntensity))
+            .context("failed clearing render op intensity attributes")?;
+    }
     if style.bold {
         queue!(stdout, SetAttribute(Attribute::Bold))
             .context("failed setting render op bold attribute")?;
@@ -682,27 +696,55 @@ fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Resul
         queue!(stdout, SetAttribute(Attribute::Dim))
             .context("failed setting render op dim attribute")?;
     }
-    if style.italic {
-        queue!(stdout, SetAttribute(Attribute::Italic))
-            .context("failed setting render op italic attribute")?;
-    }
-    if style.underline {
-        queue!(stdout, SetAttribute(Attribute::Underlined))
-            .context("failed setting render op underline attribute")?;
-    }
-    if style.blink {
-        queue!(stdout, SetAttribute(Attribute::SlowBlink))
-            .context("failed setting render op blink attribute")?;
-    }
-    if style.reverse {
-        queue!(stdout, SetAttribute(Attribute::Reverse))
-            .context("failed setting render op reverse attribute")?;
-    }
-    if style.strikethrough {
-        queue!(stdout, SetAttribute(Attribute::CrossedOut))
-            .context("failed setting render op strikethrough attribute")?;
-    }
+    queue_render_style_toggle(
+        stdout,
+        style.italic,
+        Attribute::Italic,
+        Attribute::NoItalic,
+        "italic",
+    )?;
+    queue_render_style_toggle(
+        stdout,
+        style.underline,
+        Attribute::Underlined,
+        Attribute::NoUnderline,
+        "underline",
+    )?;
+    queue_render_style_toggle(
+        stdout,
+        style.blink,
+        Attribute::SlowBlink,
+        Attribute::NoBlink,
+        "blink",
+    )?;
+    queue_render_style_toggle(
+        stdout,
+        style.reverse,
+        Attribute::Reverse,
+        Attribute::NoReverse,
+        "reverse",
+    )?;
+    queue_render_style_toggle(
+        stdout,
+        style.strikethrough,
+        Attribute::CrossedOut,
+        Attribute::NotCrossedOut,
+        "strikethrough",
+    )?;
     Ok(())
+}
+
+/// Queue either the enabling or the negating attribute for one style flag.
+fn queue_render_style_toggle<W: io::Write>(
+    stdout: &mut W,
+    enabled: bool,
+    on: Attribute,
+    off: Attribute,
+    name: &str,
+) -> Result<()> {
+    let attribute = if enabled { on } else { off };
+    queue!(stdout, SetAttribute(attribute))
+        .with_context(|| format!("failed setting render op {name} attribute"))
 }
 
 const fn render_color_to_crossterm(color: RenderColor) -> Color {
@@ -5317,8 +5359,8 @@ mod tests {
         execute_pane_content_row_output_plan, frame_damage_overlay_render_ops, opaque_row_text,
         optimize_terminal_commands, previous_extension_snapshot_cleanup_damage,
         queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
-        render_grid_row_segment,
+        queue_render_ops, queue_render_style, render_attach_scene,
+        render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -8279,8 +8321,23 @@ mod tests {
         );
 
         let output = String::from_utf8(output).expect("render op bytes should be utf8");
-        assert!(output.contains("\u{1b}[1m\u{1b}[1;1Hhi"), "{output:?}");
-        assert!(output.contains("\u{1b}[38;5;9m!"), "{output:?}");
+        // Styles now fully specify their attribute state, so the enabling code
+        // is no longer byte-adjacent to the text. Assert the intent instead:
+        // bold is in effect for "hi" and is not cancelled before it.
+        let hi_at = output.find("hi").expect("first span should render");
+        let bold_at = output[..hi_at]
+            .rfind("\u{1b}[1m")
+            .expect("first span should be bold");
+        assert!(
+            !output[bold_at..hi_at].contains("\u{1b}[22m"),
+            "bold must not be cleared before the text it applies to: {output:?}"
+        );
+        // The second span switches foreground colour and is not repositioned.
+        let bang_at = output.find('!').expect("second span should render");
+        let red_at = output[..bang_at]
+            .rfind("\u{1b}[38;5;9m")
+            .expect("second span should set bright red");
+        assert!(red_at < bang_at, "{output:?}");
         assert!(!output.contains("\u{1b}[1;3H!"), "{output:?}");
     }
 
@@ -8357,6 +8414,106 @@ mod tests {
 
         let output = String::from_utf8(output).expect("render op bytes should be utf8");
         assert!(output.contains("\u{1b}[38;5;11m"), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_clears_attributes_between_spans() {
+        // Regression: terminal attributes are sticky and the surface reset is
+        // only emitted once at the end, so a dim span used to leak `Dim` into
+        // every following span (dimmed inactive tabs made later hovered tabs
+        // render dim too).
+        let dim = RenderStyle {
+            dim: true,
+            ..RenderStyle::default()
+        };
+        let bright = RenderStyle::default();
+        let ops = [
+            RenderOp::TextRun {
+                x: 0,
+                y: 0,
+                text: "dim".to_string(),
+                style: dim,
+            },
+            RenderOp::TextRun {
+                x: 3,
+                y: 0,
+                text: "lit".to_string(),
+                style: bright,
+            },
+        ];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("styled ops should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        let dim_at = output.find("\u{1b}[2m").expect("dim span should set SGR 2");
+        let lit_at = output.find("lit").expect("second span should render");
+        let cleared_at = output[dim_at..lit_at]
+            .find("\u{1b}[22m")
+            .expect("intensity must be cleared before the non-dim span");
+        assert!(
+            dim_at + cleared_at < lit_at,
+            "SGR 22 should precede the bright span: {output:?}"
+        );
+    }
+
+    #[test]
+    fn queue_render_style_negates_every_unset_attribute() {
+        let mut output = Vec::new();
+        queue_render_style(&mut output, RenderStyle::default())
+            .expect("default style should queue");
+        let output = String::from_utf8(output).expect("render style bytes should be utf8");
+
+        // Intensity (22), italic (23), underline (24), blink (25), reverse (27),
+        // strikethrough (29) are all explicitly turned off.
+        for code in ["22", "23", "24", "25", "27", "29"] {
+            assert!(
+                output.contains(&format!("\u{1b}[{code}m")),
+                "default style should clear SGR {code}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_render_style_keeps_enabled_attributes_after_clearing() {
+        let style = RenderStyle {
+            bold: true,
+            underline: true,
+            ..RenderStyle::default()
+        };
+        let mut output = Vec::new();
+        queue_render_style(&mut output, style).expect("style should queue");
+        let output = String::from_utf8(output).expect("render style bytes should be utf8");
+
+        let bold_at = output.find("\u{1b}[1m").expect("bold should be set");
+        let clear_at = output
+            .find("\u{1b}[22m")
+            .expect("intensity clear should be emitted for the unset dim flag");
+        assert!(
+            clear_at < bold_at,
+            "intensity clear must not cancel bold: {output:?}"
+        );
+        assert!(
+            output.contains("\u{1b}[4m"),
+            "underline should be set: {output:?}"
+        );
+        assert!(
+            !output.contains("\u{1b}[24m"),
+            "underline should not be cleared when enabled: {output:?}"
+        );
     }
 
     #[test]
