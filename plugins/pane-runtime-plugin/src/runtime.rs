@@ -2002,6 +2002,45 @@ impl SessionRuntimeManager {
         })
     }
 
+    pub(crate) fn reconcile_padding_after_metadata_change(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        before: &crate::padding_api::RuntimePanePaddingState,
+    ) -> Result<crate::padding_api::RuntimePanePaddingState, SessionRuntimeError> {
+        let after = self.padding_state(session_id, Some(pane_id))?;
+        self.apply_padding_geometry_change(session_id, pane_id, before, &after)?;
+        Ok(after)
+    }
+
+    fn apply_padding_geometry_change(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        before: &crate::padding_api::RuntimePanePaddingState,
+        after: &crate::padding_api::RuntimePanePaddingState,
+    ) -> Result<(), SessionRuntimeError> {
+        if before.effective_content_rect == after.effective_content_rect {
+            return Ok(());
+        }
+        if before.effective_content_rect.w != after.effective_content_rect.w
+            || before.effective_content_rect.h != after.effective_content_rect.h
+        {
+            let pane = self
+                .runtimes
+                .get(&session_id)
+                .and_then(|runtime| runtime.panes.get(&pane_id))
+                .ok_or(SessionRuntimeError::NotFound)?;
+            pane.resize_pty(
+                after.effective_content_rect.h.max(1),
+                after.effective_content_rect.w.max(1),
+            );
+        }
+        self.bump_attach_view_revision(session_id);
+        emit_attach_view_changed_for_layout(session_id);
+        Ok(())
+    }
+
     pub(crate) fn set_padding_override(
         &mut self,
         session_id: SessionId,
@@ -2025,23 +2064,7 @@ impl SessionRuntimeManager {
             .ok_or(SessionRuntimeError::NotFound)?
             .padding_override = spec;
         let after = self.padding_state(session_id, Some(target))?;
-        if before.effective_content_rect != after.effective_content_rect {
-            if before.effective_content_rect.w != after.effective_content_rect.w
-                || before.effective_content_rect.h != after.effective_content_rect.h
-            {
-                let pane = self
-                    .runtimes
-                    .get(&session_id)
-                    .and_then(|runtime| runtime.panes.get(&target))
-                    .ok_or(SessionRuntimeError::NotFound)?;
-                pane.resize_pty(
-                    after.effective_content_rect.h.max(1),
-                    after.effective_content_rect.w.max(1),
-                );
-            }
-            self.bump_attach_view_revision(session_id);
-            emit_attach_view_changed_for_layout(session_id);
-        }
+        self.apply_padding_geometry_change(session_id, target, &before, &after)?;
         mark_snapshot_dirty_flag();
         Ok(after)
     }
@@ -3862,6 +3885,7 @@ impl SessionRuntimeManager {
 
                                 let metadata = shell_metadata_parser.process_chunk(chunk);
                                 if !metadata.events.is_empty() {
+                                    let padding_before = pane_padding_state(session_id, pane_id);
                                     let mut replay_command = None;
                                     if let Ok(mut resurrection_state) =
                                         resurrection_state_for_reader.lock()
@@ -3891,7 +3915,9 @@ impl SessionRuntimeManager {
                                         }
                                     }
                                     mark_snapshot_dirty_flag();
-                                    notify_pane_metadata_changed(session_id, pane_id);
+                                    if let Some(before) = padding_before {
+                                        notify_pane_metadata_changed(session_id, pane_id, before);
+                                    }
                                 }
                                 let chunk = metadata.filtered;
                                 let chunk = chunk.as_slice();
@@ -7207,23 +7233,32 @@ struct PaneExitEvent {
     pane_id: Uuid,
 }
 
-fn notify_pane_metadata_changed(session_id: SessionId, pane_id: Uuid) {
-    let handle = bmux_plugin::global_plugin_state_registry()
+fn pane_padding_handle() -> Option<PanePaddingRuntimeHandle> {
+    bmux_plugin::global_plugin_state_registry()
         .get::<PanePaddingRuntimeHandle>()
-        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()));
-    let Some(handle) = handle else {
+        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
+}
+
+fn pane_padding_state(
+    session_id: SessionId,
+    pane_id: Uuid,
+) -> Option<crate::padding_api::RuntimePanePaddingState> {
+    pane_padding_handle()?.state(session_id, Some(pane_id)).ok()
+}
+
+fn notify_pane_metadata_changed(
+    session_id: SessionId,
+    pane_id: Uuid,
+    before: crate::padding_api::RuntimePanePaddingState,
+) {
+    let Some(handle) = pane_padding_handle() else {
         return;
     };
-    let before = handle.state(session_id, Some(pane_id)).ok();
-    let Some(before) = before else {
-        return;
-    };
-    // Metadata has already changed in the shared pane state. Re-applying the
-    // current override computes new declarative rule selection and performs
-    // the same atomic resize/invalidation transaction as user mutations.
-    let after = handle
-        .set_override(session_id, Some(pane_id), before.runtime_override)
-        .ok();
+    let after = handle.0.lock().ok().and_then(|mut manager| {
+        manager
+            .reconcile_padding_after_metadata_change(session_id, pane_id, &before)
+            .ok()
+    });
     if after.is_some_and(|after| after.effective_content_rect != before.effective_content_rect) {
         trace!(%pane_id, "pane padding changed after shell metadata transition");
     }
@@ -7667,7 +7702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_metadata_transition_reselects_padding_rule() {
+    async fn command_and_prompt_metadata_transitions_reselect_padding_rule() {
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -7691,6 +7726,7 @@ mod tests {
                 .w,
             118
         );
+        let before = manager.padding_state(session_id, None).unwrap();
         manager.runtimes[&session_id].panes[&pane_id]
             .resurrection_state
             .lock()
@@ -7701,10 +7737,24 @@ mod tests {
             });
 
         let changed = manager
-            .set_padding_override(session_id, None, None)
-            .expect("re-evaluate metadata rule");
+            .reconcile_padding_after_metadata_change(session_id, pane_id, &before)
+            .expect("re-evaluate command metadata rule");
         assert_eq!(changed.matched_rule_index, Some(0));
         assert_eq!(changed.effective_content_rect.w, 40);
+
+        let before = changed;
+        manager.runtimes[&session_id].panes[&pane_id]
+            .resurrection_state
+            .lock()
+            .unwrap()
+            .apply_event(PaneShellMetadataEvent::Prompt {
+                cwd: "/tmp".to_string(),
+            });
+        let changed = manager
+            .reconcile_padding_after_metadata_change(session_id, pane_id, &before)
+            .expect("re-evaluate prompt metadata rule");
+        assert_eq!(changed.matched_rule_index, None);
+        assert_eq!(changed.effective_content_rect.w, 118);
     }
 
     #[tokio::test]

@@ -61,6 +61,13 @@ summary       = "Show effective padding for a pane"
 
 [[commands.arguments]]
 kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
 long       = "pane-id"
 name       = "pane-id"
 value_name = "UUID"
@@ -70,6 +77,13 @@ expose_in_cli = true
 name          = "pane-padding-set"
 path          = ["pane-padding", "set"]
 summary       = "Set a runtime padding override for a pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
 
 [[commands.arguments]]
 kind       = "string"
@@ -141,6 +155,13 @@ expose_in_cli = true
 name          = "pane-padding-reset"
 path          = ["pane-padding", "reset"]
 summary       = "Reset a pane to declarative padding"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
 
 [[commands.arguments]]
 kind       = "string"

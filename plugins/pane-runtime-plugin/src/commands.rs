@@ -5,6 +5,7 @@ use bmux_plugin_sdk::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, NativeCommandContext, NativeCommandInvocationSource,
     PluginCommandError, record_command_outcome_metadata,
 };
+use bmux_sessions_plugin_api::sessions_state;
 use uuid::Uuid;
 
 use crate::padding::{HorizontalAlignment, PanePaddingSpec, VerticalAlignment};
@@ -72,6 +73,27 @@ fn target_pane(arguments: &[String]) -> Result<Option<Uuid>, PluginCommandError>
 
 fn selected_session(context: &NativeCommandContext) -> Result<SessionId, PluginCommandError> {
     let mut client = ServiceCallerDispatchClient::new(context);
+    if let Some(selector) = option_value(&context.arguments, "session") {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(PluginCommandError::invalid_arguments(
+                "--session expects a session UUID or name",
+            ));
+        }
+        let parsed_id = Uuid::parse_str(selector).ok();
+        let result = bmux_plugin::block_on_typed_dispatch(sessions_state::client::get_session(
+            &mut client,
+            sessions_state::SessionSelector {
+                id: parsed_id,
+                name: parsed_id.is_none().then(|| selector.to_string()),
+            },
+        ))
+        .map_err(|error| PluginCommandError::failed(format!("session lookup failed: {error}")))?
+        .map_err(|error| {
+            PluginCommandError::failed(format!("session selector did not resolve: {error:?}"))
+        })?;
+        return Ok(SessionId(result.id));
+    }
     let current =
         bmux_plugin::block_on_typed_dispatch(clients_state::client::current_client(&mut client))
             .map_err(|error| {
