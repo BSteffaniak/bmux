@@ -15,8 +15,10 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
+mod commands;
 mod handlers;
 mod padding;
+mod padding_api;
 mod runtime;
 mod snapshot;
 
@@ -72,9 +74,10 @@ impl RustPlugin for PaneRuntimePlugin {
 
     fn run_command(
         &mut self,
-        _context: NativeCommandContext,
+        context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        commands::run(&context)?;
+        Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {

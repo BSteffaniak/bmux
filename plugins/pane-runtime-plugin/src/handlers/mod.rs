@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod attach_commands;
 pub mod attach_state;
+pub mod padding;
 pub mod pane_commands;
 pub mod pane_state;
 
@@ -31,6 +32,9 @@ pub mod pane_state;
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         // pane-runtime-state queries.
+        "pane-runtime-state", "pane-padding" => |req: padding::PanePaddingArgs, _ctx| {
+            Ok::<_, ServiceResponse>(padding::get(&req))
+        },
         "pane-runtime-state", "list-panes" => |req: pane_state::ListPanesArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_state::list_panes(&req, ctx))
         },
@@ -48,6 +52,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
 
         // pane-runtime-commands mutations.
+        "pane-runtime-commands", "set-pane-padding" => |req: padding::SetPanePaddingArgs, _ctx| {
+            Ok::<_, ServiceResponse>(padding::set(&req))
+        },
+        "pane-runtime-commands", "clear-pane-padding" => |req: padding::PanePaddingArgs, _ctx| {
+            Ok::<_, ServiceResponse>(padding::clear(&req))
+        },
         "pane-runtime-commands", "split-pane" => |req: pane_commands::SplitPaneArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::split_pane(&req, ctx))
         },

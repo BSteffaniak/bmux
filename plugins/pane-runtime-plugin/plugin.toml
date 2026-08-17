@@ -1,7 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.pane_runtime"
 name = "bmux Pane Runtime"
-owns_namespaces = []
+owns_namespaces = ["pane-padding"]
 provided_capabilities = [
     "bmux.pane_runtime.read",
     "bmux.pane_runtime.write",
@@ -52,3 +52,98 @@ kind         = "event"
 delivery                     = "broadcast"
 forward_to_streaming_clients = true
 kind                         = "bmux.pane_runtime/pane-runtime-events"
+
+[[commands]]
+expose_in_cli = true
+name          = "pane-padding-show"
+path          = ["pane-padding", "show"]
+summary       = "Show effective padding for a pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+value_name = "UUID"
+
+[[commands]]
+expose_in_cli = true
+name          = "pane-padding-set"
+path          = ["pane-padding", "set"]
+summary       = "Set a runtime padding override for a pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+value_name = "UUID"
+
+[[commands.arguments]]
+kind = "integer"
+long = "left"
+name = "left"
+
+[[commands.arguments]]
+kind = "integer"
+long = "right"
+name = "right"
+
+[[commands.arguments]]
+kind = "integer"
+long = "top"
+name = "top"
+
+[[commands.arguments]]
+kind = "integer"
+long = "bottom"
+name = "bottom"
+
+[[commands.arguments]]
+kind = "integer"
+long = "horizontal"
+name = "horizontal"
+
+[[commands.arguments]]
+kind = "integer"
+long = "vertical"
+name = "vertical"
+
+[[commands.arguments]]
+kind = "integer"
+long = "all"
+name = "all"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "max-content-width"
+name       = "max-content-width"
+value_name = "CELLS|none"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "max-content-height"
+name       = "max-content-height"
+value_name = "CELLS|none"
+
+[[commands.arguments]]
+choice_values = ["left", "center", "right"]
+kind          = "choice"
+long          = "horizontal-alignment"
+name          = "horizontal-alignment"
+
+[[commands.arguments]]
+choice_values = ["top", "center", "bottom"]
+kind          = "choice"
+long          = "vertical-alignment"
+name          = "vertical-alignment"
+
+[[commands]]
+expose_in_cli = true
+name          = "pane-padding-reset"
+path          = ["pane-padding", "reset"]
+summary       = "Reset a pane to declarative padding"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+value_name = "UUID"

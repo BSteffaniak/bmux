@@ -60,7 +60,8 @@ impl Drop for PaneBlockingThreadGuard {
     }
 }
 use crate::padding::{
-    PanePaddingConfig, PanePaddingMetadata, PanePaddingSpec, base_content_rect, padded_content_rect,
+    PanePaddingConfig, PanePaddingMetadata, PanePaddingSpec, base_content_rect,
+    padded_content_rect, validate_spec,
 };
 use uuid::Uuid;
 
@@ -463,6 +464,7 @@ struct SessionRuntimeManager {
     bracketed_paste_supported: bool,
     shell_integration_root: Option<std::path::PathBuf>,
     padding_config: PanePaddingConfig,
+    restored_padding_overrides: BTreeMap<(SessionId, Uuid), PanePaddingSpec>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
 }
 
@@ -1929,6 +1931,148 @@ impl SessionRuntimeManager {
         Some(runtime.attach_view_revision)
     }
 
+    fn pane_outer_rect(&self, session_id: SessionId, pane_id: Uuid) -> Option<AttachRect> {
+        let runtime = self.runtimes.get(&session_id)?;
+        if runtime.zoomed_pane_id == Some(pane_id) {
+            return Some(attach_rect_from_layout_rect(scene_root_from_viewport(
+                runtime.attach_viewport,
+            )));
+        }
+        if let Some(surface) = runtime
+            .floating_surfaces
+            .iter()
+            .find(|surface| surface.pane_id == pane_id)
+        {
+            return Some(attach_rect_from_layout_rect(surface.rect));
+        }
+        let root = scene_root_from_viewport(runtime.attach_viewport);
+        let mut rects = BTreeMap::new();
+        if let Some(layout) = &runtime.layout_root {
+            collect_layout_rects(layout, root, &mut rects);
+        }
+        rects
+            .get(&pane_id)
+            .copied()
+            .map(attach_rect_from_layout_rect)
+    }
+
+    pub(crate) fn padding_state(
+        &self,
+        session_id: SessionId,
+        pane_id: Option<Uuid>,
+    ) -> Result<crate::padding_api::RuntimePanePaddingState, SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let pane_id = pane_id.unwrap_or(runtime.focused_pane_id);
+        let pane = runtime
+            .panes
+            .get(&pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let outer = self
+            .pane_outer_rect(session_id, pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let base = base_content_rect(outer);
+        let active_command = pane
+            .resurrection_state
+            .lock()
+            .ok()
+            .and_then(|state| state.active_command.clone());
+        let metadata = PanePaddingMetadata {
+            name: pane.meta.name.as_deref(),
+            shell: &pane.meta.shell,
+            active_command: active_command.as_deref(),
+        };
+        let declarative = self.padding_config.resolve(metadata, base, None);
+        let effective = self
+            .padding_config
+            .resolve(metadata, base, pane.padding_override);
+        Ok(crate::padding_api::RuntimePanePaddingState {
+            session_id: session_id.0,
+            pane_id,
+            declarative: declarative.spec,
+            matched_rule_index: declarative.matched_rule_index,
+            runtime_override: pane.padding_override,
+            effective: effective.spec,
+            outer_rect: outer,
+            base_content_rect: base,
+            effective_content_rect: padded_content_rect(base, effective.spec),
+            persist_runtime_overrides: self.padding_config.persist_runtime_overrides,
+        })
+    }
+
+    pub(crate) fn set_padding_override(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Option<Uuid>,
+        spec: Option<PanePaddingSpec>,
+    ) -> Result<crate::padding_api::RuntimePanePaddingState, SessionRuntimeError> {
+        if let Some(spec) = spec {
+            validate_spec(spec).map_err(|_| SessionRuntimeError::Closed)?;
+        }
+        let target = {
+            let runtime = self
+                .runtimes
+                .get(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            pane_id.unwrap_or(runtime.focused_pane_id)
+        };
+        let before = self.padding_state(session_id, Some(target))?;
+        self.runtimes
+            .get_mut(&session_id)
+            .and_then(|runtime| runtime.panes.get_mut(&target))
+            .ok_or(SessionRuntimeError::NotFound)?
+            .padding_override = spec;
+        let after = self.padding_state(session_id, Some(target))?;
+        if before.effective_content_rect != after.effective_content_rect {
+            if before.effective_content_rect.w != after.effective_content_rect.w
+                || before.effective_content_rect.h != after.effective_content_rect.h
+            {
+                let pane = self
+                    .runtimes
+                    .get(&session_id)
+                    .and_then(|runtime| runtime.panes.get(&target))
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                pane.resize_pty(
+                    after.effective_content_rect.h.max(1),
+                    after.effective_content_rect.w.max(1),
+                );
+            }
+            self.bump_attach_view_revision(session_id);
+            emit_attach_view_changed_for_layout(session_id);
+        }
+        mark_snapshot_dirty_flag();
+        Ok(after)
+    }
+
+    pub(crate) fn install_restored_padding_override(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        spec: PanePaddingSpec,
+    ) {
+        self.restored_padding_overrides
+            .insert((session_id, pane_id), spec);
+    }
+
+    pub(crate) fn padding_overrides_for_snapshot(
+        &self,
+    ) -> BTreeMap<(SessionId, Uuid), PanePaddingSpec> {
+        if !self.padding_config.persist_runtime_overrides {
+            return BTreeMap::new();
+        }
+        self.runtimes
+            .iter()
+            .flat_map(|(session_id, runtime)| {
+                runtime.panes.iter().filter_map(|(pane_id, pane)| {
+                    pane.padding_override
+                        .map(|spec| ((*session_id, *pane_id), spec))
+                })
+            })
+            .collect()
+    }
+
     fn active_session_ids(&self) -> Vec<SessionId> {
         self.runtimes.keys().copied().collect()
     }
@@ -3117,6 +3261,7 @@ impl SessionRuntimeManager {
             bracketed_paste_supported,
             shell_integration_root,
             padding_config,
+            restored_padding_overrides: BTreeMap::new(),
             pane_exit_tx,
         }
     }
@@ -3954,6 +4099,10 @@ impl SessionRuntimeManager {
             exited_for_task.store(true, Ordering::SeqCst);
         });
 
+        let padding_override = self
+            .restored_padding_overrides
+            .get(&(session_id, pane_meta.id))
+            .copied();
         PaneRuntimeHandle {
             meta: pane_meta,
             process_id,
@@ -3972,7 +4121,7 @@ impl SessionRuntimeManager {
             sync_update_in_progress,
             mouse_protocol_state,
             input_mode_state,
-            padding_override: None,
+            padding_override,
             #[cfg(feature = "image-registry")]
             image_registry,
             #[cfg(feature = "image-registry")]
@@ -7400,6 +7549,57 @@ fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
     None
 }
 
+#[derive(Clone)]
+pub(crate) struct PanePaddingRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>);
+
+impl PanePaddingRuntimeHandle {
+    pub(crate) fn state(
+        &self,
+        session_id: SessionId,
+        pane_id: Option<Uuid>,
+    ) -> Result<crate::padding_api::RuntimePanePaddingState, SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .padding_state(session_id, pane_id)
+    }
+
+    pub(crate) fn overrides_for_snapshot(
+        &self,
+    ) -> Result<BTreeMap<(SessionId, Uuid), PanePaddingSpec>, SessionRuntimeError> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .padding_overrides_for_snapshot())
+    }
+
+    pub(crate) fn install_restored_override(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        spec: PanePaddingSpec,
+    ) -> Result<(), SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .install_restored_padding_override(session_id, pane_id, spec);
+        Ok(())
+    }
+
+    pub(crate) fn set_override(
+        &self,
+        session_id: SessionId,
+        pane_id: Option<Uuid>,
+        spec: Option<PanePaddingSpec>,
+    ) -> Result<crate::padding_api::RuntimePanePaddingState, SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .set_padding_override(session_id, pane_id, spec)
+    }
+}
+
 pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: PanePaddingConfig) {
     tracing::debug!(
         persist_runtime_overrides = padding_config.persist_runtime_overrides,
@@ -7422,6 +7622,9 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
         .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
             std::sync::RwLock::new(runtime_handle),
         ));
+    bmux_plugin::global_plugin_state_registry().register::<PanePaddingRuntimeHandle>(&Arc::new(
+        std::sync::RwLock::new(PanePaddingRuntimeHandle(Arc::clone(&manager))),
+    ));
 
     let shutdown_rx = watch::channel(false).1;
     let exit_manager = Arc::clone(&manager);
@@ -7438,6 +7641,36 @@ mod tests {
 
     fn leaf(id: Uuid) -> PaneLayoutNode {
         PaneLayoutNode::Leaf { pane_id: id }
+    }
+
+    #[tokio::test]
+    async fn padding_override_updates_state_resizes_and_clears() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let centered = PanePaddingSpec {
+            max_content_width: Some(40),
+            horizontal_alignment: crate::padding::HorizontalAlignment::Center,
+            ..PanePaddingSpec::default()
+        };
+
+        let changed = manager
+            .set_padding_override(session_id, None, Some(centered))
+            .expect("set padding override");
+        assert_eq!(changed.runtime_override, Some(centered));
+        assert_eq!(changed.effective_content_rect.w, 40);
+        assert_eq!(changed.effective_content_rect.x, 40);
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+        assert_eq!(*last_requested_size.lock().unwrap(), (38, 40));
+
+        let cleared = manager
+            .set_padding_override(session_id, Some(pane_id), None)
+            .expect("clear padding override");
+        assert_eq!(cleared.runtime_override, None);
+        assert_eq!(cleared.effective_content_rect.w, 118);
+        assert_eq!(*last_requested_size.lock().unwrap(), (38, 118));
     }
 
     #[test]
@@ -7566,6 +7799,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -7687,6 +7921,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (owner_session_id, owner_runtime),
@@ -8220,6 +8455,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let empty_manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8275,6 +8511,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
@@ -8325,6 +8562,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
@@ -8367,6 +8605,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8413,6 +8652,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8451,6 +8691,7 @@ mod tests {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
+            restored_padding_overrides: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),

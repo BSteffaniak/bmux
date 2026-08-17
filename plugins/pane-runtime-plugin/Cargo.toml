@@ -19,6 +19,7 @@ bmux_attach_image_protocol = { workspace = true }
 bmux_attach_layout_protocol = { workspace = true }
 bmux_attach_token_state = { workspace = true }
 bmux_client_state = { workspace = true }
+bmux_clients_plugin_api = { workspace = true }
 bmux_config = { workspace = true }
 bmux_context_state = { workspace = true }
 bmux_image = { workspace = true, optional = true }
@@ -54,6 +55,7 @@ uuid = { workspace = true, features = ["serde", "std"] }
 default = []
 fail-on-warnings = [
     "bmux_attach_layout_protocol/fail-on-warnings",
+    "bmux_clients_plugin_api/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",

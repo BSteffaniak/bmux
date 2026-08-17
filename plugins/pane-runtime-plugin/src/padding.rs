@@ -19,6 +19,44 @@ pub(crate) enum VerticalAlignment {
     Bottom,
 }
 
+impl HorizontalAlignment {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "left" => Ok(Self::Left),
+            "center" => Ok(Self::Center),
+            "right" => Ok(Self::Right),
+            _ => Err(format!("invalid horizontal alignment '{value}'")),
+        }
+    }
+}
+
+impl VerticalAlignment {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Center => "center",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "top" => Ok(Self::Top),
+            "center" => Ok(Self::Center),
+            "bottom" => Ok(Self::Bottom),
+            _ => Err(format!("invalid vertical alignment '{value}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ContentLimit {
@@ -279,6 +317,16 @@ pub(crate) const fn base_content_rect(rect: AttachRect) -> AttachRect {
         w: rect.w - 2,
         h: rect.h - 2,
     }
+}
+
+pub(crate) fn validate_spec(spec: PanePaddingSpec) -> Result<(), String> {
+    if spec.max_content_width == Some(0) {
+        return Err("max_content_width must be positive or absent".to_string());
+    }
+    if spec.max_content_height == Some(0) {
+        return Err("max_content_height must be positive or absent".to_string());
+    }
+    Ok(())
 }
 
 pub(crate) fn padded_content_rect(base: AttachRect, spec: PanePaddingSpec) -> AttachRect {

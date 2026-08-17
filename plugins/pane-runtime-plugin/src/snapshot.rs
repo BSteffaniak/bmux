@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::runtime::{session_handle, session_runtime_handle};
+use crate::padding::PanePaddingSpec;
+use crate::runtime::{PanePaddingRuntimeHandle, session_handle, session_runtime_handle};
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect,
     PaneCommandSource, PaneLaunchSpec, PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta,
@@ -87,6 +88,8 @@ pub struct PaneRuntimeSnapshotV1Pane {
     pub active_command_source: Option<PaneCommandSource>,
     #[serde(default)]
     pub last_known_cwd: Option<String>,
+    #[serde(default)]
+    pub padding_override: Option<PanePaddingSpec>,
 }
 
 /// Pane-layout tree node.
@@ -209,6 +212,11 @@ impl PaneRuntimeStateful {
 fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
     let sessions = session_handle().0.list_sessions();
     let runtime_manager = session_runtime_handle();
+    let padding_overrides = bmux_plugin::global_plugin_state_registry()
+        .get::<PanePaddingRuntimeHandle>()
+        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
+        .and_then(|handle| handle.overrides_for_snapshot().ok())
+        .unwrap_or_default();
 
     let mut out = Vec::with_capacity(sessions.len());
     for session_info in sessions {
@@ -242,6 +250,7 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
                     active_command: pane.resurrection.active_command,
                     active_command_source: pane.resurrection.active_command_source,
                     last_known_cwd: pane.resurrection.last_known_cwd,
+                    padding_override: padding_overrides.get(&(session_info.id, pane.id)).copied(),
                 }
             })
             .collect();
@@ -291,6 +300,9 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
 fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
     let session_manager = session_handle();
     let runtime_manager = session_runtime_handle();
+    let padding_handle = bmux_plugin::global_plugin_state_registry()
+        .get::<PanePaddingRuntimeHandle>()
+        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()));
 
     for entry in &payload.sessions {
         if entry.panes.is_empty() {
@@ -301,6 +313,15 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
             continue;
         }
         let session_id = SessionId(entry.session_id);
+        if let Some(handle) = &padding_handle {
+            for pane in &entry.panes {
+                if let Some(spec) = pane.padding_override
+                    && let Err(error) = handle.install_restored_override(session_id, pane.id, spec)
+                {
+                    warn!(%error, pane_id = %pane.id, "failed staging restored pane padding override");
+                }
+            }
+        }
 
         // The sessions-plugin participant is iterated before us in the
         // combined envelope, so the session entry should already exist
@@ -470,6 +491,12 @@ mod tests {
                     active_command: None,
                     active_command_source: None,
                     last_known_cwd: Some("/tmp".into()),
+                    padding_override: Some(crate::padding::PanePaddingSpec {
+                        left: 3,
+                        max_content_width: Some(100),
+                        horizontal_alignment: crate::padding::HorizontalAlignment::Center,
+                        ..crate::padding::PanePaddingSpec::default()
+                    }),
                 }],
                 focused_pane_id: Some(pane_id),
                 zoomed_pane_id: Some(pane_id),
@@ -541,6 +568,7 @@ mod tests {
                     active_command: None,
                     active_command_source: None,
                     last_known_cwd: None,
+                    padding_override: None,
                 }],
                 focused_pane_id: Some(pane_id),
                 zoomed_pane_id: None,
@@ -595,6 +623,7 @@ mod tests {
                     active_command: None,
                     active_command_source: Some(PaneCommandSource::Verbatim),
                     last_known_cwd: Some("/tmp".into()),
+                    padding_override: None,
                 }],
                 focused_pane_id: Some(pane_id),
                 zoomed_pane_id: None,
