@@ -112,9 +112,12 @@ pub fn attach_scene_damage_between(
                 absolute_damage.push(surface_outer_rect(next_surface));
             }
             Some(next_surface) if previous_surface.content_rect != next_surface.content_rect => {
-                if let Some(pane_id) = next_surface.pane_id {
-                    damage.mark_content_surface(pane_id);
-                }
+                // A content rectangle can move or shrink while the outer surface
+                // remains fixed. Damage both absolute locations so cells formerly
+                // occupied by content are repainted by extension/background layers,
+                // and the new content area is fully redrawn.
+                absolute_damage.push(surface_content_rect(previous_surface));
+                absolute_damage.push(surface_content_rect(next_surface));
                 damage.mark_extension_surface_query(next_surface.id);
             }
             Some(next_surface) if surface_is_pane(next_surface) => {
@@ -427,6 +430,27 @@ mod tests {
             &[DamageRect::new(2, 2, 4, 3), DamageRect::new(8, 2, 4, 3)]
         );
         assert!(damage.extension_surface_damaged(floating_surface, floating));
+    }
+
+    #[test]
+    fn attach_scene_damage_between_covers_old_and_new_content_rectangles() {
+        let pane_id = Uuid::from_u128(1);
+        let surface_id = Uuid::from_u128(10);
+        let previous = scene(vec![pane_surface(surface_id, pane_id, 0, 0, 20, 10, 0)]);
+        let mut next_surface = previous.surfaces[0].clone();
+        next_surface.content_rect = AttachRect {
+            x: 4,
+            y: 2,
+            w: 12,
+            h: 6,
+        };
+        let next = scene(vec![next_surface]);
+
+        let damage =
+            attach_scene_damage_between(&previous, &next, DamageCoalescingPolicy::default());
+
+        assert!(damage.content_surface_damaged(pane_id));
+        assert!(damage.extension_surface_damaged(surface_id, pane_id));
     }
 
     #[test]

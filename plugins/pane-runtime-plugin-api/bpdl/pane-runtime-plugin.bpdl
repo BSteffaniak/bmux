@@ -78,6 +78,47 @@ interface pane-runtime-state {
         pane-not-found,
     }
 
+    record pane-padding-spec {
+        left: u16,
+        right: u16,
+        top: u16,
+        bottom: u16,
+        max-content-width: u16?,
+        max-content-height: u16?,
+        horizontal-alignment: string,
+        vertical-alignment: string,
+    }
+
+    record pane-padding-rect {
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    }
+
+    record pane-padding-state {
+        session-id: uuid,
+        pane-id: uuid,
+        declarative: pane-padding-spec,
+        matched-rule-index: u32?,
+        runtime-override: pane-padding-spec?,
+        effective: pane-padding-spec,
+        source: string,
+        outer-rect: pane-padding-rect?,
+        base-content-rect: pane-padding-rect?,
+        effective-content-rect: pane-padding-rect?,
+        persist-runtime-overrides: bool,
+    }
+
+    variant pane-padding-state-error {
+        session-not-found,
+        pane-not-found,
+        geometry-unavailable,
+    }
+
+    query pane-padding(session-id: uuid, pane-id: uuid?)
+        -> result<pane-padding-state, pane-padding-state-error>;
+
     query list-panes(session_id: uuid?) -> result<session-pane-list, pane-state-error>;
     query get-pane(session_id: uuid, pane_id: uuid)
         -> result<pane-summary, pane-state-error>;
@@ -122,6 +163,17 @@ interface pane-runtime-commands {
         session-not-found,
         failed { reason: string },
     }
+
+    command set-pane-padding(
+        session-id: uuid,
+        pane-id: uuid?,
+        padding: pane-runtime-state.pane-padding-spec,
+    ) -> result<pane-runtime-state.pane-padding-state, pane-command-error>;
+
+    command clear-pane-padding(
+        session-id: uuid,
+        pane-id: uuid?,
+    ) -> result<pane-runtime-state.pane-padding-state, pane-command-error>;
 
     // Split an existing pane along the given direction at the given
     // ratio (0.1..=0.9, clamped). Creates a new pane beside the target.

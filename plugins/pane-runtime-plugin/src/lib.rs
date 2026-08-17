@@ -16,6 +16,7 @@ use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
 mod handlers;
+mod padding;
 mod runtime;
 mod snapshot;
 
@@ -27,7 +28,7 @@ impl RustPlugin for PaneRuntimePlugin {
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         // Register the focus-state channel so subscribers (e.g.
         // the decoration plugin) can observe the focused pane per
@@ -63,7 +64,9 @@ impl RustPlugin for PaneRuntimePlugin {
                 bracketed_paste: true,
                 shell_integration_root: None,
             });
-        runtime::activate_pane_runtime(config);
+        let padding_config = padding::PanePaddingConfig::parse(context.settings.as_ref())
+            .map_err(PluginCommandError::invalid_arguments)?;
+        runtime::activate_pane_runtime(config, padding_config);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 

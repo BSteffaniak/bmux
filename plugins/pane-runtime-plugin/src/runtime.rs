@@ -59,6 +59,9 @@ impl Drop for PaneBlockingThreadGuard {
         trace!(pane_id = %self.pane_id, role = self.role, active, "pane blocking thread exited");
     }
 }
+use crate::padding::{
+    PanePaddingConfig, PanePaddingMetadata, PanePaddingSpec, base_content_rect, padded_content_rect,
+};
 use uuid::Uuid;
 
 type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
@@ -459,6 +462,7 @@ struct SessionRuntimeManager {
     protocol_profile: ProtocolProfile,
     bracketed_paste_supported: bool,
     shell_integration_root: Option<std::path::PathBuf>,
+    padding_config: PanePaddingConfig,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
 }
 
@@ -582,6 +586,7 @@ struct PaneRuntimeHandle {
     sync_update_in_progress: Arc<AtomicBool>,
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
     input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
+    padding_override: Option<PanePaddingSpec>,
     #[cfg(feature = "image-registry")]
     image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
     /// Cell pixel dimensions reported by the client (width, height).
@@ -2673,24 +2678,37 @@ const fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
     }
 }
 
-/// Compute the `content_rect` for a pane surface that reserves a
-/// 1-cell inset on all sides for decoration chrome (borders, badges).
-///
-/// Every decoration consumer (the decoration plugin today; future
-/// overlay / chrome plugins later) lays out within this content rect.
-/// Panes smaller than 2 cells in either dimension have no interior
-/// and fall back to the full rect so downstream consumers don't see
-/// a zero-sized content rect.
-const fn pane_content_rect_for_outer(rect: AttachRect) -> AttachRect {
-    if rect.w < 2 || rect.h < 2 {
-        return rect;
-    }
-    AttachRect {
-        x: rect.x + 1,
-        y: rect.y + 1,
-        w: rect.w - 2,
-        h: rect.h - 2,
-    }
+fn pane_content_rect_for_metadata(
+    padding_config: &PanePaddingConfig,
+    metadata: PanePaddingMetadata<'_>,
+    runtime_override: Option<PanePaddingSpec>,
+    rect: AttachRect,
+) -> AttachRect {
+    let base = base_content_rect(rect);
+    let resolved = padding_config.resolve(metadata, base, runtime_override);
+    padded_content_rect(base, resolved.spec)
+}
+
+fn pane_content_rect(
+    padding_config: &PanePaddingConfig,
+    pane: &PaneRuntimeHandle,
+    rect: AttachRect,
+) -> AttachRect {
+    let active_command = pane
+        .resurrection_state
+        .lock()
+        .ok()
+        .and_then(|state| state.active_command.clone());
+    pane_content_rect_for_metadata(
+        padding_config,
+        PanePaddingMetadata {
+            name: pane.meta.name.as_deref(),
+            shell: &pane.meta.shell,
+            active_command: active_command.as_deref(),
+        },
+        pane.padding_override,
+        rect,
+    )
 }
 
 fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
@@ -2742,7 +2760,11 @@ fn floating_surface_visible_for_attach(
     }
 }
 
-fn attach_surface_from_floating(surface: &FloatingSurfaceRuntime) -> AttachSurface {
+fn attach_surface_from_floating(
+    padding_config: &PanePaddingConfig,
+    pane: &PaneRuntimeHandle,
+    surface: &FloatingSurfaceRuntime,
+) -> AttachSurface {
     let rect = attach_rect_from_layout_rect(surface.rect);
     AttachSurface {
         id: surface.id,
@@ -2750,7 +2772,7 @@ fn attach_surface_from_floating(surface: &FloatingSurfaceRuntime) -> AttachSurfa
         layer: surface.layer.to_attach_layer(),
         z: surface.z,
         rect,
-        content_rect: pane_content_rect_for_outer(rect),
+        content_rect: pane_content_rect(padding_config, pane, rect),
         interactive_regions: Vec::new(),
         opaque: surface.opaque,
         visible: surface.visible,
@@ -2823,6 +2845,7 @@ fn next_live_focus_after_exit(
 fn build_attach_scene(
     session_id: SessionId,
     runtime: &SessionRuntimeHandle,
+    padding_config: &PanePaddingConfig,
     viewport: Option<AttachViewport>,
     client_id: ClientId,
     context_id: Option<Uuid>,
@@ -2840,7 +2863,11 @@ fn build_attach_scene(
             layer: AttachLayer::Pane,
             z: 0,
             rect: zoomed_rect,
-            content_rect: pane_content_rect_for_outer(zoomed_rect),
+            content_rect: pane_content_rect(
+                padding_config,
+                runtime.panes.get(&zoomed_id).expect("zoomed pane exists"),
+                zoomed_rect,
+            ),
             interactive_regions: Vec::new(),
             opaque: true,
             visible: true,
@@ -2861,7 +2888,16 @@ fn build_attach_scene(
                         session_id, session_id, runtime, surface, client_id, context_id,
                     )
                 })
-                .map(attach_surface_from_floating),
+                .map(|surface| {
+                    attach_surface_from_floating(
+                        padding_config,
+                        runtime
+                            .panes
+                            .get(&surface.pane_id)
+                            .expect("floating pane exists"),
+                        surface,
+                    )
+                }),
         );
 
         let scene = AttachScene {
@@ -2897,7 +2933,11 @@ fn build_attach_scene(
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     z: index as i32,
                     rect: attach_rect,
-                    content_rect: pane_content_rect_for_outer(attach_rect),
+                    content_rect: pane_content_rect(
+                        padding_config,
+                        runtime.panes.get(&pane_id).expect("layout pane exists"),
+                        attach_rect,
+                    ),
                     interactive_regions: Vec::new(),
                     opaque: true,
                     visible: true,
@@ -2918,7 +2958,16 @@ fn build_attach_scene(
                     session_id, session_id, runtime, surface, client_id, context_id,
                 )
             })
-            .map(attach_surface_from_floating),
+            .map(|surface| {
+                attach_surface_from_floating(
+                    padding_config,
+                    runtime
+                        .panes
+                        .get(&surface.pane_id)
+                        .expect("floating pane exists"),
+                    surface,
+                )
+            }),
     );
 
     let scene = AttachScene {
@@ -2935,18 +2984,42 @@ fn build_attach_scene(
     }
 }
 
-fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
-    // PTY size must match the surface's `content_rect` so that what the
-    // program inside the pane draws aligns with what the renderer/mouse
-    // hit-tester sees. We route through the same helper that computes
-    // `content_rect` in scene construction to keep them consistent.
-    let content = pane_content_rect_for_outer(attach_rect_from_layout_rect(layout_rect));
+fn pane_pty_size_for_metadata(
+    padding_config: &PanePaddingConfig,
+    metadata: &PaneRuntimeMeta,
+    runtime_override: Option<PanePaddingSpec>,
+    layout_rect: LayoutRect,
+) -> (u16, u16) {
+    let content = pane_content_rect_for_metadata(
+        padding_config,
+        PanePaddingMetadata {
+            name: metadata.name.as_deref(),
+            shell: &metadata.shell,
+            active_command: metadata.resurrection.active_command.as_deref(),
+        },
+        runtime_override,
+        attach_rect_from_layout_rect(layout_rect),
+    );
+    (content.h.max(1), content.w.max(1))
+}
+
+fn pane_pty_size(
+    padding_config: &PanePaddingConfig,
+    pane: &PaneRuntimeHandle,
+    layout_rect: LayoutRect,
+) -> (u16, u16) {
+    let content = pane_content_rect(
+        padding_config,
+        pane,
+        attach_rect_from_layout_rect(layout_rect),
+    );
     let cols = content.w.max(1);
     let rows = content.h.max(1);
     (rows, cols)
 }
 
 fn resize_session_ptys(
+    padding_config: &PanePaddingConfig,
     runtime: &SessionRuntimeHandle,
     cols: u16,
     rows: u16,
@@ -2967,7 +3040,7 @@ fn resize_session_ptys(
         if let Some(pane) = runtime.panes.get(&zoomed_id)
             && !pane.exited.load(Ordering::SeqCst)
         {
-            let (zoom_rows, zoom_cols) = pane_pty_size(root);
+            let (zoom_rows, zoom_cols) = pane_pty_size(padding_config, pane, root);
             pane.resize_pty(zoom_rows, zoom_cols);
         }
         return;
@@ -2989,7 +3062,7 @@ fn resize_session_ptys(
                 .map(|surface| surface.rect)
         });
         if let Some(rect) = rect {
-            let (rows, cols) = pane_pty_size(rect);
+            let (rows, cols) = pane_pty_size(padding_config, pane, rect);
             pane.resize_pty(rows, cols);
         }
     }
@@ -3030,6 +3103,7 @@ impl SessionRuntimeManager {
         protocol_profile: ProtocolProfile,
         bracketed_paste_supported: bool,
         shell_integration_root: Option<std::path::PathBuf>,
+        padding_config: PanePaddingConfig,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
     ) -> Self {
         Self {
@@ -3042,6 +3116,7 @@ impl SessionRuntimeManager {
             protocol_profile,
             bracketed_paste_supported,
             shell_integration_root,
+            padding_config,
             pane_exit_tx,
         }
     }
@@ -3168,12 +3243,30 @@ impl SessionRuntimeManager {
                 // A zoomed pane fills the scene root, mirroring the zoom
                 // branch of `resize_session_ptys`, so its PTY must start
                 // full-size instead of at its tiled rect.
-                initial_pane_sizes.insert(zoomed_id, pane_pty_size(scene_root));
+                initial_pane_sizes.insert(
+                    zoomed_id,
+                    pane_pty_size_for_metadata(
+                        &self.padding_config,
+                        panes
+                            .iter()
+                            .find(|pane| pane.id == zoomed_id)
+                            .expect("zoomed pane exists"),
+                        None,
+                        scene_root,
+                    ),
+                );
             } else {
                 let mut rects = BTreeMap::new();
                 collect_layout_rects(layout_root, scene_root, &mut rects);
                 for (pane_id, rect) in rects {
-                    initial_pane_sizes.insert(pane_id, pane_pty_size(rect));
+                    let pane = panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id)
+                        .expect("layout pane exists");
+                    initial_pane_sizes.insert(
+                        pane_id,
+                        pane_pty_size_for_metadata(&self.padding_config, pane, None, rect),
+                    );
                 }
             }
         }
@@ -3879,6 +3972,7 @@ impl SessionRuntimeManager {
             sync_update_in_progress,
             mouse_protocol_state,
             input_mode_state,
+            padding_override: None,
             #[cfg(feature = "image-registry")]
             image_registry,
             #[cfg(feature = "image-registry")]
@@ -4581,6 +4675,7 @@ impl SessionRuntimeManager {
         let mut scene = build_attach_scene(
             session_id,
             session,
+            &self.padding_config,
             session.attach_viewport,
             client_id,
             context_id,
@@ -4603,7 +4698,16 @@ impl SessionRuntimeManager {
                             context_id,
                         )
                     })
-                    .map(attach_surface_from_floating),
+                    .map(|surface| {
+                        attach_surface_from_floating(
+                            &self.padding_config,
+                            owner_runtime
+                                .panes
+                                .get(&surface.pane_id)
+                                .expect("floating pane exists"),
+                            surface,
+                        )
+                    }),
             );
         }
         let pane_id = focused_pane_for_scene(&scene, session.focused_pane_id);
@@ -5111,6 +5215,7 @@ impl SessionRuntimeManager {
         }
         if let Some(viewport) = runtime.attach_viewport {
             resize_session_ptys(
+                &self.padding_config,
                 runtime,
                 viewport.cols,
                 viewport.rows,
@@ -5177,7 +5282,14 @@ impl SessionRuntimeManager {
             status_top_inset,
             status_bottom_inset,
         });
-        resize_session_ptys(runtime, cols, rows, status_top_inset, status_bottom_inset);
+        resize_session_ptys(
+            &self.padding_config,
+            runtime,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+        );
 
         // Update cell pixel dimensions for image placement sizing.
         #[cfg(feature = "image-registry")]
@@ -5202,6 +5314,7 @@ impl SessionRuntimeManager {
             return;
         };
         resize_session_ptys(
+            &self.padding_config,
             runtime,
             viewport.cols,
             viewport.rows,
@@ -7287,7 +7400,11 @@ fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
     None
 }
 
-pub fn activate_pane_runtime(config: PaneRuntimePluginConfig) {
+pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: PanePaddingConfig) {
+    tracing::debug!(
+        persist_runtime_overrides = padding_config.persist_runtime_overrides,
+        "activating pane padding configuration"
+    );
     let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
     let manager = Arc::new(Mutex::new(SessionRuntimeManager::new(
         config.shell,
@@ -7295,6 +7412,7 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig) {
         protocol_profile_for_term(&config.pane_term),
         config.bracketed_paste,
         config.shell_integration_root,
+        padding_config,
         pane_exit_tx,
     )));
     let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
@@ -7403,6 +7521,7 @@ mod tests {
                 AttachMouseProtocolState::default(),
             )),
             input_mode_state: Arc::new(std::sync::Mutex::new(AttachInputModeState::default())),
+            padding_override: None,
             #[cfg(feature = "image-registry")]
             image_registry: Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default())),
             #[cfg(feature = "image-registry")]
@@ -7446,6 +7565,7 @@ mod tests {
     ) -> SessionRuntimeManager {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -7566,6 +7686,7 @@ mod tests {
         )])));
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (owner_session_id, owner_runtime),
@@ -8098,6 +8219,7 @@ mod tests {
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let empty_manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8152,6 +8274,7 @@ mod tests {
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
@@ -8201,6 +8324,7 @@ mod tests {
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
@@ -8242,6 +8366,7 @@ mod tests {
         )];
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8287,6 +8412,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8324,6 +8450,7 @@ mod tests {
         )];
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
+            padding_config: PanePaddingConfig::default(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8919,6 +9046,7 @@ mod tests {
             ProtocolProfile::Bmux,
             true,
             None,
+            PanePaddingConfig::default(),
             pane_exit_tx,
         );
         let session_ids = [SessionId(Uuid::new_v4()), SessionId(Uuid::new_v4())];
