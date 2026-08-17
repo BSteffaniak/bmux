@@ -3891,6 +3891,7 @@ impl SessionRuntimeManager {
                                         }
                                     }
                                     mark_snapshot_dirty_flag();
+                                    notify_pane_metadata_changed(session_id, pane_id);
                                 }
                                 let chunk = metadata.filtered;
                                 let chunk = chunk.as_slice();
@@ -7206,6 +7207,28 @@ struct PaneExitEvent {
     pane_id: Uuid,
 }
 
+fn notify_pane_metadata_changed(session_id: SessionId, pane_id: Uuid) {
+    let handle = bmux_plugin::global_plugin_state_registry()
+        .get::<PanePaddingRuntimeHandle>()
+        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()));
+    let Some(handle) = handle else {
+        return;
+    };
+    let before = handle.state(session_id, Some(pane_id)).ok();
+    let Some(before) = before else {
+        return;
+    };
+    // Metadata has already changed in the shared pane state. Re-applying the
+    // current override computes new declarative rule selection and performs
+    // the same atomic resize/invalidation transaction as user mutations.
+    let after = handle
+        .set_override(session_id, Some(pane_id), before.runtime_override)
+        .ok();
+    if after.is_some_and(|after| after.effective_content_rect != before.effective_content_rect) {
+        trace!(%pane_id, "pane padding changed after shell metadata transition");
+    }
+}
+
 fn reap_exited_pane(
     manager: &Arc<Mutex<SessionRuntimeManager>>,
     session_id: SessionId,
@@ -7641,6 +7664,47 @@ mod tests {
 
     fn leaf(id: Uuid) -> PaneLayoutNode {
         PaneLayoutNode::Leaf { pane_id: id }
+    }
+
+    #[tokio::test]
+    async fn command_metadata_transition_reselects_padding_rule() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                match_command = "journal*"
+                max_content_width = 40
+                horizontal_alignment = "center"
+            }
+            .into(),
+        ))
+        .unwrap();
+        assert_eq!(
+            manager
+                .padding_state(session_id, None)
+                .unwrap()
+                .effective_content_rect
+                .w,
+            118
+        );
+        manager.runtimes[&session_id].panes[&pane_id]
+            .resurrection_state
+            .lock()
+            .unwrap()
+            .apply_event(PaneShellMetadataEvent::CommandStart {
+                command: "journalctl -f".to_string(),
+                cwd: "/tmp".to_string(),
+            });
+
+        let changed = manager
+            .set_padding_override(session_id, None, None)
+            .expect("re-evaluate metadata rule");
+        assert_eq!(changed.matched_rule_index, Some(0));
+        assert_eq!(changed.effective_content_rect.w, 40);
     }
 
     #[tokio::test]
