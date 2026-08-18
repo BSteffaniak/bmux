@@ -2249,16 +2249,16 @@ pub fn queue_frame_damage_overlay<W: io::Write>(
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
 ) -> Result<bool> {
     queue_frame_damage_overlay_with_trace(
         stdout,
         scene,
         frame_damage,
         terminal_size,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         None,
     )
 }
@@ -2276,17 +2276,12 @@ pub fn queue_frame_damage_overlay_with_trace<W: io::Write>(
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<bool> {
-    let mut rects = frame_damage_overlay_rects(
-        scene,
-        frame_damage,
-        terminal_size,
-        status_top_inset,
-        status_bottom_inset,
-    );
+    let mut rects =
+        frame_damage_overlay_rects(scene, frame_damage, terminal_size, top_inset, bottom_inset);
     if rects.is_empty() {
         return Ok(false);
     }
@@ -2313,16 +2308,11 @@ pub fn frame_damage_overlay_render_ops(
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
 ) -> Vec<RenderOp> {
-    let mut rects = frame_damage_overlay_rects(
-        scene,
-        frame_damage,
-        terminal_size,
-        status_top_inset,
-        status_bottom_inset,
-    );
+    let mut rects =
+        frame_damage_overlay_rects(scene, frame_damage, terminal_size, top_inset, bottom_inset);
     rects.sort_by_key(|rect| (rect.y, rect.x, rect.h, rect.w));
     frame_damage_overlay_render_ops_from_rects(&rects)
 }
@@ -2360,8 +2350,8 @@ pub fn frame_damage_overlay_rects(
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
 ) -> Vec<DamageRect> {
     let (terminal_width, terminal_height) = terminal_size;
     let mut rects = Vec::new();
@@ -2375,21 +2365,21 @@ pub fn frame_damage_overlay_rects(
     }
 
     if frame_damage.status {
-        if status_top_inset > 0 {
+        if top_inset > 0 {
             push_overlay_rect(
                 &mut rects,
-                DamageRect::new(0, 0, terminal_width, status_top_inset),
+                DamageRect::new(0, 0, terminal_width, top_inset),
                 terminal_size,
             );
         }
-        if status_bottom_inset > 0 {
+        if bottom_inset > 0 {
             push_overlay_rect(
                 &mut rects,
                 DamageRect::new(
                     0,
-                    terminal_height.saturating_sub(status_bottom_inset),
+                    terminal_height.saturating_sub(bottom_inset),
                     terminal_width,
-                    status_bottom_inset,
+                    bottom_inset,
                 ),
                 terminal_size,
             );
@@ -3278,8 +3268,8 @@ pub fn render_attach_scene<W: io::Write>(
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
@@ -3296,8 +3286,8 @@ pub fn render_attach_scene<W: io::Write>(
         pane_buffers,
         &mut terminal_graphics_cache,
         frame_damage,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         scrollback_views,
         zoomed,
         terminal_size,
@@ -3328,8 +3318,8 @@ pub fn render_attach_scene_with_terminal_graphics_cache<W: io::Write>(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
@@ -3345,8 +3335,8 @@ pub fn render_attach_scene_with_terminal_graphics_cache<W: io::Write>(
         pane_buffers,
         terminal_graphics_cache,
         frame_damage,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         scrollback_views,
         zoomed,
         terminal_size,
@@ -3376,8 +3366,8 @@ pub fn render_attach_scene_with_stats<W: io::Write>(
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
@@ -3391,8 +3381,8 @@ pub fn render_attach_scene_with_stats<W: io::Write>(
         panes,
         pane_buffers,
         frame_damage,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         scrollback_views,
         zoomed,
         terminal_size,
@@ -3424,8 +3414,8 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
@@ -3442,8 +3432,8 @@ pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
         pane_buffers,
         &mut terminal_graphics_cache,
         frame_damage,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         scrollback_views,
         zoomed,
         terminal_size,
@@ -3473,8 +3463,8 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
@@ -3491,8 +3481,8 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities<W: io::Write>(
         pane_buffers,
         terminal_graphics_cache,
         frame_damage,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         scrollback_views,
         zoomed,
         terminal_size,
@@ -3523,8 +3513,8 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders<
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     zoomed: bool,
     terminal_size: (u16, u16),
@@ -3548,8 +3538,8 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders<
         pane_buffers,
         terminal_graphics_cache,
         frame_damage,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
         scrollback_views,
         zoomed,
         terminal_size,
@@ -4376,9 +4366,9 @@ fn queue_full_frame_content_clear<W: io::Write>(
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) -> Result<()> {
     let (cols, rows) = terminal_size;
-    let (status_top_inset, status_bottom_inset) = status_insets;
-    let clear_start = status_top_inset.min(rows);
-    let clear_end = rows.saturating_sub(status_bottom_inset).max(clear_start);
+    let (top_inset, bottom_inset) = status_insets;
+    let clear_start = top_inset.min(rows);
+    let clear_end = rows.saturating_sub(bottom_inset).max(clear_start);
     for y in clear_start..clear_end {
         queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
             .context("failed clearing attach pane row")?;
@@ -5419,8 +5409,8 @@ fn render_attach_scene_inner<W: io::Write>(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     frame_damage: &FrameDamage,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
     scrollback_views: &PaneScrollbackViews,
     _zoomed: bool,
     terminal_size: (u16, u16),
@@ -5432,7 +5422,7 @@ fn render_attach_scene_inner<W: io::Write>(
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal_size;
-    if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
+    if cols == 0 || rows <= top_inset.saturating_add(bottom_inset) {
         return Ok(None);
     }
     if let Some(stats) = render_stats.as_deref_mut() {
@@ -5459,7 +5449,7 @@ fn render_attach_scene_inner<W: io::Write>(
         pane_buffers,
         frame_damage,
         terminal_size,
-        (status_top_inset, status_bottom_inset),
+        (top_inset, bottom_inset),
         scrollback_views,
         runtime_appearance,
         damage_policy,

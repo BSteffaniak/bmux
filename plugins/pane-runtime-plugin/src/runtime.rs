@@ -3167,23 +3167,23 @@ fn pane_content_rect(
 }
 
 fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
-    let (cols, rows, status_top_inset, status_bottom_inset) =
-        viewport.map_or((0, 0, 0, 0), |viewport| {
-            (
-                viewport.cols,
-                viewport.rows,
-                viewport.status_top_inset,
-                viewport.status_bottom_inset,
-            )
-        });
-    let y = status_top_inset.min(rows.saturating_sub(1));
-    let reserved = status_top_inset.saturating_add(status_bottom_inset);
-    let h = rows.saturating_sub(reserved).max(1);
+    let Some(viewport) = viewport else {
+        return LayoutRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+    };
+    let x = viewport.left_inset.min(viewport.cols.saturating_sub(1));
+    let y = viewport.top_inset.min(viewport.rows.saturating_sub(1));
+    let reserved_width = viewport.left_inset.saturating_add(viewport.right_inset);
+    let reserved_height = viewport.top_inset.saturating_add(viewport.bottom_inset);
     LayoutRect {
-        x: 0,
+        x,
         y,
-        w: cols.max(1),
-        h,
+        w: viewport.cols.saturating_sub(reserved_width).max(1),
+        h: viewport.rows.saturating_sub(reserved_height).max(1),
     }
 }
 
@@ -3473,22 +3473,8 @@ fn pane_pty_size(
     (rows, cols)
 }
 
-fn resize_session_ptys(
-    padding_config: &PanePaddingConfig,
-    runtime: &SessionRuntimeHandle,
-    cols: u16,
-    rows: u16,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
-) {
-    let y = status_top_inset.min(rows.saturating_sub(1));
-    let reserved = status_top_inset.saturating_add(status_bottom_inset);
-    let root = LayoutRect {
-        x: 0,
-        y,
-        w: cols.max(1),
-        h: rows.saturating_sub(reserved).max(1),
-    };
+fn resize_session_ptys(padding_config: &PanePaddingConfig, runtime: &SessionRuntimeHandle) {
+    let root = scene_root_from_viewport(runtime.attach_viewport);
 
     // When zoomed, only resize the zoomed pane to fill the viewport.
     if let Some(zoomed_id) = runtime.zoomed_pane_id {
@@ -5726,15 +5712,8 @@ impl SessionRuntimeManager {
                 .map_err(|_| SessionRuntimeError::Closed)?;
             output.register_client_at_tail(client_id);
         }
-        if let Some(viewport) = runtime.attach_viewport {
-            resize_session_ptys(
-                &self.padding_config,
-                runtime,
-                viewport.cols,
-                viewport.rows,
-                viewport.status_top_inset,
-                viewport.status_bottom_inset,
-            );
+        if runtime.attach_viewport.is_some() {
+            resize_session_ptys(&self.padding_config, runtime);
         }
         Ok(())
     }
@@ -5798,11 +5777,13 @@ impl SessionRuntimeManager {
         client_id: ClientId,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_width: u16,
         cell_pixel_height: u16,
-    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+    ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -5814,13 +5795,24 @@ impl SessionRuntimeManager {
 
         let cols = cols.max(1);
         let rows = rows.max(2);
-        let mut status_top_inset = status_top_inset.min(1);
-        let mut status_bottom_inset = status_bottom_inset.min(1);
-        while status_top_inset.saturating_add(status_bottom_inset) >= rows {
-            if status_bottom_inset > 0 {
-                status_bottom_inset -= 1;
-            } else if status_top_inset > 0 {
-                status_top_inset -= 1;
+        let mut top_inset = top_inset.min(rows.saturating_sub(1));
+        let mut bottom_inset = bottom_inset.min(rows.saturating_sub(1));
+        let mut right_inset = right_inset.min(cols.saturating_sub(1));
+        let mut left_inset = left_inset.min(cols.saturating_sub(1));
+        while top_inset.saturating_add(bottom_inset) >= rows {
+            if bottom_inset > 0 {
+                bottom_inset -= 1;
+            } else if top_inset > 0 {
+                top_inset -= 1;
+            } else {
+                break;
+            }
+        }
+        while right_inset.saturating_add(left_inset) >= cols {
+            if right_inset > 0 {
+                right_inset -= 1;
+            } else if left_inset > 0 {
+                left_inset -= 1;
             } else {
                 break;
             }
@@ -5828,17 +5820,12 @@ impl SessionRuntimeManager {
         runtime.attach_viewport = Some(AttachViewport {
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
         });
-        resize_session_ptys(
-            &self.padding_config,
-            runtime,
-            cols,
-            rows,
-            status_top_inset,
-            status_bottom_inset,
-        );
+        resize_session_ptys(&self.padding_config, runtime);
 
         // Update cell pixel dimensions for image placement sizing.
         #[cfg(feature = "image-registry")]
@@ -5852,24 +5839,17 @@ impl SessionRuntimeManager {
         #[cfg(not(feature = "image-registry"))]
         let _ = (cell_pixel_width, cell_pixel_height);
 
-        Ok((cols, rows, status_top_inset, status_bottom_inset))
+        Ok((cols, rows, top_inset, right_inset, bottom_inset, left_inset))
     }
 
     fn apply_stored_attach_viewport(&mut self, session_id: SessionId) {
         let Some(runtime) = self.runtimes.get_mut(&session_id) else {
             return;
         };
-        let Some(viewport) = runtime.attach_viewport else {
+        let Some(_viewport) = runtime.attach_viewport else {
             return;
         };
-        resize_session_ptys(
-            &self.padding_config,
-            runtime,
-            viewport.cols,
-            viewport.rows,
-            viewport.status_top_inset,
-            viewport.status_bottom_inset,
-        );
+        resize_session_ptys(&self.padding_config, runtime);
     }
 
     fn write_input(
@@ -6751,19 +6731,23 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_width: u16,
         cell_pixel_height: u16,
-    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+    ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
         self.with_lock(|m| {
             m.set_attach_viewport(
                 session_id,
                 client_id,
                 cols,
                 rows,
-                status_top_inset,
-                status_bottom_inset,
+                top_inset,
+                right_inset,
+                bottom_inset,
+                left_inset,
                 cell_pixel_width,
                 cell_pixel_height,
             )
@@ -6782,11 +6766,13 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_width: u16,
         cell_pixel_height: u16,
-    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+    ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
         self.with_lock(|m| {
             if let Some(previous_session_id) = previous_session_id
                 && previous_session_id != next_session_id
@@ -6799,8 +6785,10 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 client_id,
                 cols,
                 rows,
-                status_top_inset,
-                status_bottom_inset,
+                top_inset,
+                right_inset,
+                bottom_inset,
+                left_inset,
                 cell_pixel_width,
                 cell_pixel_height,
             )
@@ -8373,11 +8361,11 @@ mod tests {
             Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
 
         manager
-            .set_attach_viewport(session_id, client_id, 80, 30, 0, 0, 0, 0)
+            .set_attach_viewport(session_id, client_id, 80, 30, 0, 0, 0, 0, 0, 0)
             .expect("set short viewport");
         assert_eq!(*last_requested_size.lock().unwrap(), (28, 78));
         manager
-            .set_attach_viewport(session_id, client_id, 80, 50, 0, 0, 0, 0)
+            .set_attach_viewport(session_id, client_id, 80, 50, 0, 0, 0, 0, 0, 0)
             .expect("set tall viewport");
         assert_eq!(*last_requested_size.lock().unwrap(), (20, 78));
         let state = manager.padding_state(session_id, Some(pane_id)).unwrap();
@@ -8407,11 +8395,11 @@ mod tests {
             Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
 
         manager
-            .set_attach_viewport(session_id, client_id, 90, 30, 0, 0, 0, 0)
+            .set_attach_viewport(session_id, client_id, 90, 30, 0, 0, 0, 0, 0, 0)
             .expect("set narrow viewport");
         assert_eq!(*last_requested_size.lock().unwrap(), (28, 88));
         manager
-            .set_attach_viewport(session_id, client_id, 120, 30, 0, 0, 0, 0)
+            .set_attach_viewport(session_id, client_id, 120, 30, 0, 0, 0, 0, 0, 0)
             .expect("set wide viewport");
         assert_eq!(*last_requested_size.lock().unwrap(), (28, 40));
     }
@@ -8495,6 +8483,45 @@ mod tests {
         assert_eq!(zoomed_tiled.content_rect, tiled_surface.content_rect);
     }
 
+    #[test]
+    fn scene_root_reserves_all_generic_viewport_edges() {
+        let root = scene_root_from_viewport(Some(AttachViewport {
+            cols: 120,
+            rows: 40,
+            top_inset: 2,
+            right_inset: 7,
+            bottom_inset: 3,
+            left_inset: 11,
+        }));
+
+        assert_eq!(
+            root,
+            LayoutRect {
+                x: 11,
+                y: 2,
+                w: 102,
+                h: 35,
+            }
+        );
+    }
+
+    #[test]
+    fn scene_root_clamps_insets_to_preserve_one_content_cell() {
+        let root = scene_root_from_viewport(Some(AttachViewport {
+            cols: 5,
+            rows: 4,
+            top_inset: 3,
+            right_inset: 4,
+            bottom_inset: 3,
+            left_inset: 4,
+        }));
+
+        assert_eq!(root.w, 1);
+        assert_eq!(root.h, 1);
+        assert!(root.x < 5);
+        assert!(root.y < 4);
+    }
+
     #[tokio::test]
     async fn attach_scene_reselects_geometry_rules_across_viewport_boundary() {
         let session_id = SessionId(Uuid::new_v4());
@@ -8515,14 +8542,18 @@ mod tests {
         let narrow = Some(AttachViewport {
             cols: 90,
             rows: 30,
-            status_top_inset: 0,
-            status_bottom_inset: 0,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
         });
         let wide = Some(AttachViewport {
             cols: 120,
             rows: 30,
-            status_top_inset: 0,
-            status_bottom_inset: 0,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
         });
 
         let narrow_scene =
@@ -9581,8 +9612,10 @@ mod tests {
         let viewport = Some(AttachViewport {
             cols: 100,
             rows: 40,
-            status_top_inset: 0,
-            status_bottom_inset: 0,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
         });
 
         assert_eq!(next_focus_after_close(&root, b, b, viewport), Some(c));
@@ -9676,8 +9709,10 @@ mod tests {
             attach_viewport: Some(AttachViewport {
                 cols: 120,
                 rows: 40,
-                status_top_inset: 0,
-                status_bottom_inset: 0,
+                top_inset: 0,
+                right_inset: 0,
+                bottom_inset: 0,
+                left_inset: 0,
             }),
             attach_view_revision: 0,
         }
@@ -11207,8 +11242,10 @@ mod tests {
             attach_viewport: Some(AttachViewport {
                 cols: 120,
                 rows: 40,
-                status_top_inset: 0,
-                status_bottom_inset: 0,
+                top_inset: 0,
+                right_inset: 0,
+                bottom_inset: 0,
+                left_inset: 0,
             }),
             ..RestoreRuntimeRequest::default()
         };
@@ -11257,8 +11294,10 @@ mod tests {
             attach_viewport: Some(AttachViewport {
                 cols: 120,
                 rows: 40,
-                status_top_inset: 0,
-                status_bottom_inset: 0,
+                top_inset: 0,
+                right_inset: 0,
+                bottom_inset: 0,
+                left_inset: 0,
             }),
             ..RestoreRuntimeRequest::default()
         };

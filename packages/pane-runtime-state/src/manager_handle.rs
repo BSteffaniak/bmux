@@ -565,11 +565,13 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         client_id: ClientId,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_width: u16,
         cell_pixel_height: u16,
-    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError>;
+    ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError>;
 
     #[allow(
         clippy::too_many_arguments,
@@ -582,11 +584,13 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         client_id: ClientId,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_width: u16,
         cell_pixel_height: u16,
-    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+    ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
         if let Some(previous_session_id) = previous_session_id
             && previous_session_id != next_session_id
         {
@@ -598,8 +602,10 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
             client_id,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
             cell_pixel_width,
             cell_pixel_height,
         )
@@ -1074,11 +1080,13 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _client_id: ClientId,
         _cols: u16,
         _rows: u16,
-        _status_top_inset: u16,
-        _status_bottom_inset: u16,
+        _top_inset: u16,
+        _right_inset: u16,
+        _bottom_inset: u16,
+        _left_inset: u16,
         _cell_pixel_width: u16,
         _cell_pixel_height: u16,
-    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+    ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
     fn apply_stored_attach_viewport(&self, _session_id: SessionId) {}

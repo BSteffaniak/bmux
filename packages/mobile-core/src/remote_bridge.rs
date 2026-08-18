@@ -1071,8 +1071,10 @@ impl TerminalBackend for RemoteTerminalBackend {
             AttachViewport {
                 cols,
                 rows,
-                status_top_inset: 0,
-                status_bottom_inset: 0,
+                top_inset: 0,
+                right_inset: 0,
+                bottom_inset: 0,
+                left_inset: 0,
             },
             command_rx,
             Arc::clone(&actor_state),
@@ -1302,14 +1304,16 @@ async fn handle_session_command(
             response,
         } => {
             let result = client
-                .attach_set_viewport_with_insets(session_id, cols, rows, 0, 0)
+                .attach_set_viewport_with_insets(session_id, cols, rows, 0, 0, 0, 0)
                 .await
                 .map(|(_cols, _rows)| {
                     state.set_viewport(AttachViewport {
                         cols,
                         rows,
-                        status_top_inset: 0,
-                        status_bottom_inset: 0,
+                        top_inset: 0,
+                        right_inset: 0,
+                        bottom_inset: 0,
+                        left_inset: 0,
                     });
                 })
                 .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));

@@ -50,6 +50,8 @@ pub struct AttachPipelineDiagnosticEvent {
 pub struct AttachViewport {
     pub cols: u16,
     pub rows: u16,
-    pub status_top_inset: u16,
-    pub status_bottom_inset: u16,
+    pub top_inset: u16,
+    pub right_inset: u16,
+    pub bottom_inset: u16,
+    pub left_inset: u16,
 }

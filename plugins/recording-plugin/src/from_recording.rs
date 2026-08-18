@@ -504,10 +504,14 @@ fn request_to_dsl(
                             _session_id: Uuid,
                             cols: u16,
                             rows: u16,
-                            #[serde(rename = "status_top_inset")]
-                            _status_top_inset: u16,
-                            #[serde(rename = "status_bottom_inset")]
-                            _status_bottom_inset: u16,
+                            #[serde(rename = "top_inset")]
+                            _top_inset: u16,
+                            #[serde(rename = "right_inset")]
+                            _right_inset: u16,
+                            #[serde(rename = "bottom_inset")]
+                            _bottom_inset: u16,
+                            #[serde(rename = "left_inset")]
+                            _left_inset: u16,
                             #[serde(rename = "cell_pixel_w")]
                             _cell_pixel_w: u16,
                             #[serde(rename = "cell_pixel_h")]

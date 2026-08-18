@@ -509,8 +509,10 @@ mod tests {
                 attach_viewport: Some(AttachViewport {
                     cols: 120,
                     rows: 40,
-                    status_top_inset: 1,
-                    status_bottom_inset: 2,
+                    top_inset: 1,
+                    right_inset: 0,
+                    bottom_inset: 2,
+                    left_inset: 0,
                 }),
                 floating_surfaces: vec![PaneRuntimeSnapshotV1FloatingSurface {
                     id: surface_id,

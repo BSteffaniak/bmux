@@ -439,8 +439,8 @@ impl AttachScenePipeline {
             &mut self.pane_buffers,
             &mut self.terminal_graphics_cache,
             &frame_damage,
-            self.viewport.status_top_inset,
-            self.viewport.status_bottom_inset,
+            self.viewport.top_inset,
+            self.viewport.bottom_inset,
             // Snapshot-mode scene pipeline renders live pane output only; it has
             // no per-pane scrollback views.
             &PaneScrollbackViews::new(),
@@ -544,8 +544,10 @@ mod tests {
         let mut pipeline = AttachScenePipeline::new(AttachViewport {
             cols: 10,
             rows: 2,
-            status_top_inset: 0,
-            status_bottom_inset: 0,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
         });
 
         pipeline
@@ -592,8 +594,10 @@ mod tests {
         let mut pipeline = AttachScenePipeline::new(AttachViewport {
             cols: 10,
             rows: 2,
-            status_top_inset: 0,
-            status_bottom_inset: 0,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
         });
         let initial_revision = pipeline
             .pane_buffers

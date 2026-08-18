@@ -5372,15 +5372,16 @@ pub async fn retarget_attach_to_context(
     );
     let retarget_service_started = Instant::now();
     let geometry = current_attach_terminal_geometry();
-    let (status_top_inset, status_bottom_inset) =
-        status_insets_for_position(view_state.status_position);
+    let (top_inset, bottom_inset) = status_insets_for_position(view_state.status_position);
     let attach_info = client
         .retarget_attach_context_with_insets(
             context_id,
             geometry.cols,
             geometry.rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            0,
+            bottom_inset,
+            0,
         )
         .await?;
     let retarget_service_us = retarget_service_started.elapsed().as_micros();
@@ -7856,15 +7857,15 @@ fn retained_damage_overlay_surface(
     scene: &AttachScene,
     frame_damage: &bmux_attach_pipeline::FrameDamage,
     terminal_size: (u16, u16),
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    bottom_inset: u16,
 ) -> Option<RetainedSurface> {
     let ops = frame_damage_overlay_render_ops(
         scene,
         frame_damage,
         terminal_size,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        bottom_inset,
     );
     if ops.is_empty() || terminal_size.0 == 0 || terminal_size.1 == 0 {
         return None;
@@ -8364,8 +8365,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         view_state.dirty.status_needs_redraw = false;
     }
 
-    let (status_top_inset, status_bottom_inset) =
-        status_insets_for_position(view_state.status_position);
+    let (top_inset, bottom_inset) = status_insets_for_position(view_state.status_position);
     let terminal_size = (geometry.cols, geometry.rows);
     let viewport = DamageRect::new(0, 0, terminal_size.0, terminal_size.1);
     let status_surface = view_state
@@ -8505,8 +8505,8 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
                 &mut view_state.pane_buffers,
                 &mut view_state.terminal_graphics_cache,
                 &frame_damage,
-                status_top_inset,
-                status_bottom_inset,
+                top_inset,
+                bottom_inset,
                 &view_state.pane_scrollback,
                 layout_state.zoomed,
                 terminal_size,
@@ -8640,8 +8640,8 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             &layout_state.scene,
             &frame_damage,
             terminal_size,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            bottom_inset,
         )
     {
         let repaint = retained_full_surface_repaint(&damage_surface);
@@ -8650,8 +8650,8 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
                 &layout_state.scene,
                 &frame_damage,
                 terminal_size,
-                status_top_inset,
-                status_bottom_inset,
+                top_inset,
+                bottom_inset,
             );
             if let Some(trace) = render_trace.as_mut() {
                 trace.push(AttachRenderTraceOp::DamageOverlay {
@@ -9595,14 +9595,16 @@ pub async fn update_attach_viewport_with_geometry(
     if geometry.cols == 0 || geometry.rows == 0 {
         return Ok(());
     }
-    let (status_top_inset, status_bottom_inset) = status_insets_for_position(status_position);
+    let (top_inset, bottom_inset) = status_insets_for_position(status_position);
     client
         .attach_set_viewport_with_insets(
             session_id,
             geometry.cols,
             geometry.rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            0,
+            bottom_inset,
+            0,
         )
         .await?;
     Ok(())

@@ -450,8 +450,10 @@ interface attach-runtime-commands {
         session_id: uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         context_id: uuid?,
     }
 
@@ -461,8 +463,10 @@ interface attach-runtime-commands {
         can_write: bool,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     }
 
     record attach-input-accepted {
@@ -521,8 +525,10 @@ interface attach-runtime-commands {
         session_id: uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_w: u16,
         cell_pixel_h: u16,
     ) -> result<attach-viewport-set, attach-command-error>;
@@ -532,8 +538,10 @@ interface attach-runtime-commands {
         can_write: bool,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
         cell_pixel_w: u16,
         cell_pixel_h: u16,
     ) -> result<attach-retarget-ready, attach-command-error>;

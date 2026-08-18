@@ -62,8 +62,10 @@ pub struct AttachSetViewportArgs {
     pub session_id: Uuid,
     pub cols: u16,
     pub rows: u16,
-    pub status_top_inset: u16,
-    pub status_bottom_inset: u16,
+    pub top_inset: u16,
+    pub right_inset: u16,
+    pub bottom_inset: u16,
+    pub left_inset: u16,
     #[serde(alias = "cell_pixel_w")]
     pub cell_pixel_width: u16,
     #[serde(alias = "cell_pixel_h")]
@@ -77,8 +79,10 @@ pub struct AttachRetargetContextArgs {
     pub can_write: bool,
     pub cols: u16,
     pub rows: u16,
-    pub status_top_inset: u16,
-    pub status_bottom_inset: u16,
+    pub top_inset: u16,
+    pub right_inset: u16,
+    pub bottom_inset: u16,
+    pub left_inset: u16,
     #[serde(alias = "cell_pixel_w")]
     pub cell_pixel_width: u16,
     #[serde(alias = "cell_pixel_h")]
@@ -153,11 +157,13 @@ fn retarget_attach_stream(
     next_session_id: SessionId,
     cols: u16,
     rows: u16,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    right_inset: u16,
+    bottom_inset: u16,
+    left_inset: u16,
     cell_pixel_width: u16,
     cell_pixel_height: u16,
-) -> Result<(u16, u16, u16, u16), AttachCommandError> {
+) -> Result<(u16, u16, u16, u16, u16, u16), AttachCommandError> {
     let previous_stream = follow.0.attached_stream_session(client_id);
     let previous_to_detach = previous_stream.filter(|prev| *prev != next_session_id);
     let retarget_result = match runtime.0.retarget_attach_stream(
@@ -166,8 +172,10 @@ fn retarget_attach_stream(
         client_id,
         cols,
         rows,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        right_inset,
+        bottom_inset,
+        left_inset,
         cell_pixel_width,
         cell_pixel_height,
     ) {
@@ -180,8 +188,10 @@ fn retarget_attach_stream(
                 client_id,
                 cols,
                 rows,
-                status_top_inset,
-                status_bottom_inset,
+                top_inset,
+                right_inset,
+                bottom_inset,
+                left_inset,
                 cell_pixel_width,
                 cell_pixel_height,
             )
@@ -197,8 +207,10 @@ fn retarget_attach_stream(
                 client_id,
                 cols,
                 rows,
-                status_top_inset,
-                status_bottom_inset,
+                top_inset,
+                right_inset,
+                bottom_inset,
+                left_inset,
                 cell_pixel_width,
                 cell_pixel_height,
             )
@@ -551,15 +563,17 @@ pub fn attach_set_viewport(
     let session_id = SessionId(req.session_id);
     let runtime = super::session_runtime_handle()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
-    let (cols, rows, top, bottom) = runtime
+    let (cols, rows, top, right, bottom, left) = runtime
         .0
         .set_attach_viewport(
             session_id,
             client_id,
             req.cols,
             req.rows,
-            req.status_top_inset,
-            req.status_bottom_inset,
+            req.top_inset,
+            req.right_inset,
+            req.bottom_inset,
+            req.left_inset,
             req.cell_pixel_width,
             req.cell_pixel_height,
         )
@@ -572,8 +586,10 @@ pub fn attach_set_viewport(
         session_id: req.session_id,
         cols,
         rows,
-        status_top_inset: top,
-        status_bottom_inset: bottom,
+        top_inset: top,
+        right_inset: right,
+        bottom_inset: bottom,
+        left_inset: left,
         context_id,
     })
 }
@@ -629,15 +645,17 @@ pub fn attach_retarget_context(
             .set_selected_target(client_id, Some(context_id), Some(next_session_id));
     }
 
-    let (cols, rows, top, bottom) = retarget_attach_stream(
+    let (cols, rows, top, right, bottom, left) = retarget_attach_stream(
         &runtime,
         &follow,
         client_id,
         next_session_id,
         req.cols,
         req.rows,
-        req.status_top_inset,
-        req.status_bottom_inset,
+        req.top_inset,
+        req.right_inset,
+        req.bottom_inset,
+        req.left_inset,
         req.cell_pixel_width,
         req.cell_pixel_height,
     )?;
@@ -652,8 +670,10 @@ pub fn attach_retarget_context(
         can_write,
         cols,
         rows,
-        status_top_inset: top,
-        status_bottom_inset: bottom,
+        top_inset: top,
+        right_inset: right,
+        bottom_inset: bottom,
+        left_inset: left,
     })
 }
 

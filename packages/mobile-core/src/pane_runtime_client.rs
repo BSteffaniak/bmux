@@ -128,13 +128,19 @@ pub trait PaneRuntimeClientExt {
         rows: u16,
     ) -> impl Future<Output = ClientResult<(u16, u16)>> + Send;
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the four independent viewport edges mirror the generated typed attach contract; a second wrapper DTO would obscure that boundary"
+    )]
     fn attach_set_viewport_with_insets(
         &mut self,
         session_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> impl Future<Output = ClientResult<(u16, u16)>> + Send;
 
     fn attach_input(
@@ -189,7 +195,7 @@ impl PaneRuntimeClientExt for bmux_client::BmuxClient {
         cols: u16,
         rows: u16,
     ) -> ClientResult<(u16, u16)> {
-        attach_set_viewport_with_insets(self, session_id, cols, rows, 0, 0).await
+        attach_set_viewport_with_insets(self, session_id, cols, rows, 0, 0, 0, 0).await
     }
 
     async fn attach_set_viewport_with_insets(
@@ -197,16 +203,20 @@ impl PaneRuntimeClientExt for bmux_client::BmuxClient {
         session_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> ClientResult<(u16, u16)> {
         attach_set_viewport_with_insets(
             self,
             session_id,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
         )
         .await
     }
@@ -268,7 +278,7 @@ impl PaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         cols: u16,
         rows: u16,
     ) -> ClientResult<(u16, u16)> {
-        attach_set_viewport_with_insets(self, session_id, cols, rows, 0, 0).await
+        attach_set_viewport_with_insets(self, session_id, cols, rows, 0, 0, 0, 0).await
     }
 
     async fn attach_set_viewport_with_insets(
@@ -276,16 +286,20 @@ impl PaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         session_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> ClientResult<(u16, u16)> {
         attach_set_viewport_with_insets(
             self,
             session_id,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
         )
         .await
     }
@@ -360,21 +374,29 @@ async fn open_attach_stream_info(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the four independent viewport edges mirror the generated typed attach contract; a second wrapper DTO would obscure that boundary"
+)]
 async fn attach_set_viewport_with_insets(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
     cols: u16,
     rows: u16,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
+    top_inset: u16,
+    right_inset: u16,
+    bottom_inset: u16,
+    left_inset: u16,
 ) -> ClientResult<(u16, u16)> {
     match attach_commands::client::attach_set_viewport(
         client,
         session_id,
         cols,
         rows,
-        status_top_inset,
-        status_bottom_inset,
+        top_inset,
+        right_inset,
+        bottom_inset,
+        left_inset,
         0,
         0,
     )

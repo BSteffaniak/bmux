@@ -293,13 +293,19 @@ pub trait BmuxPaneRuntimeClientExt {
         rows: u16,
     ) -> impl Future<Output = ClientResult<AttachOpenInfo>> + Send;
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the four independent viewport edges mirror the generated typed attach contract; a second wrapper DTO would obscure that boundary"
+    )]
     fn retarget_attach_context_with_insets(
         &mut self,
         context_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> impl Future<Output = ClientResult<AttachOpenInfo>> + Send;
 
     fn open_attach_stream_info(
@@ -334,13 +340,19 @@ pub trait BmuxPaneRuntimeClientExt {
         rows: u16,
     ) -> impl Future<Output = ClientResult<(u16, u16)>> + Send;
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the four independent viewport edges mirror the generated typed attach contract; a second wrapper DTO would obscure that boundary"
+    )]
     fn attach_set_viewport_with_insets(
         &mut self,
         session_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> impl Future<Output = ClientResult<(u16, u16)>> + Send;
 
     fn attach_layout(
@@ -427,7 +439,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         cols: u16,
         rows: u16,
     ) -> ClientResult<AttachOpenInfo> {
-        self.retarget_attach_context_with_insets(context_id, cols, rows, 0, 0)
+        self.retarget_attach_context_with_insets(context_id, cols, rows, 0, 0, 0, 0)
             .await
     }
 
@@ -436,8 +448,10 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         context_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> ClientResult<AttachOpenInfo> {
         match AttachCommands::client::attach_retarget_context(
             self,
@@ -445,8 +459,10 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
             true,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
             cell_pixel_width(),
             cell_pixel_height(),
         )
@@ -522,7 +538,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         cols: u16,
         rows: u16,
     ) -> ClientResult<(u16, u16)> {
-        self.attach_set_viewport_with_insets(session_id, cols, rows, 0, 0)
+        self.attach_set_viewport_with_insets(session_id, cols, rows, 0, 0, 0, 0)
             .await
     }
 
@@ -531,16 +547,20 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         session_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> ClientResult<(u16, u16)> {
         match AttachCommands::client::attach_set_viewport(
             self,
             session_id,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
             cell_pixel_width(),
             cell_pixel_height(),
         )
@@ -781,7 +801,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         cols: u16,
         rows: u16,
     ) -> ClientResult<AttachOpenInfo> {
-        self.retarget_attach_context_with_insets(context_id, cols, rows, 0, 0)
+        self.retarget_attach_context_with_insets(context_id, cols, rows, 0, 0, 0, 0)
             .await
     }
 
@@ -790,8 +810,10 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         context_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> ClientResult<AttachOpenInfo> {
         match AttachCommands::client::attach_retarget_context(
             self,
@@ -799,8 +821,10 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
             true,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
             cell_pixel_width(),
             cell_pixel_height(),
         )
@@ -876,7 +900,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         cols: u16,
         rows: u16,
     ) -> ClientResult<(u16, u16)> {
-        self.attach_set_viewport_with_insets(session_id, cols, rows, 0, 0)
+        self.attach_set_viewport_with_insets(session_id, cols, rows, 0, 0, 0, 0)
             .await
     }
 
@@ -885,16 +909,20 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         session_id: Uuid,
         cols: u16,
         rows: u16,
-        status_top_inset: u16,
-        status_bottom_inset: u16,
+        top_inset: u16,
+        right_inset: u16,
+        bottom_inset: u16,
+        left_inset: u16,
     ) -> ClientResult<(u16, u16)> {
         match AttachCommands::client::attach_set_viewport(
             self,
             session_id,
             cols,
             rows,
-            status_top_inset,
-            status_bottom_inset,
+            top_inset,
+            right_inset,
+            bottom_inset,
+            left_inset,
             cell_pixel_width(),
             cell_pixel_height(),
         )
