@@ -81,6 +81,69 @@ pub fn attach_layout_requires_snapshot_hydration(
     attach_layout_pane_id_set(previous) != attach_layout_pane_id_set(next)
 }
 
+fn subtract_damage_rect(previous: DamageRect, next: DamageRect) -> [Option<DamageRect>; 4] {
+    let horizontal_start = previous.x.max(next.x);
+    let vertical_start = previous.y.max(next.y);
+    let horizontal_end = previous.right().min(next.right());
+    let vertical_end = previous.bottom().min(next.bottom());
+    if horizontal_start >= horizontal_end || vertical_start >= vertical_end {
+        return [Some(previous), None, None, None];
+    }
+    let rect =
+        |x: u16, y: u16, w: u16, h: u16| (w > 0 && h > 0).then(|| DamageRect::new(x, y, w, h));
+    [
+        rect(
+            previous.x,
+            previous.y,
+            previous.w,
+            vertical_start.saturating_sub(previous.y),
+        ),
+        rect(
+            previous.x,
+            vertical_end,
+            previous.w,
+            previous.bottom().saturating_sub(vertical_end),
+        ),
+        rect(
+            previous.x,
+            vertical_start,
+            horizontal_start.saturating_sub(previous.x),
+            vertical_end.saturating_sub(vertical_start),
+        ),
+        rect(
+            horizontal_end,
+            vertical_start,
+            previous.right().saturating_sub(horizontal_end),
+            vertical_end.saturating_sub(vertical_start),
+        ),
+    ]
+}
+
+fn mark_vacated_content_rects(
+    damage: &mut FrameDamage,
+    previous_surface: &AttachSurface,
+    next_surface: &AttachSurface,
+    policy: DamageCoalescingPolicy,
+) {
+    let outer = surface_outer_rect(next_surface);
+    for vacated in subtract_damage_rect(
+        surface_content_rect(previous_surface),
+        surface_content_rect(next_surface),
+    )
+    .into_iter()
+    .flatten()
+    {
+        if let Some(clipped) = intersect_damage_rect(vacated, outer) {
+            damage.mark_vacated_surface_rect(
+                next_surface.id,
+                rect_relative_to(clipped, outer),
+                (outer.w, outer.h),
+                policy,
+            );
+        }
+    }
+}
+
 #[must_use]
 pub fn attach_scene_damage_between(
     previous: &AttachScene,
@@ -118,6 +181,7 @@ pub fn attach_scene_damage_between(
                 // and the new content area is fully redrawn.
                 absolute_damage.push(surface_content_rect(previous_surface));
                 absolute_damage.push(surface_content_rect(next_surface));
+                mark_vacated_content_rects(&mut damage, previous_surface, next_surface, policy);
                 damage.mark_extension_surface_query(next_surface.id);
             }
             Some(next_surface) if surface_is_pane(next_surface) => {
@@ -482,6 +546,20 @@ mod tests {
             !damage.extension_surface_rects(surface_id).is_empty(),
             "old and new absolute content locations must repaint the pane background"
         );
+        let expected_vacated_area = subtract_damage_rect(
+            DamageRect::new(previous.x, previous.y, previous.w, previous.h),
+            DamageRect::new(next.x, next.y, next.w, next.h),
+        )
+        .into_iter()
+        .flatten()
+        .map(DamageRect::area)
+        .sum::<u32>();
+        let actual_vacated_area = damage
+            .vacated_surface_rects(surface_id)
+            .iter()
+            .map(|rect| rect.area())
+            .sum::<u32>();
+        assert_eq!(actual_vacated_area, expected_vacated_area);
     }
 
     #[test]
@@ -539,6 +617,27 @@ mod tests {
     }
 
     #[test]
+    fn rectangle_subtraction_is_precise_for_shrink_expansion_and_disjoint_move() {
+        let previous = DamageRect::new(0, 0, 20, 10);
+        let centered = DamageRect::new(5, 2, 10, 6);
+        let shrink = subtract_damage_rect(previous, centered)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(shrink.len(), 4);
+        assert_eq!(shrink.iter().map(|rect| rect.area()).sum::<u32>(), 140);
+        assert!(
+            subtract_damage_rect(centered, previous)
+                .into_iter()
+                .all(|rect| rect.is_none())
+        );
+        assert_eq!(
+            subtract_damage_rect(previous, DamageRect::new(30, 0, 5, 5)),
+            [Some(previous), None, None, None]
+        );
+    }
+
+    #[test]
     fn attach_scene_damage_between_marks_metadata_changes_as_extension_damage() {
         let pane_id = Uuid::from_u128(1);
         let surface_id = Uuid::from_u128(10);
@@ -553,6 +652,7 @@ mod tests {
         assert!(!damage.is_full_frame());
         assert!(!damage.content_surface_damaged(pane_id));
         assert!(damage.extension_surface_damaged(surface_id, pane_id));
+        assert!(!damage.vacated_surface_damaged(surface_id));
     }
 
     #[test]
@@ -576,5 +676,7 @@ mod tests {
         assert!(!damage.content_surface_damaged(second_pane));
         assert!(damage.extension_surface_damaged(first_surface, first_pane));
         assert!(damage.extension_surface_damaged(second_surface, second_pane));
+        assert!(!damage.vacated_surface_damaged(first_surface));
+        assert!(!damage.vacated_surface_damaged(second_surface));
     }
 }

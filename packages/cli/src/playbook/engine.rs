@@ -1195,6 +1195,15 @@ fn record_attach_trace_op(
             summary.overlay_rendered_frames = 1;
             PlaybookRenderTraceOp::DamageOverlay { rects, cells }
         }
+        AttachTraceOp::VacatedCellsCleared {
+            surface_index,
+            regions,
+            cells,
+        } => PlaybookRenderTraceOp::VacatedCellsCleared {
+            surface: trace_surface_index(surface_index),
+            regions,
+            cells,
+        },
         AttachTraceOp::Cursor {
             surface_index,
             visible,

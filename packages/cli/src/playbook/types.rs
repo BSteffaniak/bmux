@@ -371,6 +371,11 @@ pub enum PlaybookRenderTraceOp {
         rects: u16,
         cells: u64,
     },
+    VacatedCellsCleared {
+        surface: u32,
+        regions: u16,
+        cells: u64,
+    },
     Cursor {
         pane: u32,
         visible: bool,
@@ -443,6 +448,11 @@ impl PlaybookRenderTraceOp {
             }
             ["damage-overlay", rects, cells] => Ok(Self::DamageOverlay {
                 rects: parse_trace_part(rects, "rects")?,
+                cells: parse_trace_part(cells, "cells")?,
+            }),
+            ["vacated-cells-cleared", surface, regions, cells] => Ok(Self::VacatedCellsCleared {
+                surface: parse_trace_part(surface, "surface")?,
+                regions: parse_trace_part(regions, "regions")?,
                 cells: parse_trace_part(cells, "cells")?,
             }),
             ["cursor", pane, visible] => Ok(Self::Cursor {
@@ -1015,6 +1025,11 @@ pub fn render_trace_ops_to_dsl(ops: &[PlaybookRenderTraceOp]) -> String {
             PlaybookRenderTraceOp::DamageOverlay { rects, cells } => {
                 format!("damage-overlay:{rects}:{cells}")
             }
+            PlaybookRenderTraceOp::VacatedCellsCleared {
+                surface,
+                regions,
+                cells,
+            } => format!("vacated-cells-cleared:{surface}:{regions}:{cells}"),
             PlaybookRenderTraceOp::Cursor { pane, visible } => {
                 format!("cursor:{pane}:{visible}")
             }

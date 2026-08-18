@@ -426,6 +426,12 @@ pub fn retained_frame_damage_from_frame_damage(
                 damage_rect_from_attach_rect(surface.rect),
             ));
         }
+        for rect in frame_damage.vacated_surface_rects(surface.id) {
+            rects.push(translate_damage_rect(
+                *rect,
+                damage_rect_from_attach_rect(surface.rect),
+            ));
+        }
         let Some(pane_id) = surface.pane_id else {
             continue;
         };
@@ -1150,6 +1156,7 @@ mod tests {
             damage.content_surface_rects(pane_id),
             &[DamageRect::new(1, 2, 3, 1)]
         );
+        assert!(!damage.vacated_surface_damaged(surface_id));
     }
 
     #[test]
@@ -1229,6 +1236,12 @@ mod tests {
             (20, 10),
             DamageCoalescingPolicy::default(),
         );
+        frame_damage.mark_vacated_surface_rect(
+            surface_id,
+            DamageRect::new(18, 8, 2, 1),
+            (20, 10),
+            DamageCoalescingPolicy::default(),
+        );
 
         let plan = retained_repaint_plan_from_frame_damage(
             &scene,
@@ -1240,7 +1253,11 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(
             plan[0].damage,
-            vec![DamageRect::new(10, 5, 2, 1), DamageRect::new(13, 9, 3, 1)]
+            vec![
+                DamageRect::new(10, 5, 2, 1),
+                DamageRect::new(28, 13, 2, 1),
+                DamageRect::new(13, 9, 3, 1),
+            ]
         );
     }
 

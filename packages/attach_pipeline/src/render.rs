@@ -1603,6 +1603,8 @@ pub struct AttachSceneRenderStats {
     pub pane_rows_cached_skipped: u64,
     pub pane_rows_sync_deferred: u64,
     pub pane_cells_emitted: u64,
+    pub vacated_regions_cleared: u64,
+    pub vacated_cells_cleared: u64,
     pub extension_render_calls: u64,
     pub extension_render_op_calls: u64,
     pub extension_imperative_calls: u64,
@@ -1884,6 +1886,11 @@ pub enum AttachRenderTraceOp {
         rects: u16,
         cells: u64,
     },
+    VacatedCellsCleared {
+        surface_index: usize,
+        regions: u16,
+        cells: u64,
+    },
     Cursor {
         surface_index: usize,
         visible: bool,
@@ -1923,6 +1930,7 @@ pub struct FrameDamage {
     content_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
     extension_surfaces: BTreeSet<Uuid>,
     extension_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
+    vacated_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
     extension_query_surfaces: BTreeSet<Uuid>,
     extension_query: bool,
     status: bool,
@@ -1938,6 +1946,7 @@ impl FrameDamage {
             content_surface_rects: BTreeMap::new(),
             extension_surfaces: BTreeSet::new(),
             extension_surface_rects: BTreeMap::new(),
+            vacated_surface_rects: BTreeMap::new(),
             extension_query_surfaces: BTreeSet::new(),
             extension_query: false,
             status: true,
@@ -1957,6 +1966,7 @@ impl FrameDamage {
             && self.content_surface_rects.is_empty()
             && self.extension_surfaces.is_empty()
             && self.extension_surface_rects.is_empty()
+            && self.vacated_surface_rects.is_empty()
             && self.extension_query_surfaces.is_empty()
             && !self.extension_query
             && !self.status
@@ -1970,6 +1980,7 @@ impl FrameDamage {
             || !self.content_surface_rects.is_empty()
             || !self.extension_surfaces.is_empty()
             || !self.extension_surface_rects.is_empty()
+            || !self.vacated_surface_rects.is_empty()
             || !self.extension_query_surfaces.is_empty()
             || self.extension_query
     }
@@ -2027,6 +2038,40 @@ impl FrameDamage {
         ) {
             self.mark_extension_surface(surface_id);
         }
+    }
+
+    pub fn mark_vacated_surface_rect(
+        &mut self,
+        surface_id: Uuid,
+        rect: DamageRect,
+        surface_size: (u16, u16),
+        _policy: DamageCoalescingPolicy,
+    ) {
+        if self.full_frame {
+            return;
+        }
+        let Some(rect) = rect.clipped_to(surface_size.0, surface_size.1) else {
+            return;
+        };
+        let rects = self.vacated_surface_rects.entry(surface_id).or_default();
+        if !rects.contains(&rect) {
+            rects.push(rect);
+        }
+        // Vacated geometry is emitted as at most four non-overlapping strips.
+        // Never union touching strips: their bounding box can include current
+        // content and would destructively clear live cells.
+    }
+
+    #[must_use]
+    pub fn vacated_surface_damaged(&self, surface_id: Uuid) -> bool {
+        self.full_frame || self.vacated_surface_rects.contains_key(&surface_id)
+    }
+
+    #[must_use]
+    pub fn vacated_surface_rects(&self, surface_id: Uuid) -> &[DamageRect] {
+        self.vacated_surface_rects
+            .get(&surface_id)
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn mark_extension_surface_query(&mut self, surface_id: Uuid) {
@@ -2135,6 +2180,14 @@ impl FrameDamage {
                 .or_default()
                 .extend(rects.iter().copied());
         }
+        for (surface_id, rects) in &other.vacated_surface_rects {
+            let target = self.vacated_surface_rects.entry(*surface_id).or_default();
+            for rect in rects {
+                if !target.contains(rect) {
+                    target.push(*rect);
+                }
+            }
+        }
         for surface_id in &other.extension_query_surfaces {
             self.mark_extension_surface_query(*surface_id);
         }
@@ -2155,11 +2208,18 @@ impl FrameDamage {
                     .values()
                     .map(Vec::len)
                     .sum::<usize>(),
+            )
+            .saturating_add(
+                self.vacated_surface_rects
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
             );
         let rect_area_cells = self
             .content_surface_rects
             .values()
             .chain(self.extension_surface_rects.values())
+            .chain(self.vacated_surface_rects.values())
             .flat_map(|rects| rects.iter())
             .fold(0_u64, |area, rect| {
                 area.saturating_add(u64::from(rect.area()))
@@ -2358,6 +2418,13 @@ pub fn frame_damage_overlay_rects(
             push_overlay_rect(&mut rects, outer, terminal_size);
         }
         for rect in frame_damage.extension_surface_rects(surface.id) {
+            push_overlay_rect(
+                &mut rects,
+                translate_damage_rect(*rect, outer),
+                terminal_size,
+            );
+        }
+        for rect in frame_damage.vacated_surface_rects(surface.id) {
             push_overlay_rect(
                 &mut rects,
                 translate_damage_rect(*rect, outer),
@@ -3525,6 +3592,49 @@ fn render_damage_content_rects(damage: &RenderDamage, content: PaneRect) -> Vec<
         .collect()
 }
 
+fn render_damage_region_stats(damage: &RenderDamage, surface_rect: ExtensionRect) -> (u16, u64) {
+    match damage {
+        RenderDamage::None => (0, 0),
+        RenderDamage::FullSurface => (1, extension_rect_area_cells(surface_rect)),
+        RenderDamage::Regions(regions) => (
+            u16::try_from(regions.len()).unwrap_or(u16::MAX),
+            regions
+                .iter()
+                .map(|rect| extension_rect_area_cells(*rect))
+                .sum(),
+        ),
+    }
+}
+
+fn vacated_cleanup_style(appearance: &RuntimeAppearance) -> RenderStyle {
+    let bg = parse_hex_color(&appearance.background).map(|color| RenderColor::Rgb {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+    });
+    RenderStyle {
+        bg,
+        ..RenderStyle::default()
+    }
+}
+
+fn queue_vacated_cleanup_for_damage<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    appearance: &RuntimeAppearance,
+) -> Result<bool> {
+    if damage.is_none() {
+        return Ok(false);
+    }
+    let style = vacated_cleanup_style(appearance);
+    let clear_ops = render_damage_rects(damage, surface_rect)
+        .into_iter()
+        .map(|rect| RenderOp::ClearRect { rect, style })
+        .collect::<Vec<_>>();
+    queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &clear_ops)
+}
+
 fn queue_after_content_cleanup_for_damage<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -4383,7 +4493,7 @@ struct SurfaceOutputPlan<'a> {
     surface_index: usize,
     ext_rect: ExtensionRect,
     content: PaneRect,
-    extension_cleanup_damage: RenderDamage,
+    vacated_cleanup_damage: RenderDamage,
     surface_plan: PaneSurfaceFramePlan,
     stages: SurfaceOutputStages,
     before_content_snapshots: Vec<ExtensionLayerSnapshot>,
@@ -4437,7 +4547,7 @@ enum SurfaceOutputStage {
 
 impl SurfaceOutputPlan<'_> {
     const fn should_execute(&self) -> bool {
-        self.surface_plan.should_render_surface()
+        self.surface_plan.should_render_surface() || !self.vacated_cleanup_damage.is_none()
     }
 }
 
@@ -4643,11 +4753,9 @@ fn build_surface_output_plan<'a>(
     };
     let stages = surface_output_stages(&surface_plan);
 
-    let extension_cleanup_damage = if frame_damage.extension_surfaces.contains(&surface.id) {
-        RenderDamage::FullSurface
-    } else {
+    let vacated_cleanup_damage = {
         let rects = frame_damage
-            .extension_surface_rects(surface.id)
+            .vacated_surface_rects(surface.id)
             .iter()
             .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
             .collect::<Vec<_>>();
@@ -4664,7 +4772,7 @@ fn build_surface_output_plan<'a>(
         surface_index,
         ext_rect,
         content,
-        extension_cleanup_damage,
+        vacated_cleanup_damage,
         surface_plan,
         stages,
         before_content_snapshots,
@@ -4804,7 +4912,10 @@ fn commit_before_content_surface_output_plan(
     );
 }
 
-#[allow(clippy::too_many_arguments)] // Executes one planned surface with frame-local mutable resources.
+#[allow(
+    clippy::too_many_arguments, // Executes one planned surface with frame-local mutable resources.
+    clippy::too_many_lines, // Cleanup, content, and extension stages must remain one atomic synchronized transaction.
+)]
 fn execute_surface_output_plan<W: io::Write>(
     stdout: &mut W,
     plan: &SurfaceOutputPlan<'_>,
@@ -4817,12 +4928,28 @@ fn execute_surface_output_plan<W: io::Write>(
 ) -> Result<Option<AttachCursorState>> {
     let mut before_content_cells = BTreeMap::new();
     let mut cursor_state = None;
-    if !plan.extension_cleanup_damage.is_none() {
-        queue_after_content_cleanup_for_damage(
+    if !plan.vacated_cleanup_damage.is_none() && !plan.surface_plan.sync_deferred {
+        queue_vacated_cleanup_for_damage(
             stdout,
             plan.ext_rect,
-            &plan.extension_cleanup_damage,
+            &plan.vacated_cleanup_damage,
+            plan.runtime_appearance,
         )?;
+        let (regions, cells) =
+            render_damage_region_stats(&plan.vacated_cleanup_damage, plan.ext_rect);
+        if let Some(stats) = render_stats.as_deref_mut() {
+            stats.vacated_regions_cleared = stats
+                .vacated_regions_cleared
+                .saturating_add(u64::from(regions));
+            stats.vacated_cells_cleared = stats.vacated_cells_cleared.saturating_add(cells);
+        }
+        if let Some(trace) = render_trace.as_deref_mut() {
+            trace.push(AttachRenderTraceOp::VacatedCellsCleared {
+                surface_index: plan.surface_index,
+                regions,
+                cells,
+            });
+        }
     }
 
     for stage in plan.stages.iter() {
@@ -6150,7 +6277,7 @@ mod tests {
             surface_id: Uuid::from_u128(201),
             surface_index: 0,
             ext_rect: ExtensionRect::new(0, 0, 10, 3),
-            extension_cleanup_damage: RenderDamage::None,
+            vacated_cleanup_damage: RenderDamage::None,
             content: PaneRect {
                 x: 1,
                 y: 1,
@@ -9154,6 +9281,80 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_extension_damage_does_not_emit_destructive_cleanup() {
+        let pane_id = Uuid::from_u128(90_020);
+        let surface_id = Uuid::from_u128(90_021);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(90_022),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: surface_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 4,
+                },
+                content_rect: AttachRect {
+                    x: 1,
+                    y: 2,
+                    w: 18,
+                    h: 2,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 2, 18, b"stable");
+        pane_buffers.insert(pane_id, buffer);
+        let mut damage = FrameDamage::default();
+        damage.mark_extension_surface_rect(
+            surface_id,
+            DamageRect::new(0, 0, 20, 4),
+            (20, 4),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut output = Vec::new();
+        let mut trace = AttachRenderTrace::new();
+
+        render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &damage,
+            0,
+            0,
+            &PaneScrollbackViews::new(),
+            false,
+            (30, 8),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+            Some(&mut trace),
+        )
+        .expect("extension repaint");
+
+        assert!(
+            !trace
+                .ops()
+                .iter()
+                .any(|op| matches!(op, AttachRenderTraceOp::VacatedCellsCleared { .. }))
+        );
+        assert!(!damage.vacated_surface_damaged(surface_id));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Complete two-frame fixture verifies cleanup bytes, trace, and final terminal cells.
     fn rendered_content_rect_shrink_clears_exposed_gutters() {
         let pane_id = Uuid::from_u128(90_010);
         let surface_id = Uuid::from_u128(90_011);
@@ -9227,8 +9428,13 @@ mod tests {
             &next,
             DamageCoalescingPolicy::default(),
         );
+        let mut trace = AttachRenderTrace::new();
         let mut second = Vec::new();
-        render_attach_scene(
+        let appearance = RuntimeAppearance {
+            background: "#123456".to_string(),
+            ..RuntimeAppearance::default()
+        };
+        render_attach_scene_with_stats_and_trace(
             &mut second,
             &next,
             &[],
@@ -9239,11 +9445,18 @@ mod tests {
             &PaneScrollbackViews::new(),
             false,
             (30, 8),
-            &RuntimeAppearance::default(),
+            &appearance,
             DamageCoalescingPolicy::default(),
             &[],
+            Some(&mut trace),
         )
         .expect("constrained render");
+        let rendered = String::from_utf8(second.clone()).expect("render output");
+        assert!(rendered.contains("48;2;18;52;86"), "{rendered:?}");
+        assert!(trace.ops().iter().any(|op| matches!(
+            op,
+            AttachRenderTraceOp::VacatedCellsCleared { cells, .. } if *cells > 0
+        )));
         display.process(&second);
 
         let rows = display.grid().viewport_rows();
@@ -11164,6 +11377,54 @@ mod tests {
     // `AttachPaneChunk.sync_update_active` and stores it on
     // `PaneRenderBuffer.sync_update_in_progress`.  These tests verify that
     // the renderer correctly defers drawing when the flag is set.
+
+    #[test]
+    fn sync_deferred_pane_defers_vacated_cleanup() {
+        let pane_id = Uuid::from_u128(50);
+        let surface_id = Uuid::from_u128(51);
+        let scene = single_pane_scene(pane_id, 12, 4);
+        let mut scene = scene;
+        scene.surfaces[0].id = surface_id;
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 2, 10, b"hello");
+        buffer.sync_update_in_progress = true;
+        pane_buffers.insert(pane_id, buffer);
+        let mut damage = content_damage(pane_id);
+        damage.mark_vacated_surface_rect(
+            surface_id,
+            DamageRect::new(0, 0, 2, 1),
+            (12, 4),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut output = Vec::new();
+        let mut trace = AttachRenderTrace::new();
+
+        render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &damage,
+            0,
+            0,
+            &PaneScrollbackViews::new(),
+            false,
+            (80, 24),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+            Some(&mut trace),
+        )
+        .expect("defer cleanup");
+
+        assert!(
+            !trace
+                .ops()
+                .iter()
+                .any(|op| matches!(op, AttachRenderTraceOp::VacatedCellsCleared { .. }))
+        );
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
