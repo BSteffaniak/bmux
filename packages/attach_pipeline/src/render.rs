@@ -4383,6 +4383,7 @@ struct SurfaceOutputPlan<'a> {
     surface_index: usize,
     ext_rect: ExtensionRect,
     content: PaneRect,
+    extension_cleanup_damage: RenderDamage,
     surface_plan: PaneSurfaceFramePlan,
     stages: SurfaceOutputStages,
     before_content_snapshots: Vec<ExtensionLayerSnapshot>,
@@ -4540,7 +4541,10 @@ fn pane_surface_geometry(
     Some((pane_id, rect, content, ext_rect))
 }
 
-#[allow(clippy::too_many_arguments)] // One pure per-surface planning boundary keeps render loop orchestration simple.
+#[allow(
+    clippy::too_many_arguments, // One pure per-surface planning boundary keeps render loop orchestration simple.
+    clippy::too_many_lines, // Geometry, damage, extension snapshots, and stage planning are one atomic surface plan.
+)]
 fn build_surface_output_plan<'a>(
     surface_index: usize,
     surface: &bmux_attach_layout_protocol::AttachSurface,
@@ -4639,12 +4643,28 @@ fn build_surface_output_plan<'a>(
     };
     let stages = surface_output_stages(&surface_plan);
 
+    let extension_cleanup_damage = if frame_damage.extension_surfaces.contains(&surface.id) {
+        RenderDamage::FullSurface
+    } else {
+        let rects = frame_damage
+            .extension_surface_rects(surface.id)
+            .iter()
+            .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
+            .collect::<Vec<_>>();
+        if rects.is_empty() {
+            RenderDamage::None
+        } else {
+            RenderDamage::Regions(rects)
+        }
+    };
+
     Some(SurfaceOutputPlan {
         pane_id,
         surface_id: surface.id,
         surface_index,
         ext_rect,
         content,
+        extension_cleanup_damage,
         surface_plan,
         stages,
         before_content_snapshots,
@@ -4797,6 +4817,13 @@ fn execute_surface_output_plan<W: io::Write>(
 ) -> Result<Option<AttachCursorState>> {
     let mut before_content_cells = BTreeMap::new();
     let mut cursor_state = None;
+    if !plan.extension_cleanup_damage.is_none() {
+        queue_after_content_cleanup_for_damage(
+            stdout,
+            plan.ext_rect,
+            &plan.extension_cleanup_damage,
+        )?;
+    }
 
     for stage in plan.stages.iter() {
         match stage {
@@ -5391,6 +5418,7 @@ mod tests {
         AttachSceneRenderStats, TerminalGraphicsCleanupPlan, TerminalGraphicsFrameResources,
         TerminalGraphicsStaleCleanupPolicy, queue_render_items, queue_render_items_for_frame,
         queue_render_items_for_surface, render_attach_scene_with_stats_and_trace_with_capabilities,
+        terminal_graphic_instance_key, terminal_graphic_needs_reconcile,
         terminal_graphic_placement_signature,
     };
     #[cfg(feature = "image-kitty")]
@@ -6122,6 +6150,7 @@ mod tests {
             surface_id: Uuid::from_u128(201),
             surface_index: 0,
             ext_rect: ExtensionRect::new(0, 0, 10, 3),
+            extension_cleanup_damage: RenderDamage::None,
             content: PaneRect {
                 x: 1,
                 y: 1,
@@ -7461,6 +7490,69 @@ mod tests {
         assert!(fourth.contains("Ga=d,d=p,"), "{fourth:?}");
         assert!(fourth.contains("Ga=d,d=i,"), "{fourth:?}");
         assert!(cache.is_empty());
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn padded_content_graphic_placement_is_clipped_and_positioned_in_content_cells() {
+        let capabilities = test_kitty_capabilities();
+        let content = ExtensionRect {
+            x: 7,
+            y: 4,
+            w: 10,
+            h: 3,
+        };
+        let inside = TerminalGraphicOverlay {
+            cell_rect: ExtensionRect {
+                x: content.x + 2,
+                y: content.y + 1,
+                w: 4,
+                h: 1,
+            },
+            ..test_graphic_overlay(content.x + 2)
+        };
+        let outside = TerminalGraphicOverlay {
+            key: 43,
+            cell_rect: ExtensionRect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 1,
+            },
+            ..inside
+        };
+        let mut cache = BTreeMap::new();
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_items(
+                &mut output,
+                Uuid::from_u128(7),
+                content,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(inside)],
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("inside graphic placement")
+        );
+        let rendered = String::from_utf8(output).expect("kitty output");
+        assert!(
+            rendered.contains("\u{1b}[6;10H\u{1b}_Ga=p,"),
+            "{rendered:?}"
+        );
+        assert!(
+            !terminal_graphic_needs_reconcile(
+                &outside,
+                terminal_graphic_instance_key(Uuid::from_u128(7), Uuid::from_u128(7), outside.key,),
+                content,
+                &RenderDamage::FullSurface,
+                &cache,
+                capabilities,
+            ),
+            "graphics wholly outside padded content must be clipped"
+        );
     }
 
     #[cfg(feature = "image-kitty")]
@@ -9058,6 +9150,175 @@ mod tests {
         assert!(
             rendered.contains("LIVEROW"),
             "focused pane without a scrollback view must render live rows: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn rendered_content_rect_shrink_clears_exposed_gutters() {
+        let pane_id = Uuid::from_u128(90_010);
+        let surface_id = Uuid::from_u128(90_011);
+        let surface = |content_rect: AttachRect| AttachSurface {
+            id: surface_id,
+            kind: AttachSurfaceKind::Pane,
+            layer: SurfaceLayer::Pane,
+            z: 0,
+            rect: AttachRect {
+                x: 0,
+                y: 1,
+                w: 20,
+                h: 4,
+            },
+            content_rect,
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: true,
+            pane_id: Some(pane_id),
+        };
+        let scene = |surface| AttachScene {
+            session_id: Uuid::from_u128(90_012),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![surface],
+        };
+        let previous = scene(surface(AttachRect {
+            x: 0,
+            y: 1,
+            w: 20,
+            h: 2,
+        }));
+        let next = scene(surface(AttachRect {
+            x: 5,
+            y: 1,
+            w: 10,
+            h: 2,
+        }));
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 2, 20, b"XXXXXXXXXXXXXXXXXXXX");
+        pane_buffers.insert(pane_id, buffer);
+        let mut display = bmux_terminal_grid::TerminalGridStream::new(
+            30,
+            8,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("display grid");
+        let mut first = Vec::new();
+        render_attach_scene(
+            &mut first,
+            &previous,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            &PaneScrollbackViews::new(),
+            false,
+            (30, 8),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("initial render");
+        display.process(&first);
+
+        let damage = crate::reconcile::attach_scene_damage_between(
+            &previous,
+            &next,
+            DamageCoalescingPolicy::default(),
+        );
+        let mut second = Vec::new();
+        render_attach_scene(
+            &mut second,
+            &next,
+            &[],
+            &mut pane_buffers,
+            &damage,
+            0,
+            0,
+            &PaneScrollbackViews::new(),
+            false,
+            (30, 8),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("constrained render");
+        display.process(&second);
+
+        let rows = display.grid().viewport_rows();
+        let row = rows[1].cells();
+        assert_eq!(row.first().map(bmux_terminal_grid::Cell::text), Some(" "));
+        assert_eq!(row.get(4).map(bmux_terminal_grid::Cell::text), Some(" "));
+        assert!(row.get(15).is_none_or(|cell| cell.text() == " "));
+    }
+
+    #[test]
+    fn padded_content_origin_controls_text_cursor_and_grid_dimensions() {
+        let pane_id = Uuid::from_u128(90_001);
+        let content = AttachRect {
+            x: 7,
+            y: 4,
+            w: 12,
+            h: 4,
+        };
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(90_002),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 30,
+                    h: 10,
+                },
+                content_rect: content,
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, content.h, content.w, b"hello");
+        pane_buffers.insert(pane_id, buffer);
+        let mut output = Vec::new();
+
+        let cursor = render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            1,
+            0,
+            &PaneScrollbackViews::new(),
+            false,
+            (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("render padded scene")
+        .expect("focused pane cursor");
+
+        assert_eq!((cursor.x, cursor.y), (content.x + 5, content.y));
+        assert!(
+            output
+                .windows(b"\x1b[5;8Hhello".len())
+                .any(|window| window == b"\x1b[5;8Hhello")
+        );
+        let grid = pane_buffers[&pane_id].terminal_grid.grid();
+        assert_eq!(
+            (grid.width(), grid.height()),
+            (usize::from(content.w), usize::from(content.h))
         );
     }
 

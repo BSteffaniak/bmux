@@ -244,6 +244,12 @@ impl PluginCommandRegistry {
     ) -> Vec<String> {
         let mut normalized = Vec::new();
         for argument in &command.arguments {
+            // A plugin command can share a path prefix with the host command tree.
+            // When another leaf is selected, its ArgMatches lacks this command's
+            // argument IDs; clap accessors panic on unknown IDs.
+            if matches.try_get_raw(&argument.name).is_err() {
+                continue;
+            }
             if let Some(long) = &argument.long {
                 if matches.value_source(&argument.name).is_none() {
                     continue;
@@ -538,7 +544,7 @@ fn validate_plugin_owns_path(
 
 #[cfg(test)]
 mod tests {
-    use super::PluginCommandRegistry;
+    use super::{PluginCommandRegistry, selected_subcommand_path};
     use bmux_cli_schema::Cli;
     use bmux_config::BmuxConfig;
     use bmux_plugin::{PluginManifest, PluginRegistry};
@@ -639,6 +645,24 @@ minimum = "1.0"
             .expect("manifest should register");
         PluginCommandRegistry::build(&config_with_enabled("policy.plugin"), &registry)
             .expect("policy command registry should build");
+    }
+
+    #[test]
+    fn normalize_arguments_ignores_ids_from_a_different_selected_leaf() {
+        let command = bmux_plugin_sdk::PluginCommand::new("first", "first command").argument(
+            bmux_plugin_sdk::PluginCommandArgument::positional(
+                "args",
+                bmux_plugin_sdk::PluginCommandArgumentKind::String,
+            )
+            .multiple(true),
+        );
+        let matches = Command::new("root")
+            .subcommand(Command::new("second"))
+            .try_get_matches_from(["root", "second"])
+            .expect("parse second leaf");
+        let (_, leaf) = selected_subcommand_path(&matches);
+
+        assert!(PluginCommandRegistry::normalize_arguments_from_matches(&command, leaf).is_empty());
     }
 
     #[test]

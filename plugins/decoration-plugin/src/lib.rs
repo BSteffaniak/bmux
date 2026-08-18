@@ -4059,6 +4059,48 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_content_geometry_survives_surface_and_scene_publication() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa13);
+        let rect = Rect {
+            x: 2,
+            y: 1,
+            w: 30,
+            h: 12,
+        };
+        let content_rect = Rect {
+            x: 8,
+            y: 3,
+            w: 17,
+            h: 7,
+        };
+        let expected_rect = rect.clone();
+        let expected_content_rect = content_rect.clone();
+        plugin.state.with_state(move |state| {
+            state.geometry.insert(
+                pane,
+                PaneGeometry {
+                    pane_id: pane,
+                    rect: rect.clone(),
+                    content_rect: content_rect.clone(),
+                },
+            );
+            let surface = empty_surface_for(state, pane);
+            assert_eq!(surface.rect, rect);
+            assert_eq!(surface.content_rect, content_rect);
+            publish_scene_if_changed(state);
+        });
+
+        let scene = plugin.build_scene();
+        let surface = scene
+            .surfaces
+            .get(&pane)
+            .expect("published pane decoration");
+        assert_eq!(surface.rect, expected_rect);
+        assert_eq!(surface.content_rect, expected_content_rect);
+    }
+
+    #[test]
     fn publish_scene_if_changed_skips_when_scene_output_is_unchanged() {
         let mut state = State::default();
         let pane = Uuid::from_u128(0xa11);

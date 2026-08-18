@@ -71,22 +71,31 @@ fn target_pane(arguments: &[String]) -> Result<Option<Uuid>, PluginCommandError>
         .transpose()
 }
 
+fn session_selector(
+    arguments: &[String],
+) -> Result<Option<sessions_state::SessionSelector>, PluginCommandError> {
+    let Some(selector) = option_value(arguments, "session") else {
+        return Ok(None);
+    };
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(PluginCommandError::invalid_arguments(
+            "--session expects a session UUID or name",
+        ));
+    }
+    let parsed_id = Uuid::parse_str(selector).ok();
+    Ok(Some(sessions_state::SessionSelector {
+        id: parsed_id,
+        name: parsed_id.is_none().then(|| selector.to_string()),
+    }))
+}
+
 fn selected_session(context: &NativeCommandContext) -> Result<SessionId, PluginCommandError> {
     let mut client = ServiceCallerDispatchClient::new(context);
-    if let Some(selector) = option_value(&context.arguments, "session") {
-        let selector = selector.trim();
-        if selector.is_empty() {
-            return Err(PluginCommandError::invalid_arguments(
-                "--session expects a session UUID or name",
-            ));
-        }
-        let parsed_id = Uuid::parse_str(selector).ok();
+    if let Some(selector) = session_selector(&context.arguments)? {
         let result = bmux_plugin::block_on_typed_dispatch(sessions_state::client::get_session(
             &mut client,
-            sessions_state::SessionSelector {
-                id: parsed_id,
-                name: parsed_id.is_none().then(|| selector.to_string()),
-            },
+            selector,
         ))
         .map_err(|error| PluginCommandError::failed(format!("session lookup failed: {error}")))?
         .map_err(|error| {
@@ -262,17 +271,249 @@ mod tests {
     use super::*;
 
     #[test]
-    fn option_precedence_prefers_individual_edges() {
+    fn attach_outcome_records_status_without_cli_output_path() {
+        let state = PanePaddingState {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            declarative: bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingSpec {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 0,
+                max_content_width: None,
+                max_content_height: None,
+                horizontal_alignment: "left".to_string(),
+                vertical_alignment: "top".to_string(),
+            },
+            matched_rule_index: None,
+            runtime_override: None,
+            effective: bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingSpec {
+                left: 1,
+                right: 1,
+                top: 0,
+                bottom: 0,
+                max_content_width: Some(80),
+                max_content_height: None,
+                horizontal_alignment: "center".to_string(),
+                vertical_alignment: "top".to_string(),
+            },
+            source: "global".to_string(),
+            outer_rect: None,
+            base_content_rect: None,
+            effective_content_rect: None,
+            persist_runtime_overrides: true,
+        };
+        let context = test_context(NativeCommandInvocationSource::AttachKeybinding);
+        bmux_plugin_sdk::begin_command_outcome_capture();
+
+        emit_result(&context, state);
+
+        let outcome = bmux_plugin_sdk::finish_command_outcome_capture();
+        assert_eq!(
+            outcome
+                .metadata
+                .get(COMMAND_OUTCOME_STATUS_MESSAGE_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some("pane padding: edges 1/1/0/0, max 80xnone, align center/top")
+        );
+    }
+
+    fn test_context(invocation_source: NativeCommandInvocationSource) -> NativeCommandContext {
+        use bmux_plugin_sdk::{
+            CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo,
+            HostMetadata,
+        };
+        NativeCommandContext {
+            plugin_id: "bmux.pane_runtime".to_string(),
+            command: "pane-padding-show".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "test".to_string(),
+                plugin_api_version: CURRENT_PLUGIN_API_VERSION,
+                plugin_abi_version: CURRENT_PLUGIN_ABI_VERSION,
+            },
+            connection: HostConnectionInfo {
+                config_dir: "/tmp".to_string(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: "/tmp".to_string(),
+                data_dir: "/tmp".to_string(),
+                state_dir: "/tmp".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: std::collections::BTreeMap::new(),
+            caller_client_id: None,
+            invocation_source,
+            host_kernel_bridge: None,
+        }
+    }
+
+    #[test]
+    fn status_text_reports_effective_edges_limits_and_alignment() {
+        let state = PanePaddingState {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            declarative: bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingSpec {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 0,
+                max_content_width: None,
+                max_content_height: None,
+                horizontal_alignment: "left".to_string(),
+                vertical_alignment: "top".to_string(),
+            },
+            matched_rule_index: None,
+            runtime_override: None,
+            effective: bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingSpec {
+                left: 1,
+                right: 2,
+                top: 3,
+                bottom: 4,
+                max_content_width: Some(120),
+                max_content_height: None,
+                horizontal_alignment: "center".to_string(),
+                vertical_alignment: "bottom".to_string(),
+            },
+            source: "runtime_override".to_string(),
+            outer_rect: None,
+            base_content_rect: None,
+            effective_content_rect: None,
+            persist_runtime_overrides: true,
+        };
+
+        assert_eq!(
+            status_text(&state),
+            "pane padding: edges 1/2/3/4, max 120xnone, align center/bottom"
+        );
+    }
+
+    #[test]
+    fn manifest_owns_nested_padding_commands_and_declares_arguments() {
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
+            .expect("pane-runtime manifest parses");
+        assert!(manifest.owns_namespaces.contains("pane-padding"));
+        let commands = manifest
+            .commands
+            .iter()
+            .map(|command| (command.name.as_str(), command))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (name, leaf) in [
+            ("pane-padding-show", "show"),
+            ("pane-padding-set", "set"),
+            ("pane-padding-reset", "reset"),
+        ] {
+            let command = commands.get(name).expect("padding command declared");
+            assert_eq!(command.path, ["pane-padding", leaf]);
+            assert!(command.expose_in_cli);
+            assert!(
+                command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.name == "session")
+            );
+            assert!(
+                command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.name == "pane-id")
+            );
+        }
+        let set = commands["pane-padding-set"];
+        for argument in [
+            "left",
+            "right",
+            "top",
+            "bottom",
+            "horizontal",
+            "vertical",
+            "all",
+            "max-content-width",
+            "max-content-height",
+            "horizontal-alignment",
+            "vertical-alignment",
+        ] {
+            assert!(set.arguments.iter().any(|entry| entry.name == argument));
+        }
+    }
+
+    #[test]
+    fn option_precedence_covers_axes_and_individual_edges() {
         let args = vec![
             "--all".into(),
             "1".into(),
             "--horizontal".into(),
             "2".into(),
+            "--vertical=4".into(),
             "--left".into(),
             "3".into(),
+            "--bottom=5".into(),
         ];
         let spec = set_spec(&args, PanePaddingSpec::default()).unwrap();
-        assert_eq!((spec.left, spec.right, spec.top, spec.bottom), (3, 2, 1, 1));
+        assert_eq!((spec.left, spec.right, spec.top, spec.bottom), (3, 2, 4, 5));
+    }
+
+    #[test]
+    fn session_selector_normalizes_uuid_name_and_rejects_blank() {
+        let id = Uuid::new_v4();
+        let by_id = session_selector(&[format!("--session={id}")])
+            .unwrap()
+            .expect("UUID selector");
+        assert_eq!(by_id.id, Some(id));
+        assert_eq!(by_id.name, None);
+        let by_name = session_selector(&["--session".into(), "work".into()])
+            .unwrap()
+            .expect("name selector");
+        assert_eq!(by_name.id, None);
+        assert_eq!(by_name.name.as_deref(), Some("work"));
+        assert!(session_selector(&["--session=  ".into()]).is_err());
+        assert_eq!(session_selector(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn target_and_numeric_arguments_are_normalized_and_validated() {
+        let pane_id = Uuid::new_v4();
+        assert_eq!(
+            target_pane(&[format!("--pane-id={pane_id}")]).unwrap(),
+            Some(pane_id)
+        );
+        assert!(target_pane(&["--pane-id".into(), "not-a-uuid".into()]).is_err());
+        assert_eq!(
+            parse_u16(&["--left=65535".into()], "left").unwrap(),
+            Some(u16::MAX)
+        );
+        assert!(parse_u16(&["--left=-1".into()], "left").is_err());
+        assert!(parse_limit(&["--max-content-width=0".into()], "max-content-width").is_err());
+    }
+
+    #[test]
+    fn alignments_and_limits_update_complete_effective_spec() {
+        let changed = set_spec(
+            &[
+                "--max-content-width=120".into(),
+                "--max-content-height".into(),
+                "40".into(),
+                "--horizontal-alignment=center".into(),
+                "--vertical-alignment".into(),
+                "bottom".into(),
+            ],
+            PanePaddingSpec::default(),
+        )
+        .unwrap();
+        assert_eq!(changed.max_content_width, Some(120));
+        assert_eq!(changed.max_content_height, Some(40));
+        assert_eq!(changed.horizontal_alignment, HorizontalAlignment::Center);
+        assert_eq!(changed.vertical_alignment, VerticalAlignment::Bottom);
+        assert!(set_spec(&["--horizontal-alignment=middle".into()], changed).is_err());
+        assert!(set_spec(&["--vertical-alignment=middle".into()], changed).is_err());
     }
 
     #[test]

@@ -864,6 +864,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_delta_converge_after_content_resize() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 6, limits).unwrap();
+        producer.process(b"before\r\nresize");
+        producer.resize(10, 4).expect("resize producer");
+        let baseline = producer.snapshot(0, 4);
+        let mut consumer =
+            TerminalGridStream::from_snapshot(&baseline, limits).expect("hydrate resized baseline");
+        let delta = producer
+            .process_delta(b"\x1b[4;1Hafter")
+            .expect("post-resize output delta");
+
+        consumer
+            .apply_delta(&delta, limits)
+            .expect("apply post-resize delta");
+
+        assert_eq!(consumer.snapshot(0, 4), producer.snapshot(0, 4));
+        assert_eq!((consumer.grid().width(), consumer.grid().height()), (10, 4));
+    }
+
+    #[test]
     fn snapshot_and_delta_preserve_protocol_state() {
         let mut producer = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
         let delta = producer

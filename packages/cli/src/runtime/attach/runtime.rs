@@ -20500,6 +20500,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn padded_content_rect_controls_scrollback_viewport_and_copy_selection() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        let surface = view_state
+            .cached_layout_state
+            .as_mut()
+            .expect("layout")
+            .scene
+            .surfaces
+            .first_mut()
+            .expect("pane surface");
+        surface.rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: 30,
+            h: 12,
+        };
+        surface.content_rect = AttachRect {
+            x: 8,
+            y: 3,
+            w: 7,
+            h: 4,
+        };
+        assert_eq!(focused_attach_pane_inner_size(&view_state), Some((7, 4)));
+        assert!(enter_attach_scrollback(&mut view_state));
+        let base = attach_scrollback_viewport_base(&view_state, pane_id).expect("scrollback base");
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.offset = 0;
+            view.selection_anchor = Some(AttachScrollbackPosition {
+                line: base.line_for_viewport_row(0),
+                col: 0,
+            });
+            view.cursor = AttachScrollbackCursor { row: 0, col: 2 };
+        }
+
+        assert_eq!(
+            selected_attach_text(&mut view_state),
+            Some("  f".to_string())
+        );
+    }
+
     /// Copied text must equal exactly the cells the renderer highlights.
     #[test]
     fn selected_attach_text_matches_rendered_selection_highlight() {

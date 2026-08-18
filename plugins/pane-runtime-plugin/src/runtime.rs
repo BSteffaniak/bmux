@@ -3359,6 +3359,10 @@ impl SessionRuntimeManager {
         Ok(())
     }
 
+    // Restore validation, initial geometry, pane spawning, and final invariant
+    // checks form one ordered transaction; splitting it would obscure the rule
+    // that restored overrides must affect PTY size before processes start.
+    #[allow(clippy::too_many_lines)]
     fn restore_runtime(
         &mut self,
         session_id: SessionId,
@@ -3383,8 +3387,21 @@ impl SessionRuntimeManager {
         if !panes.iter().any(|pane| pane.id == focused_pane_id) {
             anyhow::bail!("focused pane missing from restored runtime");
         }
+        // Heal persisted shell/cwd/command metadata before resolving padding rules
+        // and initial PTY geometry, so shell/command matchers see the same metadata
+        // the spawned pane will own.
+        let panes = panes
+            .iter()
+            .cloned()
+            .map(|mut pane| {
+                if let Ok(resolved) = resolve_pane_launch(&pane, &self.shell) {
+                    apply_resolved_pane_launch(&mut pane, &resolved);
+                }
+                pane
+            })
+            .collect::<Vec<_>>();
 
-        let runtime_layout_root = layout_root.or_else(|| layout_from_panes(panes));
+        let runtime_layout_root = layout_root.or_else(|| layout_from_panes(&panes));
 
         // Re-validate the persisted zoom against the same invariants
         // `toggle_zoom` enforces: the pane must be a tiled pane in this
@@ -3411,6 +3428,10 @@ impl SessionRuntimeManager {
                 // A zoomed pane fills the scene root, mirroring the zoom
                 // branch of `resize_session_ptys`, so its PTY must start
                 // full-size instead of at its tiled rect.
+                let restored_override = self
+                    .restored_padding_overrides
+                    .get(&(session_id, zoomed_id))
+                    .copied();
                 initial_pane_sizes.insert(
                     zoomed_id,
                     pane_pty_size_for_metadata(
@@ -3419,7 +3440,7 @@ impl SessionRuntimeManager {
                             .iter()
                             .find(|pane| pane.id == zoomed_id)
                             .expect("zoomed pane exists"),
-                        None,
+                        restored_override,
                         scene_root,
                     ),
                 );
@@ -3433,7 +3454,14 @@ impl SessionRuntimeManager {
                         .expect("layout pane exists");
                     initial_pane_sizes.insert(
                         pane_id,
-                        pane_pty_size_for_metadata(&self.padding_config, pane, None, rect),
+                        pane_pty_size_for_metadata(
+                            &self.padding_config,
+                            pane,
+                            self.restored_padding_overrides
+                                .get(&(session_id, pane_id))
+                                .copied(),
+                            rect,
+                        ),
                     );
                 }
             }
@@ -4414,7 +4442,7 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
     ) -> Result<Uuid> {
-        let pane_meta = {
+        let (pane_meta, padding_override) = {
             let session = self
                 .runtimes
                 .get(&session_id)
@@ -4431,17 +4459,20 @@ impl SessionRuntimeManager {
                 .lock()
                 .ok()
                 .and_then(|state| state.last_known_cwd.clone());
-            PaneRuntimeMeta {
-                id: pane_id,
-                name: pane.meta.name.clone(),
-                shell: pane.meta.shell.clone(),
-                launch: pane.meta.launch.clone(),
-                resurrection: PaneResurrectionSnapshot {
-                    active_command: None,
-                    active_command_source: None,
-                    last_known_cwd: preserved_cwd,
+            (
+                PaneRuntimeMeta {
+                    id: pane_id,
+                    name: pane.meta.name.clone(),
+                    shell: pane.meta.shell.clone(),
+                    launch: pane.meta.launch.clone(),
+                    resurrection: PaneResurrectionSnapshot {
+                        active_command: None,
+                        active_command_source: None,
+                        last_known_cwd: preserved_cwd,
+                    },
                 },
-            }
+                pane.padding_override,
+            )
         };
 
         let old_pane = {
@@ -4459,7 +4490,8 @@ impl SessionRuntimeManager {
             shutdown_pane_handle(old_pane).await;
         });
 
-        let new_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        let mut new_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        new_pane.padding_override = padding_override;
         self.register_pane_input(session_id, &new_pane);
         let client_ids = {
             let session = self
@@ -7611,6 +7643,12 @@ fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
 pub(crate) struct PanePaddingRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>);
 
 impl PanePaddingRuntimeHandle {
+    pub(crate) fn has_session(&self, session_id: SessionId) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|manager| manager.runtimes.contains_key(&session_id))
+    }
+
     pub(crate) fn state(
         &self,
         session_id: SessionId,
@@ -7699,6 +7737,298 @@ mod tests {
 
     fn leaf(id: Uuid) -> PaneLayoutNode {
         PaneLayoutNode::Leaf { pane_id: id }
+    }
+
+    #[tokio::test]
+    async fn zoom_transition_reselects_padding_rule_and_restores_split_size() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[first, second]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first)),
+            second: Box::new(leaf(second)),
+        });
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                min_width = 100
+                max_content_width = 40
+                horizontal_alignment = "center"
+            }
+            .into(),
+        ))
+        .unwrap();
+        manager.apply_stored_attach_viewport(session_id);
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&first].last_requested_size);
+        assert_eq!(*last_requested_size.lock().unwrap(), (38, 58));
+
+        let (_, zoomed) = manager.toggle_zoom(session_id).expect("zoom pane");
+        assert!(zoomed);
+        assert_eq!(*last_requested_size.lock().unwrap(), (38, 40));
+        let (_, zoomed) = manager.toggle_zoom(session_id).expect("unzoom pane");
+        assert!(!zoomed);
+        assert_eq!(*last_requested_size.lock().unwrap(), (38, 58));
+    }
+
+    #[tokio::test]
+    async fn floating_resize_reselects_padding_rule_and_resizes_pty() {
+        let session_id = SessionId(Uuid::new_v4());
+        let tiled = Uuid::new_v4();
+        let floating = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[tiled, floating]);
+        runtime.layout_root = Some(PaneLayoutNode::Leaf { pane_id: tiled });
+        runtime.floating_surfaces = vec![floating_surface(floating, FloatingPaneScope::PerSession)];
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                min_width = 18
+                max_content_width = 10
+            }
+            .into(),
+        ))
+        .unwrap();
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&floating].last_requested_size);
+        manager.apply_stored_attach_viewport(session_id);
+        assert_eq!(*last_requested_size.lock().unwrap(), (3, 8));
+
+        manager
+            .resize_floating_pane(session_id, floating, 20, 8)
+            .expect("resize floating pane across rule boundary");
+
+        assert_eq!(*last_requested_size.lock().unwrap(), (6, 10));
+        let state = manager.padding_state(session_id, Some(floating)).unwrap();
+        assert_eq!(state.matched_rule_index, Some(0));
+        assert_eq!(state.effective_content_rect.w, 10);
+    }
+
+    #[tokio::test]
+    async fn padding_geometry_is_shared_across_attached_clients() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let first_client = ClientId(Uuid::new_v4());
+        let second_client = ClientId(Uuid::new_v4());
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime
+            .attached_clients
+            .extend([first_client, second_client]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let spec = PanePaddingSpec {
+            max_content_width: Some(40),
+            horizontal_alignment: crate::padding::HorizontalAlignment::Center,
+            ..PanePaddingSpec::default()
+        };
+        manager
+            .set_padding_override(session_id, Some(pane_id), Some(spec))
+            .expect("set shared pane override");
+
+        let first = manager
+            .build_attach_scene_for_client(session_id, first_client)
+            .expect("first client scene");
+        let second = manager
+            .build_attach_scene_for_client(session_id, second_client)
+            .expect("second client scene");
+
+        assert_eq!(
+            first.surfaces[0].content_rect,
+            second.surfaces[0].content_rect
+        );
+        assert_eq!(first.surfaces[0].content_rect.w, 40);
+        assert_eq!(
+            manager.runtimes[&session_id].panes[&pane_id].padding_override,
+            Some(spec)
+        );
+    }
+
+    #[tokio::test]
+    async fn viewport_height_resize_reselects_padding_rule_and_resizes_pty() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                min_height = 40
+                max_content_height = 20
+                vertical_alignment = "center"
+            }
+            .into(),
+        ))
+        .unwrap();
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+
+        manager
+            .set_attach_viewport(session_id, client_id, 80, 30, 0, 0, 0, 0)
+            .expect("set short viewport");
+        assert_eq!(*last_requested_size.lock().unwrap(), (28, 78));
+        manager
+            .set_attach_viewport(session_id, client_id, 80, 50, 0, 0, 0, 0)
+            .expect("set tall viewport");
+        assert_eq!(*last_requested_size.lock().unwrap(), (20, 78));
+        let state = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        assert_eq!(state.effective_content_rect.y, 15);
+    }
+
+    #[tokio::test]
+    async fn viewport_resize_reselects_padding_rule_and_resizes_pty() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                min_width = 100
+                max_content_width = 40
+                horizontal_alignment = "center"
+            }
+            .into(),
+        ))
+        .unwrap();
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+
+        manager
+            .set_attach_viewport(session_id, client_id, 90, 30, 0, 0, 0, 0)
+            .expect("set narrow viewport");
+        assert_eq!(*last_requested_size.lock().unwrap(), (28, 88));
+        manager
+            .set_attach_viewport(session_id, client_id, 120, 30, 0, 0, 0, 0)
+            .expect("set wide viewport");
+        assert_eq!(*last_requested_size.lock().unwrap(), (28, 40));
+    }
+
+    #[tokio::test]
+    async fn attach_scene_uses_authoritative_padding_for_tiled_zoomed_and_floating_panes() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let tiled = Uuid::new_v4();
+        let floating = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[tiled, floating]);
+        runtime.layout_root = Some(PaneLayoutNode::Leaf { pane_id: tiled });
+        runtime.floating_surfaces = vec![floating_surface(floating, FloatingPaneScope::PerSession)];
+        let config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                left = 1
+                max_content_width = 40
+                horizontal_alignment = "center"
+            }
+            .into(),
+        ))
+        .unwrap();
+        let viewport = runtime.attach_viewport;
+
+        let scene = build_attach_scene(session_id, &runtime, &config, viewport, client_id, None);
+        let tiled_surface = scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.pane_id == Some(tiled))
+            .expect("tiled surface");
+        assert_eq!(
+            tiled_surface.rect,
+            AttachRect {
+                x: 0,
+                y: 0,
+                w: 120,
+                h: 40
+            }
+        );
+        assert_eq!(
+            tiled_surface.content_rect,
+            AttachRect {
+                x: 40,
+                y: 1,
+                w: 40,
+                h: 38,
+            }
+        );
+        let floating_surface = scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.pane_id == Some(floating))
+            .expect("floating surface");
+        assert_eq!(
+            floating_surface.rect,
+            AttachRect {
+                x: 1,
+                y: 1,
+                w: 10,
+                h: 5
+            }
+        );
+        assert_eq!(
+            floating_surface.content_rect,
+            AttachRect {
+                x: 3,
+                y: 2,
+                w: 7,
+                h: 3,
+            }
+        );
+
+        runtime.zoomed_pane_id = Some(tiled);
+        let zoomed = build_attach_scene(session_id, &runtime, &config, viewport, client_id, None);
+        let zoomed_tiled = zoomed
+            .surfaces
+            .iter()
+            .find(|surface| surface.pane_id == Some(tiled))
+            .expect("zoomed tiled surface");
+        assert_eq!(zoomed_tiled.content_rect, tiled_surface.content_rect);
+    }
+
+    #[tokio::test]
+    async fn attach_scene_reselects_geometry_rules_across_viewport_boundary() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                min_width = 100
+                max_content_width = 40
+                horizontal_alignment = "center"
+            }
+            .into(),
+        ))
+        .unwrap();
+        let narrow = Some(AttachViewport {
+            cols: 90,
+            rows: 30,
+            status_top_inset: 0,
+            status_bottom_inset: 0,
+        });
+        let wide = Some(AttachViewport {
+            cols: 120,
+            rows: 30,
+            status_top_inset: 0,
+            status_bottom_inset: 0,
+        });
+
+        let narrow_scene =
+            build_attach_scene(session_id, &runtime, &config, narrow, client_id, None);
+        assert_eq!(narrow_scene.surfaces[0].content_rect.w, 88);
+        let wide_scene = build_attach_scene(session_id, &runtime, &config, wide, client_id, None);
+        assert_eq!(wide_scene.surfaces[0].content_rect.w, 40);
+        assert_eq!(wide_scene.surfaces[0].content_rect.x, 40);
     }
 
     #[tokio::test]
@@ -7831,6 +8161,160 @@ mod tests {
         assert_eq!(cleared.runtime_override, None);
         assert_eq!(cleared.effective_content_rect.w, 118);
         assert_eq!(*last_requested_size.lock().unwrap(), (38, 118));
+    }
+
+    #[tokio::test]
+    async fn invalid_padding_mutation_is_atomic() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let before = manager.padding_state(session_id, Some(pane_id)).unwrap();
+
+        let error = manager
+            .set_padding_override(
+                session_id,
+                Some(pane_id),
+                Some(PanePaddingSpec {
+                    max_content_width: Some(0),
+                    ..PanePaddingSpec::default()
+                }),
+            )
+            .expect_err("zero maximum must fail");
+
+        assert_eq!(error, SessionRuntimeError::Closed);
+        let after = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        assert_eq!(after.runtime_override, before.runtime_override);
+        assert_eq!(after.effective, before.effective);
+        assert_eq!(after.effective_content_rect, before.effective_content_rect);
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clearing_override_omits_it_and_restores_declarative_geometry() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                left = 2
+            }
+            .into(),
+        ))
+        .unwrap();
+        manager
+            .set_padding_override(
+                session_id,
+                Some(pane_id),
+                Some(PanePaddingSpec {
+                    max_content_width: Some(40),
+                    ..PanePaddingSpec::default()
+                }),
+            )
+            .expect("set override");
+        assert_eq!(manager.padding_overrides_for_snapshot().len(), 1);
+
+        let cleared = manager
+            .set_padding_override(session_id, Some(pane_id), None)
+            .expect("clear override");
+
+        assert_eq!(cleared.runtime_override, None);
+        assert_eq!(cleared.declarative.left, 2);
+        assert_eq!(cleared.effective, cleared.declarative);
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_padding_override_and_reapplies_its_size() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let spec = PanePaddingSpec {
+            max_content_width: Some(40),
+            ..PanePaddingSpec::default()
+        };
+        manager
+            .set_padding_override(session_id, Some(pane_id), Some(spec))
+            .expect("set override before restart");
+
+        manager
+            .restart_pane(session_id, Some(PaneSelector::ById(pane_id)))
+            .expect("restart pane");
+
+        let restarted = &manager.runtimes[&session_id].panes[&pane_id];
+        assert_eq!(restarted.padding_override, Some(spec));
+        assert_eq!(*restarted.last_requested_size.lock().unwrap(), (38, 40));
+        let removed = manager.remove_runtime(session_id).expect("remove runtime");
+        shutdown_runtime_handle(removed).await;
+    }
+
+    #[tokio::test]
+    async fn session_removal_omits_all_owned_padding_overrides() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        manager
+            .set_padding_override(
+                session_id,
+                Some(pane_id),
+                Some(PanePaddingSpec {
+                    left: 2,
+                    ..PanePaddingSpec::default()
+                }),
+            )
+            .expect("set pane override");
+        assert_eq!(manager.padding_overrides_for_snapshot().len(), 1);
+
+        let _removed = manager.remove_runtime(session_id).expect("remove runtime");
+
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn padding_overrides_follow_pane_close_and_persistence_policy() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[first, second]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first)),
+            second: Box::new(leaf(second)),
+        });
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let spec = PanePaddingSpec {
+            left: 3,
+            ..PanePaddingSpec::default()
+        };
+        manager
+            .set_padding_override(session_id, Some(first), Some(spec))
+            .expect("set first pane override");
+        manager
+            .set_padding_override(session_id, Some(second), Some(spec))
+            .expect("set second pane override");
+        assert_eq!(manager.padding_overrides_for_snapshot().len(), 2);
+
+        manager
+            .close_pane(session_id, Some(PaneSelector::ById(first)))
+            .expect("close overridden pane");
+        let overrides = manager.padding_overrides_for_snapshot();
+        assert_eq!(overrides.len(), 1);
+        assert!(!overrides.contains_key(&(session_id, first)));
+        assert_eq!(overrides.get(&(session_id, second)), Some(&spec));
+
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                persist_runtime_overrides = false
+            }
+            .into(),
+        ))
+        .unwrap();
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
     #[tokio::test]
@@ -9465,6 +9949,109 @@ mod tests {
                 .to_string()
                 .contains("cwd is unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn restored_shell_metadata_is_healed_before_padding_rule_initial_size() {
+        let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let stale_shell = if cfg!(windows) {
+            r"C:\definitely\missing\cmd.exe"
+        } else {
+            "/definitely/missing/sh"
+        };
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let settings: toml::Value = toml::from_str(&format!(
+            "[padding]\n[[padding.pane_rules]]\nmatch_shell = {configured_shell:?}\nmax_content_width = 40"
+        ))
+        .expect("padding settings");
+        let mut manager = SessionRuntimeManager::new(
+            configured_shell.to_string(),
+            "xterm-256color".to_string(),
+            ProtocolProfile::Bmux,
+            true,
+            None,
+            PanePaddingConfig::parse(Some(&settings)).unwrap(),
+            pane_exit_tx,
+        );
+        let pane = PaneRuntimeMeta {
+            id: pane_id,
+            name: None,
+            shell: stale_shell.to_string(),
+            launch: None,
+            resurrection: PaneResurrectionSnapshot::default(),
+        };
+        let request = RestoreRuntimeRequest {
+            focused_pane_id: pane_id,
+            attach_viewport: Some(AttachViewport {
+                cols: 120,
+                rows: 40,
+                status_top_inset: 0,
+                status_bottom_inset: 0,
+            }),
+            ..RestoreRuntimeRequest::default()
+        };
+
+        manager
+            .restore_runtime(session_id, &[pane], request)
+            .expect("restore healed shell metadata");
+
+        let restored = &manager.runtimes[&session_id].panes[&pane_id];
+        assert_eq!(restored.meta.shell, configured_shell);
+        assert_eq!(*restored.last_requested_size.lock().unwrap(), (38, 40));
+        let removed = manager.remove_runtime(session_id).expect("remove runtime");
+        shutdown_runtime_handle(removed).await;
+    }
+
+    #[tokio::test]
+    async fn restored_override_sets_initial_pty_size_before_runtime_is_available() {
+        let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            configured_shell.to_string(),
+            "xterm-256color".to_string(),
+            ProtocolProfile::Bmux,
+            true,
+            None,
+            PanePaddingConfig::default(),
+            pane_exit_tx,
+        );
+        let override_spec = PanePaddingSpec {
+            max_content_width: Some(40),
+            horizontal_alignment: crate::padding::HorizontalAlignment::Center,
+            ..PanePaddingSpec::default()
+        };
+        manager.install_restored_padding_override(session_id, pane_id, override_spec);
+        let pane = PaneRuntimeMeta {
+            id: pane_id,
+            name: None,
+            shell: configured_shell.to_string(),
+            launch: None,
+            resurrection: PaneResurrectionSnapshot::default(),
+        };
+        let request = RestoreRuntimeRequest {
+            focused_pane_id: pane_id,
+            attach_viewport: Some(AttachViewport {
+                cols: 120,
+                rows: 40,
+                status_top_inset: 0,
+                status_bottom_inset: 0,
+            }),
+            ..RestoreRuntimeRequest::default()
+        };
+
+        manager
+            .restore_runtime(session_id, &[pane], request)
+            .expect("restore runtime with padding override");
+
+        let restored = &manager.runtimes[&session_id].panes[&pane_id];
+        assert_eq!(restored.padding_override, Some(override_spec));
+        assert_eq!(*restored.last_requested_size.lock().unwrap(), (38, 40));
+        let removed = manager.remove_runtime(session_id).expect("remove runtime");
+        shutdown_runtime_handle(removed).await;
     }
 
     #[tokio::test]
