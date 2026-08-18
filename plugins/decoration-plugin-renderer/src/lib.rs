@@ -2651,6 +2651,38 @@ mod tests {
     }
 
     #[test]
+    fn content_rect_override_preserves_asymmetric_authoritative_geometry() {
+        let surface_id = Uuid::from_u128(105);
+        let mut decoration = surface(surface_id, Vec::new());
+        decoration.content_rect = SceneRect {
+            x: 4,
+            y: 2,
+            w: 11,
+            h: 6,
+        };
+        let cache = Arc::new(Mutex::new(DecorationRendererCache {
+            revision: 1,
+            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            rendered_surfaces: BTreeMap::new(),
+            scene_rx: None,
+            visual_last_at: BTreeMap::new(),
+            visual_last_revision: BTreeMap::new(),
+            visual_last_payload_hash: BTreeMap::new(),
+            visual_adapter_cache: BTreeMap::new(),
+            visual_stats: BTreeMap::new(),
+        }));
+        let extension = DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache,
+        };
+
+        assert_eq!(
+            extension.content_rect_override(surface_id),
+            Some(ExtensionRect::new(4, 2, 11, 6))
+        );
+    }
+
+    #[test]
     fn decoration_damage_uses_paint_regions_when_content_rect_changes() {
         let surface_id = Uuid::from_u128(100);
         let mut previous = surface(

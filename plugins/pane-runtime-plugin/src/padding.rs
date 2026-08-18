@@ -577,6 +577,127 @@ mod tests {
     }
 
     #[test]
+    fn geometry_supports_each_edge_axis_alignment_and_combination() {
+        let base = rect_at(10, 5, 21, 15);
+        for (spec, expected) in [
+            (
+                PanePaddingSpec {
+                    left: 2,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(12, 5, 19, 15),
+            ),
+            (
+                PanePaddingSpec {
+                    right: 3,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 5, 18, 15),
+            ),
+            (
+                PanePaddingSpec {
+                    top: 2,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 7, 21, 13),
+            ),
+            (
+                PanePaddingSpec {
+                    bottom: 4,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 5, 21, 11),
+            ),
+            (
+                PanePaddingSpec {
+                    left: 2,
+                    right: 2,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(12, 5, 17, 15),
+            ),
+            (
+                PanePaddingSpec {
+                    top: 2,
+                    bottom: 2,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 7, 21, 11),
+            ),
+            (
+                PanePaddingSpec {
+                    max_content_width: Some(9),
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 5, 9, 15),
+            ),
+            (
+                PanePaddingSpec {
+                    max_content_width: Some(9),
+                    horizontal_alignment: HorizontalAlignment::Right,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(22, 5, 9, 15),
+            ),
+            (
+                PanePaddingSpec {
+                    max_content_height: Some(7),
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 5, 21, 7),
+            ),
+            (
+                PanePaddingSpec {
+                    max_content_height: Some(7),
+                    vertical_alignment: VerticalAlignment::Center,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 9, 21, 7),
+            ),
+            (
+                PanePaddingSpec {
+                    max_content_height: Some(7),
+                    vertical_alignment: VerticalAlignment::Bottom,
+                    ..PanePaddingSpec::default()
+                },
+                rect_at(10, 13, 21, 7),
+            ),
+            (
+                PanePaddingSpec {
+                    left: 1,
+                    right: 2,
+                    top: 3,
+                    bottom: 1,
+                    max_content_width: Some(9),
+                    max_content_height: Some(5),
+                    horizontal_alignment: HorizontalAlignment::Center,
+                    vertical_alignment: VerticalAlignment::Center,
+                },
+                rect_at(15, 11, 9, 5),
+            ),
+        ] {
+            assert_eq!(padded_content_rect(base, spec), expected);
+        }
+    }
+
+    #[test]
+    fn metadata_matchers_require_values_and_matcher_free_rule_is_catch_all() {
+        let config = parse(toml::toml! {
+            [padding]
+            [[padding.pane_rules]]
+            match_name = "logs*"
+            left = 3
+            [[padding.pane_rules]]
+            right = 4
+        })
+        .unwrap();
+        let resolved = config.resolve(metadata(None, "sh", None), rect(80, 24), None);
+        assert_eq!(resolved.matched_rule_index, Some(1));
+        assert_eq!(resolved.spec.left, 0);
+        assert_eq!(resolved.spec.right, 4);
+    }
+
+    #[test]
     fn clamps_excessive_edges_to_one_cell_with_leading_priority() {
         let spec = PanePaddingSpec {
             left: 50,

@@ -7758,6 +7758,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equivalent_metadata_rule_results_avoid_resize_and_revision_churn() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        manager.padding_config = PanePaddingConfig::parse(Some(
+            &toml::toml! {
+                [padding]
+                [[padding.pane_rules]]
+                match_command = "journal*"
+                left = 0
+            }
+            .into(),
+        ))
+        .unwrap();
+        let before = manager.padding_state(session_id, None).unwrap();
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+        let size_before = *last_requested_size.lock().unwrap();
+        let revision_before = manager.runtimes[&session_id].attach_view_revision;
+
+        manager.runtimes[&session_id].panes[&pane_id]
+            .resurrection_state
+            .lock()
+            .unwrap()
+            .apply_event(PaneShellMetadataEvent::CommandStart {
+                command: "journalctl -f".to_string(),
+                cwd: "/tmp".to_string(),
+            });
+        let changed = manager
+            .reconcile_padding_after_metadata_change(session_id, pane_id, &before)
+            .expect("re-evaluate equivalent metadata rule");
+
+        assert_eq!(changed.matched_rule_index, Some(0));
+        assert_eq!(
+            changed.effective_content_rect,
+            before.effective_content_rect
+        );
+        assert_eq!(*last_requested_size.lock().unwrap(), size_before);
+        assert_eq!(
+            manager.runtimes[&session_id].attach_view_revision,
+            revision_before
+        );
+    }
+
+    #[tokio::test]
     async fn padding_override_updates_state_resizes_and_clears() {
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
@@ -7785,6 +7831,41 @@ mod tests {
         assert_eq!(cleared.runtime_override, None);
         assert_eq!(cleared.effective_content_rect.w, 118);
         assert_eq!(*last_requested_size.lock().unwrap(), (38, 118));
+    }
+
+    #[tokio::test]
+    async fn alignment_only_override_moves_content_without_resizing_pty() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let left = PanePaddingSpec {
+            max_content_width: Some(40),
+            ..PanePaddingSpec::default()
+        };
+        let centered = PanePaddingSpec {
+            horizontal_alignment: crate::padding::HorizontalAlignment::Center,
+            ..left
+        };
+        manager
+            .set_padding_override(session_id, None, Some(left))
+            .expect("set left-aligned override");
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+        let size_before = *last_requested_size.lock().unwrap();
+        let revision_before = manager.runtimes[&session_id].attach_view_revision;
+
+        let changed = manager
+            .set_padding_override(session_id, None, Some(centered))
+            .expect("move constrained content without resizing");
+
+        assert_eq!(changed.effective_content_rect.w, 40);
+        assert_eq!(changed.effective_content_rect.x, 40);
+        assert_eq!(*last_requested_size.lock().unwrap(), size_before);
+        assert_eq!(
+            manager.runtimes[&session_id].attach_view_revision,
+            revision_before + 1
+        );
     }
 
     #[test]

@@ -453,6 +453,91 @@ mod tests {
         assert!(damage.extension_surface_damaged(surface_id, pane_id));
     }
 
+    fn content_rect_scene(
+        pane_id: Uuid,
+        surface_id: Uuid,
+        content_rect: AttachRect,
+    ) -> AttachScene {
+        let mut surface = pane_surface(surface_id, pane_id, 0, 0, 20, 10, 0);
+        surface.content_rect = content_rect;
+        scene(vec![surface])
+    }
+
+    fn assert_content_rect_transition_damage(previous: AttachRect, next: AttachRect) {
+        let pane_id = Uuid::from_u128(1);
+        let surface_id = Uuid::from_u128(10);
+        let previous_scene = content_rect_scene(pane_id, surface_id, previous);
+        let next_scene = content_rect_scene(pane_id, surface_id, next);
+        let policy = DamageCoalescingPolicy {
+            max_rects: 64,
+            max_area_percent: 100,
+        };
+
+        let damage = attach_scene_damage_between(&previous_scene, &next_scene, policy);
+
+        assert_eq!(previous_scene.surfaces[0].rect, next_scene.surfaces[0].rect);
+        assert!(damage.content_surface_damaged(pane_id));
+        assert!(damage.extension_surface_damaged(surface_id, pane_id));
+        assert!(
+            !damage.extension_surface_rects(surface_id).is_empty(),
+            "old and new absolute content locations must repaint the pane background"
+        );
+    }
+
+    #[test]
+    fn content_rect_horizontal_movement_damages_old_and_new_locations() {
+        assert_content_rect_transition_damage(
+            AttachRect {
+                x: 1,
+                y: 1,
+                w: 12,
+                h: 8,
+            },
+            AttachRect {
+                x: 7,
+                y: 1,
+                w: 12,
+                h: 8,
+            },
+        );
+    }
+
+    #[test]
+    fn content_rect_vertical_movement_damages_old_and_new_locations() {
+        assert_content_rect_transition_damage(
+            AttachRect {
+                x: 1,
+                y: 1,
+                w: 18,
+                h: 5,
+            },
+            AttachRect {
+                x: 1,
+                y: 4,
+                w: 18,
+                h: 5,
+            },
+        );
+    }
+
+    #[test]
+    fn content_rect_shrink_and_expansion_damage_background_and_content() {
+        let full = AttachRect {
+            x: 1,
+            y: 1,
+            w: 18,
+            h: 8,
+        };
+        let constrained = AttachRect {
+            x: 5,
+            y: 2,
+            w: 10,
+            h: 6,
+        };
+        assert_content_rect_transition_damage(full, constrained);
+        assert_content_rect_transition_damage(constrained, full);
+    }
+
     #[test]
     fn attach_scene_damage_between_marks_metadata_changes_as_extension_damage() {
         let pane_id = Uuid::from_u128(1);

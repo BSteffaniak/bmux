@@ -670,5 +670,32 @@ mod tests {
             "absent zoomed_pane_id restores as unzoomed"
         );
         assert_eq!(decoded.sessions[0].focused_pane_id, Some(pane_id));
+        assert_eq!(decoded.sessions[0].panes[0].padding_override, None);
+    }
+
+    #[test]
+    fn schema_omits_absent_padding_override_and_decodes_it_as_none() {
+        let pane_id = Uuid::new_v4();
+        let pane = PaneRuntimeSnapshotV1Pane {
+            id: pane_id,
+            name: None,
+            shell: "/bin/sh".to_string(),
+            launch_command: None,
+            process_group_id: None,
+            active_command: None,
+            active_command_source: None,
+            last_known_cwd: None,
+            padding_override: None,
+        };
+        let value = serde_json::to_value(&pane).expect("encode pane snapshot");
+        assert!(
+            value
+                .get("padding_override")
+                .is_some_and(serde_json::Value::is_null),
+            "an absent override must not be serialized as a live specification"
+        );
+        let decoded: PaneRuntimeSnapshotV1Pane =
+            serde_json::from_value(value).expect("decode pane snapshot");
+        assert_eq!(decoded.padding_override, None);
     }
 }
