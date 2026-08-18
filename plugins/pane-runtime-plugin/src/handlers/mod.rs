@@ -58,6 +58,18 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-commands", "clear-pane-padding" => |req: padding::PanePaddingArgs, _ctx| {
             Ok::<_, ServiceResponse>(padding::clear(&req))
         },
+        "pane-runtime-commands", "begin-pane-padding-preview" => |req: padding::BeginPanePaddingPreviewArgs, ctx| {
+            Ok::<_, ServiceResponse>(padding::begin_preview(&req, ctx))
+        },
+        "pane-runtime-commands", "update-pane-padding-preview" => |req: padding::UpdatePanePaddingPreviewArgs, ctx| {
+            Ok::<_, ServiceResponse>(padding::update_preview(&req, ctx))
+        },
+        "pane-runtime-commands", "cancel-pane-padding-preview" => |req: padding::PreviewTokenArgs, ctx| {
+            Ok::<_, ServiceResponse>(padding::cancel_preview(&req, ctx))
+        },
+        "pane-runtime-commands", "commit-pane-padding-preview" => |req: padding::CommitPanePaddingPreviewArgs, ctx| {
+            Ok::<_, ServiceResponse>(padding::commit_preview(&req, ctx))
+        },
         "pane-runtime-commands", "split-pane" => |req: pane_commands::SplitPaneArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::split_pane(&req, ctx))
         },

@@ -453,6 +453,18 @@ fn format_pane_exit_reason(status: &portable_pty::ExitStatus) -> String {
     format!("process exited with status {}", status.exit_code())
 }
 
+struct PanePaddingPreviewTransaction {
+    owner_client_id: ClientId,
+    target_pane_ids: BTreeSet<Uuid>,
+    spec: PanePaddingSpec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanePaddingOverridePersistence {
+    Runtime,
+    Snapshot,
+}
+
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
     pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
@@ -465,6 +477,7 @@ struct SessionRuntimeManager {
     shell_integration_root: Option<std::path::PathBuf>,
     padding_config: PanePaddingConfig,
     restored_padding_overrides: BTreeMap<(SessionId, Uuid), PanePaddingSpec>,
+    padding_previews: BTreeMap<Uuid, PanePaddingPreviewTransaction>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
 }
 
@@ -589,6 +602,8 @@ struct PaneRuntimeHandle {
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
     input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
     padding_override: Option<PanePaddingSpec>,
+    padding_preview: Option<PanePaddingSpec>,
+    padding_override_persistence: PanePaddingOverridePersistence,
     #[cfg(feature = "image-registry")]
     image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
     /// Cell pixel dimensions reported by the client (width, height).
@@ -1956,6 +1971,209 @@ impl SessionRuntimeManager {
             .map(attach_rect_from_layout_rect)
     }
 
+    fn pane_session_id(&self, pane_id: Uuid) -> Option<SessionId> {
+        self.runtimes.iter().find_map(|(session_id, runtime)| {
+            runtime.panes.contains_key(&pane_id).then_some(*session_id)
+        })
+    }
+
+    fn preview_states(
+        &self,
+        token: Uuid,
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        let preview = self
+            .padding_previews
+            .get(&token)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        preview
+            .target_pane_ids
+            .iter()
+            .map(|pane_id| {
+                let session_id = self
+                    .pane_session_id(*pane_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                self.padding_state(session_id, Some(*pane_id))
+            })
+            .collect()
+    }
+
+    fn apply_preview_spec_to_targets(
+        &mut self,
+        target_pane_ids: &BTreeSet<Uuid>,
+        spec: Option<PanePaddingSpec>,
+    ) -> Result<(), SessionRuntimeError> {
+        let targets = target_pane_ids
+            .iter()
+            .map(|pane_id| {
+                let session_id = self
+                    .pane_session_id(*pane_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                let before = self.padding_state(session_id, Some(*pane_id))?;
+                Ok((session_id, *pane_id, before))
+            })
+            .collect::<Result<Vec<_>, SessionRuntimeError>>()?;
+        for (session_id, pane_id, before) in targets {
+            let pane = self
+                .runtimes
+                .get_mut(&session_id)
+                .and_then(|runtime| runtime.panes.get_mut(&pane_id))
+                .ok_or(SessionRuntimeError::NotFound)?;
+            pane.padding_preview = spec;
+            let after = self.padding_state(session_id, Some(pane_id))?;
+            self.apply_padding_geometry_change(session_id, pane_id, &before, &after)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_padding_preview(
+        &mut self,
+        owner_client_id: ClientId,
+        pane_ids: Vec<Uuid>,
+        spec: PanePaddingSpec,
+    ) -> Result<(Uuid, Vec<crate::padding_api::RuntimePanePaddingState>), SessionRuntimeError> {
+        validate_spec(spec).map_err(|_| SessionRuntimeError::Closed)?;
+        let target_pane_ids = pane_ids.into_iter().collect::<BTreeSet<_>>();
+        if target_pane_ids.is_empty()
+            || target_pane_ids
+                .iter()
+                .any(|pane_id| self.pane_session_id(*pane_id).is_none())
+        {
+            return Err(SessionRuntimeError::NotFound);
+        }
+        if self.padding_previews.values().any(|preview| {
+            preview.owner_client_id != owner_client_id
+                && !preview.target_pane_ids.is_disjoint(&target_pane_ids)
+        }) {
+            return Err(SessionRuntimeError::Closed);
+        }
+        let owned_tokens = self
+            .padding_previews
+            .iter()
+            .filter_map(|(token, preview)| {
+                (preview.owner_client_id == owner_client_id).then_some(*token)
+            })
+            .collect::<Vec<_>>();
+        for token in owned_tokens {
+            self.cancel_padding_preview(owner_client_id, token)?;
+        }
+        let token = Uuid::new_v4();
+        self.padding_previews.insert(
+            token,
+            PanePaddingPreviewTransaction {
+                owner_client_id,
+                target_pane_ids: target_pane_ids.clone(),
+                spec,
+            },
+        );
+        self.apply_preview_spec_to_targets(&target_pane_ids, Some(spec))?;
+        Ok((token, self.preview_states(token)?))
+    }
+
+    pub(crate) fn update_padding_preview(
+        &mut self,
+        owner_client_id: ClientId,
+        token: Uuid,
+        pane_ids: Vec<Uuid>,
+        spec: PanePaddingSpec,
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        validate_spec(spec).map_err(|_| SessionRuntimeError::Closed)?;
+        let next_targets = pane_ids.into_iter().collect::<BTreeSet<_>>();
+        let preview = self
+            .padding_previews
+            .get(&token)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if preview.owner_client_id != owner_client_id {
+            return Err(SessionRuntimeError::NotFound);
+        }
+        let previous_targets = preview.target_pane_ids.clone();
+        let previous_spec = preview.spec;
+        self.apply_preview_spec_to_targets(&previous_targets, None)?;
+        if next_targets.is_empty()
+            || next_targets
+                .iter()
+                .any(|pane_id| self.pane_session_id(*pane_id).is_none())
+            || self.padding_previews.iter().any(|(other_token, other)| {
+                *other_token != token
+                    && other.owner_client_id != owner_client_id
+                    && !other.target_pane_ids.is_disjoint(&next_targets)
+            })
+        {
+            self.apply_preview_spec_to_targets(&previous_targets, Some(previous_spec))?;
+            return Err(SessionRuntimeError::NotFound);
+        }
+        let preview = self
+            .padding_previews
+            .get_mut(&token)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        preview.target_pane_ids.clone_from(&next_targets);
+        preview.spec = spec;
+        self.apply_preview_spec_to_targets(&next_targets, Some(spec))?;
+        self.preview_states(token)
+    }
+
+    pub(crate) fn cancel_padding_preview(
+        &mut self,
+        owner_client_id: ClientId,
+        token: Uuid,
+    ) -> Result<(), SessionRuntimeError> {
+        let preview = self
+            .padding_previews
+            .remove(&token)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if preview.owner_client_id != owner_client_id {
+            self.padding_previews.insert(token, preview);
+            return Err(SessionRuntimeError::NotFound);
+        }
+        self.apply_preview_spec_to_targets(&preview.target_pane_ids, None)
+    }
+
+    pub(crate) fn commit_padding_preview(
+        &mut self,
+        owner_client_id: ClientId,
+        token: Uuid,
+        persistence: PanePaddingOverridePersistence,
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        let preview = self
+            .padding_previews
+            .remove(&token)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if preview.owner_client_id != owner_client_id {
+            self.padding_previews.insert(token, preview);
+            return Err(SessionRuntimeError::NotFound);
+        }
+        let targets = preview.target_pane_ids.iter().copied().collect::<Vec<_>>();
+        for pane_id in &targets {
+            let session_id = self
+                .pane_session_id(*pane_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            let pane = self
+                .runtimes
+                .get_mut(&session_id)
+                .and_then(|runtime| runtime.panes.get_mut(pane_id))
+                .ok_or(SessionRuntimeError::NotFound)?;
+            pane.padding_preview = None;
+            pane.padding_override = Some(preview.spec);
+            pane.padding_override_persistence = persistence;
+        }
+        mark_snapshot_dirty_flag();
+        targets
+            .into_iter()
+            .map(|pane_id| {
+                let session_id = self
+                    .pane_session_id(pane_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                self.padding_state(session_id, Some(pane_id))
+            })
+            .collect()
+    }
+
+    fn preview_spec_for_pane(&self, pane_id: Uuid) -> Option<PanePaddingSpec> {
+        self.padding_previews
+            .values()
+            .find(|preview| preview.target_pane_ids.contains(&pane_id))
+            .map(|preview| preview.spec)
+    }
+
     pub(crate) fn padding_state(
         &self,
         session_id: SessionId,
@@ -1985,19 +2203,23 @@ impl SessionRuntimeManager {
             active_command: active_command.as_deref(),
         };
         let declarative = self.padding_config.resolve(metadata, base, None);
-        let effective = self
+        let runtime_effective = self
             .padding_config
             .resolve(metadata, base, pane.padding_override);
+        let preview_spec = pane
+            .padding_preview
+            .or_else(|| self.preview_spec_for_pane(pane_id));
+        let effective_spec = preview_spec.unwrap_or(runtime_effective.spec);
         Ok(crate::padding_api::RuntimePanePaddingState {
             session_id: session_id.0,
             pane_id,
             declarative: declarative.spec,
             matched_rule_index: declarative.matched_rule_index,
             runtime_override: pane.padding_override,
-            effective: effective.spec,
+            effective: effective_spec,
             outer_rect: outer,
             base_content_rect: base,
-            effective_content_rect: padded_content_rect(base, effective.spec),
+            effective_content_rect: padded_content_rect(base, effective_spec),
             persist_runtime_overrides: self.padding_config.persist_runtime_overrides,
         })
     }
@@ -2063,6 +2285,13 @@ impl SessionRuntimeManager {
             .and_then(|runtime| runtime.panes.get_mut(&target))
             .ok_or(SessionRuntimeError::NotFound)?
             .padding_override = spec;
+        if let Some(pane) = self
+            .runtimes
+            .get_mut(&session_id)
+            .and_then(|runtime| runtime.panes.get_mut(&target))
+        {
+            pane.padding_override_persistence = PanePaddingOverridePersistence::Snapshot;
+        }
         let after = self.padding_state(session_id, Some(target))?;
         self.apply_padding_geometry_change(session_id, target, &before, &after)?;
         mark_snapshot_dirty_flag();
@@ -2089,7 +2318,9 @@ impl SessionRuntimeManager {
             .iter()
             .flat_map(|(session_id, runtime)| {
                 runtime.panes.iter().filter_map(|(pane_id, pane)| {
-                    pane.padding_override
+                    (pane.padding_override_persistence == PanePaddingOverridePersistence::Snapshot)
+                        .then_some(pane.padding_override)
+                        .flatten()
                         .map(|spec| ((*session_id, *pane_id), spec))
                 })
             })
@@ -2873,7 +3104,7 @@ fn pane_content_rect(
             shell: &pane.meta.shell,
             active_command: active_command.as_deref(),
         },
-        pane.padding_override,
+        pane.padding_preview.or(pane.padding_override),
         rect,
     )
 }
@@ -3285,6 +3516,7 @@ impl SessionRuntimeManager {
             shell_integration_root,
             padding_config,
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             pane_exit_tx,
         }
     }
@@ -4177,6 +4409,8 @@ impl SessionRuntimeManager {
             mouse_protocol_state,
             input_mode_state,
             padding_override,
+            padding_preview: None,
+            padding_override_persistence: PanePaddingOverridePersistence::Snapshot,
             #[cfg(feature = "image-registry")]
             image_registry,
             #[cfg(feature = "image-registry")]
@@ -4329,6 +4563,7 @@ impl SessionRuntimeManager {
         Ok(pane_id)
     }
 
+    #[allow(clippy::too_many_lines)] // Pane teardown atomically removes layout, floating dependents, inputs, scrollback pins, and preview targets.
     fn close_pane(
         &mut self,
         session_id: SessionId,
@@ -4377,6 +4612,11 @@ impl SessionRuntimeManager {
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
+        for preview in self.padding_previews.values_mut() {
+            preview.target_pane_ids.remove(&pane_id);
+        }
+        self.padding_previews
+            .retain(|_, preview| !preview.target_pane_ids.is_empty());
         session
             .scrollback_pins
             .retain(|(_, pinned_pane_id), _| *pinned_pane_id != pane_id);
@@ -4442,7 +4682,7 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
     ) -> Result<Uuid> {
-        let (pane_meta, padding_override) = {
+        let (pane_meta, padding_override, padding_override_persistence) = {
             let session = self
                 .runtimes
                 .get(&session_id)
@@ -4472,6 +4712,7 @@ impl SessionRuntimeManager {
                     },
                 },
                 pane.padding_override,
+                pane.padding_override_persistence,
             )
         };
 
@@ -4492,6 +4733,7 @@ impl SessionRuntimeManager {
 
         let mut new_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
         new_pane.padding_override = padding_override;
+        new_pane.padding_override_persistence = padding_override_persistence;
         self.register_pane_input(session_id, &new_pane);
         let client_ids = {
             let session = self
@@ -5369,6 +5611,17 @@ impl SessionRuntimeManager {
     }
 
     fn remove_runtime(&mut self, session_id: SessionId) -> Result<RemovedRuntime> {
+        let removed_pane_ids = self
+            .runtimes
+            .get(&session_id)
+            .map(|runtime| runtime.panes.keys().copied().collect::<BTreeSet<_>>())
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        self.padding_previews.retain(|_, preview| {
+            preview
+                .target_pane_ids
+                .retain(|pane_id| !removed_pane_ids.contains(pane_id));
+            !preview.target_pane_ids.is_empty()
+        });
         let runtime = self
             .runtimes
             .remove(&session_id)
@@ -5382,6 +5635,7 @@ impl SessionRuntimeManager {
     }
 
     fn remove_all_runtimes(&mut self) -> Vec<RemovedRuntime> {
+        self.padding_previews.clear();
         let runtimes = std::mem::take(&mut self.runtimes);
         if let Ok(mut index) = self.pane_input_index.write() {
             index.clear();
@@ -5434,7 +5688,19 @@ impl SessionRuntimeManager {
         Ok(())
     }
 
+    fn cancel_previews_for_client(&mut self, client_id: ClientId) {
+        let tokens = self
+            .padding_previews
+            .iter()
+            .filter_map(|(token, preview)| (preview.owner_client_id == client_id).then_some(*token))
+            .collect::<Vec<_>>();
+        for token in tokens {
+            let _ = self.cancel_padding_preview(client_id, token);
+        }
+    }
+
     fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
+        self.cancel_previews_for_client(client_id);
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
             let removed = runtime.attached_clients.remove(&client_id);
             if removed {
@@ -7649,6 +7915,54 @@ impl PanePaddingRuntimeHandle {
             .is_ok_and(|manager| manager.runtimes.contains_key(&session_id))
     }
 
+    pub(crate) fn begin_preview(
+        &self,
+        owner_client_id: ClientId,
+        pane_ids: Vec<Uuid>,
+        spec: PanePaddingSpec,
+    ) -> Result<(Uuid, Vec<crate::padding_api::RuntimePanePaddingState>), SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .begin_padding_preview(owner_client_id, pane_ids, spec)
+    }
+
+    pub(crate) fn update_preview(
+        &self,
+        owner_client_id: ClientId,
+        token: Uuid,
+        pane_ids: Vec<Uuid>,
+        spec: PanePaddingSpec,
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .update_padding_preview(owner_client_id, token, pane_ids, spec)
+    }
+
+    pub(crate) fn cancel_preview(
+        &self,
+        owner_client_id: ClientId,
+        token: Uuid,
+    ) -> Result<(), SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .cancel_padding_preview(owner_client_id, token)
+    }
+
+    pub(crate) fn commit_preview(
+        &self,
+        owner_client_id: ClientId,
+        token: Uuid,
+        persistence: PanePaddingOverridePersistence,
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .commit_padding_preview(owner_client_id, token, persistence)
+    }
+
     pub(crate) fn state(
         &self,
         session_id: SessionId,
@@ -8164,6 +8478,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_cross_client_padding_preview_is_rejected() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let first_owner = ClientId(Uuid::new_v4());
+        let second_owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let spec = PanePaddingSpec {
+            left: 2,
+            ..PanePaddingSpec::default()
+        };
+        manager
+            .begin_padding_preview(first_owner, vec![pane_id], spec)
+            .expect("first preview");
+
+        assert!(
+            manager
+                .begin_padding_preview(second_owner, vec![pane_id], spec)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn padding_preview_updates_cancels_and_commits_without_snapshot_leakage() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let runtime = runtime_with_panes(&[pane_id]);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let initial = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        let centered = PanePaddingSpec {
+            max_content_width: Some(40),
+            horizontal_alignment: crate::padding::HorizontalAlignment::Center,
+            ..PanePaddingSpec::default()
+        };
+
+        let (token, states) = manager
+            .begin_padding_preview(owner, vec![pane_id], centered)
+            .expect("begin preview");
+        assert_eq!(states[0].effective, centered);
+        assert_eq!(states[0].effective_content_rect.w, 40);
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+
+        let updated = PanePaddingSpec {
+            left: 3,
+            ..centered
+        };
+        let states = manager
+            .update_padding_preview(owner, token, vec![pane_id], updated)
+            .expect("update preview");
+        assert_eq!(states[0].effective, updated);
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+
+        manager
+            .cancel_padding_preview(owner, token)
+            .expect("cancel preview");
+        let cancelled = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        assert_eq!(cancelled.effective, initial.effective);
+        assert_eq!(cancelled.runtime_override, None);
+
+        let (token, _) = manager
+            .begin_padding_preview(owner, vec![pane_id], centered)
+            .expect("begin commit preview");
+        let committed = manager
+            .commit_padding_preview(owner, token, PanePaddingOverridePersistence::Runtime)
+            .expect("commit runtime preview");
+        assert_eq!(committed[0].runtime_override, Some(centered));
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+    }
+
+    #[tokio::test]
     async fn invalid_padding_mutation_is_atomic() {
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
@@ -8434,6 +8818,8 @@ mod tests {
             )),
             input_mode_state: Arc::new(std::sync::Mutex::new(AttachInputModeState::default())),
             padding_override: None,
+            padding_preview: None,
+            padding_override_persistence: PanePaddingOverridePersistence::Snapshot,
             #[cfg(feature = "image-registry")]
             image_registry: Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default())),
             #[cfg(feature = "image-registry")]
@@ -8479,6 +8865,7 @@ mod tests {
         SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -8601,6 +8988,7 @@ mod tests {
         let manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (owner_session_id, owner_runtime),
@@ -9135,6 +9523,7 @@ mod tests {
         let empty_manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -9191,6 +9580,7 @@ mod tests {
         let manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
@@ -9242,6 +9632,7 @@ mod tests {
         let manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([
                 (attach_session_id, attach_runtime),
                 (other_session_id, other_runtime),
@@ -9285,6 +9676,7 @@ mod tests {
         let mut manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -9332,6 +9724,7 @@ mod tests {
         let mut manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
@@ -9371,6 +9764,7 @@ mod tests {
         let mut manager = SessionRuntimeManager {
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
+            padding_previews: BTreeMap::new(),
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),

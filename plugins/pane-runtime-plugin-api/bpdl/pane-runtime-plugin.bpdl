@@ -175,6 +175,42 @@ interface pane-runtime-commands {
         pane-id: uuid?,
     ) -> result<pane-runtime-state.pane-padding-state, pane-command-error>;
 
+    record pane-padding-preview-token {
+        token: uuid,
+    }
+
+    record pane-padding-preview-state {
+        token: uuid,
+        pane-ids: list<uuid>,
+        padding: pane-runtime-state.pane-padding-spec,
+        panes: list<pane-runtime-state.pane-padding-state>,
+    }
+
+    variant pane-padding-persistence {
+        runtime,
+        snapshot,
+    }
+
+    command begin-pane-padding-preview(
+        pane-ids: list<uuid>,
+        padding: pane-runtime-state.pane-padding-spec,
+    ) -> result<pane-padding-preview-state, pane-command-error>;
+
+    command update-pane-padding-preview(
+        token: uuid,
+        pane-ids: list<uuid>,
+        padding: pane-runtime-state.pane-padding-spec,
+    ) -> result<pane-padding-preview-state, pane-command-error>;
+
+    command cancel-pane-padding-preview(
+        token: uuid,
+    ) -> result<pane-padding-preview-token, pane-command-error>;
+
+    command commit-pane-padding-preview(
+        token: uuid,
+        persistence: pane-padding-persistence,
+    ) -> result<list<pane-runtime-state.pane-padding-state>, pane-command-error>;
+
     // Split an existing pane along the given direction at the given
     // ratio (0.1..=0.9, clamped). Creates a new pane beside the target.
     command split-pane(
