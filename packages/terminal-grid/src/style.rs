@@ -32,6 +32,51 @@ pub struct Style {
     pub strike: bool,
 }
 
+impl Style {
+    /// Style used to fill cells erased or newly exposed while this style is
+    /// active.
+    ///
+    /// This implements background color erase (BCE), which the `bmux-256color`
+    /// terminfo entry advertises through `xterm-256color`. Applications rely on
+    /// it to paint a region by setting a background and then erasing (`EL`,
+    /// `ED`, `ECH`) or scrolling, instead of writing spaces across every column.
+    ///
+    /// `bg` is the erase color and is always preserved. `fg` is preserved only
+    /// alongside `inverse`, because inverse video makes the foreground the
+    /// effective background. Glyph-only attributes (`bold`, `italic`,
+    /// `underline`, `dim`, `strike`) must not persist into erased cells, since
+    /// they would otherwise decorate the blank spaces.
+    ///
+    /// When the active style contributes no background, this returns
+    /// [`Style::default`] so erased cells stay default-styled and remain
+    /// discardable trailing blanks.
+    #[must_use]
+    pub const fn erase_fill(self) -> Self {
+        if self.inverse {
+            return Self {
+                fg: self.fg,
+                bg: self.bg,
+                inverse: true,
+                bold: false,
+                italic: false,
+                underline: false,
+                dim: false,
+                strike: false,
+            };
+        }
+        Self {
+            fg: None,
+            bg: self.bg,
+            inverse: false,
+            bold: false,
+            italic: false,
+            underline: false,
+            dim: false,
+            strike: false,
+        }
+    }
+}
+
 /// Small style interner. The default style is always id 0.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StylePalette {

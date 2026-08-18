@@ -623,6 +623,69 @@ mod tests {
         assert!(rows[0].cells().is_empty());
     }
 
+    fn row_backgrounds(grid: &TerminalGrid, row: usize) -> Vec<Option<crate::style::Color>> {
+        let rows = grid.viewport_rows();
+        (0..grid.width())
+            .map(|col| {
+                rows[row]
+                    .cells()
+                    .get(col)
+                    .and_then(|cell| grid.palette().get(cell.style()).bg)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn erase_line_applies_background_color_erase_to_full_width() {
+        let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[41mabc\x1b[K");
+
+        let red = Some(crate::style::Color::Indexed(1));
+        assert_eq!(row_backgrounds(&grid, 0), vec![red; 10]);
+    }
+
+    #[test]
+    fn erase_display_applies_background_color_erase_to_all_rows() {
+        let mut grid = TerminalGrid::new(6, 3, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[44m\x1b[2J");
+
+        let blue = Some(crate::style::Color::Indexed(4));
+        for row in 0..3 {
+            assert_eq!(row_backgrounds(&grid, row), vec![blue; 6]);
+        }
+    }
+
+    #[test]
+    fn erase_chars_applies_background_color_erase_to_requested_span() {
+        let mut grid = TerminalGrid::new(8, 2, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[45m\x1b[3X");
+
+        let magenta = Some(crate::style::Color::Indexed(5));
+        assert_eq!(
+            row_backgrounds(&grid, 0),
+            vec![magenta, magenta, magenta, None, None, None, None, None]
+        );
+    }
+
+    #[test]
+    fn scroll_exposes_rows_with_background_color_erase() {
+        let mut grid = TerminalGrid::new(4, 3, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[46m\x1b[L");
+
+        let cyan = Some(crate::style::Color::Indexed(6));
+        assert_eq!(row_backgrounds(&grid, 0), vec![cyan; 4]);
+    }
+
+    #[test]
+    fn erase_with_default_background_stays_default_styled() {
+        let mut grid = TerminalGrid::new(6, 2, GridLimits::default()).unwrap();
+        // Bold/underline are glyph-only attributes and must not colorize erased
+        // cells, so the row stays compact and default-styled.
+        grid.process(b"\x1b[1;4mabc\x1b[2K");
+
+        assert!(grid.viewport_rows()[0].cells().is_empty());
+    }
+
     #[test]
     fn stream_preserves_split_escape_sequence() {
         let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();

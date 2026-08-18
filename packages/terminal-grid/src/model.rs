@@ -210,6 +210,20 @@ impl PhysicalRow {
         Self::default()
     }
 
+    /// Build a row whose columns are pre-filled with `style` blanks.
+    ///
+    /// A default-styled fill produces an empty row, matching the compact
+    /// representation where unwritten columns are implicit.
+    pub(crate) fn erase_filled(width: usize, style: StyleId) -> Self {
+        if style == StyleId::DEFAULT {
+            return Self::new();
+        }
+        Self {
+            cells: vec![Cell::blank(style); width],
+            wrapped: false,
+        }
+    }
+
     #[must_use]
     pub fn cells(&self) -> &[Cell] {
         &self.cells
@@ -237,13 +251,29 @@ impl PhysicalRow {
         self.cells.get_mut(col)
     }
 
-    pub(crate) fn clear_range(&mut self, start: usize, end: usize) {
-        if start >= end || start >= self.cells.len() {
+    pub(crate) fn clear_range(&mut self, start: usize, end: usize, style: StyleId) {
+        if start >= end {
             return;
         }
-        let clamped_end = end.min(self.cells.len());
-        for cell in &mut self.cells[start..clamped_end] {
-            *cell = Cell::blank(StyleId::DEFAULT);
+        if style == StyleId::DEFAULT {
+            if start >= self.cells.len() {
+                return;
+            }
+            let clamped_end = end.min(self.cells.len());
+            for cell in &mut self.cells[start..clamped_end] {
+                *cell = Cell::blank(StyleId::DEFAULT);
+            }
+        } else {
+            // A styled erase fill is materialized even past the current row
+            // extent, because background color erase must colorize columns that
+            // have never been written.
+            if self.cells.len() < end {
+                self.cells
+                    .resize_with(end, || Cell::blank(StyleId::DEFAULT));
+            }
+            for cell in &mut self.cells[start..end] {
+                *cell = Cell::blank(style);
+            }
         }
         self.trim_trailing_blanks();
     }
@@ -816,22 +846,23 @@ impl TerminalGrid {
     }
 
     pub(crate) fn erase_display(&mut self, mode: usize) {
+        let fill = self.erase_style();
         match mode {
             0 => {
                 self.erase_line(0);
                 for row in self.cursor.row + 1..self.height {
-                    self.clear_viewport_row(row);
+                    self.fill_viewport_row(row, fill);
                 }
             }
             1 => {
                 for row in 0..self.cursor.row {
-                    self.clear_viewport_row(row);
+                    self.fill_viewport_row(row, fill);
                 }
                 self.erase_line(1);
             }
             2 | 3 => {
                 for row in 0..self.height {
-                    self.clear_viewport_row(row);
+                    self.fill_viewport_row(row, fill);
                 }
                 if mode == 3 && self.mode == GridMode::Main {
                     self.main_history.clear();
@@ -848,12 +879,13 @@ impl TerminalGrid {
         let width = self.width;
         let col = self.cursor.col;
         let row = self.cursor_absolute_row();
+        let fill = self.erase_style();
         match mode {
-            0 => self.active_row_mut(row).clear_range(col, width),
+            0 => self.active_row_mut(row).clear_range(col, width, fill),
             1 => self
                 .active_row_mut(row)
-                .clear_range(0, col.saturating_add(1)),
-            2 => self.active_row_mut(row).clear_range(0, width),
+                .clear_range(0, col.saturating_add(1), fill),
+            2 => self.active_row_mut(row).clear_range(0, width, fill),
             _ => {}
         }
         self.bump_content_revision();
@@ -863,7 +895,8 @@ impl TerminalGrid {
         let start = self.cursor.col;
         let end = start.saturating_add(count.max(1)).min(self.width);
         let row = self.cursor_absolute_row();
-        self.active_row_mut(row).clear_range(start, end);
+        let fill = self.erase_style();
+        self.active_row_mut(row).clear_range(start, end, fill);
         self.bump_content_revision();
     }
 
@@ -872,12 +905,13 @@ impl TerminalGrid {
         let width = self.width;
         let col = self.cursor.col;
         let row = self.cursor_absolute_row();
+        let fill = self.erase_style();
         let mut cells = self.active_row_mut(row).visual_cells(width);
         for index in (col..width).rev() {
             cells[index] = if index >= col.saturating_add(count) {
                 cells[index - count].clone()
             } else {
-                Cell::blank(StyleId::DEFAULT)
+                Cell::blank(fill)
             };
         }
         self.replace_active_row(row, cells);
@@ -889,12 +923,13 @@ impl TerminalGrid {
         let width = self.width;
         let col = self.cursor.col;
         let row = self.cursor_absolute_row();
+        let fill = self.erase_style();
         let mut cells = self.active_row_mut(row).visual_cells(width);
         for index in col..width {
             cells[index] = if index + count < width {
                 cells[index + count].clone()
             } else {
-                Cell::blank(StyleId::DEFAULT)
+                Cell::blank(fill)
             };
         }
         self.replace_active_row(row, cells);
@@ -1170,8 +1205,17 @@ impl TerminalGrid {
         *self.active_row_mut(absolute) = value;
     }
 
-    fn clear_viewport_row(&mut self, row: usize) {
-        self.set_viewport_row(row, PhysicalRow::new());
+    /// Interned style used to fill erased or newly exposed cells (BCE).
+    fn erase_style(&mut self) -> StyleId {
+        let fill = self.current_style.erase_fill();
+        if fill == Style::default() {
+            return StyleId::DEFAULT;
+        }
+        self.palette.intern(fill)
+    }
+
+    fn fill_viewport_row(&mut self, row: usize, style: StyleId) {
+        self.set_viewport_row(row, PhysicalRow::erase_filled(self.width, style));
     }
 
     fn effective_scroll_region(&self) -> (usize, usize) {
@@ -1183,12 +1227,13 @@ impl TerminalGrid {
         if top >= bottom || bottom >= self.height {
             return;
         }
+        let fill = self.erase_style();
         for _ in 0..count.min(bottom - top + 1) {
             for row in top..bottom {
                 let next = self.viewport_row(row + 1);
                 self.set_viewport_row(row, next);
             }
-            self.clear_viewport_row(bottom);
+            self.fill_viewport_row(bottom, fill);
         }
     }
 
@@ -1196,29 +1241,33 @@ impl TerminalGrid {
         if top >= bottom || bottom >= self.height {
             return;
         }
+        let fill = self.erase_style();
         for _ in 0..count.min(bottom - top + 1) {
             for row in (top + 1..=bottom).rev() {
                 let previous = self.viewport_row(row - 1);
                 self.set_viewport_row(row, previous);
             }
-            self.clear_viewport_row(top);
+            self.fill_viewport_row(top, fill);
         }
     }
 
     fn scroll_up_one(&mut self) {
+        let fill = self.erase_style();
         match self.mode {
             GridMode::Main => {
                 if let Some(row) = self.main_rows.pop_front() {
                     self.push_history_row(&row);
                 }
-                self.main_rows.push_back(PhysicalRow::new());
+                self.main_rows
+                    .push_back(PhysicalRow::erase_filled(self.width, fill));
                 self.total_scrolled_rows = self.total_scrolled_rows.saturating_add(1);
                 self.evict_excess_history();
             }
             GridMode::Alternate => {
                 if !self.alt_rows.is_empty() {
                     self.alt_rows.remove(0);
-                    self.alt_rows.push(PhysicalRow::new());
+                    self.alt_rows
+                        .push(PhysicalRow::erase_filled(self.width, fill));
                 }
             }
         }
