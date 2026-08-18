@@ -8339,6 +8339,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn horizontal_viewport_insets_drive_scene_geometry_and_pty_size() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let last_requested_size =
+            Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+
+        let viewport = manager
+            .set_attach_viewport(session_id, client_id, 120, 40, 2, 7, 3, 11, 0, 0)
+            .expect("set four-edge viewport");
+
+        assert_eq!(viewport, (120, 40, 2, 7, 3, 11));
+        assert_eq!(*last_requested_size.lock().unwrap(), (33, 100));
+        let scene = manager
+            .build_attach_scene_for_client(session_id, client_id)
+            .expect("build attach scene");
+        let surface = scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.pane_id == Some(pane_id))
+            .expect("pane surface");
+        assert_eq!(
+            surface.rect,
+            AttachRect {
+                x: 11,
+                y: 2,
+                w: 102,
+                h: 35,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn viewport_height_resize_reselects_padding_rule_and_resizes_pty() {
         let session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
