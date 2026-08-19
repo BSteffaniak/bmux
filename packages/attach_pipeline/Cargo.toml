@@ -21,7 +21,6 @@ bmux_plugin                 = { workspace = true }
 bmux_scene_protocol         = { workspace = true }
 bmux_scene_protocol_render  = { workspace = true }
 bmux_terminal_grid          = { workspace = true }
-bmux_tui                    = { workspace = true }
 
 anyhow        = { workspace = true, features = ["std"] }
 crossterm     = { workspace = true, features = ["events"] }
@@ -45,5 +44,4 @@ fail-on-warnings = [
     "bmux_scene_protocol/fail-on-warnings",
     "bmux_scene_protocol_render/fail-on-warnings",
     "bmux_terminal_grid/fail-on-warnings",
-    "bmux_tui/fail-on-warnings",
 ]

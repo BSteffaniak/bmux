@@ -2304,6 +2304,30 @@ mod tests {
     }
 
     #[test]
+    fn identical_plugin_surface_frame_is_a_no_op() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let surface = RetainedSurface::builder(Uuid::from_u128(625), DamageRect::new(2, 2, 12, 2))
+            .revision(1)
+            .render_ops(vec![RenderOp::text_run(
+                2,
+                2,
+                "unchanged",
+                RenderStyle::new(),
+            )])
+            .build();
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            [surface.clone()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let damage =
+            compositor.replace_surfaces([surface], viewport, DamageCoalescingPolicy::default());
+        assert_eq!(damage, RetainedDamage::None);
+        assert!(compositor.repaint_plan(&damage).is_empty());
+    }
+
+    #[test]
     fn replace_surfaces_removal_damages_vacated_bounds_and_drops_state() {
         let viewport = DamageRect::new(0, 0, 80, 24);
         let mut compositor = RetainedCompositor::new();

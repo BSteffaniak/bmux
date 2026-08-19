@@ -1147,7 +1147,6 @@ dependencies = [
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
  "bmux_terminal_grid",
- "bmux_tui",
  "crossterm",
  "tracing",
  "unicode-width",

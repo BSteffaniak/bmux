@@ -3076,6 +3076,49 @@ fn attach_viewport_contract_has_no_status_specific_geometry() {
     }
 }
 
+/// HostRuntimeApi must remain a small domain-neutral convenience surface.
+#[test]
+fn host_runtime_api_remains_domain_neutral() {
+    let source = include_str!("../../plugin/src/host_runtime.rs");
+    let trait_body = source
+        .split("pub trait HostRuntimeApi")
+        .nth(1)
+        .and_then(|body| body.split("impl<T> HostRuntimeApi").next())
+        .expect("HostRuntimeApi trait body");
+    let required_methods = [
+        "fn core_cli_command_run_path(",
+        "fn plugin_command_run(",
+        "fn storage_get(",
+        "fn storage_set(",
+        "fn log_write(",
+    ];
+    for method in required_methods {
+        assert!(
+            trait_body.contains(method),
+            "HostRuntimeApi must retain {method}"
+        );
+    }
+    for denied in [
+        "fn window",
+        "fn session",
+        "fn context",
+        "fn client",
+        "fn pane",
+        "fn permission",
+        "bmux_windows_plugin_api",
+    ] {
+        assert!(
+            !trait_body.contains(denied),
+            "HostRuntimeApi must remain domain-neutral; found {denied}",
+        );
+    }
+    assert_eq!(
+        trait_body.matches("    fn ").count(),
+        required_methods.len(),
+        "HostRuntimeApi gained an unreviewed convenience method",
+    );
+}
+
 /// Generic presentation infrastructure must not acquire product-domain roles.
 #[test]
 fn plugin_presentation_primitives_remain_domain_neutral() {
