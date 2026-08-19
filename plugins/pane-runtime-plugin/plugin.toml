@@ -20,6 +20,11 @@ required_capabilities = [
 version = "0.0.1-alpha.0"
 
 [[dependencies]]
+plugin_id   = "bmux.windows"
+required    = false
+version_req = ">=0.0.1-alpha.0"
+
+[[dependencies]]
 plugin_id   = "bmux.sessions"
 version_req = ">=0.0.1-alpha.0"
 
@@ -149,6 +154,27 @@ choice_values = ["top", "center", "bottom"]
 kind          = "choice"
 long          = "vertical-alignment"
 name          = "vertical-alignment"
+
+[[commands]]
+accepts_repeat = false
+execution      = "caller_process"
+expose_in_cli  = true
+name           = "pane-padding-configure"
+path           = ["pane-padding", "configure"]
+summary        = "Open the live pane padding configurator"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+value_name = "UUID"
 
 [[commands]]
 expose_in_cli = true

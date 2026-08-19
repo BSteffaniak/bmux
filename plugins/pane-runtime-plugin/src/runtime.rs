@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{trace, warn};
@@ -74,6 +74,8 @@ const MAX_TERMINAL_GRID_DELTA_BATCHES: usize = 1_024;
 #[cfg(test)]
 const MAX_TERMINAL_GRID_DELTA_BYTES: usize = 16 * 1024 * 1024;
 const RESPONSE_METADATA_HEADROOM: usize = 65_536;
+const PANE_PADDING_PREVIEW_LEASE: Duration = Duration::from_mins(5);
+const PANE_PADDING_PREVIEW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
 
@@ -457,6 +459,7 @@ struct PanePaddingPreviewTransaction {
     owner_client_id: ClientId,
     target_pane_ids: BTreeSet<Uuid>,
     spec: PanePaddingSpec,
+    lease_expires_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2063,6 +2066,7 @@ impl SessionRuntimeManager {
                 owner_client_id,
                 target_pane_ids: target_pane_ids.clone(),
                 spec,
+                lease_expires_at: Instant::now() + PANE_PADDING_PREVIEW_LEASE,
             },
         );
         self.apply_preview_spec_to_targets(&target_pane_ids, Some(spec))?;
@@ -2107,6 +2111,7 @@ impl SessionRuntimeManager {
             .ok_or(SessionRuntimeError::NotFound)?;
         preview.target_pane_ids.clone_from(&next_targets);
         preview.spec = spec;
+        preview.lease_expires_at = Instant::now() + PANE_PADDING_PREVIEW_LEASE;
         self.apply_preview_spec_to_targets(&next_targets, Some(spec))?;
         self.preview_states(token)
     }
@@ -2135,35 +2140,43 @@ impl SessionRuntimeManager {
     ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
         let preview = self
             .padding_previews
-            .remove(&token)
+            .get(&token)
             .ok_or(SessionRuntimeError::NotFound)?;
         if preview.owner_client_id != owner_client_id {
-            self.padding_previews.insert(token, preview);
             return Err(SessionRuntimeError::NotFound);
         }
         let targets = preview.target_pane_ids.iter().copied().collect::<Vec<_>>();
-        for pane_id in &targets {
-            let session_id = self
-                .pane_session_id(*pane_id)
-                .ok_or(SessionRuntimeError::NotFound)?;
+        let target_sessions = targets
+            .iter()
+            .map(|pane_id| {
+                let session_id = self
+                    .pane_session_id(*pane_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                self.runtimes
+                    .get(&session_id)
+                    .and_then(|runtime| runtime.panes.get(pane_id))
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                Ok((*pane_id, session_id))
+            })
+            .collect::<Result<Vec<_>, SessionRuntimeError>>()?;
+        let preview = self
+            .padding_previews
+            .remove(&token)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        for (pane_id, session_id) in &target_sessions {
             let pane = self
                 .runtimes
-                .get_mut(&session_id)
+                .get_mut(session_id)
                 .and_then(|runtime| runtime.panes.get_mut(pane_id))
-                .ok_or(SessionRuntimeError::NotFound)?;
+                .expect("preview commit targets were validated while manager is exclusively held");
             pane.padding_preview = None;
             pane.padding_override = Some(preview.spec);
             pane.padding_override_persistence = persistence;
         }
         mark_snapshot_dirty_flag();
-        targets
+        target_sessions
             .into_iter()
-            .map(|pane_id| {
-                let session_id = self
-                    .pane_session_id(pane_id)
-                    .ok_or(SessionRuntimeError::NotFound)?;
-                self.padding_state(session_id, Some(pane_id))
-            })
+            .map(|(pane_id, session_id)| self.padding_state(session_id, Some(pane_id)))
             .collect()
     }
 
@@ -5699,6 +5712,30 @@ impl SessionRuntimeManager {
         }
     }
 
+    fn cancel_expired_padding_previews(&mut self, now: Instant) {
+        let expired = self
+            .padding_previews
+            .iter()
+            .filter_map(|(token, preview)| {
+                (preview.lease_expires_at <= now).then_some((*token, preview.owner_client_id))
+            })
+            .collect::<Vec<_>>();
+        for (token, owner_client_id) in expired {
+            let _ = self.cancel_padding_preview(owner_client_id, token);
+        }
+    }
+
+    fn cancel_all_padding_previews(&mut self) {
+        let previews = self
+            .padding_previews
+            .iter()
+            .map(|(token, preview)| (*token, preview.owner_client_id))
+            .collect::<Vec<_>>();
+        for (token, owner_client_id) in previews {
+            let _ = self.cancel_padding_preview(owner_client_id, token);
+        }
+    }
+
     fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
         self.cancel_previews_for_client(client_id);
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
@@ -7997,6 +8034,64 @@ impl PanePaddingRuntimeHandle {
         Ok(())
     }
 
+    pub(crate) fn cancel_all_previews(&self) -> Result<(), SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .cancel_all_padding_previews();
+        Ok(())
+    }
+
+    pub(crate) fn replace_padding_config(
+        &self,
+        padding_config: PanePaddingConfig,
+    ) -> Result<(), SessionRuntimeError> {
+        let mut manager = self.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
+        let targets = manager
+            .runtimes
+            .iter()
+            .flat_map(|(session_id, runtime)| {
+                runtime
+                    .panes
+                    .keys()
+                    .map(|pane_id| (*session_id, *pane_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let before = targets
+            .iter()
+            .map(|(session_id, pane_id)| {
+                manager
+                    .padding_state(*session_id, Some(*pane_id))
+                    .map(|state| (*session_id, *pane_id, state))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        manager.padding_config = padding_config;
+        for (session_id, pane_id, previous) in before {
+            let after = manager.padding_state(session_id, Some(pane_id))?;
+            manager.apply_padding_geometry_change(session_id, pane_id, &previous, &after)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pane_ids(&self, session_id: SessionId) -> Result<Vec<Uuid>, SessionRuntimeError> {
+        let manager = self.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
+        let runtime = manager
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        Ok(runtime.panes.keys().copied().collect())
+    }
+
+    pub(crate) fn all_pane_ids(&self) -> Result<Vec<Uuid>, SessionRuntimeError> {
+        let manager = self.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
+        Ok(manager
+            .runtimes
+            .values()
+            .flat_map(|runtime| runtime.panes.keys().copied())
+            .collect())
+    }
+
     pub(crate) fn set_override(
         &self,
         session_id: SessionId,
@@ -8035,6 +8130,19 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
     bmux_plugin::global_plugin_state_registry().register::<PanePaddingRuntimeHandle>(&Arc::new(
         std::sync::RwLock::new(PanePaddingRuntimeHandle(Arc::clone(&manager))),
     ));
+
+    let expiry_manager = Arc::clone(&manager);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Ok(mut manager) = expiry_manager.lock() else {
+                break;
+            };
+            manager.cancel_expired_padding_previews(Instant::now());
+        }
+    });
 
     let shutdown_rx = watch::channel(false).1;
     let exit_manager = Arc::clone(&manager);
@@ -8475,6 +8583,66 @@ mod tests {
         assert_eq!(cleared.runtime_override, None);
         assert_eq!(cleared.effective_content_rect.w, 118);
         assert_eq!(*last_requested_size.lock().unwrap(), (38, 118));
+    }
+
+    #[tokio::test]
+    async fn expired_padding_preview_restores_underlying_geometry() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let baseline = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        manager
+            .begin_padding_preview(
+                owner,
+                vec![pane_id],
+                PanePaddingSpec {
+                    left: 4,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("begin preview");
+
+        manager.cancel_expired_padding_previews(Instant::now() + PANE_PADDING_PREVIEW_LEASE);
+
+        assert!(manager.padding_previews.is_empty());
+        let restored = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        assert_eq!(restored.effective, baseline.effective);
+        assert_eq!(
+            restored.effective_content_rect,
+            baseline.effective_content_rect
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_padding_preview_renews_its_lease() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let (token, _) = manager
+            .begin_padding_preview(owner, vec![pane_id], PanePaddingSpec::default())
+            .expect("begin preview");
+        manager
+            .padding_previews
+            .get_mut(&token)
+            .unwrap()
+            .lease_expires_at = Instant::now();
+
+        manager
+            .update_padding_preview(
+                owner,
+                token,
+                vec![pane_id],
+                PanePaddingSpec {
+                    right: 3,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("update preview");
+        manager.cancel_expired_padding_previews(Instant::now());
+
+        assert!(manager.padding_previews.contains_key(&token));
     }
 
     #[tokio::test]

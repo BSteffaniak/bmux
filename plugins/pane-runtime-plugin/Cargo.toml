@@ -37,6 +37,7 @@ bmux_sessions_plugin_api = { workspace = true }
 bmux_snapshot_runtime = { workspace = true }
 bmux_terminal_grid = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
+bmux_windows_plugin_api = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
@@ -48,6 +49,7 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["serde", "std"] }
 

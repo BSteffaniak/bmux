@@ -72,6 +72,21 @@ impl RustPlugin for PaneRuntimePlugin {
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
+    fn deactivate(
+        &mut self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        if let Some(handle) = bmux_plugin::global_plugin_state_registry()
+            .get::<runtime::PanePaddingRuntimeHandle>()
+            .and_then(|handle| handle.read().ok().map(|guard| guard.clone()))
+        {
+            handle
+                .cancel_all_previews()
+                .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        }
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
     fn run_command(
         &mut self,
         context: NativeCommandContext,

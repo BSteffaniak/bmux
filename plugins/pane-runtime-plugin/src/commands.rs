@@ -1,11 +1,20 @@
 use bmux_clients_plugin_api::clients_state;
-use bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingState;
-use bmux_plugin::ServiceCallerDispatchClient;
+use bmux_pane_runtime_plugin_api::{
+    pane_runtime_commands,
+    pane_runtime_state::{self, PanePaddingState},
+};
+use bmux_plugin::{ServiceCallerDispatchClient, prompt};
 use bmux_plugin_sdk::{
     COMMAND_OUTCOME_STATUS_MESSAGE_KEY, NativeCommandContext, NativeCommandInvocationSource,
-    PluginCommandError, record_command_outcome_metadata,
+    PluginCommandError, PromptEvent, PromptFormField, PromptFormFieldKind, PromptFormSection,
+    PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
+    record_command_outcome_metadata,
 };
 use bmux_sessions_plugin_api::sessions_state;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::padding::{HorizontalAlignment, PanePaddingSpec, VerticalAlignment};
@@ -255,6 +264,9 @@ pub(crate) fn run(context: &NativeCommandContext) -> Result<(), PluginCommandErr
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?;
             emit_result(context, state.into_api());
         }
+        "pane-padding-configure" => {
+            configure(context)?;
+        }
         "pane-padding-reset" => {
             let state = handle
                 .set_override(session_id, pane_id, None)
@@ -263,6 +275,625 @@ pub(crate) fn run(context: &NativeCommandContext) -> Result<(), PluginCommandErr
         }
         command => return Err(PluginCommandError::unknown_command(command)),
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigureScope {
+    Pane,
+    Window,
+    Session,
+    All,
+    Global,
+}
+
+impl ConfigureScope {
+    fn parse(value: &str) -> Result<Self, PluginCommandError> {
+        match value {
+            "pane" => Ok(Self::Pane),
+            "window" => Ok(Self::Window),
+            "session" => Ok(Self::Session),
+            "all" => Ok(Self::All),
+            "global" => Ok(Self::Global),
+            _ => Err(PluginCommandError::invalid_arguments(
+                "scope must be pane, window, session, all, or global",
+            )),
+        }
+    }
+}
+
+fn select_options(values: &[(&str, &str)]) -> Vec<PromptOption> {
+    values
+        .iter()
+        .map(|(value, label)| PromptOption::new(*value, *label))
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)] // Keeping the fixed form schema together makes field defaults and sections reviewable.
+fn configure_request(spec: PanePaddingSpec) -> PromptRequest {
+    let edge = |id, label, value| {
+        PromptFormField::new(
+            id,
+            label,
+            PromptFormFieldKind::Integer {
+                initial_value: i64::from(value),
+                min: Some(0),
+                max: Some(i64::from(u16::MAX)),
+            },
+        )
+    };
+    PromptRequest::form(
+        "Pane Padding",
+        vec![
+            PromptFormSection::new(
+                "target",
+                "Target",
+                vec![
+                    PromptFormField::new(
+                        "scope",
+                        "Scope",
+                        PromptFormFieldKind::SingleSelect {
+                            options: select_options(&[
+                                ("pane", "Current pane"),
+                                ("window", "Current window"),
+                                ("session", "Current session"),
+                                ("all", "All open panes"),
+                                ("global", "Global default"),
+                            ]),
+                            default_index: 0,
+                        },
+                    ),
+                    PromptFormField::new(
+                        "lifetime",
+                        "Lifetime",
+                        PromptFormFieldKind::SingleSelect {
+                            options: select_options(&[
+                                ("runtime", "Runtime only"),
+                                ("snapshot", "Restore with pane"),
+                            ]),
+                            default_index: 0,
+                        },
+                    ),
+                ],
+            ),
+            PromptFormSection::new(
+                "padding",
+                "Padding",
+                vec![
+                    PromptFormField::new(
+                        "preset",
+                        "Preset",
+                        PromptFormFieldKind::SingleSelect {
+                            options: select_options(&[
+                                ("custom", "Custom"),
+                                ("none", "None"),
+                                ("comfortable", "Comfortable"),
+                                ("focused", "Focused reading"),
+                                ("presentation", "Presentation"),
+                            ]),
+                            default_index: 0,
+                        },
+                    ),
+                    edge("left", "Left", spec.left),
+                    edge("right", "Right", spec.right),
+                    edge("top", "Top", spec.top),
+                    edge("bottom", "Bottom", spec.bottom),
+                    PromptFormField::new(
+                        "limit-width",
+                        "Limit content width",
+                        PromptFormFieldKind::Bool {
+                            default: spec.max_content_width.is_some(),
+                        },
+                    ),
+                    PromptFormField::new(
+                        "max-content-width",
+                        "Maximum content width",
+                        PromptFormFieldKind::Integer {
+                            initial_value: i64::from(spec.max_content_width.unwrap_or(120)),
+                            min: Some(1),
+                            max: Some(i64::from(u16::MAX)),
+                        },
+                    ),
+                    PromptFormField::new(
+                        "limit-height",
+                        "Limit content height",
+                        PromptFormFieldKind::Bool {
+                            default: spec.max_content_height.is_some(),
+                        },
+                    ),
+                    PromptFormField::new(
+                        "max-content-height",
+                        "Maximum content height",
+                        PromptFormFieldKind::Integer {
+                            initial_value: i64::from(spec.max_content_height.unwrap_or(40)),
+                            min: Some(1),
+                            max: Some(i64::from(u16::MAX)),
+                        },
+                    ),
+                    PromptFormField::new(
+                        "horizontal-alignment",
+                        "Horizontal alignment",
+                        PromptFormFieldKind::SingleSelect {
+                            options: select_options(&[
+                                ("left", "Left"),
+                                ("center", "Center"),
+                                ("right", "Right"),
+                            ]),
+                            default_index: match spec.horizontal_alignment {
+                                HorizontalAlignment::Left => 0,
+                                HorizontalAlignment::Center => 1,
+                                HorizontalAlignment::Right => 2,
+                            },
+                        },
+                    ),
+                    PromptFormField::new(
+                        "vertical-alignment",
+                        "Vertical alignment",
+                        PromptFormFieldKind::SingleSelect {
+                            options: select_options(&[
+                                ("top", "Top"),
+                                ("center", "Center"),
+                                ("bottom", "Bottom"),
+                            ]),
+                            default_index: match spec.vertical_alignment {
+                                VerticalAlignment::Top => 0,
+                                VerticalAlignment::Center => 1,
+                                VerticalAlignment::Bottom => 2,
+                            },
+                        },
+                    ),
+                ],
+            ),
+        ],
+    )
+    .message("Changes preview live. Enter applies; Esc restores the previous geometry.")
+    .policy(PromptPolicy::RejectIfBusy)
+    .width_range(52, 88)
+    .form_live_preview(true)
+}
+
+fn integer_value(values: &BTreeMap<String, PromptFormValue>, key: &str) -> Option<u16> {
+    let PromptFormValue::Integer(value) = values.get(key)? else {
+        return None;
+    };
+    u16::try_from(*value).ok()
+}
+
+fn bool_value(values: &BTreeMap<String, PromptFormValue>, key: &str) -> Option<bool> {
+    let PromptFormValue::Bool(value) = values.get(key)? else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn single_value<'a>(values: &'a BTreeMap<String, PromptFormValue>, key: &str) -> Option<&'a str> {
+    let PromptFormValue::Single(value) = values.get(key)? else {
+        return None;
+    };
+    Some(value)
+}
+
+fn apply_preset(
+    values: &BTreeMap<String, PromptFormValue>,
+    spec: PanePaddingSpec,
+) -> PanePaddingSpec {
+    match single_value(values, "preset") {
+        Some("none") => PanePaddingSpec {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 0,
+            max_content_width: None,
+            max_content_height: None,
+            horizontal_alignment: HorizontalAlignment::Left,
+            vertical_alignment: VerticalAlignment::Top,
+        },
+        Some("comfortable") => PanePaddingSpec {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 1,
+            ..spec
+        },
+        Some("focused") => PanePaddingSpec {
+            left: 2,
+            right: 2,
+            top: 1,
+            bottom: 1,
+            max_content_width: Some(100),
+            horizontal_alignment: HorizontalAlignment::Center,
+            ..spec
+        },
+        Some("presentation") => PanePaddingSpec {
+            left: 4,
+            right: 4,
+            top: 2,
+            bottom: 2,
+            max_content_width: Some(120),
+            max_content_height: Some(40),
+            horizontal_alignment: HorizontalAlignment::Center,
+            vertical_alignment: VerticalAlignment::Center,
+        },
+        _ => {
+            // Preserve the current draft for the custom option.
+            spec
+        }
+    }
+}
+
+fn spec_from_form(
+    values: &BTreeMap<String, PromptFormValue>,
+    spec: PanePaddingSpec,
+) -> Result<PanePaddingSpec, PluginCommandError> {
+    let mut spec = apply_preset(values, spec);
+    if !matches!(single_value(values, "preset"), Some("custom") | None) {
+        return Ok(spec);
+    }
+    for (key, target) in [
+        ("left", &mut spec.left),
+        ("right", &mut spec.right),
+        ("top", &mut spec.top),
+        ("bottom", &mut spec.bottom),
+    ] {
+        if let Some(value) = integer_value(values, key) {
+            *target = value;
+        }
+    }
+    if let Some(enabled) = bool_value(values, "limit-width") {
+        spec.max_content_width = if enabled {
+            Some(integer_value(values, "max-content-width").ok_or_else(|| {
+                PluginCommandError::invalid_arguments("maximum content width must be 1..65535")
+            })?)
+        } else {
+            None
+        };
+    }
+    if let Some(enabled) = bool_value(values, "limit-height") {
+        spec.max_content_height = if enabled {
+            Some(integer_value(values, "max-content-height").ok_or_else(|| {
+                PluginCommandError::invalid_arguments("maximum content height must be 1..65535")
+            })?)
+        } else {
+            None
+        };
+    }
+    if let Some(value) = single_value(values, "horizontal-alignment") {
+        spec.horizontal_alignment =
+            HorizontalAlignment::parse(value).map_err(PluginCommandError::invalid_arguments)?;
+    }
+    if let Some(value) = single_value(values, "vertical-alignment") {
+        spec.vertical_alignment =
+            VerticalAlignment::parse(value).map_err(PluginCommandError::invalid_arguments)?;
+    }
+    Ok(spec)
+}
+
+fn resolve_scope(
+    context: &NativeCommandContext,
+    session_id: SessionId,
+    pane_id: Uuid,
+    scope: ConfigureScope,
+) -> Result<Vec<Uuid>, PluginCommandError> {
+    let handle = handle()?;
+    match scope {
+        ConfigureScope::Pane => Ok(vec![pane_id]),
+        ConfigureScope::Session => handle
+            .pane_ids(session_id)
+            .map_err(|error| PluginCommandError::failed(error.to_string())),
+        ConfigureScope::All | ConfigureScope::Global => handle
+            .all_pane_ids()
+            .map_err(|error| PluginCommandError::failed(error.to_string())),
+        ConfigureScope::Window => {
+            if !context
+                .available_capabilities
+                .iter()
+                .any(|capability| capability == "bmux.windows.read")
+            {
+                return Err(PluginCommandError::unavailable(
+                    "current-window scope requires the windows plugin",
+                ));
+            }
+            let mut window_context = context.clone();
+            if !window_context
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == "bmux.windows.read")
+            {
+                window_context
+                    .required_capabilities
+                    .push("bmux.windows.read".to_string());
+            }
+            let mut client = ServiceCallerDispatchClient::new(&window_context);
+            let result = bmux_plugin::block_on_typed_dispatch(
+                bmux_windows_plugin_api::windows_state::client::active_window_panes(&mut client),
+            )
+            .map_err(|error| {
+                PluginCommandError::failed(format!("window target lookup failed: {error}"))
+            })?
+            .map_err(|error| {
+                PluginCommandError::failed(format!("window target unavailable: {error:?}"))
+            })?;
+            Ok(result.pane_ids)
+        }
+    }
+}
+
+fn padding_settings_value(spec: PanePaddingSpec) -> toml::Value {
+    let mut padding = toml::map::Map::new();
+    padding.insert(
+        "left".to_string(),
+        toml::Value::Integer(i64::from(spec.left)),
+    );
+    padding.insert(
+        "right".to_string(),
+        toml::Value::Integer(i64::from(spec.right)),
+    );
+    padding.insert("top".to_string(), toml::Value::Integer(i64::from(spec.top)));
+    padding.insert(
+        "bottom".to_string(),
+        toml::Value::Integer(i64::from(spec.bottom)),
+    );
+    if let Some(value) = spec.max_content_width {
+        padding.insert(
+            "max_content_width".to_string(),
+            toml::Value::Integer(i64::from(value)),
+        );
+    }
+    if let Some(value) = spec.max_content_height {
+        padding.insert(
+            "max_content_height".to_string(),
+            toml::Value::Integer(i64::from(value)),
+        );
+    }
+    padding.insert(
+        "horizontal_alignment".to_string(),
+        toml::Value::String(spec.horizontal_alignment.as_str().to_string()),
+    );
+    padding.insert(
+        "vertical_alignment".to_string(),
+        toml::Value::String(spec.vertical_alignment.as_str().to_string()),
+    );
+    let mut settings = toml::map::Map::new();
+    settings.insert("padding".to_string(), toml::Value::Table(padding));
+    toml::Value::Table(settings)
+}
+
+fn set_padding_document(
+    source: &str,
+    spec: PanePaddingSpec,
+) -> Result<toml_edit::DocumentMut, PluginCommandError> {
+    let mut document = if source.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        source.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            PluginCommandError::failed(format!("cannot parse bmux.toml: {error}"))
+        })?
+    };
+    let padding = &mut document["plugins"]["settings"]["bmux.pane_runtime"]["padding"];
+    padding["left"] = toml_edit::value(i64::from(spec.left));
+    padding["right"] = toml_edit::value(i64::from(spec.right));
+    padding["top"] = toml_edit::value(i64::from(spec.top));
+    padding["bottom"] = toml_edit::value(i64::from(spec.bottom));
+    if let Some(value) = spec.max_content_width {
+        padding["max_content_width"] = toml_edit::value(i64::from(value));
+    } else {
+        padding
+            .as_table_like_mut()
+            .map(|table| table.remove("max_content_width"));
+    }
+    if let Some(value) = spec.max_content_height {
+        padding["max_content_height"] = toml_edit::value(i64::from(value));
+    } else {
+        padding
+            .as_table_like_mut()
+            .map(|table| table.remove("max_content_height"));
+    }
+    padding["horizontal_alignment"] = toml_edit::value(spec.horizontal_alignment.as_str());
+    padding["vertical_alignment"] = toml_edit::value(spec.vertical_alignment.as_str());
+    Ok(document)
+}
+
+fn config_path(context: &NativeCommandContext) -> PathBuf {
+    context
+        .connection
+        .probe_config_file("bmux.toml")
+        .unwrap_or_else(|| PathBuf::from(&context.connection.config_dir).join("bmux.toml"))
+}
+
+fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| PluginCommandError::failed("invalid config path"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        PluginCommandError::failed(format!("cannot create config dir: {error}"))
+    })?;
+    let temporary = parent.join(format!(".bmux.toml.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| {
+                PluginCommandError::failed(format!("cannot create config temp file: {error}"))
+            })?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| PluginCommandError::failed(format!("cannot flush config: {error}")))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| PluginCommandError::failed(format!("cannot replace config: {error}")))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn install_global_padding(
+    context: &NativeCommandContext,
+    spec: PanePaddingSpec,
+) -> Result<(), PluginCommandError> {
+    let settings = padding_settings_value(spec);
+    let config = crate::padding::PanePaddingConfig::parse(Some(&settings))
+        .map_err(PluginCommandError::invalid_arguments)?;
+    let path = config_path(context);
+    let original = fs::read(&path).unwrap_or_default();
+    let source = String::from_utf8(original.clone())
+        .map_err(|_| PluginCommandError::failed("bmux.toml is not valid UTF-8"))?;
+    let edited = set_padding_document(&source, spec)?
+        .to_string()
+        .into_bytes();
+    let current = fs::read(&path).unwrap_or_default();
+    if current != original {
+        return Err(PluginCommandError::failed(
+            "bmux.toml changed while pane padding was being applied",
+        ));
+    }
+    atomic_replace(&path, &edited)?;
+    if let Err(error) = handle()?.replace_padding_config(config) {
+        let _ = atomic_replace(&path, &original);
+        return Err(PluginCommandError::failed(format!(
+            "failed installing live pane padding: {error}"
+        )));
+    }
+    Ok(())
+}
+
+fn preview_spec(spec: PanePaddingSpec) -> pane_runtime_state::PanePaddingSpec {
+    crate::padding_api::spec_to_api(spec)
+}
+
+#[allow(clippy::too_many_lines)] // The prompt transaction loop keeps submit, cancel, and live-update ownership visibly together.
+fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
+    let session_id = selected_session(context)?;
+    let explicit_pane = target_pane(&context.arguments)?;
+    let current = handle()?
+        .state(session_id, explicit_pane)
+        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+    let pane_id = current.pane_id;
+    let initial_spec = current.effective;
+    let prompt = configure_request(initial_spec);
+    let (mut response_rx, mut event_rx) = prompt::submit_with_events(prompt)
+        .map_err(|error| PluginCommandError::unavailable(error.to_string()))?;
+    let context = context.clone();
+    tokio::spawn(async move {
+        let mut scope = ConfigureScope::Pane;
+        let mut spec = initial_spec;
+        let Ok(initial_targets) = resolve_scope(&context, session_id, pane_id, scope) else {
+            return;
+        };
+        let mut targets = initial_targets.clone();
+        let mut client = ServiceCallerDispatchClient::new(&context);
+        let Ok(Ok(started)) = bmux_plugin::block_on_typed_dispatch(
+            pane_runtime_commands::client::begin_pane_padding_preview(
+                &mut client,
+                initial_targets,
+                preview_spec(spec),
+            ),
+        ) else {
+            return;
+        };
+        let token = started.token;
+        let mut lifetime = pane_runtime_commands::PanePaddingPersistence::Runtime;
+        loop {
+            tokio::select! {
+                response = &mut response_rx => {
+                    match response {
+                        Ok(PromptResponse::Submitted(PromptValue::Form(values))) => {
+                            let final_spec = spec_from_form(&values, spec).unwrap_or(spec);
+                            let final_scope = single_value(&values, "scope")
+                                .and_then(|value| ConfigureScope::parse(value).ok())
+                                .unwrap_or(scope);
+                            if let Ok(final_targets) = resolve_scope(
+                                &context,
+                                session_id,
+                                pane_id,
+                                final_scope,
+                            ) && (final_targets != targets || final_spec != spec)
+                            {
+                                let updated = bmux_plugin::block_on_typed_dispatch(
+                                    pane_runtime_commands::client::update_pane_padding_preview(
+                                        &mut client,
+                                        token,
+                                        final_targets.clone(),
+                                        preview_spec(final_spec),
+                                    ),
+                                );
+                                if !matches!(updated, Ok(Ok(_))) {
+                                    let _ = bmux_plugin::block_on_typed_dispatch(
+                                        pane_runtime_commands::client::cancel_pane_padding_preview(
+                                            &mut client, token,
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                            if let Some(value) = single_value(&values, "lifetime") {
+                                lifetime = if value == "snapshot" {
+                                    pane_runtime_commands::PanePaddingPersistence::Snapshot
+                                } else {
+                                    pane_runtime_commands::PanePaddingPersistence::Runtime
+                                };
+                            }
+                            if final_scope == ConfigureScope::Global {
+                                let cancelled = bmux_plugin::block_on_typed_dispatch(
+                                    pane_runtime_commands::client::cancel_pane_padding_preview(
+                                        &mut client, token,
+                                    ),
+                                );
+                                if matches!(cancelled, Ok(Ok(_))) {
+                                    let _ = install_global_padding(&context, final_spec);
+                                }
+                            } else {
+                                let _ = bmux_plugin::block_on_typed_dispatch(
+                                    pane_runtime_commands::client::commit_pane_padding_preview(
+                                        &mut client, token, lifetime,
+                                    ),
+                                );
+                            }
+                        }
+                        _ => {
+                            let _ = bmux_plugin::block_on_typed_dispatch(
+                                pane_runtime_commands::client::cancel_pane_padding_preview(
+                                    &mut client, token,
+                                ),
+                            );
+                        }
+                    }
+                    break;
+                }
+                event = event_rx.recv() => {
+                    let Some(PromptEvent::FormChanged { values, .. }) = event else {
+                        continue;
+                    };
+                    let Ok(next_spec) = spec_from_form(&values, spec) else {
+                        continue;
+                    };
+                    let next_scope = single_value(&values, "scope")
+                        .and_then(|value| ConfigureScope::parse(value).ok())
+                        .unwrap_or(scope);
+                    let next_targets = if next_scope == scope {
+                        targets.clone()
+                    } else {
+                        let Ok(resolved) = resolve_scope(&context, session_id, pane_id, next_scope)
+                        else {
+                            continue;
+                        };
+                        resolved
+                    };
+                    let result = bmux_plugin::block_on_typed_dispatch(
+                        pane_runtime_commands::client::update_pane_padding_preview(
+                            &mut client, token, next_targets.clone(), preview_spec(next_spec),
+                        ),
+                    );
+                    if matches!(result, Ok(Ok(_))) {
+                        scope = next_scope;
+                        spec = next_spec;
+                        targets = next_targets;
+                    }
+                }
+            }
+        }
+    });
     Ok(())
 }
 
@@ -354,6 +985,67 @@ mod tests {
             invocation_source,
             host_kernel_bridge: None,
         }
+    }
+
+    #[test]
+    fn global_padding_edit_preserves_unrelated_content() {
+        let source = r#"# keep this comment
+[ui]
+status = true
+
+[plugins.settings."bmux.pane_runtime".padding]
+left = 9 # old value
+
+[plugins.settings."bmux.other"]
+enabled = true
+"#;
+        let spec = PanePaddingSpec {
+            left: 2,
+            right: 3,
+            top: 1,
+            bottom: 4,
+            max_content_width: Some(100),
+            horizontal_alignment: HorizontalAlignment::Center,
+            ..PanePaddingSpec::default()
+        };
+
+        let edited = set_padding_document(source, spec).unwrap().to_string();
+
+        assert!(edited.contains("# keep this comment"));
+        assert!(edited.contains("[ui]"));
+        assert!(edited.contains("[plugins.settings.\"bmux.other\"]"));
+        assert!(edited.contains("left = 2"));
+        assert!(edited.contains("max_content_width = 100"));
+        assert!(edited.contains("horizontal_alignment = \"center\""));
+    }
+
+    #[test]
+    fn form_limits_and_presets_produce_complete_specs() {
+        let values = BTreeMap::from([
+            (
+                "preset".to_string(),
+                PromptFormValue::Single("custom".to_string()),
+            ),
+            ("limit-width".to_string(), PromptFormValue::Bool(true)),
+            (
+                "max-content-width".to_string(),
+                PromptFormValue::Integer(88),
+            ),
+            ("limit-height".to_string(), PromptFormValue::Bool(false)),
+        ]);
+        let spec = spec_from_form(&values, PanePaddingSpec::default()).unwrap();
+        assert_eq!(spec.max_content_width, Some(88));
+        assert_eq!(spec.max_content_height, None);
+
+        let preset = BTreeMap::from([(
+            "preset".to_string(),
+            PromptFormValue::Single("presentation".to_string()),
+        )]);
+        let spec = spec_from_form(&preset, PanePaddingSpec::default()).unwrap();
+        assert_eq!((spec.left, spec.right, spec.top, spec.bottom), (4, 4, 2, 2));
+        assert_eq!(spec.max_content_width, Some(120));
+        assert_eq!(spec.max_content_height, Some(40));
+        assert_eq!(spec.vertical_alignment, VerticalAlignment::Center);
     }
 
     #[test]

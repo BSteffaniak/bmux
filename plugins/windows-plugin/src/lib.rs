@@ -24,7 +24,8 @@ use bmux_windows_plugin_api::windows_commands::{
     WindowMovePlacement, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{
-    self, FloatingPaneState, PaneState, WindowEntry, WindowsStateService,
+    self, ActiveWindowPaneQueryError, ActiveWindowPaneSet, FloatingPaneState, PaneState,
+    WindowEntry, WindowsStateService,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -96,6 +97,60 @@ fn current_context(caller: &(impl ServiceCaller + Sync)) -> Result<Option<Contex
     let mut client = dispatch_client(caller);
     bmux_plugin::block_on_typed_dispatch(api_contexts_state::client::current_context(&mut client))
         .map_err(|err| typed_service_error("contexts-state/current-context", err))
+}
+
+fn active_window_pane_set(
+    window: &ContextSummary,
+    selected_session_id: Option<Uuid>,
+    panes: api_pane_runtime_state::SessionPaneList,
+) -> Result<ActiveWindowPaneSet, ActiveWindowPaneQueryError> {
+    let session_id = selected_session_id.ok_or(ActiveWindowPaneQueryError::NoSelectedSession)?;
+    if panes.session_id != session_id {
+        return Err(ActiveWindowPaneQueryError::Failed {
+            reason: format!(
+                "pane runtime returned session {} while active window targets {session_id}",
+                panes.session_id
+            ),
+        });
+    }
+    Ok(ActiveWindowPaneSet {
+        window_id: window.id,
+        session_id,
+        pane_ids: panes.panes.into_iter().map(|pane| pane.id).collect(),
+    })
+}
+
+fn active_window_panes(
+    caller: &(impl ServiceCaller + Sync),
+) -> Result<ActiveWindowPaneSet, ActiveWindowPaneQueryError> {
+    let window = current_context(caller)
+        .map_err(|reason| ActiveWindowPaneQueryError::Failed { reason })?
+        .ok_or(ActiveWindowPaneQueryError::NoActiveWindow)?;
+    let mut client = dispatch_client(caller);
+    let current_client = bmux_plugin::block_on_typed_dispatch(
+        api_clients_state::client::current_client(&mut client),
+    )
+    .map_err(|error| ActiveWindowPaneQueryError::Failed {
+        reason: typed_service_error("clients-state/current-client", error),
+    })?
+    .map_err(|error| ActiveWindowPaneQueryError::Failed {
+        reason: format!("current client unavailable: {error:?}"),
+    })?;
+    if current_client
+        .selected_context_id
+        .is_some_and(|id| id != window.id)
+    {
+        return Err(ActiveWindowPaneQueryError::Failed {
+            reason: "active window and current client context are temporarily inconsistent"
+                .to_string(),
+        });
+    }
+    let session_id = current_client
+        .selected_session_id
+        .ok_or(ActiveWindowPaneQueryError::NoSelectedSession)?;
+    let panes = list_panes(caller, Some(session_id))
+        .map_err(|reason| ActiveWindowPaneQueryError::Failed { reason })?;
+    active_window_pane_set(&window, Some(session_id), panes)
 }
 
 fn create_context(
@@ -1095,6 +1150,9 @@ impl RustPlugin for WindowsPlugin {
                 let windows = list_windows(ctx, &self.runtime_state, req.session.as_deref())
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
                 Ok(windows)
+            },
+            "windows-state", "active-window-panes" => |_req: (), ctx| {
+                Ok::<_, ServiceResponse>(active_window_panes(ctx))
             },
             "windows-commands", "new-window" => |req: NewWindowArgs, ctx| {
                 create_window(ctx, &self.runtime_state, req.name)
@@ -3800,6 +3858,19 @@ impl WindowsStateService for WindowsStateHandle {
                 .unwrap_or_default()
         })
     }
+
+    fn active_window_panes<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ActiveWindowPaneSet, ActiveWindowPaneQueryError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move { active_window_panes(&*caller) })
+    }
 }
 
 #[cfg(test)]
@@ -4110,6 +4181,67 @@ mod tests {
             id: None,
             name: Some(name.to_string()),
         }
+    }
+
+    #[test]
+    fn active_window_pane_set_preserves_window_session_and_pane_identity() {
+        let window_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let window = ContextSummary {
+            id: window_id,
+            name: Some("work".to_string()),
+            attributes: BTreeMap::new(),
+        };
+        let panes = api_pane_runtime_state::SessionPaneList {
+            session_id,
+            panes: vec![
+                api_pane_runtime_state::PaneSummary {
+                    id: first,
+                    name: None,
+                    shell: "sh".to_string(),
+                    active_command: None,
+                    focused: true,
+                },
+                api_pane_runtime_state::PaneSummary {
+                    id: second,
+                    name: None,
+                    shell: "sh".to_string(),
+                    active_command: None,
+                    focused: false,
+                },
+            ],
+        };
+
+        let result = active_window_pane_set(&window, Some(session_id), panes).unwrap();
+
+        assert_eq!(result.window_id, window_id);
+        assert_eq!(result.session_id, session_id);
+        assert_eq!(result.pane_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn active_window_pane_set_rejects_missing_or_mismatched_session() {
+        let session_id = Uuid::new_v4();
+        let window = ContextSummary {
+            id: Uuid::new_v4(),
+            name: None,
+            attributes: BTreeMap::new(),
+        };
+        let panes = api_pane_runtime_state::SessionPaneList {
+            session_id,
+            panes: Vec::new(),
+        };
+
+        assert_eq!(
+            active_window_pane_set(&window, None, panes.clone()),
+            Err(ActiveWindowPaneQueryError::NoSelectedSession)
+        );
+        assert!(matches!(
+            active_window_pane_set(&window, Some(Uuid::new_v4()), panes),
+            Err(ActiveWindowPaneQueryError::Failed { .. })
+        ));
     }
 
     #[test]

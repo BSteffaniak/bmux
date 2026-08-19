@@ -65,8 +65,22 @@ interface windows-state {
     query list-panes(session: uuid) -> list<pane-state>;
     query list-floating-panes(session: uuid?) -> list<floating-pane-state>;
 
+    record active-window-pane-set {
+        window-id: uuid,
+        session-id: uuid,
+        pane-ids: list<uuid>,
+    }
+
+    variant active-window-pane-query-error {
+        no-active-window,
+        no-selected-session,
+        failed { reason: string },
+    }
+
     // Window-level queries.
     query list-windows(session: string?) -> list<window-entry>;
+    query active-window-panes()
+        -> result<active-window-pane-set, active-window-pane-query-error>;
 }
 
 @capability(WINDOWS_WRITE)
