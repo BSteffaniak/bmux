@@ -92,6 +92,40 @@ pub struct PluginLayoutRequest {
     pub operation: LayoutOperation,
 }
 
+impl PluginLayoutRequest {
+    #[must_use]
+    pub const fn split(
+        id: PluginLayoutId,
+        order: i32,
+        edge: LayoutEdge,
+        extent: LayoutExtent,
+    ) -> Self {
+        Self {
+            id,
+            order,
+            operation: LayoutOperation::Split { edge, extent },
+        }
+    }
+
+    #[must_use]
+    pub const fn overlay(id: PluginLayoutId, order: i32) -> Self {
+        Self {
+            id,
+            order,
+            operation: LayoutOperation::Overlay,
+        }
+    }
+
+    #[must_use]
+    pub const fn hidden(id: PluginLayoutId, order: i32) -> Self {
+        Self {
+            id,
+            order,
+            operation: LayoutOperation::Hidden,
+        }
+    }
+}
+
 /// Resolved region for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginLayoutAllocation {

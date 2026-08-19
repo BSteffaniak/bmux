@@ -101,6 +101,69 @@ pub struct PluginSurface {
     pub ops: Vec<RenderOp>,
 }
 
+impl PluginSurface {
+    #[must_use]
+    pub const fn layout(
+        id: PluginSurfaceId,
+        revision: u64,
+        layout_id: PluginLayoutId,
+        ops: Vec<RenderOp>,
+    ) -> Self {
+        Self {
+            id,
+            revision,
+            target: PluginSurfaceTarget::Layout(layout_id),
+            clip_rect: None,
+            interactive_regions: Vec::new(),
+            accepts_input: false,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            visible: true,
+            ops,
+        }
+    }
+
+    #[must_use]
+    pub fn interactive_region(mut self, region: PluginSurfaceRegion) -> Self {
+        self.accepts_input = true;
+        self.interactive_regions.push(region);
+        self
+    }
+
+    #[must_use]
+    pub const fn opaque(mut self, opaque: bool) -> Self {
+        self.opaque = opaque;
+        self
+    }
+
+    #[must_use]
+    pub const fn order(mut self, layer: i16, z: i32) -> Self {
+        self.layer = layer;
+        self.z = z;
+        self
+    }
+}
+
+impl PluginSurfaceRegion {
+    #[must_use]
+    pub fn new(local_id: impl Into<String>, rect: ExtensionRect) -> Self {
+        Self {
+            local_id: local_id.into(),
+            rect,
+            focusable: false,
+            cursor: PluginSurfaceCursor::Default,
+        }
+    }
+
+    #[must_use]
+    pub const fn focusable(mut self, cursor: PluginSurfaceCursor) -> Self {
+        self.focusable = true;
+        self.cursor = cursor;
+        self
+    }
+}
+
 /// Atomic owner-scoped replacement of independent surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSurfaceSnapshot {
@@ -447,6 +510,32 @@ mod tests {
             visible: true,
             ops: vec![RenderOp::text_run(1, 2, "x", RenderStyle::new())],
         }
+    }
+
+    #[test]
+    fn ergonomic_builders_preserve_canonical_identity_revision_and_defaults() {
+        let owner = "owner";
+        let layout_id = PluginLayoutId::new(owner, "region");
+        let surface = PluginSurface::layout(
+            PluginSurfaceId::new(owner, "surface", Uuid::from_u128(13)),
+            7,
+            layout_id.clone(),
+            vec![RenderOp::text_run(0, 0, "text", RenderStyle::new())],
+        )
+        .opaque(true)
+        .order(2, 3)
+        .interactive_region(
+            PluginSurfaceRegion::new("button", ExtensionRect::new(0, 0, 4, 1))
+                .focusable(PluginSurfaceCursor::Pointer),
+        );
+        assert_eq!(surface.revision, 7);
+        assert_eq!(surface.target, PluginSurfaceTarget::Layout(layout_id));
+        assert!(surface.opaque);
+        assert!(surface.accepts_input);
+        assert_eq!(surface.layer, 2);
+        assert_eq!(surface.z, 3);
+        assert_eq!(surface.interactive_regions[0].local_id, "button");
+        assert!(surface.interactive_regions[0].focusable);
     }
 
     #[test]
