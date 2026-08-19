@@ -24,7 +24,7 @@ thread_local! {
 
 use crate::padding::{HorizontalAlignment, PanePaddingSpec, VerticalAlignment};
 use crate::runtime::PanePaddingRuntimeHandle;
-use bmux_session_models::SessionId;
+use bmux_session_models::{ClientId, SessionId};
 
 fn option_value(arguments: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
@@ -315,7 +315,11 @@ fn select_options(values: &[(&str, &str)]) -> Vec<PromptOption> {
 }
 
 #[allow(clippy::too_many_lines)] // Keeping the fixed form schema together makes field defaults and sections reviewable.
-fn configure_request(spec: PanePaddingSpec, windows_available: bool) -> PromptRequest {
+fn configure_request(
+    spec: PanePaddingSpec,
+    windows_available: bool,
+    target_summary: Option<String>,
+) -> PromptRequest {
     let edge = |id, label, value| {
         PromptFormField::new(
             id,
@@ -336,7 +340,7 @@ fn configure_request(spec: PanePaddingSpec, windows_available: bool) -> PromptRe
     if windows_available {
         scope_options.insert(1, PromptOption::new("window", "Current window"));
     }
-    PromptRequest::form(
+    let mut request = PromptRequest::form(
         "Pane Padding",
         vec![
             PromptFormSection::new(
@@ -475,13 +479,18 @@ fn configure_request(spec: PanePaddingSpec, windows_available: bool) -> PromptRe
                 ],
             ),
         ],
-    )
-    .message("Changes preview live. Enter applies; Esc restores the previous geometry.")
-    .policy(PromptPolicy::RejectIfBusy)
-    .width_range(52, 88)
-    .form_live_preview(true)
-    .form_resettable(true)
-    .form_paged_on_small(true)
+    );
+    request = request
+        .message("Changes preview live. Enter applies; Esc restores the previous geometry.")
+        .policy(PromptPolicy::RejectIfBusy)
+        .width_range(52, 88)
+        .form_live_preview(true)
+        .form_resettable(true)
+        .form_paged_on_small(true);
+    if let Some(summary) = target_summary {
+        request = request.message(summary);
+    }
+    request
 }
 
 fn integer_value(values: &BTreeMap<String, PromptFormValue>, key: &str) -> Option<u16> {
@@ -848,6 +857,12 @@ fn install_global_padding(
     })
 }
 
+const NUMERIC_PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+
+fn numeric_preview_deadline(now: tokio::time::Instant) -> tokio::time::Instant {
+    now + NUMERIC_PREVIEW_DEBOUNCE
+}
+
 fn is_numeric_configure_field(field_id: &str) -> bool {
     matches!(
         field_id,
@@ -860,6 +875,36 @@ fn clear_target_overrides(targets: &[Uuid]) -> Result<(), PluginCommandError> {
         .clear_overrides(targets)
         .map_err(|error| PluginCommandError::failed(error.to_string()))?;
     Ok(())
+}
+
+struct PreviewCancelGuard {
+    handle: PanePaddingRuntimeHandle,
+    owner: ClientId,
+    token: Uuid,
+    armed: bool,
+}
+
+impl PreviewCancelGuard {
+    fn new(handle: PanePaddingRuntimeHandle, owner: ClientId, token: Uuid) -> Self {
+        Self {
+            handle,
+            owner,
+            token,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreviewCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.handle.cancel_preview(self.owner, self.token);
+        }
+    }
 }
 
 fn preview_spec(spec: PanePaddingSpec) -> pane_runtime_state::PanePaddingSpec {
@@ -879,7 +924,23 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
         .available_capabilities
         .iter()
         .any(|capability| capability == "bmux.windows.read");
-    let prompt = configure_request(initial_spec, windows_available);
+    let target_summary = format!(
+        "Targets: 1 pane | Outer: {}x{} | Base: {}x{} | Content/PTY: {}x{} | Source: {}",
+        current.outer_rect.w,
+        current.outer_rect.h,
+        current.base_content_rect.w,
+        current.base_content_rect.h,
+        current.effective_content_rect.w,
+        current.effective_content_rect.h,
+        if current.runtime_override.is_some() {
+            "runtime override"
+        } else if current.matched_rule_index.is_some() {
+            "rule"
+        } else {
+            "global"
+        },
+    );
+    let prompt = configure_request(initial_spec, windows_available, Some(target_summary));
     let (mut response_rx, mut event_rx) = prompt::submit_with_events(prompt)
         .map_err(|error| PluginCommandError::unavailable(error.to_string()))?;
     let context = context.clone();
@@ -901,6 +962,12 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
             return;
         };
         let token = started.token;
+        let owner = context
+            .caller_client_id
+            .map(ClientId)
+            .expect("preview begin requires the caller client id");
+        let mut cancel_guard =
+            PreviewCancelGuard::new(handle().expect("runtime handle"), owner, token);
         let mut lifetime = pane_runtime_commands::PanePaddingPersistence::Runtime;
         let mut refresh_value = false;
         let mut pending_numeric: Option<(String, BTreeMap<String, PromptFormValue>)> = None;
@@ -984,6 +1051,7 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
                             );
                         }
                     }
+                    cancel_guard.disarm();
                     break;
                 }
                 () = &mut numeric_debounce, if pending_numeric.is_some() => {
@@ -1012,9 +1080,7 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
                     };
                     if is_numeric_configure_field(&field_id) {
                         pending_numeric = Some((field_id, values));
-                        numeric_debounce.as_mut().reset(
-                            tokio::time::Instant::now() + std::time::Duration::from_millis(60),
-                        );
+                        numeric_debounce.as_mut().reset(numeric_preview_deadline(tokio::time::Instant::now()));
                         continue;
                     }
                     pending_numeric = None;
@@ -1142,6 +1208,15 @@ mod tests {
             invocation_source,
             host_kernel_bridge: None,
         }
+    }
+
+    #[tokio::test]
+    async fn numeric_preview_deadline_waits_for_the_settle_window() {
+        let start = tokio::time::Instant::now();
+        let deadline = numeric_preview_deadline(start);
+        assert_eq!(deadline.duration_since(start), NUMERIC_PREVIEW_DEBOUNCE);
+        tokio::time::sleep_until(deadline).await;
+        assert!(tokio::time::Instant::now() >= deadline);
     }
 
     #[test]
@@ -1370,8 +1445,8 @@ enabled = true
             options.iter().map(|option| option.value.as_str()).collect()
         }
 
-        let without_windows = configure_request(PanePaddingSpec::default(), false);
-        let with_windows = configure_request(PanePaddingSpec::default(), true);
+        let without_windows = configure_request(PanePaddingSpec::default(), false, None);
+        let with_windows = configure_request(PanePaddingSpec::default(), true, None);
         assert!(!scope_values(&without_windows).contains(&"window"));
         assert!(scope_values(&with_windows).contains(&"window"));
 

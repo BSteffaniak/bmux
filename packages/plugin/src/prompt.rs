@@ -219,6 +219,19 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn response_channel_disconnect_is_reported() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _guard = register_host(tx);
+        let response_rx = submit(PromptRequest::confirm("disconnect")).unwrap();
+        let host_request = rx.recv().await.expect("host request");
+        drop(host_request.response_tx);
+
+        let error = response_rx.await.expect_err("disconnect closes response");
+        assert!(error.to_string().contains("channel closed"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn dropping_host_guard_unregisters_the_host() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let guard = register_host(tx);

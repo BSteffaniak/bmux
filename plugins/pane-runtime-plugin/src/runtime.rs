@@ -8736,6 +8736,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_preview_commit_keeps_transaction_and_durable_state_unchanged() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let missing = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let preview_spec = PanePaddingSpec {
+            left: 3,
+            ..PanePaddingSpec::default()
+        };
+        let (token, _) = manager
+            .begin_padding_preview(owner, vec![pane_id], preview_spec)
+            .expect("begin preview");
+        manager
+            .padding_previews
+            .get_mut(&token)
+            .expect("transaction")
+            .target_pane_ids
+            .insert(missing);
+
+        manager
+            .commit_padding_preview(owner, token, PanePaddingOverridePersistence::Snapshot)
+            .expect_err("missing target must reject commit");
+
+        let transaction = manager
+            .padding_previews
+            .get(&token)
+            .expect("preview remains");
+        assert_eq!(transaction.spec, preview_spec);
+        let pane = &manager.runtimes[&session_id].panes[&pane_id];
+        assert_eq!(pane.padding_preview, Some(preview_spec));
+        assert_eq!(pane.padding_override, None);
+        assert!(manager.padding_overrides_for_snapshot().is_empty());
+    }
+
+    #[tokio::test]
     async fn clear_padding_overrides_is_atomic_across_targets() {
         let session_id = SessionId(Uuid::new_v4());
         let first = Uuid::new_v4();
