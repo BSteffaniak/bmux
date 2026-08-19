@@ -328,6 +328,16 @@ impl PluginLayoutRegistry {
         removed
     }
 
+    /// Current retained revision for one owner.
+    #[must_use]
+    pub fn owner_revision(&self, owner_plugin_id: &str) -> Option<u64> {
+        self.snapshots.read().ok().and_then(|snapshots| {
+            snapshots
+                .get(owner_plugin_id)
+                .map(|snapshot| snapshot.revision)
+        })
+    }
+
     /// Snapshot all retained requests for deterministic host-side resolution.
     #[must_use]
     pub fn requests(&self) -> Vec<PluginLayoutRequest> {
@@ -784,6 +794,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn registry_exposes_current_owner_revision() {
+        let registry = PluginLayoutRegistry::new(2);
+        assert_eq!(registry.owner_revision("owner"), None);
+        assert_eq!(
+            registry.publish(
+                "owner",
+                PluginLayoutSnapshot {
+                    revision: 9,
+                    requests: vec![request("owner", "main", 0, LayoutOperation::Overlay)],
+                },
+            ),
+            Ok(PluginLayoutPublishOutcome::Applied)
+        );
+        assert_eq!(registry.owner_revision("owner"), Some(9));
+        assert!(registry.remove_owner("owner"));
+        assert_eq!(registry.owner_revision("owner"), None);
     }
 
     #[test]

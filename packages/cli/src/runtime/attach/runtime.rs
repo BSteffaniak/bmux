@@ -8259,11 +8259,18 @@ fn retained_plugin_surfaces(viewport: DamageRect) -> Vec<RetainedSurface> {
         .into_iter()
         .map(|allocation| (allocation.id, allocation.rect))
         .collect::<BTreeMap<_, _>>();
-    retained_surfaces_from_plugin_surfaces(
-        &bmux_plugin::surface::global_plugin_surface_registry().surfaces(),
-        &allocations,
-        viewport,
-    )
+    let surfaces = bmux_plugin::surface::global_plugin_surface_registry()
+        .surfaces()
+        .into_iter()
+        .filter(|surface| match &surface.target {
+            bmux_plugin::surface::PluginSurfaceTarget::Layout(layout_id) => {
+                global_plugin_layout_registry().owner_revision(&layout_id.owner_plugin_id)
+                    == Some(surface.revision)
+            }
+            bmux_plugin::surface::PluginSurfaceTarget::Explicit(_) => true,
+        })
+        .collect::<Vec<_>>();
+    retained_surfaces_from_plugin_surfaces(&surfaces, &allocations, viewport)
 }
 
 #[allow(clippy::too_many_arguments)] // Retained planning bridges frame damage, UI surfaces, and compositor state.
@@ -11997,6 +12004,83 @@ pub const fn record_attach_mouse_event(
     view_state.mouse.last_event_at = Some(now);
 }
 
+async fn invoke_plugin_surface_pointer_event(
+    client: &mut StreamingBmuxClient,
+    view_state: &AttachViewState,
+    event: bmux_attach_pipeline::RetainedPointerEvent,
+) -> std::result::Result<bool, ClientError> {
+    let Some(endpoint) = view_state
+        .retained_compositor
+        .endpoint_for_hit(&event.hit)
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let (phase, button) = match event.phase {
+        bmux_attach_pipeline::RetainedPointerPhase::Enter => ("enter", None),
+        bmux_attach_pipeline::RetainedPointerPhase::Move => ("move", None),
+        bmux_attach_pipeline::RetainedPointerPhase::Leave => ("leave", None),
+        bmux_attach_pipeline::RetainedPointerPhase::Down => ("down", event.button),
+        bmux_attach_pipeline::RetainedPointerPhase::Up => ("up", event.button),
+        bmux_attach_pipeline::RetainedPointerPhase::Wheel => ("wheel", None),
+        bmux_attach_pipeline::RetainedPointerPhase::Drag => ("drag", event.button),
+    };
+    let button = button.map(|button| match button {
+        bmux_attach_pipeline::RetainedPointerButton::Primary => "left",
+        bmux_attach_pipeline::RetainedPointerButton::Secondary => "right",
+        bmux_attach_pipeline::RetainedPointerButton::Middle => "middle",
+        bmux_attach_pipeline::RetainedPointerButton::Other(_) => "other",
+    });
+    let hook_id = event.hit.region_id.as_ref().map_or_else(String::new, |id| {
+        format!(
+            "{}:{}:{}",
+            id.owner_plugin_id, id.surface_local_id, id.region_local_id
+        )
+    });
+    let input = AttachInputEvent {
+        hook_id,
+        event_kind: "pointer".to_owned(),
+        phase: phase.to_owned(),
+        button: button.map(str::to_owned),
+        key: None,
+        col: Some(event.hit.surface_x),
+        row: Some(event.hit.surface_y),
+        modifiers: AttachInputModifiers::default(),
+        focused_pane: None,
+        hovered_pane: None,
+    };
+    let payload =
+        bmux_codec::to_positional_vec(&input).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding plugin surface pointer event: {error}"),
+        })?;
+    let _ = client
+        .invoke_service_raw(
+            endpoint.capability,
+            InvokeServiceKind::Command,
+            endpoint.interface_id,
+            endpoint.operation,
+            payload,
+        )
+        .await?;
+    Ok(true)
+}
+
+async fn try_handle_plugin_surface_mouse(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+) -> std::result::Result<bool, ClientError> {
+    let events = view_state
+        .plugin_pointer_router
+        .route_terminal_mouse(&view_state.retained_compositor, mouse_event);
+    let mut consumed = false;
+    for event in events {
+        consumed |= invoke_plugin_surface_pointer_event(client, view_state, event).await?;
+    }
+    Ok(consumed)
+}
+
 fn attach_input_hooks() -> Vec<AttachInputHook> {
     let mut hooks = Vec::new();
     for extension in bmux_plugin::registered_render_extensions() {
@@ -12721,6 +12805,10 @@ async fn handle_attach_mouse_event_at(
             .await?;
             return Ok(());
         }
+    }
+
+    if try_handle_plugin_surface_mouse(client, view_state, mouse_event).await? {
+        return Ok(());
     }
 
     if try_handle_uncaptured_attach_input_hook_mouse(client, view_state, mouse_event, now).await? {
