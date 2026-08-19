@@ -7984,6 +7984,11 @@ fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
 pub(crate) struct PanePaddingRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>);
 
 impl PanePaddingRuntimeHandle {
+    #[cfg(test)]
+    fn from_manager_for_test(manager: SessionRuntimeManager) -> Self {
+        Self(Arc::new(Mutex::new(manager)))
+    }
+
     pub(crate) fn has_session(&self, session_id: SessionId) -> bool {
         self.0
             .lock()
@@ -8733,6 +8738,37 @@ mod tests {
         manager.cancel_expired_padding_previews(Instant::now());
 
         assert!(manager.padding_previews.contains_key(&token));
+    }
+
+    #[tokio::test]
+    async fn dropping_caller_guard_cancels_preview_and_restores_geometry() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let handle = PanePaddingRuntimeHandle::from_manager_for_test(manager);
+        let baseline = handle.state(session_id, Some(pane_id)).unwrap().effective;
+        let (token, _) = handle
+            .begin_preview(
+                owner,
+                vec![pane_id],
+                PanePaddingSpec {
+                    left: 3,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .unwrap();
+
+        drop(crate::commands::PreviewCancelGuard::new(
+            handle.clone(),
+            owner,
+            token,
+        ));
+
+        assert_eq!(
+            handle.state(session_id, Some(pane_id)).unwrap().effective,
+            baseline
+        );
     }
 
     #[tokio::test]

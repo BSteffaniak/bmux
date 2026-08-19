@@ -877,7 +877,34 @@ fn clear_target_overrides(targets: &[Uuid]) -> Result<(), PluginCommandError> {
     Ok(())
 }
 
-struct PreviewCancelGuard {
+fn preview_feedback(states: &[crate::padding_api::RuntimePanePaddingState]) -> String {
+    let Some(first) = states.first() else {
+        return "Targets: 0 panes".to_string();
+    };
+    let mixed = states
+        .iter()
+        .skip(1)
+        .any(|state| state.effective != first.effective);
+    let constrained = states
+        .iter()
+        .filter(|state| state.effective_content_rect != state.base_content_rect)
+        .count();
+    let clamped = states
+        .iter()
+        .filter(|state| state.effective_content_rect.w <= 1 || state.effective_content_rect.h <= 1)
+        .count();
+    format!(
+        "Targets: {} pane{} | {} constrained | {} unchanged | {} clamped | Values: {}",
+        states.len(),
+        if states.len() == 1 { "" } else { "s" },
+        constrained,
+        states.len().saturating_sub(constrained),
+        clamped,
+        if mixed { "mixed" } else { "uniform" },
+    )
+}
+
+pub(crate) struct PreviewCancelGuard {
     handle: PanePaddingRuntimeHandle,
     owner: ClientId,
     token: Uuid,
@@ -885,7 +912,7 @@ struct PreviewCancelGuard {
 }
 
 impl PreviewCancelGuard {
-    fn new(handle: PanePaddingRuntimeHandle, owner: ClientId, token: Uuid) -> Self {
+    pub(crate) fn new(handle: PanePaddingRuntimeHandle, owner: ClientId, token: Uuid) -> Self {
         Self {
             handle,
             owner,
@@ -962,6 +989,22 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
             return;
         };
         let token = started.token;
+        record_command_outcome_metadata(
+            COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+            preview_feedback(
+                &started
+                    .panes
+                    .into_iter()
+                    .filter_map(|state| {
+                        handle()
+                            .ok()?
+                            .state(SessionId(state.session_id), Some(state.pane_id))
+                            .ok()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        );
         let owner = context
             .caller_client_id
             .map(ClientId)
@@ -1208,6 +1251,59 @@ mod tests {
             invocation_source,
             host_kernel_bridge: None,
         }
+    }
+
+    #[test]
+    fn preview_feedback_reports_mixed_constraint_and_clamp_counts() {
+        let session_id = Uuid::new_v4();
+        let first = crate::padding_api::RuntimePanePaddingState {
+            session_id,
+            pane_id: Uuid::new_v4(),
+            declarative: PanePaddingSpec::default(),
+            matched_rule_index: None,
+            runtime_override: None,
+            effective: PanePaddingSpec::default(),
+            outer_rect: bmux_attach_layout_protocol::AttachRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 40,
+            },
+            base_content_rect: bmux_attach_layout_protocol::AttachRect {
+                x: 1,
+                y: 1,
+                w: 98,
+                h: 38,
+            },
+            effective_content_rect: bmux_attach_layout_protocol::AttachRect {
+                x: 1,
+                y: 1,
+                w: 98,
+                h: 38,
+            },
+            persist_runtime_overrides: true,
+        };
+        let second = crate::padding_api::RuntimePanePaddingState {
+            pane_id: Uuid::new_v4(),
+            effective: PanePaddingSpec {
+                left: 20,
+                ..PanePaddingSpec::default()
+            },
+            effective_content_rect: bmux_attach_layout_protocol::AttachRect {
+                x: 20,
+                y: 1,
+                w: 1,
+                h: 38,
+            },
+            ..first
+        };
+
+        let feedback = preview_feedback(&[first, second]);
+
+        assert_eq!(
+            feedback,
+            "Targets: 2 panes | 1 constrained | 1 unchanged | 1 clamped | Values: mixed"
+        );
     }
 
     #[tokio::test]
