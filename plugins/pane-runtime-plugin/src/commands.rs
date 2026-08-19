@@ -17,6 +17,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ATOMIC_TEMP_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 use crate::padding::{HorizontalAlignment, PanePaddingSpec, VerticalAlignment};
 use crate::runtime::PanePaddingRuntimeHandle;
 use bmux_session_models::SessionId;
@@ -476,6 +481,7 @@ fn configure_request(spec: PanePaddingSpec, windows_available: bool) -> PromptRe
     .width_range(52, 88)
     .form_live_preview(true)
     .form_resettable(true)
+    .form_paged_on_small(true)
 }
 
 fn integer_value(values: &BTreeMap<String, PromptFormValue>, key: &str) -> Option<u16> {
@@ -766,6 +772,11 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
     fs::create_dir_all(parent).map_err(|error| {
         PluginCommandError::failed(format!("cannot create config dir: {error}"))
     })?;
+    #[cfg(test)]
+    let temporary = TEST_ATOMIC_TEMP_PATH
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| parent.join(format!(".bmux.toml.{}.tmp", Uuid::new_v4())));
+    #[cfg(not(test))]
     let temporary = parent.join(format!(".bmux.toml.{}.tmp", Uuid::new_v4()));
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -805,6 +816,16 @@ fn persist_and_install_global_padding(
     Ok(())
 }
 
+fn verify_config_unchanged(path: &Path, original: &[u8]) -> Result<(), PluginCommandError> {
+    if fs::read(path).unwrap_or_default() == original {
+        Ok(())
+    } else {
+        Err(PluginCommandError::failed(
+            "bmux.toml changed while pane padding was being applied",
+        ))
+    }
+}
+
 fn install_global_padding(
     context: &NativeCommandContext,
     spec: PanePaddingSpec,
@@ -819,12 +840,7 @@ fn install_global_padding(
     let edited = set_padding_document(&source, spec)?
         .to_string()
         .into_bytes();
-    let current = fs::read(&path).unwrap_or_default();
-    if current != original {
-        return Err(PluginCommandError::failed(
-            "bmux.toml changed while pane padding was being applied",
-        ));
-    }
+    verify_config_unchanged(&path, &original)?;
     persist_and_install_global_padding(&path, &original, &edited, || {
         handle()?.replace_padding_config(config).map_err(|error| {
             PluginCommandError::failed(format!("failed installing live pane padding: {error}"))
@@ -1126,6 +1142,79 @@ mod tests {
             invocation_source,
             host_kernel_bridge: None,
         }
+    }
+
+    #[test]
+    fn external_global_config_edit_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bmux.toml");
+        let original = b"# original\n";
+        fs::write(&path, original).unwrap();
+        fs::write(&path, b"# externally changed\n").unwrap();
+
+        let error = verify_config_unchanged(&path, original).expect_err("conflict must fail");
+
+        assert!(error.to_string().contains("changed while pane padding"));
+        assert_eq!(fs::read(&path).unwrap(), b"# externally changed\n");
+    }
+
+    #[test]
+    fn missing_global_config_creates_focused_padding_table() {
+        let edited = set_padding_document(
+            "",
+            PanePaddingSpec {
+                left: 2,
+                max_content_width: Some(90),
+                ..PanePaddingSpec::default()
+            },
+        )
+        .unwrap()
+        .to_string();
+
+        assert!(edited.contains("plugins = { settings ="));
+        assert!(edited.contains("\"bmux.pane_runtime\""));
+        assert!(edited.contains("padding = { left = 2"));
+        assert!(edited.contains("max_content_width = 90"));
+    }
+
+    #[test]
+    fn invalid_global_config_is_not_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bmux.toml");
+        let invalid = b"[plugins.settings\n";
+        fs::write(&path, invalid).unwrap();
+
+        let source = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        set_padding_document(&source, PanePaddingSpec::default())
+            .expect_err("invalid TOML must fail before persistence");
+
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn temporary_write_failure_preserves_original_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bmux.toml");
+        let original = b"# original\n";
+        fs::write(&path, original).unwrap();
+        let blocked_temp = temp.path().join("blocked-temp");
+        fs::create_dir(&blocked_temp).unwrap();
+        TEST_ATOMIC_TEMP_PATH.with(|slot| *slot.borrow_mut() = Some(blocked_temp));
+
+        atomic_replace(&path, b"# edited\n").expect_err("temp creation must fail");
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn atomic_replace_creates_and_replaces_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bmux.toml");
+
+        atomic_replace(&path, b"first\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first\n");
+        atomic_replace(&path, b"second\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second\n");
     }
 
     #[test]

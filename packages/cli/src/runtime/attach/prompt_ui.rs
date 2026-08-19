@@ -123,6 +123,7 @@ enum PromptWidgetState {
         values: BTreeMap<String, PromptFormValue>,
         editors: BTreeMap<String, TextEditBuffer>,
         errors: BTreeMap<String, String>,
+        page: usize,
     },
 }
 
@@ -194,6 +195,7 @@ impl ActivePrompt {
                 values: initial_form_values(sections),
                 editors: initial_form_editors(sections),
                 errors: BTreeMap::new(),
+                page: 0,
             },
         };
         Self {
@@ -678,6 +680,7 @@ impl AttachPromptState {
                         sections,
                         live_preview,
                         resettable,
+                        paged_on_small,
                     },
                     PromptWidgetState::Form {
                         cursor,
@@ -685,6 +688,7 @@ impl AttachPromptState {
                         values,
                         editors,
                         errors,
+                        page,
                     },
                 ) => {
                     let fields = flatten_form_fields(sections);
@@ -701,6 +705,23 @@ impl AttachPromptState {
                             }
                             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                                 *cursor = cursor.saturating_add(1).min(len.saturating_sub(1));
+                            }
+                            KeyCode::PageUp if *paged_on_small => {
+                                *page = page.saturating_sub(1);
+                                *cursor = sections
+                                    .iter()
+                                    .take(*page)
+                                    .map(|section| section.fields.len())
+                                    .sum();
+                            }
+                            KeyCode::PageDown if *paged_on_small => {
+                                *page =
+                                    page.saturating_add(1).min(sections.len().saturating_sub(1));
+                                *cursor = sections
+                                    .iter()
+                                    .take(*page)
+                                    .map(|section| section.fields.len())
+                                    .sum();
                             }
                             KeyCode::Home => {
                                 *cursor = 0;
@@ -1426,13 +1447,19 @@ const fn form_text_input_styles(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Form rendering keeps pagination, canonical values, controls, errors, and action rows synchronized.
 fn render_form(
     active: &ActivePrompt,
     content: Rect,
     frame: &mut Frame<'_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
-    let PromptField::Form { sections, .. } = &active.envelope.request.field else {
+    let PromptField::Form {
+        sections,
+        paged_on_small,
+        ..
+    } = &active.envelope.request.field
+    else {
         return false;
     };
     let PromptWidgetState::Form {
@@ -1441,12 +1468,31 @@ fn render_form(
         values,
         editors,
         errors,
+        page,
     } = &active.state
     else {
         return false;
     };
-    let fields = flatten_form_fields(sections);
-    let rows = form_render_rows(sections, values, editors, errors);
+    let small_paged = *paged_on_small && (content.width < 24 || content.height < 8);
+    let visible_sections = if small_paged {
+        sections.get(*page).map_or(
+            &[] as &[crate::runtime::prompt::PromptFormSection],
+            std::slice::from_ref,
+        )
+    } else {
+        sections.as_slice()
+    };
+    let page_offset = if small_paged {
+        sections
+            .iter()
+            .take(*page)
+            .map(|section| section.fields.len())
+            .sum()
+    } else {
+        0
+    };
+    let fields = flatten_form_fields(visible_sections);
+    let rows = form_render_rows(visible_sections, values, editors, errors);
     let actions_height = u16::from(content.height > 1);
     let fields_area = Rect::new(
         content.x,
@@ -1475,7 +1521,7 @@ fn render_form(
                 values,
                 editors,
                 errors,
-                index == *cursor,
+                index.saturating_add(page_offset) == *cursor,
                 control_area,
                 frame,
                 theme,
@@ -1485,7 +1531,7 @@ fn render_form(
         }
         let style = if field.disabled {
             theme.muted
-        } else if index == *cursor || errors.contains_key(&field.id) {
+        } else if index.saturating_add(page_offset) == *cursor || errors.contains_key(&field.id) {
             theme.focused
         } else {
             theme.text
@@ -2280,12 +2326,15 @@ fn prompt_overlay_layout(
     if geometry.cols < 8 || geometry.rows < 4 {
         return None;
     }
-    let compact = geometry.cols < 24 || geometry.rows < 8;
+    let small = geometry.cols < 24 || geometry.rows < 8;
+    let compact = !small && (geometry.cols < 72 || geometry.rows < 20);
 
     let content_width = prompt_estimated_width(request);
     let capped_max = request.width.max.max(request.width.min);
-    let width = if compact {
+    let width = if small {
         geometry.cols as usize
+    } else if compact {
+        (geometry.cols as usize).saturating_sub(2)
     } else {
         (content_width + 4)
             .max(usize::from(request.width.min.max(24)))
@@ -2293,8 +2342,10 @@ fn prompt_overlay_layout(
             .min((geometry.cols as usize).saturating_sub(2))
     };
     let estimated_lines = prompt_estimated_lines(request);
-    let height = if compact {
+    let height = if small {
         geometry.rows as usize
+    } else if compact {
+        (geometry.rows as usize).saturating_sub(2)
     } else {
         (estimated_lines + 4)
             .max(7)
@@ -2617,6 +2668,7 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
+        prompt_overlay_layout,
     };
     use crate::runtime::attach::input::TerminalGeometry;
     use crate::runtime::attach::tui_surface::{component_theme, parse_tui_color};
@@ -2645,6 +2697,123 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn small_paged_form_switches_sections_without_losing_values() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Paged",
+                vec![
+                    PromptFormSection::new(
+                        "one",
+                        "One",
+                        vec![PromptFormField::new(
+                            "first",
+                            "First",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 1,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        )],
+                    ),
+                    PromptFormSection::new(
+                        "two",
+                        "Two",
+                        vec![PromptFormField::new(
+                            "second",
+                            "Second",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 2,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        )],
+                    ),
+                    PromptFormSection::new(
+                        "three",
+                        "Three",
+                        vec![PromptFormField::new(
+                            "third",
+                            "Third",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 3,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        )],
+                    ),
+                ],
+            )
+            .form_paged_on_small(true),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let _ = state.handle_key_event(&key_event(KeyCode::PageDown));
+        let _ = state.handle_key_event(&key_event(KeyCode::PageDown));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected completion");
+        };
+        let PromptResponse::Submitted(PromptValue::Form(values)) = completion.response else {
+            panic!("expected form values");
+        };
+        assert_eq!(values.get("first"), Some(&PromptFormValue::Integer(1)));
+        assert_eq!(values.get("second"), Some(&PromptFormValue::Integer(2)));
+        assert_eq!(values.get("third"), Some(&PromptFormValue::Integer(3)));
+    }
+
+    #[test]
+    fn form_overlay_uses_centered_full_compact_and_small_layouts() {
+        let request = PromptRequest::form(
+            "Padding",
+            vec![PromptFormSection::new(
+                "padding",
+                "Padding",
+                (0..12)
+                    .map(|index| {
+                        PromptFormField::new(
+                            format!("field-{index}"),
+                            format!("Field {index}"),
+                            PromptFormFieldKind::Integer {
+                                initial_value: 0,
+                                min: Some(0),
+                                max: Some(100),
+                            },
+                        )
+                    })
+                    .collect(),
+            )],
+        )
+        .width_range(52, 88);
+
+        let large = prompt_overlay_layout(
+            Some(&request),
+            TerminalGeometry {
+                cols: 140,
+                rows: 50,
+            },
+        )
+        .expect("large layout");
+        assert!(large.surface.rect.x > 0);
+        assert!(large.surface.rect.y > 0);
+        assert!(large.surface.rect.w >= 52);
+        assert!(large.surface.rect.w <= 88);
+
+        let compact =
+            prompt_overlay_layout(Some(&request), TerminalGeometry { cols: 60, rows: 18 })
+                .expect("compact layout");
+        assert_eq!(compact.surface.rect.x, 1);
+        assert_eq!(compact.surface.rect.w, 58);
+        assert_eq!(compact.surface.rect.y, 1);
+        assert_eq!(compact.surface.rect.h, 16);
+
+        let small = prompt_overlay_layout(Some(&request), TerminalGeometry { cols: 20, rows: 6 })
+            .expect("small layout");
+        assert_eq!((small.surface.rect.x, small.surface.rect.y), (0, 0));
+        assert_eq!((small.surface.rect.w, small.surface.rect.h), (20, 6));
     }
 
     #[test]

@@ -214,6 +214,9 @@ pub enum PromptField {
         /// Allow the host to restore modal-open form defaults with its reset shortcut.
         #[serde(default)]
         resettable: bool,
+        /// Present form sections as pages on tiny terminals.
+        #[serde(default)]
+        paged_on_small: bool,
     },
 }
 
@@ -479,6 +482,7 @@ impl PromptRequest {
                 sections,
                 live_preview: false,
                 resettable: false,
+                paged_on_small: false,
             },
         }
     }
@@ -670,6 +674,14 @@ impl PromptRequest {
     pub const fn form_resettable(mut self, enabled: bool) -> Self {
         if let PromptField::Form { resettable, .. } = &mut self.field {
             *resettable = enabled;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn form_paged_on_small(mut self, enabled: bool) -> Self {
+        if let PromptField::Form { paged_on_small, .. } = &mut self.field {
+            *paged_on_small = enabled;
         }
         self
     }

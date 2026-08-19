@@ -8736,6 +8736,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_padding_overrides_is_atomic_across_targets() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let missing = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[first, second]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first)),
+            second: Box::new(leaf(second)),
+        });
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let override_spec = PanePaddingSpec {
+            left: 2,
+            ..PanePaddingSpec::default()
+        };
+        manager
+            .set_padding_override(session_id, Some(first), Some(override_spec))
+            .unwrap();
+        manager
+            .set_padding_override(session_id, Some(second), Some(override_spec))
+            .unwrap();
+
+        manager
+            .clear_padding_overrides(&[first, missing, second])
+            .expect_err("missing target must reject the whole clear");
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(first))
+                .unwrap()
+                .runtime_override,
+            Some(override_spec)
+        );
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(second))
+                .unwrap()
+                .runtime_override,
+            Some(override_spec)
+        );
+
+        let cleared = manager
+            .clear_padding_overrides(&[first, second])
+            .expect("valid targets clear together");
+        assert_eq!(cleared.len(), 2);
+        assert!(cleared.iter().all(|state| state.runtime_override.is_none()));
+    }
+
+    #[tokio::test]
+    async fn owner_detach_cancels_owned_preview_and_restores_geometry() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(owner);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let baseline = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        manager
+            .begin_padding_preview(
+                owner,
+                vec![pane_id],
+                PanePaddingSpec {
+                    left: 4,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("begin preview");
+
+        manager.end_attach(session_id, owner);
+
+        assert!(manager.padding_previews.is_empty());
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(pane_id))
+                .unwrap()
+                .effective,
+            baseline.effective
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_all_previews_restores_every_target() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let first_owner = ClientId(Uuid::new_v4());
+        let second_owner = ClientId(Uuid::new_v4());
+        let mut runtime = runtime_with_panes(&[first, second]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first)),
+            second: Box::new(leaf(second)),
+        });
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let first_baseline = manager.padding_state(session_id, Some(first)).unwrap();
+        let second_baseline = manager.padding_state(session_id, Some(second)).unwrap();
+        manager
+            .begin_padding_preview(
+                first_owner,
+                vec![first],
+                PanePaddingSpec {
+                    left: 2,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .unwrap();
+        manager
+            .begin_padding_preview(
+                second_owner,
+                vec![second],
+                PanePaddingSpec {
+                    right: 3,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .unwrap();
+
+        manager.cancel_all_padding_previews();
+
+        assert!(manager.padding_previews.is_empty());
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(first))
+                .unwrap()
+                .effective,
+            first_baseline.effective
+        );
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(second))
+                .unwrap()
+                .effective,
+            second_baseline.effective
+        );
+    }
+
+    #[tokio::test]
     async fn preview_geometry_updates_only_resize_pty_when_dimensions_change() {
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
