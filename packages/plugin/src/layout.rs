@@ -40,6 +40,12 @@ pub enum LayoutEdge {
 pub enum LayoutExtent {
     Cells(u16),
     Percent(u8),
+    Bounded {
+        preferred: u16,
+        minimum: u16,
+        maximum: u16,
+    },
+    Fill,
 }
 
 impl LayoutExtent {
@@ -51,6 +57,15 @@ impl LayoutExtent {
                 let scaled = u32::from(available) * u32::from(percent) / 100;
                 u16::try_from(scaled).unwrap_or(available)
             }
+            Self::Bounded {
+                preferred,
+                minimum,
+                maximum,
+            } => {
+                let lower = minimum.min(maximum);
+                preferred.clamp(lower, maximum).min(available)
+            }
+            Self::Fill => available,
         }
     }
 }
@@ -65,6 +80,8 @@ pub enum LayoutOperation {
     },
     /// Allocate the current remaining region without consuming it.
     Overlay,
+    /// Retain stable identity while allocating no visible region.
+    Hidden,
 }
 
 /// One independently owned layout request.
@@ -123,14 +140,57 @@ pub enum PluginLayoutPublishError {
 pub struct PluginLayoutRegistry {
     maximum_requests_per_owner: usize,
     snapshots: RwLock<BTreeMap<String, PluginLayoutSnapshot>>,
+    revision_tx: tokio::sync::watch::Sender<u64>,
+}
+
+/// Owner-bound retained layout publisher.
+///
+/// Dropping the handle removes all state published through it, providing a
+/// lifecycle-safe default for in-process plugin adapters.
+#[derive(Debug)]
+pub struct PluginLayoutPublisher<'a> {
+    registry: &'a PluginLayoutRegistry,
+    owner_plugin_id: String,
+}
+
+impl PluginLayoutPublisher<'_> {
+    /// Replace this owner's complete retained layout snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and revision errors as
+    /// [`PluginLayoutRegistry::publish`].
+    pub fn publish(
+        &self,
+        snapshot: PluginLayoutSnapshot,
+    ) -> Result<PluginLayoutPublishOutcome, PluginLayoutPublishError> {
+        self.registry.publish(&self.owner_plugin_id, snapshot)
+    }
+}
+
+impl Drop for PluginLayoutPublisher<'_> {
+    fn drop(&mut self) {
+        self.registry.remove_owner(&self.owner_plugin_id);
+    }
 }
 
 impl PluginLayoutRegistry {
     #[must_use]
-    pub const fn new(maximum_requests_per_owner: usize) -> Self {
+    pub fn new(maximum_requests_per_owner: usize) -> Self {
+        let (revision_tx, _) = tokio::sync::watch::channel(0);
         Self {
             maximum_requests_per_owner,
             snapshots: RwLock::new(BTreeMap::new()),
+            revision_tx,
+        }
+    }
+
+    /// Create an owner-bound publisher that cleans up retained state on drop.
+    #[must_use]
+    pub fn publisher(&self, owner_plugin_id: impl Into<String>) -> PluginLayoutPublisher<'_> {
+        PluginLayoutPublisher {
+            registry: self,
+            owner_plugin_id: owner_plugin_id.into(),
         }
     }
 
@@ -165,16 +225,34 @@ impl PluginLayoutRegistry {
         }
         snapshots.insert(owner_plugin_id.to_string(), snapshot);
         drop(snapshots);
+        self.notify_changed();
         Ok(PluginLayoutPublishOutcome::Applied)
     }
 
     /// Remove all retained intent for an owner, as on plugin disable or unload.
     pub fn remove_owner(&self, owner_plugin_id: &str) -> bool {
-        self.snapshots
+        let removed = self
+            .snapshots
             .write()
             .ok()
             .and_then(|mut snapshots| snapshots.remove(owner_plugin_id))
-            .is_some()
+            .is_some();
+        if removed {
+            self.notify_changed();
+        }
+        removed
+    }
+
+    /// Subscribe to successful retained-state replacements and owner removal.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision_tx.subscribe()
+    }
+
+    fn notify_changed(&self) {
+        self.revision_tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
     }
 
     /// Snapshot all retained requests for deterministic host-side resolution.
@@ -274,6 +352,7 @@ pub fn resolve_plugin_layout(
     for request in ordered {
         let rect = match request.operation {
             LayoutOperation::Overlay => remaining,
+            LayoutOperation::Hidden => ExtensionRect::new(remaining.x, remaining.y, 0, 0),
             LayoutOperation::Split { edge, extent } => {
                 split_region(&mut remaining, edge, extent, minimum_width, minimum_height)
             }
@@ -389,6 +468,77 @@ mod tests {
             ExtensionRect::new(28, 39, 92, 1)
         );
         assert_eq!(resolved.remaining, ExtensionRect::new(28, 0, 92, 39));
+    }
+
+    #[test]
+    fn bounded_and_fill_extents_respect_constraints_and_host_remainder() {
+        let resolved = resolve_plugin_layout(
+            ExtensionRect::new(0, 0, 50, 20),
+            (10, 4),
+            &[
+                request(
+                    "bounded",
+                    "left",
+                    0,
+                    LayoutOperation::Split {
+                        edge: LayoutEdge::Left,
+                        extent: LayoutExtent::Bounded {
+                            preferred: 20,
+                            minimum: 8,
+                            maximum: 12,
+                        },
+                    },
+                ),
+                request(
+                    "fill",
+                    "top",
+                    1,
+                    LayoutOperation::Split {
+                        edge: LayoutEdge::Top,
+                        extent: LayoutExtent::Fill,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.allocations[0].rect,
+            ExtensionRect::new(0, 0, 12, 20)
+        );
+        assert_eq!(
+            resolved.allocations[1].rect,
+            ExtensionRect::new(12, 0, 38, 16)
+        );
+        assert_eq!(resolved.remaining, ExtensionRect::new(12, 16, 38, 4));
+    }
+
+    #[test]
+    fn bounded_extent_normalizes_an_inverted_range() {
+        assert_eq!(
+            LayoutExtent::Bounded {
+                preferred: 7,
+                minimum: 12,
+                maximum: 5,
+            }
+            .resolve(20),
+            5
+        );
+    }
+
+    #[test]
+    fn hidden_request_preserves_identity_without_consuming_space() {
+        let viewport = ExtensionRect::new(3, 4, 20, 10);
+        let resolved = resolve_plugin_layout(
+            viewport,
+            (1, 1),
+            &[request("owner", "hidden", 0, LayoutOperation::Hidden)],
+        )
+        .unwrap();
+
+        assert_eq!(resolved.remaining, viewport);
+        assert_eq!(resolved.allocations[0].id.local_id, "hidden");
+        assert_eq!(resolved.allocations[0].rect, ExtensionRect::new(3, 4, 0, 0));
     }
 
     #[test]
@@ -601,8 +751,26 @@ mod tests {
             Ok(PluginLayoutPublishOutcome::Applied)
         );
         assert_eq!(registry.requests()[0].id.local_id, "replacement");
+        let resolved_before_remove = resolve_plugin_layout(
+            ExtensionRect::new(0, 0, 80, 24),
+            (1, 1),
+            &registry.requests(),
+        )
+        .unwrap();
+        assert_eq!(resolved_before_remove.allocations.len(), 1);
         assert!(registry.remove_owner("owner"));
         assert!(registry.requests().is_empty());
+        let resolved_after_remove = resolve_plugin_layout(
+            ExtensionRect::new(0, 0, 80, 24),
+            (1, 1),
+            &registry.requests(),
+        )
+        .unwrap();
+        assert!(resolved_after_remove.allocations.is_empty());
+        assert_eq!(
+            resolved_after_remove.remaining,
+            ExtensionRect::new(0, 0, 80, 24)
+        );
     }
 
     #[test]
@@ -647,6 +815,57 @@ mod tests {
             ),
             Err(PluginLayoutPublishError::ConflictingRevision)
         );
+    }
+
+    #[test]
+    fn owner_bound_publisher_removes_retained_state_on_drop() {
+        let registry = PluginLayoutRegistry::new(4);
+        let mut revisions = registry.subscribe();
+        {
+            let publisher = registry.publisher("owner");
+            assert_eq!(
+                publisher.publish(PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![request("owner", "main", 0, LayoutOperation::Overlay)],
+                }),
+                Ok(PluginLayoutPublishOutcome::Applied)
+            );
+            assert_eq!(registry.owner_count(), 1);
+            revisions.borrow_and_update();
+        }
+
+        assert_eq!(registry.owner_count(), 0);
+        assert!(registry.requests().is_empty());
+        assert!(revisions.has_changed().unwrap());
+    }
+
+    #[test]
+    fn registry_notifies_only_when_retained_state_changes() {
+        let registry = PluginLayoutRegistry::new(4);
+        let mut revisions = registry.subscribe();
+        let snapshot = PluginLayoutSnapshot {
+            revision: 1,
+            requests: vec![request("owner", "main", 0, LayoutOperation::Overlay)],
+        };
+
+        assert_eq!(
+            registry.publish("owner", snapshot.clone()),
+            Ok(PluginLayoutPublishOutcome::Applied)
+        );
+        assert!(revisions.has_changed().unwrap());
+        revisions.borrow_and_update();
+
+        assert_eq!(
+            registry.publish("owner", snapshot),
+            Ok(PluginLayoutPublishOutcome::Unchanged)
+        );
+        assert!(!revisions.has_changed().unwrap());
+
+        assert!(registry.remove_owner("owner"));
+        assert!(revisions.has_changed().unwrap());
+        revisions.borrow_and_update();
+        assert!(!registry.remove_owner("owner"));
+        assert!(!revisions.has_changed().unwrap());
     }
 
     #[test]

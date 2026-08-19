@@ -1,6 +1,7 @@
 use crate::render::{DamageCoalescingPolicy, DamageRect, FrameDamage};
 use bmux_attach_layout_protocol::{AttachLayer, AttachRect, AttachScene};
-use bmux_plugin::{RenderOp, render_text_width_u16};
+use bmux_plugin::surface::{PluginSurface, PluginSurfaceRegionId, PluginSurfaceTarget};
+use bmux_plugin::{ExtensionRect, RenderOp, render_text_width_u16};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -42,6 +43,20 @@ impl RetainedSurfacePayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedInteractiveRegion {
+    pub id: Option<PluginSurfaceRegionId>,
+    pub rect: DamageRect,
+    pub focusable: bool,
+    pub cursor: bmux_plugin::surface::PluginSurfaceCursor,
+}
+
+impl PartialEq<DamageRect> for RetainedInteractiveRegion {
+    fn eq(&self, other: &DamageRect) -> bool {
+        self.rect == *other
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedSurface {
     pub id: Uuid,
     pub rect: DamageRect,
@@ -50,7 +65,8 @@ pub struct RetainedSurface {
     pub opaque: bool,
     pub opacity: RetainedOpacity,
     pub clip_rect: Option<DamageRect>,
-    pub interactive_regions: Vec<DamageRect>,
+    pub revision: Option<u64>,
+    pub interactive_regions: Vec<RetainedInteractiveRegion>,
     pub payload: RetainedSurfacePayload,
 }
 
@@ -96,9 +112,16 @@ impl RetainedSurface {
             opaque: opacity.is_opaque(),
             opacity,
             clip_rect: None,
+            revision: None,
             interactive_regions: Vec::new(),
             payload,
         }
+    }
+
+    #[must_use]
+    pub const fn with_revision(mut self, revision: Option<u64>) -> Self {
+        self.revision = revision;
+        self
     }
 
     #[must_use]
@@ -109,7 +132,15 @@ impl RetainedSurface {
 
     #[must_use]
     pub fn with_interactive_regions(mut self, interactive_regions: Vec<DamageRect>) -> Self {
-        self.interactive_regions = interactive_regions;
+        self.interactive_regions = interactive_regions
+            .into_iter()
+            .map(|rect| RetainedInteractiveRegion {
+                id: None,
+                rect,
+                focusable: false,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+            })
+            .collect();
         self
     }
 
@@ -123,6 +154,74 @@ impl RetainedSurface {
         self.clip_rect
             .map_or(Some(self.rect), |clip| intersect_rects(self.rect, clip))
     }
+}
+
+#[must_use]
+pub fn retained_surfaces_from_plugin_surfaces(
+    surfaces: &[PluginSurface],
+    allocations: &BTreeMap<bmux_plugin::layout::PluginLayoutId, ExtensionRect>,
+    viewport: DamageRect,
+) -> Vec<RetainedSurface> {
+    surfaces
+        .iter()
+        .filter(|surface| surface.visible)
+        .filter_map(|surface| {
+            let rect = match &surface.target {
+                PluginSurfaceTarget::Layout(id) => allocations.get(id).copied()?,
+                PluginSurfaceTarget::Explicit(rect) => *rect,
+            };
+            let rect = DamageRect::new(rect.x, rect.y, rect.w, rect.h);
+            if rect.w == 0 || rect.h == 0 {
+                return None;
+            }
+            let local_to_absolute = |local: ExtensionRect| {
+                DamageRect::new(
+                    rect.x.saturating_add(local.x),
+                    rect.y.saturating_add(local.y),
+                    local.w,
+                    local.h,
+                )
+            };
+            let base_clip = intersect_rects(rect, viewport)?;
+            let clip_rect = match surface.clip_rect.map(local_to_absolute) {
+                Some(clip) => {
+                    intersect_rects(clip, rect).and_then(|clip| intersect_rects(clip, viewport))?
+                }
+                None => base_clip,
+            };
+            let interactive_regions = if surface.accepts_input {
+                surface
+                    .interactive_regions
+                    .iter()
+                    .filter_map(|region| {
+                        let rect = intersect_rects(local_to_absolute(region.rect), rect)
+                            .and_then(|region| intersect_rects(region, clip_rect))?;
+                        Some(RetainedInteractiveRegion {
+                            id: Some(PluginSurfaceRegionId::new(&surface.id, &region.local_id)),
+                            rect,
+                            focusable: region.focusable,
+                            cursor: region.cursor,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut builder = RetainedSurface::builder(surface.id.retained_id, rect)
+                .layer(surface.layer)
+                .z(surface.z)
+                .revision(surface.revision)
+                .render_ops(surface.ops.clone())
+                .clip_rect(clip_rect)
+                .retained_interactive_regions(interactive_regions);
+            builder = if surface.opaque {
+                builder.opaque()
+            } else {
+                builder.transparent()
+            };
+            Some(builder.build())
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +292,12 @@ impl RetainedSurfaceBuilder {
     }
 
     #[must_use]
+    pub const fn revision(mut self, revision: u64) -> Self {
+        self.surface.revision = Some(revision);
+        self
+    }
+
+    #[must_use]
     pub const fn clip_rect(mut self, clip_rect: DamageRect) -> Self {
         self.surface.clip_rect = Some(clip_rect);
         self
@@ -200,12 +305,33 @@ impl RetainedSurfaceBuilder {
 
     #[must_use]
     pub fn interactive_region(mut self, region: DamageRect) -> Self {
-        self.surface.interactive_regions.push(region);
+        self.surface
+            .interactive_regions
+            .push(RetainedInteractiveRegion {
+                id: None,
+                rect: region,
+                focusable: false,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+            });
         self
     }
 
     #[must_use]
     pub fn interactive_regions(mut self, regions: Vec<DamageRect>) -> Self {
+        self.surface.interactive_regions = regions
+            .into_iter()
+            .map(|rect| RetainedInteractiveRegion {
+                id: None,
+                rect,
+                focusable: false,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+            })
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub fn retained_interactive_regions(mut self, regions: Vec<RetainedInteractiveRegion>) -> Self {
         self.surface.interactive_regions = regions;
         self
     }
@@ -213,6 +339,359 @@ impl RetainedSurfaceBuilder {
     #[must_use]
     pub fn build(self) -> RetainedSurface {
         self.surface
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedSurfaceHit {
+    pub surface_id: Uuid,
+    pub surface_revision: Option<u64>,
+    pub region_index: usize,
+    pub region_id: Option<PluginSurfaceRegionId>,
+    pub absolute_x: u16,
+    pub absolute_y: u16,
+    pub surface_x: u16,
+    pub surface_y: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedPointerPhase {
+    Enter,
+    Move,
+    Leave,
+    Down,
+    Up,
+    Wheel,
+    Drag,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedPointerButton {
+    Primary,
+    Secondary,
+    Middle,
+    Other(u8),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedPointerEvent {
+    pub phase: RetainedPointerPhase,
+    pub hit: RetainedSurfaceHit,
+    pub button: Option<RetainedPointerButton>,
+    pub wheel_delta: i16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedKeyboardEvent {
+    pub target: PluginSurfaceRegionId,
+    pub key: String,
+    pub pressed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedInputEvent {
+    Pointer(RetainedPointerEvent),
+    Keyboard(RetainedKeyboardEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedInputQueue {
+    maximum_events: usize,
+    events: Vec<RetainedInputEvent>,
+}
+
+impl Default for RetainedInputQueue {
+    fn default() -> Self {
+        Self::new(1_024)
+    }
+}
+
+impl RetainedInputQueue {
+    #[must_use]
+    pub const fn new(maximum_events: usize) -> Self {
+        Self {
+            maximum_events,
+            events: Vec::new(),
+        }
+    }
+
+    const fn has_capacity(&self) -> bool {
+        self.events.len() < self.maximum_events
+    }
+
+    pub fn push_pointer(&mut self, event: RetainedPointerEvent) -> bool {
+        if event.hit.region_id.is_none() || !self.has_capacity() {
+            return false;
+        }
+        self.events.push(RetainedInputEvent::Pointer(event));
+        true
+    }
+
+    pub fn push_key(
+        &mut self,
+        focus: &RetainedFocusState,
+        key: impl Into<String>,
+        pressed: bool,
+    ) -> bool {
+        if !self.has_capacity() {
+            return false;
+        }
+        let Some(target) = focus.focused().cloned() else {
+            return false;
+        };
+        self.events
+            .push(RetainedInputEvent::Keyboard(RetainedKeyboardEvent {
+                target,
+                key: key.into(),
+                pressed,
+            }));
+        true
+    }
+
+    #[must_use]
+    pub fn drain(&mut self) -> Vec<RetainedInputEvent> {
+        self.events.drain(..).collect()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetainedPointerRouter {
+    hovered: Option<RetainedSurfaceHit>,
+    captured: Option<RetainedSurfaceHit>,
+}
+
+impl RetainedPointerRouter {
+    #[must_use]
+    pub const fn hovered(&self) -> Option<&RetainedSurfaceHit> {
+        self.hovered.as_ref()
+    }
+
+    #[must_use]
+    pub const fn captured(&self) -> Option<&RetainedSurfaceHit> {
+        self.captured.as_ref()
+    }
+
+    pub fn capture(&mut self, hit: RetainedSurfaceHit) {
+        self.captured = Some(hit);
+    }
+
+    pub const fn release_capture(&mut self) -> Option<RetainedSurfaceHit> {
+        self.captured.take()
+    }
+
+    #[must_use]
+    pub fn route_move(
+        &mut self,
+        compositor: &RetainedCompositor,
+        x: u16,
+        y: u16,
+    ) -> Vec<RetainedPointerEvent> {
+        let next = compositor.hit_test(x, y);
+        let same_target =
+            self.hovered
+                .as_ref()
+                .zip(next.as_ref())
+                .is_some_and(|(current, next)| {
+                    current.surface_id == next.surface_id
+                        && current.region_index == next.region_index
+                        && current.region_id == next.region_id
+                });
+        if same_target {
+            self.hovered.clone_from(&next);
+            return next
+                .into_iter()
+                .map(|hit| RetainedPointerEvent {
+                    phase: RetainedPointerPhase::Move,
+                    hit,
+                    button: None,
+                    wheel_delta: 0,
+                })
+                .collect();
+        }
+
+        let mut events = Vec::with_capacity(2);
+        if let Some(hit) = self.hovered.take() {
+            events.push(RetainedPointerEvent {
+                phase: RetainedPointerPhase::Leave,
+                hit,
+                button: None,
+                wheel_delta: 0,
+            });
+        }
+        if let Some(hit) = next {
+            events.push(RetainedPointerEvent {
+                phase: RetainedPointerPhase::Enter,
+                hit: hit.clone(),
+                button: None,
+                wheel_delta: 0,
+            });
+            self.hovered = Some(hit);
+        }
+        events
+    }
+
+    #[must_use]
+    pub fn route_button(
+        &self,
+        compositor: &RetainedCompositor,
+        x: u16,
+        y: u16,
+        button: RetainedPointerButton,
+        pressed: bool,
+    ) -> Option<RetainedPointerEvent> {
+        compositor.hit_test(x, y).map(|hit| RetainedPointerEvent {
+            phase: if pressed {
+                RetainedPointerPhase::Down
+            } else {
+                RetainedPointerPhase::Up
+            },
+            hit,
+            button: Some(button),
+            wheel_delta: 0,
+        })
+    }
+
+    #[must_use]
+    pub fn route_wheel(
+        &self,
+        compositor: &RetainedCompositor,
+        x: u16,
+        y: u16,
+        delta: i16,
+    ) -> Option<RetainedPointerEvent> {
+        compositor.hit_test(x, y).map(|hit| RetainedPointerEvent {
+            phase: RetainedPointerPhase::Wheel,
+            hit,
+            button: None,
+            wheel_delta: delta,
+        })
+    }
+
+    #[must_use]
+    pub fn route_drag(
+        &self,
+        compositor: &RetainedCompositor,
+        x: u16,
+        y: u16,
+        button: RetainedPointerButton,
+    ) -> Option<RetainedPointerEvent> {
+        self.captured
+            .as_ref()
+            .and_then(|captured| retarget_hit(compositor, captured, x, y))
+            .or_else(|| compositor.hit_test(x, y))
+            .map(|hit| RetainedPointerEvent {
+                phase: RetainedPointerPhase::Drag,
+                hit,
+                button: Some(button),
+                wheel_delta: 0,
+            })
+    }
+
+    #[must_use]
+    pub fn reconcile(&mut self, compositor: &RetainedCompositor) -> Vec<RetainedPointerEvent> {
+        let mut events = Vec::new();
+        if let Some(hovered) = self.hovered.as_ref()
+            && !hit_target_is_present(compositor, hovered)
+            && let Some(hit) = self.hovered.take()
+        {
+            events.push(RetainedPointerEvent {
+                phase: RetainedPointerPhase::Leave,
+                hit,
+                button: None,
+                wheel_delta: 0,
+            });
+        }
+        if self
+            .captured
+            .as_ref()
+            .is_some_and(|captured| !hit_target_is_present(compositor, captured))
+        {
+            self.captured = None;
+        }
+        events
+    }
+}
+
+fn hit_target_is_present(compositor: &RetainedCompositor, hit: &RetainedSurfaceHit) -> bool {
+    compositor.surfaces().values().any(|surface| {
+        surface.id == hit.surface_id
+            && surface.revision == hit.surface_revision
+            && surface
+                .interactive_regions
+                .get(hit.region_index)
+                .is_some_and(|region| region.id == hit.region_id)
+    })
+}
+
+fn retarget_hit(
+    compositor: &RetainedCompositor,
+    captured: &RetainedSurfaceHit,
+    x: u16,
+    y: u16,
+) -> Option<RetainedSurfaceHit> {
+    let surface = compositor.surfaces().get(&captured.surface_id)?;
+    let region = surface.interactive_regions.get(captured.region_index)?;
+    if region.id != captured.region_id || surface.revision != captured.surface_revision {
+        return None;
+    }
+    Some(RetainedSurfaceHit {
+        surface_id: captured.surface_id,
+        surface_revision: captured.surface_revision,
+        region_index: captured.region_index,
+        region_id: captured.region_id.clone(),
+        absolute_x: x,
+        absolute_y: y,
+        surface_x: x.saturating_sub(surface.rect.x),
+        surface_y: y.saturating_sub(surface.rect.y),
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetainedFocusState {
+    focused: Option<PluginSurfaceRegionId>,
+}
+
+impl RetainedFocusState {
+    #[must_use]
+    pub const fn focused(&self) -> Option<&PluginSurfaceRegionId> {
+        self.focused.as_ref()
+    }
+
+    pub fn focus_hit(&mut self, compositor: &RetainedCompositor, hit: &RetainedSurfaceHit) -> bool {
+        let Some(region) = compositor
+            .surfaces()
+            .get(&hit.surface_id)
+            .and_then(|surface| surface.interactive_regions.get(hit.region_index))
+        else {
+            return false;
+        };
+        let Some(id) = region.id.as_ref().filter(|_| region.focusable) else {
+            return false;
+        };
+        self.focused = Some(id.clone());
+        true
+    }
+
+    pub const fn clear(&mut self) -> Option<PluginSurfaceRegionId> {
+        self.focused.take()
+    }
+
+    pub fn reconcile(&mut self, compositor: &RetainedCompositor) -> bool {
+        let Some(focused) = self.focused.as_ref() else {
+            return false;
+        };
+        let present = compositor.surfaces().values().any(|surface| {
+            surface
+                .interactive_regions
+                .iter()
+                .any(|region| region.focusable && region.id.as_ref() == Some(focused))
+        });
+        if present {
+            false
+        } else {
+            self.focused = None;
+            true
+        }
     }
 }
 
@@ -239,6 +718,35 @@ impl RetainedCompositor {
         let mut surfaces = self.surfaces.values().collect::<Vec<_>>();
         surfaces.sort_by_key(|surface| surface.z_key());
         surfaces
+    }
+
+    #[must_use]
+    pub fn hit_test(&self, x: u16, y: u16) -> Option<RetainedSurfaceHit> {
+        self.ordered_surfaces()
+            .into_iter()
+            .rev()
+            .find_map(|surface| {
+                let paint_rect = surface.paint_rect()?;
+                if !rect_contains_point(paint_rect, x, y) {
+                    return None;
+                }
+                surface
+                    .interactive_regions
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, region)| rect_contains_point(region.rect, x, y))
+                    .map(|(region_index, region)| RetainedSurfaceHit {
+                        surface_id: surface.id,
+                        surface_revision: surface.revision,
+                        region_index,
+                        region_id: region.id.clone(),
+                        absolute_x: x,
+                        absolute_y: y,
+                        surface_x: x.saturating_sub(surface.rect.x),
+                        surface_y: y.saturating_sub(surface.rect.y),
+                    })
+            })
     }
 
     #[must_use]
@@ -392,7 +900,7 @@ pub struct RetainedRepaintSurface {
     pub opaque: bool,
     pub opacity: RetainedOpacity,
     pub clip_rect: Option<DamageRect>,
-    pub interactive_regions: Vec<DamageRect>,
+    pub interactive_regions: Vec<RetainedInteractiveRegion>,
     pub damage: Vec<DamageRect>,
 }
 
@@ -741,6 +1249,13 @@ fn coalesce_absolute_damage(
     }
 }
 
+const fn rect_contains_point(rect: DamageRect, x: u16, y: u16) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.w)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.h)
+}
+
 const fn rect_contains(outer: DamageRect, inner: DamageRect) -> bool {
     outer.x <= inner.x
         && outer.y <= inner.y
@@ -780,7 +1295,530 @@ mod tests {
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         InteractiveRegion,
     };
+    use bmux_plugin::surface::{
+        PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceTarget,
+    };
     use bmux_plugin::{RenderOp, RenderStyle};
+
+    #[test]
+    fn plugin_surfaces_lower_through_layout_allocations_and_explicit_geometry() {
+        let owner = "example.presentation";
+        let layout_id = bmux_plugin::layout::PluginLayoutId::new(owner, "region");
+        let layout_rect = ExtensionRect::new(4, 2, 20, 3);
+        let allocations = BTreeMap::from([(layout_id.clone(), layout_rect)]);
+        let surfaces = [
+            PluginSurface {
+                id: PluginSurfaceId::new(owner, "layout", Uuid::from_u128(501)),
+                revision: 1,
+                target: PluginSurfaceTarget::Layout(layout_id),
+                clip_rect: None,
+                interactive_regions: Vec::new(),
+                accepts_input: false,
+                layer: 3,
+                z: 4,
+                opaque: true,
+                visible: true,
+                ops: vec![RenderOp::text_run(4, 2, "layout", RenderStyle::new())],
+            },
+            PluginSurface {
+                id: PluginSurfaceId::new(owner, "overlay", Uuid::from_u128(502)),
+                revision: 1,
+                target: PluginSurfaceTarget::Explicit(ExtensionRect::new(30, 5, 10, 2)),
+                clip_rect: None,
+                interactive_regions: Vec::new(),
+                accepts_input: false,
+                layer: 5,
+                z: 6,
+                opaque: false,
+                visible: true,
+                ops: Vec::new(),
+            },
+        ];
+
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &surfaces,
+            &allocations,
+            DamageRect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(lowered.len(), 2);
+        assert_eq!(lowered[0].rect, DamageRect::new(4, 2, 20, 3));
+        assert!(lowered[0].opaque);
+        assert_eq!(lowered[1].rect, DamageRect::new(30, 5, 10, 2));
+        assert!(!lowered[1].opaque);
+    }
+
+    #[test]
+    fn retained_input_queue_is_bounded_without_evicting_committed_events() {
+        let target = PluginSurfaceRegionId {
+            owner_plugin_id: "owner".to_owned(),
+            surface_local_id: "surface".to_owned(),
+            region_local_id: "region".to_owned(),
+        };
+        let focus = RetainedFocusState {
+            focused: Some(target),
+        };
+        let mut queue = RetainedInputQueue::new(1);
+        assert!(queue.push_key(&focus, "first", true));
+        assert!(!queue.push_key(&focus, "second", true));
+        let drained = queue.drain();
+        assert!(matches!(
+            drained.as_slice(),
+            [RetainedInputEvent::Keyboard(RetainedKeyboardEvent { key, .. })] if key == "first"
+        ));
+    }
+
+    #[test]
+    fn retained_input_queue_accepts_semantic_pointer_and_focused_keyboard_events() {
+        let owner = "example.queue";
+        let mut compositor = RetainedCompositor::new();
+        let surface = PluginSurface {
+            id: PluginSurfaceId::new(owner, "surface", Uuid::from_u128(617)),
+            revision: 1,
+            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
+            clip_rect: None,
+            interactive_regions: vec![PluginSurfaceRegion {
+                local_id: "field".to_owned(),
+                rect: ExtensionRect::new(0, 0, 8, 4),
+                focusable: true,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Text,
+            }],
+            accepts_input: true,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            visible: true,
+            ops: Vec::new(),
+        };
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 80, 24),
+        );
+        compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let hit = compositor.hit_test(3, 3).unwrap();
+        let mut focus = RetainedFocusState::default();
+        assert!(focus.focus_hit(&compositor, &hit));
+        let pointer = RetainedPointerRouter::default()
+            .route_button(&compositor, 3, 3, RetainedPointerButton::Primary, true)
+            .unwrap();
+        let mut queue = RetainedInputQueue::default();
+        assert!(queue.push_pointer(pointer));
+        assert!(queue.push_key(&focus, "enter", true));
+
+        assert!(matches!(queue.drain().as_slice(), [
+            RetainedInputEvent::Pointer(_),
+            RetainedInputEvent::Keyboard(RetainedKeyboardEvent { key, pressed: true, .. })
+        ] if key == "enter"));
+        assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn stale_hit_and_capture_cannot_cross_surface_revision() {
+        let mut compositor = RetainedCompositor::new();
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let make_surface = |revision| {
+            RetainedSurface::builder(Uuid::from_u128(616), DamageRect::new(2, 2, 8, 4))
+                .revision(revision)
+                .interactive_region(DamageRect::new(2, 2, 8, 4))
+                .build()
+        };
+        compositor.replace_surfaces(
+            [make_surface(1)],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let stale = compositor.hit_test(3, 3).unwrap();
+        let mut router = RetainedPointerRouter::default();
+        router.capture(stale.clone());
+
+        compositor.replace_surfaces(
+            [make_surface(2)],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(
+            router
+                .route_drag(&compositor, 20, 10, RetainedPointerButton::Primary)
+                .is_none()
+        );
+        let _ = router.reconcile(&compositor);
+        assert!(router.captured().is_none());
+        assert_ne!(
+            compositor.hit_test(3, 3).unwrap().surface_revision,
+            stale.surface_revision
+        );
+    }
+
+    #[test]
+    fn retained_focus_accepts_only_focusable_semantic_regions_and_cleans_up() {
+        let owner = "example.focus";
+        let mut compositor = RetainedCompositor::new();
+        let surface = PluginSurface {
+            id: PluginSurfaceId::new(owner, "surface", Uuid::from_u128(615)),
+            revision: 1,
+            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
+            clip_rect: None,
+            interactive_regions: vec![PluginSurfaceRegion {
+                local_id: "field".to_owned(),
+                rect: ExtensionRect::new(0, 0, 8, 4),
+                focusable: true,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Text,
+            }],
+            accepts_input: true,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            visible: true,
+            ops: Vec::new(),
+        };
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 80, 24),
+        );
+        compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let hit = compositor.hit_test(3, 3).unwrap();
+        let mut focus = RetainedFocusState::default();
+        assert!(focus.focus_hit(&compositor, &hit));
+        assert_eq!(focus.focused().unwrap().region_local_id, "field");
+        assert_eq!(
+            compositor.surfaces()[&Uuid::from_u128(615)].interactive_regions[0].cursor,
+            bmux_plugin::surface::PluginSurfaceCursor::Text
+        );
+
+        compositor.replace_surfaces(
+            [],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(focus.reconcile(&compositor));
+        assert!(focus.focused().is_none());
+    }
+
+    #[test]
+    fn pointer_capture_continues_drag_routing_and_cleans_up_removed_target() {
+        let mut compositor = RetainedCompositor::new();
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(614), DamageRect::new(2, 2, 8, 4))
+                    .interactive_region(DamageRect::new(2, 2, 8, 4))
+                    .build(),
+            ],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let mut router = RetainedPointerRouter::default();
+        let hit = compositor.hit_test(4, 3).unwrap();
+        router.capture(hit);
+
+        let dragged = router
+            .route_drag(&compositor, 40, 20, RetainedPointerButton::Primary)
+            .unwrap();
+        assert_eq!(dragged.hit.surface_id, Uuid::from_u128(614));
+        assert_eq!(dragged.hit.absolute_x, 40);
+        assert_eq!(dragged.hit.surface_x, 38);
+        assert!(router.release_capture().is_some());
+        assert!(
+            router
+                .route_drag(&compositor, 40, 20, RetainedPointerButton::Primary)
+                .is_none()
+        );
+
+        router.capture(compositor.hit_test(4, 3).unwrap());
+        compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
+        assert!(router.reconcile(&compositor).is_empty());
+        assert!(router.captured().is_none());
+    }
+
+    #[test]
+    fn pointer_router_routes_button_wheel_and_drag_phases() {
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(613), DamageRect::new(2, 2, 8, 4))
+                    .interactive_region(DamageRect::new(2, 2, 8, 4))
+                    .build(),
+            ],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let router = RetainedPointerRouter::default();
+
+        let down = router
+            .route_button(&compositor, 4, 3, RetainedPointerButton::Primary, true)
+            .unwrap();
+        assert_eq!(down.phase, RetainedPointerPhase::Down);
+        assert_eq!(down.button, Some(RetainedPointerButton::Primary));
+        assert_eq!(
+            router
+                .route_button(&compositor, 4, 3, RetainedPointerButton::Primary, false)
+                .unwrap()
+                .phase,
+            RetainedPointerPhase::Up
+        );
+        let wheel = router.route_wheel(&compositor, 4, 3, -3).unwrap();
+        assert_eq!(wheel.phase, RetainedPointerPhase::Wheel);
+        assert_eq!(wheel.wheel_delta, -3);
+        assert_eq!(
+            router
+                .route_drag(&compositor, 4, 3, RetainedPointerButton::Primary)
+                .unwrap()
+                .phase,
+            RetainedPointerPhase::Drag
+        );
+        assert!(router.route_wheel(&compositor, 40, 20, 1).is_none());
+    }
+
+    #[test]
+    fn pointer_router_emits_enter_move_leave_and_cleans_up_removed_target() {
+        let mut compositor = RetainedCompositor::new();
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(610), DamageRect::new(5, 3, 10, 5))
+                    .interactive_region(DamageRect::new(5, 3, 10, 5))
+                    .build(),
+            ],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let mut router = RetainedPointerRouter::default();
+
+        let entered = router.route_move(&compositor, 7, 4);
+        assert_eq!(entered.len(), 1);
+        assert_eq!(entered[0].phase, RetainedPointerPhase::Enter);
+        let moved = router.route_move(&compositor, 8, 4);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].phase, RetainedPointerPhase::Move);
+        let left = router.route_move(&compositor, 30, 20);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].phase, RetainedPointerPhase::Leave);
+
+        let _ = router.route_move(&compositor, 7, 4);
+        compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
+        assert_eq!(
+            router.reconcile(&compositor)[0].phase,
+            RetainedPointerPhase::Leave
+        );
+        assert!(router.hovered().is_none());
+    }
+
+    #[test]
+    fn pointer_router_orders_leave_before_enter_between_targets() {
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(611), DamageRect::new(0, 0, 4, 2))
+                    .interactive_region(DamageRect::new(0, 0, 4, 2))
+                    .build(),
+                RetainedSurface::builder(Uuid::from_u128(612), DamageRect::new(5, 0, 4, 2))
+                    .interactive_region(DamageRect::new(5, 0, 4, 2))
+                    .build(),
+            ],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut router = RetainedPointerRouter::default();
+        let _ = router.route_move(&compositor, 1, 1);
+        let events = router.route_move(&compositor, 6, 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, RetainedPointerPhase::Leave);
+        assert_eq!(events[1].phase, RetainedPointerPhase::Enter);
+    }
+
+    #[test]
+    fn retained_hit_test_prefers_topmost_region_and_returns_local_coordinates() {
+        let mut compositor = RetainedCompositor::new();
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(600), DamageRect::new(5, 3, 10, 5))
+                    .layer(1)
+                    .z(0)
+                    .interactive_region(DamageRect::new(5, 3, 10, 5))
+                    .build(),
+                RetainedSurface::builder(Uuid::from_u128(601), DamageRect::new(8, 4, 10, 5))
+                    .layer(2)
+                    .z(0)
+                    .interactive_regions(vec![
+                        DamageRect::new(8, 4, 6, 3),
+                        DamageRect::new(10, 5, 2, 1),
+                    ])
+                    .build(),
+            ],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(
+            compositor.hit_test(10, 5),
+            Some(RetainedSurfaceHit {
+                surface_id: Uuid::from_u128(601),
+                surface_revision: None,
+                region_index: 1,
+                region_id: None,
+                absolute_x: 10,
+                absolute_y: 5,
+                surface_x: 2,
+                surface_y: 1,
+            })
+        );
+        assert_eq!(
+            compositor.hit_test(6, 4).unwrap().surface_id,
+            Uuid::from_u128(600)
+        );
+        assert_eq!(compositor.hit_test(30, 20), None);
+    }
+
+    #[test]
+    fn retained_hit_test_respects_surface_clip() {
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(602), DamageRect::new(5, 3, 10, 5))
+                    .clip_rect(DamageRect::new(7, 4, 2, 2))
+                    .interactive_region(DamageRect::new(5, 3, 10, 5))
+                    .build(),
+            ],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert!(compositor.hit_test(7, 4).is_some());
+        assert_eq!(compositor.hit_test(6, 4), None);
+    }
+
+    #[test]
+    fn plugin_surface_lowering_clips_and_gates_local_input_regions() {
+        let owner = "example.presentation";
+        let surface = PluginSurface {
+            id: PluginSurfaceId::new(owner, "interactive", Uuid::from_u128(506)),
+            revision: 1,
+            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(10, 4, 8, 4)),
+            clip_rect: Some(ExtensionRect::new(2, 1, 4, 2)),
+            interactive_regions: vec![
+                bmux_plugin::surface::PluginSurfaceRegion {
+                    local_id: "whole".to_owned(),
+                    rect: ExtensionRect::new(0, 0, 8, 4),
+                    focusable: false,
+                    cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                },
+                bmux_plugin::surface::PluginSurfaceRegion {
+                    local_id: "inner".to_owned(),
+                    rect: ExtensionRect::new(3, 1, 2, 1),
+                    focusable: false,
+                    cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                },
+            ],
+            accepts_input: true,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            visible: true,
+            ops: Vec::new(),
+        };
+
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(lowered[0].clip_rect, Some(DamageRect::new(12, 5, 4, 2)));
+        assert_eq!(
+            lowered[0].interactive_regions,
+            vec![DamageRect::new(12, 5, 4, 2), DamageRect::new(13, 5, 2, 1)]
+        );
+        assert_eq!(
+            lowered[0].interactive_regions[1].id,
+            Some(PluginSurfaceRegionId {
+                owner_plugin_id: owner.to_owned(),
+                surface_local_id: "interactive".to_owned(),
+                region_local_id: "inner".to_owned(),
+            })
+        );
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(
+            compositor.hit_test(13, 5).unwrap().region_id,
+            Some(PluginSurfaceRegionId {
+                owner_plugin_id: owner.to_owned(),
+                surface_local_id: "interactive".to_owned(),
+                region_local_id: "inner".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn plugin_surface_lowering_skips_hidden_unresolved_and_zero_area_surfaces() {
+        let owner = "example.presentation";
+        let surfaces = [
+            PluginSurface {
+                id: PluginSurfaceId::new(owner, "hidden", Uuid::from_u128(503)),
+                revision: 1,
+                target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 1, 4, 1)),
+                clip_rect: None,
+                interactive_regions: Vec::new(),
+                accepts_input: false,
+                layer: 0,
+                z: 0,
+                opaque: true,
+                visible: false,
+                ops: Vec::new(),
+            },
+            PluginSurface {
+                id: PluginSurfaceId::new(owner, "missing", Uuid::from_u128(504)),
+                revision: 1,
+                target: PluginSurfaceTarget::Layout(bmux_plugin::layout::PluginLayoutId::new(
+                    owner, "missing",
+                )),
+                clip_rect: None,
+                interactive_regions: Vec::new(),
+                accepts_input: false,
+                layer: 0,
+                z: 0,
+                opaque: true,
+                visible: true,
+                ops: Vec::new(),
+            },
+            PluginSurface {
+                id: PluginSurfaceId::new(owner, "empty", Uuid::from_u128(505)),
+                revision: 1,
+                target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 1, 0, 1)),
+                clip_rect: None,
+                interactive_regions: Vec::new(),
+                accepts_input: false,
+                layer: 0,
+                z: 0,
+                opaque: true,
+                visible: true,
+                ops: Vec::new(),
+            },
+        ];
+
+        assert!(
+            retained_surfaces_from_plugin_surfaces(
+                &surfaces,
+                &BTreeMap::new(),
+                DamageRect::new(0, 0, 80, 24),
+            )
+            .is_empty()
+        );
+    }
 
     fn surface(id: u128, x: u16, y: u16, layer: i16, z: i32, opaque: bool) -> RetainedSurface {
         RetainedSurface::new(

@@ -1495,7 +1495,12 @@ pub(super) fn activate_loaded_plugins(
                 );
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
-                if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
+                let deactivate_result = activated_plugin.deactivate(&context);
+                bmux_plugin::layout::global_plugin_layout_registry()
+                    .remove_owner(activated_plugin.declaration.id.as_str());
+                bmux_plugin::surface::global_plugin_surface_registry()
+                    .remove_owner(activated_plugin.declaration.id.as_str());
+                if let Err(deactivate_error) = deactivate_result {
                     warn!(
                         "failed rolling back plugin activation for {}: {deactivate_error}",
                         activated_plugin.declaration.id.as_str()
@@ -1594,7 +1599,12 @@ pub(super) fn deactivate_loaded_plugins(
             registered_plugins.clone(),
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
-        let _ = plugin.deactivate(&context).with_context(|| {
+        let deactivate_result = plugin.deactivate(&context);
+        bmux_plugin::layout::global_plugin_layout_registry()
+            .remove_owner(plugin.declaration.id.as_str());
+        bmux_plugin::surface::global_plugin_surface_registry()
+            .remove_owner(plugin.declaration.id.as_str());
+        let _ = deactivate_result.with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",
                 plugin.declaration.id.as_str()

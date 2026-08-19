@@ -28,6 +28,7 @@ pub mod render;
 mod service_location;
 mod startup_gate;
 mod static_vtable_registry;
+pub mod surface;
 pub mod test_support;
 mod typed_dispatch_bridge;
 mod typed_service_caller;

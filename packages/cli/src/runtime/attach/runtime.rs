@@ -18,7 +18,8 @@ use bmux_attach_pipeline::{
     RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload, ScrollbackViewportBase,
     frame_damage_from_retained_repaint_plan, merge_retained_damages,
     retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
-    retained_layer_order, retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
+    retained_layer_order, retained_surfaces_from_attach_scene,
+    retained_surfaces_from_plugin_surfaces, update_protocol_hints_from_state,
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
@@ -38,6 +39,9 @@ use bmux_ipc::InvokeServiceKind;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
+use bmux_plugin::layout::{
+    PluginLayoutRequest, global_plugin_layout_registry, resolve_plugin_layout,
+};
 use bmux_plugin::{
     AttachInputEvent, AttachInputHook, AttachInputModifiers, AttachInputPaneContext,
     AttachInputResult, AttachVisualProjectionUpdate, ExtensionRect,
@@ -3554,6 +3558,9 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         }
     }
 
+    let mut layout_revision_rx = global_plugin_layout_registry().subscribe();
+    let mut surface_revision_rx =
+        bmux_plugin::surface::global_plugin_surface_registry().subscribe();
     update_attach_viewport_with_geometry(
         &mut client,
         view_state.attached_id,
@@ -3721,7 +3728,6 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     }
 
     loop {
-        // ── Event-driven select: sleep until something happens ────────
         tokio::select! {
             // Server-pushed events (layout changes, session events, pane output)
             event = client.event_receiver().recv() => {
@@ -3897,6 +3903,33 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                     // Broadcast lagged/closed — drop subscription.
                     scene_event_rx = None;
                 }
+            }
+
+            surface_revision_result = surface_revision_rx.changed() => {
+                if surface_revision_result.is_err() {
+                    tracing::warn!("plugin surface revision channel closed");
+                    continue;
+                }
+                view_state
+                    .dirty
+                    .mark_extension_dirty(AttachDirtySource::SceneChanged);
+            }
+
+            layout_revision_result = layout_revision_rx.changed() => {
+                if layout_revision_result.is_err() {
+                    tracing::warn!("plugin layout revision channel closed");
+                    continue;
+                }
+                update_attach_viewport_with_geometry(
+                    &mut client,
+                    view_state.attached_id,
+                    view_state.status_position,
+                    terminal.geometry(),
+                )
+                .await?;
+                view_state
+                    .dirty
+                    .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
             }
 
             // Windows-plugin published a new ordered window list.
@@ -5372,16 +5405,16 @@ pub async fn retarget_attach_to_context(
     );
     let retarget_service_started = Instant::now();
     let geometry = current_attach_terminal_geometry();
-    let (top_inset, bottom_inset) = status_insets_for_position(view_state.status_position);
+    let insets = resolved_attach_viewport_insets(geometry, view_state.status_position);
     let attach_info = client
         .retarget_attach_context_with_insets(
             context_id,
             geometry.cols,
             geometry.rows,
-            top_inset,
-            0,
-            bottom_inset,
-            0,
+            insets.top,
+            insets.right,
+            insets.bottom,
+            insets.left,
         )
         .await?;
     let retarget_service_us = retarget_service_started.elapsed().as_micros();
@@ -7472,6 +7505,48 @@ pub const fn status_insets_for_position(status_position: StatusPosition) -> (u16
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachViewportInsets {
+    top: u16,
+    right: u16,
+    bottom: u16,
+    left: u16,
+}
+
+fn resolved_attach_viewport_insets(
+    geometry: TerminalGeometry,
+    status_position: StatusPosition,
+) -> AttachViewportInsets {
+    let requests = global_plugin_layout_registry().requests();
+    resolved_attach_viewport_insets_for_requests(geometry, status_position, &requests)
+}
+
+fn resolved_attach_viewport_insets_for_requests(
+    geometry: TerminalGeometry,
+    status_position: StatusPosition,
+    requests: &[PluginLayoutRequest],
+) -> AttachViewportInsets {
+    let (status_top, status_bottom) = status_insets_for_position(status_position);
+    let viewport = ExtensionRect::new(0, 0, geometry.cols, geometry.rows);
+    let minimum_height = 1_u16
+        .saturating_add(status_top)
+        .saturating_add(status_bottom);
+    let remaining = resolve_plugin_layout(viewport, (1, minimum_height), requests)
+        .map_or(viewport, |resolution| resolution.remaining);
+    let remaining_right = remaining.x.saturating_add(remaining.w);
+    let remaining_bottom = remaining.y.saturating_add(remaining.h);
+
+    AttachViewportInsets {
+        top: remaining.y.saturating_add(status_top),
+        right: geometry.cols.saturating_sub(remaining_right),
+        bottom: geometry
+            .rows
+            .saturating_sub(remaining_bottom)
+            .saturating_add(status_bottom),
+        left: remaining.x,
+    }
+}
+
 pub const fn status_row_for_position(status_position: StatusPosition, rows: u16) -> Option<u16> {
     if rows == 0 {
         return None;
@@ -8167,6 +8242,27 @@ impl RetainedFramePlan {
     }
 }
 
+fn retained_plugin_surfaces(viewport: DamageRect) -> Vec<RetainedSurface> {
+    let plugin_layout = resolve_plugin_layout(
+        ExtensionRect::new(viewport.x, viewport.y, viewport.w, viewport.h),
+        (1, 1),
+        &global_plugin_layout_registry().requests(),
+    );
+    let Ok(plugin_layout) = plugin_layout else {
+        return Vec::new();
+    };
+    let allocations = plugin_layout
+        .allocations
+        .into_iter()
+        .map(|allocation| (allocation.id, allocation.rect))
+        .collect::<BTreeMap<_, _>>();
+    retained_surfaces_from_plugin_surfaces(
+        &bmux_plugin::surface::global_plugin_surface_registry().surfaces(),
+        &allocations,
+        viewport,
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // Retained planning bridges frame damage, UI surfaces, and compositor state.
 fn build_retained_frame_plan(
     view_state: &mut AttachViewState,
@@ -8232,6 +8328,7 @@ fn build_retained_frame_plan(
     let explicit_ui_damage =
         retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
     let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
+    retained_surfaces.extend(retained_plugin_surfaces(viewport));
     retained_surfaces.extend(status_surface.iter().cloned());
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
@@ -9595,16 +9692,16 @@ pub async fn update_attach_viewport_with_geometry(
     if geometry.cols == 0 || geometry.rows == 0 {
         return Ok(());
     }
-    let (top_inset, bottom_inset) = status_insets_for_position(status_position);
+    let insets = resolved_attach_viewport_insets(geometry, status_position);
     client
         .attach_set_viewport_with_insets(
             session_id,
             geometry.cols,
             geometry.rows,
-            top_inset,
-            0,
-            bottom_inset,
-            0,
+            insets.top,
+            insets.right,
+            insets.bottom,
+            insets.left,
         )
         .await?;
     Ok(())
@@ -15448,6 +15545,9 @@ mod tests {
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
+    use bmux_plugin::layout::{
+        LayoutEdge, LayoutExtent, LayoutOperation, PluginLayoutId, PluginLayoutRequest,
+    };
     use bmux_plugin::{
         AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
     };
@@ -15459,6 +15559,141 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    #[test]
+    fn plugin_layout_reservations_produce_four_edge_viewport_insets() {
+        let requests = [
+            PluginLayoutRequest {
+                id: PluginLayoutId::new("example.sidebar", "main"),
+                order: 0,
+                operation: LayoutOperation::Split {
+                    edge: LayoutEdge::Left,
+                    extent: LayoutExtent::Cells(18),
+                },
+            },
+            PluginLayoutRequest {
+                id: PluginLayoutId::new("example.footer", "main"),
+                order: 1,
+                operation: LayoutOperation::Split {
+                    edge: LayoutEdge::Bottom,
+                    extent: LayoutExtent::Cells(2),
+                },
+            },
+        ];
+
+        let insets = resolved_attach_viewport_insets_for_requests(
+            TerminalGeometry {
+                cols: 100,
+                rows: 30,
+            },
+            StatusPosition::Top,
+            &requests,
+        );
+
+        assert_eq!(
+            insets,
+            AttachViewportInsets {
+                top: 1,
+                right: 0,
+                bottom: 2,
+                left: 18,
+            }
+        );
+    }
+
+    #[test]
+    fn plugin_layout_reservations_preserve_a_host_content_cell() {
+        let requests = [
+            PluginLayoutRequest {
+                id: PluginLayoutId::new("example.left", "main"),
+                order: 0,
+                operation: LayoutOperation::Split {
+                    edge: LayoutEdge::Left,
+                    extent: LayoutExtent::Cells(u16::MAX),
+                },
+            },
+            PluginLayoutRequest {
+                id: PluginLayoutId::new("example.top", "main"),
+                order: 1,
+                operation: LayoutOperation::Split {
+                    edge: LayoutEdge::Top,
+                    extent: LayoutExtent::Cells(u16::MAX),
+                },
+            },
+        ];
+
+        let insets = resolved_attach_viewport_insets_for_requests(
+            TerminalGeometry { cols: 9, rows: 5 },
+            StatusPosition::Bottom,
+            &requests,
+        );
+
+        assert_eq!(
+            insets,
+            AttachViewportInsets {
+                top: 3,
+                right: 0,
+                bottom: 1,
+                left: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_plugin_layout_fails_closed_to_baseline_viewport() {
+        let duplicate_id = PluginLayoutId::new("example.invalid", "duplicate");
+        let requests = [
+            PluginLayoutRequest {
+                id: duplicate_id.clone(),
+                order: 0,
+                operation: LayoutOperation::Split {
+                    edge: LayoutEdge::Left,
+                    extent: LayoutExtent::Cells(20),
+                },
+            },
+            PluginLayoutRequest {
+                id: duplicate_id,
+                order: 1,
+                operation: LayoutOperation::Split {
+                    edge: LayoutEdge::Right,
+                    extent: LayoutExtent::Cells(20),
+                },
+            },
+        ];
+
+        let insets = resolved_attach_viewport_insets_for_requests(
+            TerminalGeometry { cols: 80, rows: 24 },
+            StatusPosition::Bottom,
+            &requests,
+        );
+
+        assert_eq!(
+            insets,
+            AttachViewportInsets {
+                top: 0,
+                right: 0,
+                bottom: 1,
+                left: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn plugin_layout_overlays_do_not_reserve_viewport_space() {
+        let requests = [PluginLayoutRequest {
+            id: PluginLayoutId::new("example.overlay", "main"),
+            order: 0,
+            operation: LayoutOperation::Overlay,
+        }];
+
+        let insets = resolved_attach_viewport_insets_for_requests(
+            TerminalGeometry { cols: 80, rows: 24 },
+            StatusPosition::Off,
+            &requests,
+        );
+
+        assert_eq!(insets, AttachViewportInsets::default());
+    }
 
     fn normal_mode_input_processor() -> InputProcessor {
         let mut config = BmuxConfig::default();
