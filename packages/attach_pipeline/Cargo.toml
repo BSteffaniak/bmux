@@ -23,7 +23,7 @@ bmux_scene_protocol_render  = { workspace = true }
 bmux_terminal_grid          = { workspace = true }
 
 anyhow        = { workspace = true, features = ["std"] }
-crossterm     = { workspace = true }
+crossterm     = { workspace = true, features = ["events"] }
 tracing       = { workspace = true, features = ["std"] }
 unicode-width = { workspace = true }
 uuid          = { workspace = true, features = ["std"] }

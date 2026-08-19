@@ -4588,6 +4588,8 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     );
 
     terminal.restore_after_attach_ui()?;
+    bmux_plugin::surface::global_plugin_surface_registry().clear();
+    bmux_plugin::layout::global_plugin_layout_registry().clear();
 
     if exit_reason != AttachExitReason::Detached {
         let _ = client.detach().await;
@@ -7965,6 +7967,7 @@ fn retained_full_surface_repaint(surface: &RetainedSurface) -> RetainedRepaintSu
         layer: surface.layer,
         z: surface.z,
         opaque: surface.opaque,
+        modal: surface.modal,
         opacity: surface.opacity,
         clip_rect: surface.clip_rect,
         interactive_regions: surface.interactive_regions.clone(),

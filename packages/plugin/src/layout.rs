@@ -289,6 +289,18 @@ impl PluginLayoutRegistry {
         });
     }
 
+    pub fn clear(&self) -> usize {
+        let removed = self.snapshots.write().map_or(0, |mut snapshots| {
+            let count = snapshots.len();
+            snapshots.clear();
+            count
+        });
+        if removed > 0 {
+            self.notify_changed();
+        }
+        removed
+    }
+
     /// Snapshot all retained requests for deterministic host-side resolution.
     #[must_use]
     pub fn requests(&self) -> Vec<PluginLayoutRequest> {

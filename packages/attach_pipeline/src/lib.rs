@@ -24,14 +24,15 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub use compositor::{
-    RetainedCompositor, RetainedDamage, RetainedFocusState, RetainedInputEvent, RetainedInputQueue,
-    RetainedInteractiveRegion, RetainedKeyboardEvent, RetainedOpacity, RetainedPointerButton,
-    RetainedPointerEvent, RetainedPointerPhase, RetainedPointerRouter, RetainedRepaintSurface,
-    RetainedSurface, RetainedSurfaceBuilder, RetainedSurfaceHit, RetainedSurfacePayload,
-    frame_damage_from_retained_repaint_plan, merge_retained_damages,
-    retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
-    retained_layer_order, retained_repaint_plan_from_frame_damage,
-    retained_surfaces_from_attach_scene, retained_surfaces_from_plugin_surfaces,
+    RetainedCompositor, RetainedDamage, RetainedFocusState, RetainedInputDispatch,
+    RetainedInputEvent, RetainedInputQueue, RetainedInteractiveRegion, RetainedKeyboardEvent,
+    RetainedOpacity, RetainedPointerButton, RetainedPointerEvent, RetainedPointerPhase,
+    RetainedPointerRouter, RetainedRepaintSurface, RetainedSurface, RetainedSurfaceBuilder,
+    RetainedSurfaceHit, RetainedSurfacePayload, frame_damage_from_retained_repaint_plan,
+    merge_retained_damages, retained_damage_from_absolute_rects,
+    retained_frame_damage_from_frame_damage, retained_layer_order,
+    retained_repaint_plan_from_frame_damage, retained_surfaces_from_attach_scene,
+    retained_surfaces_from_plugin_surfaces,
 };
 pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,

@@ -7,7 +7,8 @@
 use crate::layout::PluginLayoutId;
 use crate::{ExtensionRect, RenderOp};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Stable namespaced identity for an independently composed surface.
@@ -80,9 +81,12 @@ pub struct PluginSurfaceRegion {
     pub rect: ExtensionRect,
     pub focusable: bool,
     pub cursor: PluginSurfaceCursor,
+    /// Typed generic service endpoint that owns input for this region.
+    pub endpoint: Option<crate::AttachInputEndpoint>,
 }
 
 /// Complete retained visual state for one independent surface.
+#[allow(clippy::struct_excessive_bools)] // Independent visibility, opacity, modal, and input policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSurface {
     pub id: PluginSurfaceId,
@@ -97,6 +101,8 @@ pub struct PluginSurface {
     pub layer: i16,
     pub z: i32,
     pub opaque: bool,
+    /// When true, input cannot fall through to lower composed surfaces.
+    pub modal: bool,
     pub visible: bool,
     pub ops: Vec<RenderOp>,
 }
@@ -119,6 +125,7 @@ impl PluginSurface {
             layer: 0,
             z: 0,
             opaque: false,
+            modal: false,
             visible: true,
             ops,
         }
@@ -138,6 +145,12 @@ impl PluginSurface {
     }
 
     #[must_use]
+    pub const fn modal(mut self, modal: bool) -> Self {
+        self.modal = modal;
+        self
+    }
+
+    #[must_use]
     pub const fn order(mut self, layer: i16, z: i32) -> Self {
         self.layer = layer;
         self.z = z;
@@ -153,7 +166,14 @@ impl PluginSurfaceRegion {
             rect,
             focusable: false,
             cursor: PluginSurfaceCursor::Default,
+            endpoint: None,
         }
+    }
+
+    #[must_use]
+    pub fn endpoint(mut self, endpoint: crate::AttachInputEndpoint) -> Self {
+        self.endpoint = Some(endpoint);
+        self
     }
 
     #[must_use]
@@ -223,11 +243,96 @@ pub enum PluginSurfacePublishError {
         surface_revision: u64,
         snapshot_revision: u64,
     },
+    UpdateTooFrequent {
+        minimum_interval_ms: u64,
+    },
     ForeignLayoutTarget {
         id: PluginLayoutId,
     },
     ConflictingRevision,
 }
+
+impl std::fmt::Display for PluginSurfacePublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyOwner => formatter.write_str("plugin surface owner must not be empty"),
+            Self::TooManySurfaces { count, maximum } => write!(
+                formatter,
+                "plugin surface snapshot has {count} surfaces; maximum is {maximum}"
+            ),
+            Self::TooManyRetainedItems { id, count, maximum } => write!(
+                formatter,
+                "surface '{}:{}' has {count} retained items; maximum is {maximum}",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::TextTooLong { id, bytes, maximum } => write!(
+                formatter,
+                "surface '{}:{}' contains a {bytes}-byte text item; maximum is {maximum}",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::SnapshotTooLarge { bytes, maximum } => write!(
+                formatter,
+                "plugin surface snapshot is {bytes} bytes; maximum is {maximum}"
+            ),
+            Self::OwnerMismatch { id } => write!(
+                formatter,
+                "surface '{}:{}' does not belong to the publishing owner",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::DuplicateId { id } => write!(
+                formatter,
+                "surface identity '{}:{}' is duplicated",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::DuplicateRetainedId { retained_id } => {
+                write!(
+                    formatter,
+                    "retained compositor id {retained_id} is already owned"
+                )
+            }
+            Self::EmptyRegionId { id } => write!(
+                formatter,
+                "surface '{}:{}' contains an empty input region id",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::DuplicateRegionId { id, local_id } => write!(
+                formatter,
+                "surface '{}:{}' duplicates input region id '{local_id}'",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::RegionsWithoutInput { id } => write!(
+                formatter,
+                "surface '{}:{}' publishes regions while input is disabled",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::SurfaceRevisionMismatch {
+                id,
+                surface_revision,
+                snapshot_revision,
+            } => write!(
+                formatter,
+                "surface '{}:{}' revision {surface_revision} does not match snapshot revision {snapshot_revision}",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::UpdateTooFrequent {
+                minimum_interval_ms,
+            } => write!(
+                formatter,
+                "plugin surface update arrived before the {minimum_interval_ms}ms minimum interval"
+            ),
+            Self::ForeignLayoutTarget { id } => write!(
+                formatter,
+                "layout target '{}:{}' belongs to another owner",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::ConflictingRevision => {
+                formatter.write_str("surface revision conflicts with retained owner state")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PluginSurfacePublishError {}
 
 /// Thread-safe retained surface snapshots keyed by plugin owner.
 #[derive(Debug)]
@@ -238,6 +343,54 @@ pub struct PluginSurfaceRegistry {
     maximum_snapshot_bytes: usize,
     snapshots: RwLock<BTreeMap<String, PluginSurfaceSnapshot>>,
     revision_tx: tokio::sync::watch::Sender<u64>,
+}
+
+/// Owner-bound retained surface publisher.
+///
+/// Dropping the publisher removes all retained surfaces for its owner, making
+/// cleanup the default for in-process plugin companions.
+#[derive(Debug)]
+pub struct PluginSurfacePublisher<'a> {
+    registry: &'a PluginSurfaceRegistry,
+    owner_plugin_id: String,
+    minimum_interval: Duration,
+    last_applied: Mutex<Option<Instant>>,
+}
+
+impl PluginSurfacePublisher<'_> {
+    /// Replace this owner's complete retained surface snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and revision failures as
+    /// [`PluginSurfaceRegistry::publish`].
+    pub fn publish(
+        &self,
+        snapshot: PluginSurfaceSnapshot,
+    ) -> Result<PluginSurfacePublishOutcome, PluginSurfacePublishError> {
+        let mut last_applied = self
+            .last_applied
+            .lock()
+            .map_err(|_| PluginSurfacePublishError::ConflictingRevision)?;
+        if last_applied.is_some_and(|last| last.elapsed() < self.minimum_interval) {
+            return Err(PluginSurfacePublishError::UpdateTooFrequent {
+                minimum_interval_ms: u64::try_from(self.minimum_interval.as_millis())
+                    .unwrap_or(u64::MAX),
+            });
+        }
+        let outcome = self.registry.publish(&self.owner_plugin_id, snapshot)?;
+        if outcome == PluginSurfacePublishOutcome::Applied {
+            *last_applied = Some(Instant::now());
+        }
+        drop(last_applied);
+        Ok(outcome)
+    }
+}
+
+impl Drop for PluginSurfacePublisher<'_> {
+    fn drop(&mut self) {
+        self.registry.remove_owner(&self.owner_plugin_id);
+    }
 }
 
 impl PluginSurfaceRegistry {
@@ -266,6 +419,27 @@ impl PluginSurfaceRegistry {
             maximum_snapshot_bytes,
             snapshots: RwLock::new(BTreeMap::new()),
             revision_tx,
+        }
+    }
+
+    /// Create an owner-bound publisher that cleans up retained state on drop.
+    #[must_use]
+    pub fn publisher(&self, owner_plugin_id: impl Into<String>) -> PluginSurfacePublisher<'_> {
+        self.rate_limited_publisher(owner_plugin_id, Duration::ZERO)
+    }
+
+    /// Create an owner-bound publisher with a minimum applied-update interval.
+    #[must_use]
+    pub fn rate_limited_publisher(
+        &self,
+        owner_plugin_id: impl Into<String>,
+        minimum_interval: Duration,
+    ) -> PluginSurfacePublisher<'_> {
+        PluginSurfacePublisher {
+            registry: self,
+            owner_plugin_id: owner_plugin_id.into(),
+            minimum_interval,
+            last_applied: Mutex::new(None),
         }
     }
 
@@ -339,6 +513,27 @@ impl PluginSurfaceRegistry {
             self.notify_changed();
         }
         removed
+    }
+
+    pub fn clear(&self) -> usize {
+        let removed = self.snapshots.write().map_or(0, |mut snapshots| {
+            let count = snapshots.len();
+            snapshots.clear();
+            count
+        });
+        if removed > 0 {
+            self.notify_changed();
+        }
+        removed
+    }
+
+    /// Return one owner's current retained snapshot for hydration/debugging.
+    #[must_use]
+    pub fn owner_snapshot(&self, owner_plugin_id: &str) -> Option<PluginSurfaceSnapshot> {
+        self.snapshots
+            .read()
+            .ok()
+            .and_then(|snapshots| snapshots.get(owner_plugin_id).cloned())
     }
 
     #[must_use]
@@ -507,9 +702,124 @@ mod tests {
             layer: 1,
             z: 2,
             opaque: true,
+            modal: false,
             visible: true,
             ops: vec![RenderOp::text_run(1, 2, "x", RenderStyle::new())],
         }
+    }
+
+    #[test]
+    fn owner_bound_publisher_enforces_configured_update_frequency() {
+        let registry = PluginSurfaceRegistry::new(2);
+        let publisher = registry.rate_limited_publisher("owner", Duration::from_secs(1));
+        assert_eq!(
+            publisher.publish(PluginSurfaceSnapshot {
+                revision: 1,
+                surfaces: vec![surface("owner", "main", Uuid::from_u128(17))],
+            }),
+            Ok(PluginSurfacePublishOutcome::Applied)
+        );
+        let mut next = surface("owner", "main", Uuid::from_u128(17));
+        next.revision = 2;
+        assert!(matches!(
+            publisher.publish(PluginSurfaceSnapshot {
+                revision: 2,
+                surfaces: vec![next],
+            }),
+            Err(PluginSurfacePublishError::UpdateTooFrequent {
+                minimum_interval_ms: 1_000
+            })
+        ));
+        assert_eq!(registry.owner_snapshot("owner").unwrap().revision, 1);
+    }
+
+    #[test]
+    fn publication_errors_are_actionable_and_identify_the_bad_resource() {
+        let id = PluginSurfaceId::new("owner", "surface", Uuid::from_u128(16));
+        assert_eq!(
+            PluginSurfacePublishError::DuplicateRegionId {
+                id: id.clone(),
+                local_id: "button".to_owned(),
+            }
+            .to_string(),
+            "surface 'owner:surface' duplicates input region id 'button'"
+        );
+        assert_eq!(
+            PluginSurfacePublishError::SurfaceRevisionMismatch {
+                id,
+                surface_revision: 2,
+                snapshot_revision: 3,
+            }
+            .to_string(),
+            "surface 'owner:surface' revision 2 does not match snapshot revision 3"
+        );
+    }
+
+    #[test]
+    fn registry_clear_removes_all_owners_with_one_notification() {
+        let registry = PluginSurfaceRegistry::new(2);
+        for (owner, retained_id) in [("one", 18), ("two", 19)] {
+            assert_eq!(
+                registry.publish(
+                    owner,
+                    PluginSurfaceSnapshot {
+                        revision: 1,
+                        surfaces: vec![surface(owner, "main", Uuid::from_u128(retained_id))],
+                    },
+                ),
+                Ok(PluginSurfacePublishOutcome::Applied)
+            );
+        }
+        let mut changes = registry.subscribe();
+        changes.borrow_and_update();
+        assert_eq!(registry.clear(), 2);
+        assert!(registry.surfaces().is_empty());
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        assert_eq!(registry.clear(), 0);
+        assert!(!changes.has_changed().unwrap());
+    }
+
+    #[test]
+    fn late_subscriber_and_snapshot_reader_receive_current_retained_state() {
+        let registry = PluginSurfaceRegistry::new(2);
+        let snapshot = PluginSurfaceSnapshot {
+            revision: 4,
+            surfaces: vec![{
+                let mut surface = surface("owner", "main", Uuid::from_u128(15));
+                surface.revision = 4;
+                surface
+            }],
+        };
+        assert_eq!(
+            registry.publish("owner", snapshot.clone()),
+            Ok(PluginSurfacePublishOutcome::Applied)
+        );
+
+        assert_eq!(registry.owner_snapshot("owner"), Some(snapshot));
+        let receiver = registry.subscribe();
+        assert_eq!(*receiver.borrow(), 1);
+        assert_eq!(registry.surfaces().len(), 1);
+    }
+
+    #[test]
+    fn owner_bound_surface_publisher_removes_state_on_drop() {
+        let registry = PluginSurfaceRegistry::new(2);
+        let mut changes = registry.subscribe();
+        {
+            let publisher = registry.publisher("owner");
+            assert_eq!(
+                publisher.publish(PluginSurfaceSnapshot {
+                    revision: 1,
+                    surfaces: vec![surface("owner", "main", Uuid::from_u128(14))],
+                }),
+                Ok(PluginSurfacePublishOutcome::Applied)
+            );
+            changes.borrow_and_update();
+            assert_eq!(registry.surfaces().len(), 1);
+        }
+        assert!(registry.surfaces().is_empty());
+        assert!(changes.has_changed().unwrap());
     }
 
     #[test]
@@ -591,12 +901,14 @@ mod tests {
                 rect: ExtensionRect::new(0, 0, 1, 1),
                 focusable: false,
                 cursor: PluginSurfaceCursor::Default,
+                endpoint: None,
             },
             PluginSurfaceRegion {
                 local_id: "same".to_owned(),
                 rect: ExtensionRect::new(1, 0, 1, 1),
                 focusable: false,
                 cursor: PluginSurfaceCursor::Default,
+                endpoint: None,
             },
         ];
         let registry = PluginSurfaceRegistry::new(2);
@@ -617,6 +929,7 @@ mod tests {
             rect: ExtensionRect::new(0, 0, 1, 1),
             focusable: false,
             cursor: PluginSurfaceCursor::Default,
+            endpoint: None,
         }];
         assert!(matches!(
             registry.publish(

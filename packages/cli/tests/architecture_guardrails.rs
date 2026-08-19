@@ -3075,3 +3075,41 @@ fn attach_viewport_contract_has_no_status_specific_geometry() {
         );
     }
 }
+
+/// Generic presentation infrastructure must not acquire product-domain roles.
+#[test]
+fn plugin_presentation_primitives_remain_domain_neutral() {
+    let sources = [
+        (
+            "packages/plugin/src/layout.rs",
+            include_str!("../../plugin/src/layout.rs"),
+        ),
+        (
+            "packages/plugin/src/surface.rs",
+            include_str!("../../plugin/src/surface.rs"),
+        ),
+        (
+            "packages/attach_pipeline/src/compositor.rs",
+            include_str!("../../attach_pipeline/src/compositor.rs"),
+        ),
+    ];
+    let denied = [
+        "AttachTab",
+        "tab_strip",
+        "tab-strip",
+        "sidebar",
+        "windows-list",
+        "bmux.windows",
+        "status_top_inset",
+        "status_bottom_inset",
+    ];
+
+    for (path, source) in sources {
+        for marker in denied {
+            assert!(
+                !production_section(source).contains(marker),
+                "{path} must remain presentation-domain neutral; found {marker}",
+            );
+        }
+    }
+}

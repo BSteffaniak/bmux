@@ -48,6 +48,7 @@ pub struct RetainedInteractiveRegion {
     pub rect: DamageRect,
     pub focusable: bool,
     pub cursor: bmux_plugin::surface::PluginSurfaceCursor,
+    pub endpoint: Option<bmux_plugin::AttachInputEndpoint>,
 }
 
 impl PartialEq<DamageRect> for RetainedInteractiveRegion {
@@ -63,6 +64,7 @@ pub struct RetainedSurface {
     pub layer: i16,
     pub z: i32,
     pub opaque: bool,
+    pub modal: bool,
     pub opacity: RetainedOpacity,
     pub clip_rect: Option<DamageRect>,
     pub revision: Option<u64>,
@@ -110,6 +112,7 @@ impl RetainedSurface {
             layer,
             z,
             opaque: opacity.is_opaque(),
+            modal: false,
             opacity,
             clip_rect: None,
             revision: None,
@@ -139,6 +142,7 @@ impl RetainedSurface {
                 rect,
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                endpoint: None,
             })
             .collect();
         self
@@ -201,6 +205,7 @@ pub fn retained_surfaces_from_plugin_surfaces(
                             rect,
                             focusable: region.focusable,
                             cursor: region.cursor,
+                            endpoint: region.endpoint.clone(),
                         })
                     })
                     .collect()
@@ -210,6 +215,7 @@ pub fn retained_surfaces_from_plugin_surfaces(
             let mut builder = RetainedSurface::builder(surface.id.retained_id, rect)
                 .layer(surface.layer)
                 .z(surface.z)
+                .modal(surface.modal)
                 .revision(surface.revision)
                 .render_ops(surface.ops.clone())
                 .clip_rect(clip_rect)
@@ -253,6 +259,12 @@ impl RetainedSurfaceBuilder {
     #[must_use]
     pub const fn z(mut self, z: i32) -> Self {
         self.surface.z = z;
+        self
+    }
+
+    #[must_use]
+    pub const fn modal(mut self, modal: bool) -> Self {
+        self.surface.modal = modal;
         self
     }
 
@@ -312,6 +324,7 @@ impl RetainedSurfaceBuilder {
                 rect: region,
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                endpoint: None,
             });
         self
     }
@@ -325,6 +338,7 @@ impl RetainedSurfaceBuilder {
                 rect,
                 focusable: false,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                endpoint: None,
             })
             .collect();
         self
@@ -395,6 +409,22 @@ pub enum RetainedInputEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedInputDispatch {
+    pub endpoint: bmux_plugin::AttachInputEndpoint,
+    pub event: RetainedInputEvent,
+}
+
+impl RetainedInputEvent {
+    #[must_use]
+    pub const fn target(&self) -> Option<&PluginSurfaceRegionId> {
+        match self {
+            Self::Pointer(event) => event.hit.region_id.as_ref(),
+            Self::Keyboard(event) => Some(&event.target),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedInputQueue {
     maximum_events: usize,
     events: Vec<RetainedInputEvent>,
@@ -449,6 +479,20 @@ impl RetainedInputQueue {
     }
 
     #[must_use]
+    pub fn drain_for_dispatch(
+        &mut self,
+        compositor: &RetainedCompositor,
+    ) -> Vec<RetainedInputDispatch> {
+        self.events
+            .drain(..)
+            .filter_map(|event| {
+                let endpoint = compositor.endpoint_for_region(event.target()?)?.clone();
+                Some(RetainedInputDispatch { endpoint, event })
+            })
+            .collect()
+    }
+
+    #[must_use]
     pub fn drain(&mut self) -> Vec<RetainedInputEvent> {
         self.events.drain(..).collect()
     }
@@ -477,6 +521,44 @@ impl RetainedPointerRouter {
 
     pub const fn release_capture(&mut self) -> Option<RetainedSurfaceHit> {
         self.captured.take()
+    }
+
+    #[must_use]
+    pub fn route_terminal_mouse(
+        &mut self,
+        compositor: &RetainedCompositor,
+        event: crossterm::event::MouseEvent,
+    ) -> Vec<RetainedPointerEvent> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let button = |button| match button {
+            MouseButton::Left => RetainedPointerButton::Primary,
+            MouseButton::Right => RetainedPointerButton::Secondary,
+            MouseButton::Middle => RetainedPointerButton::Middle,
+        };
+        match event.kind {
+            MouseEventKind::Moved => self.route_move(compositor, event.column, event.row),
+            MouseEventKind::Down(next) => self
+                .route_button(compositor, event.column, event.row, button(next), true)
+                .into_iter()
+                .collect(),
+            MouseEventKind::Up(next) => self
+                .route_button(compositor, event.column, event.row, button(next), false)
+                .into_iter()
+                .collect(),
+            MouseEventKind::Drag(next) => self
+                .route_drag(compositor, event.column, event.row, button(next))
+                .into_iter()
+                .collect(),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollRight => self
+                .route_wheel(compositor, event.column, event.row, 1)
+                .into_iter()
+                .collect(),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft => self
+                .route_wheel(compositor, event.column, event.row, -1)
+                .into_iter()
+                .collect(),
+        }
     }
 
     #[must_use]
@@ -722,10 +804,20 @@ impl RetainedCompositor {
 
     #[must_use]
     pub fn hit_test(&self, x: u16, y: u16) -> Option<RetainedSurfaceHit> {
-        self.ordered_surfaces()
+        let ordered = self.ordered_surfaces();
+        let mut modal_floor = None;
+        for (index, surface) in ordered.iter().enumerate() {
+            if surface.modal && rect_contains_point(surface.paint_rect()?, x, y) {
+                modal_floor = Some(index);
+            }
+        }
+        let start = modal_floor.unwrap_or(0);
+        ordered
             .into_iter()
+            .enumerate()
             .rev()
-            .find_map(|surface| {
+            .take_while(|(index, _)| *index >= start)
+            .find_map(|(_, surface)| {
                 let paint_rect = surface.paint_rect()?;
                 if !rect_contains_point(paint_rect, x, y) {
                     return None;
@@ -747,6 +839,52 @@ impl RetainedCompositor {
                         surface_y: y.saturating_sub(surface.rect.y),
                     })
             })
+    }
+
+    #[must_use]
+    pub fn endpoint_for_region(
+        &self,
+        target: &PluginSurfaceRegionId,
+    ) -> Option<&bmux_plugin::AttachInputEndpoint> {
+        self.surfaces.values().find_map(|surface| {
+            surface.interactive_regions.iter().find_map(|region| {
+                (region.id.as_ref() == Some(target))
+                    .then_some(region.endpoint.as_ref())
+                    .flatten()
+            })
+        })
+    }
+
+    #[must_use]
+    pub fn endpoint_for_hit(
+        &self,
+        hit: &RetainedSurfaceHit,
+    ) -> Option<&bmux_plugin::AttachInputEndpoint> {
+        let surface = self.surfaces.get(&hit.surface_id)?;
+        if surface.revision != hit.surface_revision {
+            return None;
+        }
+        let region = surface.interactive_regions.get(hit.region_index)?;
+        if region.id != hit.region_id {
+            return None;
+        }
+        region.endpoint.as_ref()
+    }
+
+    #[must_use]
+    pub fn cursor_for_hit(
+        &self,
+        hit: &RetainedSurfaceHit,
+    ) -> Option<bmux_plugin::surface::PluginSurfaceCursor> {
+        let surface = self.surfaces.get(&hit.surface_id)?;
+        if surface.revision != hit.surface_revision {
+            return None;
+        }
+        let region = surface.interactive_regions.get(hit.region_index)?;
+        if region.id != hit.region_id {
+            return None;
+        }
+        Some(region.cursor)
     }
 
     #[must_use]
@@ -808,6 +946,7 @@ impl RetainedCompositor {
                         layer: surface.layer,
                         z: surface.z,
                         opaque: surface.opaque,
+                        modal: surface.modal,
                         opacity: surface.opacity,
                         clip_rect: surface.clip_rect,
                         interactive_regions: surface.interactive_regions.clone(),
@@ -898,6 +1037,7 @@ pub struct RetainedRepaintSurface {
     pub layer: i16,
     pub z: i32,
     pub opaque: bool,
+    pub modal: bool,
     pub opacity: RetainedOpacity,
     pub clip_rect: Option<DamageRect>,
     pub interactive_regions: Vec<RetainedInteractiveRegion>,
@@ -1158,7 +1298,16 @@ fn render_ops_damage_between(
     let next_rows = render_ops_row_signatures(next_ops, next.rect);
     (previous.rect.y..previous.rect.bottom())
         .filter(|row| previous_rows.get(row) != next_rows.get(row))
-        .map(|row| DamageRect::new(previous.rect.x, row, previous.rect.w, 1))
+        .filter_map(|row| {
+            previous_rows
+                .get(&row)
+                .into_iter()
+                .flatten()
+                .chain(next_rows.get(&row).into_iter().flatten())
+                .filter_map(|op| intersect_rects(render_op_damage_bounds(op), previous.rect))
+                .map(|bounds| DamageRect::new(bounds.x, row, bounds.w, 1))
+                .reduce(DamageRect::union)
+        })
         .collect()
 }
 
@@ -1301,6 +1450,52 @@ mod tests {
     use bmux_plugin::{RenderOp, RenderStyle};
 
     #[test]
+    fn neutral_independent_split_surface_renders_through_retained_compositor() {
+        use bmux_plugin::layout::{
+            LayoutEdge, LayoutExtent, PluginLayoutRequest, resolve_plugin_layout,
+        };
+
+        let owner = "example.presentation";
+        let layout_id = bmux_plugin::layout::PluginLayoutId::new(owner, "leading");
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let resolution = resolve_plugin_layout(
+            ExtensionRect::new(viewport.x, viewport.y, viewport.w, viewport.h),
+            (1, 1),
+            &[PluginLayoutRequest::split(
+                layout_id.clone(),
+                0,
+                LayoutEdge::Left,
+                LayoutExtent::Cells(12),
+            )],
+        )
+        .unwrap();
+        let allocations = resolution
+            .allocations
+            .into_iter()
+            .map(|allocation| (allocation.id, allocation.rect))
+            .collect::<BTreeMap<_, _>>();
+        let surface = PluginSurface::layout(
+            PluginSurfaceId::new(owner, "surface", Uuid::from_u128(621)),
+            1,
+            layout_id,
+            vec![RenderOp::text_run(0, 0, "independent", RenderStyle::new())],
+        )
+        .opaque(true);
+        let lowered = retained_surfaces_from_plugin_surfaces(&[surface], &allocations, viewport);
+
+        assert_eq!(lowered.len(), 1);
+        assert_eq!(lowered[0].rect, DamageRect::new(0, 0, 12, 24));
+        let mut compositor = RetainedCompositor::new();
+        let damage =
+            compositor.replace_surfaces(lowered, viewport, DamageCoalescingPolicy::default());
+        let repaint = compositor.repaint_plan(&damage);
+        assert_eq!(repaint.len(), 1);
+        assert_eq!(repaint[0].surface_id, Uuid::from_u128(621));
+        assert_eq!(repaint[0].damage, vec![DamageRect::new(0, 0, 12, 24)]);
+        assert_eq!(resolution.remaining, ExtensionRect::new(12, 0, 68, 24));
+    }
+
+    #[test]
     fn plugin_surfaces_lower_through_layout_allocations_and_explicit_geometry() {
         let owner = "example.presentation";
         let layout_id = bmux_plugin::layout::PluginLayoutId::new(owner, "region");
@@ -1317,6 +1512,7 @@ mod tests {
                 layer: 3,
                 z: 4,
                 opaque: true,
+                modal: false,
                 visible: true,
                 ops: vec![RenderOp::text_run(4, 2, "layout", RenderStyle::new())],
             },
@@ -1330,6 +1526,7 @@ mod tests {
                 layer: 5,
                 z: 6,
                 opaque: false,
+                modal: false,
                 visible: true,
                 ops: Vec::new(),
             },
@@ -1346,6 +1543,138 @@ mod tests {
         assert!(lowered[0].opaque);
         assert_eq!(lowered[1].rect, DamageRect::new(30, 5, 10, 2));
         assert!(!lowered[1].opaque);
+    }
+
+    #[test]
+    fn semantic_queue_resolves_typed_dispatch_and_drops_removed_targets() {
+        let owner = "example.dispatch";
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.input".to_owned(),
+            interface_id: "example-input".to_owned(),
+            operation: "handle".to_owned(),
+        };
+        let mut compositor = RetainedCompositor::new();
+        let surface = PluginSurface::layout(
+            PluginSurfaceId::new(owner, "surface", Uuid::from_u128(620)),
+            1,
+            bmux_plugin::layout::PluginLayoutId::new(owner, "region"),
+            Vec::new(),
+        )
+        .interactive_region(
+            PluginSurfaceRegion::new("button", ExtensionRect::new(0, 0, 8, 4))
+                .endpoint(endpoint.clone()),
+        );
+        let allocation = BTreeMap::from([(
+            bmux_plugin::layout::PluginLayoutId::new(owner, "region"),
+            ExtensionRect::new(2, 2, 8, 4),
+        )]);
+        compositor.replace_surfaces(
+            retained_surfaces_from_plugin_surfaces(
+                &[surface],
+                &allocation,
+                DamageRect::new(0, 0, 80, 24),
+            ),
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let pointer = RetainedPointerRouter::default()
+            .route_button(&compositor, 3, 3, RetainedPointerButton::Primary, true)
+            .unwrap();
+        let mut queue = RetainedInputQueue::default();
+        assert!(queue.push_pointer(pointer.clone()));
+        let dispatch = queue.drain_for_dispatch(&compositor);
+        assert_eq!(dispatch.len(), 1);
+        assert_eq!(dispatch[0].endpoint, endpoint);
+
+        assert!(queue.push_pointer(pointer));
+        compositor.replace_surfaces(
+            [],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(queue.drain_for_dispatch(&compositor).is_empty());
+    }
+
+    #[test]
+    fn committed_hit_resolves_typed_endpoint_and_rejects_stale_revision() {
+        let owner = "example.endpoint";
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.input".to_owned(),
+            interface_id: "example-input".to_owned(),
+            operation: "handle".to_owned(),
+        };
+        let mut compositor = RetainedCompositor::new();
+        let surface = PluginSurface::layout(
+            PluginSurfaceId::new(owner, "surface", Uuid::from_u128(619)),
+            1,
+            bmux_plugin::layout::PluginLayoutId::new(owner, "region"),
+            Vec::new(),
+        )
+        .interactive_region(
+            PluginSurfaceRegion::new("button", ExtensionRect::new(0, 0, 8, 4))
+                .endpoint(endpoint.clone()),
+        );
+        let allocations = BTreeMap::from([(
+            bmux_plugin::layout::PluginLayoutId::new(owner, "region"),
+            ExtensionRect::new(2, 2, 8, 4),
+        )]);
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &allocations,
+            DamageRect::new(0, 0, 80, 24),
+        );
+        compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut hit = compositor.hit_test(3, 3).unwrap();
+        assert_eq!(compositor.endpoint_for_hit(&hit), Some(&endpoint));
+        hit.surface_revision = Some(2);
+        assert_eq!(compositor.endpoint_for_hit(&hit), None);
+    }
+
+    #[test]
+    fn committed_hit_resolves_cursor_role_and_rejects_stale_revision() {
+        let owner = "example.cursor";
+        let mut compositor = RetainedCompositor::new();
+        let surface = PluginSurface {
+            id: PluginSurfaceId::new(owner, "surface", Uuid::from_u128(618)),
+            revision: 1,
+            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
+            clip_rect: None,
+            interactive_regions: vec![PluginSurfaceRegion {
+                local_id: "link".to_owned(),
+                rect: ExtensionRect::new(0, 0, 8, 4),
+                focusable: false,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Pointer,
+                endpoint: None,
+            }],
+            accepts_input: true,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            modal: false,
+            visible: true,
+            ops: Vec::new(),
+        };
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 80, 24),
+        );
+        compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut hit = compositor.hit_test(3, 3).unwrap();
+        assert_eq!(
+            compositor.cursor_for_hit(&hit),
+            Some(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+        );
+        hit.surface_revision = Some(2);
+        assert_eq!(compositor.cursor_for_hit(&hit), None);
     }
 
     #[test]
@@ -1382,11 +1711,13 @@ mod tests {
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: true,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Text,
+                endpoint: None,
             }],
             accepts_input: true,
             layer: 0,
             z: 0,
             opaque: false,
+            modal: false,
             visible: true,
             ops: Vec::new(),
         };
@@ -1468,11 +1799,13 @@ mod tests {
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: true,
                 cursor: bmux_plugin::surface::PluginSurfaceCursor::Text,
+                endpoint: None,
             }],
             accepts_input: true,
             layer: 0,
             z: 0,
             opaque: false,
+            modal: false,
             visible: true,
             ops: Vec::new(),
         };
@@ -1538,6 +1871,71 @@ mod tests {
         compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
         assert!(router.reconcile(&compositor).is_empty());
         assert!(router.captured().is_none());
+    }
+
+    #[test]
+    fn terminal_mouse_normalization_routes_into_semantic_pointer_phases() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(624), DamageRect::new(2, 2, 8, 4))
+                    .interactive_region(DamageRect::new(2, 2, 8, 4))
+                    .build(),
+            ],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut router = RetainedPointerRouter::default();
+        let event = |kind| MouseEvent {
+            kind,
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            router.route_terminal_mouse(&compositor, event(MouseEventKind::Moved))[0].phase,
+            RetainedPointerPhase::Enter
+        );
+        assert_eq!(
+            router
+                .route_terminal_mouse(&compositor, event(MouseEventKind::Down(MouseButton::Left)))
+                [0]
+            .phase,
+            RetainedPointerPhase::Down
+        );
+        assert_eq!(
+            router.route_terminal_mouse(&compositor, event(MouseEventKind::ScrollDown))[0]
+                .wheel_delta,
+            -1
+        );
+    }
+
+    #[test]
+    fn modal_surface_blocks_input_fallthrough_inside_its_scope() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(622), DamageRect::new(0, 0, 20, 10))
+                    .layer(0)
+                    .interactive_region(DamageRect::new(0, 0, 20, 10))
+                    .build(),
+                RetainedSurface::builder(Uuid::from_u128(623), DamageRect::new(2, 2, 10, 5))
+                    .layer(10)
+                    .modal(true)
+                    .build(),
+            ],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(compositor.hit_test(3, 3), None);
+        assert_eq!(
+            compositor.hit_test(15, 3).unwrap().surface_id,
+            Uuid::from_u128(622)
+        );
     }
 
     #[test]
@@ -1712,18 +2110,21 @@ mod tests {
                     rect: ExtensionRect::new(0, 0, 8, 4),
                     focusable: false,
                     cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                    endpoint: None,
                 },
                 bmux_plugin::surface::PluginSurfaceRegion {
                     local_id: "inner".to_owned(),
                     rect: ExtensionRect::new(3, 1, 2, 1),
                     focusable: false,
                     cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                    endpoint: None,
                 },
             ],
             accepts_input: true,
             layer: 0,
             z: 0,
             opaque: false,
+            modal: false,
             visible: true,
             ops: Vec::new(),
         };
@@ -1777,6 +2178,7 @@ mod tests {
                 layer: 0,
                 z: 0,
                 opaque: true,
+                modal: false,
                 visible: false,
                 ops: Vec::new(),
             },
@@ -1792,6 +2194,7 @@ mod tests {
                 layer: 0,
                 z: 0,
                 opaque: true,
+                modal: false,
                 visible: true,
                 ops: Vec::new(),
             },
@@ -1805,6 +2208,7 @@ mod tests {
                 layer: 0,
                 z: 0,
                 opaque: true,
+                modal: false,
                 visible: true,
                 ops: Vec::new(),
             },
@@ -1896,7 +2300,55 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
 
-        assert_eq!(damage.rects(), &[DamageRect::new(10, 6, 12, 1)]);
+        assert_eq!(damage.rects(), &[DamageRect::new(10, 6, 6, 1)]);
+    }
+
+    #[test]
+    fn replace_surfaces_removal_damages_vacated_bounds_and_drops_state() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            [surface(1, 7, 4, 0, 0, true)],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        let removed = compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
+
+        assert_eq!(removed.rects(), &[DamageRect::new(7, 4, 4, 2)]);
+        assert!(compositor.surfaces().is_empty());
+        assert!(compositor.repaint_plan(&removed).is_empty());
+    }
+
+    #[test]
+    fn replacement_damages_only_changed_retained_item_bounds() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let rect = DamageRect::new(0, 0, 40, 10);
+        let first = vec![
+            RenderOp::text_run(2, 2, "stable", RenderStyle::default()),
+            RenderOp::text_run(2, 4, "before", RenderStyle::default()),
+        ];
+        let second = vec![
+            RenderOp::text_run(2, 2, "stable", RenderStyle::default()),
+            RenderOp::text_run(2, 4, "after", RenderStyle::default()),
+        ];
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            [RetainedSurface::builder(Uuid::from_u128(700), rect)
+                .render_ops(first)
+                .build()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let damage = compositor.replace_surfaces(
+            [RetainedSurface::builder(Uuid::from_u128(700), rect)
+                .render_ops(second)
+                .build()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(damage.rects(), &[DamageRect::new(2, 4, 6, 1)]);
     }
 
     #[test]
@@ -2174,6 +2626,7 @@ mod tests {
             layer: retained_layer_order(AttachLayer::Pane),
             z: 0,
             opaque: true,
+            modal: false,
             opacity: RetainedOpacity::Opaque,
             clip_rect: None,
             interactive_regions: Vec::new(),
