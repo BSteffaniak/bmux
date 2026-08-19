@@ -165,6 +165,33 @@ pub enum PluginLayoutPublishError {
     ConflictingRevision,
 }
 
+impl std::fmt::Display for PluginLayoutPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyOwner => formatter.write_str("plugin layout owner must not be empty"),
+            Self::TooManyRequests { count, maximum } => write!(
+                formatter,
+                "plugin layout snapshot has {count} requests; maximum is {maximum}"
+            ),
+            Self::OwnerMismatch { id } => write!(
+                formatter,
+                "layout request '{}:{}' does not belong to the publishing owner",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::DuplicateId { id } => write!(
+                formatter,
+                "layout request identity '{}:{}' is duplicated",
+                id.owner_plugin_id, id.local_id
+            ),
+            Self::ConflictingRevision => {
+                formatter.write_str("layout revision conflicts with retained owner state")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PluginLayoutPublishError {}
+
 /// Thread-safe retained snapshots keyed by plugin owner.
 ///
 /// Publication validates and clones only on update. Render/layout consumers can
@@ -757,6 +784,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn layout_publication_errors_are_actionable() {
+        let id = PluginLayoutId::new("owner", "region");
+        assert_eq!(
+            PluginLayoutPublishError::DuplicateId { id: id.clone() }.to_string(),
+            "layout request identity 'owner:region' is duplicated"
+        );
+        assert_eq!(
+            PluginLayoutPublishError::OwnerMismatch { id }.to_string(),
+            "layout request 'owner:region' does not belong to the publishing owner"
+        );
     }
 
     #[test]
