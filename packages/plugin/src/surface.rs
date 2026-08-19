@@ -1,8 +1,43 @@
 //! Retained plugin-owned surfaces independent of pane surfaces.
 //!
 //! Plugins publish complete owner-scoped snapshots. The attach host resolves
-//! layout targets, converts the retained paint operations into compositor
-//! surfaces, and never calls the plugin from the frame path.
+//! layout targets, converts retained paint operations into compositor surfaces,
+//! and never calls the plugin from the frame path.
+//!
+//! # Interactive split example
+//!
+//! ```
+//! use bmux_plugin::layout::{LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest};
+//! use bmux_plugin::surface::{PluginSurface, PluginSurfaceId, PluginSurfaceRegion};
+//! use bmux_plugin::{ExtensionRect, RenderOp, RenderStyle};
+//! use uuid::Uuid;
+//!
+//! let owner = "example.presentation";
+//! let layout_id = PluginLayoutId::new(owner, "leading");
+//! let layout = PluginLayoutRequest::split(
+//!     layout_id.clone(),
+//!     0,
+//!     LayoutEdge::Left,
+//!     LayoutExtent::Cells(20),
+//! );
+//! let surface = PluginSurface::layout(
+//!     PluginSurfaceId::new(owner, "main", Uuid::from_u128(1)),
+//!     1,
+//!     layout_id,
+//!     vec![RenderOp::text_run(0, 0, "item", RenderStyle::new())],
+//! )
+//! .interactive_region(PluginSurfaceRegion::new(
+//!     "item-0",
+//!     ExtensionRect::new(0, 0, 20, 1),
+//! ));
+//! assert_eq!(layout.id.owner_plugin_id, owner);
+//! assert!(surface.accepts_input);
+//! ```
+//!
+//! To update one list item, republish the complete owner snapshot with the same
+//! stable surface/region IDs and a higher revision, changing only that item's
+//! retained operation. The compositor diffs retained operation bounds, so the
+//! unchanged rows are not damaged.
 
 use crate::layout::PluginLayoutId;
 use crate::{ExtensionRect, RenderOp};
