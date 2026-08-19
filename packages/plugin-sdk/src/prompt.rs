@@ -211,6 +211,9 @@ pub enum PromptField {
     Form {
         sections: Vec<PromptFormSection>,
         live_preview: bool,
+        /// Allow the host to restore modal-open form defaults with its reset shortcut.
+        #[serde(default)]
+        resettable: bool,
     },
 }
 
@@ -475,6 +478,7 @@ impl PromptRequest {
             field: PromptField::Form {
                 sections,
                 live_preview: false,
+                resettable: false,
             },
         }
     }
@@ -658,6 +662,14 @@ impl PromptRequest {
     pub const fn form_live_preview(mut self, enabled: bool) -> Self {
         if let PromptField::Form { live_preview, .. } = &mut self.field {
             *live_preview = enabled;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn form_resettable(mut self, enabled: bool) -> Self {
+        if let PromptField::Form { resettable, .. } = &mut self.field {
+            *resettable = enabled;
         }
         self
     }

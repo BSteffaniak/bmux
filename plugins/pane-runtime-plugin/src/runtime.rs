@@ -2000,6 +2000,18 @@ impl SessionRuntimeManager {
             .collect()
     }
 
+    fn drop_padding_preview_targets(
+        previews: &mut BTreeMap<Uuid, PanePaddingPreviewTransaction>,
+        pane_ids: &BTreeSet<Uuid>,
+    ) {
+        for preview in previews.values_mut() {
+            preview
+                .target_pane_ids
+                .retain(|pane_id| !pane_ids.contains(pane_id));
+        }
+        previews.retain(|_, preview| !preview.target_pane_ids.is_empty());
+    }
+
     fn apply_preview_spec_to_targets(
         &mut self,
         target_pane_ids: &BTreeSet<Uuid>,
@@ -2091,6 +2103,14 @@ impl SessionRuntimeManager {
         }
         let previous_targets = preview.target_pane_ids.clone();
         let previous_spec = preview.spec;
+        if previous_targets == next_targets && previous_spec == spec {
+            let preview = self
+                .padding_previews
+                .get_mut(&token)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            preview.lease_expires_at = Instant::now() + PANE_PADDING_PREVIEW_LEASE;
+            return self.preview_states(token);
+        }
         self.apply_preview_spec_to_targets(&previous_targets, None)?;
         if next_targets.is_empty()
             || next_targets
@@ -2180,13 +2200,6 @@ impl SessionRuntimeManager {
             .collect()
     }
 
-    fn preview_spec_for_pane(&self, pane_id: Uuid) -> Option<PanePaddingSpec> {
-        self.padding_previews
-            .values()
-            .find(|preview| preview.target_pane_ids.contains(&pane_id))
-            .map(|preview| preview.spec)
-    }
-
     pub(crate) fn padding_state(
         &self,
         session_id: SessionId,
@@ -2219,9 +2232,7 @@ impl SessionRuntimeManager {
         let runtime_effective = self
             .padding_config
             .resolve(metadata, base, pane.padding_override);
-        let preview_spec = pane
-            .padding_preview
-            .or_else(|| self.preview_spec_for_pane(pane_id));
+        let preview_spec = pane.padding_preview;
         let effective_spec = preview_spec.unwrap_or(runtime_effective.spec);
         Ok(crate::padding_api::RuntimePanePaddingState {
             session_id: session_id.0,
@@ -2274,6 +2285,39 @@ impl SessionRuntimeManager {
         self.bump_attach_view_revision(session_id);
         emit_attach_view_changed_for_layout(session_id);
         Ok(())
+    }
+
+    pub(crate) fn clear_padding_overrides(
+        &mut self,
+        pane_ids: &[Uuid],
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        let targets = pane_ids
+            .iter()
+            .map(|pane_id| {
+                let session_id = self
+                    .pane_session_id(*pane_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                let before = self.padding_state(session_id, Some(*pane_id))?;
+                Ok((session_id, *pane_id, before))
+            })
+            .collect::<Result<Vec<_>, SessionRuntimeError>>()?;
+        for (session_id, pane_id, _) in &targets {
+            let pane = self
+                .runtimes
+                .get_mut(session_id)
+                .and_then(|runtime| runtime.panes.get_mut(pane_id))
+                .ok_or(SessionRuntimeError::NotFound)?;
+            pane.padding_override = None;
+            pane.padding_override_persistence = PanePaddingOverridePersistence::Snapshot;
+        }
+        let mut states = Vec::with_capacity(targets.len());
+        for (session_id, pane_id, before) in targets {
+            let after = self.padding_state(session_id, Some(pane_id))?;
+            self.apply_padding_geometry_change(session_id, pane_id, &before, &after)?;
+            states.push(after);
+        }
+        mark_snapshot_dirty_flag();
+        Ok(states)
     }
 
     pub(crate) fn set_padding_override(
@@ -4625,11 +4669,6 @@ impl SessionRuntimeManager {
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
-        for preview in self.padding_previews.values_mut() {
-            preview.target_pane_ids.remove(&pane_id);
-        }
-        self.padding_previews
-            .retain(|_, preview| !preview.target_pane_ids.is_empty());
         session
             .scrollback_pins
             .retain(|(_, pinned_pane_id), _| *pinned_pane_id != pane_id);
@@ -4643,6 +4682,10 @@ impl SessionRuntimeManager {
             .map(|surface| surface.pane_id)
             .filter(|floating_pane_id| *floating_pane_id != pane_id)
             .collect::<Vec<_>>();
+        let closed_pane_ids = std::iter::once(pane_id)
+            .chain(anchored_floating_panes.iter().copied())
+            .collect::<BTreeSet<_>>();
+        Self::drop_padding_preview_targets(&mut self.padding_previews, &closed_pane_ids);
         session.floating_surfaces.retain(|surface| {
             surface.pane_id != pane_id && surface.anchor_pane_id != Some(pane_id)
         });
@@ -5629,12 +5672,7 @@ impl SessionRuntimeManager {
             .get(&session_id)
             .map(|runtime| runtime.panes.keys().copied().collect::<BTreeSet<_>>())
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        self.padding_previews.retain(|_, preview| {
-            preview
-                .target_pane_ids
-                .retain(|pane_id| !removed_pane_ids.contains(pane_id));
-            !preview.target_pane_ids.is_empty()
-        });
+        Self::drop_padding_preview_targets(&mut self.padding_previews, &removed_pane_ids);
         let runtime = self
             .runtimes
             .remove(&session_id)
@@ -8011,6 +8049,16 @@ impl PanePaddingRuntimeHandle {
             .padding_state(session_id, pane_id)
     }
 
+    pub(crate) fn clear_overrides(
+        &self,
+        pane_ids: &[Uuid],
+    ) -> Result<Vec<crate::padding_api::RuntimePanePaddingState>, SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .clear_padding_overrides(pane_ids)
+    }
+
     pub(crate) fn overrides_for_snapshot(
         &self,
     ) -> Result<BTreeMap<(SessionId, Uuid), PanePaddingSpec>, SessionRuntimeError> {
@@ -8685,6 +8733,345 @@ mod tests {
         manager.cancel_expired_padding_previews(Instant::now());
 
         assert!(manager.padding_previews.contains_key(&token));
+    }
+
+    #[tokio::test]
+    async fn preview_geometry_updates_only_resize_pty_when_dimensions_change() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let size = Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
+        manager.apply_stored_attach_viewport(session_id);
+        let initial_size = *size.lock().unwrap();
+        let initial_revision = manager.runtimes[&session_id].attach_view_revision;
+
+        let (token, _) = manager
+            .begin_padding_preview(
+                owner,
+                vec![pane_id],
+                PanePaddingSpec {
+                    horizontal_alignment: crate::padding::HorizontalAlignment::Right,
+                    max_content_width: Some(80),
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("dimension preview");
+        let dimension_size = *size.lock().unwrap();
+        let dimension_revision = manager.runtimes[&session_id].attach_view_revision;
+        assert_ne!(dimension_size, initial_size);
+        assert!(dimension_revision > initial_revision);
+
+        manager
+            .update_padding_preview(
+                owner,
+                token,
+                vec![pane_id],
+                PanePaddingSpec {
+                    horizontal_alignment: crate::padding::HorizontalAlignment::Left,
+                    max_content_width: Some(80),
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("alignment-only preview");
+        let alignment_revision = manager.runtimes[&session_id].attach_view_revision;
+        assert_eq!(*size.lock().unwrap(), dimension_size);
+        assert!(alignment_revision > dimension_revision);
+
+        manager
+            .update_padding_preview(
+                owner,
+                token,
+                vec![pane_id],
+                PanePaddingSpec {
+                    horizontal_alignment: crate::padding::HorizontalAlignment::Left,
+                    max_content_width: Some(80),
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("equivalent preview");
+        assert_eq!(*size.lock().unwrap(), dimension_size);
+        assert_eq!(
+            manager.runtimes[&session_id].attach_view_revision,
+            alignment_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_preview_restores_runtime_override_and_persistence() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let underlying = PanePaddingSpec {
+            left: 2,
+            max_content_width: Some(70),
+            ..PanePaddingSpec::default()
+        };
+        manager
+            .set_padding_override(session_id, Some(pane_id), Some(underlying))
+            .expect("set underlying override");
+        let (token, _) = manager
+            .begin_padding_preview(
+                owner,
+                vec![pane_id],
+                PanePaddingSpec {
+                    right: 5,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("begin preview");
+
+        manager
+            .cancel_padding_preview(owner, token)
+            .expect("cancel preview");
+
+        let restored = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        assert_eq!(restored.runtime_override, Some(underlying));
+        assert_eq!(restored.effective, underlying);
+        assert_eq!(
+            manager.runtimes[&session_id].panes[&pane_id].padding_override_persistence,
+            PanePaddingOverridePersistence::Snapshot
+        );
+        assert_eq!(
+            manager
+                .padding_overrides_for_snapshot()
+                .get(&(session_id, pane_id)),
+            Some(&underlying)
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_preview_target_retains_remaining_targets() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first_pane = Uuid::new_v4();
+        let second_pane = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut runtime = runtime_with_panes(&[first_pane, second_pane]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first_pane)),
+            second: Box::new(leaf(second_pane)),
+        });
+        runtime.focused_pane_id = first_pane;
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let (token, _) = manager
+            .begin_padding_preview(
+                owner,
+                vec![first_pane, second_pane],
+                PanePaddingSpec {
+                    left: 2,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("begin preview");
+
+        manager
+            .close_pane(session_id, Some(PaneSelector::ById(first_pane)))
+            .expect("close first target");
+
+        let preview = manager
+            .padding_previews
+            .get(&token)
+            .expect("preview remains");
+        assert_eq!(preview.target_pane_ids, BTreeSet::from([second_pane]));
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(second_pane))
+                .unwrap()
+                .effective
+                .left,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_session_drops_only_its_preview_targets() {
+        let first_session = SessionId(Uuid::new_v4());
+        let second_session = SessionId(Uuid::new_v4());
+        let first_pane = Uuid::new_v4();
+        let second_pane = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(first_session, runtime_with_panes(&[first_pane]));
+        manager
+            .runtimes
+            .insert(second_session, runtime_with_panes(&[second_pane]));
+        let (token, _) = manager
+            .begin_padding_preview(
+                owner,
+                vec![first_pane, second_pane],
+                PanePaddingSpec {
+                    top: 3,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("begin cross-session preview");
+
+        let _removed = manager
+            .remove_runtime(first_session)
+            .expect("remove session");
+
+        let preview = manager
+            .padding_previews
+            .get(&token)
+            .expect("preview remains");
+        assert_eq!(preview.target_pane_ids, BTreeSet::from([second_pane]));
+        assert_eq!(
+            manager
+                .padding_state(second_session, Some(second_pane))
+                .unwrap()
+                .effective
+                .top,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_padding_preview_update_preserves_previous_preview() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
+        let previous = PanePaddingSpec {
+            left: 3,
+            ..PanePaddingSpec::default()
+        };
+        let (token, _) = manager
+            .begin_padding_preview(owner, vec![pane_id], previous)
+            .expect("begin preview");
+
+        manager
+            .update_padding_preview(
+                owner,
+                token,
+                vec![pane_id],
+                PanePaddingSpec {
+                    max_content_width: Some(0),
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect_err("invalid update must fail");
+
+        let preview = manager
+            .padding_previews
+            .get(&token)
+            .expect("preview remains");
+        assert_eq!(preview.spec, previous);
+        let state = manager.padding_state(session_id, Some(pane_id)).unwrap();
+        assert_eq!(state.effective, previous);
+    }
+
+    #[tokio::test]
+    async fn non_overlapping_cross_client_padding_previews_coexist() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first_pane = Uuid::new_v4();
+        let second_pane = Uuid::new_v4();
+        let first_owner = ClientId(Uuid::new_v4());
+        let second_owner = ClientId(Uuid::new_v4());
+        let mut runtime = runtime_with_panes(&[first_pane, second_pane]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first_pane)),
+            second: Box::new(leaf(second_pane)),
+        });
+        let mut manager = manager_with_runtime(session_id, runtime);
+
+        manager
+            .begin_padding_preview(
+                first_owner,
+                vec![first_pane],
+                PanePaddingSpec {
+                    left: 2,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("first preview");
+        manager
+            .begin_padding_preview(
+                second_owner,
+                vec![second_pane],
+                PanePaddingSpec {
+                    right: 4,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("non-overlapping preview");
+
+        assert_eq!(manager.padding_previews.len(), 2);
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(first_pane))
+                .unwrap()
+                .effective
+                .left,
+            2
+        );
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(second_pane))
+                .unwrap()
+                .effective
+                .right,
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn same_client_new_padding_preview_replaces_previous_preview() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first_pane = Uuid::new_v4();
+        let second_pane = Uuid::new_v4();
+        let owner = ClientId(Uuid::new_v4());
+        let mut runtime = runtime_with_panes(&[first_pane, second_pane]);
+        runtime.layout_root = Some(PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(first_pane)),
+            second: Box::new(leaf(second_pane)),
+        });
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let (old_token, _) = manager
+            .begin_padding_preview(
+                owner,
+                vec![first_pane],
+                PanePaddingSpec {
+                    left: 2,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("first preview");
+
+        let (new_token, _) = manager
+            .begin_padding_preview(
+                owner,
+                vec![second_pane],
+                PanePaddingSpec {
+                    right: 3,
+                    ..PanePaddingSpec::default()
+                },
+            )
+            .expect("replacement preview");
+
+        assert_ne!(old_token, new_token);
+        assert_eq!(manager.padding_previews.len(), 1);
+        assert!(!manager.padding_previews.contains_key(&old_token));
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(first_pane))
+                .unwrap()
+                .effective,
+            PanePaddingSpec::default()
+        );
+        assert_eq!(
+            manager
+                .padding_state(session_id, Some(second_pane))
+                .unwrap()
+                .effective
+                .right,
+            3
+        );
     }
 
     #[tokio::test]

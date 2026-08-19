@@ -63,7 +63,19 @@ bmux pane-padding configure
 
 The recommended chord is `Ctrl+A, P`. The modal previews edge padding, content limits, presets, and alignment immediately without changing pane outer rectangles or split ratios. `Esc` cancels and restores the underlying declarative/runtime state; `Enter` applies once.
 
+Padding changes the PTY dimensions shared by every client attached to the same pane. The configurator itself remains local to the invoking attach client, but every attached client observes the same live content geometry while a preview is active and after it is committed. Overlapping previews from different clients are rejected rather than racing; previews for disjoint pane sets may coexist.
+
+The initial presets are:
+
+- **None:** zero edges and no maximum dimensions.
+- **Comfortable:** one-cell padding on every edge.
+- **Centered 120:** a 120-column maximum aligned to the horizontal center.
+- **Presentation:** a 100×34 maximum centered on both axes.
+- **Custom:** the current manually edited values.
+
 Scopes are current pane, current window, current session, all open panes, and global default. Current-window scope requires the windows plugin; other scopes continue to work without it. Scope targets are frozen when selected, so panes opened afterward are not silently added.
+
+The generic prompt host provides an `F6` hide/show toggle while a form is active. Hiding removes only the overlay; the prompt remains active, keeps modal input ownership, and consumes keys instead of forwarding them to the pane PTY. Press `F6` again to restore the form without cancelling its live preview.
 
 Runtime-only changes disappear when the pane runtime is recreated. **Restore with pane** changes enter pane snapshots. **Global default** edits only `[plugins.settings."bmux.pane_runtime".padding]` in `bmux.toml`, preserves unrelated configuration, installs the defaults live for panes without overrides, and applies to future panes. Existing runtime or snapshot overrides retain precedence.
 
@@ -124,3 +136,12 @@ horizontal_alignment = "center"
 ```
 
 A full-screen pane on a superwide display retains its full outer rectangle while its terminal application receives a 120-column PTY centered between clear gutters. Resizing below 180 columns returns it to normal full-width behavior.
+
+To preview and adopt the same result interactively:
+
+1. Focus the pane on the superwide monitor and run `bmux pane-padding configure` (or press the recommended `Ctrl+A, P` binding).
+2. Keep **Scope** on **Current pane** and choose **Centered 120**. The pane's outer rectangle and neighboring split ratios remain unchanged while its PTY becomes at most 120 columns and the content is centered.
+3. Resize the terminal or move the pane between narrow and wide layouts to inspect clamping. Padding consumes only available interior space and never expands or rearranges the pane.
+4. Press `Esc` to restore the exact prior geometry, or choose a lifetime and press `Enter` to apply. Use **Global default** only when future panes should inherit the same 120-column centered constraint.
+
+For a declarative threshold that affects only genuinely wide panes, use the rule above after previewing the visual result.

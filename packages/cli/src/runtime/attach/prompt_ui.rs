@@ -208,6 +208,7 @@ impl ActivePrompt {
 pub struct AttachPromptState {
     queue: VecDeque<AttachPromptEnvelope>,
     active: Option<ActivePrompt>,
+    overlay_visible: bool,
 }
 
 pub enum PromptKeyDisposition {
@@ -243,7 +244,7 @@ impl AttachPromptState {
                 "Prompt | Up/Down move | Space toggle | Enter submit | Esc cancel"
             }
             PromptField::Form { .. } => {
-                "Prompt | Up/Down move | Space edit/toggle | Enter apply | Esc cancel"
+                "Prompt | F6 hide/show | Up/Down move | Space edit/toggle | Enter apply | Esc cancel"
             }
         };
         Some(hint)
@@ -294,6 +295,7 @@ impl AttachPromptState {
                 PromptField::Form {
                     sections,
                     live_preview,
+                    ..
                 },
                 PromptWidgetState::Form {
                     cursor,
@@ -326,6 +328,11 @@ impl AttachPromptState {
             return PromptKeyDisposition::NotActive;
         }
         if !prompt_accepts_key_kind(key.kind) {
+            return PromptKeyDisposition::Consumed;
+        }
+
+        if matches!(key.code, KeyCode::F(6)) {
+            self.overlay_visible = !self.overlay_visible;
             return PromptKeyDisposition::Consumed;
         }
 
@@ -670,6 +677,7 @@ impl AttachPromptState {
                     PromptField::Form {
                         sections,
                         live_preview,
+                        resettable,
                     },
                     PromptWidgetState::Form {
                         cursor,
@@ -688,10 +696,10 @@ impl AttachPromptState {
                         }
                     } else {
                         match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => {
+                            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                                 *cursor = cursor.saturating_sub(1);
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
+                            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                                 *cursor = cursor.saturating_add(1).min(len.saturating_sub(1));
                             }
                             KeyCode::Home => {
@@ -700,15 +708,28 @@ impl AttachPromptState {
                             KeyCode::End => {
                                 *cursor = len.saturating_sub(1);
                             }
+                            KeyCode::Char('r' | 'R') if *resettable => {
+                                *values = initial_form_values(sections);
+                                *editors = initial_form_editors(sections);
+                                errors.clear();
+                                if *live_preview {
+                                    for field in &fields {
+                                        emit_form_changed(&active.envelope, field, values);
+                                    }
+                                }
+                            }
                             KeyCode::Char(' ') => {
                                 if let Some(field) = fields.get(*cursor)
                                     && !field.disabled
                                 {
                                     cycle_form_value(field, values);
-                                    errors.remove(&field.id);
-                                    if *live_preview {
-                                        emit_form_changed(&active.envelope, field, values);
-                                    }
+                                    validate_and_emit_form_change(
+                                        &active.envelope,
+                                        field,
+                                        values,
+                                        errors,
+                                        *live_preview,
+                                    );
                                 }
                             }
                             KeyCode::Enter => {
@@ -738,10 +759,13 @@ impl AttachPromptState {
                                         FormEditAction::Insert(ch),
                                     )
                                 {
-                                    errors.remove(&field.id);
-                                    if *live_preview {
-                                        emit_form_changed(&active.envelope, field, values);
-                                    }
+                                    validate_and_emit_form_change(
+                                        &active.envelope,
+                                        field,
+                                        values,
+                                        errors,
+                                        *live_preview,
+                                    );
                                 }
                             }
                             KeyCode::Backspace => {
@@ -754,10 +778,13 @@ impl AttachPromptState {
                                         FormEditAction::Delete(TextDelete::Backward),
                                     )
                                 {
-                                    errors.remove(&field.id);
-                                    if *live_preview {
-                                        emit_form_changed(&active.envelope, field, values);
-                                    }
+                                    validate_and_emit_form_change(
+                                        &active.envelope,
+                                        field,
+                                        values,
+                                        errors,
+                                        *live_preview,
+                                    );
                                 }
                             }
                             KeyCode::Delete => {
@@ -770,10 +797,53 @@ impl AttachPromptState {
                                         FormEditAction::Delete(TextDelete::Forward),
                                     )
                                 {
-                                    errors.remove(&field.id);
-                                    if *live_preview {
-                                        emit_form_changed(&active.envelope, field, values);
-                                    }
+                                    validate_and_emit_form_change(
+                                        &active.envelope,
+                                        field,
+                                        values,
+                                        errors,
+                                        *live_preview,
+                                    );
+                                }
+                            }
+                            KeyCode::Left | KeyCode::Right
+                                if key.modifiers.intersects(KeyModifiers::SHIFT)
+                                    && let Some(field) = fields.get(*cursor)
+                                    && !field.disabled =>
+                            {
+                                let sign = if matches!(key.code, KeyCode::Left) {
+                                    -1
+                                } else {
+                                    1
+                                };
+                                if adjust_form_integer(field, values, sign * 5) {
+                                    validate_and_emit_form_change(
+                                        &active.envelope,
+                                        field,
+                                        values,
+                                        errors,
+                                        *live_preview,
+                                    );
+                                }
+                            }
+                            KeyCode::Left | KeyCode::Right
+                                if key.modifiers.intersects(KeyModifiers::CONTROL)
+                                    && let Some(field) = fields.get(*cursor)
+                                    && !field.disabled =>
+                            {
+                                let sign = if matches!(key.code, KeyCode::Left) {
+                                    -1
+                                } else {
+                                    1
+                                };
+                                if adjust_form_integer(field, values, sign * 10) {
+                                    validate_and_emit_form_change(
+                                        &active.envelope,
+                                        field,
+                                        values,
+                                        errors,
+                                        *live_preview,
+                                    );
                                 }
                             }
                             KeyCode::Left
@@ -867,11 +937,15 @@ impl AttachPromptState {
             })
     }
 
+    #[allow(clippy::too_many_lines)] // Mouse routing keeps modal containment and concrete prompt interactions in one state-machine entry point.
     pub fn handle_mouse_event(
         &mut self,
         mouse: MouseEvent,
         geometry: TerminalGeometry,
     ) -> PromptKeyDisposition {
+        if !self.overlay_visible {
+            return PromptKeyDisposition::Consumed;
+        }
         let Some(layout) = prompt_overlay_layout(
             self.active.as_ref().map(|active| &active.envelope.request),
             geometry,
@@ -881,6 +955,63 @@ impl AttachPromptState {
         let Some(active) = self.active.as_mut() else {
             return PromptKeyDisposition::NotActive;
         };
+
+        if let (
+            PromptField::Form {
+                sections,
+                live_preview,
+                ..
+            },
+            PromptWidgetState::Form {
+                cursor,
+                scroll,
+                values,
+                errors,
+                ..
+            },
+        ) = (&active.envelope.request.field, &mut active.state)
+        {
+            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return PromptKeyDisposition::Consumed;
+            }
+            let content_y = layout.surface.rect.y.saturating_add(1);
+            let content_bottom = layout
+                .surface
+                .rect
+                .y
+                .saturating_add(layout.surface.rect.h.saturating_sub(1));
+            if mouse.column <= layout.surface.rect.x
+                || mouse.column
+                    >= layout
+                        .surface
+                        .rect
+                        .x
+                        .saturating_add(layout.surface.rect.w)
+                        .saturating_sub(1)
+                || mouse.row < content_y
+                || mouse.row >= content_bottom
+            {
+                return PromptKeyDisposition::Consumed;
+            }
+            let fields = flatten_form_fields(sections);
+            let row = usize::from(mouse.row.saturating_sub(content_y));
+            let index = scroll.saturating_add(row);
+            let Some(field) = fields.get(index) else {
+                return PromptKeyDisposition::Consumed;
+            };
+            *cursor = index;
+            if !field.disabled && matches!(field.kind, PromptFormFieldKind::Bool { .. }) {
+                cycle_form_value(field, values);
+                validate_and_emit_form_change(
+                    &active.envelope,
+                    field,
+                    values,
+                    errors,
+                    *live_preview,
+                );
+            }
+            return PromptKeyDisposition::Consumed;
+        }
 
         if active.envelope.request.modal_id.as_deref() == Some("command-palette") {
             let Some(hit) = active.hits.hit_test(Point::new(mouse.column, mouse.row)) else {
@@ -981,6 +1112,9 @@ impl AttachPromptState {
 
     #[must_use]
     pub fn overlay_surface(&self, geometry: TerminalGeometry) -> Option<AttachSurface> {
+        if !self.overlay_visible {
+            return None;
+        }
         prompt_overlay_layout(
             self.active.as_ref().map(|active| &active.envelope.request),
             geometry,
@@ -995,6 +1129,9 @@ impl AttachPromptState {
         appearance: &RuntimeAppearance,
         extension_chrome: bool,
     ) -> Option<AttachPromptOverlayRender> {
+        if !self.overlay_visible {
+            return None;
+        }
         let layout = prompt_overlay_layout(
             self.active.as_ref().map(|active| &active.envelope.request),
             geometry,
@@ -1115,6 +1252,7 @@ impl AttachPromptState {
             return;
         }
         if let Some(next) = self.queue.pop_front() {
+            self.overlay_visible = true;
             self.active = Some(ActivePrompt::from_envelope(next));
         }
     }
@@ -1123,6 +1261,7 @@ impl AttachPromptState {
         let Some(active) = self.active.take() else {
             return PromptKeyDisposition::NotActive;
         };
+        self.overlay_visible = true;
         self.activate_next();
         PromptKeyDisposition::Completed(AttachPromptCompletion {
             origin: active.envelope.origin,
@@ -1330,16 +1469,18 @@ fn render_form(
             1,
         );
         let field = fields[index];
-        if render_form_control(
-            field,
-            values,
-            editors,
-            errors,
-            index == *cursor,
-            control_area,
-            frame,
-            theme,
-        ) {
+        if !errors.contains_key(&field.id)
+            && render_form_control(
+                field,
+                values,
+                editors,
+                errors,
+                index == *cursor,
+                control_area,
+                frame,
+                theme,
+            )
+        {
             continue;
         }
         let style = if field.disabled {
@@ -1757,6 +1898,26 @@ fn emit_form_changed(
     }
 }
 
+fn validate_and_emit_form_change(
+    envelope: &AttachPromptEnvelope,
+    field: &PromptFormField,
+    values: &BTreeMap<String, PromptFormValue>,
+    errors: &mut BTreeMap<String, String>,
+    live_preview: bool,
+) {
+    match validate_form_field(field, values) {
+        Ok(()) => {
+            errors.remove(&field.id);
+            if live_preview {
+                emit_form_changed(envelope, field, values);
+            }
+        }
+        Err(message) => {
+            errors.insert(field.id.clone(), message);
+        }
+    }
+}
+
 fn flatten_form_fields(
     sections: &[crate::runtime::prompt::PromptFormSection],
 ) -> Vec<&PromptFormField> {
@@ -1961,6 +2122,27 @@ fn edit_form_integer(value: &mut i64, action: FormEditAction) -> bool {
     } else {
         return false;
     };
+    true
+}
+
+fn adjust_form_integer(
+    field: &PromptFormField,
+    values: &mut BTreeMap<String, PromptFormValue>,
+    delta: i64,
+) -> bool {
+    let PromptFormFieldKind::Integer { min, max, .. } = &field.kind else {
+        return false;
+    };
+    let Some(PromptFormValue::Integer(value)) = values.get_mut(&field.id) else {
+        return false;
+    };
+    *value = value.saturating_add(delta);
+    if let Some(min) = min {
+        *value = (*value).max(*min);
+    }
+    if let Some(max) = max {
+        *value = (*value).min(*max);
+    }
     true
 }
 
@@ -2261,10 +2443,19 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
             "Up/Down move | Space toggle | Enter {} | Esc {}",
             request.submit_label, request.cancel_label
         ),
-        PromptField::Form { .. } => format!(
-            "Up/Down move | Space clear/toggle | Type edit | Enter {} | Esc {}",
-            request.submit_label, request.cancel_label
-        ),
+        PromptField::Form { resettable, .. } => {
+            if resettable {
+                format!(
+                    "F6 hide/show | R reset | Tab move | Shift/Ctrl Left/Right adjust | Enter {} | Esc {}",
+                    request.submit_label, request.cancel_label
+                )
+            } else {
+                format!(
+                    "F6 hide/show | Tab/Up/Down move | Shift/Ctrl Left/Right adjust | Enter {} | Esc {}",
+                    request.submit_label, request.cancel_label
+                )
+            }
+        }
     }
 }
 
@@ -2434,11 +2625,13 @@ mod tests {
         PromptRequest, PromptResponse, PromptValidation, PromptValue,
     };
     use bmux_appearance::RuntimeAppearance;
+    use bmux_plugin::prompt::PromptHostRequest;
     use bmux_tui::style::Color;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
+    use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
 
     fn key_event(code: KeyCode) -> KeyEvent {
@@ -2988,6 +3181,242 @@ mod tests {
             completion.response,
             PromptResponse::Submitted(PromptValue::Single("wide".to_string()))
         );
+    }
+
+    #[test]
+    fn form_mouse_click_focuses_fields_and_toggles_boole() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Settings",
+                vec![PromptFormSection::new(
+                    "general",
+                    "General",
+                    vec![
+                        PromptFormField::new(
+                            "enabled",
+                            "Enabled",
+                            PromptFormFieldKind::Bool { default: false },
+                        ),
+                        PromptFormField::new(
+                            "count",
+                            "Count",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 2,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        ),
+                    ],
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        let surface = state.overlay_surface(geometry).expect("overlay");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: surface.rect.x.saturating_add(2),
+            row: surface.rect.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            state.handle_mouse_event(mouse, geometry),
+            PromptKeyDisposition::Consumed
+        ));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected completion");
+        };
+        let PromptResponse::Submitted(PromptValue::Form(values)) = completion.response else {
+            panic!("expected form values");
+        };
+        assert_eq!(values.get("enabled"), Some(&PromptFormValue::Bool(true)));
+    }
+
+    #[test]
+    fn form_keyboard_navigation_and_integer_steps_work() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Settings",
+                vec![PromptFormSection::new(
+                    "general",
+                    "General",
+                    vec![
+                        PromptFormField::new(
+                            "first",
+                            "First",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 1,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        ),
+                        PromptFormField::new(
+                            "second",
+                            "Second",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 2,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        ),
+                    ],
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Tab));
+        let _ = state.handle_key_event(&modified_key_event(KeyCode::Right, KeyModifiers::SHIFT));
+        let _ = state.handle_key_event(&modified_key_event(KeyCode::Right, KeyModifiers::CONTROL));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected completion");
+        };
+        let PromptResponse::Submitted(PromptValue::Form(values)) = completion.response else {
+            panic!("expected form values");
+        };
+        assert_eq!(values.get("first"), Some(&PromptFormValue::Integer(1)));
+        assert_eq!(values.get("second"), Some(&PromptFormValue::Integer(17)));
+    }
+
+    #[test]
+    fn form_temporary_hide_keeps_prompt_active_and_consumes_input() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Settings",
+                vec![PromptFormSection::new(
+                    "general",
+                    "General",
+                    vec![PromptFormField::new(
+                        "enabled",
+                        "Enabled",
+                        PromptFormFieldKind::Bool { default: false },
+                    )],
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        assert!(state.overlay_surface(geometry).is_some());
+
+        assert!(matches!(
+            state.handle_key_event(&key_event(KeyCode::F(6))),
+            PromptKeyDisposition::Consumed
+        ));
+        assert!(state.is_active());
+        assert!(state.overlay_surface(geometry).is_none());
+        assert!(matches!(
+            state.handle_key_event(&key_event(KeyCode::Char(' '))),
+            PromptKeyDisposition::Consumed
+        ));
+
+        let _ = state.handle_key_event(&key_event(KeyCode::F(6)));
+        assert!(state.overlay_surface(geometry).is_some());
+    }
+
+    #[test]
+    fn invalid_live_form_edit_shows_error_without_emitting_preview() {
+        let mut state = AttachPromptState::default();
+        let (response_tx, _response_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        state.enqueue_external(PromptHostRequest {
+            request: PromptRequest::form(
+                "Padding",
+                vec![PromptFormSection::new(
+                    "limits",
+                    "Limits",
+                    vec![PromptFormField::new(
+                        "width",
+                        "Width",
+                        PromptFormFieldKind::Integer {
+                            initial_value: 1,
+                            min: Some(1),
+                            max: Some(10),
+                        },
+                    )],
+                )],
+            )
+            .form_live_preview(true),
+            response_tx,
+            event_tx: Some(event_tx),
+        });
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Char(' ')));
+
+        assert!(event_rx.try_recv().is_err());
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+                false,
+            )
+            .expect("form should render");
+        let text = render
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                bmux_plugin::RenderOp::TextRun { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("value is out of range"), "rendered: {text:?}");
+    }
+
+    #[test]
+    fn valid_live_form_edit_emits_complete_values() {
+        let mut state = AttachPromptState::default();
+        let (response_tx, _response_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        state.enqueue_external(PromptHostRequest {
+            request: PromptRequest::form(
+                "Padding",
+                vec![PromptFormSection::new(
+                    "padding",
+                    "Padding",
+                    vec![
+                        PromptFormField::new(
+                            "left",
+                            "Left",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 1,
+                                min: Some(0),
+                                max: Some(20),
+                            },
+                        ),
+                        PromptFormField::new(
+                            "right",
+                            "Right",
+                            PromptFormFieldKind::Integer {
+                                initial_value: 2,
+                                min: Some(0),
+                                max: Some(10),
+                            },
+                        ),
+                    ],
+                )],
+            )
+            .form_live_preview(true),
+            response_tx,
+            event_tx: Some(event_tx),
+        });
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Char('3')));
+
+        let crate::runtime::prompt::PromptEvent::FormChanged {
+            field_id, values, ..
+        } = event_rx.try_recv().expect("live event")
+        else {
+            panic!("expected form change");
+        };
+        assert_eq!(field_id, "left");
+        assert_eq!(values.get("left"), Some(&PromptFormValue::Integer(13)));
+        assert_eq!(values.get("right"), Some(&PromptFormValue::Integer(2)));
     }
 
     #[test]

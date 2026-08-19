@@ -310,7 +310,7 @@ fn select_options(values: &[(&str, &str)]) -> Vec<PromptOption> {
 }
 
 #[allow(clippy::too_many_lines)] // Keeping the fixed form schema together makes field defaults and sections reviewable.
-fn configure_request(spec: PanePaddingSpec) -> PromptRequest {
+fn configure_request(spec: PanePaddingSpec, windows_available: bool) -> PromptRequest {
     let edge = |id, label, value| {
         PromptFormField::new(
             id,
@@ -322,6 +322,15 @@ fn configure_request(spec: PanePaddingSpec) -> PromptRequest {
             },
         )
     };
+    let mut scope_options = vec![
+        PromptOption::new("pane", "Current pane"),
+        PromptOption::new("session", "Current session"),
+        PromptOption::new("all", "All open panes"),
+        PromptOption::new("global", "Global default"),
+    ];
+    if windows_available {
+        scope_options.insert(1, PromptOption::new("window", "Current window"));
+    }
     PromptRequest::form(
         "Pane Padding",
         vec![
@@ -333,16 +342,22 @@ fn configure_request(spec: PanePaddingSpec) -> PromptRequest {
                         "scope",
                         "Scope",
                         PromptFormFieldKind::SingleSelect {
-                            options: select_options(&[
-                                ("pane", "Current pane"),
-                                ("window", "Current window"),
-                                ("session", "Current session"),
-                                ("all", "All open panes"),
-                                ("global", "Global default"),
-                            ]),
+                            options: scope_options,
                             default_index: 0,
                         },
                     ),
+                    PromptFormField::new(
+                        "refresh-targets",
+                        "Refresh target selection",
+                        PromptFormFieldKind::Bool { default: false },
+                    )
+                    .description("Toggle to re-resolve the selected scope's open panes"),
+                    PromptFormField::new(
+                        "use-declarative",
+                        "Use declarative settings on apply",
+                        PromptFormFieldKind::Bool { default: false },
+                    )
+                    .description("Clear pane overrides instead of committing this draft"),
                     PromptFormField::new(
                         "lifetime",
                         "Lifetime",
@@ -368,11 +383,21 @@ fn configure_request(spec: PanePaddingSpec) -> PromptRequest {
                                 ("custom", "Custom"),
                                 ("none", "None"),
                                 ("comfortable", "Comfortable"),
-                                ("focused", "Focused reading"),
+                                ("centered-120", "Centered 120"),
                                 ("presentation", "Presentation"),
                             ]),
                             default_index: 0,
                         },
+                    ),
+                    PromptFormField::new(
+                        "link-horizontal",
+                        "Link left/right",
+                        PromptFormFieldKind::Bool { default: false },
+                    ),
+                    PromptFormField::new(
+                        "link-vertical",
+                        "Link top/bottom",
+                        PromptFormFieldKind::Bool { default: false },
                     ),
                     edge("left", "Left", spec.left),
                     edge("right", "Right", spec.right),
@@ -450,6 +475,7 @@ fn configure_request(spec: PanePaddingSpec) -> PromptRequest {
     .policy(PromptPolicy::RejectIfBusy)
     .width_range(52, 88)
     .form_live_preview(true)
+    .form_resettable(true)
 }
 
 fn integer_value(values: &BTreeMap<String, PromptFormValue>, key: &str) -> Option<u16> {
@@ -495,24 +521,17 @@ fn apply_preset(
             bottom: 1,
             ..spec
         },
-        Some("focused") => PanePaddingSpec {
-            left: 2,
-            right: 2,
-            top: 1,
-            bottom: 1,
-            max_content_width: Some(100),
+        Some("centered-120") => PanePaddingSpec {
+            max_content_width: Some(120),
             horizontal_alignment: HorizontalAlignment::Center,
             ..spec
         },
         Some("presentation") => PanePaddingSpec {
-            left: 4,
-            right: 4,
-            top: 2,
-            bottom: 2,
-            max_content_width: Some(120),
-            max_content_height: Some(40),
+            max_content_width: Some(100),
+            max_content_height: Some(34),
             horizontal_alignment: HorizontalAlignment::Center,
             vertical_alignment: VerticalAlignment::Center,
+            ..spec
         },
         _ => {
             // Preserve the current draft for the custom option.
@@ -566,6 +585,28 @@ fn spec_from_form(
             VerticalAlignment::parse(value).map_err(PluginCommandError::invalid_arguments)?;
     }
     Ok(spec)
+}
+
+fn apply_linked_edge(
+    values: &BTreeMap<String, PromptFormValue>,
+    changed_field: &str,
+    mut spec: PanePaddingSpec,
+) -> PanePaddingSpec {
+    if bool_value(values, "link-horizontal") == Some(true) {
+        match changed_field {
+            "left" => spec.right = spec.left,
+            "right" => spec.left = spec.right,
+            _ => {}
+        }
+    }
+    if bool_value(values, "link-vertical") == Some(true) {
+        match changed_field {
+            "top" => spec.bottom = spec.top,
+            "bottom" => spec.top = spec.bottom,
+            _ => {}
+        }
+    }
+    spec
 }
 
 fn non_empty_targets(targets: Vec<Uuid>) -> Result<Vec<Uuid>, PluginCommandError> {
@@ -791,6 +832,20 @@ fn install_global_padding(
     })
 }
 
+fn is_numeric_configure_field(field_id: &str) -> bool {
+    matches!(
+        field_id,
+        "left" | "right" | "top" | "bottom" | "max-content-width" | "max-content-height"
+    )
+}
+
+fn clear_target_overrides(targets: &[Uuid]) -> Result<(), PluginCommandError> {
+    handle()?
+        .clear_overrides(targets)
+        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+    Ok(())
+}
+
 fn preview_spec(spec: PanePaddingSpec) -> pane_runtime_state::PanePaddingSpec {
     crate::padding_api::spec_to_api(spec)
 }
@@ -804,7 +859,11 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
         .map_err(|error| PluginCommandError::failed(error.to_string()))?;
     let pane_id = current.pane_id;
     let initial_spec = current.effective;
-    let prompt = configure_request(initial_spec);
+    let windows_available = context
+        .available_capabilities
+        .iter()
+        .any(|capability| capability == "bmux.windows.read");
+    let prompt = configure_request(initial_spec, windows_available);
     let (mut response_rx, mut event_rx) = prompt::submit_with_events(prompt)
         .map_err(|error| PluginCommandError::unavailable(error.to_string()))?;
     let context = context.clone();
@@ -827,6 +886,10 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
         };
         let token = started.token;
         let mut lifetime = pane_runtime_commands::PanePaddingPersistence::Runtime;
+        let mut refresh_value = false;
+        let mut pending_numeric: Option<(String, BTreeMap<String, PromptFormValue>)> = None;
+        let numeric_debounce = tokio::time::sleep(std::time::Duration::MAX);
+        tokio::pin!(numeric_debounce);
         loop {
             tokio::select! {
                 response = &mut response_rx => {
@@ -836,12 +899,14 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
                             let final_scope = single_value(&values, "scope")
                                 .and_then(|value| ConfigureScope::parse(value).ok())
                                 .unwrap_or(scope);
-                            if let Ok(final_targets) = resolve_scope(
+                            let final_targets = resolve_scope(
                                 &context,
                                 session_id,
                                 pane_id,
                                 final_scope,
-                            ) && (final_targets != targets || final_spec != spec)
+                            )
+                            .unwrap_or_else(|_| targets.clone());
+                            if final_targets != targets || final_spec != spec
                             {
                                 let updated = bmux_plugin::block_on_typed_dispatch(
                                     pane_runtime_commands::client::update_pane_padding_preview(
@@ -867,7 +932,18 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
                                     pane_runtime_commands::PanePaddingPersistence::Runtime
                                 };
                             }
-                            if final_scope == ConfigureScope::Global {
+                            let use_declarative =
+                                bool_value(&values, "use-declarative") == Some(true);
+                            if use_declarative {
+                                let cancelled = bmux_plugin::block_on_typed_dispatch(
+                                    pane_runtime_commands::client::cancel_pane_padding_preview(
+                                        &mut client, token,
+                                    ),
+                                );
+                                if matches!(cancelled, Ok(Ok(_))) {
+                                    let _ = clear_target_overrides(&final_targets);
+                                }
+                            } else if final_scope == ConfigureScope::Global {
                                 let cancelled = bmux_plugin::block_on_typed_dispatch(
                                     pane_runtime_commands::client::cancel_pane_padding_preview(
                                         &mut client, token,
@@ -894,17 +970,48 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
                     }
                     break;
                 }
+                () = &mut numeric_debounce, if pending_numeric.is_some() => {
+                    let Some((field_id, values)) = pending_numeric.take() else {
+                        continue;
+                    };
+                    let Ok(parsed_spec) = spec_from_form(&values, spec) else {
+                        continue;
+                    };
+                    let next_spec = apply_linked_edge(&values, &field_id, parsed_spec);
+                    let result = bmux_plugin::block_on_typed_dispatch(
+                        pane_runtime_commands::client::update_pane_padding_preview(
+                            &mut client, token, targets.clone(), preview_spec(next_spec),
+                        ),
+                    );
+                    if matches!(result, Ok(Ok(_))) {
+                        spec = next_spec;
+                    }
+                }
                 event = event_rx.recv() => {
-                    let Some(PromptEvent::FormChanged { values, .. }) = event else {
+                    let Some(PromptEvent::FormChanged {
+                        field_id, values, ..
+                    }) = event
+                    else {
                         continue;
                     };
-                    let Ok(next_spec) = spec_from_form(&values, spec) else {
+                    if is_numeric_configure_field(&field_id) {
+                        pending_numeric = Some((field_id, values));
+                        numeric_debounce.as_mut().reset(
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(60),
+                        );
+                        continue;
+                    }
+                    pending_numeric = None;
+                    let Ok(parsed_spec) = spec_from_form(&values, spec) else {
                         continue;
                     };
+                    let next_spec = apply_linked_edge(&values, &field_id, parsed_spec);
                     let next_scope = single_value(&values, "scope")
                         .and_then(|value| ConfigureScope::parse(value).ok())
                         .unwrap_or(scope);
-                    let next_targets = if next_scope == scope {
+                    let next_refresh = bool_value(&values, "refresh-targets").unwrap_or(refresh_value);
+                    let refresh_requested = next_refresh != refresh_value;
+                    let next_targets = if next_scope == scope && !refresh_requested {
                         targets.clone()
                     } else {
                         let Ok(resolved) = resolve_scope(&context, session_id, pane_id, next_scope)
@@ -920,6 +1027,7 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
                     );
                     if matches!(result, Ok(Ok(_))) {
                         scope = next_scope;
+                        refresh_value = next_refresh;
                         spec = next_spec;
                         targets = next_targets;
                     }
@@ -1091,10 +1199,102 @@ enabled = true
             PromptFormValue::Single("presentation".to_string()),
         )]);
         let spec = spec_from_form(&preset, PanePaddingSpec::default()).unwrap();
-        assert_eq!((spec.left, spec.right, spec.top, spec.bottom), (4, 4, 2, 2));
-        assert_eq!(spec.max_content_width, Some(120));
-        assert_eq!(spec.max_content_height, Some(40));
+        assert_eq!((spec.left, spec.right, spec.top, spec.bottom), (0, 0, 0, 0));
+        assert_eq!(spec.max_content_width, Some(100));
+        assert_eq!(spec.max_content_height, Some(34));
+        assert_eq!(spec.horizontal_alignment, HorizontalAlignment::Center);
         assert_eq!(spec.vertical_alignment, VerticalAlignment::Center);
+
+        let centered = BTreeMap::from([(
+            "preset".to_string(),
+            PromptFormValue::Single("centered-120".to_string()),
+        )]);
+        let spec = spec_from_form(&centered, PanePaddingSpec::default()).unwrap();
+        assert_eq!(spec.max_content_width, Some(120));
+        assert_eq!(spec.horizontal_alignment, HorizontalAlignment::Center);
+    }
+
+    #[test]
+    fn configurator_debounces_only_numeric_fields() {
+        for field in [
+            "left",
+            "right",
+            "top",
+            "bottom",
+            "max-content-width",
+            "max-content-height",
+        ] {
+            assert!(is_numeric_configure_field(field), "{field}");
+        }
+        for field in [
+            "scope",
+            "lifetime",
+            "preset",
+            "link-horizontal",
+            "limit-width",
+            "horizontal-alignment",
+        ] {
+            assert!(!is_numeric_configure_field(field), "{field}");
+        }
+    }
+
+    #[test]
+    fn form_linked_edges_follow_the_changed_field() {
+        let values = BTreeMap::from([
+            (
+                "preset".to_string(),
+                PromptFormValue::Single("custom".to_string()),
+            ),
+            ("link-horizontal".to_string(), PromptFormValue::Bool(true)),
+            ("link-vertical".to_string(), PromptFormValue::Bool(true)),
+            ("left".to_string(), PromptFormValue::Integer(7)),
+            ("right".to_string(), PromptFormValue::Integer(2)),
+            ("top".to_string(), PromptFormValue::Integer(3)),
+            ("bottom".to_string(), PromptFormValue::Integer(9)),
+        ]);
+
+        let horizontal = apply_linked_edge(
+            &values,
+            "left",
+            spec_from_form(&values, PanePaddingSpec::default()).unwrap(),
+        );
+        assert_eq!((horizontal.left, horizontal.right), (7, 7));
+
+        let vertical = apply_linked_edge(
+            &values,
+            "bottom",
+            spec_from_form(&values, PanePaddingSpec::default()).unwrap(),
+        );
+        assert_eq!((vertical.top, vertical.bottom), (9, 9));
+    }
+
+    #[test]
+    fn form_omits_window_scope_when_windows_capability_is_missing() {
+        fn scope_values(request: &PromptRequest) -> Vec<&str> {
+            let bmux_plugin_sdk::PromptField::Form { sections, .. } = &request.field else {
+                panic!("configure request must be a form");
+            };
+            let PromptFormFieldKind::SingleSelect { options, .. } = &sections[0].fields[0].kind
+            else {
+                panic!("scope must be a single select");
+            };
+            options.iter().map(|option| option.value.as_str()).collect()
+        }
+
+        let without_windows = configure_request(PanePaddingSpec::default(), false);
+        let with_windows = configure_request(PanePaddingSpec::default(), true);
+        assert!(!scope_values(&without_windows).contains(&"window"));
+        assert!(scope_values(&with_windows).contains(&"window"));
+
+        let bmux_plugin_sdk::PromptField::Form { sections, .. } = with_windows.field else {
+            panic!("configure request must be a form");
+        };
+        assert!(
+            sections[0]
+                .fields
+                .iter()
+                .any(|field| field.id == "refresh-targets")
+        );
     }
 
     #[test]
