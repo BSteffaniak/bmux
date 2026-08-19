@@ -18,6 +18,7 @@ bmux_plugin_runtime = { workspace = true }
 # External dependencies (host-side only)
 bmux_ipc            = { workspace = true }
 bmux_perf_telemetry = { workspace = true }
+bmux_tui            = { workspace = true }
 libloading          = { workspace = true }
 semver              = { workspace = true }
 serde               = { workspace = true, features = ["derive", "std"] }
@@ -42,4 +43,5 @@ default = []
 fail-on-warnings = [
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
 ]

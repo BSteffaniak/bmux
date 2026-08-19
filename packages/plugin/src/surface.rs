@@ -160,6 +160,34 @@ impl PluginSurface {
 
 impl PluginSurfaceRegion {
     #[must_use]
+    pub fn from_tui(region: &bmux_tui::hit::HitRegion) -> Self {
+        use bmux_tui::hit::HitRole;
+
+        let cursor = match region.role {
+            HitRole::TextInput => PluginSurfaceCursor::Text,
+            HitRole::ResizeHandle => PluginSurfaceCursor::ResizeHorizontal,
+            HitRole::Action | HitRole::ListItem | HitRole::DragHandle => {
+                PluginSurfaceCursor::Pointer
+            }
+            HitRole::Scroll | HitRole::Decoration | HitRole::Custom(_) => {
+                PluginSurfaceCursor::Default
+            }
+        };
+        Self {
+            local_id: region.id.as_str().to_owned(),
+            rect: ExtensionRect::new(
+                region.area.x,
+                region.area.y,
+                region.area.width,
+                region.area.height,
+            ),
+            focusable: region.focusable && region.enabled && region.visible,
+            cursor,
+            endpoint: None,
+        }
+    }
+
+    #[must_use]
     pub fn new(local_id: impl Into<String>, rect: ExtensionRect) -> Self {
         Self {
             local_id: local_id.into(),
@@ -706,6 +734,21 @@ mod tests {
             visible: true,
             ops: vec![RenderOp::text_run(1, 2, "x", RenderStyle::new())],
         }
+    }
+
+    #[test]
+    fn tui_hit_region_lowers_to_semantic_plugin_region() {
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::hit::{HitRegion, HitRole};
+
+        let hit = HitRegion::new("field", Rect::new(2, 3, 8, 1))
+            .role(HitRole::TextInput)
+            .focusable(true);
+        let region = PluginSurfaceRegion::from_tui(&hit);
+        assert_eq!(region.local_id, "field");
+        assert_eq!(region.rect, ExtensionRect::new(2, 3, 8, 1));
+        assert!(region.focusable);
+        assert_eq!(region.cursor, PluginSurfaceCursor::Text);
     }
 
     #[test]
