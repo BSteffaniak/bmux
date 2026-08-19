@@ -48,6 +48,25 @@ A rule inherits unspecified values from the global padding settings. A live runt
 
 If fixed padding and limits do not fit, bmux clamps the content area deterministically to at least `1x1`. Center alignment places an odd surplus cell on the trailing side. Padding is pane-scoped and shared by every client attached to that pane because the pane has one canonical PTY size.
 
+## Live configurator
+
+Open the floating live-preview configurator from a CLI or attach plugin-command binding:
+
+```sh
+bmux pane-padding configure
+```
+
+```toml
+[keybindings.runtime]
+"Ctrl+A P" = "plugin:bmux.pane_runtime:pane-padding-configure"
+```
+
+The recommended chord is `Ctrl+A, P`. The modal previews edge padding, content limits, presets, and alignment immediately without changing pane outer rectangles or split ratios. `Esc` cancels and restores the underlying declarative/runtime state; `Enter` applies once.
+
+Scopes are current pane, current window, current session, all open panes, and global default. Current-window scope requires the windows plugin; other scopes continue to work without it. Scope targets are frozen when selected, so panes opened afterward are not silently added.
+
+Runtime-only changes disappear when the pane runtime is recreated. **Restore with pane** changes enter pane snapshots. **Global default** edits only `[plugins.settings."bmux.pane_runtime".padding]` in `bmux.toml`, preserves unrelated configuration, installs the defaults live for panes without overrides, and applies to future panes. Existing runtime or snapshot overrides retain precedence.
+
 ## Runtime commands
 
 Inspect the focused pane in the current client's selected session:

@@ -8046,6 +8046,15 @@ impl PanePaddingRuntimeHandle {
         &self,
         padding_config: PanePaddingConfig,
     ) -> Result<(), SessionRuntimeError> {
+        self.replace_padding_config_with_hook(padding_config, || Ok(()))
+    }
+
+    fn replace_padding_config_with_hook(
+        &self,
+        padding_config: PanePaddingConfig,
+        before_install: impl FnOnce() -> Result<(), SessionRuntimeError>,
+    ) -> Result<(), SessionRuntimeError> {
+        before_install()?;
         let mut manager = self.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
         let targets = manager
             .runtimes
@@ -8583,6 +8592,39 @@ mod tests {
         assert_eq!(cleared.runtime_override, None);
         assert_eq!(cleared.effective_content_rect.w, 118);
         assert_eq!(*last_requested_size.lock().unwrap(), (38, 118));
+    }
+
+    #[tokio::test]
+    async fn replacement_padding_config_applies_to_panes_created_later() {
+        let session_id = SessionId(Uuid::new_v4());
+        let first_pane_id = Uuid::new_v4();
+        let manager = manager_with_runtime(session_id, runtime_with_panes(&[first_pane_id]));
+        let handle = PanePaddingRuntimeHandle(Arc::new(Mutex::new(manager)));
+        let settings = toml::Value::Table(toml::toml! {
+            [padding]
+            left = 3
+            max_content_width = 72
+        });
+        let config = PanePaddingConfig::parse(Some(&settings)).unwrap();
+        handle.replace_padding_config(config).unwrap();
+
+        let future_pane_id = Uuid::new_v4();
+        {
+            let mut manager = handle.0.lock().unwrap();
+            let runtime = manager.runtimes.get_mut(&session_id).unwrap();
+            runtime
+                .panes
+                .insert(future_pane_id, dummy_pane(future_pane_id));
+            runtime.layout_root = Some(PaneLayoutNode::Leaf {
+                pane_id: future_pane_id,
+            });
+            runtime.focused_pane_id = future_pane_id;
+        }
+
+        let future = handle.state(session_id, Some(future_pane_id)).unwrap();
+        assert_eq!(future.declarative.left, 3);
+        assert_eq!(future.declarative.max_content_width, Some(72));
+        assert_eq!(future.runtime_override, None);
     }
 
     #[tokio::test]

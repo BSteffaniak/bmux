@@ -568,6 +568,16 @@ fn spec_from_form(
     Ok(spec)
 }
 
+fn non_empty_targets(targets: Vec<Uuid>) -> Result<Vec<Uuid>, PluginCommandError> {
+    if targets.is_empty() {
+        Err(PluginCommandError::failed(
+            "selected pane-padding scope contains no open panes",
+        ))
+    } else {
+        Ok(targets)
+    }
+}
+
 fn resolve_scope(
     context: &NativeCommandContext,
     session_id: SessionId,
@@ -576,13 +586,15 @@ fn resolve_scope(
 ) -> Result<Vec<Uuid>, PluginCommandError> {
     let handle = handle()?;
     match scope {
-        ConfigureScope::Pane => Ok(vec![pane_id]),
+        ConfigureScope::Pane => non_empty_targets(vec![pane_id]),
         ConfigureScope::Session => handle
             .pane_ids(session_id)
-            .map_err(|error| PluginCommandError::failed(error.to_string())),
+            .map_err(|error| PluginCommandError::failed(error.to_string()))
+            .and_then(non_empty_targets),
         ConfigureScope::All | ConfigureScope::Global => handle
             .all_pane_ids()
-            .map_err(|error| PluginCommandError::failed(error.to_string())),
+            .map_err(|error| PluginCommandError::failed(error.to_string()))
+            .and_then(non_empty_targets),
         ConfigureScope::Window => {
             if !context
                 .available_capabilities
@@ -613,13 +625,20 @@ fn resolve_scope(
             .map_err(|error| {
                 PluginCommandError::failed(format!("window target unavailable: {error:?}"))
             })?;
-            Ok(result.pane_ids)
+            non_empty_targets(result.pane_ids)
         }
     }
 }
 
-fn padding_settings_value(spec: PanePaddingSpec) -> toml::Value {
-    let mut padding = toml::map::Map::new();
+fn padding_settings_value(existing: Option<&toml::Value>, spec: PanePaddingSpec) -> toml::Value {
+    let mut settings = existing
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let mut padding = settings
+        .remove("padding")
+        .and_then(|value| value.as_table().cloned())
+        .unwrap_or_default();
     padding.insert(
         "left".to_string(),
         toml::Value::Integer(i64::from(spec.left)),
@@ -653,7 +672,6 @@ fn padding_settings_value(spec: PanePaddingSpec) -> toml::Value {
         "vertical_alignment".to_string(),
         toml::Value::String(spec.vertical_alignment.as_str().to_string()),
     );
-    let mut settings = toml::map::Map::new();
     settings.insert("padding".to_string(), toml::Value::Table(padding));
     toml::Value::Table(settings)
 }
@@ -728,11 +746,29 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
     result
 }
 
+fn persist_and_install_global_padding(
+    path: &Path,
+    original: &[u8],
+    edited: &[u8],
+    install: impl FnOnce() -> Result<(), PluginCommandError>,
+) -> Result<(), PluginCommandError> {
+    atomic_replace(path, edited)?;
+    if let Err(error) = install() {
+        atomic_replace(path, original).map_err(|rollback| {
+            PluginCommandError::failed(format!(
+                "{error}; additionally failed restoring bmux.toml: {rollback}"
+            ))
+        })?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn install_global_padding(
     context: &NativeCommandContext,
     spec: PanePaddingSpec,
 ) -> Result<(), PluginCommandError> {
-    let settings = padding_settings_value(spec);
+    let settings = padding_settings_value(context.settings.as_ref(), spec);
     let config = crate::padding::PanePaddingConfig::parse(Some(&settings))
         .map_err(PluginCommandError::invalid_arguments)?;
     let path = config_path(context);
@@ -748,14 +784,11 @@ fn install_global_padding(
             "bmux.toml changed while pane padding was being applied",
         ));
     }
-    atomic_replace(&path, &edited)?;
-    if let Err(error) = handle()?.replace_padding_config(config) {
-        let _ = atomic_replace(&path, &original);
-        return Err(PluginCommandError::failed(format!(
-            "failed installing live pane padding: {error}"
-        )));
-    }
-    Ok(())
+    persist_and_install_global_padding(&path, &original, &edited, || {
+        handle()?.replace_padding_config(config).map_err(|error| {
+            PluginCommandError::failed(format!("failed installing live pane padding: {error}"))
+        })
+    })
 }
 
 fn preview_spec(spec: PanePaddingSpec) -> pane_runtime_state::PanePaddingSpec {
@@ -985,6 +1018,22 @@ mod tests {
             invocation_source,
             host_kernel_bridge: None,
         }
+    }
+
+    #[test]
+    fn global_padding_install_restores_file_when_live_install_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bmux.toml");
+        let original = b"# original\n";
+        fs::write(&path, original).unwrap();
+
+        let error = persist_and_install_global_padding(&path, original, b"# edited\n", || {
+            Err(PluginCommandError::failed("injected install failure"))
+        })
+        .expect_err("install should fail");
+
+        assert!(error.to_string().contains("injected install failure"));
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
