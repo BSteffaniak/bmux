@@ -3032,3 +3032,46 @@ fn pane_runtime_new_session_with_runtime_does_not_create_context() {
         );
     }
 }
+
+/// Attach viewport geometry is a neutral four-edge reservation contract.
+/// Product presentation roles such as the historical status bar must not leak
+/// back into runtime state, transport schemas, or client adapters.
+#[test]
+fn attach_viewport_contract_has_no_status_specific_geometry() {
+    let sources = [
+        (
+            "packages/pane-runtime-state/src/attach.rs",
+            include_str!("../../pane-runtime-state/src/attach.rs"),
+        ),
+        (
+            "plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl",
+            include_str!("../../../plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl"),
+        ),
+        (
+            "packages/cli/src/pane_runtime_client.rs",
+            include_str!("../src/pane_runtime_client.rs"),
+        ),
+        (
+            "packages/mobile-core/src/pane_runtime_client.rs",
+            include_str!("../../mobile-core/src/pane_runtime_client.rs"),
+        ),
+    ];
+
+    for (path, source) in sources {
+        for denied in ["status_top_inset", "status_bottom_inset"] {
+            assert!(
+                !source.contains(denied),
+                "{path} must keep attach viewport geometry presentation-neutral; found {denied}",
+            );
+        }
+    }
+
+    let schema =
+        include_str!("../../../plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl");
+    for required in ["top_inset", "right_inset", "bottom_inset", "left_inset"] {
+        assert!(
+            schema.contains(required),
+            "pane-runtime attach viewport contract must carry generic edge {required}",
+        );
+    }
+}

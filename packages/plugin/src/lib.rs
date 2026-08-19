@@ -18,6 +18,7 @@ mod declaration;
 mod discovery;
 mod event_bus;
 mod host_runtime;
+pub mod layout;
 mod loader;
 mod manifest;
 mod plugin_state;
