@@ -57,6 +57,51 @@ See the executable split-surface example and stable update guidance in
 `packages/plugin/src/surface.rs`, and the deterministic layout contract in
 `packages/plugin/src/layout.rs`.
 
+### Scene ownership and lowering boundaries
+
+BMUX has several scene-related representations, but they do not have equal
+ownership or form competing renderers:
+
+| Layer | Responsibility | Boundary |
+| --- | --- | --- |
+| `packages/tui` and `packages/tui-components` | Producer-side widgets, buffers, semantic hit regions, focus, and reusable visual components | A presentation companion lowers selected cells/widgets into generic `RenderOp` values and `PluginSurfaceRegion`s; TUI state is not retained by attach core. |
+| `packages/plugin/src/render.rs` | Generic paint vocabulary shared by extension adapters and independent retained surfaces | `RenderOp` is the canonical producer payload for in-process plugin surfaces. It contains no pane, tab, sidebar, or window semantics. |
+| `packages/plugin/src/layout.rs` and `surface.rs` | Canonical owner-scoped in-process publication, identity, revisions, validation, bounds, and lifecycle | Complete snapshots are the only input to independent presentation lowering. |
+| `packages/scene-protocol` | Typed retained **pane-decoration compatibility contract** for the decoration plugin | `DecorationScene` remains decoration-owned. It is not the wire format for independent plugin surfaces and must not grow tab/sidebar roles. |
+| `packages/scene-protocol-render` | Pure lowering/render helpers for decoration-protocol paint commands | It consumes the decoration wire vocabulary; it does not own retained state or composition. |
+| `packages/attach-layout-protocol` | Authoritative host pane scene, content rectangles, focus, and pane interactive summaries | It describes runtime-owned pane surfaces, not plugin presentation projection. |
+| `packages/attach_pipeline/src/compositor.rs` | Canonical composed retained graph, hit testing, damage, occlusion, repaint order, focus, and pointer routing | Both runtime pane surfaces and lowered plugin surfaces become `RetainedSurface`s here. This is the only in-process compositor representation. |
+
+Independent presentation state has no generic cross-process wire scene. The
+selected attach-client companion consumes typed domain state and publishes
+`PluginLayoutSnapshot` and `PluginSurfaceSnapshot` in process. Adding a second
+serialized scene contract would duplicate identity, revisions, limits, and
+lifecycle semantics. If a future execution environment cannot publish in
+process, it must transport these same owner-scoped snapshot semantics and lower
+into the existing registries rather than introducing another compositor model.
+
+The single independent-surface lowering path is:
+
+```text
+TUI/domain projection in attach-client companion
+→ PluginLayoutSnapshot + PluginSurfaceSnapshot
+→ deterministic layout resolution
+→ retained_surfaces_from_plugin_surfaces
+→ RetainedSurface graph in RetainedCompositor
+→ damage/repaint plan
+→ terminal renderer
+```
+
+Stable `PluginSurfaceId.retained_id` values preserve compositor identity.
+Monotonic owner revisions reject stale updates, owner replacement removes
+superseded operations, publisher drop removes owner state, and reconnect
+rehydrates from the latest complete snapshot. Malformed, foreign, duplicate,
+oversized, or conflicting publications fail before lowering. Unsupported or
+zero-area geometry is omitted safely. Text runs, styled spans, fills, clears,
+row erases, cell grids, borders, clipping, opacity, and semantic input regions
+all lower through this path. Terminal graphics remain runtime-owned rather than
+unbounded bytes embedded in a plugin surface snapshot.
+
 ## Design principles
 
 1. **Core is domain-agnostic.** `packages/server`, `packages/client`,

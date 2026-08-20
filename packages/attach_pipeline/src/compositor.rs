@@ -2439,6 +2439,68 @@ mod tests {
     }
 
     #[test]
+    fn plugin_surface_lowering_preserves_every_supported_retained_paint_item() {
+        use bmux_plugin::{BorderGlyphs, RenderCell, RenderTextSpan};
+
+        let owner = "example.paint-items";
+        let surface_id = PluginSurfaceId::new(owner, "main", Uuid::from_u128(506));
+        let style = RenderStyle::new().bold().underline();
+        let ops = vec![
+            RenderOp::text_run(1, 1, "text", style),
+            RenderOp::styled_text(
+                1,
+                2,
+                vec![
+                    RenderTextSpan::new("first", style),
+                    RenderTextSpan::new("second", RenderStyle::new()),
+                ],
+            ),
+            RenderOp::clear_rect(ExtensionRect::new(1, 3, 4, 1), style),
+            RenderOp::erase_row_segment(1, 4, 4, style),
+            RenderOp::fill_rect(ExtensionRect::new(1, 5, 4, 1), 'x', style),
+            RenderOp::border(
+                ExtensionRect::new(0, 0, 10, 8),
+                BorderGlyphs::rounded(),
+                style,
+            ),
+            RenderOp::cell_grid(
+                1,
+                6,
+                vec![vec![
+                    RenderCell::new('a', style),
+                    RenderCell::sparse(RenderStyle::new()),
+                ]],
+            ),
+        ];
+        let surface = PluginSurface {
+            id: surface_id,
+            revision: 7,
+            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(5, 3, 10, 8)),
+            clip_rect: Some(ExtensionRect::new(1, 1, 8, 6)),
+            interactive_regions: Vec::new(),
+            accepts_input: false,
+            layer: 0,
+            z: 0,
+            opaque: true,
+            modal: false,
+            visible: true,
+            ops: ops.clone(),
+        };
+
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(lowered.len(), 1);
+        assert_eq!(lowered[0].revision, Some(7));
+        assert_eq!(lowered[0].opacity, RetainedOpacity::Opaque);
+        assert_eq!(lowered[0].clip_rect, Some(DamageRect::new(6, 4, 8, 6)));
+        assert_eq!(lowered[0].payload, RetainedSurfacePayload::RenderOps(ops));
+    }
+
+    #[test]
     fn retained_surface_builder_sets_payload_opacity_clip_and_regions() {
         let surface = RetainedSurface::builder(Uuid::from_u128(42), DamageRect::new(1, 2, 3, 4))
             .layer(5)
