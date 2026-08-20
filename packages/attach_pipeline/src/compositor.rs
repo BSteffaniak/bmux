@@ -2011,6 +2011,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual performance baseline; run with --release --ignored --nocapture"]
+    fn pointer_move_routing_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITEM_COUNT: usize = 200;
+        const ITERATIONS: u32 = 100_000;
+        let viewport = DamageRect::new(0, 0, 80, 240);
+        let retained = (0..ITEM_COUNT)
+            .map(|index| {
+                let y = u16::try_from(index).unwrap();
+                RetainedSurface::builder(
+                    Uuid::from_u128(u128::try_from(index + 1).unwrap()),
+                    DamageRect::new(0, y, 40, 1),
+                )
+                .interactive_region(DamageRect::new(0, y, 40, 1))
+                .build()
+            })
+            .collect::<Vec<_>>();
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(retained, viewport, DamageCoalescingPolicy::default());
+        let mut router = RetainedPointerRouter::default();
+        let started = Instant::now();
+        for iteration in 0..ITERATIONS {
+            let row = u16::try_from(iteration as usize % ITEM_COUNT).unwrap();
+            black_box(router.route_move(&compositor, 4, row));
+        }
+        let average_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+        println!(
+            "pointer regions={ITEM_COUNT} iterations={ITERATIONS} move_average_ns={average_ns}"
+        );
+    }
+
+    #[test]
     fn pointer_router_routes_button_wheel_and_drag_phases() {
         let mut compositor = RetainedCompositor::new();
         compositor.replace_surfaces(

@@ -15827,6 +15827,7 @@ mod tests {
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
+    use serial_test::serial;
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 
@@ -17698,6 +17699,201 @@ mod tests {
         let frame_plan = RenderFramePlan::from_damage(plan, &frame_damage, false);
         assert!(frame_plan.use_synchronized_update);
         assert!(!frame_plan.render_scene);
+    }
+
+    #[test]
+    #[serial]
+    fn retained_frame_plan_composes_published_plugin_surface_through_attach_path() {
+        use bmux_plugin::layout::{LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutSnapshot};
+        use bmux_plugin::surface::{
+            PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, global_plugin_surface_registry,
+        };
+
+        let owner = "example.attach-surface";
+        global_plugin_layout_registry().remove_owner(owner);
+        global_plugin_surface_registry().remove_owner(owner);
+        let layout_id = PluginLayoutId::new(owner, "leading");
+        assert_eq!(
+            global_plugin_layout_registry().publish(
+                owner,
+                PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![PluginLayoutRequest::split(
+                        layout_id.clone(),
+                        0,
+                        LayoutEdge::Left,
+                        LayoutExtent::Cells(12),
+                    )],
+                },
+            ),
+            Ok(bmux_plugin::layout::PluginLayoutPublishOutcome::Applied)
+        );
+        let retained_id = Uuid::from_u128(900);
+        assert_eq!(
+            global_plugin_surface_registry().publish(
+                owner,
+                PluginSurfaceSnapshot {
+                    revision: 1,
+                    surfaces: vec![PluginSurface::layout(
+                        PluginSurfaceId::new(owner, "main", retained_id),
+                        1,
+                        layout_id,
+                        vec![bmux_plugin::RenderOp::text_run(
+                            0,
+                            0,
+                            "plugin",
+                            bmux_plugin::RenderStyle::new(),
+                        )],
+                    )],
+                },
+            ),
+            Ok(bmux_plugin::surface::PluginSurfacePublishOutcome::Applied)
+        );
+
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let layout_state = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![test_pane_surface(
+                    pane_id,
+                    AttachRect {
+                        x: 12,
+                        y: 0,
+                        w: 68,
+                        h: 24,
+                    },
+                )],
+            },
+            zoomed: false,
+        };
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        let mut frame_damage = bmux_attach_pipeline::FrameDamage::default();
+        let plan = build_retained_frame_plan(
+            &mut view_state,
+            &layout_state,
+            &mut frame_damage,
+            None,
+            None,
+            None,
+            None,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+
+        let plugin_surface = view_state
+            .retained_compositor
+            .surfaces()
+            .get(&retained_id)
+            .expect("published plugin surface should reach attach compositor");
+        assert_eq!(plugin_surface.rect, DamageRect::new(0, 0, 12, 24));
+        assert!(
+            plan.repaint_plan
+                .iter()
+                .any(|entry| entry.surface_id == retained_id)
+        );
+
+        global_plugin_surface_registry().remove_owner(owner);
+        global_plugin_layout_registry().remove_owner(owner);
+    }
+
+    #[test]
+    #[serial]
+    fn retained_plugin_surface_lifecycle_cleans_and_rehydrates_without_stale_state() {
+        use bmux_plugin::layout::{LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutSnapshot};
+        use bmux_plugin::surface::{
+            PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, global_plugin_surface_registry,
+        };
+
+        let owner = "example.attach-lifecycle";
+        global_plugin_layout_registry().remove_owner(owner);
+        global_plugin_surface_registry().remove_owner(owner);
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let retained_id = Uuid::from_u128(901);
+        let layout_id = PluginLayoutId::new(owner, "leading");
+        let publish = |revision, width| {
+            assert_eq!(
+                global_plugin_layout_registry().publish(
+                    owner,
+                    PluginLayoutSnapshot {
+                        revision,
+                        requests: vec![PluginLayoutRequest::split(
+                            layout_id.clone(),
+                            0,
+                            LayoutEdge::Left,
+                            LayoutExtent::Cells(width),
+                        )],
+                    },
+                ),
+                Ok(bmux_plugin::layout::PluginLayoutPublishOutcome::Applied)
+            );
+            assert_eq!(
+                global_plugin_surface_registry().publish(
+                    owner,
+                    PluginSurfaceSnapshot {
+                        revision,
+                        surfaces: vec![PluginSurface::layout(
+                            PluginSurfaceId::new(owner, "main", retained_id),
+                            revision,
+                            layout_id.clone(),
+                            vec![bmux_plugin::RenderOp::text_run(
+                                0,
+                                0,
+                                format!("revision-{revision}"),
+                                bmux_plugin::RenderStyle::new(),
+                            )],
+                        )],
+                    },
+                ),
+                Ok(bmux_plugin::surface::PluginSurfacePublishOutcome::Applied)
+            );
+        };
+        publish(1, 12);
+
+        let mut compositor = bmux_attach_pipeline::RetainedCompositor::new();
+        let initial = compositor.replace_surfaces(
+            retained_plugin_surfaces(viewport),
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(initial.rects(), &[DamageRect::new(0, 0, 12, 24)]);
+
+        assert!(global_plugin_surface_registry().remove_owner(owner));
+        assert!(global_plugin_layout_registry().remove_owner(owner));
+        let removed = compositor.replace_surfaces(
+            retained_plugin_surfaces(viewport),
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(removed.rects(), &[DamageRect::new(0, 0, 12, 24)]);
+        assert!(!compositor.surfaces().contains_key(&retained_id));
+
+        publish(2, 16);
+        let rehydrated = compositor.replace_surfaces(
+            retained_plugin_surfaces(viewport),
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(rehydrated.rects(), &[DamageRect::new(0, 0, 16, 24)]);
+        let surface = compositor
+            .surfaces()
+            .get(&retained_id)
+            .expect("rehydrated retained surface");
+        assert_eq!(surface.revision, Some(2));
+        assert_eq!(surface.rect, DamageRect::new(0, 0, 16, 24));
+
+        global_plugin_surface_registry().remove_owner(owner);
+        global_plugin_layout_registry().remove_owner(owner);
     }
 
     #[test]

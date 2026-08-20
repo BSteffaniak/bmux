@@ -33,6 +33,8 @@ being called from the terminal frame loop. The canonical path is:
    it removes the owner's retained layout or surfaces automatically; explicit
    owner removal is available for other lifecycle models.
 
+The selected execution model is an **in-process attach-client companion**. Geometry-dependent projection belongs beside the attach host because terminal dimensions, resolved allocations, and committed input coordinates are client-local facts. Server-side plugins continue to publish authoritative typed domain state; the companion consumes that state and publishes generic retained layout/surface snapshots locally. Declarative server-published retained presentation is not the canonical model because it would either guess client geometry or require synchronous geometry/render round trips. Another execution mechanism must not be introduced while this canonical path exists.
+
 The public primitives are intentionally generic: layout edges, rectangles,
 paint operations, semantic regions, focus, cursor roles, and typed dispatch.
 Window tabs, sidebars, status modules, and other product projections belong in
