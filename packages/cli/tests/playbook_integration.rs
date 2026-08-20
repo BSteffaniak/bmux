@@ -173,7 +173,7 @@ fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
     let output = sandbox
         .command()
         .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
-        .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
+        .env("BMUX_PLAYBOOK_ENV_MODE", "clean")
         .output()
         .expect("failed to run bmux playbook");
 

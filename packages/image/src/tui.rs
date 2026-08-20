@@ -854,6 +854,60 @@ mod tests {
     }
 
     #[test]
+    fn malformed_and_oversized_payloads_fail_without_emitting_output() {
+        let cases = [
+            (
+                ImagePayload::Png {
+                    bytes: vec![0, 1, 2, 3],
+                    width: 1,
+                    height: 1,
+                },
+                ImageConfig::default(),
+            ),
+            (
+                ImagePayload::Pixels {
+                    bytes: vec![0; 16],
+                    width: 2,
+                    height: 2,
+                    format: ImagePixelFormat::Rgba8,
+                },
+                ImageConfig {
+                    max_image_bytes: 8,
+                    ..ImageConfig::default()
+                },
+            ),
+        ];
+        for (payload, config) in cases {
+            let mut scene = ImageScene::default();
+            scene.reconcile(&[ImageContribution::Present(ImagePlacement {
+                key: ImageKey::new("invalid"),
+                payload,
+                destination: Rect::new(0, 0, 1, 1),
+                clip: Rect::new(0, 0, 10, 5),
+                lifecycle: ImageLifecycle::Frame,
+            })]);
+            let mut output = Vec::new();
+            let result = TuiImageCompositor::new().render(
+                &mut output,
+                &scene,
+                PaneRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 5,
+                },
+                &kitty_caps(),
+                &config,
+            );
+            assert!(matches!(
+                result,
+                Err(super::TuiImageError::InvalidPayload { .. })
+            ));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
     fn resize_and_unsupported_hosts_are_bounded_and_silent() {
         let mut scene = ImageScene::default();
         scene.reconcile(&[ImageContribution::Present(placement(

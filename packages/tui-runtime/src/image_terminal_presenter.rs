@@ -180,9 +180,14 @@ impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
         Ok(())
     }
 
-    /// Consume the presenter and return its terminal.
-    pub fn into_terminal(self) -> Terminal<W> {
-        self.terminal
+    /// Consume the presenter after cleaning host image resources and return its terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when protocol cleanup cannot be written or flushed.
+    pub fn into_clean_terminal(mut self) -> Result<Terminal<W>, ImagePresentationError> {
+        self.cleanup_images()?;
+        Ok(self.terminal)
     }
 }
 
@@ -303,6 +308,106 @@ mod tests {
             kitty_graphics: true,
             ..bmux_image::HostImageCapabilities::default()
         }
+    }
+
+    #[test]
+    fn reset_resize_and_cleanup_cover_image_lifecycle_handoffs() {
+        let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+            frame.push_image(ImageContribution::Present(ImagePlacement {
+                key: ImageKey::new("image"),
+                payload: ImagePayload::Pixels {
+                    bytes: vec![1, 2, 3, 4],
+                    width: 1,
+                    height: 1,
+                    format: ImagePixelFormat::Rgba8,
+                },
+                destination: Rect::new(0, 0, 1, 1),
+                clip: frame.area(),
+                lifecycle: ImageLifecycle::Frame,
+            }));
+        };
+        let mut presenter = ImageTerminalPresenter::new(
+            terminal,
+            render,
+            capabilities(),
+            bmux_image::ImageConfig::default(),
+        );
+        presenter.present(&mut ()).expect("initial presentation");
+        presenter.resize(bmux_tui::geometry::Size::new(8, 4));
+        presenter.reset(ResetReason::Resize);
+        presenter.present(&mut ()).expect("resize presentation");
+        let before = presenter.terminal().writer().len();
+
+        presenter.reset_presentation().expect("full reset cleanup");
+
+        let output = String::from_utf8(presenter.terminal().writer()[before..].to_vec())
+            .expect("terminal output");
+        assert!(output.contains("a=d"));
+        assert_eq!(presenter.terminal().area(), Rect::new(0, 0, 8, 4));
+    }
+
+    #[test]
+    fn consuming_presenter_cleans_images_before_returning_terminal() {
+        let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+            frame.push_image(ImageContribution::Present(ImagePlacement {
+                key: ImageKey::new("image"),
+                payload: ImagePayload::Pixels {
+                    bytes: vec![1, 2, 3, 4],
+                    width: 1,
+                    height: 1,
+                    format: ImagePixelFormat::Rgba8,
+                },
+                destination: Rect::new(0, 0, 1, 1),
+                clip: frame.area(),
+                lifecycle: ImageLifecycle::Frame,
+            }));
+        };
+        let mut presenter = ImageTerminalPresenter::new(
+            terminal,
+            render,
+            capabilities(),
+            bmux_image::ImageConfig::default(),
+        );
+        presenter.present(&mut ()).expect("initial presentation");
+
+        let terminal = presenter.into_clean_terminal().expect("clean handoff");
+        let output = String::from_utf8(terminal.writer().clone()).expect("terminal output");
+        assert!(output.contains("a=d"));
+    }
+
+    #[test]
+    fn cleanup_removes_host_images_before_terminal_handoff() {
+        let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+            frame.push_image(ImageContribution::Present(ImagePlacement {
+                key: ImageKey::new("image"),
+                payload: ImagePayload::Pixels {
+                    bytes: vec![1, 2, 3, 4],
+                    width: 1,
+                    height: 1,
+                    format: ImagePixelFormat::Rgba8,
+                },
+                destination: Rect::new(0, 0, 1, 1),
+                clip: frame.area(),
+                lifecycle: ImageLifecycle::Frame,
+            }));
+        };
+        let mut presenter = ImageTerminalPresenter::new(
+            terminal,
+            render,
+            capabilities(),
+            bmux_image::ImageConfig::default(),
+        );
+        presenter.present(&mut ()).expect("initial presentation");
+        let before = presenter.terminal().writer().len();
+
+        presenter.cleanup_images().expect("image cleanup");
+
+        let output = String::from_utf8(presenter.terminal().writer()[before..].to_vec())
+            .expect("terminal output");
+        assert!(output.contains("a=d"));
     }
 
     #[test]

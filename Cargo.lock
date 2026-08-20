@@ -2468,6 +2468,7 @@ name = "bmux_tui_runtime"
 version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_image",
+ "bmux_keyboard",
  "bmux_tui",
  "tokio",
 ]
