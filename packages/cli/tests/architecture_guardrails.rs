@@ -2367,6 +2367,51 @@ fn iter_plugin_crate_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+fn plugin_api_crate_dirs() -> Vec<std::path::PathBuf> {
+    iter_plugin_crate_dirs()
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-plugin-api"))
+        })
+        .collect()
+}
+
+#[test]
+fn plugin_api_crates_do_not_expose_handwritten_transport_clients() {
+    for plugin_dir in plugin_api_crate_dirs() {
+        let typed_client = plugin_dir.join("src/typed_client.rs");
+        assert!(
+            !typed_client.exists(),
+            "{} must use BPDL-generated clients instead of a public handwritten typed_client.rs",
+            typed_client.display(),
+        );
+
+        for source_path in rust_source_files(&plugin_dir) {
+            let source = std::fs::read_to_string(&source_path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source_path.display()));
+            assert!(
+                !production_section(&source).contains("pub mod typed_client"),
+                "{} must not expose a handwritten typed_client module",
+                source_path.display(),
+            );
+        }
+    }
+}
+
+#[test]
+fn plugin_implementations_do_not_recreate_domain_ipc_layers() {
+    for plugin_dir in iter_plugin_dirs() {
+        let compatibility_layer = plugin_dir.join("src/domain_ipc.rs");
+        assert!(
+            !compatibility_layer.exists(),
+            "{} must call generated BPDL clients directly or use narrow purpose-named helpers",
+            compatibility_layer.display(),
+        );
+    }
+}
+
 /// Walk `plugin_dir/src` recursively and return every `.rs` file.
 fn rust_source_files(plugin_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn visit(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -3044,8 +3089,28 @@ fn attach_viewport_contract_has_no_status_specific_geometry() {
             include_str!("../../pane-runtime-state/src/attach.rs"),
         ),
         (
+            "plugins/pane-runtime-plugin/src/handlers/attach_commands.rs",
+            include_str!("../../../plugins/pane-runtime-plugin/src/handlers/attach_commands.rs"),
+        ),
+        (
+            "plugins/pane-runtime-plugin/src/runtime.rs",
+            include_str!("../../../plugins/pane-runtime-plugin/src/runtime.rs"),
+        ),
+        (
+            "plugins/pane-runtime-plugin/src/snapshot.rs",
+            include_str!("../../../plugins/pane-runtime-plugin/src/snapshot.rs"),
+        ),
+        (
             "plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl",
             include_str!("../../../plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl"),
+        ),
+        (
+            "packages/attach_pipeline/src/compositor.rs",
+            include_str!("../../attach_pipeline/src/compositor.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/runtime.rs",
+            include_str!("../src/runtime/attach/runtime.rs"),
         ),
         (
             "packages/cli/src/pane_runtime_client.rs",

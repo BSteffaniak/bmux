@@ -9,6 +9,52 @@ See [`bpdl-spec.md`](./bpdl-spec.md) for the BPDL grammar and
 semantics, and the [Plugin SDK README](../packages/plugin-sdk/README.md)
 for the author-facing Rust API.
 
+## Generic attach presentation primitives
+
+Plugins that provide attach-side presentation publish retained state instead of
+being called from the terminal frame loop. The canonical path is:
+
+1. Publish owner-scoped geometry through
+   `bmux_plugin::layout::PluginLayoutRegistry`. Split requests are resolved in
+   deterministic `(order, owner_plugin_id, local_id)` order and preserve the
+   host's configured minimum content region.
+2. Publish a complete, owner-scoped `PluginSurfaceSnapshot` through
+   `bmux_plugin::surface::PluginSurfaceRegistry`. A surface either follows one
+   of that owner's layout allocations or uses explicit geometry for an overlay.
+3. Put stable, owner-local `PluginSurfaceRegion` identities and typed
+   `AttachInputEndpoint`s on interactive retained surfaces. The attach
+   compositor routes pointer and focused-key events from the committed surface
+   revision; product interpretation remains in the plugin.
+4. Republish the complete owner snapshot with stable IDs and a higher revision
+   when state changes. The retained compositor computes damage from changed
+   operations, so plugins must not synchronously render or perform IPC from the
+   frame path.
+5. Keep an owner-bound publisher alive for the presentation lifecycle. Dropping
+   it removes the owner's retained layout or surfaces automatically; explicit
+   owner removal is available for other lifecycle models.
+
+The public primitives are intentionally generic: layout edges, rectangles,
+paint operations, semantic regions, focus, cursor roles, and typed dispatch.
+Window tabs, sidebars, status modules, and other product projections belong in
+their owning plugins and must consume domain state through generated BPDL
+clients. The attach host does not subscribe to domain state on their behalf.
+
+Publications are bounded and validated. Layout and surface registries reject
+foreign ownership, duplicate stable identity, stale/conflicting revisions,
+oversized snapshots, excessive retained operations, oversized text, and
+optionally over-frequent updates. Rendering uses the last committed snapshot
+and never requires a synchronous plugin call per frame.
+
+The in-process global registries are the current attach-host publication
+mechanism. They support late subscribers through retained snapshots and watch
+revisions. They are not a cross-process transport; a plugin execution model
+that runs outside the attach process must first provide an equivalent retained,
+revisioned publication channel rather than bypassing the canonical registries.
+
+See the executable split-surface example and stable update guidance in
+`packages/plugin/src/surface.rs`, and the deterministic layout contract in
+`packages/plugin/src/layout.rs`.
+
 ## Design principles
 
 1. **Core is domain-agnostic.** `packages/server`, `packages/client`,

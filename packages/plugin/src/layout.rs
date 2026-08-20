@@ -610,6 +610,65 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual performance baseline; run with --release --ignored --nocapture"]
+    fn layout_resolution_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 20_000;
+        for request_count in [2_usize, 8, 64] {
+            let requests = (0..request_count)
+                .map(|index| {
+                    let edge = match index % 4 {
+                        0 => LayoutEdge::Top,
+                        1 => LayoutEdge::Right,
+                        2 => LayoutEdge::Bottom,
+                        _ => LayoutEdge::Left,
+                    };
+                    request(
+                        &format!("owner-{index:02}"),
+                        "region",
+                        i32::try_from(request_count - index).unwrap(),
+                        LayoutOperation::Split {
+                            edge,
+                            extent: LayoutExtent::Bounded {
+                                preferred: u16::try_from(index % 7 + 1).unwrap(),
+                                minimum: 0,
+                                maximum: 8,
+                            },
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(
+                    resolve_plugin_layout(
+                        ExtensionRect::new(0, 0, 240, 80),
+                        (1, 1),
+                        black_box(&requests),
+                    )
+                    .unwrap(),
+                );
+            }
+            let elapsed = started.elapsed();
+            let average_ns = elapsed.as_nanos() / u128::from(ITERATIONS);
+            println!(
+                "layout requests={request_count} iterations={ITERATIONS} average_ns={average_ns}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_requests_preserve_the_complete_host_viewport() {
+        let viewport = ExtensionRect::new(3, 4, 80, 24);
+        let resolved = resolve_plugin_layout(viewport, (1, 1), &[]).unwrap();
+
+        assert!(resolved.allocations.is_empty());
+        assert_eq!(resolved.remaining, viewport);
+    }
+
+    #[test]
     fn hidden_request_preserves_identity_without_consuming_space() {
         let viewport = ExtensionRect::new(3, 4, 20, 10);
         let resolved = resolve_plugin_layout(

@@ -2339,6 +2339,72 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual performance baseline; run with --release --ignored --nocapture"]
+    fn plugin_surface_reconciliation_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITEM_COUNT: usize = 200;
+        const ITERATIONS: u32 = 10_000;
+        let viewport = DamageRect::new(0, 0, 240, 200);
+        let build = |changed: Option<usize>| {
+            (0..ITEM_COUNT)
+                .map(|index| {
+                    let y = u16::try_from(index).unwrap();
+                    let text = if changed == Some(index) {
+                        format!("changed-{index}")
+                    } else {
+                        format!("item-{index}")
+                    };
+                    RetainedSurface::builder(
+                        Uuid::from_u128(u128::try_from(index + 1).unwrap()),
+                        DamageRect::new(0, y, 40, 1),
+                    )
+                    .revision(1)
+                    .render_ops(vec![RenderOp::text_run(0, y, text, RenderStyle::default())])
+                    .build()
+                })
+                .collect::<Vec<_>>()
+        };
+        let stable = build(None);
+        let changed = build(Some(ITEM_COUNT / 2));
+        let mut compositor = RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            stable.clone(),
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(compositor.replace_surfaces(
+                stable.clone(),
+                viewport,
+                DamageCoalescingPolicy::default(),
+            ));
+        }
+        let no_op_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+        let started = Instant::now();
+        for iteration in 0..ITERATIONS {
+            let next = if iteration % 2 == 0 {
+                changed.clone()
+            } else {
+                stable.clone()
+            };
+            black_box(compositor.replace_surfaces(
+                next,
+                viewport,
+                DamageCoalescingPolicy::default(),
+            ));
+        }
+        let incremental_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+        println!(
+            "plugin surfaces={ITEM_COUNT} iterations={ITERATIONS} no_op_average_ns={no_op_ns} incremental_average_ns={incremental_ns}"
+        );
+    }
+
+    #[test]
     fn retained_surface_builder_sets_payload_opacity_clip_and_regions() {
         let surface = RetainedSurface::builder(Uuid::from_u128(42), DamageRect::new(1, 2, 3, 4))
             .layer(5)

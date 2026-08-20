@@ -76,6 +76,79 @@ Every plugin implements `RustPlugin`. All five methods have default implementati
 
 The trait requires `Default + Send + 'static`. Use `#[derive(Default)]` on your struct.
 
+## Retained attach presentations
+
+Attach presentations use the domain-neutral retained layout and surface APIs in
+`bmux_plugin`; the host does not call a plugin while painting a frame.
+
+```rust,ignore
+use bmux_plugin::layout::{
+    LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest,
+    PluginLayoutSnapshot, global_plugin_layout_registry,
+};
+use bmux_plugin::surface::{
+    PluginSurface, PluginSurfaceId, PluginSurfaceRegion,
+    PluginSurfaceSnapshot, global_plugin_surface_registry,
+};
+use bmux_plugin::{AttachInputEndpoint, ExtensionRect, RenderOp, RenderStyle};
+use uuid::Uuid;
+
+let owner = "example.presentation";
+let allocation = PluginLayoutId::new(owner, "leading");
+let layout = global_plugin_layout_registry().publisher(owner);
+let surfaces = global_plugin_surface_registry().publisher(owner);
+
+layout.publish(PluginLayoutSnapshot {
+    revision: 1,
+    requests: vec![PluginLayoutRequest::split(
+        allocation.clone(),
+        0,
+        LayoutEdge::Left,
+        LayoutExtent::Cells(20),
+    )],
+})?;
+
+let endpoint = AttachInputEndpoint {
+    capability: "example.presentation.input".into(),
+    interface_id: "presentation-input".into(),
+    operation: "handle".into(),
+};
+let surface = PluginSurface::layout(
+    PluginSurfaceId::new(owner, "main", Uuid::from_u128(1)),
+    1,
+    allocation,
+    vec![RenderOp::text_run(0, 0, "Item", RenderStyle::new())],
+)
+.interactive_region(
+    PluginSurfaceRegion::new("item-0", ExtensionRect::new(0, 0, 20, 1))
+        .endpoint(endpoint),
+);
+surfaces.publish(PluginSurfaceSnapshot {
+    revision: 1,
+    surfaces: vec![surface],
+})?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Keep both publishers alive while the presentation is active. Their `Drop`
+implementations remove all retained state for the owner, preventing stale
+layout, pixels, and input regions after unload. For updates, reuse the same
+layout, surface, retained, and region IDs; publish a complete snapshot with a
+strictly higher revision. Changing one retained operation lets the compositor
+damage only that operation's bounds.
+
+Input regions carry typed generic endpoints. The attach host supplies semantic
+pointer phases or focused key events with surface-local coordinates. The plugin
+interprets those events and invokes its domain's generated BPDL client; do not
+put domain commands or handwritten transport envelopes into the generic
+presentation API.
+
+Publications are validated and bounded. Handle publication errors rather than
+retrying in the frame loop. There is no synchronous render callback for these
+surfaces. The current global registries are in-process attach-host capability;
+out-of-process companions require a retained, revisioned publication transport
+before they can use this path.
+
 ## Writing Command Plugins
 
 ### Dispatching commands
