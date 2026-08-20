@@ -117,18 +117,23 @@ fn selected_session(context: &NativeCommandContext) -> Result<SessionId, PluginC
         })?;
         return Ok(SessionId(result.id));
     }
-    let current =
+    let selected =
         bmux_plugin::block_on_typed_dispatch(clients_state::client::current_client(&mut client))
-            .map_err(|error| {
-                PluginCommandError::failed(format!("current client lookup failed: {error}"))
-            })?
-            .map_err(|error| {
-                PluginCommandError::failed(format!("current client unavailable: {error:?}"))
-            })?;
-    current
-        .selected_session_id
-        .map(SessionId)
-        .ok_or_else(|| PluginCommandError::failed("current client has no selected session"))
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|current| current.selected_session_id)
+            .map(SessionId);
+    if let Some(session_id) = selected {
+        return Ok(session_id);
+    }
+    if let Some(client_id) = context.caller_client_id
+        && let Ok(session_id) = handle()?.session_for_client(ClientId(client_id))
+    {
+        return Ok(session_id);
+    }
+    Err(PluginCommandError::failed(
+        "current client has no selected or attached session",
+    ))
 }
 
 fn handle() -> Result<PanePaddingRuntimeHandle, PluginCommandError> {

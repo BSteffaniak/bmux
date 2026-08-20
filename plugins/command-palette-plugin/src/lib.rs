@@ -125,8 +125,13 @@ async fn handle_command_palette_response(
             command_name,
             schema,
         } => {
-            let Some(args) = collect_command_arguments(&schema).await else {
-                return;
+            let args = if uses_default_palette_arguments(&plugin_id, &command_name) {
+                Vec::new()
+            } else {
+                let Some(args) = collect_command_arguments(&schema).await else {
+                    return;
+                };
+                args
             };
             let action = plugin_action_string(&plugin_id, &command_name, &args);
             dispatch_action(&action);
@@ -282,6 +287,10 @@ async fn prompt_for_bindable_action_argument(
             None
         }
     }
+}
+
+fn uses_default_palette_arguments(plugin_id: &str, command_name: &str) -> bool {
+    plugin_id == "bmux.pane_runtime" && command_name == "pane-padding-configure"
 }
 
 async fn collect_command_arguments(command: &PluginCommand) -> Option<Vec<String>> {
@@ -478,10 +487,29 @@ bmux_plugin_sdk::export_plugin!(CommandPalettePlugin, include_str!("../plugin.to
 #[cfg(test)]
 mod tests {
     use super::{
-        PaletteEntry, PaletteEntryKind, bindable_action_key_hint, plugin_action_string,
-        plugin_command_key_hint, shell_quote,
+        PaletteEntry, PaletteEntryKind, bindable_action_key_hint, collect_command_arguments,
+        plugin_action_string, plugin_command_key_hint, shell_quote, uses_default_palette_arguments,
     };
-    use bmux_plugin_sdk::{ActiveKeybinding, PromptOption};
+    use bmux_plugin_sdk::{ActiveKeybinding, PluginCommand, PromptOption};
+
+    #[test]
+    fn pane_padding_configurator_uses_default_palette_arguments() {
+        assert!(uses_default_palette_arguments(
+            "bmux.pane_runtime",
+            "pane-padding-configure"
+        ));
+        assert!(!uses_default_palette_arguments(
+            "bmux.pane_runtime",
+            "pane-padding-set"
+        ));
+    }
+
+    #[tokio::test]
+    async fn argumentless_plugin_command_collects_no_arguments() {
+        let command = PluginCommand::new("configure", "Open configurator");
+
+        assert_eq!(collect_command_arguments(&command).await, Some(Vec::new()));
+    }
 
     #[test]
     fn shell_quote_leaves_simple_values_unquoted() {

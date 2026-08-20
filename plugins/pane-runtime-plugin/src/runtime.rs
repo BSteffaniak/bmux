@@ -7989,6 +7989,24 @@ impl PanePaddingRuntimeHandle {
         Self(Arc::new(Mutex::new(manager)))
     }
 
+    pub(crate) fn session_for_client(
+        &self,
+        client_id: ClientId,
+    ) -> Result<SessionId, SessionRuntimeError> {
+        self.0
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?
+            .runtimes
+            .iter()
+            .find_map(|(session_id, runtime)| {
+                runtime
+                    .attached_clients
+                    .contains(&client_id)
+                    .then_some(*session_id)
+            })
+            .ok_or(SessionRuntimeError::NotFound)
+    }
+
     pub(crate) fn has_session(&self, session_id: SessionId) -> bool {
         self.0
             .lock()
