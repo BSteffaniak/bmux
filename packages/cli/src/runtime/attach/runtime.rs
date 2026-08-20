@@ -12006,7 +12006,7 @@ pub const fn record_attach_mouse_event(
 
 async fn invoke_plugin_surface_pointer_event(
     client: &mut StreamingBmuxClient,
-    view_state: &AttachViewState,
+    view_state: &mut AttachViewState,
     event: bmux_attach_pipeline::RetainedPointerEvent,
 ) -> std::result::Result<bool, ClientError> {
     let Some(endpoint) = view_state
@@ -12054,7 +12054,7 @@ async fn invoke_plugin_surface_pointer_event(
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("encoding plugin surface pointer event: {error}"),
         })?;
-    let _ = client
+    let response = client
         .invoke_service_raw(
             endpoint.capability,
             InvokeServiceKind::Command,
@@ -12063,7 +12063,32 @@ async fn invoke_plugin_surface_pointer_event(
             payload,
         )
         .await?;
-    Ok(true)
+    let result =
+        bmux_codec::from_positional_bytes::<AttachInputResult>(&response).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("decoding plugin surface pointer result: {error}"),
+            }
+        })?;
+    if result.capture_pointer {
+        view_state.plugin_pointer_router.capture(event.hit.clone());
+    }
+    if result.release_capture {
+        let _ = view_state.plugin_pointer_router.release_capture();
+    }
+    if result.dirty {
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+    }
+    if let Some(message) = result.status_message.as_deref() {
+        view_state.set_transient_status(
+            truncate_attach_status_message(message),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+    Ok(result.consumed)
 }
 
 async fn try_handle_plugin_surface_mouse(
