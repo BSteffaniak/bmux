@@ -11,10 +11,15 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_tui = { workspace = true }
-tokio    = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+bmux_image = { workspace = true, optional = true }
+bmux_tui   = { workspace = true }
+tokio      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [features]
 crossterm        = ["bmux_tui/crossterm"]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["bmux_image?/fail-on-warnings"]
+image-iterm2     = ["images", "bmux_image/iterm2"]
+image-kitty      = ["images", "bmux_image/kitty"]
+image-sixel      = ["images", "bmux_image/sixel"]
+images           = ["dep:bmux_image"]

@@ -48,14 +48,12 @@ impl HostImageCapabilities {
     }
 }
 
-/// Detect host terminal image capabilities.
+/// Detect host terminal image capabilities from environment heuristics.
 ///
-/// This performs synchronous terminal queries (DA, kitty graphics query,
-/// environment variable inspection).  Must be called at attach time before
-/// entering the render loop.
-///
-/// Returns `HostImageCapabilities::default()` (nothing supported) if
-/// detection fails or the terminal does not respond.
+/// This function performs no terminal I/O and does not consume input. It is
+/// safe to call before runtime input admission begins. Applications that opt
+/// into active terminal queries must call [`detect_with_queries`] while raw
+/// mode is active and before starting any competing input reader.
 pub fn detect_from_env() -> HostImageCapabilities {
     let mut caps = HostImageCapabilities::default();
 

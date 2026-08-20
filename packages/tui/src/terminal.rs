@@ -169,6 +169,25 @@ impl<W: Write> Terminal<W> {
         self.draw_damage(Damage::Full, render)
     }
 
+    /// Draw one complete frame and emit protocol overlays before committing it.
+    ///
+    /// The overlay callback receives the staged image scene and its delta after
+    /// cell output has been written but before the shared output flush. The
+    /// frame becomes authoritative only when both cell and overlay output
+    /// succeed. This allows image-capable presenters to preserve the same
+    /// commit boundary as text, focus, hit, cursor, and selection metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error reported by the backend writer or overlay callback.
+    pub fn draw_with_overlay(
+        &mut self,
+        render: impl FnOnce(&mut Frame<'_>),
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> io::Result<DrawStats> {
+        self.draw_damage_with_overlay(Damage::Full, render, overlay)
+    }
+
     /// Draw a frame using process-local retained presentation state outside `damage`.
     ///
     /// Region damage is valid only after a successful complete presentation. If no retained
@@ -181,11 +200,29 @@ impl<W: Write> Terminal<W> {
     ///
     /// Returns any I/O error reported by the backend writer. Failed output does not advance the
     /// retained buffer, hit map, selection scene, cursor, or image scene.
-    #[allow(clippy::too_many_lines)]
     pub fn draw_damage(
         &mut self,
         damage: Damage,
         render: impl FnOnce(&mut Frame<'_>),
+    ) -> io::Result<DrawStats> {
+        self.draw_damage_with_overlay(damage, render, |_, _, _| Ok(()))
+    }
+
+    /// Draw a frame and emit protocol overlays before committing retained state.
+    ///
+    /// This has the same regional-retention semantics as [`Self::draw_damage`].
+    /// The overlay callback observes the complete staged image scene and delta,
+    /// and writes through the terminal's writer before its single flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error reported by the backend writer or overlay callback.
+    #[allow(clippy::too_many_lines)]
+    pub fn draw_damage_with_overlay(
+        &mut self,
+        damage: Damage,
+        render: impl FnOnce(&mut Frame<'_>),
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
         let damage = if self.previous.is_none() {
             Damage::Full
@@ -256,13 +293,20 @@ impl<W: Write> Terminal<W> {
         }
         buffer.debug_assert_valid_wide_spans();
 
+        let mut image_scene = self.image_scene.clone();
+        let image_delta = image_scene.reconcile(&images);
         let output = (|| {
+            self.writer.write_all(b"\x1b[?2026h")?;
             let stats = if let Some(previous) = &self.previous {
                 write_ansi_frame_diff(&mut self.writer, previous, &buffer, cursor)?.into()
             } else {
                 write_ansi_frame(&mut self.writer, &buffer, cursor)?;
                 DrawStats::full(buffer.cells().len())
             };
+            let overlay_result = overlay(&mut self.writer, &image_scene, &image_delta);
+            let end_result = self.writer.write_all(b"\x1b[?2026l");
+            overlay_result?;
+            end_result?;
             self.writer.flush()?;
             Ok(stats)
         })();
@@ -273,8 +317,6 @@ impl<W: Write> Terminal<W> {
                 return Err(error);
             }
         };
-        let mut image_scene = self.image_scene.clone();
-        let image_delta = image_scene.reconcile(&images);
         let previous_focus = self.focus.active().cloned();
         self.hits = hits;
         self.focus_scope = focus_scope;
@@ -343,6 +385,71 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn failed_overlay_does_not_commit_image_or_interaction_scene() {
+        let mut terminal = Terminal::new(
+            FailingWriter {
+                bytes: Vec::new(),
+                fail: false,
+            },
+            Rect::new(0, 0, 4, 1),
+        );
+        terminal
+            .draw(|frame| {
+                frame.push_hit(HitRegion::new("committed", frame.area()));
+                frame.push_image(ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new("committed"),
+                    payload: ImagePayload::Pixels {
+                        bytes: vec![1, 2, 3, 4],
+                        width: 1,
+                        height: 1,
+                        format: crate::image::ImagePixelFormat::Rgba8,
+                    },
+                    destination: frame.area(),
+                    clip: frame.area(),
+                    lifecycle: ImageLifecycle::Frame,
+                }));
+            })
+            .expect("initial frame commits");
+
+        let error = terminal.draw_with_overlay(
+            |frame| {
+                frame.push_hit(HitRegion::new("speculative", frame.area()));
+                frame.push_image(ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new("speculative"),
+                    payload: ImagePayload::Pixels {
+                        bytes: vec![5, 6, 7, 8],
+                        width: 1,
+                        height: 1,
+                        format: crate::image::ImagePixelFormat::Rgba8,
+                    },
+                    destination: frame.area(),
+                    clip: frame.area(),
+                    lifecycle: ImageLifecycle::Frame,
+                }));
+            },
+            |_, _, _| Err(io::Error::other("injected overlay failure")),
+        );
+
+        assert!(error.is_err());
+        assert_eq!(terminal.hits().regions()[0].id.as_str(), "committed");
+        assert!(
+            terminal
+                .image_scene()
+                .get(&ImageKey::new("committed"))
+                .is_some()
+        );
+        assert!(
+            terminal
+                .image_scene()
+                .get(&ImageKey::new("speculative"))
+                .is_none()
+        );
+        assert!(terminal.retained_buffer().is_none());
+        let output = String::from_utf8(terminal.writer().bytes.clone()).expect("ANSI output");
+        assert!(output.ends_with("\u{1b}[?2026l"));
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub mod command;
 mod command_scheduler;
 pub mod config;
 pub mod ids;
+#[cfg(feature = "images")]
+pub mod image_terminal_presenter;
 #[cfg(feature = "crossterm")]
 pub mod input;
 pub mod invalidation;
@@ -30,6 +32,8 @@ pub mod terminal_presenter;
 pub use command::{Command, CommandPolicy};
 pub use config::RuntimeConfig;
 pub use ids::{CommandKey, MessageKey, SubscriptionKey, TimerId};
+#[cfg(feature = "images")]
+pub use image_terminal_presenter::{ImagePresentationError, ImageTerminalPresenter};
 #[cfg(feature = "crossterm")]
 pub use input::{ManagedTerminalInput, TerminalInput};
 pub use invalidation::InvalidationSignal;

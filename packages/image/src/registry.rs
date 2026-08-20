@@ -19,11 +19,13 @@ enum ChangeLogEntry {
 
 /// Accumulator for kitty chunked transmissions.
 #[cfg(feature = "kitty")]
+#[derive(Clone)]
 struct KittyChunkAccumulator {
     data: Vec<u8>,
 }
 
 /// Per-pane image storage with scroll tracking and delta queries.
+#[derive(Clone)]
 #[allow(dead_code)] // Fields used when image features are enabled; dead in minimal feature combos
 pub struct ImageRegistry {
     images: Vec<PaneImage>,

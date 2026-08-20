@@ -21,7 +21,22 @@ The framework is not a product-specific UI layer. It owns terminal UI primitives
 - Do not rewrite the attach pipeline wholesale as an early step.
 - Do not create speculative helper crates before implementation pressure proves they are needed.
 
-## TUI crate boundaries
+## Image presentation boundary
+
+`bmux_tui` frames may contribute protocol-neutral image payloads, stable keys,
+cell destinations, clips, and frame or persistent lifecycles. The terminal
+retains and reconciles this image scene alongside its cell buffer and
+interaction metadata. `draw_with_overlay` and `draw_damage_with_overlay` let a
+backend emit protocol overlays before the shared flush, so failed image output
+does not commit speculative frame state.
+
+Terminal protocol selection and encoding are intentionally outside
+`bmux_tui`. The feature-gated `bmux_tui_runtime::ImageTerminalPresenter` uses
+`bmux_image` for Kitty, Sixel, and iTerm2 output and owns the normal runtime
+integration. Applications retain semantic image identity, content, sizing, and
+text fallback policy.
+
+
 
 BMUX's TUI framework has three domain-neutral layers:
 

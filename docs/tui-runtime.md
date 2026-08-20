@@ -158,6 +158,26 @@ A presenter failure terminates the runtime without treating the failed frame as 
 
 With the `crossterm` feature, the runtime can own a blocking terminal reader thread. It forwards events through bounded terminal admission. Dropping the input source requests shutdown and detaches a reader blocked in the operating-system backend; the thread exits after the next event or when runtime admission closes. The runtime does not claim that a blocking OS read is synchronously cancellable.
 
+## Image-capable presenters
+
+The optional `bmux_tui_runtime::ImageTerminalPresenter` is the runtime boundary
+for applications that contribute protocol-neutral images through `bmux_tui`
+frames. It combines retained cell drawing with `bmux_image` scene compositing
+inside one synchronized update and flush. The presenter publishes committed
+interaction metadata only after both outputs succeed.
+
+Image support is split into additive Cargo features: `images` enables the
+presenter and individual `image-kitty`, `image-sixel`, and `image-iterm2`
+features enable host protocols. Text-only runtime users retain the default
+minimal dependency graph.
+
+Environment-only detection is safe before input admission because it performs
+no terminal I/O. Active capability queries must run after raw mode is active
+and before a runtime terminal reader starts. Applications must retain presenter
+ownership long enough to call `cleanup_images` before graceful exit,
+suspension, or application-error recovery; `reset_presentation` combines image
+cleanup with retained-frame invalidation.
+
 ## Shutdown and errors
 
 Graceful exit stops admission processing, cancels runtime-owned command and subscription tasks, performs no speculative final semantic update, and returns the final program and runtime statistics to the caller. Immediate abort follows the same ownership cleanup but may skip an application-requested final redraw. Program and presenter errors are surfaced distinctly.
