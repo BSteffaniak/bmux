@@ -328,7 +328,7 @@ fn current_context_id_for_session(session_id: SessionId) -> Option<Uuid> {
     context_handle().0.context_for_session(session_id)
 }
 
-fn emit_attach_view_changed_for_layout(session_id: SessionId) {
+pub(crate) fn emit_attach_view_changed_for_layout(session_id: SessionId) {
     let revision = session_runtime_handle()
         .0
         .bump_attach_view_revision(session_id);
@@ -3175,15 +3175,12 @@ fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
             h: 1,
         };
     };
-    let x = viewport.left_inset.min(viewport.cols.saturating_sub(1));
-    let y = viewport.top_inset.min(viewport.rows.saturating_sub(1));
-    let reserved_width = viewport.left_inset.saturating_add(viewport.right_inset);
-    let reserved_height = viewport.top_inset.saturating_add(viewport.bottom_inset);
+    let content = viewport.content_region();
     LayoutRect {
-        x,
-        y,
-        w: viewport.cols.saturating_sub(reserved_width).max(1),
-        h: viewport.rows.saturating_sub(reserved_height).max(1),
+        x: content.x,
+        y: content.y,
+        w: content.cols,
+        h: content.rows,
     }
 }
 
@@ -5793,38 +5790,15 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::NotAttached);
         }
 
-        let cols = cols.max(1);
-        let rows = rows.max(2);
-        let mut top_inset = top_inset.min(rows.saturating_sub(1));
-        let mut bottom_inset = bottom_inset.min(rows.saturating_sub(1));
-        let mut right_inset = right_inset.min(cols.saturating_sub(1));
-        let mut left_inset = left_inset.min(cols.saturating_sub(1));
-        while top_inset.saturating_add(bottom_inset) >= rows {
-            if bottom_inset > 0 {
-                bottom_inset -= 1;
-            } else if top_inset > 0 {
-                top_inset -= 1;
-            } else {
-                break;
-            }
-        }
-        while right_inset.saturating_add(left_inset) >= cols {
-            if right_inset > 0 {
-                right_inset -= 1;
-            } else if left_inset > 0 {
-                left_inset -= 1;
-            } else {
-                break;
-            }
-        }
-        runtime.attach_viewport = Some(AttachViewport {
+        let viewport = AttachViewport::normalized(
             cols,
             rows,
             top_inset,
             right_inset,
             bottom_inset,
             left_inset,
-        });
+        );
+        runtime.attach_viewport = Some(viewport);
         resize_session_ptys(&self.padding_config, runtime);
 
         // Update cell pixel dimensions for image placement sizing.
@@ -5839,7 +5813,14 @@ impl SessionRuntimeManager {
         #[cfg(not(feature = "image-registry"))]
         let _ = (cell_pixel_width, cell_pixel_height);
 
-        Ok((cols, rows, top_inset, right_inset, bottom_inset, left_inset))
+        Ok((
+            viewport.cols,
+            viewport.rows,
+            viewport.top_inset,
+            viewport.right_inset,
+            viewport.bottom_inset,
+            viewport.left_inset,
+        ))
     }
 
     fn apply_stored_attach_viewport(&mut self, session_id: SessionId) {
@@ -6774,13 +6755,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         cell_pixel_height: u16,
     ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
         self.with_lock(|m| {
-            if let Some(previous_session_id) = previous_session_id
-                && previous_session_id != next_session_id
-            {
-                m.end_attach(previous_session_id, client_id);
-            }
             m.begin_attach(next_session_id, client_id)?;
-            m.set_attach_viewport(
+            let viewport = match m.set_attach_viewport(
                 next_session_id,
                 client_id,
                 cols,
@@ -6791,7 +6767,21 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 left_inset,
                 cell_pixel_width,
                 cell_pixel_height,
-            )
+            ) {
+                Ok(viewport) => viewport,
+                Err(error) => {
+                    if previous_session_id != Some(next_session_id) {
+                        m.end_attach(next_session_id, client_id);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(previous_session_id) = previous_session_id
+                && previous_session_id != next_session_id
+            {
+                m.end_attach(previous_session_id, client_id);
+            }
+            Ok(viewport)
         })
         .unwrap_or(Err(SessionRuntimeError::Closed))
     }
@@ -8339,6 +8329,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_retarget_preserves_previous_attach_registration() {
+        let previous_session_id = SessionId(Uuid::new_v4());
+        let missing_session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let manager = manager_with_runtime(previous_session_id, runtime);
+        let adapter = adapter_for_manager(manager);
+
+        let result = bmux_pane_runtime_state::SessionRuntimeManagerApi::retarget_attach_stream(
+            &adapter,
+            Some(previous_session_id),
+            missing_session_id,
+            client_id,
+            80,
+            24,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(result, Err(SessionRuntimeError::NotFound));
+        let manager = adapter.inner.lock().expect("runtime manager lock");
+        assert!(
+            manager.runtimes[&previous_session_id]
+                .attached_clients
+                .contains(&client_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn over_reserved_viewport_normalizes_once_for_scene_and_response() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let mut manager = manager_with_runtime(session_id, runtime);
+
+        let response = manager
+            .set_attach_viewport(session_id, client_id, 10, 5, 4, 9, 4, 9, 0, 0)
+            .expect("set over-reserved viewport");
+        assert_eq!(response, (10, 5, 4, 0, 0, 9));
+        assert_eq!(
+            manager.runtimes[&session_id].attach_viewport,
+            Some(AttachViewport::normalized(10, 5, 4, 9, 4, 9))
+        );
+        let scene = manager
+            .build_attach_scene_for_client(session_id, client_id)
+            .expect("build clamped attach scene");
+        assert_eq!(
+            scene.surfaces[0].rect,
+            AttachRect {
+                x: 9,
+                y: 4,
+                w: 1,
+                h: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn horizontal_viewport_insets_drive_scene_geometry_and_pty_size() {
         let session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
@@ -8438,6 +8493,62 @@ mod tests {
             .set_attach_viewport(session_id, client_id, 120, 30, 0, 0, 0, 0, 0, 0)
             .expect("set wide viewport");
         assert_eq!(*last_requested_size.lock().unwrap(), (28, 40));
+    }
+
+    #[tokio::test]
+    async fn floating_geometry_remains_host_viewport_relative_with_reserved_content_edges() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let tiled = Uuid::new_v4();
+        let floating = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[tiled, floating]);
+        runtime.layout_root = Some(PaneLayoutNode::Leaf { pane_id: tiled });
+        runtime.attach_viewport = Some(AttachViewport::normalized(100, 30, 2, 3, 4, 10));
+        let mut floating_surface = floating_surface(floating, FloatingPaneScope::PerSession);
+        floating_surface.rect = LayoutRect {
+            x: 1,
+            y: 1,
+            w: 20,
+            h: 8,
+        };
+        runtime.floating_surfaces = vec![floating_surface];
+
+        let scene = build_attach_scene(
+            session_id,
+            &runtime,
+            &PanePaddingConfig::default(),
+            runtime.attach_viewport,
+            client_id,
+            None,
+        );
+        let tiled_surface = scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.pane_id == Some(tiled))
+            .expect("tiled surface");
+        assert_eq!(
+            tiled_surface.rect,
+            AttachRect {
+                x: 10,
+                y: 2,
+                w: 87,
+                h: 24,
+            }
+        );
+        let floating_surface = scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.pane_id == Some(floating))
+            .expect("floating surface");
+        assert_eq!(
+            floating_surface.rect,
+            AttachRect {
+                x: 1,
+                y: 1,
+                w: 20,
+                h: 8,
+            }
+        );
     }
 
     #[tokio::test]

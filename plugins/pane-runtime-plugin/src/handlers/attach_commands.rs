@@ -582,6 +582,7 @@ pub fn attach_set_viewport(
         .0
         .current_for_client(client_id)
         .map(|c| c.id);
+    crate::runtime::emit_attach_view_changed_for_layout(session_id);
     Ok(AttachViewportSet {
         session_id: req.session_id,
         cols,
@@ -592,6 +593,21 @@ pub fn attach_set_viewport(
         left_inset: left,
         context_id,
     })
+}
+
+fn restore_context_selection(
+    contexts: &bmux_context_state::ContextStateHandle,
+    client_id: ClientId,
+    previous_context_id: Option<Uuid>,
+) {
+    if let Some(previous_context_id) = previous_context_id {
+        let _ = contexts.0.select_for_client(
+            client_id,
+            &PrimitiveContextSelector::ById(previous_context_id),
+        );
+    } else {
+        contexts.0.disconnect_client(client_id);
+    }
 }
 
 pub fn attach_retarget_context(
@@ -607,6 +623,12 @@ pub fn attach_retarget_context(
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
 
     let selected_target = follow.0.selected_target(client_id);
+    let previous_context_id = contexts
+        .0
+        .snapshot()
+        .selected_by_client
+        .get(&client_id)
+        .copied();
     let (context_id, next_session_id, selection_already_applied) =
         if let Some((Some(selected_context_id), Some(selected_session_id))) = selected_target
             && selected_context_id == req.context_id
@@ -618,6 +640,7 @@ pub fn attach_retarget_context(
                 .select_for_client(client_id, &PrimitiveContextSelector::ById(req.context_id))
                 .map_err(|_| AttachCommandError::ContextNotFound)?;
             let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
+                restore_context_selection(&contexts, client_id, previous_context_id);
                 return Err(failed("context has no attached runtime"));
             };
             (context.id, selected_session_id, false)
@@ -625,27 +648,24 @@ pub fn attach_retarget_context(
 
     // Validate the session exists in the manager.
     if !manager.0.contains(next_session_id) {
+        if !selection_already_applied {
+            restore_context_selection(&contexts, client_id, previous_context_id);
+        }
         return Err(AttachCommandError::SessionNotFound);
     }
 
-    // Track previous session for client migration if switching.
     let previous_session = selected_target.and_then(|(_, session_id)| session_id);
-    if let Some(prev) = previous_session
-        && prev != next_session_id
-    {
-        manager.0.remove_client(prev, &client_id);
-    }
+    let can_write = match session_write_allowed(ctx, next_session_id, client_id) {
+        Ok(allowed) => req.can_write && allowed,
+        Err(error) => {
+            if !selection_already_applied {
+                restore_context_selection(&contexts, client_id, previous_context_id);
+            }
+            return Err(error);
+        }
+    };
 
-    // Ensure client is registered with the target session.
-    manager.0.add_client(next_session_id, client_id);
-
-    if !selection_already_applied {
-        follow
-            .0
-            .set_selected_target(client_id, Some(context_id), Some(next_session_id));
-    }
-
-    let (cols, rows, top, right, bottom, left) = retarget_attach_stream(
+    let retargeted = match retarget_attach_stream(
         &runtime,
         &follow,
         client_id,
@@ -658,11 +678,31 @@ pub fn attach_retarget_context(
         req.left_inset,
         req.cell_pixel_width,
         req.cell_pixel_height,
-    )?;
-    let can_write = req.can_write && session_write_allowed(ctx, next_session_id, client_id)?;
+    ) {
+        Ok(viewport) => viewport,
+        Err(error) => {
+            if !selection_already_applied {
+                restore_context_selection(&contexts, client_id, previous_context_id);
+            }
+            return Err(error);
+        }
+    };
+    let (cols, rows, top, right, bottom, left) = retargeted;
+    if let Some(prev) = previous_session
+        && prev != next_session_id
+    {
+        manager.0.remove_client(prev, &client_id);
+    }
+    manager.0.add_client(next_session_id, client_id);
+    if !selection_already_applied {
+        follow
+            .0
+            .set_selected_target(client_id, Some(context_id), Some(next_session_id));
+    }
     runtime
         .0
         .set_client_write_permission(next_session_id, client_id, can_write);
+    crate::runtime::emit_attach_view_changed_for_layout(next_session_id);
 
     Ok(AttachRetargetReady {
         session_id: next_session_id.0,

@@ -9,7 +9,8 @@ pub use bmux_attach_pipeline::{
     PaneRenderBuffer, PaneScrollbackView, PaneScrollbackViews, ScrollbackPin,
 };
 use bmux_attach_pipeline::{
-    FrameDamage, RetainedCompositor, RetainedPointerRouter, TerminalGraphicsCache,
+    FrameDamage, RetainedCompositor, RetainedFocusState, RetainedPointerRouter,
+    TerminalGraphicsCache,
 };
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
@@ -297,8 +298,10 @@ pub struct AttachViewState {
     pub status_position: StatusPosition,
     pub cached_status_line: Option<AttachStatusLine>,
     pub cached_layout_state: Option<AttachLayoutState>,
+    pub last_attach_view_revision: Option<(Uuid, u64)>,
     pub retained_compositor: RetainedCompositor,
     pub plugin_pointer_router: Box<RetainedPointerRouter>,
+    pub plugin_focus: RetainedFocusState,
     /// Opaque overlay coverage used to occlude pane terminal graphics on the
     /// previous retained frame. Content-only edits within stable bounds must
     /// not invalidate every pane extension.
@@ -932,8 +935,10 @@ impl AttachViewState {
             status_position: StatusPosition::Bottom,
             cached_status_line: None,
             cached_layout_state: None,
+            last_attach_view_revision: None,
             retained_compositor: RetainedCompositor::new(),
             plugin_pointer_router: Box::default(),
+            plugin_focus: RetainedFocusState::default(),
             opaque_overlay_rects: Vec::new(),
             last_help_overlay_surface: None,
             last_prompt_overlay_surface: None,

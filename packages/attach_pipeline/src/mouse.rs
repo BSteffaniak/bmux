@@ -348,6 +348,48 @@ mod tests {
     }
 
     #[test]
+    fn pane_mouse_mapping_uses_final_reserved_content_geometry() {
+        let pane = Uuid::new_v4();
+        let outer = AttachRect {
+            x: 10,
+            y: 2,
+            w: 87,
+            h: 24,
+        };
+        let content = AttachRect {
+            x: 12,
+            y: 3,
+            w: 83,
+            h: 22,
+        };
+        let mut pane_surface = surface(pane, AttachLayer::Pane, 0, outer, true, true);
+        pane_surface.content_rect = content;
+        let scene = scene(vec![pane_surface]);
+
+        let (_, hit_content) = pane_and_rect_at(&scene, 20, 8).expect("pane hit");
+        assert_eq!(hit_content, content);
+        let local = translate_event_to_pane_local(
+            Event {
+                kind: EventKind::Down(Button::Left),
+                column: 20,
+                row: 8,
+                modifiers: Modifiers::default(),
+            },
+            hit_content,
+        )
+        .expect("content-local event");
+        assert_eq!((local.column, local.row), (8, 5));
+
+        let border = Event {
+            kind: EventKind::Down(Button::Left),
+            column: outer.x,
+            row: outer.y,
+            modifiers: Modifiers::default(),
+        };
+        assert!(translate_event_to_pane_local(border, hit_content).is_none());
+    }
+
+    #[test]
     fn pane_and_rect_at_returns_matched_surface_rect() {
         let pane = Uuid::new_v4();
         let rect = AttachRect {

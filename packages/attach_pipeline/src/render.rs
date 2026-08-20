@@ -389,7 +389,8 @@ fn queue_render_items_for_frame_with_cleanup<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     cleanup_surface_graphics: bool,
 ) -> Result<bool> {
-    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
+    let current_graphics =
+        active_terminal_graphic_keys(pane_id, surface_id, surface_rect, items, capabilities);
     let mut wrote = if cleanup_surface_graphics {
         terminal_graphics.cleanup_stale_for_surface(
             stdout,
@@ -967,6 +968,7 @@ fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
 fn active_terminal_graphic_keys(
     pane_id: Uuid,
     surface_id: Uuid,
+    surface_rect: ExtensionRect,
     items: &[RenderLayerItem],
     capabilities: TerminalRenderCapabilities,
 ) -> BTreeSet<u64> {
@@ -976,12 +978,14 @@ fn active_terminal_graphic_keys(
     items
         .iter()
         .filter_map(|item| match item {
-            RenderLayerItem::Graphic(graphic) => Some(terminal_graphic_instance_key(
-                pane_id,
-                surface_id,
-                graphic.key,
-            )),
-            RenderLayerItem::Op(_) => None,
+            RenderLayerItem::Graphic(graphic) if graphic.cell_rect.intersects(surface_rect) => {
+                Some(terminal_graphic_instance_key(
+                    pane_id,
+                    surface_id,
+                    graphic.key,
+                ))
+            }
+            RenderLayerItem::Graphic(_) | RenderLayerItem::Op(_) => None,
         })
         .collect()
 }
@@ -3981,7 +3985,8 @@ fn queue_before_content_render_items_with_cleanup<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     cleanup_surface_graphics: bool,
 ) -> Result<Vec<RenderOp>> {
-    let current_graphics = active_terminal_graphic_keys(pane_id, surface_id, items, capabilities);
+    let current_graphics =
+        active_terminal_graphic_keys(pane_id, surface_id, surface_rect, items, capabilities);
     if cleanup_surface_graphics {
         terminal_graphics.cleanup_stale_for_surface(
             stdout,
@@ -7647,7 +7652,7 @@ mod tests {
                 Uuid::from_u128(7),
                 content,
                 &RenderDamage::FullSurface,
-                &[RenderLayerItem::Graphic(inside)],
+                &[RenderLayerItem::Graphic(inside.clone())],
                 &mut cache,
                 capabilities,
                 None,
@@ -7670,6 +7675,27 @@ mod tests {
             ),
             "graphics wholly outside padded content must be clipped"
         );
+
+        let mut clipped_output = Vec::new();
+        assert!(
+            queue_render_items(
+                &mut clipped_output,
+                Uuid::from_u128(7),
+                content,
+                &RenderDamage::FullSurface,
+                &[RenderLayerItem::Graphic(TerminalGraphicOverlay {
+                    key: inside.key,
+                    ..outside
+                })],
+                &mut cache,
+                capabilities,
+                None,
+            )
+            .expect("clipped graphic cleanup")
+        );
+        let clipped_output = String::from_utf8(clipped_output).expect("kitty cleanup output");
+        assert!(clipped_output.contains("Ga=d,d=p,"), "{clipped_output:?}");
+        assert!(cache.is_empty());
     }
 
     #[cfg(feature = "image-kitty")]

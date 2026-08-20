@@ -5161,9 +5161,17 @@ fn handle_pane_runtime_plugin_event(
         pane_events::PaneEvent::AttachViewChanged {
             context_id,
             session_id,
+            revision,
             components,
-            ..
         } if attach_view_event_matches_target(view_state, context_id, session_id) => {
+            if view_state.last_attach_view_revision.is_some_and(
+                |(tracked_session, tracked_revision)| {
+                    tracked_session == session_id && revision <= tracked_revision
+                },
+            ) {
+                return PaneRuntimePluginEventOutcome::default();
+            }
+            view_state.last_attach_view_revision = Some((session_id, revision));
             let components = components
                 .iter()
                 .copied()
@@ -5423,6 +5431,7 @@ pub async fn retarget_attach_to_context(
     let select_us = 0_u128;
     let open_us = retarget_service_us;
     view_state.attached_id = attach_info.session_id;
+    view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
     let viewport_us = 0_u128;
@@ -8273,6 +8282,25 @@ fn retained_plugin_surfaces(viewport: DamageRect) -> Vec<RetainedSurface> {
     retained_surfaces_from_plugin_surfaces(&surfaces, &allocations, viewport)
 }
 
+fn replace_retained_surfaces(
+    view_state: &mut AttachViewState,
+    retained_surfaces: Vec<RetainedSurface>,
+    viewport: DamageRect,
+    damage_policy: DamageCoalescingPolicy,
+) -> RetainedDamage {
+    let damage =
+        view_state
+            .retained_compositor
+            .replace_surfaces(retained_surfaces, viewport, damage_policy);
+    let _ = view_state
+        .plugin_focus
+        .reconcile(&view_state.retained_compositor);
+    let _ = view_state
+        .plugin_pointer_router
+        .reconcile(&view_state.retained_compositor);
+    damage
+}
+
 #[allow(clippy::too_many_arguments)] // Retained planning bridges frame damage, UI surfaces, and compositor state.
 fn build_retained_frame_plan(
     view_state: &mut AttachViewState,
@@ -8343,7 +8371,8 @@ fn build_retained_frame_plan(
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
     retained_surfaces.extend(tab_menu_surface.iter().cloned());
-    let graph_damage = view_state.retained_compositor.replace_surfaces(
+    let graph_damage = replace_retained_surfaces(
+        view_state,
         retained_surfaces.clone(),
         viewport,
         damage_policy,
@@ -9204,6 +9233,7 @@ pub async fn reconcile_attached_session_from_catalog(
 
     let attach_info = open_attach_for_context(client, context_id).await?;
     view_state.attached_id = attach_info.session_id;
+    view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
     update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
@@ -10699,6 +10729,7 @@ async fn handle_clients_plugin_event(
                 return Ok(());
             };
             view_state.attached_id = attach_info.session_id;
+            view_state.last_attach_view_revision = None;
             view_state.attached_context_id = attach_info.context_id.or(context_id);
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id, view_state.status_position)
@@ -10814,6 +10845,7 @@ pub async fn recover_attach_after_session_removed(
             continue;
         };
         view_state.attached_id = attach_info.session_id;
+        view_state.last_attach_view_revision = None;
         view_state.attached_context_id = attach_info.context_id;
         view_state.can_write = attach_info.can_write;
         update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
@@ -11145,6 +11177,7 @@ pub async fn handle_attach_terminal_event(
         }
         Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
             view_state.mouse.clear_pointer_gestures();
+            let _ = view_state.plugin_focus.clear();
         }
         Some(
             TerminalInputEvent::Key(_)
@@ -11313,6 +11346,20 @@ pub async fn handle_attach_terminal_event(
     }
 
     if let Some(TerminalInputEvent::Key(key)) = &normalized_event {
+        match try_handle_plugin_surface_key(client, view_state, key).await {
+            Ok(true) => return Ok(AttachLoopControl::Continue),
+            Ok(false) => {}
+            Err(error) => {
+                view_state.set_transient_status(
+                    format!(
+                        "plugin surface input failed: {}",
+                        map_attach_client_error(error)
+                    ),
+                    now,
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
         match try_handle_attach_input_hook_key(client, view_state, key).await {
             Ok(true) => return Ok(AttachLoopControl::Continue),
             Ok(false) => {}
@@ -11568,6 +11615,7 @@ async fn retarget_attach_to_session(
 ) -> std::result::Result<(), ClientError> {
     let attach_info = open_attach_for_session(client, session_id).await?;
     view_state.attached_id = attach_info.session_id;
+    view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id;
     view_state.can_write = attach_info.can_write;
     update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
@@ -12091,19 +12139,125 @@ async fn invoke_plugin_surface_pointer_event(
     Ok(result.consumed)
 }
 
+fn update_plugin_surface_focus(
+    focus: &mut bmux_attach_pipeline::RetainedFocusState,
+    compositor: &bmux_attach_pipeline::RetainedCompositor,
+    event: &bmux_attach_pipeline::RetainedPointerEvent,
+    consumed: bool,
+) {
+    if consumed && event.phase == bmux_attach_pipeline::RetainedPointerPhase::Down {
+        let _ = focus.focus_hit(compositor, &event.hit);
+    }
+}
+
 async fn try_handle_plugin_surface_mouse(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
 ) -> std::result::Result<bool, ClientError> {
+    if matches!(mouse_event.kind, MouseEventKind::Down(_)) {
+        let _ = view_state.plugin_focus.clear();
+    }
     let events = view_state
         .plugin_pointer_router
         .route_terminal_mouse(&view_state.retained_compositor, mouse_event);
     let mut consumed = false;
     for event in events {
-        consumed |= invoke_plugin_surface_pointer_event(client, view_state, event).await?;
+        let event_consumed =
+            invoke_plugin_surface_pointer_event(client, view_state, event.clone()).await?;
+        update_plugin_surface_focus(
+            &mut view_state.plugin_focus,
+            &view_state.retained_compositor,
+            &event,
+            event_consumed,
+        );
+        consumed |= event_consumed;
     }
     Ok(consumed)
+}
+
+async fn try_handle_plugin_surface_key(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    key: &TerminalKeyEvent,
+) -> std::result::Result<bool, ClientError> {
+    let Some(key_name) = attach_input_key_name(key) else {
+        return Ok(false);
+    };
+    let Some(target) = view_state.plugin_focus.focused().cloned() else {
+        return Ok(false);
+    };
+    let Some(endpoint) = view_state
+        .retained_compositor
+        .endpoint_for_region(&target)
+        .cloned()
+    else {
+        let _ = view_state.plugin_focus.clear();
+        return Ok(false);
+    };
+    let input = AttachInputEvent {
+        hook_id: format!(
+            "{}:{}:{}",
+            target.owner_plugin_id, target.surface_local_id, target.region_local_id
+        ),
+        event_kind: "key".to_owned(),
+        phase: match key.kind {
+            super::input::TerminalKeyPhase::Press => "press".to_owned(),
+            super::input::TerminalKeyPhase::Repeat => "repeat".to_owned(),
+            super::input::TerminalKeyPhase::Release => "release".to_owned(),
+        },
+        button: None,
+        key: Some(key_name),
+        col: None,
+        row: None,
+        modifiers: AttachInputModifiers {
+            shift: key.modifiers.shift,
+            alt: key.modifiers.alt,
+            control: key.modifiers.control,
+            super_key: key.modifiers.super_key,
+            hyper: key.modifiers.hyper,
+            meta: key.modifiers.meta,
+        },
+        focused_pane: attach_input_focused_context(view_state),
+        hovered_pane: None,
+    };
+    let payload =
+        bmux_codec::to_positional_vec(&input).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding plugin surface keyboard event: {error}"),
+        })?;
+    let response = client
+        .invoke_service_raw(
+            endpoint.capability,
+            InvokeServiceKind::Command,
+            endpoint.interface_id,
+            endpoint.operation,
+            payload,
+        )
+        .await?;
+    let result =
+        bmux_codec::from_positional_bytes::<AttachInputResult>(&response).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("decoding plugin surface keyboard result: {error}"),
+            }
+        })?;
+    if result.release_capture {
+        let _ = view_state.plugin_focus.clear();
+    }
+    if result.dirty {
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+    }
+    if let Some(message) = result.status_message.as_deref() {
+        view_state.set_transient_status(
+            truncate_attach_status_message(message),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+    Ok(result.consumed)
 }
 
 fn attach_input_hooks() -> Vec<AttachInputHook> {
@@ -16192,6 +16346,62 @@ mod tests {
     }
 
     #[test]
+    fn plugin_surface_focus_requires_consumed_focusable_pointer_down() {
+        let owner = "example.focus";
+        let surface = bmux_plugin::surface::PluginSurface {
+            id: bmux_plugin::surface::PluginSurfaceId::new(owner, "surface", Uuid::from_u128(50)),
+            revision: 1,
+            target: bmux_plugin::surface::PluginSurfaceTarget::Explicit(ExtensionRect::new(
+                2, 2, 8, 4,
+            )),
+            clip_rect: None,
+            interactive_regions: Vec::new(),
+            accepts_input: false,
+            layer: 0,
+            z: 0,
+            opaque: false,
+            modal: false,
+            visible: true,
+            ops: Vec::new(),
+        }
+        .interactive_region(
+            bmux_plugin::surface::PluginSurfaceRegion::new("field", ExtensionRect::new(0, 0, 8, 4))
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Text),
+        );
+        let lowered = retained_surfaces_from_plugin_surfaces(
+            &[surface],
+            &BTreeMap::new(),
+            DamageRect::new(0, 0, 80, 24),
+        );
+        let mut compositor = bmux_attach_pipeline::RetainedCompositor::new();
+        let _ = compositor.replace_surfaces(
+            lowered,
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let hit = compositor.hit_test(3, 3).expect("focusable region hit");
+        let down = bmux_attach_pipeline::RetainedPointerEvent {
+            phase: bmux_attach_pipeline::RetainedPointerPhase::Down,
+            hit: hit.clone(),
+            button: Some(bmux_attach_pipeline::RetainedPointerButton::Primary),
+            wheel_delta: 0,
+        };
+        let mut focus = bmux_attach_pipeline::RetainedFocusState::default();
+        update_plugin_surface_focus(&mut focus, &compositor, &down, false);
+        assert!(focus.focused().is_none());
+        update_plugin_surface_focus(&mut focus, &compositor, &down, true);
+        assert_eq!(focus.focused(), hit.region_id.as_ref());
+
+        let move_event = bmux_attach_pipeline::RetainedPointerEvent {
+            phase: bmux_attach_pipeline::RetainedPointerPhase::Move,
+            ..down
+        };
+        let _ = focus.clear();
+        update_plugin_surface_focus(&mut focus, &compositor, &move_event, true);
+        assert!(focus.focused().is_none());
+    }
+
+    #[test]
     fn prompt_acquisition_cancels_pointer_owner() {
         let mut view_state = AttachViewState::new(AttachOpenInfo {
             context_id: None,
@@ -19898,6 +20108,55 @@ mod tests {
         assert_eq!(floating_drag_position(drag, 12, 11), (7, 5));
         assert_eq!(floating_drag_position(drag, 30, 30), (12, 5));
         assert_eq!(floating_drag_position(drag, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn resize_separator_uses_reserved_final_scene_offsets() {
+        let session_id = Uuid::new_v4();
+        let left_pane = Uuid::new_v4();
+        let right_pane = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: left_pane,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id: left_pane },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id: left_pane },
+                surfaces: vec![
+                    test_pane_surface(
+                        left_pane,
+                        AttachRect {
+                            x: 11,
+                            y: 2,
+                            w: 20,
+                            h: 20,
+                        },
+                    ),
+                    test_pane_surface(
+                        right_pane,
+                        AttachRect {
+                            x: 31,
+                            y: 2,
+                            w: 30,
+                            h: 20,
+                        },
+                    ),
+                ],
+            },
+            zoomed: false,
+        });
+
+        let drag = attach_scene_resize_separator_at(&view_state, 30, 10, Instant::now())
+            .expect("offset separator");
+        assert!(drag.horizontal.is_some());
+        assert!(attach_scene_resize_separator_at(&view_state, 9, 10, Instant::now()).is_none());
     }
 
     #[test]

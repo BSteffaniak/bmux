@@ -394,7 +394,7 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
                 focused_pane_id,
                 zoomed_pane_id: entry.zoomed_pane_id,
                 floating_surfaces,
-                attach_viewport: entry.attach_viewport,
+                attach_viewport: entry.attach_viewport.map(AttachViewport::normalize),
             },
         ) {
             warn!(
@@ -464,6 +464,29 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    #[test]
+    fn decoded_snapshot_viewport_normalizes_before_runtime_restore() {
+        let viewport = AttachViewport {
+            cols: 10,
+            rows: 5,
+            top_inset: 4,
+            right_inset: 9,
+            bottom_inset: 4,
+            left_inset: 9,
+        };
+        assert_eq!(
+            viewport.normalize(),
+            AttachViewport {
+                cols: 10,
+                rows: 5,
+                top_inset: 4,
+                right_inset: 0,
+                bottom_inset: 0,
+                left_inset: 9,
+            }
+        );
+    }
 
     #[test]
     fn default_snapshot_is_empty() {

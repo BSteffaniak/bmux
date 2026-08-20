@@ -29,7 +29,7 @@ pub mod manager_handle;
 pub mod meta;
 pub mod output;
 
-pub use attach::AttachViewport;
+pub use attach::{AttachContentRegion, AttachViewport};
 pub use error::SessionRuntimeError;
 pub use layout::{
     FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect, PaneLayoutNode,

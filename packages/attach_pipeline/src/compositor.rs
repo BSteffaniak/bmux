@@ -575,6 +575,7 @@ impl RetainedPointerRouter {
                 .zip(next.as_ref())
                 .is_some_and(|(current, next)| {
                     current.surface_id == next.surface_id
+                        && current.surface_revision == next.surface_revision
                         && current.region_index == next.region_index
                         && current.region_id == next.region_id
                 });
@@ -1975,6 +1976,32 @@ mod tests {
             RetainedPointerPhase::Drag
         );
         assert!(router.route_wheel(&compositor, 40, 20, 1).is_none());
+    }
+
+    #[test]
+    fn pointer_router_replaces_hover_across_surface_revision() {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let surface = |revision| {
+            RetainedSurface::builder(Uuid::from_u128(625), DamageRect::new(2, 2, 8, 4))
+                .revision(revision)
+                .interactive_region(DamageRect::new(2, 2, 8, 4))
+                .build()
+        };
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces([surface(1)], viewport, DamageCoalescingPolicy::default());
+        let mut router = RetainedPointerRouter::default();
+        assert_eq!(
+            router.route_move(&compositor, 3, 3)[0].phase,
+            RetainedPointerPhase::Enter
+        );
+
+        compositor.replace_surfaces([surface(2)], viewport, DamageCoalescingPolicy::default());
+        let events = router.route_move(&compositor, 3, 3);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, RetainedPointerPhase::Leave);
+        assert_eq!(events[0].hit.surface_revision, Some(1));
+        assert_eq!(events[1].phase, RetainedPointerPhase::Enter);
+        assert_eq!(events[1].hit.surface_revision, Some(2));
     }
 
     #[test]
