@@ -229,7 +229,7 @@ pub fn source_viewer_rows_with_style(
     for (index, spans) in highlighted.into_iter().enumerate() {
         let spans = spans
             .into_iter()
-            .map(|span| Span::styled(span.content, span.style.patch(style.source)))
+            .map(|span| Span::styled(span.content, style.source.patch(span.style)))
             .collect();
         let chunks = wrap_spans(spans, body_width);
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
@@ -366,6 +366,7 @@ fn spans_width(spans: &[Span]) -> usize {
 mod tests {
     use super::*;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::style::Modifier;
 
     fn rendered(rows: &[Line]) -> String {
         rows.iter()
@@ -400,6 +401,45 @@ mod tests {
             rows.iter()
                 .flat_map(|row| &row.spans)
                 .any(|span| span.style.fg == Some(Color::Red))
+        );
+    }
+
+    #[test]
+    fn base_source_style_stays_beneath_caller_token_styles() {
+        let token_style = Style::new().fg(Color::Red);
+        let styled = [Line::from_spans(vec![
+            Span::styled("let", token_style),
+            Span::raw(" value"),
+        ])];
+        let style = SourceViewerStyle {
+            source: Style::new().fg(Color::Blue).add_modifier(Modifier::DIM),
+            ..SourceViewerStyle::default()
+        };
+        let rows = source_viewer_rows_with_style(
+            SourceViewerInput {
+                label: "file.rs",
+                styled_lines: Some(&styled),
+                contents: "let value",
+                start_line: 1,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: false,
+            },
+            40,
+            style,
+        );
+        let token = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|span| span.content == "l")
+            .expect("token span");
+
+        assert_eq!(token.style.fg, Some(Color::Red));
+        assert!(token.style.modifiers.contains(Modifier::DIM));
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.content == "v" && span.style.fg == Some(Color::Blue))
         );
     }
 
