@@ -1914,6 +1914,77 @@ mod tests {
     }
 
     #[test]
+    fn generic_surface_routes_complete_pointer_workflow_and_cleanup() {
+        let owner = "example.interactive";
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.input".to_owned(),
+            interface_id: "example-input".to_owned(),
+            operation: "handle".to_owned(),
+        };
+        let surface = PluginSurface::layout(
+            PluginSurfaceId::new(owner, "surface", Uuid::from_u128(625)),
+            1,
+            bmux_plugin::layout::PluginLayoutId::new(owner, "region"),
+            Vec::new(),
+        )
+        .interactive_region(
+            PluginSurfaceRegion::new("item", ExtensionRect::new(0, 0, 12, 6))
+                .endpoint(endpoint.clone()),
+        );
+        let allocations = BTreeMap::from([(
+            bmux_plugin::layout::PluginLayoutId::new(owner, "region"),
+            ExtensionRect::new(2, 2, 12, 6),
+        )]);
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            retained_surfaces_from_plugin_surfaces(&[surface], &allocations, viewport),
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let mut router = RetainedPointerRouter::default();
+
+        let hover = router.route_move(&compositor, 4, 3);
+        assert_eq!(hover.len(), 1);
+        assert_eq!(hover[0].phase, RetainedPointerPhase::Enter);
+        assert_eq!((hover[0].hit.surface_x, hover[0].hit.surface_y), (2, 1));
+
+        let click = router
+            .route_button(&compositor, 4, 3, RetainedPointerButton::Primary, true)
+            .expect("click");
+        assert_eq!(click.phase, RetainedPointerPhase::Down);
+        router.capture(click.hit.clone());
+
+        let wheel = router.route_wheel(&compositor, 4, 3, -1).expect("wheel");
+        assert_eq!(wheel.phase, RetainedPointerPhase::Wheel);
+        assert_eq!(wheel.wheel_delta, -1);
+
+        let drag = router
+            .route_drag(&compositor, 40, 20, RetainedPointerButton::Primary)
+            .expect("captured drag");
+        assert_eq!(drag.phase, RetainedPointerPhase::Drag);
+        assert_eq!((drag.hit.absolute_x, drag.hit.absolute_y), (40, 20));
+
+        let mut queue = RetainedInputQueue::default();
+        assert!(queue.push_pointer(click));
+        assert!(queue.push_pointer(wheel));
+        assert!(queue.push_pointer(drag));
+        assert!(
+            queue
+                .drain_for_dispatch(&compositor)
+                .into_iter()
+                .all(|dispatch| dispatch.endpoint == endpoint)
+        );
+
+        compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
+        let cleanup = router.reconcile(&compositor);
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].phase, RetainedPointerPhase::Leave);
+        assert!(router.hovered().is_none());
+        assert!(router.captured().is_none());
+    }
+
+    #[test]
     fn modal_surface_blocks_input_fallthrough_inside_its_scope() {
         let viewport = DamageRect::new(0, 0, 80, 24);
         let mut compositor = RetainedCompositor::new();
