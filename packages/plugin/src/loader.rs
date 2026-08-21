@@ -2246,7 +2246,6 @@ impl LoadedPlugin {
             Some(ProcessInvocationResponse::Error {
                 protocol_version,
                 details,
-                status: _,
                 ..
             }) => {
                 Self::process_error_to_result("service", protocol_version, details)?;
@@ -2538,7 +2537,6 @@ impl LoadedPlugin {
                 ProcessInvocationResponse::Error {
                     protocol_version,
                     details,
-                    status: _,
                     ..
                 } => {
                     Self::process_error_to_result("command", protocol_version, details)?;

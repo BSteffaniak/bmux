@@ -350,38 +350,35 @@ impl AttachPromptState {
         let mut completion: Option<PromptResponse> = None;
         if let Some(active) = self.active.as_mut() {
             match (&active.envelope.request.field, &mut active.state) {
-                (
-                    PromptField::Confirm {
-                        yes_label: _,
-                        no_label: _,
-                        ..
-                    },
-                    PromptWidgetState::Confirm { selected_yes },
-                ) => match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        *selected_yes = true;
+                (PromptField::Confirm { .. }, PromptWidgetState::Confirm { selected_yes }) => {
+                    match key.code {
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            *selected_yes = true;
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            *selected_yes = false;
+                        }
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Char(' ') => {
+                            *selected_yes = !*selected_yes;
+                        }
+                        KeyCode::Char('y' | 'Y') => {
+                            *selected_yes = true;
+                            completion =
+                                Some(PromptResponse::Submitted(PromptValue::Confirm(true)));
+                        }
+                        KeyCode::Char('n' | 'N') => {
+                            *selected_yes = false;
+                            completion =
+                                Some(PromptResponse::Submitted(PromptValue::Confirm(false)));
+                        }
+                        KeyCode::Enter => {
+                            completion = Some(PromptResponse::Submitted(PromptValue::Confirm(
+                                *selected_yes,
+                            )));
+                        }
+                        _ => {}
                     }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        *selected_yes = false;
-                    }
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Char(' ') => {
-                        *selected_yes = !*selected_yes;
-                    }
-                    KeyCode::Char('y' | 'Y') => {
-                        *selected_yes = true;
-                        completion = Some(PromptResponse::Submitted(PromptValue::Confirm(true)));
-                    }
-                    KeyCode::Char('n' | 'N') => {
-                        *selected_yes = false;
-                        completion = Some(PromptResponse::Submitted(PromptValue::Confirm(false)));
-                    }
-                    KeyCode::Enter => {
-                        completion = Some(PromptResponse::Submitted(PromptValue::Confirm(
-                            *selected_yes,
-                        )));
-                    }
-                    _ => {}
-                },
+                }
                 (
                     PromptField::TextInput {
                         required,

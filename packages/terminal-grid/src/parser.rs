@@ -278,7 +278,7 @@ impl Perform for ProtocolPerformer<'_> {
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore || intermediates != [b'?'] || !matches!(action, 'h' | 'l') {
+        if ignore || intermediates != *b"?" || !matches!(action, 'h' | 'l') {
             return;
         }
         let enabled = action == 'h';
@@ -418,7 +418,7 @@ impl Perform for GridPerformer<'_> {
                     self.grid.set_scroll_region(Some(top), Some(bottom));
                 }
             }
-            'h' | 'l' if intermediates == [b'?'] => {
+            'h' | 'l' if intermediates == *b"?" => {
                 let enabled = action == 'h';
                 for value in values {
                     match value {

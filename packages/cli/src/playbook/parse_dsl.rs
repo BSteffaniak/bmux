@@ -618,7 +618,7 @@ fn parse_value(input: &str) -> Result<(String, &str)> {
 /// Parse a quoted value, consuming the opening and closing quote.
 fn parse_quoted_value(input: &str, quote: char) -> Result<(String, &str)> {
     let bytes = input.as_bytes();
-    debug_assert!(bytes[0] == quote as u8);
+    debug_assert_eq!(bytes[0], quote as u8);
     let quote_byte = quote as u8;
     let mut result = Vec::new();
     let mut i = 1; // skip opening quote

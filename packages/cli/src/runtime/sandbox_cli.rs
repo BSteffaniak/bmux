@@ -2143,7 +2143,7 @@ fn directory_sha256_hex(path: &Path) -> Option<String> {
         hasher.update(relative.as_bytes());
         hasher.update([0]);
         hasher.update(digest.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(*b"\n");
     }
 
     Some(hex_encode_digest(hasher.finalize()))
