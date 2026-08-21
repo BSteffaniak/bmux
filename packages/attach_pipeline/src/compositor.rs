@@ -2419,22 +2419,61 @@ mod tests {
         }
         let no_op_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
 
-        let started = Instant::now();
-        for iteration in 0..ITERATIONS {
-            let next = if iteration % 2 == 0 {
-                changed.clone()
-            } else {
-                stable.clone()
-            };
-            black_box(compositor.replace_surfaces(
-                next,
-                viewport,
-                DamageCoalescingPolicy::default(),
-            ));
-        }
-        let incremental_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+        let row_changed = (0..ITEM_COUNT)
+            .map(|index| {
+                let y = u16::try_from(index).unwrap();
+                let text = if (80..120).contains(&index) {
+                    format!("row-changed-{index}")
+                } else {
+                    format!("item-{index}")
+                };
+                RetainedSurface::builder(
+                    Uuid::from_u128(u128::try_from(index + 1).unwrap()),
+                    DamageRect::new(0, y, 40, 1),
+                )
+                .revision(1)
+                .render_ops(vec![RenderOp::text_run(0, y, text, RenderStyle::default())])
+                .build()
+            })
+            .collect::<Vec<_>>();
+        let full_changed = (0..ITEM_COUNT)
+            .map(|index| {
+                let y = u16::try_from(index).unwrap();
+                RetainedSurface::builder(
+                    Uuid::from_u128(u128::try_from(index + 1).unwrap()),
+                    DamageRect::new(0, y, 40, 1),
+                )
+                .revision(1)
+                .render_ops(vec![RenderOp::text_run(
+                    0,
+                    y,
+                    format!("full-changed-{index}"),
+                    RenderStyle::default(),
+                )])
+                .build()
+            })
+            .collect::<Vec<_>>();
+        let mut measure_alternating = |alternate: &[RetainedSurface]| {
+            let started = Instant::now();
+            for iteration in 0..ITERATIONS {
+                let next = if iteration % 2 == 0 {
+                    alternate.to_vec()
+                } else {
+                    stable.clone()
+                };
+                black_box(compositor.replace_surfaces(
+                    next,
+                    viewport,
+                    DamageCoalescingPolicy::default(),
+                ));
+            }
+            started.elapsed().as_nanos() / u128::from(ITERATIONS)
+        };
+        let incremental_ns = measure_alternating(&changed);
+        let row_ns = measure_alternating(&row_changed);
+        let full_ns = measure_alternating(&full_changed);
         println!(
-            "plugin surfaces={ITEM_COUNT} iterations={ITERATIONS} no_op_average_ns={no_op_ns} incremental_average_ns={incremental_ns}"
+            "plugin surfaces={ITEM_COUNT} iterations={ITERATIONS} no_op_average_ns={no_op_ns} one_item_average_ns={incremental_ns} one_row_average_ns={row_ns} full_surface_average_ns={full_ns}"
         );
     }
 
