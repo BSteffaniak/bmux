@@ -2400,6 +2400,59 @@ fn plugin_api_crates_do_not_expose_handwritten_transport_clients() {
     }
 }
 
+/// Stable plugin API crates are contracts, not runtime implementation homes.
+/// Keep this scan repository-wide so a newly-added API crate is covered without
+/// requiring a hand-maintained allowlist.
+#[test]
+fn plugin_api_crates_do_not_own_runtime_implementation() {
+    const FORBIDDEN_RUNTIME_MARKERS: &[&str] = &[
+        "impl RustPlugin",
+        "NativeLifecycleContext",
+        "TypedServiceRegistry",
+        "global_event_bus()",
+        "register_state_channel",
+        "register_channel::<",
+        "tokio::spawn",
+        "std::thread::spawn",
+        "std::sync::Mutex",
+        "std::sync::RwLock",
+        "std::sync::OnceLock",
+    ];
+    const FORBIDDEN_CONCRETE_TYPES: &[&str] = &[
+        "pub struct FollowState",
+        "pub struct ContextState",
+        "pub struct SessionManager",
+        "pub struct RecordingRuntime",
+        "pub struct PresentationRegistry",
+        "pub struct PresentationManager",
+        "pub struct RateLimiter",
+    ];
+
+    for plugin_dir in plugin_api_crate_dirs() {
+        for source_path in rust_source_files(&plugin_dir) {
+            let source = std::fs::read_to_string(&source_path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source_path.display()));
+            let production = production_section(&source);
+
+            for marker in FORBIDDEN_RUNTIME_MARKERS {
+                assert!(
+                    !production.contains(marker),
+                    "{} must not contain runtime implementation marker `{marker}`",
+                    source_path.display(),
+                );
+            }
+
+            for marker in FORBIDDEN_CONCRETE_TYPES {
+                assert!(
+                    !production.contains(marker),
+                    "{} must not define concrete runtime type `{marker}` in a plugin API crate",
+                    source_path.display(),
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn plugin_implementations_do_not_recreate_domain_ipc_layers() {
     for plugin_dir in iter_plugin_dirs() {
