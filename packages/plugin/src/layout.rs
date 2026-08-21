@@ -85,6 +85,12 @@ pub enum LayoutOperation {
 }
 
 /// One independently owned layout request.
+///
+/// Requests participate in one flat root-viewport sequence. They do not name a
+/// parent or target another request: a split consumes the current remainder,
+/// while an overlay or hidden request observes that same remainder without
+/// consuming it. Producers subdivide an allocation internally when they need a
+/// nested arrangement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginLayoutRequest {
     pub id: PluginLayoutId,
@@ -396,7 +402,13 @@ pub fn global_plugin_layout_registry() -> &'static PluginLayoutRegistry {
     GLOBAL_PLUGIN_LAYOUT_REGISTRY.get_or_init(|| PluginLayoutRegistry::new(64))
 }
 
-/// Resolve requests in `(order, owner_plugin_id, local_id)` order.
+/// Resolve flat root-viewport requests in `(order, owner_plugin_id, local_id)`
+/// order.
+///
+/// Requests have no parent relationship and cannot target another request's
+/// allocation. Each operation is evaluated against the current root remainder;
+/// only a split consumes it. This keeps composition deterministic across
+/// independently owned producers without exposing product relationships.
 ///
 /// `minimum_remaining` reserves a lower bound for the final host-owned region.
 /// Each split is clamped independently, so malformed or oversized requests

@@ -137,6 +137,11 @@ impl AttachSimHarness {
         self.render();
     }
 
+    pub fn resize_viewport(&mut self, cols: u16, rows: u16) {
+        self.geometry = TerminalGeometry { cols, rows };
+        self.render();
+    }
+
     pub fn set_tab_template(&mut self, template: &str) {
         self.status_config.tab_template = Some(template.to_string());
         self.render();

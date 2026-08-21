@@ -42,7 +42,7 @@ pub use render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, DamageCoalescingPolicy,
     DamageRect, ExtensionRenderStats, FrameDamage, FrameDamageStats, frame_damage_overlay_rects,
     frame_damage_overlay_render_ops, queue_frame_damage_overlay,
-    queue_frame_damage_overlay_with_trace,
+    queue_frame_damage_overlay_with_trace, queue_render_ops_with_capabilities,
 };
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{

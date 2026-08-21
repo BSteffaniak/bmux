@@ -2434,6 +2434,31 @@ pub fn install() {
     });
 }
 
+/// Publish one transport-relayed scene into the decoration compatibility
+/// adapter's retained local channel.
+///
+/// The renderer owns channel creation and the empty compatibility snapshot so
+/// attach core only decodes and forwards the decoration plugin's typed payload.
+pub fn publish_relayed_scene(scene: DecorationScene) {
+    if bmux_plugin::global_event_bus()
+        .publish_state(&SCENE_STATE_KIND, scene.clone())
+        .is_ok()
+    {
+        return;
+    }
+    let _ = bmux_plugin::global_event_bus().register_state_channel::<DecorationScene>(
+        SCENE_STATE_KIND,
+        DecorationScene {
+            revision: 0,
+            surfaces: BTreeMap::new(),
+            animation: None,
+            input_hooks: Vec::new(),
+            visual_adapters: Vec::new(),
+        },
+    );
+    let _ = bmux_plugin::global_event_bus().publish_state(&SCENE_STATE_KIND, scene);
+}
+
 /// Manual push path. Callers that receive scene payloads from a
 /// transport other than the local event bus (e.g. the CLI's
 /// streaming loop decoding IPC `PluginBusEvent`s) call this to

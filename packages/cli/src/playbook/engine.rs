@@ -1624,7 +1624,9 @@ async fn switch_window_by_id_playbook(client: &mut BmuxClient, id: Uuid) -> anyh
         invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::WindowAck>(
             client,
             "switch-window",
-            &id.to_string(),
+            &windows_commands::client::SwitchWindowRequest {
+                target: id.to_string(),
+            },
         )
         .await?;
     Ok(())
@@ -1758,11 +1760,13 @@ async fn run_known_attach_plugin_command_playbook(
     match command_name {
         "new-window" => {
             let name = args.first().cloned();
-            let _ack = invoke_windows_command_bmux::<
-                _,
-                bmux_windows_plugin_api::windows_commands::WindowAck,
-            >(client, "new-window", &name)
-            .await?;
+            let _ack: bmux_windows_plugin_api::windows_commands::WindowAck =
+                invoke_windows_command_bmux(
+                    client,
+                    "new-window",
+                    &windows_commands::client::NewWindowRequest { name },
+                )
+                .await?;
             Ok(Some(PluginCliCommandResponse::new(0)))
         }
         "next-window" => {
@@ -2158,6 +2162,12 @@ fn execute_attach_sim_step(
             sim.render();
             Ok(Some(sim.rendered().to_string()))
         }
+        Action::ResizeViewport { cols, rows } => {
+            sim.resize_viewport(*cols, *rows);
+            Ok(Some(format!(
+                "attach-sim viewport resized to {cols}x{rows}"
+            )))
+        }
         Action::Locate { id, text } => {
             let resolved_text = runtime_vars.resolve_opt(text);
             let location = sim
@@ -2297,6 +2307,9 @@ fn execute_attach_sim_step(
                 }
                 ("appearance.status_position", "bottom") => {
                     sim.set_status_position(bmux_config::StatusPosition::Bottom);
+                }
+                ("appearance.status_position", "off") => {
+                    sim.set_status_position(bmux_config::StatusPosition::Off);
                 }
                 ("status_bar.tab_template", template) => {
                     sim.set_tab_template(template);

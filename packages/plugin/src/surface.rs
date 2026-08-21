@@ -204,7 +204,7 @@ impl PluginSurfaceRegion {
             HitRole::Action | HitRole::ListItem | HitRole::DragHandle => {
                 PluginSurfaceCursor::Pointer
             }
-            HitRole::Scroll | HitRole::Decoration | HitRole::Custom(_) => {
+            HitRole::Scroll | HitRole::Background | HitRole::Custom(_) => {
                 PluginSurfaceCursor::Default
             }
         };

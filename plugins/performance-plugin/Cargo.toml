@@ -19,13 +19,16 @@ bmux_performance_plugin_api = { workspace = true }
 bmux_performance_state      = { workspace = true }
 bmux_plugin                 = { workspace = true }
 bmux_plugin_sdk             = { workspace = true }
+bmux_presentation_state     = { workspace = true }
 serde                       = { workspace = true, features = ["derive", "std"] }
 serde_json                  = { workspace = true }
 sysinfo                     = { workspace = true }
+uuid                        = { workspace = true, features = ["std"] }
 
 [features]
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_presentation_state/fail-on-warnings",
 ]
 static-bundled = []

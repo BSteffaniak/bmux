@@ -462,6 +462,28 @@ pub enum RenderColor {
     Rgb { r: u8, g: u8, b: u8 },
 }
 
+impl RenderColor {
+    /// Resolve a color to a terminal-supported representation.
+    #[must_use]
+    pub fn for_capabilities(self, capabilities: TerminalRenderCapabilities) -> Self {
+        match self {
+            Self::Rgb { r, g, b } if !capabilities.truecolor => {
+                Self::Indexed(rgb_to_ansi256(r, g, b))
+            }
+            color => color,
+        }
+    }
+}
+
+fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    fn component(value: u8) -> u16 {
+        (u16::from(value) * 5 + 127) / 255
+    }
+
+    let indexed = 16 + 36 * component(r) + 6 * component(g) + component(b);
+    u8::try_from(indexed).expect("ANSI 256-color cube index is bounded")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderNamedColor {
     Black,
@@ -552,6 +574,14 @@ impl RenderStyle {
     #[must_use]
     pub const fn indexed_background(self, color: u8) -> Self {
         self.background(RenderColor::Indexed(color))
+    }
+
+    /// Resolve capability-dependent style values before terminal lowering.
+    #[must_use]
+    pub fn for_capabilities(mut self, capabilities: TerminalRenderCapabilities) -> Self {
+        self.fg = self.fg.map(|color| color.for_capabilities(capabilities));
+        self.bg = self.bg.map(|color| color.for_capabilities(capabilities));
+        self
     }
 
     #[must_use]
@@ -680,6 +710,16 @@ impl BorderGlyphs {
             bottom_right: '┘',
             horizontal: '─',
             vertical: '│',
+        }
+    }
+
+    /// Use ASCII borders when the terminal cannot reliably draw Unicode boxes.
+    #[must_use]
+    pub const fn for_capabilities(self, capabilities: TerminalRenderCapabilities) -> Self {
+        if capabilities.unicode_box_drawing {
+            self
+        } else {
+            Self::ascii()
         }
     }
 }
@@ -1923,6 +1963,37 @@ mod tests {
                 },
             ),
             Some((0, "界".to_string()))
+        );
+    }
+
+    #[test]
+    fn render_capability_fallbacks_are_deterministic() {
+        let capabilities = TerminalRenderCapabilities {
+            truecolor: false,
+            unicode_box_drawing: false,
+            ..TerminalRenderCapabilities::default()
+        };
+        assert_eq!(
+            RenderColor::Rgb { r: 255, g: 0, b: 0 }.for_capabilities(capabilities),
+            RenderColor::Indexed(196)
+        );
+        assert_eq!(
+            RenderColor::Rgb {
+                r: 128,
+                g: 128,
+                b: 128,
+            }
+            .for_capabilities(capabilities),
+            RenderColor::Indexed(145)
+        );
+        assert_eq!(
+            BorderGlyphs::rounded().for_capabilities(capabilities),
+            BorderGlyphs::ascii()
+        );
+        assert_eq!(
+            RenderColor::Rgb { r: 1, g: 2, b: 3 }
+                .for_capabilities(TerminalRenderCapabilities::default()),
+            RenderColor::Rgb { r: 1, g: 2, b: 3 }
         );
     }
 

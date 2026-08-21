@@ -3197,6 +3197,10 @@ fn plugin_presentation_primitives_remain_domain_neutral() {
             include_str!("../../plugin/src/surface.rs"),
         ),
         (
+            "packages/plugin/src/render.rs",
+            include_str!("../../plugin/src/render.rs"),
+        ),
+        (
             "packages/attach_pipeline/src/compositor.rs",
             include_str!("../../attach_pipeline/src/compositor.rs"),
         ),
@@ -3210,6 +3214,7 @@ fn plugin_presentation_primitives_remain_domain_neutral() {
         "bmux.windows",
         "status_top_inset",
         "status_bottom_inset",
+        "HitRole::Decoration",
     ];
 
     for (path, source) in sources {
@@ -3220,4 +3225,28 @@ fn plugin_presentation_primitives_remain_domain_neutral() {
             );
         }
     }
+}
+
+/// Independent retained surfaces must remain bounded text/cell paint rather
+/// than becoming an unbounded terminal-image transport.
+#[test]
+fn plugin_surface_paint_contract_excludes_graphics_payloads() {
+    let surface_source = production_section(include_str!("../../plugin/src/surface.rs"));
+    let render_source = production_section(include_str!("../../plugin/src/render.rs"));
+    let render_op = render_source
+        .split("pub enum RenderOp {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nimpl RenderOp").next())
+        .expect("RenderOp declaration should remain available to the architecture guard");
+
+    for marker in ["TerminalGraphic", "Graphic(", "Image", "Pixel", "Vec<u8>"] {
+        assert!(
+            !render_op.contains(marker),
+            "RenderOp must not carry terminal graphics payload marker {marker}",
+        );
+    }
+    assert!(
+        !surface_source.contains("TerminalGraphic"),
+        "plugin surface snapshots must not embed terminal graphics payloads",
+    );
 }

@@ -29,6 +29,7 @@ bmux_pane_runtime_state = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_presentation_state = { workspace = true }
 bmux_recording_protocol = { workspace = true }
 bmux_recording_runtime = { workspace = true }
 bmux_session_models = { workspace = true }
@@ -61,6 +62,7 @@ fail-on-warnings = [
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_presentation_state/fail-on-warnings",
     "bmux_permissions_plugin_api/fail-on-warnings",
     "bmux_sessions_plugin_api/fail-on-warnings",
 ]

@@ -7,6 +7,7 @@ use bmux_plugin::{RenderColor, RenderStyle, RenderTextSpan};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct AttachTab {
     pub label: String,
     pub active: bool,
@@ -1433,6 +1434,44 @@ fn clamp_hitboxes_to_visible_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual presentation baseline; run with --release --ignored --nocapture"]
+    fn status_projection_performance_baseline() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 20_000;
+        let config = indexed_config();
+        let one = sim_tabs(1, 0);
+        let many = sim_tabs(64, 32);
+        let hovered = many[40].context_id;
+        let mut reordered = many.clone();
+        reordered.rotate_left(17);
+        let mut renamed = many.clone();
+        renamed[32].label = "renamed-window-with-a-long-label".to_string();
+
+        let measure = |tabs: &[AttachTab], hover: Option<Uuid>| {
+            let started = Instant::now();
+            let mut bytes = 0_usize;
+            for _ in 0..ITERATIONS {
+                let status = status_line_hovering(240, &config, black_box(tabs), hover);
+                bytes = bytes.saturating_add(status.rendered.len());
+                black_box(status);
+            }
+            (started.elapsed().as_nanos() / u128::from(ITERATIONS), bytes)
+        };
+        let (one_ns, one_bytes) = measure(&one, None);
+        let (many_ns, many_bytes) = measure(&many, None);
+        let (idle_ns, idle_bytes) = measure(&many, None);
+        let (hover_ns, hover_bytes) = measure(&many, hovered);
+        let (reorder_ns, reorder_bytes) = measure(&reordered, None);
+        let (rename_ns, rename_bytes) = measure(&renamed, None);
+
+        println!(
+            "status iterations={ITERATIONS} one_ns={one_ns} one_bytes={one_bytes} many_ns={many_ns} many_bytes={many_bytes} idle_ns={idle_ns} idle_bytes={idle_bytes} hover_ns={hover_ns} hover_bytes={hover_bytes} reorder_ns={reorder_ns} reorder_bytes={reorder_bytes} rename_ns={rename_ns} rename_bytes={rename_bytes}"
+        );
+    }
 
     #[test]
     fn mode_badge_uses_mode_indicator_color() {

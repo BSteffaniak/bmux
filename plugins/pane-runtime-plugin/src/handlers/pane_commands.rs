@@ -16,9 +16,14 @@ use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, AttachViewComponen
 use bmux_pane_runtime_state::{
     FloatingPaneLayer, FloatingPaneScope, LayoutRect, PaneResizeDirection,
 };
+use bmux_presentation_state::{
+    PresentationEntityRef, PresentationFact, PresentationFactRole, PresentationFactSnapshot,
+    global_presentation_fact_host_service,
+};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -397,6 +402,56 @@ fn publish_pane_event(event: PaneEvent) {
     let _ = bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event);
 }
 
+static PANE_FACT_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn publish_pane_lifecycle_facts() {
+    let Some(handle) = super::session_runtime_handle() else {
+        return;
+    };
+    let facts = handle
+        .0
+        .active_session_ids()
+        .into_iter()
+        .flat_map(|session_id| handle.0.list_panes(session_id).unwrap_or_default())
+        .map(|pane| PresentationFact {
+            entity: PresentationEntityRef::new("bmux.panes", pane.id.to_string()),
+            key: "lifecycle".to_string(),
+            role: if matches!(pane.state, bmux_attach_layout_protocol::PaneState::Exited) {
+                PresentationFactRole::Error
+            } else {
+                PresentationFactRole::Active
+            },
+            short_text: if matches!(pane.state, bmux_attach_layout_protocol::PaneState::Exited) {
+                "exited".to_string()
+            } else {
+                "running".to_string()
+            },
+            detail_text: pane.state_reason,
+            icon_id: Some(
+                if matches!(pane.state, bmux_attach_layout_protocol::PaneState::Exited) {
+                    "pane.exited"
+                } else {
+                    "pane.running"
+                }
+                .to_string(),
+            ),
+            priority: 100,
+        })
+        .collect();
+    let _ = global_presentation_fact_host_service()
+        .registry()
+        .publish_authorized(
+            "bmux.pane_runtime",
+            "bmux.pane_runtime",
+            PresentationFactSnapshot {
+                revision: PANE_FACT_REVISION
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1),
+                facts,
+            },
+        );
+}
+
 /// Bump a session's attach-view revision and publish the scene
 /// component update. Mirrors the server's
 /// `emit_attach_view_changed_for_layout` helper so plugin-side
@@ -419,6 +474,7 @@ fn emit_attach_view_changed_scene(session_id: SessionId) {
         components: vec![AttachViewComponent::Scene],
     });
     super::publish_focus_state_snapshot();
+    publish_pane_lifecycle_facts();
 }
 
 fn emit_attach_view_changed_scene_all() {

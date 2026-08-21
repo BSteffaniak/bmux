@@ -25,6 +25,10 @@ use bmux_performance_state::{
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_presentation_state::{
+    PresentationEntityRef, PresentationFact, PresentationFactRole, PresentationFactSnapshot,
+    global_presentation_fact_host_service,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -58,6 +62,8 @@ impl Default for MetricsState {
 }
 
 static METRICS_STATE: OnceLock<Mutex<MetricsState>> = OnceLock::new();
+static PRESENTATION_FACT_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn metrics_state() -> &'static Mutex<MetricsState> {
     METRICS_STATE.get_or_init(|| Mutex::new(MetricsState::default()))
@@ -675,6 +681,7 @@ fn publish_metrics_snapshot(snapshot: &MetricsSnapshot) {
     if let Ok(mut state) = metrics_state().lock() {
         state.snapshot = snapshot.clone();
     }
+    publish_performance_facts(snapshot);
     let _ = global_event_bus().publish_state(&METRICS_STATE_KIND, snapshot.clone());
     let _ = global_event_bus().emit(
         &METRIC_EVENT_KIND,
@@ -682,6 +689,44 @@ fn publish_metrics_snapshot(snapshot: &MetricsSnapshot) {
             sampled_at_epoch_ms: snapshot.sampled_at_epoch_ms,
         },
     );
+}
+
+fn publish_performance_facts(snapshot: &MetricsSnapshot) {
+    let facts = snapshot
+        .panes
+        .values()
+        .filter(|pane| pane.available)
+        .map(|pane| PresentationFact {
+            entity: PresentationEntityRef::new("bmux.panes", pane.pane_id.to_string()),
+            key: "resource-usage".to_string(),
+            role: if pane.cpu_percent >= 90.0 {
+                PresentationFactRole::Warning
+            } else if pane.cpu_percent > 0.0 {
+                PresentationFactRole::Active
+            } else {
+                PresentationFactRole::Idle
+            },
+            short_text: format!("cpu {:.0}%", pane.cpu_percent),
+            detail_text: Some(format!(
+                "memory {} bytes; {} process(es)",
+                pane.memory_bytes, pane.process_count
+            )),
+            icon_id: Some("metrics.cpu".to_string()),
+            priority: 10,
+        })
+        .collect();
+    let _ = global_presentation_fact_host_service()
+        .registry()
+        .publish_authorized(
+            "bmux.performance",
+            "bmux.performance",
+            PresentationFactSnapshot {
+                revision: PRESENTATION_FACT_REVISION
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1),
+                facts,
+            },
+        );
 }
 
 fn sample_metrics(system: &mut System, watches: Vec<MetricWatch>) -> MetricsSnapshot {
@@ -880,6 +925,41 @@ bmux_plugin_sdk::export_plugin!(PerformancePlugin, include_str!("../plugin.toml"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn performance_snapshot_projects_bounded_pane_facts() {
+        let pane_id = uuid::Uuid::from_u128(42);
+        let snapshot = MetricsSnapshot {
+            sampled_at_epoch_ms: 1,
+            panes: BTreeMap::from([(
+                pane_id,
+                PaneMetricsSnapshot {
+                    pane_id,
+                    session_id: None,
+                    pid: None,
+                    process_group_id: None,
+                    cpu_percent: 95.0,
+                    cpu_raw_percent: 95.0,
+                    cpu_normalized_percent: 95.0,
+                    memory_bytes: 4096,
+                    process_count: 2,
+                    available: true,
+                },
+            )]),
+            ..MetricsSnapshot::default()
+        };
+        publish_performance_facts(&snapshot);
+        let facts = global_presentation_fact_host_service()
+            .registry()
+            .facts_for_entity(&PresentationEntityRef::new(
+                "bmux.panes",
+                pane_id.to_string(),
+            ));
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].0, "bmux.performance");
+        assert_eq!(facts[0].1.role, PresentationFactRole::Warning);
+        assert_eq!(facts[0].1.short_text, "cpu 95%");
+    }
 
     #[test]
     fn process_tree_aggregates_descendants() {

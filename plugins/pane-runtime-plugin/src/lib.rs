@@ -51,6 +51,7 @@ impl RustPlugin for PaneRuntimePlugin {
         // though the map is usually empty at activate time — sessions
         // are created later).
         handlers::publish_focus_state_snapshot();
+        handlers::pane_commands::publish_pane_lifecycle_facts();
 
         let config = bmux_plugin::global_plugin_state_registry()
             .get::<bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig>()
@@ -84,6 +85,9 @@ impl RustPlugin for PaneRuntimePlugin {
                 .cancel_all_previews()
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?;
         }
+        bmux_presentation_state::global_presentation_fact_host_service()
+            .registry()
+            .remove_producer("bmux.pane_runtime");
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 

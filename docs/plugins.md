@@ -15,9 +15,15 @@ Plugins that provide attach-side presentation publish retained state instead of
 being called from the terminal frame loop. The canonical path is:
 
 1. Publish owner-scoped geometry through
-   `bmux_plugin::layout::PluginLayoutRegistry`. Split requests are resolved in
-   deterministic `(order, owner_plugin_id, local_id)` order and preserve the
-   host's configured minimum content region.
+   `bmux_plugin::layout::PluginLayoutRegistry`. Every request targets the one
+   attach-host root viewport; requests do not form a parent/child tree and
+   cannot target another owner's allocation. Split requests consume the current
+   root remainder, while overlay and hidden requests observe that same current
+   remainder without consuming it. Cross-plugin composition is expressed only
+   by deterministic `(order, owner_plugin_id, local_id)` ordering. This flat
+   root model deliberately keeps product relationships out of the generic
+   layout contract; a producer that needs internal subdivision projects it
+   inside its allocated surface.
 2. Publish a complete, owner-scoped `PluginSurfaceSnapshot` through
    `bmux_plugin::surface::PluginSurfaceRegistry`. A surface either follows one
    of that owner's layout allocations or uses explicit geometry for an overlay.
@@ -45,7 +51,11 @@ Publications are bounded and validated. Layout and surface registries reject
 foreign ownership, duplicate stable identity, stale/conflicting revisions,
 oversized snapshots, excessive retained operations, oversized text, and
 optionally over-frequent updates. Rendering uses the last committed snapshot
-and never requires a synchronous plugin call per frame.
+and never requires a synchronous plugin call per frame. Retained paint lowering
+also receives the attach terminal's generic capabilities: RGB colors degrade to
+the ANSI 256-color cube when truecolor is unavailable, and Unicode borders
+degrade to ASCII when box drawing is unavailable. Producers can use the same
+`TerminalRenderCapabilities` facts for product-specific glyph choices.
 
 The in-process global registries are the current attach-host publication
 mechanism. They support late subscribers through retained snapshots and watch

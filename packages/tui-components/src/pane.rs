@@ -372,7 +372,7 @@ impl Pane<'_> {
         if self.policy.mouse.enabled && !state.area.is_empty() {
             frame.push_hit(
                 SceneRegion::new(id.clone(), state.area)
-                    .role(HitRole::Decoration)
+                    .role(HitRole::Background)
                     .hoverable(true)
                     .focusable(false)
                     .enabled(!state.interaction.disabled),
@@ -816,7 +816,7 @@ mod tests {
         let regions = frame.hits().regions();
         assert_eq!(regions[0].id.as_str(), "editor");
         assert_eq!(regions[0].area, Rect::new(5, 3, 10, 5));
-        assert_eq!(regions[0].role, HitRole::Decoration);
+        assert_eq!(regions[0].role, HitRole::Background);
         assert_eq!(regions[1].id.as_str(), "editor.title");
         assert_eq!(regions[1].area, Rect::new(5, 3, 10, 1));
         assert_eq!(regions[1].role, HitRole::DragHandle);

@@ -16,10 +16,11 @@ use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceK
 use bmux_plugin::TerminalGraphicFill;
 use bmux_plugin::{
     AttachRenderExtension, AttachVisualCellRef, AttachVisualFrameView,
-    AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect,
+    AttachVisualProjectionUpdate, AttachVisualSurfaceView, BorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
-    RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell, TerminalGraphicOverlay,
-    TerminalRenderCapabilities, clip_render_text_run_to_rect, render_text_width_u16,
+    RenderNamedColor, RenderOp, RenderStyle, RenderTextSpan, RenderUnderCell,
+    TerminalGraphicOverlay, TerminalRenderCapabilities, clip_render_text_run_to_rect,
+    render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
@@ -461,8 +462,100 @@ pub fn queue_render_ops<W: io::Write>(
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> Result<bool> {
-    let plan = build_render_ops_output_plan(surface_rect, damage, ops);
+    queue_render_ops_with_capabilities(
+        stdout,
+        surface_rect,
+        damage,
+        ops,
+        TerminalRenderCapabilities::default(),
+    )
+}
+
+/// Queue declarative text/cell operations using detected terminal capabilities.
+///
+/// RGB colors fall back to the ANSI 256-color cube when truecolor is absent,
+/// and Unicode borders fall back to ASCII when box drawing is unavailable.
+///
+/// # Errors
+///
+/// Returns an error if writing terminal control bytes fails.
+pub fn queue_render_ops_with_capabilities<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+    capabilities: TerminalRenderCapabilities,
+) -> Result<bool> {
+    let fallback_ops = render_ops_for_capabilities(ops, capabilities);
+    let plan = build_render_ops_output_plan(surface_rect, damage, &fallback_ops);
     emit_render_ops_output_plan(stdout, &plan)
+}
+
+fn render_ops_for_capabilities(
+    ops: &[RenderOp],
+    capabilities: TerminalRenderCapabilities,
+) -> Vec<RenderOp> {
+    ops.iter()
+        .cloned()
+        .map(|op| match op {
+            RenderOp::TextRun { x, y, text, style } => RenderOp::TextRun {
+                x,
+                y,
+                text,
+                style: style.for_capabilities(capabilities),
+            },
+            RenderOp::StyledText { x, y, spans } => RenderOp::StyledText {
+                x,
+                y,
+                spans: spans
+                    .into_iter()
+                    .map(|span| RenderTextSpan {
+                        text: span.text,
+                        style: span.style.for_capabilities(capabilities),
+                    })
+                    .collect(),
+            },
+            RenderOp::ClearRect { rect, style } => RenderOp::ClearRect {
+                rect,
+                style: style.for_capabilities(capabilities),
+            },
+            RenderOp::EraseRowSegment { x, y, width, style } => RenderOp::EraseRowSegment {
+                x,
+                y,
+                width,
+                style: style.for_capabilities(capabilities),
+            },
+            RenderOp::FillRect { rect, ch, style } => RenderOp::FillRect {
+                rect,
+                ch,
+                style: style.for_capabilities(capabilities),
+            },
+            RenderOp::Border {
+                rect,
+                glyphs,
+                style,
+            } => RenderOp::Border {
+                rect,
+                glyphs: glyphs.for_capabilities(capabilities),
+                style: style.for_capabilities(capabilities),
+            },
+            RenderOp::CellGrid { x, y, rows } => RenderOp::CellGrid {
+                x,
+                y,
+                rows: rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|cell| RenderCell {
+                                ch: cell.ch,
+                                style: cell.style.for_capabilities(capabilities),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5508,8 +5601,8 @@ mod tests {
         execute_pane_content_row_output_plan, frame_damage_overlay_render_ops, opaque_row_text,
         optimize_terminal_commands, previous_extension_snapshot_cleanup_damage,
         queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, queue_render_style, render_attach_scene,
-        render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        queue_render_ops, queue_render_ops_with_capabilities, queue_render_style,
+        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -5521,14 +5614,12 @@ mod tests {
         AttachSurfaceKind, PaneState, PaneSummary,
     };
     use bmux_plugin::{
-        ExtensionRect, RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer,
-        RenderNamedColor, RenderOp, RenderStyle, RenderUnderCell,
+        BorderGlyphs as PluginBorderGlyphs, ExtensionRect, RenderColor, RenderDamage,
+        RenderExtensionContext, RenderExtensionLayer, RenderNamedColor, RenderOp, RenderStyle,
+        RenderUnderCell, TerminalRenderCapabilities,
     };
     #[cfg(feature = "image-kitty")]
-    use bmux_plugin::{
-        RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRenderCapabilities,
-        TerminalRgba,
-    };
+    use bmux_plugin::{RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRgba};
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
@@ -8514,6 +8605,42 @@ mod tests {
         assert!(output.contains("\u{1b}[1;2H   "), "{output:?}");
         assert!(output.contains("\u{1b}[2;2H   "), "{output:?}");
         assert!(output.contains("\u{1b}[2;6H  "), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_degrades_color_and_border_capabilities() {
+        let ops = [
+            RenderOp::text_run(0, 0, "x", RenderStyle::new().rgb_foreground(255, 0, 0)),
+            RenderOp::border(
+                ExtensionRect::new(0, 1, 4, 2),
+                PluginBorderGlyphs::rounded(),
+                RenderStyle::default(),
+            ),
+        ];
+        let capabilities = TerminalRenderCapabilities {
+            truecolor: false,
+            unicode_box_drawing: false,
+            ..TerminalRenderCapabilities::default()
+        };
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops_with_capabilities(
+                &mut output,
+                ExtensionRect::new(0, 0, 8, 4),
+                &RenderDamage::FullSurface,
+                &ops,
+                capabilities,
+            )
+            .expect("fallback render ops should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[38;5;196m"), "{output:?}");
+        assert!(!output.contains("38;2;255;0;0"), "{output:?}");
+        assert!(output.contains('+'), "{output:?}");
+        assert!(output.contains('-'), "{output:?}");
+        assert!(!output.contains('╭'), "{output:?}");
     }
 
     #[test]

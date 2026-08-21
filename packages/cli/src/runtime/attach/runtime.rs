@@ -17,9 +17,10 @@ use bmux_attach_pipeline::{
     FrameDamageStats, PaneScrollbackWindow, RetainedDamage, RetainedOpacity,
     RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload, ScrollbackViewportBase,
     frame_damage_from_retained_repaint_plan, merge_retained_damages,
-    retained_damage_from_absolute_rects, retained_frame_damage_from_frame_damage,
-    retained_layer_order, retained_surfaces_from_attach_scene,
-    retained_surfaces_from_plugin_surfaces, update_protocol_hints_from_state,
+    queue_render_ops_with_capabilities, retained_damage_from_absolute_rects,
+    retained_frame_damage_from_frame_damage, retained_layer_order,
+    retained_surfaces_from_attach_scene, retained_surfaces_from_plugin_surfaces,
+    update_protocol_hints_from_state,
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
@@ -697,37 +698,6 @@ where
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("decoding {operation} response: {error}"),
     })
-}
-
-/// Empty local decoration scene used only when the attach process needs to
-/// create the retained state channel before publishing a relayed scene event.
-const fn empty_decoration_scene() -> bmux_scene_protocol::scene_protocol::DecorationScene {
-    bmux_scene_protocol::scene_protocol::DecorationScene {
-        revision: 0,
-        surfaces: BTreeMap::new(),
-        animation: None,
-        input_hooks: Vec::new(),
-        visual_adapters: Vec::new(),
-    }
-}
-
-fn publish_decoration_scene_locally(scene: bmux_scene_protocol::scene_protocol::DecorationScene) {
-    if bmux_plugin::global_event_bus()
-        .publish_state(
-            &bmux_scene_protocol::scene_protocol::STATE_KIND,
-            scene.clone(),
-        )
-        .is_ok()
-    {
-        return;
-    }
-    let _ = bmux_plugin::global_event_bus()
-        .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
-            bmux_scene_protocol::scene_protocol::STATE_KIND,
-            empty_decoration_scene(),
-        );
-    let _ = bmux_plugin::global_event_bus()
-        .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
 }
 
 /// Typed dispatch wrapper for `contexts-state:current-context`.
@@ -4925,7 +4895,7 @@ async fn handle_attach_stream_server_event(
             ) {
                 Ok(scene) => {
                     let scene_revision = scene.revision;
-                    publish_decoration_scene_locally(scene);
+                    bmux_decoration_plugin_renderer::publish_relayed_scene(scene);
                     if scene_revision != *last_scene_revision {
                         *last_scene_revision = scene_revision;
                         view_state
@@ -8016,6 +7986,7 @@ fn queue_retained_render_ops(
     stdout: &mut impl Write,
     surface: &RetainedSurface,
     repaint: &RetainedRepaintSurface,
+    capabilities: bmux_plugin::TerminalRenderCapabilities,
 ) -> Result<bool> {
     let RetainedSurfacePayload::RenderOps(ops) = &surface.payload else {
         return Ok(false);
@@ -8027,7 +7998,7 @@ fn queue_retained_render_ops(
         surface.rect.h,
     );
     let damage = render_damage_from_retained_damage_rects(&repaint.damage);
-    queue_render_ops(stdout, surface_rect, &damage, ops)
+    queue_render_ops_with_capabilities(stdout, surface_rect, &damage, ops, capabilities)
         .context("failed queueing retained render ops")
 }
 
@@ -8571,13 +8542,14 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         cs.visible = false;
     }
     queue_retained_background_clear(&mut frame_bytes, &frame_plan.retained.damage.graph)?;
+    let retained_capabilities = terminal_render_capabilities(view_state);
     let status_rendered = if let Some((surface, repaint)) = frame_plan
         .retained
         .status_surface
         .as_ref()
         .zip(retained_repaint_by_id.get(&STATUS_SURFACE_ID))
     {
-        queue_retained_render_ops(&mut frame_bytes, surface, repaint)?
+        queue_retained_render_ops(&mut frame_bytes, surface, repaint, retained_capabilities)?
     } else {
         false
     };
@@ -8701,11 +8673,15 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     for extension in &retained_extensions {
         extension.refresh_state();
     }
-    let retained_capabilities = terminal_render_capabilities(view_state);
     let mut overlay_cursor_state = None;
     if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
-        && queue_retained_render_ops(&mut frame_bytes, help_surface, repaint)?
+        && queue_retained_render_ops(
+            &mut frame_bytes,
+            help_surface,
+            repaint,
+            retained_capabilities,
+        )?
     {
         if let Some(trace) = render_trace.as_deref_mut() {
             trace.push(AttachRenderTraceOp::HelpOverlay {
@@ -8726,7 +8702,12 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     }
     if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
-        && queue_retained_render_ops(&mut frame_bytes, prompt_surface, repaint)?
+        && queue_retained_render_ops(
+            &mut frame_bytes,
+            prompt_surface,
+            repaint,
+            retained_capabilities,
+        )?
     {
         overlay_cursor_state = frame_plan
             .retained
@@ -8758,7 +8739,12 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
 
     if let Some(menu_surface) = frame_plan.retained.tab_menu_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&menu_surface.id)
-        && queue_retained_render_ops(&mut frame_bytes, menu_surface, repaint)?
+        && queue_retained_render_ops(
+            &mut frame_bytes,
+            menu_surface,
+            repaint,
+            retained_capabilities,
+        )?
     {
         overlay_rendered = true;
         overlay_rendered |= queue_retained_extension_ops(
@@ -8781,7 +8767,12 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         )
     {
         let repaint = retained_full_surface_repaint(&damage_surface);
-        if queue_retained_render_ops(&mut frame_bytes, &damage_surface, &repaint)? {
+        if queue_retained_render_ops(
+            &mut frame_bytes,
+            &damage_surface,
+            &repaint,
+            retained_capabilities,
+        )? {
             let rects = frame_damage_overlay_rects(
                 &layout_state.scene,
                 &frame_damage,
@@ -17867,6 +17858,21 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         assert_eq!(initial.rects(), &[DamageRect::new(0, 0, 12, 24)]);
+        let mut reconnected_compositor = bmux_attach_pipeline::RetainedCompositor::new();
+        let reconnect_hydration = reconnected_compositor.replace_surfaces(
+            retained_plugin_surfaces(viewport),
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(
+            reconnect_hydration.rects(),
+            &[DamageRect::new(0, 0, 12, 24)]
+        );
+        let reconnected_surface = reconnected_compositor
+            .surfaces()
+            .get(&retained_id)
+            .expect("new attach compositor should hydrate retained owner state");
+        assert_eq!(reconnected_surface.revision, Some(1));
 
         assert!(global_plugin_surface_registry().remove_owner(owner));
         assert!(global_plugin_layout_registry().remove_owner(owner));

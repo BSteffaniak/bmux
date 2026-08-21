@@ -500,7 +500,7 @@ impl PanelGroup {
             for (index, panel) in layout.panels.iter().copied().enumerate() {
                 frame.push_hit(
                     SceneRegion::new(format!("{}.panel.{index}", id.as_str()), panel)
-                        .role(HitRole::Decoration)
+                        .role(HitRole::Background)
                         .focusable(false),
                 );
             }
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(regions.len(), 3);
         assert_eq!(regions[0].id.as_str(), "workspace.panel.0");
         assert_eq!(regions[0].area, Rect::new(5, 3, 4, 3));
-        assert_eq!(regions[0].role, HitRole::Decoration);
+        assert_eq!(regions[0].role, HitRole::Background);
         assert_eq!(regions[1].id.as_str(), "workspace.panel.1");
         assert_eq!(regions[1].area, Rect::new(10, 3, 7, 3));
         assert_eq!(regions[2].id.as_str(), "workspace.divider.0");

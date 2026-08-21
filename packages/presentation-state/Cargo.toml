@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral bounded semantic presentation fact primitives and retained registry"
+edition     = { workspace = true }
+keywords    = ["bmux", "presentation", "state", "primitive"]
+license     = { workspace = true }
+name        = "bmux_presentation_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_codec = { workspace = true }
+serde      = { workspace = true, features = ["derive", "std"] }
+tokio      = { workspace = true, features = ["sync"] }
+
+[features]
+default          = []
+fail-on-warnings = ["bmux_codec/fail-on-warnings"]

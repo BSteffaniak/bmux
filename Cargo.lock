@@ -1849,6 +1849,7 @@ dependencies = [
  "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_presentation_state",
  "bmux_recording_protocol",
  "bmux_recording_runtime",
  "bmux_session_models",
@@ -1932,9 +1933,11 @@ dependencies = [
  "bmux_performance_state",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_presentation_state",
  "serde",
  "serde_json",
  "sysinfo",
+ "uuid",
 ]
 
 [[package]]
@@ -2069,6 +2072,15 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bmux_presentation_state"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_codec",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

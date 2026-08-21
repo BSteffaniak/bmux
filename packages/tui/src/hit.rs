@@ -48,8 +48,8 @@ pub enum HitRole {
     ResizeHandle,
     /// Draggable region.
     DragHandle,
-    /// Non-actionable decoration/background region.
-    Decoration,
+    /// Non-actionable background region.
+    Background,
     /// Caller-defined role code.
     Custom(u16),
 }

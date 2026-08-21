@@ -615,6 +615,55 @@ mod tests {
     }
 
     #[test]
+    fn service_pipeline_preserves_typed_encoded_payload_bytes() {
+        #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct TypedPayload {
+            protocol_version: u16,
+            plugin_id: String,
+            command_name: String,
+            arguments: Vec<String>,
+        }
+
+        let payload = bmux_codec::to_typed_vec(&TypedPayload {
+            protocol_version: 1,
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "next-window".to_string(),
+            arguments: Vec::new(),
+        })
+        .expect("typed payload should encode");
+        let request = Request::InvokeServicePipeline {
+            pipeline: ServicePipelineRequest {
+                inputs: BTreeMap::new(),
+                steps: vec![ServicePipelineStep {
+                    capability: "bmux.commands".to_string(),
+                    kind: InvokeServiceKind::Command,
+                    interface_id: "core-cli-command/v1".to_string(),
+                    operation: "run_plugin".to_string(),
+                    payload: ServicePipelinePayload::Encoded {
+                        payload: payload.clone(),
+                    },
+                }],
+            },
+        };
+
+        let bytes = encode(&request).expect("pipeline request should encode");
+        let decoded: Request = decode(&bytes).expect("pipeline request should decode");
+        let Request::InvokeServicePipeline { pipeline } = decoded else {
+            panic!("decoded request should remain a service pipeline");
+        };
+        let ServicePipelinePayload::Encoded {
+            payload: decoded_payload,
+        } = &pipeline.steps[0].payload
+        else {
+            panic!("pipeline payload should remain encoded bytes");
+        };
+        assert_eq!(decoded_payload, &payload);
+        let decoded_message: TypedPayload = bmux_codec::from_typed_bytes(decoded_payload)
+            .expect("preserved payload should remain typed-decodable");
+        assert_eq!(decoded_message.command_name, "next-window");
+    }
+
+    #[test]
     fn serializes_response_roundtrip() {
         let response = Response::Ok(ResponsePayload::Pong);
         let bytes = encode(&response).expect("response should encode");

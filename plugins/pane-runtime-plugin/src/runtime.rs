@@ -7646,6 +7646,7 @@ fn reap_exited_pane(
         emit_attach_view_changed_for_layout(session_id);
     }
     crate::handlers::publish_focus_state_snapshot();
+    crate::handlers::pane_commands::publish_pane_lifecycle_facts();
     mark_snapshot_dirty_flag();
 }
 
