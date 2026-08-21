@@ -1,40 +1,65 @@
-//! Managed blocking crossterm input sources.
+//! Managed asynchronous Crossterm input sources.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
-
-use bmux_tui::crossterm::read_event;
+use bmux_tui::crossterm::CrosstermEventStream;
 use bmux_tui::event::Event;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::program::Program;
 use crate::runtime::RuntimeHandle;
 
 /// Managed bounded terminal event stream.
-///
-/// Crossterm input is a blocking operating-system read. Shutdown marks the source closed, but does
-/// not join a thread currently blocked in the backend. The detached thread observes shutdown after
-/// the next event or backend error. Bounded channel admission backpressures the reader rather than
-/// allocating without limit.
 pub struct ManagedTerminalInput {
-    receiver: mpsc::Receiver<Result<Option<Event>, std::io::Error>>,
-    shutdown: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    receiver: mpsc::Receiver<Result<Event, std::io::Error>>,
+    shutdown: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl ManagedTerminalInput {
-    /// Start a blocking terminal reader with the requested bounded event capacity.
+    /// Start an asynchronous terminal reader with the requested bounded event capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
     #[must_use]
     pub fn start(capacity: usize) -> Self {
+        Self::start_stream(capacity, CrosstermEventStream::new())
+    }
+
+    fn start_stream<S>(capacity: usize, mut events: S) -> Self
+    where
+        S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + Unpin + 'static,
+    {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = Arc::clone(&shutdown);
-        let thread = std::thread::spawn(move || {
-            while !thread_shutdown.load(Ordering::Relaxed) {
-                let result = read_event();
+        let (shutdown, mut shutdown_receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_err() || *shutdown_receiver.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    result = futures_util::StreamExt::next(&mut events) => match result {
+                        Some(result) => result,
+                        None => break,
+                    },
+                };
                 let terminal = result.is_err();
-                if sender.blocking_send(result).is_err() || terminal {
+                let sent = tokio::select! {
+                    biased;
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_err() || *shutdown_receiver.borrow() {
+                            false
+                        } else {
+                            continue;
+                        }
+                    }
+                    sent = sender.send(result) => sent.is_ok(),
+                };
+                if !sent || terminal {
                     break;
                 }
             }
@@ -42,14 +67,13 @@ impl ManagedTerminalInput {
         Self {
             receiver,
             shutdown,
-            thread: Some(thread),
+            task: Some(task),
         }
     }
 
     /// Create a deterministic bounded input stream from already available events.
     ///
-    /// This is intended for headless tests and embedding environments that already decoded terminal
-    /// input. Capacity is exactly the number of supplied entries, normalized to one when empty.
+    /// Capacity is exactly the number of supplied entries, normalized to one when empty.
     ///
     /// # Panics
     ///
@@ -58,7 +82,10 @@ impl ManagedTerminalInput {
     pub fn from_events(
         events: impl IntoIterator<Item = Result<Option<Event>, std::io::Error>>,
     ) -> Self {
-        let events = events.into_iter().collect::<Vec<_>>();
+        let events = events
+            .into_iter()
+            .filter_map(Result::transpose)
+            .collect::<Vec<_>>();
         let (sender, receiver) = mpsc::channel(events.len().max(1));
         for event in events {
             sender
@@ -66,21 +93,31 @@ impl ManagedTerminalInput {
                 .expect("pre-sized deterministic terminal input channel");
         }
         drop(sender);
+        let (shutdown, _) = watch::channel(false);
         Self {
             receiver,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            shutdown,
+            task: None,
         }
     }
 
     /// Receive the next terminal event or reader error.
     pub async fn recv(&mut self) -> Option<Result<Option<Event>, std::io::Error>> {
-        self.receiver.recv().await
+        self.receiver.recv().await.map(|event| event.map(Some))
     }
 
     /// Request reader shutdown.
     pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Request shutdown and await complete event-reader cancellation.
+    pub async fn shutdown(&mut self) {
+        self.request_shutdown();
+        self.receiver.close();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 
     /// Return the configured channel capacity.
@@ -94,22 +131,20 @@ impl Drop for ManagedTerminalInput {
     fn drop(&mut self) {
         self.request_shutdown();
         self.receiver.close();
-        let _detached = self.thread.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
 /// Managed terminal input reader forwarding events directly into a runtime.
-///
-/// Crossterm input is a blocking operating-system read. Shutdown marks the source closed, but does
-/// not join a thread currently blocked in the backend. The detached thread observes shutdown after
-/// the next event or backend error.
 pub struct TerminalInput {
-    shutdown: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl TerminalInput {
-    /// Start a blocking input reader using the current Tokio runtime to await bounded admission.
+    /// Start an event-driven input reader forwarding into bounded runtime admission.
     /// Backend errors are converted to an application message by `map_error`.
     ///
     /// # Panics
@@ -123,76 +158,102 @@ impl TerminalInput {
     where
         P: Program,
     {
-        Self::start_with::<P>(handle, map_error, read_event)
+        Self::start_stream::<P, _>(handle, map_error, CrosstermEventStream::new())
     }
 
-    fn start_with<P>(
+    fn start_stream<P, S>(
         handle: RuntimeHandle<P::Message>,
         map_error: impl Fn(std::io::Error) -> P::Message + Send + 'static,
-        mut read: impl FnMut() -> std::io::Result<Option<Event>> + Send + 'static,
+        mut events: S,
     ) -> Self
     where
         P: Program,
+        S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + Unpin + 'static,
     {
-        let runtime = tokio::runtime::Handle::current();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = Arc::clone(&shutdown);
-        let thread = std::thread::spawn(move || {
-            while !thread_shutdown.load(Ordering::Relaxed) {
-                match read() {
-                    Ok(Some(
-                        event @ (Event::Resize(_)
+        let (shutdown, mut shutdown_receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_err() || *shutdown_receiver.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    result = futures_util::StreamExt::next(&mut events) => match result {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => {
+                            let message = map_error(error);
+                            let _ = handle.send(message).await;
+                            break;
+                        }
+                        None => break,
+                    },
+                };
+                if matches!(
+                    event,
+                    Event::Resize(_)
                         | Event::Mouse(bmux_tui::event::MouseEvent {
                             kind: bmux_tui::event::MouseEventKind::Move,
                             ..
-                        })),
-                    )) => {
-                        if handle.send_latest_terminal(event).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Some(event)) => {
-                        if runtime.block_on(handle.send_terminal(event)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _result = runtime.block_on(handle.send(map_error(error)));
+                        })
+                ) {
+                    if handle.send_latest_terminal(event).is_err() {
                         break;
                     }
+                    continue;
+                }
+                let admitted = tokio::select! {
+                    biased;
+                    changed = shutdown_receiver.changed() => {
+                        !(changed.is_err() || *shutdown_receiver.borrow())
+                    }
+                    result = handle.send_terminal(event) => result.is_ok(),
+                };
+                if !admitted {
+                    break;
                 }
             }
         });
         Self {
             shutdown,
-            thread: Some(thread),
+            task: Some(task),
         }
     }
 
     /// Request reader shutdown.
     pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Request shutdown and await complete event-reader cancellation.
+    pub async fn shutdown(&mut self) {
+        self.request_shutdown();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for TerminalInput {
     fn drop(&mut self) {
         self.request_shutdown();
-        let _detached = self.thread.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::{HeadlessPresenter, Program, Runtime, RuntimeConfig, RuntimeEvent, Update};
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::event::Event;
+    use futures_util::StreamExt;
+
+    use crate::{HeadlessPresenter, Program, Runtime, RuntimeConfig, RuntimeEvent, Update};
 
     use super::{ManagedTerminalInput, TerminalInput};
 
@@ -226,44 +287,56 @@ mod tests {
             HeadlessPresenter::default(),
             RuntimeConfig::default(),
         );
-        let events = Arc::new(Mutex::new(VecDeque::from([
-            Ok(Some(Event::Key(KeyStroke::simple(KeyCode::Char('q'))))),
-            Ok(None),
-        ])));
-        let reader_events = Arc::clone(&events);
-        let read_called = Arc::new(AtomicBool::new(false));
-        let reader_called = Arc::clone(&read_called);
-        let input = TerminalInput::start_with::<ExitProgram>(
-            handle,
-            |_| (),
-            move || {
-                reader_called.store(true, Ordering::Relaxed);
-                reader_events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop_front()
-                    .unwrap_or(Ok(None))
-            },
-        );
-
-        let wait_started = std::time::Instant::now();
-        while !read_called.load(Ordering::Relaxed) {
-            assert!(wait_started.elapsed() < Duration::from_secs(1));
-            tokio::task::yield_now().await;
-        }
+        let events =
+            futures_util::stream::iter([Ok(Event::Key(KeyStroke::simple(KeyCode::Char('q'))))])
+                .chain(futures_util::stream::pending());
+        let mut input = TerminalInput::start_stream::<ExitProgram, _>(handle, |_| (), events);
 
         let output = tokio::time::timeout(Duration::from_secs(1), runtime.run())
             .await
             .expect("key event should exit runtime")
             .unwrap_or_else(|_| panic!("infallible runtime failed"));
-        drop(input);
+        input.shutdown().await;
 
         assert!(output.stats.updates_completed >= 1);
     }
 
+    #[tokio::test]
+    async fn terminal_input_shutdown_cancels_pending_event_wait() {
+        let (runtime, handle) = Runtime::new(
+            ExitNeverProgram,
+            HeadlessPresenter::default(),
+            RuntimeConfig::default(),
+        );
+        let mut input = TerminalInput::start_stream::<ExitNeverProgram, _>(
+            handle,
+            |_| (),
+            futures_util::stream::pending(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), input.shutdown())
+            .await
+            .expect("shutdown should cancel pending event wait");
+        drop(runtime);
+    }
+
+    struct ExitNeverProgram;
+
+    impl Program for ExitNeverProgram {
+        type Message = ();
+        type Error = std::convert::Infallible;
+
+        fn update(
+            &mut self,
+            _event: RuntimeEvent<Self::Message>,
+        ) -> Result<Update<Self::Message>, Self::Error> {
+            Ok(Update::none())
+        }
+    }
+
     #[test]
     fn managed_input_normalizes_zero_capacity() {
-        let input = ManagedTerminalInput::start(0);
+        let input = ManagedTerminalInput::from_events([]);
         assert_eq!(input.capacity(), 1);
     }
 }

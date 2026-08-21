@@ -1,19 +1,23 @@
 //! Crossterm terminal lifecycle and event adapter.
 
 use std::io::{self, Write};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, KeyEvent as CrosstermKeyEvent, KeyModifiers as CrosstermKeyModifiers,
-    MouseButton as CrosstermMouseButton, MouseEvent as CrosstermMouseEvent,
-    MouseEventKind as CrosstermMouseEventKind, poll as crossterm_poll, read as crossterm_read,
+    Event as CrosstermEvent, EventStream, KeyEvent as CrosstermKeyEvent,
+    KeyModifiers as CrosstermKeyModifiers, MouseButton as CrosstermMouseButton,
+    MouseEvent as CrosstermMouseEvent, MouseEventKind as CrosstermMouseEventKind,
+    poll as crossterm_poll, read as crossterm_read,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     size as crossterm_size,
 };
 use crossterm::{execute, queue};
+use futures_util::{Stream, StreamExt};
 
 use crate::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use crate::geometry::{Point, Size};
@@ -153,6 +157,65 @@ fn push_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
 fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) -> io::Result<()> {
     queue!(writer, crossterm::event::PopKeyboardEnhancementFlags)?;
     writer.flush()
+}
+
+/// Async Crossterm event stream converted into backend-neutral BMUX events.
+pub struct CrosstermEventStream {
+    inner: EventStream,
+}
+
+impl CrosstermEventStream {
+    /// Create an event stream for the active terminal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: EventStream::new(),
+        }
+    }
+
+    /// Await the next supported terminal event.
+    ///
+    /// Unsupported Crossterm event kinds are skipped. Dropping the future or stream cancels the
+    /// wait through Crossterm's platform event-reader waker.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by Crossterm's event stream.
+    pub async fn next_event(&mut self) -> io::Result<Event> {
+        loop {
+            let event = self.inner.next().await.transpose()?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream closed")
+            })?;
+            if let Some(event) = event_from_crossterm(event) {
+                return Ok(event);
+            }
+        }
+    }
+}
+
+impl Stream for CrosstermEventStream {
+    type Item = io::Result<Event>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(event))) => {
+                    if let Some(event) = event_from_crossterm(event) {
+                        return Poll::Ready(Some(Ok(event)));
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Default for CrosstermEventStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Poll for a terminal event and convert it to a BMUX TUI event.

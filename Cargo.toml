@@ -282,6 +282,7 @@ env_logger = { version = "0.11.10", default-features = false }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.23.0" }
 futures = { version = "0.3.32", default-features = false }
+futures-util = { version = "0.3.32", default-features = false }
 gif = { version = "0.14.2" }
 image = { version = "0.25", default-features = false, features = [
     "png",

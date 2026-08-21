@@ -15,9 +15,10 @@ name              = "image_runtime"
 required-features = ["images"]
 
 [dependencies]
-bmux_image = { workspace = true, optional = true }
-bmux_tui   = { workspace = true }
-tokio      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+bmux_image   = { workspace = true, optional = true }
+bmux_tui     = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+tokio        = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 bmux_keyboard = { workspace = true }
