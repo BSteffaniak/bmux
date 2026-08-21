@@ -6,6 +6,8 @@ use crate::style::Style;
 use crate::text::{Line, Text, wrap_line_character, wrap_line_word};
 use crate::widget::Widget;
 
+pub use crate::text::TextWrap;
+
 /// Horizontal text alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Alignment {
@@ -16,19 +18,6 @@ pub enum Alignment {
     Center,
     /// Align to the right edge.
     Right,
-}
-
-/// Text wrapping policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TextWrap {
-    /// Do not wrap lines; rendering clips to the target area.
-    #[default]
-    None,
-    /// Wrap at grapheme boundaries when a line exceeds the target width.
-    Character,
-    /// Wrap at word boundaries when possible, falling back to grapheme wrapping
-    /// for words longer than the target width.
-    Word,
 }
 
 /// A simple styled text block.

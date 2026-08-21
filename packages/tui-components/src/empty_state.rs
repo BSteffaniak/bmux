@@ -223,7 +223,7 @@ impl<'a> EmptyState<'a> {
         TextBlock::new(text)
             .alignment(self.policy.alignment)
             .wrap(if self.policy.wrap {
-                TextWrap::Character
+                TextWrap::Word
             } else {
                 TextWrap::None
             })

@@ -178,7 +178,7 @@ impl Widget for ToolBlock {
         let panel = self.panel.clone().title(title);
         panel.render(area, frame);
         TextBlock::new(self.body.clone())
-            .wrap(TextWrap::Character)
+            .wrap(TextWrap::Word)
             .render(panel.inner_area(area), frame);
     }
 }

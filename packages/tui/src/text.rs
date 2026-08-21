@@ -134,6 +134,12 @@ impl Line {
         wrap_line_word(self, width)
     }
 
+    /// Return this line wrapped using an explicit policy and per-row geometry.
+    #[must_use]
+    pub fn wrap(&self, geometry: TextWrapGeometry, wrap: TextWrap) -> Vec<Self> {
+        wrap_line_with_geometry(self, geometry, wrap)
+    }
+
     /// Append a span to the line.
     pub fn push_span(&mut self, span: Span) {
         self.spans.push(span);
@@ -258,113 +264,340 @@ fn push_or_merge_span(spans: &mut Vec<Span>, content: String, style: Style) {
     spans.push(Span::styled(content, style));
 }
 
+/// Text wrapping policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextWrap {
+    /// Do not wrap lines; rendering clips to the target area.
+    #[default]
+    None,
+    /// Wrap at grapheme boundaries when a line exceeds the target width.
+    Character,
+    /// Wrap at word boundaries when possible, falling back to grapheme wrapping
+    /// for words longer than the target width.
+    ///
+    /// Word detection spans style boundaries, so a word split across differently
+    /// styled spans is kept intact when it fits.
+    Word,
+}
+
+/// Per-row target widths for a wrapping operation.
+///
+/// A distinct first-row width supports callers that reserve leading space for a
+/// label, marker, or prefix and indent continuation rows differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextWrapGeometry {
+    /// Target display width for the first produced row.
+    pub first_width: usize,
+    /// Target display width for every subsequent row.
+    pub continuation_width: usize,
+}
+
+impl TextWrapGeometry {
+    /// Create geometry using one uniform width for every row.
+    #[must_use]
+    pub const fn uniform(width: usize) -> Self {
+        Self {
+            first_width: width,
+            continuation_width: width,
+        }
+    }
+
+    /// Create geometry with a distinct first-row width.
+    #[must_use]
+    pub const fn with_continuation(first_width: usize, continuation_width: usize) -> Self {
+        Self {
+            first_width,
+            continuation_width,
+        }
+    }
+
+    /// Return the target width for `row`, clamped to at least one cell.
+    #[must_use]
+    pub const fn width_for_row(self, row: usize) -> usize {
+        let width = if row == 0 {
+            self.first_width
+        } else {
+            self.continuation_width
+        };
+        if width == 0 { 1 } else { width }
+    }
+}
+
+impl From<usize> for TextWrapGeometry {
+    fn from(width: usize) -> Self {
+        Self::uniform(width)
+    }
+}
+
+/// One contiguous run of graphemes sharing whitespace classification.
+///
+/// Segments are collected across span boundaries so word wrapping can keep a
+/// word intact even when its graphemes carry different styles.
+struct WordSegment {
+    /// Styled grapheme pieces in source order.
+    pieces: Vec<(String, Style)>,
+    /// Total display width of this segment.
+    width: usize,
+    /// Whether this segment is whitespace.
+    whitespace: bool,
+}
+
+impl WordSegment {
+    const fn new(whitespace: bool) -> Self {
+        Self {
+            pieces: Vec::new(),
+            width: 0,
+            whitespace,
+        }
+    }
+
+    fn push(&mut self, grapheme: &str, style: Style) {
+        self.width = self.width.saturating_add(display_width(grapheme));
+        if let Some((content, last_style)) = self.pieces.last_mut()
+            && *last_style == style
+        {
+            content.push_str(grapheme);
+            return;
+        }
+        self.pieces.push((grapheme.to_owned(), style));
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+}
+
+/// Split a line into whitespace and non-whitespace segments across all spans.
+fn word_segments(line: &Line) -> Vec<WordSegment> {
+    let mut segments: Vec<WordSegment> = Vec::new();
+    let mut current: Option<WordSegment> = None;
+
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let whitespace = !grapheme.is_empty() && grapheme.chars().all(char::is_whitespace);
+            match &mut current {
+                Some(segment) if segment.whitespace == whitespace => {
+                    segment.push(grapheme, span.style);
+                }
+                Some(_) => {
+                    if let Some(finished) = current.take() {
+                        segments.push(finished);
+                    }
+                    let mut segment = WordSegment::new(whitespace);
+                    segment.push(grapheme, span.style);
+                    current = Some(segment);
+                }
+                None => {
+                    let mut segment = WordSegment::new(whitespace);
+                    segment.push(grapheme, span.style);
+                    current = Some(segment);
+                }
+            }
+        }
+    }
+    if let Some(finished) = current {
+        segments.push(finished);
+    }
+    segments
+}
+
+/// Wrapping accumulator shared by every policy.
+struct WrapSink {
+    lines: Vec<Line>,
+    column: usize,
+    geometry: TextWrapGeometry,
+}
+
+impl WrapSink {
+    fn new(geometry: TextWrapGeometry) -> Self {
+        Self {
+            lines: vec![Line::new()],
+            column: 0,
+            geometry,
+        }
+    }
+
+    const fn current_width(&self) -> usize {
+        self.geometry
+            .width_for_row(self.lines.len().saturating_sub(1))
+    }
+
+    fn break_row(&mut self) {
+        self.lines.push(Line::new());
+        self.column = 0;
+    }
+
+    fn push_piece(&mut self, content: &str, style: Style) {
+        if let Some(last) = self.lines.last_mut() {
+            push_or_merge_span(&mut last.spans, content.to_owned(), style);
+        }
+        self.column = self.column.saturating_add(display_width(content));
+    }
+
+    /// Emit graphemes, breaking whenever the current row is full.
+    fn push_graphemes(&mut self, content: &str, style: Style) {
+        for grapheme in content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if self.column > 0 && self.column.saturating_add(grapheme_width) > self.current_width()
+            {
+                self.break_row();
+            }
+            self.push_piece(grapheme, style);
+        }
+    }
+
+    fn finish(self) -> Vec<Line> {
+        self.lines
+    }
+}
+
 /// Return a styled line wrapped at grapheme boundaries.
 #[must_use]
 pub fn wrap_line_character(line: &Line, width: usize) -> Vec<Line> {
-    let width = width.max(1);
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-
-    for span in &line.spans {
-        for grapheme in span.content.graphemes(true) {
-            let grapheme_width = display_width(grapheme);
-            if col > 0 && col.saturating_add(grapheme_width) > width {
-                lines.push(Line::new());
-                row = row.saturating_add(1);
-                col = 0;
-            }
-            push_or_merge_span(&mut lines[row].spans, grapheme.to_owned(), span.style);
-            col = col.saturating_add(grapheme_width);
-        }
-    }
-
-    lines
+    wrap_line_with_geometry(line, TextWrapGeometry::uniform(width), TextWrap::Character)
 }
 
 /// Return a styled line wrapped at word boundaries when possible.
+///
+/// Words are detected across span boundaries, so inline style changes inside a
+/// word do not introduce a break.
 #[must_use]
 pub fn wrap_line_word(line: &Line, width: usize) -> Vec<Line> {
-    let width = width.max(1);
-    let mut lines = vec![Line::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-
-    for span in &line.spans {
-        let mut segment = String::new();
-        let mut segment_is_whitespace = false;
-        for grapheme in span.content.graphemes(true) {
-            let is_whitespace = grapheme.chars().all(char::is_whitespace);
-            if segment.is_empty() {
-                segment_is_whitespace = is_whitespace;
-            }
-            if !segment.is_empty() && is_whitespace != segment_is_whitespace {
-                push_word_segment(
-                    &mut lines,
-                    &mut row,
-                    &mut col,
-                    &segment,
-                    span.style,
-                    width,
-                    segment_is_whitespace,
-                );
-                segment.clear();
-                segment_is_whitespace = is_whitespace;
-            }
-            segment.push_str(grapheme);
-        }
-        if !segment.is_empty() {
-            push_word_segment(
-                &mut lines,
-                &mut row,
-                &mut col,
-                &segment,
-                span.style,
-                width,
-                segment_is_whitespace,
-            );
-        }
-    }
-
-    lines
+    wrap_line_with_geometry(line, TextWrapGeometry::uniform(width), TextWrap::Word)
 }
 
-fn push_word_segment(
-    lines: &mut Vec<Line>,
-    row: &mut usize,
-    col: &mut usize,
-    segment: &str,
-    style: Style,
-    width: usize,
-    is_whitespace: bool,
-) {
-    let segment_width = display_width(segment);
-    if is_whitespace && *col == 0 {
-        return;
-    }
-    if *col > 0 && col.saturating_add(segment_width) > width {
-        lines.push(Line::new());
-        *row = row.saturating_add(1);
-        *col = 0;
-        if is_whitespace {
-            return;
-        }
-    }
-    if segment_width > width {
-        for grapheme in segment.graphemes(true) {
-            let grapheme_width = display_width(grapheme);
-            if *col > 0 && col.saturating_add(grapheme_width) > width {
-                lines.push(Line::new());
-                *row = row.saturating_add(1);
-                *col = 0;
+/// Wrap one styled line using an explicit policy and per-row geometry.
+///
+/// `TextWrap::None` returns the line unchanged. Continuation rows never begin
+/// with wrapped whitespace, and words wider than the target width fall back to
+/// grapheme wrapping.
+#[must_use]
+pub fn wrap_line_with_geometry(
+    line: &Line,
+    geometry: TextWrapGeometry,
+    wrap: TextWrap,
+) -> Vec<Line> {
+    match wrap {
+        TextWrap::None => vec![line.clone()],
+        TextWrap::Character => {
+            let mut sink = WrapSink::new(geometry);
+            for span in &line.spans {
+                sink.push_graphemes(&span.content, span.style);
             }
-            push_or_merge_span(&mut lines[*row].spans, grapheme.to_owned(), style);
-            *col = col.saturating_add(grapheme_width);
+            sink.finish()
         }
-        return;
+        TextWrap::Word => {
+            let mut sink = WrapSink::new(geometry);
+            let mut wrapped_any = false;
+            for segment in word_segments(line) {
+                if segment.is_empty() {
+                    continue;
+                }
+                // Leading indentation is meaningful, so only whitespace that a
+                // wrap break consumed is dropped.
+                if segment.whitespace && sink.column == 0 && wrapped_any {
+                    continue;
+                }
+                if sink.column > 0
+                    && sink.column.saturating_add(segment.width) > sink.current_width()
+                {
+                    sink.break_row();
+                    wrapped_any = true;
+                    if segment.whitespace {
+                        continue;
+                    }
+                }
+                if segment.width > sink.current_width() {
+                    for (content, style) in &segment.pieces {
+                        sink.push_graphemes(content, *style);
+                    }
+                    wrapped_any = true;
+                    continue;
+                }
+                for (content, style) in &segment.pieces {
+                    sink.push_piece(content, *style);
+                }
+            }
+            sink.finish()
+        }
     }
-    push_or_merge_span(&mut lines[*row].spans, segment.to_owned(), style);
-    *col = col.saturating_add(segment_width);
+}
+
+/// Wrap plain text using an explicit policy and per-row geometry.
+///
+/// Returns one string per produced row. `TextWrap::None` returns `text`
+/// unchanged as a single row.
+///
+/// This operates directly on the string rather than building intermediate
+/// styled lines, keeping allocation proportional to the output.
+#[must_use]
+pub fn wrap_text(text: &str, geometry: TextWrapGeometry, wrap: TextWrap) -> Vec<String> {
+    if matches!(wrap, TextWrap::None) {
+        return vec![text.to_owned()];
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut column = 0usize;
+    // Byte offset and starting column of the in-progress word in `current`.
+    let mut word_start: Option<(usize, usize)> = None;
+    let mut wrapped_any = false;
+
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        let max_width = geometry.width_for_row(rows.len());
+        let whitespace = matches!(wrap, TextWrap::Word)
+            && !grapheme.is_empty()
+            && grapheme.chars().all(char::is_whitespace);
+
+        if whitespace {
+            word_start = None;
+            // Leading indentation is meaningful; only whitespace consumed by a
+            // wrap break is dropped.
+            if column == 0 && wrapped_any {
+                continue;
+            }
+            if column > 0 && column.saturating_add(grapheme_width) > max_width {
+                rows.push(std::mem::take(&mut current));
+                column = 0;
+                wrapped_any = true;
+                continue;
+            }
+            current.push_str(grapheme);
+            column = column.saturating_add(grapheme_width);
+            continue;
+        }
+
+        if matches!(wrap, TextWrap::Word) && word_start.is_none() {
+            word_start = Some((current.len(), column));
+        }
+
+        if column > 0 && column.saturating_add(grapheme_width) > max_width {
+            match word_start {
+                // Move the whole word down instead of splitting it.
+                Some((offset, start_column)) if start_column > 0 && offset <= current.len() => {
+                    let moved = current.split_off(offset);
+                    rows.push(std::mem::take(&mut current));
+                    current = moved;
+                    column = display_width(&current);
+                }
+                // The word spans the full row width, so break mid-word.
+                _ => {
+                    rows.push(std::mem::take(&mut current));
+                    column = 0;
+                }
+            }
+            wrapped_any = true;
+            if matches!(wrap, TextWrap::Word) {
+                word_start = Some((0, 0));
+            }
+        }
+        current.push_str(grapheme);
+        column = column.saturating_add(grapheme_width);
+    }
+
+    rows.push(current);
+    rows
 }
 
 /// Multiple lines of styled text.
@@ -458,7 +691,10 @@ impl From<String> for Text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Line, Span, Text, line_viewport, wrap_line_word};
+    use super::{
+        Line, Span, Text, TextWrap, TextWrapGeometry, line_viewport, wrap_line_character,
+        wrap_line_with_geometry, wrap_line_word,
+    };
     use crate::style::{Color, Style};
 
     #[test]
@@ -585,6 +821,107 @@ mod tests {
 
         assert_eq!(wrapped[0], Line::from_spans([Span::styled("one ", red)]));
         assert_eq!(wrapped[1], Line::from_spans([Span::styled("two", blue)]));
+    }
+
+    #[test]
+    fn word_wrap_keeps_words_intact_across_style_boundaries() {
+        let plain = Style::new();
+        let bold = Style::new().fg(Color::Red);
+        // "wraps" is split across two spans, as emphasis produces.
+        let line = Line::from_spans([
+            Span::styled("alpha wrap", plain),
+            Span::styled("s", bold),
+            Span::styled(" omega", plain),
+        ]);
+
+        let wrapped = wrap_line_word(&line, 12);
+
+        assert_eq!(
+            wrapped.iter().map(Line::plain_text).collect::<Vec<_>>(),
+            ["alpha wraps ", "omega"],
+            "a word split across spans must not break at the style boundary"
+        );
+    }
+
+    #[test]
+    fn word_wrap_merges_adjacent_same_style_spans() {
+        let line = Line::from_spans([
+            Span::raw("alpha"),
+            Span::raw(" "),
+            Span::raw("beta"),
+            Span::raw(" gamma"),
+        ]);
+
+        let wrapped = wrap_line_word(&line, 40);
+
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(
+            wrapped[0].spans.len(),
+            1,
+            "identically styled neighbors must coalesce into one span"
+        );
+        assert_eq!(wrapped[0].plain_text(), "alpha beta gamma");
+    }
+
+    #[test]
+    fn character_wrap_merges_adjacent_same_style_graphemes() {
+        let line = Line::from_spans([Span::raw("abcdefgh")]);
+
+        let wrapped = wrap_line_character(&line, 4);
+
+        assert_eq!(wrapped.len(), 2);
+        assert!(
+            wrapped.iter().all(|line| line.spans.len() == 1),
+            "character wrapping must not emit one span per grapheme"
+        );
+        assert_eq!(wrapped[0].plain_text(), "abcd");
+        assert_eq!(wrapped[1].plain_text(), "efgh");
+    }
+
+    #[test]
+    fn wrap_geometry_supports_distinct_first_row_width() {
+        let line = Line::raw("alpha beta gamma delta");
+        let wrapped = wrap_line_with_geometry(
+            &line,
+            TextWrapGeometry::with_continuation(12, 6),
+            TextWrap::Word,
+        );
+
+        assert_eq!(
+            wrapped.iter().map(Line::plain_text).collect::<Vec<_>>(),
+            ["alpha beta ", "gamma ", "delta"]
+        );
+    }
+
+    #[test]
+    fn wrap_none_returns_the_line_unchanged() {
+        let line = Line::raw("alpha beta gamma");
+        let wrapped = wrap_line_with_geometry(&line, TextWrapGeometry::uniform(4), TextWrap::None);
+
+        assert_eq!(wrapped, vec![line]);
+    }
+
+    #[test]
+    fn word_wrap_preserves_leading_indentation() {
+        // Pretty-printed structured text relies on leading indentation, so only
+        // whitespace consumed by a wrap break may be dropped.
+        let line = Line::raw("    \"value\": 1");
+        let wrapped = wrap_line_word(&line, 40);
+
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].plain_text(), "    \"value\": 1");
+    }
+
+    #[test]
+    fn word_wrap_preserves_wide_graphemes_for_overlong_words() {
+        let line = Line::raw("界界界界");
+        let wrapped = wrap_line_word(&line, 3);
+
+        assert_eq!(
+            wrapped.iter().map(Line::plain_text).collect::<Vec<_>>(),
+            ["界", "界", "界", "界"],
+            "wide graphemes must never be split across rows"
+        );
     }
 
     #[test]

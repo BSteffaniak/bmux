@@ -142,7 +142,7 @@ impl<'a> Dialog<'a> {
     pub fn new(body: impl Into<Text>, actions: &'a [DialogAction]) -> Self {
         Self {
             panel: Panel::new().border(Border::single()),
-            body: TextBlock::new(body.into()).wrap(TextWrap::Character),
+            body: TextBlock::new(body.into()).wrap(TextWrap::Word),
             actions,
             button_style: Style::new(),
             focused_button_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),

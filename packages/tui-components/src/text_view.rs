@@ -197,7 +197,7 @@ impl TextViewPolicy {
     #[must_use]
     pub const fn scrollable() -> Self {
         Self {
-            wrap: TextWrap::Character,
+            wrap: TextWrap::Word,
             alignment: Alignment::Left,
             trim: true,
             keyboard: true,
@@ -301,16 +301,7 @@ impl<'a> TextView<'a> {
             highlights: &[],
             selection: None,
             cursor: None,
-            policy: TextViewPolicy {
-                wrap: TextWrap::Character,
-                alignment: Alignment::Left,
-                trim: true,
-                keyboard: true,
-                mouse_wheel: true,
-                background: false,
-                vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
-                horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
-            },
+            policy: TextViewPolicy::scrollable(),
             styles: TextViewStyles {
                 text: Style::new(),
                 empty: Style::new(),
