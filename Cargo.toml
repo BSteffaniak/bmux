@@ -266,9 +266,9 @@ switchy = { version = "0.4.0", package = "switchy", default-features = false, gi
 moosicbox_log_runtime = { version = "0.3.0", package = "moosicbox_log_runtime", default-features = false }
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", rev = "4b3d808ecfc83a755b720db4b96eef0405b78549", package = "moosicbox_log_watch", default-features = false }
 
-git_sshripped_recipient    = { version = "0.9.0", default-features = false }
-git_sshripped_ssh_agent    = { version = "0.9.0", default-features = false }
-git_sshripped_ssh_identity = { version = "0.9.0", default-features = false }
+git_sshripped_recipient    = { version = "0.10.0", default-features = false }
+git_sshripped_ssh_agent    = { version = "0.10.0", default-features = false }
+git_sshripped_ssh_identity = { version = "0.10.0", default-features = false }
 
 # External dependencies
 ab_glyph = { version = "0.2.32" }
