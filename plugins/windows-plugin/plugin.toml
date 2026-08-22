@@ -83,11 +83,11 @@ forward_to_streaming_clients = true
 kind                         = "bmux.windows/windows-list"
 
 [[commands]]
-aliases       = [["window", "new"]]
+aliases       = [["window", "new"], ["tab", "new"]]
 expose_in_cli = true
 name          = "new-window"
 path          = ["new-window"]
-summary       = "Create a workspace window"
+summary       = "Create a workspace tab"
 
 [[commands.arguments]]
 kind       = "string"
@@ -104,12 +104,12 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
-aliases       = [["window", "rename"]]
+aliases       = [["window", "rename"], ["tab", "rename"]]
 execution     = "caller_process"
 expose_in_cli = true
 name          = "rename-window"
 path          = ["rename-window"]
-summary       = "Rename the current workspace window"
+summary       = "Rename the current workspace tab"
 
 [[commands.arguments]]
 kind       = "string"
@@ -139,11 +139,11 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
-aliases       = [["window", "list"]]
+aliases       = [["window", "list"], ["tab", "list"]]
 expose_in_cli = true
 name          = "list-windows"
 path          = ["list-windows"]
-summary       = "List workspace windows"
+summary       = "List workspace tabs"
 
 [[commands.arguments]]
 kind       = "string"
@@ -159,11 +159,11 @@ name  = "json"
 short = "j"
 
 [[commands]]
-aliases       = [["window", "kill"]]
+aliases       = [["window", "kill"], ["tab", "kill"]]
 expose_in_cli = true
 name          = "kill-window"
 path          = ["kill-window"]
-summary       = "Kill a workspace window"
+summary       = "Kill a workspace tab"
 
 [[commands.arguments]]
 kind       = "string"
@@ -185,7 +185,7 @@ long = "force-local"
 name = "force-local"
 
 [[commands]]
-aliases       = [["window", "kill-all"]]
+aliases       = [["window", "kill-all"], ["tab", "kill-all"]]
 expose_in_cli = true
 name          = "kill-all-windows"
 path          = ["kill-all-windows"]
@@ -204,7 +204,7 @@ long = "force-local"
 name = "force-local"
 
 [[commands]]
-aliases       = [["window", "switch"]]
+aliases       = [["window", "switch"], ["tab", "switch"]]
 expose_in_cli = true
 name          = "switch-window"
 path          = ["switch-window"]
@@ -225,7 +225,7 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
-aliases       = [["window", "move"]]
+aliases       = [["window", "move"], ["tab", "move"]]
 expose_in_cli = true
 name          = "move-window"
 path          = ["move-window"]
@@ -255,7 +255,7 @@ values     = ["before", "after"]
 
 [[commands]]
 accepts_repeat = true
-aliases        = [["window", "next"]]
+aliases        = [["window", "next"], ["tab", "next"]]
 expose_in_cli  = true
 name           = "next-window"
 path           = ["next-window"]
@@ -263,21 +263,21 @@ summary        = "Switch to the next workspace window"
 
 [[commands]]
 accepts_repeat = true
-aliases        = [["window", "prev"]]
+aliases        = [["window", "prev"], ["tab", "prev"]]
 expose_in_cli  = true
 name           = "prev-window"
 path           = ["prev-window"]
 summary        = "Switch to the previous workspace window"
 
 [[commands]]
-aliases       = [["window", "last"]]
+aliases       = [["window", "last"], ["tab", "last"]]
 expose_in_cli = true
 name          = "last-window"
 path          = ["last-window"]
 summary       = "Switch to the previously active workspace window"
 
 [[commands]]
-aliases       = [["window", "goto"]]
+aliases       = [["window", "goto"], ["tab", "goto"]]
 expose_in_cli = true
 name          = "goto-window"
 path          = ["goto-window"]
@@ -291,14 +291,14 @@ required   = true
 value_name = "INDEX"
 
 [[commands]]
-aliases       = [["window", "close-current"]]
+aliases       = [["window", "close-current"], ["tab", "close-current"]]
 expose_in_cli = true
 name          = "close-current-window"
 path          = ["close-current-window"]
 summary       = "Close the current workspace window"
 
 [[commands]]
-aliases       = [["window", "reset-order"]]
+aliases       = [["window", "reset-order"], ["tab", "reset-order"]]
 expose_in_cli = true
 name          = "reset-order"
 path          = ["reset-order"]

@@ -31,6 +31,8 @@ use uuid::Uuid;
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_WORKSPACE_ATTRIBUTE: &str = "default";
 const SELECTED_CONTEXT_OUTCOME_KEY: &str = "bmux.contexts.selected_context_id";
+const ACTIVE_BY_CLIENT_KEY: &str = "workspaces.active_by_client";
+const PREVIOUS_BY_CLIENT_KEY: &str = "workspaces.previous_by_client";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkspaceRecord {
@@ -92,9 +94,14 @@ impl RustPlugin for WorkspacesPlugin {
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         let records = load_catalog(&context).unwrap_or_default();
+        let active_by_client =
+            load_client_workspace_map(&context, ACTIVE_BY_CLIENT_KEY).unwrap_or_default();
+        let previous_by_client =
+            load_client_workspace_map(&context, PREVIOUS_BY_CLIENT_KEY).unwrap_or_default();
         let mut state = WorkspaceState {
             records,
-            ..WorkspaceState::default()
+            active_by_client,
+            previous_by_client,
         };
         state.ensure_default();
         let state = Arc::new(RwLock::new(state));
@@ -490,6 +497,7 @@ fn kill_workspace(
                 *previous = fallback_id;
             }
         }
+        persist_client_selection(caller, &guard)?;
         (id, fallback_id, guard.records.clone())
     };
     for context in contexts
@@ -517,6 +525,16 @@ fn switch_workspace(
     switch_workspace_for_client(caller, selector, client_id)
 }
 
+fn most_recent_context_in_workspace(
+    contexts: &[contexts_state::ContextSummary],
+    workspace_id: Uuid,
+) -> Option<Uuid> {
+    contexts
+        .iter()
+        .find(|context| context_workspace_id(context) == workspace_id)
+        .map(|context| context.id)
+}
+
 fn switch_workspace_for_client(
     caller: &(impl HostRuntimeApi + Sync),
     selector: &WorkspaceSelector,
@@ -534,19 +552,22 @@ fn switch_workspace_for_client(
             .map(|record| record.id)
             .ok_or(WorkspaceCommandError::NotFound)?
     };
-    let context_id = contexts
-        .iter()
-        .find(|context| context_workspace_id(context) == workspace_id)
-        .map(|context| context.id);
+    let context_id = most_recent_context_in_workspace(&contexts, workspace_id);
     if let Some(context_id) = context_id {
         select_context(caller, context_id)?;
     }
-    {
+    let (active_by_client, previous_by_client) = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
         })?;
         guard.select(client_id, workspace_id);
-    }
+        (
+            guard.active_by_client.clone(),
+            guard.previous_by_client.clone(),
+        )
+    };
+    save_client_workspace_map(caller, ACTIVE_BY_CLIENT_KEY, &active_by_client)?;
+    save_client_workspace_map(caller, PREVIOUS_BY_CLIENT_KEY, &previous_by_client)?;
     if let Some(context_id) = context_id {
         let _ = global_event_bus().emit(
             &workspaces_events::EVENT_KIND,
@@ -650,6 +671,48 @@ fn move_tab(
     })
 }
 
+fn load_client_workspace_map(
+    caller: &impl HostRuntimeApi,
+    key: &str,
+) -> Result<HashMap<Uuid, Uuid>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest::new(
+            bmux_plugin_sdk::StorageKey::new(key).map_err(|error| error.to_string())?,
+        ))
+        .map_err(|error| error.to_string())?;
+    response.value.map_or_else(
+        || Ok(HashMap::new()),
+        |value| serde_json::from_slice(&value).map_err(|error| error.to_string()),
+    )
+}
+
+fn save_client_workspace_map(
+    caller: &impl HostRuntimeApi,
+    key: &str,
+    values: &HashMap<Uuid, Uuid>,
+) -> Result<(), WorkspaceCommandError> {
+    let value = serde_json::to_vec(values).map_err(|error| WorkspaceCommandError::Failed {
+        reason: error.to_string(),
+    })?;
+    let key =
+        bmux_plugin_sdk::StorageKey::new(key).map_err(|error| WorkspaceCommandError::Failed {
+            reason: error.to_string(),
+        })?;
+    caller
+        .storage_set(&StorageSetRequest::new(key, value))
+        .map_err(|error| WorkspaceCommandError::Failed {
+            reason: error.to_string(),
+        })
+}
+
+fn persist_client_selection(
+    caller: &impl HostRuntimeApi,
+    state: &WorkspaceState,
+) -> Result<(), WorkspaceCommandError> {
+    save_client_workspace_map(caller, ACTIVE_BY_CLIENT_KEY, &state.active_by_client)?;
+    save_client_workspace_map(caller, PREVIOUS_BY_CLIENT_KEY, &state.previous_by_client)
+}
+
 fn load_catalog(caller: &impl HostRuntimeApi) -> Result<Vec<WorkspaceRecord>, String> {
     let response = caller
         .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
@@ -724,12 +787,15 @@ fn run_command(context: &NativeCommandContext) -> Result<(), String> {
             let selector = parse_selector_argument(context, 0)?;
             let name = positional_value_at(&context.arguments, 1)
                 .ok_or_else(|| "missing NAME".to_string())?;
-            rename_workspace(context, &selector, name).map_err(|error| format!("{error:?}"))?;
+            let ack =
+                rename_workspace(context, &selector, name).map_err(|error| format!("{error:?}"))?;
+            record_outcome(&ack);
             Ok(())
         }
         "kill-workspace" => {
             let selector = parse_selector_argument(context, 0)?;
-            kill_workspace(context, &selector).map_err(|error| format!("{error:?}"))?;
+            let ack = kill_workspace(context, &selector).map_err(|error| format!("{error:?}"))?;
+            record_outcome(&ack);
             Ok(())
         }
         "move-tab-to-workspace" => {
@@ -737,7 +803,9 @@ fn run_command(context: &NativeCommandContext) -> Result<(), String> {
                 .ok_or_else(|| "missing CONTEXT_ID".to_string())
                 .and_then(|value| Uuid::parse_str(&value).map_err(|error| error.to_string()))?;
             let selector = parse_selector_argument(context, 1)?;
-            move_tab(context, context_id, &selector).map_err(|error| format!("{error:?}"))?;
+            let ack =
+                move_tab(context, context_id, &selector).map_err(|error| format!("{error:?}"))?;
+            record_outcome(&ack);
             Ok(())
         }
         command => Err(format!("unsupported command '{command}'")),
@@ -999,6 +1067,95 @@ mod tests {
         );
         assert_eq!(state.active_id(second_client), Uuid::nil());
         assert!(!state.previous_by_client.contains_key(&second_client));
+    }
+
+    #[test]
+    fn workspace_target_uses_first_context_from_mru_order() {
+        let workspace_id = Uuid::from_u128(2);
+        let first = contexts_state::ContextSummary {
+            id: Uuid::from_u128(10),
+            name: Some("recent".to_string()),
+            attributes: std::collections::BTreeMap::from([(
+                "workspace".to_string(),
+                workspace_id.to_string(),
+            )]),
+        };
+        let second = contexts_state::ContextSummary {
+            id: Uuid::from_u128(11),
+            name: Some("older".to_string()),
+            attributes: first.attributes.clone(),
+        };
+        assert_eq!(
+            most_recent_context_in_workspace(&[first.clone(), second], workspace_id),
+            Some(first.id)
+        );
+    }
+
+    #[test]
+    fn command_outcome_records_selected_context_for_attach() {
+        let context_id = Uuid::from_u128(42);
+        bmux_plugin_sdk::begin_command_outcome_capture();
+        record_outcome(&WorkspaceAck {
+            id: Uuid::from_u128(2),
+            selected_context_id: Some(context_id),
+        });
+        let outcome = bmux_plugin_sdk::finish_command_outcome_capture();
+        let expected = context_id.to_string();
+        assert_eq!(
+            outcome
+                .metadata
+                .get(SELECTED_CONTEXT_OUTCOME_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn client_selection_maps_round_trip_through_storage() {
+        let client_id = Uuid::from_u128(1);
+        let workspace_id = Uuid::from_u128(2);
+        let values = HashMap::from([(client_id, workspace_id)]);
+        let encoded = serde_json::to_vec(&values).expect("selection map should encode");
+        let decoded: HashMap<Uuid, Uuid> =
+            serde_json::from_slice(&encoded).expect("selection map should decode");
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn removing_workspace_repairs_all_client_pointers() {
+        let removed = Uuid::from_u128(10);
+        let fallback = Uuid::from_u128(20);
+        let first_client = Uuid::from_u128(1);
+        let second_client = Uuid::from_u128(2);
+        let mut state = WorkspaceState {
+            records: vec![
+                WorkspaceRecord {
+                    id: removed,
+                    name: "removed".to_string(),
+                },
+                WorkspaceRecord {
+                    id: fallback,
+                    name: "fallback".to_string(),
+                },
+            ],
+            active_by_client: HashMap::from([(first_client, removed), (second_client, fallback)]),
+            previous_by_client: HashMap::from([(first_client, fallback), (second_client, removed)]),
+        };
+
+        state.records.retain(|record| record.id != removed);
+        for active in state.active_by_client.values_mut() {
+            if *active == removed {
+                *active = fallback;
+            }
+        }
+        for previous in state.previous_by_client.values_mut() {
+            if *previous == removed {
+                *previous = fallback;
+            }
+        }
+
+        assert!(state.active_by_client.values().all(|id| *id == fallback));
+        assert!(state.previous_by_client.values().all(|id| *id == fallback));
     }
 
     #[test]

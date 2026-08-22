@@ -922,6 +922,8 @@ mod tests {
             id: Uuid::from_u128(10),
             name: "build".to_string(),
             active: true,
+            workspace: "default".to_string(),
+            workspace_id: uuid::Uuid::nil(),
         };
         assert_eq!(
             render_template("{{literal}} {index}{name} {active}", &window, 1, true, None,),
@@ -935,6 +937,8 @@ mod tests {
             id: Uuid::from_u128(20),
             name: "build".to_string(),
             active: false,
+            workspace: "default".to_string(),
+            workspace_id: uuid::Uuid::nil(),
         };
         let fact = PresentationFact {
             entity: PresentationEntityRef::new("bmux.windows", window.id.to_string()),
@@ -982,11 +986,15 @@ mod tests {
                     id: first,
                     name: "one".to_string(),
                     active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 },
                 windows_list::WindowListEntry {
                     id: second,
                     name: "two".to_string(),
                     active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 },
             ],
             revision: 1,
@@ -1011,6 +1019,8 @@ mod tests {
                     id: Uuid::from_u128(index),
                     name: format!("window-{index}"),
                     active: index == 4,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 })
                 .collect(),
             revision: 1,
@@ -1036,11 +1046,15 @@ mod tests {
                     id: first,
                     name: "one".to_string(),
                     active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 },
                 windows_list::WindowListEntry {
                     id: second,
                     name: "two".to_string(),
                     active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 },
             ],
             revision: 1,
@@ -1090,6 +1104,8 @@ mod tests {
                     id: Uuid::from_u128(index),
                     name: format!("window-{index}"),
                     active: index == 1_999,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 })
                 .collect(),
             revision: 1,
@@ -1116,6 +1132,8 @@ mod tests {
                 id: Uuid::from_u128(50),
                 name: "single".to_string(),
                 active: true,
+                workspace: "default".to_string(),
+                workspace_id: uuid::Uuid::nil(),
             }],
             revision: 1,
         });
@@ -1127,6 +1145,8 @@ mod tests {
                     id: Uuid::from_u128(index),
                     name: format!("window-{index}"),
                     active: index == 1_999,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 })
                 .collect(),
             revision: 2,
@@ -1147,6 +1167,8 @@ mod tests {
                 id: Uuid::from_u128(40),
                 name: "one".to_string(),
                 active: true,
+                workspace: "default".to_string(),
+                workspace_id: uuid::Uuid::nil(),
             }],
             revision: 1,
         });
@@ -1169,6 +1191,8 @@ mod tests {
                 id,
                 name: "main".to_string(),
                 active: true,
+                workspace: "default".to_string(),
+                workspace_id: uuid::Uuid::nil(),
             }],
             revision: 1,
         });

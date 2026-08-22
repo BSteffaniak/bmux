@@ -1236,6 +1236,7 @@ dependencies = [
  "bmux_decoration_plugin_renderer",
  "bmux_diagnostic_log",
  "bmux_env",
+ "bmux_finder_plugin",
  "bmux_image",
  "bmux_ipc",
  "bmux_keybind",
@@ -1273,6 +1274,7 @@ dependencies = [
  "bmux_visual_adapters_plugin_renderer",
  "bmux_windows_plugin",
  "bmux_windows_plugin_api",
+ "bmux_workspaces_plugin",
  "clap",
  "crossterm",
  "dirs",
@@ -1755,6 +1757,19 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_finder_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_windows_plugin_api",
+ "bmux_workspaces_plugin_api",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

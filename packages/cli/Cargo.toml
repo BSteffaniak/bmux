@@ -98,6 +98,9 @@ bmux_decoration_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 bmux_decoration_plugin_renderer = { workspace = true, optional = true }
+bmux_finder_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_pane_runtime_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -133,6 +136,9 @@ bmux_theme_plugin = { workspace = true, optional = true, features = [
 ] }
 bmux_visual_adapters_plugin_renderer = { workspace = true, optional = true }
 bmux_windows_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+bmux_workspaces_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 
@@ -244,8 +250,10 @@ fail-on-warnings = [
     "bmux_terminal_grid/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
     "bmux_windows_plugin?/fail-on-warnings",
+    "bmux_workspaces_plugin?/fail-on-warnings",
     "bmux_decoration_plugin?/fail-on-warnings",
     "bmux_decoration_plugin_renderer?/fail-on-warnings",
+    "bmux_finder_plugin?/fail-on-warnings",
 ]
 
 # Semantic bracketed-paste capture and pane forwarding
@@ -278,7 +286,9 @@ bundled-plugins = [
     "bundled-plugin-tab-strip",
     "bundled-plugin-theme",
     "bundled-plugin-windows",
+    "bundled-plugin-workspaces",
     "bundled-plugin-decoration",
+    "bundled-plugin-finder",
     "bundled-visual-adapters",
 ]
 
@@ -298,6 +308,7 @@ bundled-plugin-decoration = [
     "dep:bmux_decoration_plugin",
     "dep:bmux_decoration_plugin_renderer",
 ]
+bundled-plugin-finder = ["dep:bmux_finder_plugin"]
 bundled-plugin-pane-runtime = ["dep:bmux_pane_runtime_plugin"]
 bundled-plugin-performance = ["dep:bmux_performance_plugin"]
 bundled-plugin-permissions = ["dep:bmux_permissions_plugin"]
@@ -309,6 +320,7 @@ bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
 bundled-plugin-tab-strip = ["dep:bmux_tab_strip_plugin"]
 bundled-plugin-theme = ["dep:bmux_theme_plugin"]
 bundled-plugin-windows = ["dep:bmux_windows_plugin"]
+bundled-plugin-workspaces = ["dep:bmux_workspaces_plugin"]
 bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]
 
 # Optional features

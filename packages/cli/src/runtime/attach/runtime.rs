@@ -3676,6 +3676,8 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                     id,
                     name: entry.name,
                     active: entry.active,
+                    workspace: entry.workspace,
+                    workspace_id: entry.workspace_id,
                 })
             })
             .collect();

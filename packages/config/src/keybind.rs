@@ -170,6 +170,10 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
         "ctrl+l".to_string(),
         "plugin:bmux.windows:last-window".to_string(),
     );
+    map.insert(
+        "alt+l".to_string(),
+        "plugin:bmux.workspaces:last-workspace".to_string(),
+    );
     map
 }
 
@@ -250,6 +254,14 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     map.insert(
         "shift+c".to_string(),
         "plugin:bmux.sessions:new-session".to_string(),
+    );
+    map.insert(
+        "shift+w".to_string(),
+        "plugin:bmux.workspaces:new-workspace".to_string(),
+    );
+    map.insert(
+        "shift+s".to_string(),
+        "plugin:bmux.workspaces:switch-workspace".to_string(),
     );
     map
 }

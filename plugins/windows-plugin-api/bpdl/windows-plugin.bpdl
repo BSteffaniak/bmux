@@ -56,6 +56,8 @@ interface windows-state {
         id: string,
         name: string,
         active: bool,
+        workspace: string,
+        workspace-id: uuid,
     }
 
     // Pane-level queries.
@@ -380,6 +382,8 @@ interface windows-list {
         id: uuid,
         name: string,
         active: bool,
+        workspace: string,
+        workspace-id: uuid,
     }
 
     @state events window-list-snapshot;

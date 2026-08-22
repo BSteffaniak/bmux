@@ -223,6 +223,11 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
+    feature = "bundled-plugin-finder",
+    id = "bmux.finder",
+    manifest = include_str!("../../../../plugins/finder-plugin/plugin.toml"),
+    plugin_type = bmux_finder_plugin::FinderPlugin;
+
     feature = "bundled-plugin-pane-runtime",
     id = "bmux.pane_runtime",
     manifest = include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
@@ -252,6 +257,11 @@ declare_bundled_plugins! {
     id = "bmux.windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
     plugin_type = bmux_windows_plugin::WindowsPlugin;
+
+    feature = "bundled-plugin-workspaces",
+    id = "bmux.workspaces",
+    manifest = include_str!("../../../../plugins/workspaces-plugin/plugin.toml"),
+    plugin_type = bmux_workspaces_plugin::WorkspacesPlugin;
 
     feature = "bundled-plugin-decoration",
     id = "bmux.decoration",
@@ -430,6 +440,8 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         "contexts-plugin",
         #[cfg(feature = "bundled-plugin-control-catalog")]
         "control-catalog-plugin",
+        #[cfg(feature = "bundled-plugin-finder")]
+        "finder-plugin",
         #[cfg(feature = "bundled-plugin-performance")]
         "performance-plugin",
         #[cfg(feature = "bundled-plugin-permissions")]
@@ -450,6 +462,8 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         "theme-plugin",
         #[cfg(feature = "bundled-plugin-windows")]
         "windows-plugin",
+        #[cfg(feature = "bundled-plugin-workspaces")]
+        "workspaces-plugin",
         #[cfg(feature = "bundled-plugin-decoration")]
         "decoration-plugin",
     ]

@@ -93,6 +93,35 @@ fn list_contexts(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<ContextSumm
         .map_err(|err| typed_service_error("contexts-state/list-contexts", err))
 }
 
+fn active_workspace_id(caller: &(impl ServiceCaller + Sync)) -> Uuid {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::current_workspace(&mut client),
+    )
+    .ok()
+    .flatten()
+    .map_or_else(Uuid::nil, |workspace| workspace.id)
+}
+
+fn filter_contexts_for_workspace(
+    contexts: Vec<ContextSummary>,
+    workspace_id: Uuid,
+) -> Vec<ContextSummary> {
+    contexts
+        .into_iter()
+        .filter(|context| context_workspace_id(context) == workspace_id)
+        .collect()
+}
+
+fn list_contexts_in_active_workspace(
+    caller: &(impl ServiceCaller + Sync),
+) -> Result<Vec<ContextSummary>, String> {
+    Ok(filter_contexts_for_workspace(
+        list_contexts(caller)?,
+        active_workspace_id(caller),
+    ))
+}
+
 fn current_context(caller: &(impl ServiceCaller + Sync)) -> Result<Option<ContextSummary>, String> {
     let mut client = dispatch_client(caller);
     bmux_plugin::block_on_typed_dispatch(api_contexts_state::client::current_context(&mut client))
@@ -2102,6 +2131,28 @@ enum WindowCycleDirection {
     Last,
 }
 
+fn context_workspace_id(context: &ContextSummary) -> Uuid {
+    let attribute = context
+        .attributes
+        .get("workspace")
+        .map_or("default", String::as_str);
+    if attribute == "default" {
+        return Uuid::nil();
+    }
+    Uuid::parse_str(attribute).unwrap_or_else(|_| Uuid::nil())
+}
+
+fn workspace_names(caller: &(impl ServiceCaller + Sync)) -> BTreeMap<Uuid, String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::list_workspaces(&mut client),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|workspace| (workspace.id, workspace.name))
+    .collect()
+}
+
 fn list_windows(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
@@ -2121,15 +2172,25 @@ fn list_windows(
     let current_context =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &selected)?;
 
+    let workspace_names = workspace_names(caller);
     Ok(selected
         .into_iter()
         .enumerate()
-        .map(|(index, context)| WindowEntry {
-            id: context.id.to_string(),
-            name: context
-                .name
-                .unwrap_or_else(|| format!("tab-{}", index.saturating_add(1))),
-            active: current_context == Some(context.id),
+        .map(|(index, context)| {
+            let workspace_id = context_workspace_id(&context);
+            let workspace = workspace_names
+                .get(&workspace_id)
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            WindowEntry {
+                id: context.id.to_string(),
+                name: context
+                    .name
+                    .unwrap_or_else(|| format!("tab-{}", index.saturating_add(1))),
+                active: current_context == Some(context.id),
+                workspace,
+                workspace_id,
+            }
         })
         .collect())
 }
@@ -2166,18 +2227,29 @@ fn publish_window_list_snapshot(
 }
 
 fn publish_window_list_ordered_contexts(
+    caller: &(impl ServiceCaller + Sync),
     contexts: Vec<ContextSummary>,
     active_context_id: Option<Uuid>,
 ) {
+    let workspace_names = workspace_names(caller);
     let entries = contexts
         .into_iter()
         .enumerate()
-        .map(|(index, context)| WindowEntry {
-            id: context.id.to_string(),
-            name: context
-                .name
-                .unwrap_or_else(|| format!("tab-{}", index.saturating_add(1))),
-            active: active_context_id == Some(context.id),
+        .map(|(index, context)| {
+            let workspace_id = context_workspace_id(&context);
+            let workspace = workspace_names
+                .get(&workspace_id)
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            WindowEntry {
+                id: context.id.to_string(),
+                name: context
+                    .name
+                    .unwrap_or_else(|| format!("tab-{}", index.saturating_add(1))),
+                active: active_context_id == Some(context.id),
+                workspace,
+                workspace_id,
+            }
         })
         .collect();
     publish_window_list_entries(entries);
@@ -2192,6 +2264,8 @@ fn publish_window_list_entries(entries: Vec<WindowEntry>) {
                 id,
                 name: entry.name,
                 active: entry.active,
+                workspace: entry.workspace,
+                workspace_id: entry.workspace_id,
             })
         })
         .collect();
@@ -2216,7 +2290,7 @@ fn reset_window_order(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
 ) -> Result<usize, String> {
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
     set_stored_window_order_ids(caller, &ids)?;
@@ -2252,8 +2326,7 @@ fn create_window(
     runtime_state: &WindowRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<WindowAck, String> {
-    let mut contexts =
-        cached_known_contexts(runtime_state).map_or_else(|| list_contexts(caller), Ok)?;
+    let mut contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
     let previous_context =
@@ -2293,7 +2366,7 @@ fn rename_window(
     name: &str,
 ) -> Result<WindowAck, String> {
     let name = normalize_window_name(name)?;
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let context_id =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
@@ -2444,7 +2517,7 @@ fn switch_window(
 ) -> Result<WindowAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let context_list_us = list_started.elapsed().as_micros();
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     switch_window_with_contexts(
@@ -2508,7 +2581,7 @@ fn switch_window_with_contexts(
     );
     let remember_us = remember_started.elapsed().as_micros();
     let publish_started = Instant::now();
-    publish_window_list_ordered_contexts(contexts.to_vec(), Some(context_id));
+    publish_window_list_ordered_contexts(caller, contexts.to_vec(), Some(context_id));
     let publish_us = publish_started.elapsed().as_micros();
     emit_attach_phase_timing(&serde_json::json!({
         "phase": "windows.switch_window",
@@ -2542,7 +2615,7 @@ fn move_window(
         });
     }
 
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let live_ids = contexts
         .iter()
         .map(|context| context.id)
@@ -2596,7 +2669,7 @@ fn cycle_window(
 ) -> Result<WindowAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let context_list_us = list_started.elapsed().as_micros();
     let order_started = Instant::now();
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
@@ -2678,7 +2751,7 @@ fn goto_window_by_index(
         return Err("window index must be 1 or greater".to_string());
     }
     let list_started = Instant::now();
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let context_list_us = list_started.elapsed().as_micros();
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     if contexts.is_empty() {
@@ -2713,7 +2786,7 @@ fn close_current_window(
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
-    let contexts = list_contexts(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let current_id =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
@@ -2948,12 +3021,14 @@ fn resolve_window_order_ids(
     if let Some(order_ids) = cached_window_order_ids(runtime_state) {
         return Ok(project_window_order_ids(order_ids, contexts));
     }
-
-    let mut order_ids = get_stored_window_order_ids(caller)?;
+    let workspace_id = contexts
+        .first()
+        .map_or_else(Uuid::nil, context_workspace_id);
+    let mut order_ids = get_stored_window_order_ids_for_workspace(caller, workspace_id)?;
     if order_ids.is_empty() && !contexts.is_empty() {
         order_ids = contexts.iter().map(|context| context.id).collect();
         order_ids.sort_by_key(uuid::Uuid::as_u128);
-        set_stored_window_order_ids(caller, &order_ids)?;
+        set_stored_window_order_ids_for_workspace(caller, workspace_id, &order_ids)?;
         if let Ok(mut state) = runtime_state.lock() {
             state.window_order_ids = Some(order_ids.clone());
             state.window_order_dirty = false;
@@ -2985,7 +3060,7 @@ fn resolve_window_order_ids(
     }
 
     if changed {
-        set_stored_window_order_ids(caller, &order_ids)?;
+        set_stored_window_order_ids_for_workspace(caller, workspace_id, &order_ids)?;
     }
 
     let order_ids = project_window_order_ids(order_ids, contexts);
@@ -3001,24 +3076,6 @@ fn cached_window_order_ids(runtime_state: &WindowRuntimeStateHandle) -> Option<V
         .lock()
         .ok()
         .and_then(|state| state.window_order_ids.clone())
-}
-
-fn cached_known_contexts(runtime_state: &WindowRuntimeStateHandle) -> Option<Vec<ContextSummary>> {
-    let state = runtime_state.lock().ok()?;
-    if state.known_contexts.is_empty() {
-        return None;
-    }
-    Some(
-        state
-            .known_contexts
-            .iter()
-            .map(|(id, name)| ContextSummary {
-                id: *id,
-                name: name.clone(),
-                attributes: BTreeMap::new(),
-            })
-            .collect(),
-    )
 }
 
 fn seed_known_contexts(runtime_state: &WindowRuntimeStateHandle, contexts: &[ContextSummary]) {
@@ -3074,19 +3131,35 @@ fn project_window_order_ids(mut order_ids: Vec<Uuid>, contexts: &[ContextSummary
     order_ids
 }
 
-fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>, String> {
+fn workspace_order_storage_key(workspace_id: Uuid) -> bmux_plugin_sdk::StorageKey {
+    storage_key(&format!("windows.order.{}", workspace_id.simple()))
+}
+
+fn get_stored_window_order_ids_for_workspace(
+    caller: &impl HostRuntimeApi,
+    workspace_id: Uuid,
+) -> Result<Vec<Uuid>, String> {
     let response = caller
-        .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
-            "windows.order"
+        .storage_get(&StorageGetRequest::new(workspace_order_storage_key(
+            workspace_id,
         )))
         .map_err(|error| error.to_string())?;
-    let Some(value) = response.value else {
-        return Ok(Vec::new());
-    };
-    if value.is_empty() {
-        return Ok(Vec::new());
+    if let Some(value) = response.value
+        && !value.is_empty()
+    {
+        return parse_stored_window_order_value(value);
     }
+    if workspace_id.is_nil() {
+        let legacy = get_stored_window_order_ids(caller)?;
+        if !legacy.is_empty() {
+            set_stored_window_order_ids_for_workspace(caller, workspace_id, &legacy)?;
+        }
+        return Ok(legacy);
+    }
+    Ok(Vec::new())
+}
 
+fn parse_stored_window_order_value(value: Vec<u8>) -> Result<Vec<Uuid>, String> {
     if let Ok(raw) = serde_json::from_slice::<Vec<String>>(&value) {
         return parse_stored_window_order_entries(raw);
     }
@@ -3099,6 +3172,34 @@ fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>
             .map(ToOwned::to_owned)
             .collect(),
     )
+}
+
+fn set_stored_window_order_ids_for_workspace(
+    caller: &impl HostRuntimeApi,
+    workspace_id: Uuid,
+    order_ids: &[Uuid],
+) -> Result<(), String> {
+    caller
+        .storage_set(&StorageSetRequest::new(
+            workspace_order_storage_key(workspace_id),
+            encode_stored_window_order_lines(order_ids),
+        ))
+        .map_err(|error| error.to_string())
+}
+
+fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest::new(bmux_plugin_sdk::storage_key!(
+            "windows.order"
+        )))
+        .map_err(|error| error.to_string())?;
+    let Some(value) = response.value else {
+        return Ok(Vec::new());
+    };
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    parse_stored_window_order_value(value)
 }
 
 fn parse_stored_window_order_entries(raw: Vec<String>) -> Result<Vec<Uuid>, String> {
@@ -5628,7 +5729,8 @@ mod tests {
             ]
         );
 
-        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
+        let stored_order = get_stored_window_order_ids_for_workspace(&host, Uuid::nil())
+            .expect("workspace order lookup should succeed");
         assert_eq!(stored_order, vec![first_id, second_id, third_id]);
 
         *host
@@ -5947,6 +6049,31 @@ mod tests {
     }
 
     #[test]
+    fn workspace_filter_keeps_only_matching_contexts() {
+        let default_context = ContextSummary {
+            id: Uuid::from_u128(1),
+            name: Some("default".to_string()),
+            attributes: BTreeMap::from([("workspace".to_string(), "default".to_string())]),
+        };
+        let workspace_id = Uuid::from_u128(2);
+        let workspace_context = ContextSummary {
+            id: Uuid::from_u128(3),
+            name: Some("project".to_string()),
+            attributes: BTreeMap::from([("workspace".to_string(), workspace_id.to_string())]),
+        };
+
+        let filtered = filter_contexts_for_workspace(
+            vec![default_context.clone(), workspace_context.clone()],
+            workspace_id,
+        );
+        assert_eq!(filtered, vec![workspace_context]);
+        assert_eq!(
+            filter_contexts_for_workspace(vec![default_context.clone()], Uuid::nil()),
+            vec![default_context]
+        );
+    }
+
+    #[test]
     fn goto_window_by_index_selects_first_context() {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
@@ -6249,6 +6376,48 @@ mod tests {
 
     /// Simulates a `ContextEvent::Closed` for a middle entry. The
     /// remaining entries preserve their relative order.
+    #[test]
+    fn legacy_flat_order_migrates_to_default_workspace_without_reordering() {
+        let host = MockHost::with_sessions(Vec::new());
+        let legacy = [
+            Uuid::from_u128(30),
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+        ];
+        set_stored_window_order_ids(&host, &legacy).expect("legacy order should seed");
+
+        let migrated = get_stored_window_order_ids_for_workspace(&host, Uuid::nil())
+            .expect("default workspace order should migrate");
+        assert_eq!(migrated, legacy);
+
+        set_stored_window_order_ids(&host, &[]).expect("legacy order should clear");
+        let persisted = get_stored_window_order_ids_for_workspace(&host, Uuid::nil())
+            .expect("migrated order should remain");
+        assert_eq!(persisted, legacy);
+    }
+
+    #[test]
+    fn workspace_order_keys_are_isolated_by_uuid() {
+        let host = MockHost::with_sessions(Vec::new());
+        let first_workspace = Uuid::from_u128(1);
+        let second_workspace = Uuid::from_u128(2);
+        let first_order = [Uuid::from_u128(10), Uuid::from_u128(11)];
+        let second_order = [Uuid::from_u128(20)];
+        set_stored_window_order_ids_for_workspace(&host, first_workspace, &first_order)
+            .expect("first workspace order should persist");
+        set_stored_window_order_ids_for_workspace(&host, second_workspace, &second_order)
+            .expect("second workspace order should persist");
+
+        assert_eq!(
+            get_stored_window_order_ids_for_workspace(&host, first_workspace).unwrap(),
+            first_order
+        );
+        assert_eq!(
+            get_stored_window_order_ids_for_workspace(&host, second_workspace).unwrap(),
+            second_order
+        );
+    }
+
     #[test]
     fn remove_context_from_window_order_preserves_surrounding_order() {
         let host = MockHost::with_sessions(Vec::new());

@@ -75,9 +75,11 @@ bmux new-session dev
 bmux list-sessions
 bmux attach dev
 
-# Work with windows
-bmux window new --session dev --name editor
-bmux window list --session dev
+# Work with named workspaces and tabs
+bmux workspace new --name project
+bmux tab new --name editor
+bmux tab list
+bmux workspace switch project
 
 # Multi-client collaboration
 bmux list-clients

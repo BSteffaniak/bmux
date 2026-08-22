@@ -1,0 +1,16 @@
+execution_class       = "native_fast"
+id                    = "bmux.finder"
+name                  = "bmux Finder"
+owns_namespaces       = ["finder"]
+required_capabilities = ["bmux.windows.read", "bmux.workspaces.read"]
+version               = "0.0.1-alpha.0"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "show"
+path          = ["finder", "show"]
+summary       = "Search tabs across workspaces"
+
+[keybindings.runtime]
+"shift+f" = "plugin:bmux.finder:show"

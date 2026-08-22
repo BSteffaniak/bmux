@@ -1106,6 +1106,8 @@ mod tests {
             id: Uuid::from_u128(8),
             name: "界界界".to_string(),
             active: true,
+            workspace: "default".to_string(),
+            workspace_id: uuid::Uuid::nil(),
         };
         let settings = Settings {
             maximum_label_width: 5,
@@ -1125,11 +1127,15 @@ mod tests {
                     id: first,
                     name: "one".to_string(),
                     active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 },
                 windows_list::WindowListEntry {
                     id: second,
                     name: "two".to_string(),
                     active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 },
             ],
             revision: 1,
@@ -1154,6 +1160,8 @@ mod tests {
                     id: Uuid::from_u128(index),
                     name: format!("window-{index}"),
                     active: index == 4,
+                    workspace: "default".to_string(),
+                    workspace_id: uuid::Uuid::nil(),
                 })
                 .collect(),
             revision: 1,
@@ -1186,6 +1194,8 @@ mod tests {
                 id: Uuid::from_u128(index),
                 name: format!("w{index}"),
                 active: false,
+                workspace: "default".to_string(),
+                workspace_id: uuid::Uuid::nil(),
             })
             .collect();
         assert_eq!(visible_window_at_col(&state, 4), Some(Uuid::from_u128(1)));
@@ -1216,6 +1226,8 @@ mod tests {
                 id,
                 name: "main".to_string(),
                 active: true,
+                workspace: "default".to_string(),
+                workspace_id: uuid::Uuid::nil(),
             }],
             revision: 1,
         });
