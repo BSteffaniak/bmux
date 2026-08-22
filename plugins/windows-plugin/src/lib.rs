@@ -1121,8 +1121,6 @@ struct WindowRuntimeState {
     previous_context_id: Option<Uuid>,
     window_order_ids: Option<Vec<Uuid>>,
     window_order_dirty: bool,
-    window_order_flush_generation: u64,
-    window_order_flush_scheduled: bool,
     known_contexts: BTreeMap<Uuid, Option<String>>,
 }
 
@@ -1425,12 +1423,19 @@ fn handle_context_event(
     match event {
         ContextEvent::Created { context_id, name } => {
             cache_known_context(&shared.runtime_state, *context_id, name.clone());
-            cache_contexts_to_window_order(&shared.runtime_state, [*context_id]);
-            schedule_window_order_flush(shared.clone());
+            let workspace_id = list_contexts(caller)
+                .ok()
+                .and_then(|contexts| {
+                    contexts
+                        .into_iter()
+                        .find(|context| context.id == *context_id)
+                })
+                .map_or_else(Uuid::nil, |context| context_workspace_id(&context));
+            let _ = append_context_to_workspace_order(caller, workspace_id, *context_id);
         }
         ContextEvent::Closed { context_id } => {
             remove_known_context(&shared.runtime_state, *context_id);
-            let _ = remove_context_from_window_order(caller, &shared.runtime_state, *context_id);
+            let _ = remove_context_from_all_workspace_orders(caller, *context_id);
             publish_window_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::Selected { context_id } => {
@@ -1453,6 +1458,39 @@ fn handle_context_event(
     }
 }
 
+fn append_context_to_workspace_order(
+    caller: &impl HostRuntimeApi,
+    workspace_id: Uuid,
+    context_id: Uuid,
+) -> Result<(), String> {
+    let mut order = get_stored_window_order_ids_for_workspace(caller, workspace_id)?;
+    if !order.contains(&context_id) {
+        order.push(context_id);
+        set_stored_window_order_ids_for_workspace(caller, workspace_id, &order)?;
+    }
+    Ok(())
+}
+
+fn remove_context_from_all_workspace_orders(
+    caller: &(impl HostRuntimeApi + Sync),
+    context_id: Uuid,
+) -> Result<(), String> {
+    let mut client = dispatch_client(caller);
+    let workspaces = bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::list_workspaces(&mut client),
+    )
+    .unwrap_or_default();
+    for workspace in workspaces {
+        let mut order = get_stored_window_order_ids_for_workspace(caller, workspace.id)?;
+        let original_len = order.len();
+        order.retain(|id| *id != context_id);
+        if order.len() != original_len {
+            set_stored_window_order_ids_for_workspace(caller, workspace.id, &order)?;
+        }
+    }
+    Ok(())
+}
+
 /// Append `context_id` to the persisted `windows.order` list when it
 /// is not already present. Preserves the existing order of every
 /// already-known entry — new contexts land at the end, matching the
@@ -1464,72 +1502,6 @@ fn append_context_to_window_order(
     context_id: Uuid,
 ) -> Result<(), String> {
     append_contexts_to_window_order(caller, runtime_state, [context_id])
-}
-
-fn schedule_window_order_flush(shared: WindowsSharedState) {
-    let mut generation = {
-        let Ok(mut state) = shared.runtime_state.lock() else {
-            return;
-        };
-        state.window_order_flush_generation = state.window_order_flush_generation.saturating_add(1);
-        if state.window_order_flush_scheduled {
-            return;
-        }
-        state.window_order_flush_scheduled = true;
-        state.window_order_flush_generation
-    };
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let Some(current_generation) =
-                current_window_order_flush_generation(&shared.runtime_state)
-            else {
-                return;
-            };
-            if current_generation != generation {
-                generation = current_generation;
-                continue;
-            }
-            let _ = flush_dirty_window_order(shared.caller.as_ref(), &shared.runtime_state);
-            let Ok(mut state) = shared.runtime_state.lock() else {
-                return;
-            };
-            if state.window_order_flush_generation == generation {
-                state.window_order_flush_scheduled = false;
-                return;
-            }
-            generation = state.window_order_flush_generation;
-        }
-    });
-}
-
-fn current_window_order_flush_generation(runtime_state: &WindowRuntimeStateHandle) -> Option<u64> {
-    runtime_state
-        .lock()
-        .ok()
-        .map(|state| state.window_order_flush_generation)
-}
-
-fn flush_dirty_window_order(
-    caller: &impl HostRuntimeApi,
-    runtime_state: &WindowRuntimeStateHandle,
-) -> Result<(), String> {
-    let order_ids = {
-        let Ok(state) = runtime_state.lock() else {
-            return Ok(());
-        };
-        if !state.window_order_dirty {
-            return Ok(());
-        }
-        state.window_order_ids.clone().unwrap_or_default()
-    };
-    set_stored_window_order_ids(caller, &order_ids)?;
-    if let Ok(mut state) = runtime_state.lock()
-        && state.window_order_ids.as_ref() == Some(&order_ids)
-    {
-        state.window_order_dirty = false;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1609,6 +1581,7 @@ fn append_contexts_to_stored_window_order(
 /// Remove `context_id` from the persisted `windows.order` list.
 /// No-op when the id is not present. Also clears the active marker
 /// if it was pointing at the removed context.
+#[cfg(test)]
 fn remove_context_from_window_order(
     caller: &impl HostRuntimeApi,
     runtime_state: &WindowRuntimeStateHandle,
@@ -1923,6 +1896,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 &plugin.runtime_state,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
+                context.settings.as_ref(),
             )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("closed current window context {id}");
@@ -2293,7 +2267,7 @@ fn reset_window_order(
     let contexts = list_contexts_in_active_workspace(caller)?;
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
-    set_stored_window_order_ids(caller, &ids)?;
+    set_stored_window_order_ids_for_workspace(caller, active_workspace_id(caller), &ids)?;
     if let Ok(mut state) = runtime_state.lock() {
         state.window_order_ids = Some(ids.clone());
         state.window_order_dirty = false;
@@ -2641,7 +2615,7 @@ fn move_window(
     };
     order_ids.insert(insert_index.min(order_ids.len()), source_id);
 
-    set_stored_window_order_ids(caller, &order_ids)?;
+    set_stored_window_order_ids_for_workspace(caller, active_workspace_id(caller), &order_ids)?;
     if let Ok(mut state) = runtime_state.lock() {
         state.window_order_ids = Some(order_ids);
         state.window_order_dirty = false;
@@ -2780,11 +2754,48 @@ fn goto_window_by_index(
     )
 }
 
+fn on_last_tab_closed_setting(settings: Option<&toml::Value>) -> Result<&'static str, String> {
+    let Some(value) = settings.and_then(|settings| settings.get("on_last_tab_closed")) else {
+        return Ok("delete");
+    };
+    match value.as_str() {
+        Some("delete") => Ok("delete"),
+        Some("keep_empty") => Ok("keep_empty"),
+        Some(other) => Err(format!(
+            "invalid on_last_tab_closed value '{other}' (expected delete or keep_empty)"
+        )),
+        None => Err("invalid on_last_tab_closed value (expected string)".to_string()),
+    }
+}
+
+fn kill_active_workspace(caller: &(impl ServiceCaller + Sync)) -> Result<(), String> {
+    let mut client = dispatch_client(caller);
+    let current = bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::current_workspace(&mut client),
+    )
+    .map_err(|error| typed_service_error("workspaces-state/current-workspace", error))?
+    .ok_or_else(|| "no active workspace".to_string())?;
+    let result = bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_commands::client::kill_workspace(
+            &mut client,
+            bmux_workspaces_plugin_api::workspaces_state::WorkspaceSelector {
+                id: Some(current.id),
+                name: None,
+            },
+        ),
+    )
+    .map_err(|error| typed_service_error("workspaces-commands/kill-workspace", error))?;
+    result
+        .map(|_| ())
+        .map_err(|error| format!("kill-workspace failed: {error:?}"))
+}
+
 fn close_current_window(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
+    settings: Option<&toml::Value>,
 ) -> Result<WindowAck, String> {
     let contexts = list_contexts_in_active_workspace(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
@@ -2815,6 +2826,9 @@ fn close_current_window(
     }
 
     close_context(caller, context_selector_by_id(current_id), false)?;
+    if contexts.len() == 1 && on_last_tab_closed_setting(settings)? == "delete" {
+        kill_active_workspace(caller)?;
+    }
 
     publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck {
@@ -3212,6 +3226,7 @@ fn parse_stored_window_order_entries(raw: Vec<String>) -> Result<Vec<Uuid>, Stri
         .collect()
 }
 
+#[cfg(test)]
 fn set_stored_window_order_ids(
     caller: &impl HostRuntimeApi,
     order_ids: &[Uuid],
@@ -6128,6 +6143,18 @@ mod tests {
     }
 
     #[test]
+    fn last_tab_closed_setting_defaults_to_delete_and_accepts_keep_empty() {
+        assert_eq!(on_last_tab_closed_setting(None).unwrap(), "delete");
+        let keep_empty = toml::toml! { on_last_tab_closed = "keep_empty" }.into();
+        assert_eq!(
+            on_last_tab_closed_setting(Some(&keep_empty)).unwrap(),
+            "keep_empty"
+        );
+        let invalid = toml::toml! { on_last_tab_closed = "invalid" }.into();
+        assert!(on_last_tab_closed_setting(Some(&invalid)).is_err());
+    }
+
+    #[test]
     fn close_current_window_closes_and_switches() {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
@@ -6135,7 +6162,7 @@ mod tests {
         let last_selected_by_client = LastSelectedByClient::default();
         let runtime_state = runtime_state();
 
-        let ack = close_current_window(&host, &runtime_state, &last_selected_by_client, None)
+        let ack = close_current_window(&host, &runtime_state, &last_selected_by_client, None, None)
             .expect("close current should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
@@ -6184,7 +6211,8 @@ mod tests {
 
         assert!(ack.ok);
         assert_eq!(ack.id, Some(third.to_string()));
-        let order = get_stored_window_order_ids(&host).expect("order readable");
+        let order =
+            get_stored_window_order_ids_for_workspace(&host, Uuid::nil()).expect("order readable");
         assert_eq!(order, vec![third, first, second]);
         assert_eq!(cached_window_order_ids(&runtime_state), Some(order));
     }
@@ -6209,7 +6237,8 @@ mod tests {
         )
         .expect("move should succeed");
 
-        let order = get_stored_window_order_ids(&host).expect("order readable");
+        let order =
+            get_stored_window_order_ids_for_workspace(&host, Uuid::nil()).expect("order readable");
         assert_eq!(order, vec![second, third, first]);
         assert_eq!(
             get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable"),

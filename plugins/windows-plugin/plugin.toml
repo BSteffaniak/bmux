@@ -54,6 +54,7 @@ required_capabilities = [
     "bmux.sessions.read",
     "bmux.sessions.write",
     "bmux.workspaces.read",
+    "bmux.workspaces.write",
     "bmux.storage",
 ]
 version = "0.0.1-alpha.0"
