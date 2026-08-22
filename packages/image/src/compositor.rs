@@ -138,15 +138,17 @@ fn emit_passthrough(
             let placement_id = host_image_id;
 
             if needs_transmit {
-                out.write_all(b"\x1b_")?;
-                out.write_all(&crate::codec::kitty::encode_transmit(
+                for chunk in crate::codec::kitty::encode_transmit_chunks(
                     host_image_id,
                     crate::model::KittyFormat::Png,
                     raw,
                     image.pixel_size.width,
                     image.pixel_size.height,
-                ))?;
-                out.write_all(b"\x1b\\")?;
+                ) {
+                    out.write_all(b"\x1b_")?;
+                    out.write_all(&chunk)?;
+                    out.write_all(b"\x1b\\")?;
+                }
             }
 
             // Always re-place at the (potentially updated) position.
@@ -213,15 +215,17 @@ fn emit_from_pixels(
             };
             let (host_id, needs_transmit) = kitty_state.get_or_allocate(image.id);
             if needs_transmit {
-                out.write_all(b"\x1b_")?;
-                out.write_all(&crate::codec::kitty::encode_transmit(
+                for chunk in crate::codec::kitty::encode_transmit_chunks(
                     host_id,
                     kitty_format,
                     data,
                     pixels.width,
                     pixels.height,
-                ))?;
-                out.write_all(b"\x1b\\")?;
+                ) {
+                    out.write_all(b"\x1b_")?;
+                    out.write_all(&chunk)?;
+                    out.write_all(b"\x1b\\")?;
+                }
             }
             out.write_all(b"\x1b_")?;
             out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(

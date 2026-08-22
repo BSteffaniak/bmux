@@ -1332,6 +1332,29 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
     }
 }
 
+fn configure_pane_terminal_env(
+    command: &mut CommandBuilder,
+    pane_term: &str,
+    image_protocol: Option<&str>,
+) {
+    command.env("TERM", pane_term);
+    command.env("TERM_PROGRAM", "bmux");
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    command.env("BMUX_PANE", "1");
+
+    // Physical-host identity must not leak through the emulated pane boundary.
+    command.env_remove("LC_TERMINAL");
+    command.env_remove("LC_TERMINAL_VERSION");
+    command.env_remove("KITTY_WINDOW_ID");
+    command.env_remove("KITTY_LISTEN_ON");
+
+    if let Some(protocol) = image_protocol {
+        command.env("BMUX_IMAGE_PROTOCOL", protocol);
+    } else {
+        command.env_remove("BMUX_IMAGE_PROTOCOL");
+    }
+}
+
 fn configure_device_seal_broker_env(command: &mut CommandBuilder) {
     if std::env::var("BMUX_DEVICE_SEAL_SCOPE").as_deref() == Ok("client") {
         if let Ok(exe) = std::env::current_exe() {
@@ -3860,11 +3883,18 @@ impl SessionRuntimeManager {
         let input_mode_state_for_reader = Arc::clone(&input_mode_state);
 
         #[cfg(feature = "image-registry")]
+        let image_config = bmux_config::BmuxConfig::load()
+            .unwrap_or_default()
+            .behavior
+            .images;
+        #[cfg(feature = "image-registry")]
+        let pane_image_protocol = image_config.enabled.then_some("kitty");
+        #[cfg(not(feature = "image-registry"))]
+        let pane_image_protocol: Option<&str> = None;
+
+        #[cfg(feature = "image-registry")]
         let image_registry = {
-            let img_config = bmux_config::BmuxConfig::load()
-                .unwrap_or_default()
-                .behavior
-                .images;
+            let img_config = image_config.clone();
             Arc::new(std::sync::Mutex::new(if img_config.enabled {
                 #[allow(clippy::cast_possible_truncation)]
                 bmux_image::ImageRegistry::new(
@@ -3933,7 +3963,7 @@ impl SessionRuntimeManager {
                     return;
                 }
                 let mut command = CommandBuilder::new(&launch.program);
-                command.env("TERM", &pane_term);
+                configure_pane_terminal_env(&mut command, &pane_term, pane_image_protocol);
                 for arg in &launch.args {
                     command.arg(arg);
                 }
@@ -3947,7 +3977,7 @@ impl SessionRuntimeManager {
                 (command, format!("command '{}'", launch.program))
             } else {
                 let mut command = CommandBuilder::new(&shell);
-                command.env("TERM", &pane_term);
+                configure_pane_terminal_env(&mut command, &pane_term, pane_image_protocol);
                 configure_device_seal_broker_env(&mut command);
                 if let Some(cwd) = initial_cwd.as_deref()
                     && !cwd.is_empty()
@@ -4098,7 +4128,11 @@ impl SessionRuntimeManager {
                     // output buffer.  Feature-gated to compile away when no image
                     // protocols are enabled.
                     #[cfg(feature = "image-registry")]
-                    let mut image_interceptor = bmux_image::ImageInterceptor::new();
+                    let mut image_interceptor =
+                        bmux_image::ImageInterceptor::with_max_encoded_bytes(
+                            usize::try_from(image_config.max_image_bytes.saturating_mul(2))
+                                .unwrap_or(usize::MAX),
+                        );
 
                     loop {
                         match reader.read(&mut buffer) {
@@ -8215,6 +8249,45 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_terminal_environment_hides_outer_host_and_advertises_virtual_images() {
+        let mut command = CommandBuilder::new("sh");
+        command.env("TERM_PROGRAM", "ghostty");
+        command.env("LC_TERMINAL", "iTerm2");
+        command.env("KITTY_WINDOW_ID", "42");
+
+        configure_pane_terminal_env(&mut command, "bmux-256color", Some("kitty"));
+
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("bmux-256color"))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new("bmux"))
+        );
+        assert_eq!(
+            command.get_env("BMUX_PANE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            command.get_env("BMUX_IMAGE_PROTOCOL"),
+            Some(std::ffi::OsStr::new("kitty"))
+        );
+        assert_eq!(command.get_env("LC_TERMINAL"), None);
+        assert_eq!(command.get_env("KITTY_WINDOW_ID"), None);
+    }
+
+    #[test]
+    fn pane_terminal_environment_does_not_advertise_disabled_images() {
+        let mut command = CommandBuilder::new("sh");
+        command.env("BMUX_IMAGE_PROTOCOL", "kitty");
+
+        configure_pane_terminal_env(&mut command, "bmux-256color", None);
+
+        assert_eq!(command.get_env("BMUX_IMAGE_PROTOCOL"), None);
+    }
 
     fn leaf(id: Uuid) -> PaneLayoutNode {
         PaneLayoutNode::Leaf { pane_id: id }

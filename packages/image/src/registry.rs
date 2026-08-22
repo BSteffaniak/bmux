@@ -22,6 +22,9 @@ enum ChangeLogEntry {
 #[derive(Clone)]
 struct KittyChunkAccumulator {
     data: Vec<u8>,
+    format: crate::model::KittyFormat,
+    width: u32,
+    height: u32,
 }
 
 /// Per-pane image storage with scroll tracking and delta queries.
@@ -400,13 +403,21 @@ impl ImageRegistry {
                 more_chunks: false,
             } => {
                 // Check if this is the final chunk of a multi-chunk transmission.
-                let final_data = if let Some(mut acc) = self.kitty_pending_chunks.remove(&image_id)
-                {
-                    acc.data.extend_from_slice(&data);
-                    acc.data
-                } else {
-                    data
-                };
+                let (final_data, format, width, height) =
+                    if let Some(mut acc) = self.kitty_pending_chunks.remove(&image_id) {
+                        if self.max_bytes > 0
+                            && acc.data.len().saturating_add(data.len()) > self.max_bytes
+                        {
+                            return;
+                        }
+                        acc.data.extend_from_slice(&data);
+                        (acc.data, acc.format, acc.width, acc.height)
+                    } else {
+                        if self.max_bytes > 0 && data.len() > self.max_bytes {
+                            return;
+                        }
+                        (data, format, width, height)
+                    };
                 self.kitty_transmitted.insert(
                     image_id,
                     KittyTransmittedImage {
@@ -421,17 +432,27 @@ impl ImageRegistry {
             }
             KittyCommand::Transmit {
                 image_id,
-                format: _,
+                format,
                 data,
-                width: _,
-                height: _,
+                width,
+                height,
                 more_chunks: true,
             } => {
                 // Accumulate chunks until the final chunk arrives.
                 let acc = self
                     .kitty_pending_chunks
                     .entry(image_id)
-                    .or_insert_with(|| KittyChunkAccumulator { data: Vec::new() });
+                    .or_insert_with(|| KittyChunkAccumulator {
+                        data: Vec::new(),
+                        format,
+                        width,
+                        height,
+                    });
+                if self.max_bytes > 0 && acc.data.len().saturating_add(data.len()) > self.max_bytes
+                {
+                    self.kitty_pending_chunks.remove(&image_id);
+                    return;
+                }
                 acc.data.extend_from_slice(&data);
             }
             KittyCommand::Place(placement) => {

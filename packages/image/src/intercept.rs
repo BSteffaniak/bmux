@@ -7,6 +7,8 @@
 
 use crate::model::{ImageEvent, ImagePosition};
 
+const DEFAULT_MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Interceptor state machine
 // ---------------------------------------------------------------------------
@@ -69,6 +71,8 @@ pub struct ImageInterceptor {
     capture_position: ImagePosition,
     /// Byte offset in the filtered output when the current image's ESC was seen.
     capture_filtered_offset: usize,
+    max_encoded_image_bytes: usize,
+    discarding_oversized: bool,
 
     #[cfg(feature = "sixel")]
     dcs_intermediates: Vec<u8>,
@@ -85,10 +89,43 @@ impl ImageInterceptor {
             buf: Vec::with_capacity(4096),
             capture_position: ImagePosition { row: 0, col: 0 },
             capture_filtered_offset: 0,
+            max_encoded_image_bytes: DEFAULT_MAX_ENCODED_IMAGE_BYTES,
+            discarding_oversized: false,
             #[cfg(feature = "sixel")]
             dcs_intermediates: Vec::new(),
             #[cfg(feature = "iterm2")]
             osc_prefix: Vec::new(),
+        }
+    }
+
+    /// Create an interceptor with an encoded image sequence byte limit.
+    #[must_use]
+    pub fn with_max_encoded_bytes(max_encoded_image_bytes: usize) -> Self {
+        Self {
+            max_encoded_image_bytes: max_encoded_image_bytes.max(1),
+            ..Self::new()
+        }
+    }
+
+    fn push_image_byte(&mut self, byte: u8) {
+        if self.discarding_oversized {
+            return;
+        }
+        if self.buf.len() >= self.max_encoded_image_bytes {
+            self.buf.clear();
+            self.discarding_oversized = true;
+        } else {
+            self.buf.push(byte);
+        }
+    }
+
+    fn take_image_bytes(&mut self) -> Option<Vec<u8>> {
+        if self.discarding_oversized {
+            self.discarding_oversized = false;
+            self.buf.clear();
+            None
+        } else {
+            Some(std::mem::take(&mut self.buf))
         }
     }
 
@@ -134,6 +171,7 @@ impl ImageInterceptor {
                         b'_' => {
                             self.state = State::KittyBody;
                             self.buf.clear();
+                            self.discarding_oversized = false;
                             self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
@@ -216,27 +254,27 @@ impl ImageInterceptor {
                         0x1B => self.state = State::KittyEscape,
                         0x07 => {
                             // BEL terminates APC in some terminals.
-                            if let Some(cmd) =
-                                crate::codec::kitty::parse_command(&self.buf, self.capture_position)
+                            if let Some(body) = self.take_image_bytes()
+                                && let Some(cmd) =
+                                    crate::codec::kitty::parse_command(&body, self.capture_position)
                             {
                                 events.push(ImageEvent::KittyCommand {
                                     command: cmd,
                                     filtered_byte_offset: self.capture_filtered_offset,
                                 });
                             }
-                            self.buf.clear();
                             self.state = State::Ground;
                         }
                         _ => {
                             // Only accumulate if it starts with 'G' (kitty graphics).
-                            if self.buf.is_empty() && byte != b'G' {
+                            if self.buf.is_empty() && !self.discarding_oversized && byte != b'G' {
                                 // Not a kitty graphics APC — pass through.
                                 filtered.push(0x1B);
                                 filtered.push(b'_');
                                 filtered.push(byte);
                                 self.state = State::Ground;
                             } else {
-                                self.buf.push(byte);
+                                self.push_image_byte(byte);
                             }
                         }
                     }
@@ -246,19 +284,19 @@ impl ImageInterceptor {
                 State::KittyEscape => {
                     if byte == b'\\' {
                         // ST — kitty command complete.
-                        if let Some(cmd) =
-                            crate::codec::kitty::parse_command(&self.buf, self.capture_position)
+                        if let Some(body) = self.take_image_bytes()
+                            && let Some(cmd) =
+                                crate::codec::kitty::parse_command(&body, self.capture_position)
                         {
                             events.push(ImageEvent::KittyCommand {
                                 command: cmd,
                                 filtered_byte_offset: self.capture_filtered_offset,
                             });
                         }
-                        self.buf.clear();
                         self.state = State::Ground;
                     } else {
-                        self.buf.push(0x1B);
-                        self.buf.push(byte);
+                        self.push_image_byte(0x1B);
+                        self.push_image_byte(byte);
                         self.state = State::KittyBody;
                     }
                 }
@@ -337,6 +375,7 @@ impl ImageInterceptor {
     pub fn reset(&mut self) {
         self.state = State::Ground;
         self.buf.clear();
+        self.discarding_oversized = false;
         #[cfg(feature = "sixel")]
         self.dcs_intermediates.clear();
         #[cfg(feature = "iterm2")]
@@ -357,6 +396,20 @@ impl Default for ImageInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn oversized_kitty_sequence_is_discarded_and_text_resumes() {
+        let mut interceptor = ImageInterceptor::with_max_encoded_bytes(8);
+        let mut input = b"before\x1b_Ga=t,i=1,f=100;".to_vec();
+        input.extend_from_slice(&[b'A'; 64]);
+        input.extend_from_slice(b"\x1b\\after");
+
+        let result = interceptor.process(&input);
+
+        assert_eq!(result.filtered, b"beforeafter");
+        assert!(result.events.is_empty());
+    }
 
     #[test]
     fn passthrough_non_image_data() {

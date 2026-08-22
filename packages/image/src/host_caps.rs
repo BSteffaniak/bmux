@@ -57,6 +57,23 @@ impl HostImageCapabilities {
 pub fn detect_from_env() -> HostImageCapabilities {
     let mut caps = HostImageCapabilities::default();
 
+    // A BMUX pane is an emulated terminal boundary. Never inherit physical-host
+    // capability hints such as TERM_PROGRAM=ghostty into the pane. BMUX
+    // advertises only protocols its pane interceptor can safely virtualize.
+    if std::env::var_os("BMUX_PANE").is_some() {
+        match std::env::var("BMUX_IMAGE_PROTOCOL")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "kitty" => caps.kitty_graphics = true,
+            "sixel" => caps.sixel = true,
+            "iterm2" => caps.iterm2_inline = true,
+            _ => {}
+        }
+        return caps;
+    }
+
     // -- Environment variable heuristics ----------------------------------
 
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();

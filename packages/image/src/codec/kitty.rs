@@ -144,6 +144,40 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
     }
 }
 
+const KITTY_MAX_ENCODED_CHUNK_BYTES: usize = 4096;
+const KITTY_RAW_CHUNK_BYTES: usize = KITTY_MAX_ENCODED_CHUNK_BYTES / 4 * 3;
+
+/// Encode a Kitty graphics transmission as bounded APC bodies.
+///
+/// Continuation chunks use `m=1`; the final chunk uses `m=0`. Each chunk
+/// repeats identity and geometry so a nested terminal can validate and bound
+/// every fragment independently.
+#[must_use]
+pub fn encode_transmit_chunks(
+    image_id: u32,
+    format: KittyFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Vec<Vec<u8>> {
+    let fmt = match format {
+        KittyFormat::Rgb => 24,
+        KittyFormat::Rgba => 32,
+        KittyFormat::Png => 100,
+    };
+    let chunks = data.chunks(KITTY_RAW_CHUNK_BYTES).collect::<Vec<_>>();
+    let chunk_count = chunks.len().max(1);
+    (0..chunk_count)
+        .map(|index| {
+            let chunk = chunks.get(index).copied().unwrap_or_default();
+            let more = u8::from(index + 1 < chunk_count);
+            let b64 = base64_encode(chunk);
+            format!("Ga=t,i={image_id},f={fmt},s={width},v={height},m={more},q=2;{b64}")
+                .into_bytes()
+        })
+        .collect()
+}
+
 /// Encode a kitty graphics transmit command as APC body bytes
 /// (between `ESC _` and `ESC \`).
 pub fn encode_transmit(
@@ -255,6 +289,28 @@ mod tests {
                 assert_eq!(placement.position.row, 5);
             }
             _ => panic!("expected Place"),
+        }
+    }
+
+    #[test]
+    fn kitty_transmit_chunks_are_bounded_and_reassemble() {
+        let data = vec![0x5a; 32 * 1024];
+        let chunks = encode_transmit_chunks(42, KittyFormat::Png, &data, 320, 160);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() < 4300));
+        for (index, chunk) in chunks.iter().enumerate() {
+            let command = parse_command(chunk, ImagePosition { row: 0, col: 0 }).unwrap();
+            let KittyCommand::Transmit {
+                more_chunks,
+                width,
+                height,
+                ..
+            } = command
+            else {
+                panic!("expected transmit command");
+            };
+            assert_eq!(more_chunks, index + 1 < chunks.len());
+            assert_eq!((width, height), (320, 160));
         }
     }
 
