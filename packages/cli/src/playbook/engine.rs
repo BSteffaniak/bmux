@@ -4975,27 +4975,6 @@ mod tests {
     }
 
     #[test]
-    fn attach_sim_playbook_reorders_tabs_without_sandbox() {
-        let input = r#"
-@driver attach-sim
-@viewport cols=100 rows=24
-seed-window-list names='one,two,three' active='one'
-render
-assert-rendered contains='one'
-locate id='one' text='one'
-locate id='three' text='three'
-terminal-event kind=mouse phase=down button=left col='${one.center_col}' row='${one.row}'
-terminal-event kind=mouse phase=move button=left col='${three.end_col}' row='${three.row}'
-terminal-event kind=mouse phase=up button=left col='${three.end_col}' row='${three.row}'
-assert-effect operation='move-window'
-assert-state path='windows.names' equals='["two","three","one"]'
-"#;
-        let (playbook, _) = crate::playbook::parse_dsl::parse_dsl(input).expect("parse playbook");
-        let result = run_attach_sim_playbook(&playbook, Instant::now());
-        assert!(result.pass, "attach sim failed: {:?}", result.error);
-    }
-
-    #[test]
     fn render_delta_records_semantic_trace_ops() {
         let before = vec![pane_capture(1, "prompt> old\nsame")];
         let after = vec![pane_capture(1, "prompt> new\nsame")];

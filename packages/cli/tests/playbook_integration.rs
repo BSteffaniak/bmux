@@ -24,22 +24,6 @@ fn fixtures_dir() -> PathBuf {
 }
 
 const ATTACH_SIM_FIXTURES: &[&str] = &[
-    "attach_sim_tab_drag.dsl",
-    "attach_sim_tab_drag_no_motion.dsl",
-    "attach_sim_tab_drag_left_half.dsl",
-    "attach_sim_tab_drag_right_half.dsl",
-    "attach_sim_tab_drag_gap.dsl",
-    "attach_sim_tab_drag_mru_noop.dsl",
-    "attach_sim_tab_click_switch.dsl",
-    "attach_sim_tab_hover.dsl",
-    "attach_sim_tab_template.dsl",
-    "attach_sim_tab_rename.dsl",
-    "attach_sim_tab_menu.dsl",
-    "attach_sim_status_top.dsl",
-    "attach_sim_status_off.dsl",
-    "attach_sim_status_resize.dsl",
-    "attach_sim_status_snapshot.dsl",
-    "attach_sim_status_wide_tabs.dsl",
     "attach_sim_scrollback_selection.dsl",
     "attach_sim_pane_resize.dsl",
     "attach_sim_floating_pane_drag.dsl",

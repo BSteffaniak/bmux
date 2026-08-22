@@ -432,7 +432,7 @@ use crate::pane_runtime_client::{
     attach_pane_grid_window_state_streaming, attach_pane_scrollback_pin_streaming,
     attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
-use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
+use crate::status::{AttachStatusLine, build_attach_status_line};
 use bmux_plugin::{
     RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp, RenderStyle,
 };
@@ -3475,7 +3475,6 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     view_state.mouse.config = attach_config.attach_mouse_config();
     view_state.bracketed_paste_enabled =
         bracketed_paste_enabled(attach_config.behavior.bracketed_paste);
-    view_state.mouse.tab_drag_enabled = status_tab_drag_enabled(&attach_config.status_bar);
     view_state.status_position = if attach_config.status_bar.enabled {
         attach_config.appearance.status_position
     } else {
@@ -7127,14 +7126,6 @@ pub fn build_attach_status_line_for_draw(
     let cached_sessions = view_state.cached_sessions.clone();
     let cached_context_session_bindings = view_state.cached_context_session_bindings.clone();
 
-    let tabs = build_attach_tabs_from_catalog(
-        &cached_contexts,
-        &cached_context_session_bindings,
-        view_state,
-        status_config,
-        context_id,
-        session_id,
-    );
     let (session_label, session_count) =
         resolve_attach_session_label_and_count_from_catalog(&cached_sessions, session_id);
     let current_context_label = resolve_attach_context_label_from_catalog(
@@ -7143,10 +7134,7 @@ pub fn build_attach_status_line_for_draw(
         context_id,
         session_id,
     );
-    let tab_position_label = tabs
-        .iter()
-        .position(|tab| tab.active)
-        .map(|active_index| format!("tab:{}/{}", active_index + 1, tabs.len()));
+    let tab_position_label: Option<String> = None;
     let zoomed = view_state
         .cached_layout_state
         .as_ref()
@@ -7205,24 +7193,14 @@ pub fn build_attach_status_line_for_draw(
         }
     };
 
-    let mut status_line = build_attach_status_line(
+    build_attach_status_line(
         geometry.cols,
         status_config,
         &runtime_appearance,
         &session_label,
         session_count,
         &current_context_label,
-        &crate::status::AttachTabStripInput::new(&tabs)
-            .hovered(view_state.mouse.hovered_tab_context_id)
-            .editing(view_state.tab_rename.as_ref().map(|rename| {
-                let selection = rename.buffer.selection();
-                crate::status::AttachTabEdit {
-                    context_id: rename.context_id,
-                    text: rename.text(),
-                    cursor: rename.buffer.cursor_byte_index(),
-                    selection: selection.map(|range| (range.start, range.end)),
-                }
-            })),
+        &crate::status::AttachTabStripInput::new(&[]),
         tab_position_label.as_deref(),
         mode_label,
         role_label,
@@ -7232,17 +7210,7 @@ pub fn build_attach_status_line_for_draw(
             .flatten()
             .and_then(|view| view.pin.map(|_| "FROZEN")),
         &hint,
-    );
-    status_line.drag_marker_col = view_state
-        .mouse
-        .tab_drag
-        .as_ref()
-        // Only show the drop marker once motion has actually started a drag;
-        // a plain click must not paint a reorder indicator.
-        .filter(|drag| drag.active)
-        .and_then(|drag| drag.drop_target)
-        .and_then(|target| attach_tab_drop_marker_col(&status_line, target, geometry.cols));
-    status_line
+    )
 }
 
 pub fn attach_mode_hint(mode_id: &str, _ui_mode: AttachUiMode, keymap: &Keymap) -> String {
@@ -7441,7 +7409,6 @@ fn apply_attach_profile_switch_with_path(
             StatusPosition::Off
         };
         view_state.mouse.config = resolved_config.attach_mouse_config();
-        view_state.mouse.tab_drag_enabled = status_tab_drag_enabled(&resolved_config.status_bar);
         view_state.mouse.clear_pointer_gestures();
         sync_attach_active_mode_from_processor(
             view_state,
@@ -8917,164 +8884,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     view_state.last_prompt_overlay_surface = current_prompt_overlay_surface;
     view_state.dirty.clear_frame_damage();
     Ok(stats)
-}
-
-pub const fn status_tab_drag_enabled(status_config: &bmux_config::StatusBarConfig) -> bool {
-    !matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
-        && !matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru)
-}
-
-pub fn build_attach_tabs_from_catalog(
-    contexts: &[ContextRow],
-    bindings: &[ContextSessionBinding],
-    view_state: &AttachViewState,
-    status_config: &bmux_config::StatusBarConfig,
-    context_id: Option<Uuid>,
-    session_id: Uuid,
-) -> Vec<AttachTab> {
-    // Prefer the windows-plugin's authoritative ordered window list
-    // whenever it has been published. The plugin owns tab ordering
-    // (`windows.order` persisted storage) and publishes a fresh
-    // snapshot on every mutation via the `windows-list` state channel.
-    // Subscribing to that channel (see attach main loop) keeps
-    // `cached_window_list` live without polling.
-    //
-    // Two opt-out paths remain for MRU-flavored status-bar configs so
-    // existing semantics survive the migration:
-    //   - `tab_scope = Mru` and `tab_order = Mru` — use the raw MRU
-    //     order from `cached_contexts`.
-    //   - `tab_scope = SessionContexts` — filter the plugin list
-    //     (if the plugin filtered view is empty, fall back to the full
-    //     plugin list).
-    let use_mru = matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
-        || matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru);
-
-    if !use_mru
-        && let Some(snapshot) = view_state.cached_window_list.as_ref()
-        && !snapshot.windows.is_empty()
-    {
-        return build_attach_tabs_from_plugin_snapshot(
-            snapshot,
-            contexts,
-            bindings,
-            status_config,
-            context_id,
-            session_id,
-        );
-    }
-
-    build_attach_tabs_from_raw_contexts(contexts, bindings, status_config, context_id, session_id)
-}
-
-/// Project the windows-plugin's authoritative ordered window list onto
-/// the attach tab-bar view. Called whenever `cached_window_list` has
-/// been populated from the `windows-list` state channel.
-fn build_attach_tabs_from_plugin_snapshot(
-    snapshot: &bmux_windows_plugin_api::windows_list::WindowListSnapshot,
-    contexts: &[ContextRow],
-    bindings: &[ContextSessionBinding],
-    status_config: &bmux_config::StatusBarConfig,
-    context_id: Option<Uuid>,
-    session_id: Uuid,
-) -> Vec<AttachTab> {
-    // Filter to this session's contexts if the user asked for
-    // `SessionContexts` scope. Cross-reference `cached_contexts` to
-    // locate the `bmux.session_id` attribute for each window.
-    let filtered: Vec<&bmux_windows_plugin_api::windows_list::WindowListEntry> = if matches!(
-        status_config.tab_scope,
-        bmux_config::StatusTabScope::SessionContexts
-    ) {
-        let session_match: Vec<_> = snapshot
-            .windows
-            .iter()
-            .filter(|entry| {
-                contexts
-                    .iter()
-                    .find(|context| context.id == entry.id)
-                    .is_some_and(|context| {
-                        context_session_id(bindings, context.id) == Some(session_id)
-                    })
-            })
-            .collect();
-        if session_match.is_empty() {
-            snapshot.windows.iter().collect()
-        } else {
-            session_match
-        }
-    } else {
-        snapshot.windows.iter().collect()
-    };
-
-    let current_id = context_id.or_else(|| {
-        contexts
-            .iter()
-            .find(|context| context_session_id(bindings, context.id) == Some(session_id))
-            .map(|context| context.id)
-    });
-
-    filtered
-        .into_iter()
-        .map(|entry| AttachTab {
-            label: entry.name.clone(),
-            active: current_id.map_or(entry.active, |id| id == entry.id),
-            context_id: Some(entry.id),
-        })
-        .collect()
-}
-
-/// Baseline tab-bar renderer when no plugin snapshot is available
-/// (plugin absent, not yet activated, or user opted into MRU mode).
-/// Renders `cached_contexts` in the order the server delivered them.
-/// Core does not stabilize or reorder — that's the plugin's job.
-fn build_attach_tabs_from_raw_contexts(
-    contexts: &[ContextRow],
-    bindings: &[ContextSessionBinding],
-    status_config: &bmux_config::StatusBarConfig,
-    context_id: Option<Uuid>,
-    session_id: Uuid,
-) -> Vec<AttachTab> {
-    if contexts.is_empty() {
-        return vec![AttachTab {
-            label: "terminal".to_string(),
-            active: true,
-            context_id: None,
-        }];
-    }
-
-    let tab_contexts = match status_config.tab_scope {
-        bmux_config::StatusTabScope::AllContexts | bmux_config::StatusTabScope::Mru => {
-            contexts.to_vec()
-        }
-        bmux_config::StatusTabScope::SessionContexts => {
-            let filtered = contexts
-                .iter()
-                .filter(|context| context_session_id(bindings, context.id) == Some(session_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if filtered.is_empty() {
-                contexts.to_vec()
-            } else {
-                filtered
-            }
-        }
-    };
-
-    let current_context_id = context_id.or_else(|| {
-        tab_contexts
-            .iter()
-            .find(|context| context_session_id(bindings, context.id) == Some(session_id))
-            .map(|context| context.id)
-    });
-
-    tab_contexts
-        .into_iter()
-        .enumerate()
-        .map(|(index, context)| AttachTab {
-            label: context_summary_label(&context, Some(index.saturating_add(1))),
-            active: current_context_id == Some(context.id),
-            context_id: Some(context.id),
-        })
-        .collect()
 }
 
 pub fn resolve_attach_context_label_from_catalog(
@@ -17449,19 +17258,6 @@ mod tests {
         assert!(snapshot.windows[2].active);
     }
 
-    #[test]
-    fn tab_drag_is_disabled_for_mru_status_config() {
-        let mut config = BmuxConfig::default().status_bar;
-        assert!(status_tab_drag_enabled(&config));
-
-        config.tab_order = bmux_config::StatusTabOrder::Mru;
-        assert!(!status_tab_drag_enabled(&config));
-
-        config.tab_order = bmux_config::StatusTabOrder::Stable;
-        config.tab_scope = bmux_config::StatusTabScope::Mru;
-        assert!(!status_tab_drag_enabled(&config));
-    }
-
     fn frame_stats_for_classifier(scene_render: AttachSceneRenderStats) -> AttachFrameRenderStats {
         AttachFrameRenderStats {
             frame_bytes: 0,
@@ -18452,74 +18248,6 @@ mod tests {
         assert_eq!(
             selected_context_id_from_command_outcome(&execution.outcome),
             None
-        );
-    }
-
-    #[test]
-    fn plugin_window_snapshot_uses_attached_context_as_active() {
-        let session_id = Uuid::new_v4();
-        let stale_active = Uuid::new_v4();
-        let attached_context = Uuid::new_v4();
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
-            context_id: Some(attached_context),
-            session_id,
-            can_write: true,
-        });
-        view_state.cached_window_list = Some(std::sync::Arc::new(
-            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
-                windows: vec![
-                    bmux_windows_plugin_api::windows_list::WindowListEntry {
-                        id: stale_active,
-                        name: "old".to_string(),
-                        active: true,
-                    },
-                    bmux_windows_plugin_api::windows_list::WindowListEntry {
-                        id: attached_context,
-                        name: "new".to_string(),
-                        active: false,
-                    },
-                ],
-                revision: 1,
-            },
-        ));
-        let contexts = vec![
-            ContextRow {
-                id: stale_active,
-                name: Some("old".to_string()),
-            },
-            ContextRow {
-                id: attached_context,
-                name: Some("new".to_string()),
-            },
-        ];
-        let bindings = vec![
-            ContextSessionBinding {
-                context_id: stale_active,
-                session_id,
-            },
-            ContextSessionBinding {
-                context_id: attached_context,
-                session_id,
-            },
-        ];
-
-        let tabs = build_attach_tabs_from_catalog(
-            &contexts,
-            &bindings,
-            &view_state,
-            &BmuxConfig::default().status_bar,
-            Some(attached_context),
-            session_id,
-        );
-
-        assert_eq!(tabs.iter().filter(|tab| tab.active).count(), 1);
-        assert!(
-            tabs.iter()
-                .any(|tab| tab.context_id == Some(attached_context) && tab.active)
-        );
-        assert!(
-            tabs.iter()
-                .any(|tab| tab.context_id == Some(stale_active) && !tab.active)
         );
     }
 
