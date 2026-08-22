@@ -121,11 +121,14 @@ macro_rules! declare_bundled_plugins {
         }
 
         #[allow(unused_variables, clippy::missing_const_for_fn)]
-        fn install_static_bundled_client_adapters(enabled: &[String]) {
+        fn install_static_bundled_client_adapters(
+            enabled: &[String],
+            settings: &std::collections::BTreeMap<String, toml::Value>,
+        ) {
             $(
                 #[cfg(feature = $feature)]
                 if enabled.iter().any(|plugin_id| plugin_id == $plugin_id) {
-                    install_bundled_client_adapter($plugin_id);
+                    install_bundled_client_adapter($plugin_id, settings.get($plugin_id));
                 }
             )*
         }
@@ -135,10 +138,22 @@ macro_rules! declare_bundled_plugins {
 
 /// Register an optional client-side adapter owned by one bundled plugin.
 #[allow(unused_variables, clippy::missing_const_for_fn)]
-fn install_bundled_client_adapter(plugin_id: &str) {
+fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value>) {
     #[cfg(feature = "bundled-plugin-cluster")]
     if plugin_id == "bmux.cluster" {
         bmux_cluster_plugin_client::install();
+    }
+    #[cfg(feature = "bundled-plugin-tab-strip")]
+    if plugin_id == "bmux.tab_strip"
+        && let Err(error) = bmux_tab_strip_plugin::install(settings)
+    {
+        tracing::warn!(%error, "failed installing tab-strip attach companion");
+    }
+    #[cfg(feature = "bundled-plugin-sidebar")]
+    if plugin_id == "bmux.sidebar"
+        && let Err(error) = bmux_sidebar_plugin::install(settings)
+    {
+        tracing::warn!(%error, "failed installing sidebar attach companion");
     }
 }
 
@@ -217,6 +232,16 @@ declare_bundled_plugins! {
     id = "bmux.snapshot",
     manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
     plugin_type = bmux_snapshot_plugin::SnapshotPlugin;
+
+    feature = "bundled-plugin-sidebar",
+    id = "bmux.sidebar",
+    manifest = include_str!("../../../../plugins/sidebar-plugin/plugin.toml"),
+    plugin_type = bmux_sidebar_plugin::SidebarPlugin;
+
+    feature = "bundled-plugin-tab-strip",
+    id = "bmux.tab_strip",
+    manifest = include_str!("../../../../plugins/tab-strip-plugin/plugin.toml"),
+    plugin_type = bmux_tab_strip_plugin::TabStripPlugin;
 
     feature = "bundled-plugin-theme",
     id = "bmux.theme",
@@ -695,7 +720,10 @@ pub(super) fn effective_enabled_plugins(
 /// different lifetimes. This hook derives client registration from the same
 /// effective enabled-plugin set so disabled plugins cannot claim targets.
 pub(super) fn install_enabled_client_adapters(config: &BmuxConfig, registry: &PluginRegistry) {
-    install_static_bundled_client_adapters(&effective_enabled_plugins(config, registry));
+    install_static_bundled_client_adapters(
+        &effective_enabled_plugins(config, registry),
+        &config.plugins.settings,
+    );
 }
 
 pub(super) fn validate_enabled_plugins(

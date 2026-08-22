@@ -119,7 +119,13 @@ bmux_recording_plugin = { workspace = true, optional = true, features = [
 bmux_sessions_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_sidebar_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_snapshot_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+bmux_tab_strip_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 bmux_theme_plugin = { workspace = true, optional = true, features = [
@@ -233,6 +239,8 @@ fail-on-warnings = [
     "bmux_server/fail-on-warnings",
     "bmux_sessions_plugin?/fail-on-warnings",
     "bmux_snapshot_plugin?/fail-on-warnings",
+    "bmux_sidebar_plugin?/fail-on-warnings",
+    "bmux_tab_strip_plugin?/fail-on-warnings",
     "bmux_theme_plugin?/fail-on-warnings",
     "bmux_terminal_grid/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
@@ -267,6 +275,8 @@ bundled-plugins = [
     "bundled-plugin-recording",
     "bundled-plugin-sessions",
     "bundled-plugin-snapshot",
+    "bundled-plugin-sidebar",
+    "bundled-plugin-tab-strip",
     "bundled-plugin-theme",
     "bundled-plugin-windows",
     "bundled-plugin-decoration",
@@ -295,7 +305,9 @@ bundled-plugin-permissions = ["dep:bmux_permissions_plugin"]
 bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
 bundled-plugin-recording = ["dep:bmux_recording_plugin"]
 bundled-plugin-sessions = ["dep:bmux_sessions_plugin"]
+bundled-plugin-sidebar = ["dep:bmux_sidebar_plugin"]
 bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
+bundled-plugin-tab-strip = ["dep:bmux_tab_strip_plugin"]
 bundled-plugin-theme = ["dep:bmux_theme_plugin"]
 bundled-plugin-windows = ["dep:bmux_windows_plugin"]
 bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]

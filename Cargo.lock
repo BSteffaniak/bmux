@@ -1259,9 +1259,11 @@ dependencies = [
  "bmux_session_models",
  "bmux_sessions_plugin",
  "bmux_sessions_plugin_api",
+ "bmux_sidebar_plugin",
  "bmux_slots",
  "bmux_snapshot_plugin",
  "bmux_snapshot_plugin_api",
+ "bmux_tab_strip_plugin",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
  "bmux_text_edit",
@@ -2331,6 +2333,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_sidebar_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_windows_plugin_api",
+ "tokio",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_slots"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -2391,6 +2407,20 @@ dependencies = [
  "bmux_snapshot_protocol",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "bmux_tab_strip_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_windows_plugin_api",
+ "tokio",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "unicode-width",
+ "uuid",
 ]
 
 [[package]]

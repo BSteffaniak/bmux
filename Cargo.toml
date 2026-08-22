@@ -97,6 +97,8 @@ members = [
     "plugins/sessions-plugin-api",
     "plugins/snapshot-plugin",
     "plugins/snapshot-plugin-api",
+    "plugins/sidebar-plugin",
+    "plugins/tab-strip-plugin",
     "plugins/theme-plugin",
     "plugins/visual-adapters-plugin-renderer",
     "plugins/windows-plugin",
@@ -244,8 +246,10 @@ bmux_recording_plugin                = { version = "0.0.1-alpha.1", default-feat
 bmux_recording_plugin_api            = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/recording-plugin-api" }
 bmux_sessions_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sessions-plugin" }
 bmux_sessions_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sessions-plugin-api" }
+bmux_sidebar_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sidebar-plugin" }
 bmux_snapshot_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin" }
 bmux_snapshot_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin-api" }
+bmux_tab_strip_plugin                = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tab-strip-plugin" }
 bmux_theme_plugin                    = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/theme-plugin" }
 bmux_visual_adapters_plugin_renderer = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/visual-adapters-plugin-renderer" }
 bmux_windows_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/windows-plugin" }

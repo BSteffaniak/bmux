@@ -3512,6 +3512,14 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             revision: 0,
         },
     );
+    #[cfg(feature = "bundled-plugin-tab-strip")]
+    if let Err(error) = bmux_tab_strip_plugin::start() {
+        tracing::warn!(%error, "failed starting tab-strip attach companion");
+    }
+    #[cfg(feature = "bundled-plugin-sidebar")]
+    if let Err(error) = bmux_sidebar_plugin::start() {
+        tracing::warn!(%error, "failed starting sidebar attach companion");
+    }
 
     // Honour any startup gates plugins have self-registered via
     // `bmux_plugin::register_startup_ready_gate`. Attach startup
