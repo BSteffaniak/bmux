@@ -119,6 +119,7 @@ struct CompanionState {
     settings: Settings,
     revision: u64,
     snapshot: windows_list::WindowListSnapshot,
+    hovered_window_id: Option<Uuid>,
 }
 
 impl CompanionState {
@@ -130,6 +131,7 @@ impl CompanionState {
                 windows: Vec::new(),
                 revision: 0,
             },
+            hovered_window_id: None,
         }
     }
 
@@ -322,16 +324,16 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         let label = format!(" {} ", tab_label(&state.settings, window, index));
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str()))
             .unwrap_or(u16::MAX);
-        ops.push(RenderOp::text_run(
-            x,
-            0,
-            label,
-            if window.active {
-                active_style
-            } else {
-                inactive_style
-            },
-        ));
+        let style = if window.active {
+            active_style
+        } else if state.hovered_window_id == Some(window.id) {
+            inactive_style
+                .named_foreground(RenderNamedColor::BrightWhite)
+                .named_background(RenderNamedColor::Blue)
+        } else {
+            inactive_style
+        };
+        ops.push(RenderOp::text_run(x, 0, label, style));
         regions.push(
             PluginSurfaceRegion::new(
                 format!("window:{}", window.id),
@@ -358,7 +360,49 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     surface
 }
 
+fn update_hover(event: &AttachInputEvent) -> bool {
+    let target = event
+        .hook_id
+        .strip_prefix("bmux.tab_strip:strip:window:")
+        .and_then(|target| Uuid::parse_str(target).ok());
+    let hovered = match event.phase.as_str() {
+        "enter" | "move" => target,
+        "leave" => None,
+        _ => return false,
+    };
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    if companion.hovered_window_id == hovered {
+        return false;
+    }
+    companion.hovered_window_id = hovered;
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let revision = companion.revision;
+    let surface = build_surface(companion, revision);
+    drop(guard);
+    global_plugin_surface_registry()
+        .publish(
+            OWNER,
+            PluginSurfaceSnapshot {
+                revision,
+                surfaces: vec![surface],
+            },
+        )
+        .is_ok()
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
+    if update_hover(event) {
+        return AttachInputResult {
+            consumed: true,
+            dirty: true,
+            ..AttachInputResult::default()
+        };
+    }
     if event.event_kind != "pointer"
         || event.phase != "down"
         || event.button.as_deref() != Some("left")
@@ -428,6 +472,33 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(tab_label(&settings, &window, 0), "1:界");
+    }
+
+    #[test]
+    fn hover_style_changes_only_the_target_window_operation() {
+        let mut state = CompanionState::new(Settings::default());
+        let first = Uuid::from_u128(11);
+        let second = Uuid::from_u128(12);
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: vec![
+                windows_list::WindowListEntry {
+                    id: first,
+                    name: "one".to_string(),
+                    active: false,
+                },
+                windows_list::WindowListEntry {
+                    id: second,
+                    name: "two".to_string(),
+                    active: false,
+                },
+            ],
+            revision: 1,
+        });
+        let before = build_surface(&state, 1);
+        state.hovered_window_id = Some(second);
+        let after = build_surface(&state, 2);
+        assert_eq!(before.ops[1], after.ops[1]);
+        assert_ne!(before.ops[2], after.ops[2]);
     }
 
     #[test]

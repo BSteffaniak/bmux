@@ -132,6 +132,7 @@ struct CompanionState {
     settings: Settings,
     revision: u64,
     snapshot: windows_list::WindowListSnapshot,
+    hovered_window_id: Option<Uuid>,
 }
 
 impl CompanionState {
@@ -143,6 +144,7 @@ impl CompanionState {
                 windows: Vec::new(),
                 revision: 0,
             },
+            hovered_window_id: None,
         }
     }
 
@@ -409,12 +411,16 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             state.settings.show_index,
         );
         let title = truncate_to_width(&title, content_width);
-        ops.push(RenderOp::text_run(
-            2,
-            row,
-            title,
-            if window.active { active } else { inactive },
-        ));
+        let item_style = if window.active {
+            active
+        } else if state.hovered_window_id == Some(window.id) {
+            inactive
+                .named_foreground(RenderNamedColor::BrightWhite)
+                .named_background(RenderNamedColor::Blue)
+        } else {
+            inactive
+        };
+        ops.push(RenderOp::text_run(2, row, title, item_style));
         row = row.saturating_add(1);
         let description = render_template(
             &state.settings.description_template,
@@ -480,7 +486,49 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     surface
 }
 
+fn update_hover(event: &AttachInputEvent) -> bool {
+    let target = event
+        .hook_id
+        .strip_prefix("bmux.sidebar:sidebar:window:")
+        .and_then(|target| Uuid::parse_str(target).ok());
+    let hovered = match event.phase.as_str() {
+        "enter" | "move" => target,
+        "leave" => None,
+        _ => return false,
+    };
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    if companion.hovered_window_id == hovered {
+        return false;
+    }
+    companion.hovered_window_id = hovered;
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let revision = companion.revision;
+    let surface = build_surface(companion, revision);
+    drop(guard);
+    global_plugin_surface_registry()
+        .publish(
+            OWNER,
+            PluginSurfaceSnapshot {
+                revision,
+                surfaces: vec![surface],
+            },
+        )
+        .is_ok()
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
+    if update_hover(event) {
+        return AttachInputResult {
+            consumed: true,
+            dirty: true,
+            ..AttachInputResult::default()
+        };
+    }
     if event.event_kind != "pointer"
         || event.phase != "down"
         || event.button.as_deref() != Some("left")
@@ -557,6 +605,33 @@ mod tests {
         let rows = push_wrapped_text(&mut ops, "alpha 界 beta", 0, 0, 7, 3, RenderStyle::new());
         assert_eq!(rows, 2);
         assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn hover_style_changes_only_the_target_card_title() {
+        let mut state = CompanionState::new(Settings::default());
+        let first = Uuid::from_u128(11);
+        let second = Uuid::from_u128(12);
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: vec![
+                windows_list::WindowListEntry {
+                    id: first,
+                    name: "one".to_string(),
+                    active: false,
+                },
+                windows_list::WindowListEntry {
+                    id: second,
+                    name: "two".to_string(),
+                    active: false,
+                },
+            ],
+            revision: 1,
+        });
+        let before = build_surface(&state, 1);
+        state.hovered_window_id = Some(second);
+        let after = build_surface(&state, 2);
+        assert_eq!(before.ops[3], after.ops[3]);
+        assert_ne!(before.ops[4], after.ops[4]);
     }
 
     #[test]

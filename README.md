@@ -292,6 +292,9 @@ path = ["recording", "start"]
 
 Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 
+Window presentation settings and the tab-strip/sidebar enablement combinations
+are documented in [Window presentation plugins](docs/window-presentations.md).
+
 ## Examples
 
 - Prompt showcase (isolated in-process sandbox + attach prompt API):
