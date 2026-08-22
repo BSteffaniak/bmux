@@ -44,12 +44,19 @@ height = 1                       # 1..=4 cells
 order = 100                      # lower layout order is allocated first
 show_index = true
 label_template = "{index}{name}"
-maximum_label_width = 32         # Unicode display cells
+maximum_label_width = 32
+maximum_visible_tabs = 8
+show_compact_facts = false
 ```
 
-The label template supports `{index}`, `{name}`, `{id}`, and `{active}`.
-Double braces render literal braces. Clicking a visible item switches to that
-window through the typed `bmux.windows` command service.
+The label template supports `{index}`, `{name}`, `{id}`, `{active}`, and
+`{fact}`. When `show_compact_facts` is enabled, the highest-priority retained
+window fact supplies `{fact}` and its semantic role styles the compact tab.
+Double braces render literal braces. `maximum_visible_tabs` bounds retained tab
+projection; overflow markers show hidden leading/trailing items, wheel input
+scrolls the visible window, and authoritative active-window changes realign it.
+Clicking a visible item switches to that window through the typed
+`bmux.windows` command service.
 
 ## Sidebar settings
 
@@ -65,11 +72,24 @@ heading = "Windows"
 title_template = "{marker} {index}{name}"
 description_template = ""
 status_template = ""
+maximum_visible_items = 20
+content_height = false
+collapse_below_width = 80
+collapsed_width = 8
 ```
 
-Sidebar templates support `{marker}`, `{index}`, `{name}`, `{id}`, and
-`{active}`. Descriptions wrap to a bounded two-line region using Unicode display
-width; status text receives its own row. Clicking an item switches windows.
+Sidebar templates support `{marker}`, `{index}`, `{name}`, `{id}`, `{active}`,
+`{fact}`, `{fact_detail}`, and `{fact_icon}`. The highest priority retained fact
+for entity `("bmux.windows", window UUID)` supplies text and semantic role;
+roles map to neutral/idle/active/success/warning/attention/error terminal styles.
+Descriptions wrap to a bounded two-line region using Unicode display width;
+status text receives its own row. `maximum_visible_items` bounds retained
+card projection; wheel input scrolls the virtual window and authoritative active
+window changes realign it automatically. `content_height = false` paints the
+full resolved allocation; enabling it clips background/border paint to the
+bounded visible-card height while retaining the same layout reservation. Below `collapse_below_width` terminal
+columns, generic layout reserves `collapsed_width` instead of the preferred
+width. Clicking an item switches windows.
 
 The layout `order` values define deterministic composition when both plugins
 are enabled. For example, the defaults allocate the tab strip before the

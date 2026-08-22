@@ -2338,10 +2338,12 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_presentation_state",
  "bmux_windows_plugin_api",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
 ]
@@ -2415,10 +2417,13 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_presentation_state",
+ "bmux_tui_components",
  "bmux_windows_plugin_api",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
 ]

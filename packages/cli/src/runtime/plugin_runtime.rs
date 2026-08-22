@@ -2407,6 +2407,31 @@ mod tests {
     }
 
     #[test]
+    fn presentation_plugins_support_all_enablement_combinations() {
+        let mut registry = PluginRegistry::new();
+        register_static_bundled_plugins(&mut registry);
+        let combinations = [(true, true), (true, false), (false, true), (false, false)];
+        for (tab_strip, sidebar) in combinations {
+            let mut config = BmuxConfig::default();
+            if !tab_strip {
+                config.plugins.disabled.push("bmux.tab_strip".to_string());
+            }
+            if !sidebar {
+                config.plugins.disabled.push("bmux.sidebar".to_string());
+            }
+            let enabled = effective_enabled_plugins(&config, &registry);
+            assert_eq!(
+                enabled.iter().any(|plugin| plugin == "bmux.tab_strip"),
+                tab_strip
+            );
+            assert_eq!(
+                enabled.iter().any(|plugin| plugin == "bmux.sidebar"),
+                sidebar
+            );
+        }
+    }
+
+    #[test]
     fn effective_enabled_plugins_includes_bundled_plugins_by_default() {
         let Some(bundled_root) = bundled_plugin_root() else {
             return;

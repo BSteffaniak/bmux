@@ -16,6 +16,10 @@ use bmux_plugin::{
     RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::prelude::*;
+use bmux_presentation_state::{
+    PresentationEntityRef, PresentationFact, PresentationFactRole,
+    global_presentation_fact_host_service,
+};
 use bmux_windows_plugin_api::{windows_commands, windows_list};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -43,6 +47,10 @@ struct Settings {
     title_template: String,
     description_template: String,
     status_template: String,
+    maximum_visible_items: usize,
+    content_height: bool,
+    collapse_below_width: u16,
+    collapsed_width: u16,
 }
 
 impl Default for Settings {
@@ -58,6 +66,10 @@ impl Default for Settings {
             title_template: "{marker} {index}{name}".to_string(),
             description_template: String::new(),
             status_template: String::new(),
+            maximum_visible_items: 20,
+            content_height: false,
+            collapse_below_width: 80,
+            collapsed_width: 8,
         }
     }
 }
@@ -83,6 +95,8 @@ impl Settings {
             ("width", &mut settings.width),
             ("minimum_width", &mut settings.minimum_width),
             ("maximum_width", &mut settings.maximum_width),
+            ("collapse_below_width", &mut settings.collapse_below_width),
+            ("collapsed_width", &mut settings.collapsed_width),
         ] {
             if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                 *target = u16::try_from(value)
@@ -98,6 +112,11 @@ impl Settings {
         if settings.minimum_width > settings.width || settings.width > settings.maximum_width {
             return Err(PluginCommandError::invalid_arguments(
                 "bmux.sidebar requires minimum_width <= width <= maximum_width",
+            ));
+        }
+        if settings.collapsed_width > settings.width {
+            return Err(PluginCommandError::invalid_arguments(
+                "bmux.sidebar collapsed_width must not exceed width",
             ));
         }
         if let Some(order) = table.get("order").and_then(toml::Value::as_integer) {
@@ -123,6 +142,22 @@ impl Settings {
                 *target = value.to_string();
             }
         }
+        if let Some(content_height) = table.get("content_height").and_then(toml::Value::as_bool) {
+            settings.content_height = content_height;
+        }
+        if let Some(count) = table
+            .get("maximum_visible_items")
+            .and_then(toml::Value::as_integer)
+        {
+            settings.maximum_visible_items = usize::try_from(count)
+                .ok()
+                .filter(|count| *count > 0 && *count <= 1_024)
+                .ok_or_else(|| {
+                    PluginCommandError::invalid_arguments(
+                        "bmux.sidebar maximum_visible_items must be between 1 and 1024",
+                    )
+                })?;
+        }
         Ok(settings)
     }
 }
@@ -133,6 +168,7 @@ struct CompanionState {
     revision: u64,
     snapshot: windows_list::WindowListSnapshot,
     hovered_window_id: Option<Uuid>,
+    scroll_offset: usize,
 }
 
 impl CompanionState {
@@ -145,12 +181,37 @@ impl CompanionState {
                 revision: 0,
             },
             hovered_window_id: None,
+            scroll_offset: 0,
         }
     }
 
     fn replace_windows(&mut self, snapshot: windows_list::WindowListSnapshot) {
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
+            let maximum_offset = self
+                .snapshot
+                .windows
+                .len()
+                .saturating_sub(self.settings.maximum_visible_items);
+            self.scroll_offset = self.scroll_offset.min(maximum_offset);
+            if let Some(active) = self
+                .snapshot
+                .windows
+                .iter()
+                .position(|window| window.active)
+            {
+                if active < self.scroll_offset {
+                    self.scroll_offset = active;
+                } else if active
+                    >= self
+                        .scroll_offset
+                        .saturating_add(self.settings.maximum_visible_items)
+                {
+                    self.scroll_offset = active
+                        .saturating_add(1)
+                        .saturating_sub(self.settings.maximum_visible_items);
+                }
+            }
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -257,10 +318,10 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
             Placement::Left => LayoutEdge::Left,
             Placement::Right => LayoutEdge::Right,
         },
-        LayoutExtent::Bounded {
+        LayoutExtent::Responsive {
             preferred: settings.width,
-            minimum: settings.minimum_width,
-            maximum: settings.maximum_width,
+            collapsed: settings.collapsed_width,
+            collapse_below: settings.collapse_below_width,
         },
     )
 }
@@ -289,17 +350,61 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
 }
 
 fn truncate_to_width(value: &str, maximum: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let mut result = String::new();
     let mut width = 0_usize;
-    for ch in value.chars() {
-        let cell_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in value.graphemes(true) {
+        let cell_width = unicode_width::UnicodeWidthStr::width(grapheme);
         if width.saturating_add(cell_width) > maximum {
             break;
         }
-        result.push(ch);
+        result.push_str(grapheme);
         width = width.saturating_add(cell_width);
     }
     result
+}
+
+fn window_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFact> {
+    let entity = PresentationEntityRef::new("bmux.windows", window.id.to_string());
+    global_presentation_fact_host_service()
+        .registry()
+        .facts_for_entity(&entity)
+        .into_iter()
+        .map(|(_, fact)| fact)
+        .max_by(|left, right| {
+            (left.priority, role_rank(left.role), &left.key).cmp(&(
+                right.priority,
+                role_rank(right.role),
+                &right.key,
+            ))
+        })
+}
+
+const fn role_rank(role: PresentationFactRole) -> u8 {
+    match role {
+        PresentationFactRole::Neutral => 0,
+        PresentationFactRole::Idle => 1,
+        PresentationFactRole::Active => 2,
+        PresentationFactRole::Success => 3,
+        PresentationFactRole::Warning => 4,
+        PresentationFactRole::Attention => 5,
+        PresentationFactRole::Error => 6,
+    }
+}
+
+const fn fact_style(role: PresentationFactRole, fallback: RenderStyle) -> RenderStyle {
+    match role {
+        PresentationFactRole::Neutral => fallback,
+        PresentationFactRole::Idle => fallback.dim(),
+        PresentationFactRole::Active => fallback.named_foreground(RenderNamedColor::BrightCyan),
+        PresentationFactRole::Success => fallback.named_foreground(RenderNamedColor::BrightGreen),
+        PresentationFactRole::Warning => fallback.named_foreground(RenderNamedColor::BrightYellow),
+        PresentationFactRole::Attention => {
+            fallback.named_foreground(RenderNamedColor::BrightMagenta)
+        }
+        PresentationFactRole::Error => fallback.named_foreground(RenderNamedColor::BrightRed),
+    }
 }
 
 fn render_template(
@@ -307,9 +412,11 @@ fn render_template(
     window: &windows_list::WindowListEntry,
     index: usize,
     show_index: bool,
+    fact: Option<&PresentationFact>,
 ) -> String {
     const MARKER_TOKEN: &str = concat!("{", "marker}");
     const INDEX_TOKEN: &str = concat!("{", "index}");
+    const FACT_TOKEN: &str = concat!("{", "fact}");
     let marker = if window.active { "●" } else { "○" };
     let index = if show_index {
         format!("{} ", index.saturating_add(1))
@@ -324,6 +431,16 @@ fn render_template(
         .replace("{name}", &window.name)
         .replace("{id}", &window.id.to_string())
         .replace("{active}", if window.active { "active" } else { "idle" })
+        .replace(FACT_TOKEN, fact.map_or("", |fact| fact.short_text.as_str()))
+        .replace(
+            "{fact_detail}",
+            fact.and_then(|fact| fact.detail_text.as_deref())
+                .unwrap_or(""),
+        )
+        .replace(
+            "{fact_icon}",
+            fact.and_then(|fact| fact.icon_id.as_deref()).unwrap_or(""),
+        )
         .replace('\u{0}', "{")
         .replace('\u{1}', "}")
 }
@@ -390,10 +507,23 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let inactive = RenderStyle::new()
         .named_foreground(RenderNamedColor::White)
         .named_background(RenderNamedColor::Black);
+    let height = if state.settings.content_height {
+        u16::try_from(
+            state
+                .snapshot
+                .windows
+                .len()
+                .min(state.settings.maximum_visible_items)
+                .saturating_add(2),
+        )
+        .unwrap_or(u16::MAX)
+    } else {
+        u16::MAX
+    };
     let mut ops = vec![
-        RenderOp::fill_rect(ExtensionRect::new(0, 0, width, u16::MAX), ' ', background),
+        RenderOp::fill_rect(ExtensionRect::new(0, 0, width, height), ' ', background),
         RenderOp::border(
-            ExtensionRect::new(0, 0, width, u16::MAX),
+            ExtensionRect::new(0, 0, width, height),
             BorderGlyphs::square(),
             background,
         ),
@@ -402,24 +532,38 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
     let content_width = usize::from(width.saturating_sub(4));
     let mut row = 1_u16;
-    for (index, window) in state.snapshot.windows.iter().enumerate() {
+    for (index, window) in state
+        .snapshot
+        .windows
+        .iter()
+        .enumerate()
+        .skip(state.scroll_offset)
+        .take(state.settings.maximum_visible_items)
+    {
+        let fact = window_fact(window);
         let start_row = row;
         let title = render_template(
             &state.settings.title_template,
             window,
             index,
             state.settings.show_index,
+            fact.as_ref(),
         );
         let title = truncate_to_width(&title, content_width);
-        let item_style = if window.active {
-            active
-        } else if state.hovered_window_id == Some(window.id) {
-            inactive
-                .named_foreground(RenderNamedColor::BrightWhite)
-                .named_background(RenderNamedColor::Blue)
-        } else {
-            inactive
-        };
+        let item_style = fact.as_ref().map_or_else(
+            || {
+                if window.active {
+                    active
+                } else if state.hovered_window_id == Some(window.id) {
+                    inactive
+                        .named_foreground(RenderNamedColor::BrightWhite)
+                        .named_background(RenderNamedColor::Blue)
+                } else {
+                    inactive
+                }
+            },
+            |fact| fact_style(fact.role, if window.active { active } else { inactive }),
+        );
         ops.push(RenderOp::text_run(2, row, title, item_style));
         row = row.saturating_add(1);
         let description = render_template(
@@ -427,6 +571,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             window,
             index,
             state.settings.show_index,
+            fact.as_ref(),
         );
         row = row.saturating_add(push_wrapped_text(
             &mut ops,
@@ -442,6 +587,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             window,
             index,
             state.settings.show_index,
+            fact.as_ref(),
         );
         if !status.is_empty() {
             ops.push(RenderOp::text_run(
@@ -521,7 +667,53 @@ fn update_hover(event: &AttachInputEvent) -> bool {
         .is_ok()
 }
 
+fn update_scroll(event: &AttachInputEvent) -> bool {
+    if event.phase != "wheel" || event.wheel_delta == 0 {
+        return false;
+    }
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    let maximum = companion
+        .snapshot
+        .windows
+        .len()
+        .saturating_sub(companion.settings.maximum_visible_items);
+    let next = if event.wheel_delta > 0 {
+        companion.scroll_offset.saturating_sub(1)
+    } else {
+        companion.scroll_offset.saturating_add(1).min(maximum)
+    };
+    if next == companion.scroll_offset {
+        return true;
+    }
+    companion.scroll_offset = next;
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let revision = companion.revision;
+    let surface = build_surface(companion, revision);
+    drop(guard);
+    global_plugin_surface_registry()
+        .publish(
+            OWNER,
+            PluginSurfaceSnapshot {
+                revision,
+                surfaces: vec![surface],
+            },
+        )
+        .is_ok()
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
+    if update_scroll(event) {
+        return AttachInputResult {
+            consumed: true,
+            dirty: true,
+            ..AttachInputResult::default()
+        };
+    }
     if update_hover(event) {
         return AttachInputResult {
             consumed: true,
@@ -568,6 +760,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn layout_request_places_sidebar_on_configured_edge_and_order() {
+        let left = layout_request(&Settings::default());
+        let right = layout_request(&Settings {
+            placement: Placement::Right,
+            order: 50,
+            ..Settings::default()
+        });
+        assert!(matches!(
+            left.operation,
+            bmux_plugin::layout::LayoutOperation::Split {
+                edge: LayoutEdge::Left,
+                ..
+            }
+        ));
+        assert_eq!(right.order, 50);
+        assert!(matches!(
+            right.operation,
+            bmux_plugin::layout::LayoutOperation::Split {
+                edge: LayoutEdge::Right,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn settings_validate_width_bounds() {
         let settings: toml::Value = toml::from_str(
             "placement = 'right'\nwidth = 24\nminimum_width = 12\nmaximum_width = 40",
@@ -576,9 +793,15 @@ mod tests {
         let settings = Settings::parse(Some(&settings)).unwrap();
         assert_eq!(settings.placement, Placement::Right);
         assert_eq!(settings.title_template, "{marker} {index}{name}");
+        assert_eq!(settings.collapse_below_width, 80);
         let invalid: toml::Value =
             toml::from_str("width = 10\nminimum_width = 12\nmaximum_width = 40").unwrap();
         assert!(Settings::parse(Some(&invalid)).is_err());
+    }
+
+    #[test]
+    fn truncation_preserves_combining_graphemes() {
+        assert_eq!(truncate_to_width("e\u{301}x", 1), "e\u{301}");
     }
 
     #[test]
@@ -594,8 +817,42 @@ mod tests {
             active: true,
         };
         assert_eq!(
-            render_template("{{literal}} {index}{name} {active}", &window, 1, true),
+            render_template("{{literal}} {index}{name} {active}", &window, 1, true, None,),
             "{literal} 2 build active"
+        );
+    }
+
+    #[test]
+    fn semantic_fact_populates_templates_and_style_role() {
+        let window = windows_list::WindowListEntry {
+            id: Uuid::from_u128(20),
+            name: "build".to_string(),
+            active: false,
+        };
+        let fact = PresentationFact {
+            entity: PresentationEntityRef::new("bmux.windows", window.id.to_string()),
+            key: "activity".to_string(),
+            role: PresentationFactRole::Warning,
+            short_text: "waiting".to_string(),
+            detail_text: Some("approval required".to_string()),
+            icon_id: Some("attention".to_string()),
+            priority: 5,
+        };
+        assert_eq!(
+            render_template(
+                concat!("{name} ", "{", "fact}", " {fact_detail} {fact_icon}"),
+                &window,
+                0,
+                true,
+                Some(&fact)
+            ),
+            "build waiting approval required attention"
+        );
+        assert_eq!(
+            fact_style(fact.role, RenderStyle::new()).fg,
+            Some(bmux_plugin::RenderColor::Named(
+                RenderNamedColor::BrightYellow
+            ))
         );
     }
 
@@ -632,6 +889,168 @@ mod tests {
         let after = build_surface(&state, 2);
         assert_eq!(before.ops[3], after.ops[3]);
         assert_ne!(before.ops[4], after.ops[4]);
+    }
+
+    #[test]
+    fn virtual_window_realigns_to_active_and_bounds_projected_items() {
+        let settings = Settings {
+            maximum_visible_items: 2,
+            ..Settings::default()
+        };
+        let mut state = CompanionState::new(settings);
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: (0..5)
+                .map(|index| windows_list::WindowListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("window-{index}"),
+                    active: index == 4,
+                })
+                .collect(),
+            revision: 1,
+        });
+        assert_eq!(state.scroll_offset, 3);
+        let surface = build_surface(&state, 1);
+        assert_eq!(surface.interactive_regions.len(), 2);
+        assert_eq!(
+            surface.interactive_regions[1].local_id,
+            format!("window:{}", Uuid::from_u128(4))
+        );
+    }
+
+    #[test]
+    fn one_semantic_fact_changes_only_its_target_card_operation() {
+        let producer = format!("sidebar-test-{}", Uuid::from_u128(30));
+        let first = Uuid::from_u128(31);
+        let second = Uuid::from_u128(32);
+        let mut state = CompanionState::new(Settings::default());
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: vec![
+                windows_list::WindowListEntry {
+                    id: first,
+                    name: "one".to_string(),
+                    active: false,
+                },
+                windows_list::WindowListEntry {
+                    id: second,
+                    name: "two".to_string(),
+                    active: false,
+                },
+            ],
+            revision: 1,
+        });
+        let before = build_surface(&state, 1);
+        global_presentation_fact_host_service()
+            .registry()
+            .publish(
+                &producer,
+                bmux_presentation_state::PresentationFactSnapshot {
+                    revision: 1,
+                    facts: vec![PresentationFact {
+                        entity: PresentationEntityRef::new("bmux.windows", second.to_string()),
+                        key: "activity".to_string(),
+                        role: PresentationFactRole::Warning,
+                        short_text: "waiting".to_string(),
+                        detail_text: None,
+                        icon_id: None,
+                        priority: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        let after = build_surface(&state, 2);
+        assert_eq!(before.ops[3], after.ops[3]);
+        assert_ne!(before.ops[4], after.ops[4]);
+        assert!(
+            global_presentation_fact_host_service()
+                .registry()
+                .remove_producer(&producer)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual presentation performance baseline; run with --release --ignored --nocapture"]
+    fn sidebar_projection_performance_baseline() {
+        use std::time::Instant;
+
+        let settings = Settings {
+            maximum_visible_items: 32,
+            ..Settings::default()
+        };
+        let mut state = CompanionState::new(settings);
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: (0..2_000)
+                .map(|index| windows_list::WindowListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("window-{index}"),
+                    active: index == 1_999,
+                })
+                .collect(),
+            revision: 1,
+        });
+        let iterations = 10_000_u32;
+        let started = Instant::now();
+        for revision in 1..=iterations {
+            std::hint::black_box(build_surface(&state, u64::from(revision)));
+        }
+        let average_ns = started.elapsed().as_nanos() / u128::from(iterations);
+        eprintln!("sidebar 2,000-window/32-visible projection average: {average_ns} ns");
+        assert!(average_ns < 70_000, "projection exceeded 70 us budget");
+    }
+
+    #[test]
+    fn single_and_large_window_lists_remain_bounded() {
+        let settings = Settings {
+            maximum_visible_items: 32,
+            ..Settings::default()
+        };
+        let mut state = CompanionState::new(settings);
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: vec![windows_list::WindowListEntry {
+                id: Uuid::from_u128(50),
+                name: "single".to_string(),
+                active: true,
+            }],
+            revision: 1,
+        });
+        assert_eq!(build_surface(&state, 1).interactive_regions.len(), 1);
+
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: (0..2_000)
+                .map(|index| windows_list::WindowListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("window-{index}"),
+                    active: index == 1_999,
+                })
+                .collect(),
+            revision: 2,
+        });
+        let surface = build_surface(&state, 2);
+        assert_eq!(surface.interactive_regions.len(), 32);
+        assert_eq!(state.scroll_offset, 1_968);
+    }
+
+    #[test]
+    fn content_height_bounds_background_paint() {
+        let mut state = CompanionState::new(Settings {
+            content_height: true,
+            ..Settings::default()
+        });
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: vec![windows_list::WindowListEntry {
+                id: Uuid::from_u128(40),
+                name: "one".to_string(),
+                active: true,
+            }],
+            revision: 1,
+        });
+        let surface = build_surface(&state, 1);
+        assert!(matches!(
+            surface.ops[0],
+            RenderOp::FillRect {
+                rect: ExtensionRect { h: 3, .. },
+                ..
+            }
+        ));
     }
 
     #[test]

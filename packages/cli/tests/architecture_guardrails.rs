@@ -3280,6 +3280,57 @@ fn plugin_presentation_primitives_remain_domain_neutral() {
     }
 }
 
+#[test]
+fn presentation_plugins_own_product_projection_and_interaction() {
+    let repo = repo_root();
+    let tab = std::fs::read_to_string(repo.join("plugins/tab-strip-plugin/src/lib.rs"))
+        .expect("tab-strip plugin source");
+    let sidebar = std::fs::read_to_string(repo.join("plugins/sidebar-plugin/src/lib.rs"))
+        .expect("sidebar plugin source");
+    for required in [
+        "label_template",
+        "move_window",
+        "rename_window_by_id",
+        "show_compact_facts",
+    ] {
+        assert!(tab.contains(required), "tab-strip must own {required}");
+    }
+    for required in [
+        "title_template",
+        "description_template",
+        "maximum_visible_items",
+        "PresentationFactRole",
+    ] {
+        assert!(sidebar.contains(required), "sidebar must own {required}");
+    }
+    for (path, source) in [
+        (
+            "packages/plugin/src/layout.rs",
+            include_str!("../../plugin/src/layout.rs"),
+        ),
+        (
+            "packages/plugin/src/surface.rs",
+            include_str!("../../plugin/src/surface.rs"),
+        ),
+        (
+            "packages/plugin/src/render.rs",
+            include_str!("../../plugin/src/render.rs"),
+        ),
+    ] {
+        for denied in [
+            "label_template",
+            "title_template",
+            "rename_window_by_id",
+            "WindowMovePlacement",
+        ] {
+            assert!(
+                !production_section(source).contains(denied),
+                "{path} must not own presentation behavior {denied}",
+            );
+        }
+    }
+}
+
 /// Independent retained surfaces must remain bounded text/cell paint rather
 /// than becoming an unbounded terminal-image transport.
 #[test]

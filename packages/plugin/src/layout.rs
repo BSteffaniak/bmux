@@ -45,6 +45,11 @@ pub enum LayoutExtent {
         minimum: u16,
         maximum: u16,
     },
+    Responsive {
+        preferred: u16,
+        collapsed: u16,
+        collapse_below: u16,
+    },
     Fill,
 }
 
@@ -64,6 +69,17 @@ impl LayoutExtent {
             } => {
                 let lower = minimum.min(maximum);
                 preferred.clamp(lower, maximum).min(available)
+            }
+            Self::Responsive {
+                preferred,
+                collapsed,
+                collapse_below,
+            } => {
+                if available < collapse_below {
+                    collapsed.min(available)
+                } else {
+                    preferred.min(available)
+                }
             }
             Self::Fill => available,
         }
@@ -524,6 +540,71 @@ mod tests {
             order,
             operation,
         }
+    }
+
+    #[test]
+    fn geometry_matrix_preserves_host_content_and_bounds_allocations() {
+        for (width, height) in [(1, 1), (20, 5), (80, 24), (240, 80)] {
+            let requests = [
+                request(
+                    "tab",
+                    "top",
+                    10,
+                    LayoutOperation::Split {
+                        edge: LayoutEdge::Top,
+                        extent: LayoutExtent::Cells(1),
+                    },
+                ),
+                request(
+                    "side",
+                    "left",
+                    20,
+                    LayoutOperation::Split {
+                        edge: LayoutEdge::Left,
+                        extent: LayoutExtent::Responsive {
+                            preferred: 28,
+                            collapsed: 8,
+                            collapse_below: 80,
+                        },
+                    },
+                ),
+            ];
+            let resolved =
+                resolve_plugin_layout(ExtensionRect::new(0, 0, width, height), (1, 1), &requests)
+                    .unwrap();
+            assert!(resolved.remaining.w >= 1 && resolved.remaining.h >= 1);
+            for allocation in resolved.allocations {
+                assert!(allocation.rect.right() <= width);
+                assert!(allocation.rect.bottom() <= height);
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_extent_collapses_below_threshold() {
+        let request = request(
+            "owner",
+            "responsive",
+            0,
+            LayoutOperation::Split {
+                edge: LayoutEdge::Left,
+                extent: LayoutExtent::Responsive {
+                    preferred: 28,
+                    collapsed: 8,
+                    collapse_below: 80,
+                },
+            },
+        );
+        let wide = resolve_plugin_layout(
+            ExtensionRect::new(0, 0, 100, 24),
+            (1, 1),
+            std::slice::from_ref(&request),
+        )
+        .unwrap();
+        let narrow =
+            resolve_plugin_layout(ExtensionRect::new(0, 0, 60, 24), (1, 1), &[request]).unwrap();
+        assert_eq!(wide.allocations[0].rect.w, 28);
+        assert_eq!(narrow.allocations[0].rect.w, 8);
     }
 
     #[test]

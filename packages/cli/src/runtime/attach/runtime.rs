@@ -12092,6 +12092,7 @@ async fn invoke_plugin_surface_pointer_event(
         key: None,
         col: Some(event.hit.surface_x),
         row: Some(event.hit.surface_y),
+        wheel_delta: event.wheel_delta,
         modifiers: AttachInputModifiers::default(),
         focused_pane: None,
         hovered_pane: None,
@@ -12209,6 +12210,7 @@ async fn try_handle_plugin_surface_key(
         key: Some(key_name),
         col: None,
         row: None,
+        wheel_delta: 0,
         modifiers: AttachInputModifiers {
             shift: key.modifiers.shift,
             alt: key.modifiers.alt,
@@ -12385,6 +12387,7 @@ fn attach_input_key_name(key: &TerminalKeyEvent) -> Option<String> {
         super::input::TerminalKeyCode::Enter => "enter".to_string(),
         super::input::TerminalKeyCode::Tab => "tab".to_string(),
         super::input::TerminalKeyCode::BackTab => "backtab".to_string(),
+        super::input::TerminalKeyCode::Backspace => "backspace".to_string(),
         super::input::TerminalKeyCode::Char(ch) => ch.to_string(),
         _ => return None,
     };
@@ -12530,6 +12533,7 @@ async fn try_handle_captured_attach_input_hook_mouse(
         key: None,
         col: Some(mouse_event.column),
         row: Some(mouse_event.row),
+        wheel_delta: 0,
         modifiers: attach_input_event_modifiers(mouse_event.modifiers),
         focused_pane: attach_input_focused_context(view_state),
         hovered_pane: attach_input_hovered_pane_context(
@@ -12584,6 +12588,7 @@ async fn try_handle_uncaptured_attach_input_hook_mouse(
             key: None,
             col: Some(mouse_event.column),
             row: Some(mouse_event.row),
+            wheel_delta: 0,
             modifiers: attach_input_event_modifiers(mouse_event.modifiers),
             focused_pane: focused.clone(),
             hovered_pane: hovered.clone(),
@@ -12635,6 +12640,7 @@ async fn try_handle_attach_input_hook_key(
             key: Some(key_name.clone()),
             col: None,
             row: None,
+            wheel_delta: 0,
             modifiers: AttachInputModifiers {
                 shift: key.modifiers.shift,
                 alt: key.modifiers.alt,

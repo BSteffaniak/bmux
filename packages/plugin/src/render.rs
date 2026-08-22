@@ -217,6 +217,9 @@ pub struct AttachInputEvent {
     pub key: Option<String>,
     pub col: Option<u16>,
     pub row: Option<u16>,
+    /// Signed wheel movement for pointer wheel events; zero otherwise.
+    #[serde(default)]
+    pub wheel_delta: i16,
     pub modifiers: AttachInputModifiers,
     pub focused_pane: Option<AttachInputPaneContext>,
     pub hovered_pane: Option<AttachInputPaneContext>,

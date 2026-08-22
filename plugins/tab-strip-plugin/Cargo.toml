@@ -15,10 +15,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bmux_plugin             = { workspace = true }
 bmux_plugin_sdk         = { workspace = true }
+bmux_presentation_state = { workspace = true }
+bmux_tui_components     = { workspace = true, features = ["tab-bar"] }
 bmux_windows_plugin_api = { workspace = true }
 tokio                   = { workspace = true, features = ["rt", "sync"] }
 toml                    = { workspace = true }
 tracing                 = { workspace = true }
+unicode-segmentation    = { workspace = true }
 unicode-width           = { workspace = true }
 uuid                    = { workspace = true, features = ["std"] }
 
@@ -26,6 +29,8 @@ uuid                    = { workspace = true, features = ["std"] }
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_presentation_state/fail-on-warnings",
+    "bmux_tui_components/fail-on-warnings",
     "bmux_windows_plugin_api/fail-on-warnings",
 ]
 static-bundled = []

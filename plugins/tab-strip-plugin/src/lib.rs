@@ -16,6 +16,11 @@ use bmux_plugin::{
     ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::prelude::*;
+use bmux_presentation_state::{
+    PresentationEntityRef, PresentationFact, PresentationFactRole,
+    global_presentation_fact_host_service,
+};
+use bmux_tui_components::tab_bar::TabItem;
 use bmux_windows_plugin_api::{windows_commands, windows_list};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -39,6 +44,8 @@ struct Settings {
     show_index: bool,
     label_template: String,
     maximum_label_width: u16,
+    maximum_visible_tabs: usize,
+    show_compact_facts: bool,
 }
 
 impl Default for Settings {
@@ -50,6 +57,8 @@ impl Default for Settings {
             show_index: true,
             label_template: "{index}{name}".to_string(),
             maximum_label_width: 32,
+            maximum_visible_tabs: 8,
+            show_compact_facts: false,
         }
     }
 }
@@ -110,6 +119,25 @@ impl Settings {
                     )
                 })?;
         }
+        if let Some(count) = table
+            .get("maximum_visible_tabs")
+            .and_then(toml::Value::as_integer)
+        {
+            settings.maximum_visible_tabs = usize::try_from(count)
+                .ok()
+                .filter(|count| *count > 0 && *count <= 1_024)
+                .ok_or_else(|| {
+                    PluginCommandError::invalid_arguments(
+                        "bmux.tab_strip maximum_visible_tabs must be between 1 and 1024",
+                    )
+                })?;
+        }
+        if let Some(show_facts) = table
+            .get("show_compact_facts")
+            .and_then(toml::Value::as_bool)
+        {
+            settings.show_compact_facts = show_facts;
+        }
         Ok(settings)
     }
 }
@@ -120,6 +148,13 @@ struct CompanionState {
     revision: u64,
     snapshot: windows_list::WindowListSnapshot,
     hovered_window_id: Option<Uuid>,
+    scroll_offset: usize,
+    pointer_source: Option<Uuid>,
+    pointer_moved: bool,
+    editing_window_id: Option<Uuid>,
+    edit_buffer: String,
+    menu_window_id: Option<Uuid>,
+    menu_selected: usize,
 }
 
 impl CompanionState {
@@ -132,12 +167,43 @@ impl CompanionState {
                 revision: 0,
             },
             hovered_window_id: None,
+            scroll_offset: 0,
+            pointer_source: None,
+            pointer_moved: false,
+            editing_window_id: None,
+            edit_buffer: String::new(),
+            menu_window_id: None,
+            menu_selected: 0,
         }
     }
 
     fn replace_windows(&mut self, snapshot: windows_list::WindowListSnapshot) {
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
+            let maximum_offset = self
+                .snapshot
+                .windows
+                .len()
+                .saturating_sub(self.settings.maximum_visible_tabs);
+            self.scroll_offset = self.scroll_offset.min(maximum_offset);
+            if let Some(active) = self
+                .snapshot
+                .windows
+                .iter()
+                .position(|window| window.active)
+            {
+                if active < self.scroll_offset {
+                    self.scroll_offset = active;
+                } else if active
+                    >= self
+                        .scroll_offset
+                        .saturating_add(self.settings.maximum_visible_tabs)
+                {
+                    self.scroll_offset = active
+                        .saturating_add(1)
+                        .saturating_sub(self.settings.maximum_visible_tabs);
+                }
+            }
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -271,27 +337,80 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
     Ok(())
 }
 
+fn compact_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFact> {
+    let entity = PresentationEntityRef::new("bmux.windows", window.id.to_string());
+    global_presentation_fact_host_service()
+        .registry()
+        .facts_for_entity(&entity)
+        .into_iter()
+        .map(|(_, fact)| fact)
+        .max_by(|left, right| {
+            (left.priority, compact_role_rank(left.role), &left.key).cmp(&(
+                right.priority,
+                compact_role_rank(right.role),
+                &right.key,
+            ))
+        })
+}
+
+const fn compact_role_rank(role: PresentationFactRole) -> u8 {
+    match role {
+        PresentationFactRole::Neutral => 0,
+        PresentationFactRole::Idle => 1,
+        PresentationFactRole::Active => 2,
+        PresentationFactRole::Success => 3,
+        PresentationFactRole::Warning => 4,
+        PresentationFactRole::Attention => 5,
+        PresentationFactRole::Error => 6,
+    }
+}
+
+const fn compact_fact_style(role: PresentationFactRole, fallback: RenderStyle) -> RenderStyle {
+    match role {
+        PresentationFactRole::Neutral => fallback,
+        PresentationFactRole::Idle => fallback.dim(),
+        PresentationFactRole::Active => fallback.named_foreground(RenderNamedColor::BrightCyan),
+        PresentationFactRole::Success => fallback.named_foreground(RenderNamedColor::BrightGreen),
+        PresentationFactRole::Warning => fallback.named_foreground(RenderNamedColor::BrightYellow),
+        PresentationFactRole::Attention => {
+            fallback.named_foreground(RenderNamedColor::BrightMagenta)
+        }
+        PresentationFactRole::Error => fallback.named_foreground(RenderNamedColor::BrightRed),
+    }
+}
+
 fn truncate_to_width(value: &str, maximum: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let mut result = String::new();
     let mut width = 0_usize;
-    for ch in value.chars() {
-        let cell_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in value.graphemes(true) {
+        let cell_width = unicode_width::UnicodeWidthStr::width(grapheme);
         if width.saturating_add(cell_width) > maximum {
             break;
         }
-        result.push(ch);
+        result.push_str(grapheme);
         width = width.saturating_add(cell_width);
     }
     result
 }
 
+fn component_label(id: &str, label: &str) -> String {
+    TabItem::new(id, label).label()
+}
+
 fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index: usize) -> String {
     const INDEX_TOKEN: &str = concat!("{", "index}");
+    const FACT_TOKEN: &str = concat!("{", "fact}");
     let index = if settings.show_index {
         format!("{}:", index.saturating_add(1))
     } else {
         String::new()
     };
+    let fact = settings
+        .show_compact_facts
+        .then(|| compact_fact(window))
+        .flatten();
     let label = settings
         .label_template
         .replace("{{", "\u{0}")
@@ -300,11 +419,19 @@ fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index:
         .replace("{name}", &window.name)
         .replace("{id}", &window.id.to_string())
         .replace("{active}", if window.active { "active" } else { "idle" })
+        .replace(
+            FACT_TOKEN,
+            fact.as_ref().map_or("", |fact| fact.short_text.as_str()),
+        )
         .replace('\u{0}', "{")
         .replace('\u{1}', "}");
-    truncate_to_width(&label, usize::from(settings.maximum_label_width))
+    truncate_to_width(
+        &component_label(&window.id.to_string(), &label),
+        usize::from(settings.maximum_label_width),
+    )
 }
 
+#[allow(clippy::too_many_lines)] // One ordered retained projection keeps tab, overflow, editor, and menu geometry consistent.
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let active_style = RenderStyle::new()
         .named_foreground(RenderNamedColor::BrightWhite)
@@ -320,11 +447,50 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     )];
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
     let mut x = 0_u16;
-    for (index, window) in state.snapshot.windows.iter().enumerate() {
-        let label = format!(" {} ", tab_label(&state.settings, window, index));
+    let visible = state
+        .snapshot
+        .windows
+        .iter()
+        .enumerate()
+        .skip(state.scroll_offset)
+        .take(state.settings.maximum_visible_tabs)
+        .collect::<Vec<_>>();
+    let hidden_before = state.scroll_offset > 0;
+    let hidden_after =
+        state.scroll_offset.saturating_add(visible.len()) < state.snapshot.windows.len();
+    if hidden_before {
+        ops.push(RenderOp::text_run(x, 0, " ‹ ", inactive_style));
+        x = x.saturating_add(3);
+    }
+    for (index, window) in visible {
+        let label = if state.editing_window_id == Some(window.id) {
+            format!(
+                " [{}] ",
+                truncate_to_width(
+                    &state.edit_buffer,
+                    usize::from(state.settings.maximum_label_width)
+                )
+            )
+        } else {
+            format!(" {} ", tab_label(&state.settings, window, index))
+        };
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str()))
             .unwrap_or(u16::MAX);
-        let style = if window.active {
+        let fact = state
+            .settings
+            .show_compact_facts
+            .then(|| compact_fact(window))
+            .flatten();
+        let style = if let Some(fact) = fact {
+            compact_fact_style(
+                fact.role,
+                if window.active {
+                    active_style
+                } else {
+                    inactive_style
+                },
+            )
+        } else if window.active {
             active_style
         } else if state.hovered_window_id == Some(window.id) {
             inactive_style
@@ -343,9 +509,38 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                 capability: "bmux.tab_strip.input".to_string(),
                 interface_id: "presentation-input".to_string(),
                 operation: "handle-input".to_string(),
-            }),
+            })
+            .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
         );
         x = x.saturating_add(width);
+    }
+    if hidden_after {
+        ops.push(RenderOp::text_run(x, 0, " › ", inactive_style));
+    }
+    if let Some(target) = state.menu_window_id {
+        let menu_style = RenderStyle::new()
+            .named_foreground(RenderNamedColor::BrightWhite)
+            .named_background(RenderNamedColor::Black);
+        let selected_style = menu_style.named_background(RenderNamedColor::Blue).bold();
+        let menu_x = visible_window_start(state, target).unwrap_or(0);
+        let mut menu_x = menu_x;
+        for (index, label) in ["Switch", "Rename", "Close"].iter().enumerate() {
+            let text = format!(" {label} ");
+            ops.push(RenderOp::text_run(
+                menu_x,
+                0,
+                &text,
+                if index == state.menu_selected {
+                    selected_style
+                } else {
+                    menu_style
+                },
+            ));
+            menu_x = menu_x.saturating_add(
+                u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str()))
+                    .unwrap_or(u16::MAX),
+            );
+        }
     }
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
@@ -395,7 +590,442 @@ fn update_hover(event: &AttachInputEvent) -> bool {
         .is_ok()
 }
 
+fn update_scroll(event: &AttachInputEvent) -> bool {
+    if event.phase != "wheel" || event.wheel_delta == 0 {
+        return false;
+    }
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    let maximum = companion
+        .snapshot
+        .windows
+        .len()
+        .saturating_sub(companion.settings.maximum_visible_tabs);
+    let next = if event.wheel_delta > 0 {
+        companion.scroll_offset.saturating_sub(1)
+    } else {
+        companion.scroll_offset.saturating_add(1).min(maximum)
+    };
+    if next == companion.scroll_offset {
+        return true;
+    }
+    companion.scroll_offset = next;
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let revision = companion.revision;
+    let surface = build_surface(companion, revision);
+    drop(guard);
+    global_plugin_surface_registry()
+        .publish(
+            OWNER,
+            PluginSurfaceSnapshot {
+                revision,
+                surfaces: vec![surface],
+            },
+        )
+        .is_ok()
+}
+
+fn visible_window_start(state: &CompanionState, target: Uuid) -> Option<u16> {
+    let mut x = if state.scroll_offset > 0 { 3 } else { 0 };
+    for (index, window) in state
+        .snapshot
+        .windows
+        .iter()
+        .enumerate()
+        .skip(state.scroll_offset)
+        .take(state.settings.maximum_visible_tabs)
+    {
+        if window.id == target {
+            return Some(x);
+        }
+        let label = format!(" {} ", tab_label(&state.settings, window, index));
+        x = x.saturating_add(
+            u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str())).ok()?,
+        );
+    }
+    None
+}
+
+fn visible_window_at_col(state: &CompanionState, col: u16) -> Option<Uuid> {
+    let mut x = if state.scroll_offset > 0 { 3 } else { 0 };
+    for (index, window) in state
+        .snapshot
+        .windows
+        .iter()
+        .enumerate()
+        .skip(state.scroll_offset)
+        .take(state.settings.maximum_visible_tabs)
+    {
+        let label = format!(" {} ", tab_label(&state.settings, window, index));
+        let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str())).ok()?;
+        if col >= x && col < x.saturating_add(width) {
+            return Some(window.id);
+        }
+        x = x.saturating_add(width);
+    }
+    None
+}
+
+fn update_drag(
+    context: &NativeServiceContext,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    let source = event
+        .hook_id
+        .strip_prefix("bmux.tab_strip:strip:window:")
+        .and_then(|target| Uuid::parse_str(target).ok())?;
+    let mut guard = state().lock().ok()?;
+    let companion = guard.as_mut()?;
+    match event.phase.as_str() {
+        "down" if event.button.as_deref() == Some("left") => {
+            companion.pointer_source = Some(source);
+            companion.pointer_moved = false;
+            Some(AttachInputResult {
+                consumed: true,
+                capture_pointer: true,
+                ..AttachInputResult::default()
+            })
+        }
+        "drag" if companion.pointer_source == Some(source) => {
+            companion.pointer_moved = true;
+            Some(AttachInputResult {
+                consumed: true,
+                capture_pointer: true,
+                ..AttachInputResult::default()
+            })
+        }
+        "up" if companion.pointer_source == Some(source) => {
+            let moved = companion.pointer_moved;
+            let target = event
+                .col
+                .and_then(|col| visible_window_at_col(companion, col));
+            companion.pointer_source = None;
+            companion.pointer_moved = false;
+            drop(guard);
+            let result = if moved {
+                target.filter(|target| *target != source).map_or_else(
+                    || Ok(Ok(None)),
+                    |target| {
+                        let mut client = ServiceCallerDispatchClient::new(context);
+                        block_on_typed_dispatch(windows_commands::client::move_window(
+                            &mut client,
+                            source,
+                            target,
+                            windows_commands::WindowMovePlacement::Before,
+                        ))
+                        .map(|result| result.map(Some))
+                    },
+                )
+            } else {
+                let mut client = ServiceCallerDispatchClient::new(context);
+                block_on_typed_dispatch(windows_commands::client::switch_window(
+                    &mut client,
+                    source.to_string(),
+                ))
+                .map(|result| result.map(Some))
+            };
+            Some(match result {
+                Ok(Ok(_)) => AttachInputResult {
+                    consumed: true,
+                    release_capture: true,
+                    dirty: true,
+                    ..AttachInputResult::default()
+                },
+                Ok(Err(error)) => AttachInputResult {
+                    consumed: true,
+                    release_capture: true,
+                    status_message: Some(format!("window action failed: {error:?}")),
+                    ..AttachInputResult::default()
+                },
+                Err(error) => AttachInputResult {
+                    consumed: true,
+                    release_capture: true,
+                    status_message: Some(format!("window action unavailable: {error}")),
+                    ..AttachInputResult::default()
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn republish_companion(companion: &mut CompanionState) -> bool {
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let revision = companion.revision;
+    let surface = build_surface(companion, revision);
+    global_plugin_surface_registry()
+        .publish(
+            OWNER,
+            PluginSurfaceSnapshot {
+                revision,
+                surfaces: vec![surface],
+            },
+        )
+        .is_ok()
+}
+
+fn update_editor(
+    context: &NativeServiceContext,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
+        return None;
+    }
+    let mut guard = state().lock().ok()?;
+    let companion = guard.as_mut()?;
+    let editing = companion.editing_window_id?;
+    let key = event.key.as_deref()?;
+    match key {
+        "esc" => {
+            companion.editing_window_id = None;
+            companion.edit_buffer.clear();
+        }
+        "backspace" => {
+            companion.edit_buffer.pop();
+        }
+        "enter" => {
+            let name = companion.edit_buffer.trim().to_string();
+            if name.is_empty() {
+                return Some(AttachInputResult {
+                    consumed: true,
+                    status_message: Some("window name must not be empty".to_string()),
+                    ..AttachInputResult::default()
+                });
+            }
+            companion.editing_window_id = None;
+            companion.edit_buffer.clear();
+            drop(guard);
+            let mut client = ServiceCallerDispatchClient::new(context);
+            return Some(
+                match block_on_typed_dispatch(windows_commands::client::rename_window_by_id(
+                    &mut client,
+                    editing,
+                    name,
+                )) {
+                    Ok(Ok(_)) => AttachInputResult {
+                        consumed: true,
+                        dirty: true,
+                        ..AttachInputResult::default()
+                    },
+                    Ok(Err(error)) => AttachInputResult {
+                        consumed: true,
+                        status_message: Some(format!("window rename failed: {error:?}")),
+                        ..AttachInputResult::default()
+                    },
+                    Err(error) => AttachInputResult {
+                        consumed: true,
+                        status_message: Some(format!("window rename unavailable: {error}")),
+                        ..AttachInputResult::default()
+                    },
+                },
+            );
+        }
+        value if value.chars().count() == 1 && companion.edit_buffer.len() < 4_096 => {
+            companion.edit_buffer.push_str(value);
+        }
+        _ => {
+            return Some(AttachInputResult {
+                consumed: true,
+                ..AttachInputResult::default()
+            });
+        }
+    }
+    let dirty = republish_companion(companion);
+    Some(AttachInputResult {
+        consumed: true,
+        dirty,
+        ..AttachInputResult::default()
+    })
+}
+
+fn begin_rename(event: &AttachInputEvent) -> bool {
+    if event.event_kind != "pointer"
+        || event.phase != "down"
+        || event.button.as_deref() != Some("middle")
+    {
+        return false;
+    }
+    let Some(target) = event
+        .hook_id
+        .strip_prefix("bmux.tab_strip:strip:window:")
+        .and_then(|target| Uuid::parse_str(target).ok())
+    else {
+        return false;
+    };
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    let Some(window) = companion
+        .snapshot
+        .windows
+        .iter()
+        .find(|window| window.id == target)
+    else {
+        return false;
+    };
+    companion.editing_window_id = Some(target);
+    companion.edit_buffer.clone_from(&window.name);
+    republish_companion(companion)
+}
+
+fn begin_menu(event: &AttachInputEvent) -> bool {
+    if event.event_kind != "pointer"
+        || event.phase != "down"
+        || event.button.as_deref() != Some("right")
+    {
+        return false;
+    }
+    let Some(target) = event
+        .hook_id
+        .strip_prefix("bmux.tab_strip:strip:window:")
+        .and_then(|target| Uuid::parse_str(target).ok())
+    else {
+        return false;
+    };
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    companion.menu_window_id = Some(target);
+    companion.menu_selected = 0;
+    republish_companion(companion)
+}
+
+fn update_menu(
+    context: &NativeServiceContext,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
+        return None;
+    }
+    let mut guard = state().lock().ok()?;
+    let companion = guard.as_mut()?;
+    let target = companion.menu_window_id?;
+    match event.key.as_deref()? {
+        "left" => companion.menu_selected = companion.menu_selected.saturating_sub(1),
+        "right" | "tab" => companion.menu_selected = (companion.menu_selected + 1).min(2),
+        "esc" => {
+            companion.menu_window_id = None;
+        }
+        "enter" => {
+            let action = companion.menu_selected;
+            companion.menu_window_id = None;
+            if action == 1 {
+                let Some(window) = companion
+                    .snapshot
+                    .windows
+                    .iter()
+                    .find(|window| window.id == target)
+                else {
+                    return Some(AttachInputResult::default());
+                };
+                companion.editing_window_id = Some(target);
+                companion.edit_buffer.clone_from(&window.name);
+                let dirty = republish_companion(companion);
+                return Some(AttachInputResult {
+                    consumed: true,
+                    dirty,
+                    ..AttachInputResult::default()
+                });
+            }
+            drop(guard);
+            let mut client = ServiceCallerDispatchClient::new(context);
+            let result = if action == 0 {
+                block_on_typed_dispatch(windows_commands::client::switch_window(
+                    &mut client,
+                    target.to_string(),
+                ))
+            } else {
+                block_on_typed_dispatch(windows_commands::client::kill_window(
+                    &mut client,
+                    target.to_string(),
+                    false,
+                ))
+            };
+            return Some(match result {
+                Ok(Ok(_)) => AttachInputResult {
+                    consumed: true,
+                    dirty: true,
+                    ..AttachInputResult::default()
+                },
+                Ok(Err(error)) => AttachInputResult {
+                    consumed: true,
+                    status_message: Some(format!("window menu action failed: {error:?}")),
+                    ..AttachInputResult::default()
+                },
+                Err(error) => AttachInputResult {
+                    consumed: true,
+                    status_message: Some(format!("window menu action unavailable: {error}")),
+                    ..AttachInputResult::default()
+                },
+            });
+        }
+        _ => {
+            return Some(AttachInputResult {
+                consumed: true,
+                ..AttachInputResult::default()
+            });
+        }
+    }
+    let dirty = republish_companion(companion);
+    Some(AttachInputResult {
+        consumed: true,
+        dirty,
+        ..AttachInputResult::default()
+    })
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
+    if let Some(result) = update_menu(context, event) {
+        return result;
+    }
+    if let Some(result) = update_editor(context, event) {
+        return result;
+    }
+    if begin_menu(event) {
+        return AttachInputResult {
+            consumed: true,
+            capture_keyboard: vec![
+                "left".to_string(),
+                "right".to_string(),
+                "tab".to_string(),
+                "enter".to_string(),
+                "esc".to_string(),
+            ],
+            dirty: true,
+            ..AttachInputResult::default()
+        };
+    }
+    if begin_rename(event) {
+        return AttachInputResult {
+            consumed: true,
+            capture_keyboard: vec!["enter".to_string(), "esc".to_string()],
+            dirty: true,
+            ..AttachInputResult::default()
+        };
+    }
+    if event.event_kind != "pointer" {
+        return AttachInputResult::default();
+    }
+    if let Some(result) = update_drag(context, event) {
+        return result;
+    }
+    if update_scroll(event) {
+        return AttachInputResult {
+            consumed: true,
+            dirty: true,
+            ..AttachInputResult::default()
+        };
+    }
     if update_hover(event) {
         return AttachInputResult {
             consumed: true,
@@ -403,36 +1033,7 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
             ..AttachInputResult::default()
         };
     }
-    if event.event_kind != "pointer"
-        || event.phase != "down"
-        || event.button.as_deref() != Some("left")
-    {
-        return AttachInputResult::default();
-    }
-    let Some(target) = event.hook_id.strip_prefix("bmux.tab_strip:strip:window:") else {
-        return AttachInputResult::default();
-    };
-    let mut client = ServiceCallerDispatchClient::new(context);
-    match block_on_typed_dispatch(windows_commands::client::switch_window(
-        &mut client,
-        target.to_string(),
-    )) {
-        Ok(Ok(_)) => AttachInputResult {
-            consumed: true,
-            dirty: true,
-            ..AttachInputResult::default()
-        },
-        Ok(Err(error)) => AttachInputResult {
-            consumed: true,
-            status_message: Some(format!("window switch failed: {error:?}")),
-            ..AttachInputResult::default()
-        },
-        Err(error) => AttachInputResult {
-            consumed: true,
-            status_message: Some(format!("window switch unavailable: {error}")),
-            ..AttachInputResult::default()
-        },
-    }
+    AttachInputResult::default()
 }
 
 bmux_plugin_sdk::export_plugin!(TabStripPlugin, include_str!("../plugin.toml"));
@@ -440,6 +1041,29 @@ bmux_plugin_sdk::export_plugin!(TabStripPlugin, include_str!("../plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_request_places_strip_on_configured_edge() {
+        let top = layout_request(&Settings::default());
+        let bottom = layout_request(&Settings {
+            placement: Placement::Bottom,
+            ..Settings::default()
+        });
+        assert!(matches!(
+            top.operation,
+            bmux_plugin::layout::LayoutOperation::Split {
+                edge: LayoutEdge::Top,
+                ..
+            }
+        ));
+        assert!(matches!(
+            bottom.operation,
+            bmux_plugin::layout::LayoutOperation::Split {
+                edge: LayoutEdge::Bottom,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn settings_validate_placement_and_height() {
@@ -454,6 +1078,8 @@ mod tests {
                 show_index: false,
                 label_template: "{index}{name}".to_string(),
                 maximum_label_width: 32,
+                maximum_visible_tabs: 8,
+                show_compact_facts: false,
             }
         );
         let invalid: toml::Value = toml::from_str("height = 0").unwrap();
@@ -499,6 +1125,72 @@ mod tests {
         let after = build_surface(&state, 2);
         assert_eq!(before.ops[1], after.ops[1]);
         assert_ne!(before.ops[2], after.ops[2]);
+    }
+
+    #[test]
+    fn overflow_window_keeps_active_tab_visible_and_bounded() {
+        let settings = Settings {
+            maximum_visible_tabs: 2,
+            ..Settings::default()
+        };
+        let mut state = CompanionState::new(settings);
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: (0..5)
+                .map(|index| windows_list::WindowListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("window-{index}"),
+                    active: index == 4,
+                })
+                .collect(),
+            revision: 1,
+        });
+        assert_eq!(state.scroll_offset, 3);
+        let surface = build_surface(&state, 1);
+        assert_eq!(surface.interactive_regions.len(), 2);
+        assert_eq!(
+            surface.interactive_regions[1].local_id,
+            format!("window:{}", Uuid::from_u128(4))
+        );
+        assert!(
+            surface
+                .ops
+                .iter()
+                .any(|op| matches!(op, RenderOp::TextRun { text, .. } if text == " ‹ "))
+        );
+    }
+
+    #[test]
+    fn visible_window_lookup_accounts_for_overflow_marker() {
+        let settings = Settings {
+            maximum_visible_tabs: 2,
+            ..Settings::default()
+        };
+        let mut state = CompanionState::new(settings);
+        state.scroll_offset = 1;
+        state.snapshot.windows = (0..4)
+            .map(|index| windows_list::WindowListEntry {
+                id: Uuid::from_u128(index),
+                name: format!("w{index}"),
+                active: false,
+            })
+            .collect();
+        assert_eq!(visible_window_at_col(&state, 4), Some(Uuid::from_u128(1)));
+        assert_eq!(visible_window_at_col(&state, 10), Some(Uuid::from_u128(2)));
+    }
+
+    #[test]
+    fn tab_label_truncation_preserves_combining_graphemes() {
+        assert_eq!(truncate_to_width("e\u{301}x", 1), "e\u{301}");
+    }
+
+    #[test]
+    fn compact_fact_style_maps_warning_role() {
+        assert_eq!(
+            compact_fact_style(PresentationFactRole::Warning, RenderStyle::new()).fg,
+            Some(bmux_plugin::RenderColor::Named(
+                RenderNamedColor::BrightYellow
+            ))
+        );
     }
 
     #[test]

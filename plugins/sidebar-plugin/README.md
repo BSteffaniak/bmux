@@ -14,6 +14,10 @@ heading = "Windows"
 title_template = "{marker} {index}{name}"
 description_template = ""
 status_template = ""
+maximum_visible_items = 20
+content_height = false
+collapse_below_width = 80
+collapsed_width = 8
 ```
 
 Templates support `{marker}`, `{index}`, `{name}`, `{id}`, and `{active}`.
