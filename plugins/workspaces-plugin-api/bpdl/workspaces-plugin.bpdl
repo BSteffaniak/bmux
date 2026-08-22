@@ -1,0 +1,90 @@
+// Public typed contract for named workspace metadata above tabs.
+plugin bmux.workspaces version 1;
+
+capability WORKSPACES_READ = bmux.workspaces.read;
+capability WORKSPACES_WRITE = bmux.workspaces.write;
+
+@capability(WORKSPACES_READ)
+interface workspaces-state {
+    record workspace-summary {
+        id: uuid,
+        name: string,
+        tab-ids: list<uuid>,
+        active: bool,
+    }
+
+    record workspace-selector {
+        id: uuid?,
+        name: string?,
+    }
+
+    variant workspace-query-error {
+        not-found,
+        invalid-selector { reason: string },
+    }
+
+    query list-workspaces() -> list<workspace-summary>;
+    query get-workspace(selector: workspace-selector)
+        -> result<workspace-summary, workspace-query-error>;
+    query current-workspace() -> workspace-summary?;
+}
+
+@capability(WORKSPACES_WRITE)
+interface workspaces-commands {
+    record workspace-ack {
+        id: uuid,
+        selected-context-id: uuid?,
+    }
+
+    variant workspace-command-error {
+        not-found,
+        invalid-name { reason: string },
+        cannot-remove-last-workspace,
+        no-previous-workspace,
+        denied { reason: string },
+        failed { reason: string },
+    }
+
+    command new-workspace(name: string?)
+        -> result<workspace-ack, workspace-command-error>;
+    command rename-workspace(selector: workspaces-state.workspace-selector, name: string)
+        -> result<workspace-ack, workspace-command-error>;
+    command kill-workspace(selector: workspaces-state.workspace-selector)
+        -> result<workspace-ack, workspace-command-error>;
+    command switch-workspace(selector: workspaces-state.workspace-selector)
+        -> result<workspace-ack, workspace-command-error>;
+    command next-workspace()
+        -> result<workspace-ack, workspace-command-error>;
+    command prev-workspace()
+        -> result<workspace-ack, workspace-command-error>;
+    command last-workspace()
+        -> result<workspace-ack, workspace-command-error>;
+    command move-tab-to-workspace(
+        context-id: uuid,
+        workspace: workspaces-state.workspace-selector,
+    ) -> result<workspace-ack, workspace-command-error>;
+}
+
+interface workspaces-events {
+    variant workspace-event {
+        created { workspace-id: uuid, name: string },
+        removed { workspace-id: uuid },
+        selected {
+            workspace-id: uuid,
+            context-id: uuid,
+            initiator-client-id: uuid?,
+        },
+        renamed { workspace-id: uuid, name: string },
+    }
+
+    events workspace-event;
+}
+
+interface workspaces-list {
+    record workspace-list-snapshot {
+        workspaces: list<workspaces-state.workspace-summary>,
+        revision: u64,
+    }
+
+    @state events workspace-list-snapshot;
+}

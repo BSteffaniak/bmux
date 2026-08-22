@@ -2228,6 +2228,25 @@ fn reset_window_order(
     Ok(ids.len())
 }
 
+fn active_workspace_attribute(caller: &(impl ServiceCaller + Sync)) -> String {
+    let mut client = dispatch_client(caller);
+    let workspace = bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::current_workspace(&mut client),
+    )
+    .ok()
+    .flatten();
+    workspace.map_or_else(
+        || "default".to_string(),
+        |workspace| {
+            if workspace.id.is_nil() {
+                "default".to_string()
+            } else {
+                workspace.id.to_string()
+            }
+        },
+    )
+}
+
 fn create_window(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
@@ -2241,7 +2260,9 @@ fn create_window(
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)
             .ok()
             .flatten();
-    let context = create_context(caller, resolved_name, BTreeMap::new())?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("workspace".to_string(), active_workspace_attribute(caller));
+    let context = create_context(caller, resolved_name, attributes)?;
     let context_id = context.id;
     cache_known_context(runtime_state, context_id, context.name.clone());
     contexts.push(context);

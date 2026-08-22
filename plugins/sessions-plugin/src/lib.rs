@@ -20,6 +20,7 @@
 pub mod session_manager;
 pub use session_manager::SessionManager;
 
+use bmux_contexts_plugin_api::contexts_commands;
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
@@ -46,9 +47,18 @@ use bmux_sessions_plugin_api::sessions_state::{
 };
 use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+
+const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
+
+const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+) -> bmux_plugin::ServiceCallerDispatchClient<'_, C> {
+    bmux_plugin::ServiceCallerDispatchClient::new(caller)
+}
 
 /// Adapter wrapping the plugin's `Arc<RwLock<SessionManager>>` and
 /// implementing the domain-agnostic [`SessionManagerReader`] +
@@ -334,8 +344,9 @@ impl RustPlugin for SessionsPlugin {
         match context.command.as_str() {
             "new-session" => {
                 let name = option_value(&context.arguments, "name");
-                match new_session_via_ipc(&context, name) {
+                match create_context_via_contexts_plugin(&context, name) {
                     Ok(ack) => {
+                        record_selected_context_outcome(ack.id);
                         if matches!(
                             context.invocation_source,
                             bmux_plugin_sdk::NativeCommandInvocationSource::Cli
@@ -497,6 +508,32 @@ fn reconcile_client_membership_local(req: &ReconcileArgs) -> Result<SessionAck, 
 }
 
 // ── IPC helpers ──────────────────────────────────────────────────────
+
+fn create_context_via_contexts_plugin(
+    caller: &(impl ServiceCaller + Sync),
+    name: Option<String>,
+) -> Result<SessionAck, NewSessionError> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::create_context(
+        &mut client,
+        name,
+        BTreeMap::default(),
+    ))
+    .map_err(|error| NewSessionError::Failed {
+        reason: format!("contexts-commands/create-context failed: {error}"),
+    })?;
+    let ack = result.map_err(|error| NewSessionError::Failed {
+        reason: format!("create-context failed: {error:?}"),
+    })?;
+    Ok(SessionAck { id: ack.id })
+}
+
+fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
+    bmux_plugin_sdk::record_command_outcome_metadata(
+        COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
+        serde_json::json!(context_id),
+    );
+}
 
 fn new_session_via_ipc(
     caller: &impl ServiceCaller,
@@ -914,6 +951,23 @@ mod tests {
             error,
             SelectSessionError::Denied { reason } if reason.contains("blocked")
         ));
+    }
+
+    #[test]
+    fn selected_context_outcome_records_new_context_id() {
+        let context_id = ::uuid::Uuid::from_u128(42);
+        bmux_plugin_sdk::begin_command_outcome_capture();
+        record_selected_context_outcome(context_id);
+
+        let outcome = bmux_plugin_sdk::finish_command_outcome_capture();
+        let expected = context_id.to_string();
+        assert_eq!(
+            outcome
+                .metadata
+                .get(COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
     }
 
     #[test]

@@ -1,0 +1,130 @@
+execution_class = "native_fast"
+id = "bmux.workspaces"
+name = "bmux Workspaces"
+owns_namespaces = ["workspace"]
+provided_capabilities = ["bmux.workspaces.read", "bmux.workspaces.write"]
+provided_features = ["bmux.workspaces"]
+required_capabilities = [
+    "bmux.clients.read",
+    "bmux.contexts.read",
+    "bmux.contexts.write",
+    "bmux.storage",
+]
+version = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.workspaces.read"
+interface_id = "workspaces-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.workspaces.write"
+interface_id = "workspaces-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.workspaces.read"
+interface_id = "workspaces-events"
+kind         = "event"
+
+[[event_publications]]
+delivery                     = "broadcast"
+forward_to_streaming_clients = true
+kind                         = "bmux.workspaces/workspaces-events"
+
+[[commands]]
+expose_in_cli = true
+name          = "new-workspace"
+path          = ["workspace", "new"]
+summary       = "Create and select a workspace"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+value_name = "NAME"
+
+[[commands]]
+expose_in_cli = true
+name          = "list-workspaces"
+path          = ["workspace", "list"]
+summary       = "List workspaces"
+
+[[commands]]
+expose_in_cli = true
+name          = "switch-workspace"
+path          = ["workspace", "switch"]
+summary       = "Switch to a workspace"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+required   = true
+value_name = "TARGET"
+
+[[commands]]
+expose_in_cli = true
+name          = "rename-workspace"
+path          = ["workspace", "rename"]
+summary       = "Rename a workspace"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+required   = true
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "name"
+required   = true
+value_name = "NAME"
+
+[[commands]]
+expose_in_cli = true
+name          = "kill-workspace"
+path          = ["workspace", "kill"]
+summary       = "Remove a workspace"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+required   = true
+value_name = "TARGET"
+
+[[commands]]
+expose_in_cli = true
+name          = "move-tab-to-workspace"
+path          = ["workspace", "move-tab"]
+summary       = "Move a tab into a workspace"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "context-id"
+required   = true
+value_name = "CONTEXT_ID"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+required   = true
+value_name = "TARGET"
+
+[[commands]]
+expose_in_cli = true
+name          = "next-workspace"
+path          = ["workspace", "next"]
+summary       = "Select the next workspace"
+
+[[commands]]
+expose_in_cli = true
+name          = "prev-workspace"
+path          = ["workspace", "previous"]
+summary       = "Select the previous workspace"
+
+[[commands]]
+expose_in_cli = true
+name          = "last-workspace"
+path          = ["workspace", "last"]
+summary       = "Return to the previous workspace"

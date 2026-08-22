@@ -1,11 +1,15 @@
-execution_class       = "native_fast"
-id                    = "bmux.sessions"
-name                  = "bmux Sessions"
-owns_namespaces       = ["new-session"]
+execution_class = "native_fast"
+id = "bmux.sessions"
+name = "bmux Sessions"
+owns_namespaces = ["new-session"]
 provided_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
-provided_features     = ["bmux.sessions"]
-required_capabilities = ["bmux.attach_runtime.write", "bmux.pane_runtime.write"]
-version               = "0.0.1-alpha.0"
+provided_features = ["bmux.sessions"]
+required_capabilities = [
+    "bmux.attach_runtime.write",
+    "bmux.contexts.write",
+    "bmux.pane_runtime.write",
+]
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.sessions.read"

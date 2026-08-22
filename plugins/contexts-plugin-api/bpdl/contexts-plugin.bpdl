@@ -75,6 +75,13 @@ interface contexts-commands {
         failed { reason: string },
     }
 
+    // Errors a `set-context-attributes` command can produce.
+    variant set-context-attributes-error {
+        not-found,
+        denied { reason: string },
+        failed { reason: string },
+    }
+
     // Acknowledgement returned by mutating context commands. `id`
     // carries the target context id after the operation (the newly
     // created one for `create-context`, or the resolved selector for
@@ -99,6 +106,10 @@ interface contexts-commands {
         -> result<context-ack, close-context-error>;
     command rename-context(selector: contexts-state.context-selector, name: string)
         -> result<context-ack, rename-context-error>;
+    command set-context-attributes(
+        selector: contexts-state.context-selector,
+        attributes: map<string, string>,
+    ) -> result<context-ack, set-context-attributes-error>;
 }
 
 interface contexts-events {

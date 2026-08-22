@@ -167,6 +167,33 @@ impl ContextState {
         Ok(Self::to_summary(context))
     }
 
+    /// Replace all attributes on a context selected by `selector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static error message when the selector does not resolve.
+    pub fn set_attributes(
+        &mut self,
+        selector: &ContextSelector,
+        attributes: BTreeMap<String, String>,
+    ) -> core::result::Result<ContextSummary, &'static str> {
+        let id = self.resolve_id(selector)?;
+        let Some(context) = self.contexts.get_mut(&id) else {
+            return Err("context not found");
+        };
+        context.attributes = attributes;
+        if let Some(session_id) = context
+            .attributes
+            .get(CONTEXT_SESSION_ID_ATTRIBUTE)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        {
+            self.session_by_context.insert(id, SessionId(session_id));
+        } else {
+            self.session_by_context.remove(&id);
+        }
+        Ok(Self::to_summary(context))
+    }
+
     /// Close a context selected by `selector`, preferring `client_id`
     /// as a destination for replacement selection. Returns the removed
     /// context's id + bound session (if any).

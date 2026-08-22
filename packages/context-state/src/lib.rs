@@ -98,6 +98,16 @@ pub trait ContextStateWriter: ContextStateReader {
         selector: &ContextSelector,
         name: String,
     ) -> Result<ContextSummary, &'static str>;
+    /// Replace all attributes on a context selected by `selector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static error message when the selector doesn't resolve.
+    fn set_attributes(
+        &self,
+        selector: &ContextSelector,
+        attributes: BTreeMap<String, String>,
+    ) -> Result<ContextSummary, &'static str>;
     /// Close a context selected by `selector`. Returns `(removed_id,
     /// removed_session)` when the context existed.
     ///
@@ -206,6 +216,13 @@ impl ContextStateWriter for NoopContextState {
         &self,
         _selector: &ContextSelector,
         _name: String,
+    ) -> Result<ContextSummary, &'static str> {
+        Err("contexts plugin not active")
+    }
+    fn set_attributes(
+        &self,
+        _selector: &ContextSelector,
+        _attributes: BTreeMap<String, String>,
     ) -> Result<ContextSummary, &'static str> {
         Err("contexts plugin not active")
     }

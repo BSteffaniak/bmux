@@ -22,7 +22,7 @@ use bmux_context_state::{
 };
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextsCommandsService, CreateContextError,
-    RenameContextError, SelectContextError,
+    RenameContextError, SelectContextError, SetContextAttributesError,
 };
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 use bmux_contexts_plugin_api::contexts_state::{
@@ -136,6 +136,17 @@ impl ContextStateWriter for ContextStateAdapter {
     ) -> std::result::Result<PrimitiveContextSummary, &'static str> {
         self.with_write(
             |state| state.rename(selector, name),
+            Err("context-state lock poisoned"),
+        )
+    }
+
+    fn set_attributes(
+        &self,
+        selector: &PrimitiveContextSelector,
+        attributes: BTreeMap<String, String>,
+    ) -> std::result::Result<PrimitiveContextSummary, &'static str> {
+        self.with_write(
+            |state| state.set_attributes(selector, attributes),
             Err("context-state lock poisoned"),
         )
     }
@@ -308,6 +319,12 @@ struct CloseContextArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetContextAttributesArgs {
+    selector: WireSelector,
+    attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RenameContextArgs {
     selector: WireSelector,
     name: String,
@@ -426,6 +443,11 @@ impl RustPlugin for ContextsPlugin {
             "contexts-commands", "rename-context" => |req: RenameContextArgs, ctx| {
                 Ok::<Result<ContextAck, RenameContextError>, ServiceResponse>(
                     rename_context_local(ctx, &req.selector, &req.name)
+                )
+            },
+            "contexts-commands", "set-context-attributes" => |req: SetContextAttributesArgs, _ctx| {
+                Ok::<Result<ContextAck, SetContextAttributesError>, ServiceResponse>(
+                    set_context_attributes_local(&req.selector, req.attributes)
                 )
             },
         })
@@ -568,8 +590,11 @@ fn create_context_local(
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     name: Option<String>,
-    attributes: BTreeMap<String, String>,
+    mut attributes: BTreeMap<String, String>,
 ) -> Result<ContextAck, CreateContextError> {
+    attributes
+        .entry("workspace".to_string())
+        .or_insert_with(|| "default".to_string());
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| CreateContextError::Failed { reason })?;
     // Pair this entry log with the `ContextState::create` debug log
@@ -908,6 +933,32 @@ fn validate_context_rename_name(name: &str) -> Result<String, RenameContextError
         });
     }
     Ok(trimmed.to_string())
+}
+
+fn set_context_attributes_local(
+    selector: &WireSelector,
+    attributes: BTreeMap<String, String>,
+) -> Result<ContextAck, SetContextAttributesError> {
+    let Some(context_selector) = selector.to_primitive() else {
+        return Err(SetContextAttributesError::Denied {
+            reason: "selector must specify either id or name".to_string(),
+        });
+    };
+    let state = local_state().map_err(|reason| SetContextAttributesError::Failed { reason })?;
+    let mut guard = state
+        .write()
+        .map_err(|_| SetContextAttributesError::Failed {
+            reason: "context state lock poisoned".to_string(),
+        })?;
+    let context = guard
+        .set_attributes(&context_selector, attributes)
+        .map_err(|_| SetContextAttributesError::NotFound)?;
+    let session_id = guard.session_by_context.get(&context.id).copied();
+    drop(guard);
+    Ok(ContextAck {
+        id: context.id,
+        session_id: session_id.map(|id| id.0),
+    })
 }
 
 #[instrument(
@@ -1281,6 +1332,26 @@ impl ContextsCommandsService for ContextsCommandsHandle {
             rename_context_local(self.caller.as_ref(), &wire, &name)
         })
     }
+
+    fn set_context_attributes<'a>(
+        &'a self,
+        selector: StateContextSelector,
+        attributes: BTreeMap<String, String>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = std::result::Result<ContextAck, SetContextAttributesError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let wire = WireSelector {
+                id: selector.id,
+                name: selector.name,
+            };
+            set_context_attributes_local(&wire, attributes)
+        })
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1339,6 +1410,56 @@ mod tests {
             context_state.current_session_for_client(client_id),
             Some(second_session_id)
         );
+    }
+
+    #[test]
+    fn set_attributes_replaces_attributes_and_preserves_snapshot_round_trip() {
+        let client_id = ClientId::new();
+        let mut context_state = ContextState::default();
+        let context = context_state.create(
+            client_id,
+            Some("tab".to_string()),
+            BTreeMap::from([("old".to_string(), "value".to_string())]),
+        );
+        let session_id = SessionId::new();
+        context_state
+            .bind_session(context.id, session_id)
+            .expect("context should bind");
+        let attributes = BTreeMap::from([
+            (
+                bmux_context_state::CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+                session_id.0.to_string(),
+            ),
+            ("workspace".to_string(), "workspace-id".to_string()),
+        ]);
+
+        let updated = context_state
+            .set_attributes(
+                &PrimitiveContextSelector::ById(context.id),
+                attributes.clone(),
+            )
+            .expect("attributes should update");
+        assert_eq!(updated.attributes, attributes);
+
+        let inner = Arc::new(RwLock::new(context_state));
+        let adapter = ContextStateAdapter {
+            inner: Arc::clone(&inner),
+        };
+        let snapshot = adapter.snapshot();
+        let restored_inner = Arc::new(RwLock::new(ContextState::default()));
+        let restored_adapter = ContextStateAdapter {
+            inner: Arc::clone(&restored_inner),
+        };
+        restored_adapter.restore_snapshot(snapshot);
+        let restored = restored_inner.read().expect("restored state should lock");
+        let restored_context = restored
+            .list()
+            .into_iter()
+            .find(|candidate| candidate.id == context.id)
+            .expect("context should survive snapshot round trip");
+        assert_eq!(restored_context.attributes, attributes);
+        assert_eq!(restored.context_for_session(session_id), Some(context.id));
+        drop(restored);
     }
 
     #[test]
@@ -1592,6 +1713,17 @@ mod tests {
             BTreeMap::new(),
         )
         .expect("create-context should succeed");
+        let created = state_handle
+            .read()
+            .expect("context state should lock")
+            .contexts
+            .get(&ack.id)
+            .cloned()
+            .expect("created context should exist");
+        assert_eq!(
+            created.attributes.get("workspace").map(String::as_str),
+            Some("default")
+        );
 
         let emitted = drain_events_after_short_wait(&events_rx);
         assert!(
