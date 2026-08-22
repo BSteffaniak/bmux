@@ -95,6 +95,17 @@ pub trait StatefulPlugin: Send + Sync {
     /// to the plugin that declared it.
     fn id(&self) -> PluginEventKind;
 
+    /// Snapshot participant IDs that must restore successfully before this
+    /// participant is invoked.
+    ///
+    /// The snapshot orchestrator uses these generic identifier edges to build
+    /// a deterministic restore order. Implementations must not rely on plugin
+    /// activation, registration, or envelope section order.
+    #[must_use]
+    fn restore_dependencies(&self) -> Vec<PluginEventKind> {
+        Vec::new()
+    }
+
     /// Produce a snapshot of the plugin's current state.
     ///
     /// # Errors

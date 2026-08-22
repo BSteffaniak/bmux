@@ -247,6 +247,12 @@ impl StatefulPlugin for ContextsStatefulPlugin {
         CONTEXTS_STATEFUL_ID
     }
 
+    fn restore_dependencies(&self) -> Vec<PluginEventKind> {
+        vec![PluginEventKind::from_static(
+            "bmux.sessions/session-manager",
+        )]
+    }
+
     fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
         let snap = self.writer.snapshot();
         let bytes =

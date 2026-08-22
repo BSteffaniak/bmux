@@ -297,7 +297,7 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
 /// sessions-plugin participant's responsibility, restored earlier in
 /// the envelope iteration), reconstruct the pane runtime via
 /// `SessionRuntimeManager::restore_runtime`.
-fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
+fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
     let session_manager = session_handle();
     let runtime_manager = session_runtime_handle();
     let padding_handle = bmux_plugin::global_plugin_state_registry()
@@ -306,11 +306,10 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
 
     for entry in &payload.sessions {
         if entry.panes.is_empty() {
-            warn!(
-                "skipping pane-runtime entry for session {}: no panes to restore",
+            anyhow::bail!(
+                "pane-runtime snapshot for session {} contains no panes",
                 entry.session_id
             );
-            continue;
         }
         let session_id = SessionId(entry.session_id);
         if let Some(handle) = &padding_handle {
@@ -328,11 +327,10 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
         // in the session manager. If it doesn't, skip — there's no
         // owning session to attach the runtime to.
         if !session_manager.0.contains(session_id) {
-            warn!(
-                "skipping pane-runtime entry for session {}: session not in manager",
+            anyhow::bail!(
+                "pane-runtime restore dependency missing owning session {}",
                 entry.session_id
             );
-            continue;
         }
 
         let runtime_panes = entry
@@ -386,31 +384,38 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
             })
             .collect::<Vec<_>>();
 
-        if let Err(error) = runtime_manager.0.restore_runtime(
-            session_id,
-            &runtime_panes,
-            RestoreRuntimeRequest {
-                layout_root: entry.layout_root.as_ref().map(layout_from_snapshot),
-                focused_pane_id,
-                zoomed_pane_id: entry.zoomed_pane_id,
-                floating_surfaces,
-                attach_viewport: entry.attach_viewport.map(AttachViewport::normalize),
-            },
-        ) {
-            warn!(
-                "failed restoring pane runtime for session {}: {error}",
-                entry.session_id
-            );
-            // Remove the orphaned session entry so future snapshots
-            // don't trip over an incomplete restore.
-            let _ = session_manager.0.remove_session(session_id);
-        }
+        runtime_manager
+            .0
+            .restore_runtime(
+                session_id,
+                &runtime_panes,
+                RestoreRuntimeRequest {
+                    layout_root: entry.layout_root.as_ref().map(layout_from_snapshot),
+                    focused_pane_id,
+                    zoomed_pane_id: entry.zoomed_pane_id,
+                    floating_surfaces,
+                    attach_viewport: entry.attach_viewport.map(AttachViewport::normalize),
+                },
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed restoring pane runtime for session {}: {error}",
+                    entry.session_id
+                )
+            })?;
     }
+    Ok(())
 }
 
 impl StatefulPlugin for PaneRuntimeStateful {
     fn id(&self) -> PluginEventKind {
         PANE_RUNTIME_PLUGIN_SNAPSHOT_ID
+    }
+
+    fn restore_dependencies(&self) -> Vec<PluginEventKind> {
+        vec![PluginEventKind::from_static(
+            "bmux.sessions/session-manager",
+        )]
     }
 
     fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
@@ -446,7 +451,12 @@ impl StatefulPlugin for PaneRuntimeStateful {
                     details: err.to_string(),
                 }
             })?;
-        apply_pane_runtime_payload(&decoded);
+        apply_pane_runtime_payload(&decoded).map_err(|error| {
+            StatefulPluginError::RestoreFailed {
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+                details: format!("{error:#}"),
+            }
+        })?;
         Ok(())
     }
 }

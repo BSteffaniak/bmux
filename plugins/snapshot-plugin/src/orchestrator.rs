@@ -5,6 +5,7 @@
 //! an atomic rename-on-write pattern, and maintains a status record
 //! the `status()` method returns.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -131,39 +132,132 @@ impl BmuxSnapshotOrchestrator {
         let registry = self.stateful_registry.read().map_err(|_| {
             SnapshotOrchestratorError::Other("stateful plugin registry lock poisoned".into())
         })?;
+        let section_count = envelope.sections.len();
+        let mut sections = envelope
+            .sections
+            .into_iter()
+            .map(|section| (section.id.clone(), section))
+            .collect::<BTreeMap<_, _>>();
+        let available_section_ids = sections.keys().cloned().collect::<BTreeSet<_>>();
+        let registered = registry
+            .as_slice()
+            .iter()
+            .map(|handle| (handle.as_dyn().id().as_str().to_string(), handle))
+            .collect::<BTreeMap<_, _>>();
+        if sections.len() != section_count {
+            return Err(SnapshotOrchestratorError::Other(
+                "snapshot envelope contains duplicate section IDs".into(),
+            ));
+        }
+        if registered.len() != registry.len() {
+            return Err(SnapshotOrchestratorError::Other(
+                "stateful plugin registry contains duplicate participant IDs".into(),
+            ));
+        }
+        let restore_order = restore_order(&registered)?;
+        let mut restored_ids = BTreeSet::new();
+        let mut failed_ids = BTreeSet::new();
         let mut restored = 0usize;
         let mut failed = 0usize;
-        for section in envelope.sections {
-            let Some(participant) = registry
-                .as_slice()
-                .iter()
-                .find(|h| h.as_dyn().id().as_str() == section.id)
-            else {
-                warn!(
-                    "snapshot envelope has section '{id}' with no matching participant — skipped",
-                    id = section.id
-                );
+        for id in restore_order {
+            let participant = registered[&id];
+            let dependencies = participant
+                .as_dyn()
+                .restore_dependencies()
+                .into_iter()
+                .map(|dependency| dependency.as_str().to_string())
+                .collect::<Vec<_>>();
+            let unavailable = dependencies.iter().find(|dependency| {
+                !registered.contains_key(*dependency)
+                    || !available_section_ids.contains(*dependency)
+                    || failed_ids.contains(*dependency)
+                    || !restored_ids.contains(*dependency)
+            });
+            if let Some(dependency) = unavailable {
+                failed += 1;
+                failed_ids.insert(id.clone());
+                warn!(participant = %id, %dependency, "snapshot participant dependency unavailable; restore skipped");
+                continue;
+            }
+            let Some(section) = sections.remove(&id) else {
                 continue;
             };
-            let id = participant.as_dyn().id();
-            let payload = StatefulPluginSnapshot::new(id, section.version, section.bytes);
+            let payload = StatefulPluginSnapshot::new(
+                participant.as_dyn().id(),
+                section.version,
+                section.bytes,
+            );
             match participant.as_dyn().restore_snapshot(payload) {
-                Ok(()) => restored += 1,
+                Ok(()) => {
+                    restored += 1;
+                    restored_ids.insert(id);
+                }
                 Err(err) => {
                     failed += 1;
+                    failed_ids.insert(id.clone());
                     warn!(
                         "stateful plugin restore failed for '{}': {}",
-                        section.id,
+                        id,
                         StatefulErrorDisplay(&err)
                     );
                 }
             }
+        }
+        for id in sections.keys() {
+            warn!("snapshot envelope has section '{id}' with no matching participant — skipped");
         }
         Ok(RestoreSummary {
             restored_plugins: restored,
             failed_plugins: failed,
         })
     }
+}
+
+fn restore_order(
+    registered: &BTreeMap<String, &bmux_plugin_sdk::StatefulPluginHandle>,
+) -> SnapshotOrchestratorResult<Vec<String>> {
+    fn visit(
+        id: &str,
+        registered: &BTreeMap<String, &bmux_plugin_sdk::StatefulPluginHandle>,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+        ordered: &mut Vec<String>,
+    ) -> SnapshotOrchestratorResult<()> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if !visiting.insert(id.to_string()) {
+            return Err(SnapshotOrchestratorError::Other(format!(
+                "stateful restore dependency cycle includes '{id}'"
+            )));
+        }
+        if let Some(participant) = registered.get(id) {
+            let mut dependencies = participant
+                .as_dyn()
+                .restore_dependencies()
+                .into_iter()
+                .map(|dependency| dependency.as_str().to_string())
+                .collect::<Vec<_>>();
+            dependencies.sort();
+            for dependency in dependencies {
+                if registered.contains_key(&dependency) {
+                    visit(&dependency, registered, visiting, visited, ordered)?;
+                }
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id.to_string());
+        ordered.push(id.to_string());
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(registered.len());
+    for id in registered.keys() {
+        visit(id, registered, &mut visiting, &mut visited, &mut ordered)?;
+    }
+    Ok(ordered)
 }
 
 impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
@@ -342,7 +436,123 @@ mod tests {
         StatefulPluginSnapshot,
     };
     use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotOrchestrator, StatefulPluginRegistry};
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex, RwLock};
+
+    struct OrderedParticipant {
+        id: PluginEventKind,
+        dependencies: Vec<PluginEventKind>,
+        restored: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StatefulPlugin for OrderedParticipant {
+        fn id(&self) -> PluginEventKind {
+            self.id.clone()
+        }
+
+        fn restore_dependencies(&self) -> Vec<PluginEventKind> {
+            self.dependencies.clone()
+        }
+
+        fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+            Ok(StatefulPluginSnapshot::new(self.id.clone(), 1, Vec::new()))
+        }
+
+        fn restore_snapshot(&self, _snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+            self.restored.lock().unwrap().push(self.id.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shuffled_envelope_restores_dependencies_first() {
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let session_id = PluginEventKind::from_static("test/session-state");
+        let pane_id = PluginEventKind::from_static("test/pane-state");
+        let mut registry = StatefulPluginRegistry::new();
+        registry.push(StatefulPluginHandle::new(OrderedParticipant {
+            id: pane_id.clone(),
+            dependencies: vec![session_id.clone()],
+            restored: Arc::clone(&restored),
+        }));
+        registry.push(StatefulPluginHandle::new(OrderedParticipant {
+            id: session_id.clone(),
+            dependencies: Vec::new(),
+            restored: Arc::clone(&restored),
+        }));
+        let orchestrator = BmuxSnapshotOrchestrator::new(
+            None,
+            Arc::new(SnapshotDirtyFlag::new()),
+            Arc::new(RwLock::new(registry)),
+        );
+        let envelope = bmux_snapshot_plugin_api::envelope::CombinedSnapshotEnvelope::build(vec![
+            bmux_snapshot_plugin_api::envelope::SectionV1 {
+                id: pane_id.to_string(),
+                version: 1,
+                bytes: Vec::new(),
+            },
+            bmux_snapshot_plugin_api::envelope::SectionV1 {
+                id: session_id.to_string(),
+                version: 1,
+                bytes: Vec::new(),
+            },
+        ])
+        .unwrap();
+        let summary = orchestrator.apply_envelope(envelope).unwrap();
+        assert_eq!(summary.restored_plugins, 2);
+        assert_eq!(summary.failed_plugins, 0);
+        assert_eq!(
+            *restored.lock().unwrap(),
+            vec![session_id.to_string(), pane_id.to_string()]
+        );
+    }
+
+    #[test]
+    fn restore_order_honors_dependencies_over_registration_order() {
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let session_id = PluginEventKind::from_static("test/sessions");
+        let pane_id = PluginEventKind::from_static("test/panes");
+        let session = StatefulPluginHandle::new(OrderedParticipant {
+            id: session_id.clone(),
+            dependencies: Vec::new(),
+            restored: Arc::clone(&restored),
+        });
+        let pane = StatefulPluginHandle::new(OrderedParticipant {
+            id: pane_id.clone(),
+            dependencies: vec![session_id],
+            restored,
+        });
+        let registered = BTreeMap::from([
+            (pane_id.to_string(), &pane),
+            (session.as_dyn().id().to_string(), &session),
+        ]);
+        assert_eq!(
+            super::restore_order(&registered).unwrap(),
+            vec![session.as_dyn().id().to_string(), pane_id.to_string()]
+        );
+    }
+
+    #[test]
+    fn restore_order_rejects_dependency_cycles() {
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let first_id = PluginEventKind::from_static("test/first");
+        let second_id = PluginEventKind::from_static("test/second");
+        let first = StatefulPluginHandle::new(OrderedParticipant {
+            id: first_id.clone(),
+            dependencies: vec![second_id.clone()],
+            restored: Arc::clone(&restored),
+        });
+        let second = StatefulPluginHandle::new(OrderedParticipant {
+            id: second_id.clone(),
+            dependencies: vec![first_id.clone()],
+            restored,
+        });
+        let registered = BTreeMap::from([
+            (first_id.to_string(), &first),
+            (second_id.to_string(), &second),
+        ]);
+        assert!(super::restore_order(&registered).is_err());
+    }
 
     const TEST_ID: PluginEventKind = PluginEventKind::from_static("bmux.test/snap");
 
