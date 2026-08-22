@@ -7134,7 +7134,6 @@ pub fn build_attach_status_line_for_draw(
         context_id,
         session_id,
     );
-    let tab_position_label: Option<String> = None;
     let zoomed = view_state
         .cached_layout_state
         .as_ref()
@@ -7200,8 +7199,6 @@ pub fn build_attach_status_line_for_draw(
         &session_label,
         session_count,
         &current_context_label,
-        &crate::status::AttachTabStripInput::new(&[]),
-        tab_position_label.as_deref(),
         mode_label,
         role_label,
         follow_label.as_deref(),
@@ -14380,6 +14377,7 @@ pub fn resolve_attach_tab_drop_target(
     })
 }
 
+#[cfg(test)]
 pub(super) fn attach_tab_drop_marker_col(
     status_line: &AttachStatusLine,
     target: AttachTabDropTarget,

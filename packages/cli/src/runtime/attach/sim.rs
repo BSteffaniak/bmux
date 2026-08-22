@@ -5,11 +5,11 @@ use super::prompt_ui::AttachInternalPromptAction;
 use super::prompt_ui::PromptKeyDisposition;
 use super::runtime::{
     AttachPointerContinuation, attach_key_event_actions, attach_mouse_forward_bytes_for_target,
-    attach_tab_drop_marker_col, build_attach_help_lines, continue_attach_builtin_pointer_owner,
-    encode_bracketed_paste, focused_attach_pane_input_mode, handle_attach_ui_action_at,
-    handle_help_overlay_key_event, maybe_begin_attach_mouse_selection_drag,
-    reduce_attach_mouse_floating_drag_event, reduce_attach_mouse_resize_event,
-    reduce_attach_status_tab_mouse_event, status_row_for_position,
+    build_attach_help_lines, continue_attach_builtin_pointer_owner, encode_bracketed_paste,
+    focused_attach_pane_input_mode, handle_attach_ui_action_at, handle_help_overlay_key_event,
+    maybe_begin_attach_mouse_selection_drag, reduce_attach_mouse_floating_drag_event,
+    reduce_attach_mouse_resize_event, reduce_attach_status_tab_mouse_event,
+    status_row_for_position,
 };
 use super::state::{
     AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer,
@@ -17,7 +17,7 @@ use super::state::{
 use crate::input::{InputProcessor, RuntimeAction};
 #[cfg(test)]
 use crate::runtime::prompt::PromptRequest;
-use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
+use crate::status::{AttachStatusLine, build_attach_status_line};
 use anyhow::{Result, bail};
 use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{
@@ -160,14 +160,6 @@ impl AttachSimHarness {
     }
 
     /// Column of the inline editor cursor in the last rendered status line.
-    #[cfg(test)]
-    pub fn tab_rename_cursor_col(&self) -> Option<u16> {
-        self.view_state
-            .cached_status_line
-            .as_ref()
-            .and_then(|line| line.edit_cursor_col)
-    }
-
     /// Feed a chord (or literal text) into the inline tab rename editor.
     ///
     /// Returns the number of key events applied.
@@ -283,33 +275,7 @@ impl AttachSimHarness {
         }
     }
 
-    #[cfg(test)]
-    pub fn send_rename_paste(&mut self, text: &str) {
-        if let Some(reduction) =
-            super::runtime::handle_attach_tab_rename_paste(&mut self.view_state, text)
-        {
-            for effect in reduction.effects {
-                self.apply_effect(effect);
-            }
-            self.render();
-        }
-    }
-
-    #[cfg(test)]
-    pub fn set_mru_tab_order(&mut self) {
-        self.set_tab_order(StatusTabOrder::Mru);
-    }
-
     pub fn render(&mut self) -> &AttachStatusLine {
-        let tabs = self
-            .windows
-            .iter()
-            .map(|window| AttachTab {
-                label: window.name.clone(),
-                active: window.active,
-                context_id: Some(window.id),
-            })
-            .collect::<Vec<_>>();
         let mode_label = if self.view_state.help_overlay_open {
             "HELP"
         } else if self.view_state.prompt.is_active() {
@@ -322,25 +288,13 @@ impl AttachSimHarness {
         } else {
             self.view_state.prompt.active_hint().unwrap_or("")
         };
-        let mut status_line = build_attach_status_line(
+        let status_line = build_attach_status_line(
             self.geometry.cols,
             &self.status_config,
             &self.appearance,
             "sim",
             1,
             "sim",
-            &crate::status::AttachTabStripInput::new(&tabs)
-                .hovered(self.view_state.mouse.hovered_tab_context_id)
-                .editing(self.view_state.tab_rename.as_ref().map(|rename| {
-                    let selection = rename.buffer.selection();
-                    crate::status::AttachTabEdit {
-                        context_id: rename.context_id,
-                        text: rename.text(),
-                        cursor: rename.buffer.cursor_byte_index(),
-                        selection: selection.map(|range| (range.start, range.end)),
-                    }
-                })),
-            None,
             mode_label,
             "write",
             None,
@@ -349,16 +303,6 @@ impl AttachSimHarness {
                 .and_then(|view| view.pin.map(|_| "FROZEN")),
             hint,
         );
-        status_line.drag_marker_col = self
-            .view_state
-            .mouse
-            .tab_drag
-            // Mirror production: the marker appears only for an active drag.
-            .filter(|drag| drag.active)
-            .and_then(|drag| drag.drop_target)
-            .and_then(|target| {
-                attach_tab_drop_marker_col(&status_line, target, self.geometry.cols)
-            });
         self.view_state.cached_status_line = Some(status_line);
         self.view_state
             .cached_status_line
@@ -1294,11 +1238,8 @@ mod tests {
     use crate::runtime::attach::input::{
         TerminalModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMousePhase,
     };
-    use crate::runtime::attach::state::{
-        AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect,
-    };
+    use crate::runtime::attach::state::{AttachPointerOwner, AttachUiEffect};
     use bmux_attach_layout_protocol::AttachFocusTarget;
-    use bmux_config::StatusPosition;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
@@ -1434,77 +1375,6 @@ mod tests {
         assert!(sim.effects().is_empty());
     }
 
-    #[test]
-    fn attach_sim_reorders_tabs_through_shared_reducer() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-        assert!(sim.rendered().contains("one"));
-
-        let one = sim.locate_text("1:one").expect("one tab");
-        let three = sim.locate_text("3:three").expect("three tab");
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            one.center_col,
-            one.row,
-        ));
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Move,
-            three.end_col,
-            three.row,
-        ));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, three.end_col, three.row));
-
-        assert_eq!(
-            sim.effects(),
-            &[AttachUiEffect::MoveWindow {
-                source_context_id: Uuid::from_u128(1),
-                target_context_id: Uuid::from_u128(3),
-                placement: AttachTabDropPlacement::After,
-            }]
-        );
-        assert_eq!(sim.window_names(), ["two", "three", "one"]);
-        // Indexes renumber after a reorder; assert that against an explicitly
-        // indexed template so the check survives tab-template default changes.
-        sim.set_tab_template("{index}:{name}");
-        assert!(sim.rendered().contains("1:two"));
-        assert!(sim.rendered().contains("3:one"));
-    }
-
-    #[test]
-    fn attach_sim_status_position_changes_located_mouse_row() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-        let bottom = sim.locate_text("1:one").expect("bottom tab");
-        assert_eq!(bottom.row, 23);
-
-        sim.set_status_position(StatusPosition::Top);
-        let top = sim.locate_text("1:one").expect("top tab");
-        assert_eq!(top.row, 0);
-    }
-
-    fn key(code: super::super::input::TerminalKeyCode) -> super::super::input::TerminalKeyEvent {
-        super::super::input::TerminalKeyEvent {
-            code,
-            modifiers: TerminalModifiers::default(),
-            kind: super::super::input::TerminalKeyPhase::Press,
-        }
-    }
-
-    fn double_click_tab(sim: &mut AttachSimHarness, name: &str) {
-        let tab = sim.locate_text(name).expect("tab should be located");
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            tab.center_col,
-            tab.row,
-        ));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, tab.center_col, tab.row));
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            tab.center_col,
-            tab.row,
-        ));
-    }
-
     fn right_mouse(phase: TerminalMousePhase, col: u16, row: u16) -> TerminalMouseEvent {
         TerminalMouseEvent {
             phase,
@@ -1512,223 +1382,6 @@ mod tests {
             col,
             row,
             modifiers: TerminalModifiers::default(),
-        }
-    }
-
-    fn open_tab_menu(sim: &mut AttachSimHarness, name: &str) -> super::AttachSimLocatedText {
-        let tab = sim.locate_text(name).expect("tab should be located");
-        sim.send_mouse(right_mouse(
-            TerminalMousePhase::Down,
-            tab.center_col,
-            tab.row,
-        ));
-        tab
-    }
-
-    #[test]
-    fn attach_sim_right_click_opens_tab_menu_without_switching() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        open_tab_menu(&mut sim, "two");
-
-        assert!(sim.tab_menu_active(), "right-click should open the menu");
-        assert_eq!(
-            sim.active_window_name(),
-            Some("one"),
-            "opening the menu must not switch windows"
-        );
-        assert_eq!(
-            sim.render().drag_marker_col,
-            None,
-            "no drag should be armed"
-        );
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_disables_position_moves_at_the_edges() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        open_tab_menu(&mut sim, "one");
-        let items = sim.tab_menu_items();
-        assert!(
-            items.contains(&"move-left:disabled".to_string()),
-            "first tab cannot move left: {items:?}"
-        );
-        assert!(
-            items.contains(&"move-to-first:disabled".to_string()),
-            "{items:?}"
-        );
-        assert!(items.contains(&"move-right".to_string()), "{items:?}");
-
-        sim.send_menu_chord("Esc");
-        open_tab_menu(&mut sim, "three");
-        let items = sim.tab_menu_items();
-        assert!(
-            items.contains(&"move-right:disabled".to_string()),
-            "last tab cannot move right: {items:?}"
-        );
-        assert!(items.contains(&"move-left".to_string()), "{items:?}");
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_focus_skips_disabled_items_and_wraps() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        open_tab_menu(&mut sim, "one");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("rename"));
-
-        sim.send_menu_chord("Down");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("close"));
-        // move-left / move-to-first are disabled on the first tab.
-        sim.send_menu_chord("Down");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("move-right"));
-
-        // Wrapping upward returns to the first enabled entry.
-        sim.send_menu_chord("Up");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("close"));
-
-        sim.send_menu_chord("End");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("new-window"));
-        sim.send_menu_chord("Home");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("rename"));
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_escape_dismisses() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        open_tab_menu(&mut sim, "two");
-        assert!(sim.tab_menu_active());
-        sim.send_menu_chord("Esc");
-        assert!(!sim.tab_menu_active());
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_rename_opens_inline_editor_for_clicked_tab() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        open_tab_menu(&mut sim, "three");
-        sim.send_menu_chord("Enter");
-
-        assert!(!sim.tab_menu_active());
-        assert!(sim.tab_rename_active(), "rename should open the editor");
-        assert_eq!(
-            sim.tab_rename_text(),
-            Some("three"),
-            "editor should target the right-clicked tab"
-        );
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_close_targets_the_clicked_tab() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        open_tab_menu(&mut sim, "three");
-        sim.send_menu_chord("Down");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("close"));
-        sim.send_menu_chord("Enter");
-
-        let closed = sim
-            .effects()
-            .iter()
-            .find_map(|effect| match effect {
-                AttachUiEffect::CloseWindow { context_id } => Some(*context_id),
-                _ => None,
-            })
-            .expect("close should emit a CloseWindow effect");
-        assert_eq!(
-            closed,
-            Uuid::from_u128(3),
-            "close must target the clicked tab, not the active one"
-        );
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_move_right_emits_move_after_neighbor() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        open_tab_menu(&mut sim, "one");
-        // rename -> close -> move-right (move-left disabled on first tab)
-        sim.send_menu_chord("Down");
-        sim.send_menu_chord("Down");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("move-right"));
-        sim.send_menu_chord("Enter");
-
-        assert_eq!(sim.window_names(), ["two", "one", "three"]);
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_move_to_last_moves_to_the_end() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        open_tab_menu(&mut sim, "one");
-        sim.send_menu_chord("End");
-        sim.send_menu_chord("Up");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("move-to-last"));
-        sim.send_menu_chord("Enter");
-
-        assert_eq!(sim.window_names(), ["two", "three", "one"]);
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_new_window_appends_and_activates() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        open_tab_menu(&mut sim, "one");
-        sim.send_menu_chord("End");
-        assert_eq!(sim.tab_menu_focused().as_deref(), Some("new-window"));
-        sim.send_menu_chord("Enter");
-
-        assert_eq!(sim.window_names().len(), 3);
-        assert_eq!(sim.active_window_name(), Some("tab-3"));
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_click_outside_dismisses() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        let tab = open_tab_menu(&mut sim, "two");
-        assert!(sim.tab_menu_active());
-        // Click far from the menu overlay.
-        sim.send_mouse(left_mouse(TerminalMousePhase::Down, tab.center_col, 2));
-        assert!(!sim.tab_menu_active());
-    }
-
-    #[test]
-    fn attach_sim_tab_menu_ignores_disabled_item_activation() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one"], "one");
-
-        open_tab_menu(&mut sim, "one");
-        // Only rename, close, and new-window are enabled for a lone tab.
-        let items = sim.tab_menu_items();
-        assert!(
-            items.contains(&"move-left:disabled".to_string()),
-            "{items:?}"
-        );
-        assert!(
-            items.contains(&"move-right:disabled".to_string()),
-            "{items:?}"
-        );
-
-        // Focus can never land on a disabled entry, so Enter cannot activate it.
-        for _ in 0..items.len() {
-            sim.send_menu_chord("Down");
-            let focused = sim.tab_menu_focused();
-            assert!(
-                matches!(focused.as_deref(), Some("rename" | "close" | "new-window")),
-                "focus landed on a disabled entry: {focused:?}"
-            );
         }
     }
 
@@ -1740,260 +1393,6 @@ mod tests {
         // Right-click in pane content: bmux must not open a tab menu there.
         sim.send_mouse(right_mouse(TerminalMousePhase::Down, 10, 5));
         assert!(!sim.tab_menu_active());
-    }
-
-    #[test]
-    fn attach_sim_double_click_opens_inline_rename_with_name_selected() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        double_click_tab(&mut sim, "two");
-
-        assert!(
-            sim.tab_rename_active(),
-            "double-click should open the editor"
-        );
-        assert_eq!(sim.tab_rename_text(), Some("two"));
-        // Whole name selected: typing replaces it outright.
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('x')));
-        assert_eq!(sim.tab_rename_text(), Some("x"));
-    }
-
-    #[test]
-    fn attach_sim_single_click_does_not_open_rename() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-        let tab = sim.locate_text("two").expect("tab");
-
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            tab.center_col,
-            tab.row,
-        ));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, tab.center_col, tab.row));
-
-        assert!(!sim.tab_rename_active());
-    }
-
-    #[test]
-    fn attach_sim_slow_second_click_does_not_open_rename() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-        let tab = sim.locate_text("two").expect("tab");
-
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            tab.center_col,
-            tab.row,
-        ));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, tab.center_col, tab.row));
-        // Past the double-click window.
-        sim.advance_clock(std::time::Duration::from_secs(1));
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            tab.center_col,
-            tab.row,
-        ));
-
-        assert!(!sim.tab_rename_active());
-    }
-
-    #[test]
-    fn attach_sim_rename_commit_renames_window_and_restores_template() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-        sim.set_tab_template("[{name}]");
-
-        double_click_tab(&mut sim, "two");
-        // Raw editor text replaces the template while editing.
-        assert!(sim.rendered().contains("two"), "{:?}", sim.rendered());
-
-        for ch in "dev".chars() {
-            sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char(ch)));
-        }
-        assert_eq!(sim.tab_rename_text(), Some("dev"));
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Enter));
-
-        assert!(!sim.tab_rename_active());
-        assert_eq!(sim.window_names(), ["one", "dev", "three"]);
-        // Template chrome is restored after commit.
-        assert!(sim.rendered().contains("[dev]"), "{:?}", sim.rendered());
-    }
-
-    #[test]
-    fn attach_sim_rename_escape_restores_original_name() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        double_click_tab(&mut sim, "two");
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('z')));
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Esc));
-
-        assert!(!sim.tab_rename_active());
-        assert_eq!(sim.window_names(), ["one", "two"]);
-        assert!(
-            !sim.effects()
-                .iter()
-                .any(|effect| matches!(effect, AttachUiEffect::RenameWindow { .. })),
-            "escape must not emit a rename"
-        );
-    }
-
-    #[test]
-    fn attach_sim_rename_arrow_key_appends_instead_of_replacing() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        double_click_tab(&mut sim, "two");
-        // Right arrow collapses the selection to the end, so typing appends.
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Right));
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('!')));
-
-        assert_eq!(sim.tab_rename_text(), Some("two!"));
-    }
-
-    #[test]
-    fn attach_sim_rename_backspace_and_home_behave_like_a_text_input() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "alpha"], "one");
-
-        double_click_tab(&mut sim, "alpha");
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::End));
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Backspace));
-        assert_eq!(sim.tab_rename_text(), Some("alph"));
-
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Home));
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char('_')));
-        assert_eq!(sim.tab_rename_text(), Some("_alph"));
-    }
-
-    #[test]
-    fn attach_sim_rename_blank_name_is_not_committed() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        double_click_tab(&mut sim, "two");
-        // Selection covers the whole name, so a space replaces it entirely.
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Char(' ')));
-        sim.send_rename_key(&key(super::super::input::TerminalKeyCode::Enter));
-
-        assert!(!sim.tab_rename_active());
-        assert_eq!(
-            sim.window_names(),
-            ["one", "two"],
-            "blank names must be rejected"
-        );
-    }
-
-    #[test]
-    fn attach_sim_rename_paste_collapses_newlines() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        double_click_tab(&mut sim, "two");
-        sim.send_rename_paste("multi\nline");
-
-        assert_eq!(sim.tab_rename_text(), Some("multi line"));
-    }
-
-    #[test]
-    fn attach_sim_rename_cursor_column_is_reported_for_rendering() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        double_click_tab(&mut sim, "two");
-        let cursor = sim
-            .tab_rename_cursor_col()
-            .expect("editor should expose a cursor column");
-        let tab = sim.locate_text("two").expect("tab");
-        assert!(
-            cursor >= tab.start_col && cursor <= tab.end_col.saturating_add(1),
-            "cursor {cursor} should sit within the edited tab {}..={}",
-            tab.start_col,
-            tab.end_col
-        );
-    }
-
-    #[test]
-    fn attach_sim_double_click_does_not_start_a_tab_drag() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-
-        double_click_tab(&mut sim, "two");
-        assert_eq!(sim.render().drag_marker_col, None);
-
-        // Moving after the double-click edits text, it must not reorder tabs.
-        let three = sim.locate_text("three").expect("three tab");
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Move,
-            three.end_col,
-            three.row,
-        ));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, three.end_col, three.row));
-        assert_eq!(sim.window_names(), ["one", "two", "three"]);
-    }
-
-    #[test]
-    fn attach_sim_drag_marker_only_appears_once_drag_is_active() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-        let one = sim.locate_text("1:one").expect("one tab");
-        let three = sim.locate_text("3:three").expect("three tab");
-
-        // Plain mouse-down must not paint a drop marker.
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            one.center_col,
-            one.row,
-        ));
-        assert_eq!(
-            sim.render().drag_marker_col,
-            None,
-            "mouse-down alone should not show a drag marker"
-        );
-
-        // Motion past the threshold starts the drag and shows the marker.
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Move,
-            three.end_col,
-            three.row,
-        ));
-        assert!(
-            sim.render().drag_marker_col.is_some(),
-            "active drag should show a drop marker"
-        );
-
-        // Releasing clears it again.
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, three.end_col, three.row));
-        assert_eq!(sim.render().drag_marker_col, None);
-    }
-
-    #[test]
-    fn attach_sim_mru_order_does_not_move() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two", "three"], "one");
-        sim.set_mru_tab_order();
-
-        let one = sim.locate_text("1:one").expect("one tab");
-        let three = sim.locate_text("3:three").expect("three tab");
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            one.center_col,
-            one.row,
-        ));
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Move,
-            three.end_col,
-            three.row,
-        ));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, three.end_col, three.row));
-
-        assert_eq!(sim.window_names(), ["one", "two", "three"]);
-        assert!(
-            !sim.effects()
-                .iter()
-                .any(|effect| matches!(effect, AttachUiEffect::MoveWindow { .. }))
-        );
     }
 
     #[test]
@@ -2013,28 +1412,6 @@ mod tests {
         // Selection runs from the anchor at row 3 col 2 up to row 2 col 2, so it
         // covers `     five` from col 2 and `  six` through col 2.
         assert_eq!(sim.selected_text(), Some("   five\n  s".to_string()));
-    }
-
-    #[test]
-    fn attach_sim_status_tab_drag_remains_owned_outside_status_row() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-        sim.seed_vertical_split_panes();
-        sim.enable_pane_mouse_reporting();
-        let one = sim.locate_text("1:one").expect("one tab");
-
-        sim.send_mouse(left_mouse(
-            TerminalMousePhase::Down,
-            one.center_col,
-            one.row,
-        ));
-        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::StatusTab));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 3, 3));
-        assert_eq!(sim.pointer_owner(), Some(AttachPointerOwner::StatusTab));
-        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 3, 3));
-
-        assert!(sim.forwarded_mouse_bytes().is_empty());
-        assert_eq!(sim.pointer_owner(), None);
     }
 
     #[test]
