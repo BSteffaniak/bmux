@@ -616,7 +616,8 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                 capability: "bmux.sidebar.input".to_string(),
                 interface_id: "presentation-input".to_string(),
                 operation: "handle-input".to_string(),
-            }),
+            })
+            .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
         );
     }
     let mut surface = PluginSurface::layout(
@@ -706,7 +707,99 @@ fn update_scroll(event: &AttachInputEvent) -> bool {
         .is_ok()
 }
 
+fn update_keyboard(
+    context: &NativeServiceContext,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
+        return None;
+    }
+    let target = event
+        .hook_id
+        .strip_prefix("bmux.sidebar:sidebar:window:")
+        .and_then(|target| Uuid::parse_str(target).ok())?;
+    let mut guard = state().lock().ok()?;
+    let companion = guard.as_mut()?;
+    let index = companion
+        .snapshot
+        .windows
+        .iter()
+        .position(|window| window.id == target)?;
+    match event.key.as_deref()? {
+        "up" => {
+            let next = index.saturating_sub(1);
+            companion.scroll_offset = companion.scroll_offset.min(next);
+            companion.hovered_window_id =
+                companion.snapshot.windows.get(next).map(|window| window.id);
+        }
+        "down" => {
+            let next = index
+                .saturating_add(1)
+                .min(companion.snapshot.windows.len().saturating_sub(1));
+            let visible_end = companion
+                .scroll_offset
+                .saturating_add(companion.settings.maximum_visible_items);
+            if next >= visible_end {
+                companion.scroll_offset = next
+                    .saturating_add(1)
+                    .saturating_sub(companion.settings.maximum_visible_items);
+            }
+            companion.hovered_window_id =
+                companion.snapshot.windows.get(next).map(|window| window.id);
+        }
+        "enter" => {
+            drop(guard);
+            let mut client = ServiceCallerDispatchClient::new(context);
+            return Some(
+                match block_on_typed_dispatch(windows_commands::client::switch_window(
+                    &mut client,
+                    target.to_string(),
+                )) {
+                    Ok(Ok(_)) => AttachInputResult {
+                        consumed: true,
+                        dirty: true,
+                        ..AttachInputResult::default()
+                    },
+                    Ok(Err(error)) => AttachInputResult {
+                        consumed: true,
+                        status_message: Some(format!("window switch failed: {error:?}")),
+                        ..AttachInputResult::default()
+                    },
+                    Err(error) => AttachInputResult {
+                        consumed: true,
+                        status_message: Some(format!("window switch unavailable: {error}")),
+                        ..AttachInputResult::default()
+                    },
+                },
+            );
+        }
+        _ => return None,
+    }
+    let dirty = {
+        companion.revision = companion.revision.saturating_add(1).max(1);
+        let revision = companion.revision;
+        let surface = build_surface(companion, revision);
+        global_plugin_surface_registry()
+            .publish(
+                OWNER,
+                PluginSurfaceSnapshot {
+                    revision,
+                    surfaces: vec![surface],
+                },
+            )
+            .is_ok()
+    };
+    Some(AttachInputResult {
+        consumed: true,
+        dirty,
+        ..AttachInputResult::default()
+    })
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
+    if let Some(result) = update_keyboard(context, event) {
+        return result;
+    }
     if update_scroll(event) {
         return AttachInputResult {
             consumed: true,
