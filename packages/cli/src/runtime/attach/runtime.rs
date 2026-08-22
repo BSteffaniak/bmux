@@ -11029,63 +11029,6 @@ pub async fn handle_attach_terminal_event(
         .await?;
     }
 
-    if view_state.tab_menu.is_some() {
-        // The context menu owns input while open, ahead of the inline editor,
-        // prompt overlay, and pane forwarding.
-        let menu_reduction = match &normalized_event {
-            Some(TerminalInputEvent::Key(key)) => handle_attach_tab_menu_key_event(view_state, key),
-            Some(TerminalInputEvent::Mouse(mouse)) => {
-                handle_attach_tab_menu_mouse_event(view_state, *mouse, geometry)
-            }
-            Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
-                let _ = close_attach_tab_menu(view_state);
-                Some(AttachUiReduction::consumed())
-            }
-            _ => None,
-        };
-        if let Some(reduction) = menu_reduction {
-            execute_attach_ui_effects(
-                client,
-                view_state,
-                reduction.effects,
-                kernel_client_factory,
-                now,
-            )
-            .await?;
-            return Ok(AttachLoopControl::Continue);
-        }
-    }
-
-    if view_state.tab_rename.is_some() {
-        // The inline tab editor owns keyboard input while open, ahead of the
-        // prompt overlay and pane forwarding.
-        let rename_reduction = match &normalized_event {
-            Some(TerminalInputEvent::Key(key)) => {
-                handle_attach_tab_rename_key_event(view_state, key)
-            }
-            Some(TerminalInputEvent::Paste(text)) => {
-                handle_attach_tab_rename_paste(view_state, text)
-            }
-            Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
-                // Cancel rather than silently commit on focus loss or resize.
-                let _ = cancel_attach_tab_rename(view_state);
-                Some(AttachUiReduction::consumed())
-            }
-            _ => None,
-        };
-        if let Some(reduction) = rename_reduction {
-            execute_attach_ui_effects(
-                client,
-                view_state,
-                reduction.effects,
-                kernel_client_factory,
-                now,
-            )
-            .await?;
-            return Ok(AttachLoopControl::Continue);
-        }
-    }
-
     if view_state.prompt.is_active() {
         let prompt_disposition = match &normalized_event {
             Some(TerminalInputEvent::Key(key))
@@ -12730,20 +12673,6 @@ async fn handle_attach_mouse_event_at(
         None => {}
     }
 
-    if handle_attach_status_tab_mouse_event_at(
-        client,
-        view_state,
-        mouse_event,
-        kernel_client_factory,
-        now,
-        geometry,
-    )
-    .await?
-    {
-        view_state.mouse.debug_assert_single_pointer_owner();
-        return Ok(());
-    }
-
     // Terminal applications that explicitly enable mouse reporting own pointer
     // semantics inside their pane content. Forward those events after bmux
     // chrome hit-testing so status/tab clicks are never swallowed by pane mouse
@@ -13546,6 +13475,8 @@ const fn mouse_event_to_shared(mouse_event: MouseEvent) -> attach_mouse::Event {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn handle_attach_status_tab_mouse_event_at(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -13639,6 +13570,8 @@ pub fn handle_attach_tab_rename_key_event(
 }
 
 /// Route pasted text into the inline tab rename editor.
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn handle_attach_tab_rename_paste(
     view_state: &mut AttachViewState,
     text: &str,
