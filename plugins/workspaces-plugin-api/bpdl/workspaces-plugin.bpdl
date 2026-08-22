@@ -39,7 +39,6 @@ interface workspaces-commands {
     variant workspace-command-error {
         not-found,
         invalid-name { reason: string },
-        cannot-remove-last-workspace,
         no-previous-workspace,
         denied { reason: string },
         failed { reason: string },

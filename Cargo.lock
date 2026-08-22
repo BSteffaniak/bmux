@@ -1769,6 +1769,7 @@ dependencies = [
  "bmux_windows_plugin_api",
  "bmux_workspaces_plugin_api",
  "tokio",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uuid",
 ]

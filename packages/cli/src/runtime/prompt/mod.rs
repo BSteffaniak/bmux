@@ -7,6 +7,6 @@
 pub use bmux_plugin::prompt::{
     PromptEvent, PromptField, PromptFormField, PromptFormFieldKind, PromptFormSection,
     PromptFormValue, PromptHostRequest, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
-    PromptSubmitError, PromptValidation, PromptValue, PromptWidth, register_host, request,
-    request_with_events, submit, submit_with_events,
+    PromptSearchMatchMode, PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
+    register_host, request, request_with_events, submit, submit_with_events,
 };

@@ -45,6 +45,10 @@ impl Default for PromptWidth {
 pub struct PromptOption {
     pub value: String,
     pub label: String,
+    /// Optional caller-defined text used by searchable prompts. When absent,
+    /// hosts search the label, detail, and key hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_text: Option<String>,
     /// Optional secondary description rendered with muted styling by capable hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -59,9 +63,17 @@ impl PromptOption {
         Self {
             value: value.into(),
             label: label.into(),
+            search_text: None,
             detail: None,
             key_hint: None,
         }
+    }
+
+    /// Set optional caller-defined searchable text.
+    #[must_use]
+    pub fn search_text(mut self, search_text: impl Into<String>) -> Self {
+        self.search_text = Some(search_text.into());
+        self
     }
 
     /// Set optional secondary descriptive text.
@@ -195,6 +207,9 @@ pub enum PromptField {
         options: Vec<PromptOption>,
         default_index: usize,
         placeholder: Option<String>,
+        /// Matching strategy used by the host while filtering options.
+        #[serde(default)]
+        match_mode: PromptSearchMatchMode,
         /// Emit selection-change events while the user moves through the filtered list.
         /// Hosts can use this for live previews without waiting for submit.
         live_preview: bool,
@@ -218,6 +233,16 @@ pub enum PromptField {
         #[serde(default)]
         paged_on_small: bool,
     },
+}
+
+/// Matching strategy for searchable select prompts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSearchMatchMode {
+    #[default]
+    Fuzzy,
+    Prefix,
+    Substring,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +464,7 @@ impl PromptRequest {
                 options,
                 default_index: 0,
                 placeholder: Some("Type to search".to_string()),
+                match_mode: PromptSearchMatchMode::Fuzzy,
                 live_preview: false,
             },
         }
@@ -635,6 +661,14 @@ impl PromptRequest {
     pub fn search_placeholder(mut self, value: impl Into<String>) -> Self {
         if let PromptField::SearchSelect { placeholder, .. } = &mut self.field {
             *placeholder = Some(value.into());
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn search_match_mode(mut self, mode: PromptSearchMatchMode) -> Self {
+        if let PromptField::SearchSelect { match_mode, .. } = &mut self.field {
+            *match_mode = mode;
         }
         self
     }

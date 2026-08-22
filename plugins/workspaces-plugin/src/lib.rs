@@ -84,6 +84,36 @@ impl WorkspaceState {
             self.active_by_client.insert(client_id, workspace_id);
         }
     }
+
+    fn remove(&mut self, workspace_id: Uuid) -> Uuid {
+        let fallback_id = self
+            .records
+            .iter()
+            .find(|record| record.id != workspace_id)
+            .map(|record| record.id);
+        let fallback_id = if let Some(fallback_id) = fallback_id {
+            fallback_id
+        } else {
+            let replacement_id = Uuid::new_v4();
+            self.records.push(WorkspaceRecord {
+                id: replacement_id,
+                name: DEFAULT_WORKSPACE_NAME.to_string(),
+            });
+            replacement_id
+        };
+        self.records.retain(|record| record.id != workspace_id);
+        for active in self.active_by_client.values_mut() {
+            if *active == workspace_id {
+                *active = fallback_id;
+            }
+        }
+        for previous in self.previous_by_client.values_mut() {
+            if *previous == workspace_id {
+                *previous = fallback_id;
+            }
+        }
+        fallback_id
+    }
 }
 
 #[derive(Default)]
@@ -409,6 +439,7 @@ fn new_workspace(
         };
         guard.records.push(record.clone());
         guard.select(client_id, record.id);
+        persist_client_selection(caller, &guard)?;
         (record, guard.records.clone())
     };
     save_catalog(caller, &records)?;
@@ -477,30 +508,7 @@ fn kill_workspace(
             .resolve(selector)
             .map(|record| record.id)
             .ok_or(WorkspaceCommandError::NotFound)?;
-        let fallback_id = guard
-            .records
-            .iter()
-            .find(|record| record.id != id)
-            .map(|record| record.id);
-        let fallback_id = fallback_id.unwrap_or_else(|| {
-            let replacement_id = Uuid::new_v4();
-            guard.records.push(WorkspaceRecord {
-                id: replacement_id,
-                name: DEFAULT_WORKSPACE_NAME.to_string(),
-            });
-            replacement_id
-        });
-        guard.records.retain(|record| record.id != id);
-        for active in guard.active_by_client.values_mut() {
-            if *active == id {
-                *active = fallback_id;
-            }
-        }
-        for previous in guard.previous_by_client.values_mut() {
-            if *previous == id {
-                *previous = fallback_id;
-            }
-        }
+        let fallback_id = guard.remove(id);
         persist_client_selection(caller, &guard)?;
         (id, fallback_id, guard.records.clone())
     };
@@ -836,6 +844,7 @@ fn new_workspace_for_context(
         };
         guard.records.push(record.clone());
         guard.select(client_id, record.id);
+        persist_client_selection(context, &guard).map_err(|error| format!("{error:?}"))?;
         (record, guard.records.clone())
     };
     save_catalog(context, &records).map_err(|error| format!("{error:?}"))?;
@@ -1146,18 +1155,9 @@ mod tests {
             previous_by_client: HashMap::from([(first_client, fallback), (second_client, removed)]),
         };
 
-        state.records.retain(|record| record.id != removed);
-        for active in state.active_by_client.values_mut() {
-            if *active == removed {
-                *active = fallback;
-            }
-        }
-        for previous in state.previous_by_client.values_mut() {
-            if *previous == removed {
-                *previous = fallback;
-            }
-        }
+        let actual_fallback = state.remove(removed);
 
+        assert_eq!(actual_fallback, fallback);
         assert!(state.active_by_client.values().all(|id| *id == fallback));
         assert!(state.previous_by_client.values().all(|id| *id == fallback));
     }
@@ -1174,22 +1174,11 @@ mod tests {
             active_by_client: HashMap::from([(client, removed)]),
             previous_by_client: HashMap::from([(client, removed)]),
         };
-        let replacement = Uuid::from_u128(20);
-        state.records.push(WorkspaceRecord {
-            id: replacement,
-            name: DEFAULT_WORKSPACE_NAME.to_string(),
-        });
-        state.records.retain(|record| record.id != removed);
-        for active in state.active_by_client.values_mut() {
-            if *active == removed {
-                *active = replacement;
-            }
-        }
-        for previous in state.previous_by_client.values_mut() {
-            if *previous == removed {
-                *previous = replacement;
-            }
-        }
+        let replacement = state.remove(removed);
+
+        assert_ne!(replacement, removed);
+        assert_eq!(state.records[0].id, replacement);
+        assert_eq!(state.records[0].name, DEFAULT_WORKSPACE_NAME);
         assert_eq!(state.records.len(), 1);
         assert_eq!(state.active_id(client), replacement);
         assert_eq!(state.previous_by_client.get(&client), Some(&replacement));

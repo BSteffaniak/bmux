@@ -243,42 +243,42 @@ fn bundled_windows_manifest_matches_pragmatic_command_surface() {
         (
             "new-window",
             vec!["new-window"],
-            vec![vec!["window", "new"]],
+            vec![vec!["window", "new"], vec!["tab", "new"]],
         ),
         (
             "list-windows",
             vec!["list-windows"],
-            vec![vec!["window", "list"]],
+            vec![vec!["window", "list"], vec!["tab", "list"]],
         ),
         (
             "kill-window",
             vec!["kill-window"],
-            vec![vec!["window", "kill"]],
+            vec![vec!["window", "kill"], vec!["tab", "kill"]],
         ),
         (
             "kill-all-windows",
             vec!["kill-all-windows"],
-            vec![vec!["window", "kill-all"]],
+            vec![vec!["window", "kill-all"], vec!["tab", "kill-all"]],
         ),
         (
             "switch-window",
             vec!["switch-window"],
-            vec![vec!["window", "switch"]],
+            vec![vec!["window", "switch"], vec!["tab", "switch"]],
         ),
         (
             "next-window",
             vec!["next-window"],
-            vec![vec!["window", "next"]],
+            vec![vec!["window", "next"], vec!["tab", "next"]],
         ),
         (
             "prev-window",
             vec!["prev-window"],
-            vec![vec!["window", "prev"]],
+            vec![vec!["window", "prev"], vec!["tab", "prev"]],
         ),
         (
             "last-window",
             vec!["last-window"],
-            vec![vec!["window", "last"]],
+            vec![vec!["window", "last"], vec!["tab", "last"]],
         ),
     ];
 

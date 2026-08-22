@@ -4,7 +4,7 @@ use super::state::AttachCursorState;
 use super::tui_surface::{buffer_render_ops, component_theme, surface_buffer};
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
-    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
+    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
 };
 use anyhow::Result;
 use bmux_appearance::RuntimeAppearance;
@@ -255,11 +255,15 @@ impl AttachPromptState {
                 *error = None;
             }
             (
-                PromptField::SearchSelect { options, .. },
+                PromptField::SearchSelect {
+                    options,
+                    match_mode,
+                    ..
+                },
                 PromptWidgetState::SearchSelect { palette },
             ) => {
                 palette.query.paste(text);
-                let len = filtered_option_indices(options, palette.query.text()).len();
+                let len = filtered_option_indices(options, palette.query.text(), *match_mode).len();
                 let selected = palette
                     .list
                     .selected
@@ -478,6 +482,7 @@ impl AttachPromptState {
                 (
                     PromptField::SearchSelect {
                         options,
+                        match_mode,
                         live_preview,
                         ..
                     },
@@ -486,10 +491,11 @@ impl AttachPromptState {
                     let query = &mut palette.query;
                     let selected = palette.list.selected.get_or_insert(0);
                     let scroll = &mut palette.list.offset;
-                    let previous_selected_value = filtered_option_indices(options, query.text())
-                        .get(*selected)
-                        .and_then(|index| options.get(*index))
-                        .map(|option| option.value.clone());
+                    let previous_selected_value =
+                        filtered_option_indices(options, query.text(), *match_mode)
+                            .get(*selected)
+                            .and_then(|index| options.get(*index))
+                            .map(|option| option.value.clone());
                     match key.code {
                         KeyCode::Char(ch)
                             if !key
@@ -551,18 +557,21 @@ impl AttachPromptState {
                             if matches!(key.code, KeyCode::Down)
                                 || key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            let len = filtered_option_indices(options, query.text()).len();
+                            let len =
+                                filtered_option_indices(options, query.text(), *match_mode).len();
                             *selected = selected.saturating_add(1).min(len.saturating_sub(1));
                         }
                         KeyCode::Home => {
                             *selected = 0;
                         }
                         KeyCode::End => {
-                            let len = filtered_option_indices(options, query.text()).len();
+                            let len =
+                                filtered_option_indices(options, query.text(), *match_mode).len();
                             *selected = len.saturating_sub(1);
                         }
                         KeyCode::Enter => {
-                            let filtered = filtered_option_indices(options, query.text());
+                            let filtered =
+                                filtered_option_indices(options, query.text(), *match_mode);
                             if let Some(option) = filtered
                                 .get(*selected)
                                 .and_then(|index| options.get(*index))
@@ -574,7 +583,7 @@ impl AttachPromptState {
                         }
                         _ => {}
                     }
-                    let filtered = filtered_option_indices(options, query.text());
+                    let filtered = filtered_option_indices(options, query.text(), *match_mode);
                     *selected = (*selected).min(filtered.len().saturating_sub(1));
                     *scroll = (*scroll).min(*selected);
                     if *live_preview {
@@ -1015,6 +1024,7 @@ impl AttachPromptState {
             };
             let PromptField::SearchSelect {
                 options,
+                match_mode,
                 live_preview,
                 ..
             } = &active.envelope.request.field
@@ -1024,7 +1034,7 @@ impl AttachPromptState {
             let PromptWidgetState::SearchSelect { palette } = &mut active.state else {
                 return PromptKeyDisposition::Consumed;
             };
-            let filtered = filtered_option_indices(options, palette.query.text());
+            let filtered = filtered_option_indices(options, palette.query.text(), *match_mode);
             let Some(filtered_index) = filtered.iter().position(|index| *index == source_index)
             else {
                 return PromptKeyDisposition::Consumed;
@@ -1728,6 +1738,7 @@ fn render_command_palette(
     let PromptField::SearchSelect {
         options,
         placeholder,
+        match_mode,
         ..
     } = &active.envelope.request.field
     else {
@@ -1751,13 +1762,16 @@ fn render_command_palette(
             }
             PaletteItem::new(option.value.clone(), Line::from_spans(spans)).search_text(format!(
                 "{} {} {}",
-                option.label,
+                option
+                    .search_text
+                    .as_deref()
+                    .unwrap_or(option.label.as_str()),
                 option.detail.as_deref().unwrap_or_default(),
                 option.key_hint.as_deref().unwrap_or_default()
             ))
         })
         .collect::<Vec<_>>();
-    let filtered = filtered_option_indices(options, palette.query.text());
+    let filtered = filtered_option_indices(options, palette.query.text(), *match_mode);
     let message_rows = active
         .envelope
         .request
@@ -2482,12 +2496,21 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
     }
 }
 
-fn filtered_option_indices(options: &[PromptOption], query: &str) -> Vec<usize> {
+fn filtered_option_indices(
+    options: &[PromptOption],
+    query: &str,
+    match_mode: PromptSearchMatchMode,
+) -> Vec<usize> {
     let mut scored = options
         .iter()
         .enumerate()
         .filter_map(|(index, option)| {
-            fuzzy_score(query, &option.label).map(|score| (index, score, option.label.as_str()))
+            let search_text = option
+                .search_text
+                .as_deref()
+                .unwrap_or(option.label.as_str());
+            search_score(query, search_text, match_mode)
+                .map(|score| (index, score, option.label.as_str()))
         })
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| {
@@ -2498,6 +2521,24 @@ fn filtered_option_indices(options: &[PromptOption], query: &str) -> Vec<usize> 
             .then_with(|| left.0.cmp(&right.0))
     });
     scored.into_iter().map(|(index, _, _)| index).collect()
+}
+
+fn search_score(query: &str, candidate: &str, match_mode: PromptSearchMatchMode) -> Option<i64> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Some(0);
+    }
+    match match_mode {
+        PromptSearchMatchMode::Fuzzy => fuzzy_score(query, candidate),
+        PromptSearchMatchMode::Prefix => candidate
+            .to_ascii_lowercase()
+            .starts_with(&query.trim().to_ascii_lowercase())
+            .then_some(0),
+        PromptSearchMatchMode::Substring => candidate
+            .to_ascii_lowercase()
+            .contains(&query.trim().to_ascii_lowercase())
+            .then_some(0),
+    }
 }
 
 fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
@@ -2640,13 +2681,13 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
-        prompt_overlay_layout,
+        filtered_option_indices, prompt_overlay_layout,
     };
     use crate::runtime::attach::input::TerminalGeometry;
     use crate::runtime::attach::tui_surface::{component_theme, parse_tui_color};
     use crate::runtime::prompt::{
         PromptFormField, PromptFormFieldKind, PromptFormSection, PromptFormValue, PromptOption,
-        PromptRequest, PromptResponse, PromptValidation, PromptValue,
+        PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValidation, PromptValue,
     };
     use bmux_appearance::RuntimeAppearance;
     use bmux_plugin::prompt::PromptHostRequest;
@@ -3145,6 +3186,34 @@ mod tests {
         assert!(text.contains("Stop"));
         assert!(!text.contains("[x]"));
         assert!(!text.contains("[ ]"));
+    }
+
+    #[test]
+    fn search_match_modes_filter_against_custom_search_text() {
+        let options = vec![
+            PromptOption::new("editor", "project/editor").search_text("project editor"),
+            PromptOption::new("shell", "other/shell").search_text("other shell"),
+        ];
+
+        assert_eq!(
+            filtered_option_indices(&options, "pro ed", PromptSearchMatchMode::Fuzzy),
+            vec![0]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "project", PromptSearchMatchMode::Prefix),
+            vec![0]
+        );
+        assert!(
+            filtered_option_indices(&options, "editor", PromptSearchMatchMode::Prefix).is_empty()
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "editor", PromptSearchMatchMode::Substring),
+            vec![0]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "", PromptSearchMatchMode::Prefix),
+            vec![1, 0]
+        );
     }
 
     #[test]

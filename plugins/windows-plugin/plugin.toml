@@ -3,6 +3,7 @@ id = "bmux.windows"
 name = "bmux Windows"
 owns_namespaces = [
     "window",
+    "tab",
     "new-window",
     "rename-window",
     "rename-window-by-id",
