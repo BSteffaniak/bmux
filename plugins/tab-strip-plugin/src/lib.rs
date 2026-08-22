@@ -31,12 +31,14 @@ enum Placement {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
     placement: Placement,
     height: u16,
     order: i32,
     show_index: bool,
+    label_template: String,
+    maximum_label_width: u16,
 }
 
 impl Default for Settings {
@@ -46,6 +48,8 @@ impl Default for Settings {
             height: 1,
             order: 100,
             show_index: true,
+            label_template: "{index}{name}".to_string(),
+            maximum_label_width: 32,
         }
     }
 }
@@ -84,6 +88,27 @@ impl Settings {
         }
         if let Some(show_index) = table.get("show_index").and_then(toml::Value::as_bool) {
             settings.show_index = show_index;
+        }
+        if let Some(template) = table.get("label_template").and_then(toml::Value::as_str) {
+            if template.len() > 4_096 {
+                return Err(PluginCommandError::invalid_arguments(
+                    "bmux.tab_strip label_template must not exceed 4096 bytes",
+                ));
+            }
+            settings.label_template = template.to_string();
+        }
+        if let Some(width) = table
+            .get("maximum_label_width")
+            .and_then(toml::Value::as_integer)
+        {
+            settings.maximum_label_width = u16::try_from(width)
+                .ok()
+                .filter(|width| *width > 0)
+                .ok_or_else(|| {
+                    PluginCommandError::invalid_arguments(
+                        "bmux.tab_strip maximum_label_width must be positive",
+                    )
+                })?;
         }
         Ok(settings)
     }
@@ -157,6 +182,7 @@ impl RustPlugin for TabStripPlugin {
 /// Returns an error for invalid settings or rejected retained publication.
 pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
+    let request = layout_request(&settings);
     let mut guard = state()
         .lock()
         .map_err(|_| "tab-strip state lock poisoned".to_string())?;
@@ -170,7 +196,7 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             OWNER,
             PluginLayoutSnapshot {
                 revision: 1,
-                requests: vec![layout_request(settings)],
+                requests: vec![request],
             },
         )
         .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
@@ -208,7 +234,7 @@ pub fn uninstall() {
     }
 }
 
-fn layout_request(settings: Settings) -> PluginLayoutRequest {
+fn layout_request(settings: &Settings) -> PluginLayoutRequest {
     PluginLayoutRequest::split(
         PluginLayoutId::new(OWNER, LAYOUT_ID),
         settings.order,
@@ -243,6 +269,40 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
     Ok(())
 }
 
+fn truncate_to_width(value: &str, maximum: usize) -> String {
+    let mut result = String::new();
+    let mut width = 0_usize;
+    for ch in value.chars() {
+        let cell_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(cell_width) > maximum {
+            break;
+        }
+        result.push(ch);
+        width = width.saturating_add(cell_width);
+    }
+    result
+}
+
+fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index: usize) -> String {
+    const INDEX_TOKEN: &str = concat!("{", "index}");
+    let index = if settings.show_index {
+        format!("{}:", index.saturating_add(1))
+    } else {
+        String::new()
+    };
+    let label = settings
+        .label_template
+        .replace("{{", "\u{0}")
+        .replace("}}", "\u{1}")
+        .replace(INDEX_TOKEN, &index)
+        .replace("{name}", &window.name)
+        .replace("{id}", &window.id.to_string())
+        .replace("{active}", if window.active { "active" } else { "idle" })
+        .replace('\u{0}', "{")
+        .replace('\u{1}', "}");
+    truncate_to_width(&label, usize::from(settings.maximum_label_width))
+}
+
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let active_style = RenderStyle::new()
         .named_foreground(RenderNamedColor::BrightWhite)
@@ -259,12 +319,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
     let mut x = 0_u16;
     for (index, window) in state.snapshot.windows.iter().enumerate() {
-        let prefix = if state.settings.show_index {
-            format!("{}:", index.saturating_add(1))
-        } else {
-            String::new()
-        };
-        let label = format!(" {prefix}{} ", window.name);
+        let label = format!(" {} ", tab_label(&state.settings, window, index));
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str()))
             .unwrap_or(u16::MAX);
         ops.push(RenderOp::text_run(
@@ -353,10 +408,26 @@ mod tests {
                 height: 2,
                 order: 100,
                 show_index: false,
+                label_template: "{index}{name}".to_string(),
+                maximum_label_width: 32,
             }
         );
         let invalid: toml::Value = toml::from_str("height = 0").unwrap();
         assert!(Settings::parse(Some(&invalid)).is_err());
+    }
+
+    #[test]
+    fn tab_labels_expand_templates_and_truncate_by_display_width() {
+        let window = windows_list::WindowListEntry {
+            id: Uuid::from_u128(8),
+            name: "界界界".to_string(),
+            active: true,
+        };
+        let settings = Settings {
+            maximum_label_width: 5,
+            ..Settings::default()
+        };
+        assert_eq!(tab_label(&settings, &window, 0), "1:界");
     }
 
     #[test]

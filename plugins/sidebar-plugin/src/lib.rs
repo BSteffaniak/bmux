@@ -31,7 +31,7 @@ enum Placement {
     Right,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
     placement: Placement,
     width: u16,
@@ -39,6 +39,10 @@ struct Settings {
     maximum_width: u16,
     order: i32,
     show_index: bool,
+    heading: String,
+    title_template: String,
+    description_template: String,
+    status_template: String,
 }
 
 impl Default for Settings {
@@ -50,6 +54,10 @@ impl Default for Settings {
             maximum_width: 60,
             order: 200,
             show_index: true,
+            heading: "Windows".to_string(),
+            title_template: "{marker} {index}{name}".to_string(),
+            description_template: String::new(),
+            status_template: String::new(),
         }
     }
 }
@@ -99,6 +107,21 @@ impl Settings {
         }
         if let Some(show_index) = table.get("show_index").and_then(toml::Value::as_bool) {
             settings.show_index = show_index;
+        }
+        for (key, target) in [
+            ("heading", &mut settings.heading),
+            ("title_template", &mut settings.title_template),
+            ("description_template", &mut settings.description_template),
+            ("status_template", &mut settings.status_template),
+        ] {
+            if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
+                if value.len() > 4_096 {
+                    return Err(PluginCommandError::invalid_arguments(format!(
+                        "bmux.sidebar {key} must not exceed 4096 bytes"
+                    )));
+                }
+                *target = value.to_string();
+            }
         }
         Ok(settings)
     }
@@ -172,6 +195,7 @@ impl RustPlugin for SidebarPlugin {
 /// Returns an error for invalid settings or rejected retained publication.
 pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
+    let request = layout_request(&settings);
     let mut guard = state()
         .lock()
         .map_err(|_| "sidebar state lock poisoned".to_string())?;
@@ -185,7 +209,7 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             OWNER,
             PluginLayoutSnapshot {
                 revision: 1,
-                requests: vec![layout_request(settings)],
+                requests: vec![request],
             },
         )
         .map_err(|error| format!("publishing sidebar layout: {error:?}"))?;
@@ -223,7 +247,7 @@ pub fn uninstall() {
     }
 }
 
-fn layout_request(settings: Settings) -> PluginLayoutRequest {
+fn layout_request(settings: &Settings) -> PluginLayoutRequest {
     PluginLayoutRequest::split(
         PluginLayoutId::new(OWNER, LAYOUT_ID),
         settings.order,
@@ -276,6 +300,82 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
     result
 }
 
+fn render_template(
+    template: &str,
+    window: &windows_list::WindowListEntry,
+    index: usize,
+    show_index: bool,
+) -> String {
+    const MARKER_TOKEN: &str = concat!("{", "marker}");
+    const INDEX_TOKEN: &str = concat!("{", "index}");
+    let marker = if window.active { "●" } else { "○" };
+    let index = if show_index {
+        format!("{} ", index.saturating_add(1))
+    } else {
+        String::new()
+    };
+    template
+        .replace("{{", "\u{0}")
+        .replace("}}", "\u{1}")
+        .replace(MARKER_TOKEN, marker)
+        .replace(INDEX_TOKEN, &index)
+        .replace("{name}", &window.name)
+        .replace("{id}", &window.id.to_string())
+        .replace("{active}", if window.active { "active" } else { "idle" })
+        .replace('\u{0}', "{")
+        .replace('\u{1}', "}")
+}
+
+fn push_wrapped_text(
+    ops: &mut Vec<RenderOp>,
+    text: &str,
+    x: u16,
+    start_row: u16,
+    width: usize,
+    maximum_rows: u16,
+    style: RenderStyle,
+) -> u16 {
+    if text.is_empty() || width == 0 || maximum_rows == 0 {
+        return 0;
+    }
+    let mut rows = 0_u16;
+    let mut remaining = text.trim();
+    while !remaining.is_empty() && rows < maximum_rows {
+        let mut split = remaining.len();
+        let mut cells = 0_usize;
+        let mut last_space = None;
+        for (offset, ch) in remaining.char_indices() {
+            let next =
+                cells.saturating_add(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0));
+            if next > width {
+                split = last_space.unwrap_or(offset);
+                break;
+            }
+            cells = next;
+            if ch.is_whitespace() {
+                last_space = Some(offset);
+            }
+        }
+        let (line, tail) = remaining.split_at(split);
+        let line = line.trim_end();
+        if !line.is_empty() {
+            ops.push(RenderOp::text_run(
+                x,
+                start_row.saturating_add(rows),
+                line,
+                style,
+            ));
+            rows = rows.saturating_add(1);
+        }
+        remaining = tail.trim_start();
+        if split == 0 {
+            break;
+        }
+    }
+    rows
+}
+
+#[allow(clippy::too_many_lines)] // Scene construction is one ordered retained projection; splitting obscures row accounting.
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let width = state.settings.width;
     let background = RenderStyle::new()
@@ -295,31 +395,70 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             BorderGlyphs::square(),
             background,
         ),
-        RenderOp::text_run(2, 0, " Windows ", active),
+        RenderOp::text_run(2, 0, format!(" {} ", state.settings.heading), active),
     ];
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
     let content_width = usize::from(width.saturating_sub(4));
+    let mut row = 1_u16;
     for (index, window) in state.snapshot.windows.iter().enumerate() {
-        let Ok(row) = u16::try_from(index.saturating_add(1)) else {
-            break;
-        };
-        let prefix = if state.settings.show_index {
-            format!("{} ", index.saturating_add(1))
-        } else {
-            String::new()
-        };
-        let marker = if window.active { "●" } else { "○" };
-        let text = truncate_to_width(&format!("{marker} {prefix}{}", window.name), content_width);
+        let start_row = row;
+        let title = render_template(
+            &state.settings.title_template,
+            window,
+            index,
+            state.settings.show_index,
+        );
+        let title = truncate_to_width(&title, content_width);
         ops.push(RenderOp::text_run(
             2,
             row,
-            text,
+            title,
             if window.active { active } else { inactive },
         ));
+        row = row.saturating_add(1);
+        let description = render_template(
+            &state.settings.description_template,
+            window,
+            index,
+            state.settings.show_index,
+        );
+        row = row.saturating_add(push_wrapped_text(
+            &mut ops,
+            &description,
+            3,
+            row,
+            content_width.saturating_sub(1),
+            2,
+            inactive.dim(),
+        ));
+        let status = render_template(
+            &state.settings.status_template,
+            window,
+            index,
+            state.settings.show_index,
+        );
+        if !status.is_empty() {
+            ops.push(RenderOp::text_run(
+                3,
+                row,
+                truncate_to_width(&status, content_width.saturating_sub(1)),
+                if window.active {
+                    active
+                } else {
+                    inactive.dim()
+                },
+            ));
+            row = row.saturating_add(1);
+        }
         regions.push(
             PluginSurfaceRegion::new(
                 format!("window:{}", window.id),
-                ExtensionRect::new(1, row, width.saturating_sub(2), 1),
+                ExtensionRect::new(
+                    1,
+                    start_row,
+                    width.saturating_sub(2),
+                    row.saturating_sub(start_row).max(1),
+                ),
             )
             .endpoint(bmux_plugin::AttachInputEndpoint {
                 capability: "bmux.sidebar.input".to_string(),
@@ -386,10 +525,9 @@ mod tests {
             "placement = 'right'\nwidth = 24\nminimum_width = 12\nmaximum_width = 40",
         )
         .unwrap();
-        assert_eq!(
-            Settings::parse(Some(&settings)).unwrap().placement,
-            Placement::Right
-        );
+        let settings = Settings::parse(Some(&settings)).unwrap();
+        assert_eq!(settings.placement, Placement::Right);
+        assert_eq!(settings.title_template, "{marker} {index}{name}");
         let invalid: toml::Value =
             toml::from_str("width = 10\nminimum_width = 12\nmaximum_width = 40").unwrap();
         assert!(Settings::parse(Some(&invalid)).is_err());
@@ -398,6 +536,27 @@ mod tests {
     #[test]
     fn truncation_is_unicode_cell_safe() {
         assert_eq!(truncate_to_width("ab界cd", 4), "ab界");
+    }
+
+    #[test]
+    fn templates_escape_braces_and_expand_stable_window_fields() {
+        let window = windows_list::WindowListEntry {
+            id: Uuid::from_u128(10),
+            name: "build".to_string(),
+            active: true,
+        };
+        assert_eq!(
+            render_template("{{literal}} {index}{name} {active}", &window, 1, true),
+            "{literal} 2 build active"
+        );
+    }
+
+    #[test]
+    fn descriptions_wrap_on_unicode_cell_boundaries() {
+        let mut ops = Vec::new();
+        let rows = push_wrapped_text(&mut ops, "alpha 界 beta", 0, 0, 7, 3, RenderStyle::new());
+        assert_eq!(rows, 2);
+        assert_eq!(ops.len(), 2);
     }
 
     #[test]
