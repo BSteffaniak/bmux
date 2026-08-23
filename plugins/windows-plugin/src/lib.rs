@@ -2320,6 +2320,7 @@ fn create_window(
     order_appends.push(context_id);
     cache_contexts_to_window_order(runtime_state, order_appends);
     mark_context_active_cached(runtime_state, previous_context, context_id);
+    publish_window_list_ordered_contexts(caller, contexts, Some(context_id));
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -6401,6 +6402,21 @@ mod tests {
 
         let order = get_stored_window_order_ids(&host).expect("order readable");
         assert_eq!(order, vec![a]);
+    }
+
+    #[test]
+    fn legacy_context_without_workspace_attribute_belongs_to_default_workspace() {
+        let context = ContextSummary {
+            id: Uuid::from_u128(1),
+            name: Some("legacy".to_string()),
+            attributes: BTreeMap::new(),
+        };
+
+        assert_eq!(context_workspace_id(&context), Uuid::nil());
+        assert_eq!(
+            filter_contexts_for_workspace(vec![context.clone()], Uuid::nil()),
+            vec![context]
+        );
     }
 
     /// Simulates a `ContextEvent::Closed` for a middle entry. The
