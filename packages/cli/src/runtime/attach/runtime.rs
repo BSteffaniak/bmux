@@ -59,7 +59,7 @@ use bmux_tui::frame::Frame as TuiFrame;
 use bmux_tui::geometry::{Insets as TuiInsets, Rect as TuiRect, Size as TuiSize};
 use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::menu::{Menu, MenuItem, MenuState, MenuStyles};
+use bmux_tui_components::menu::{Menu, MenuItem, MenuState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
@@ -462,7 +462,6 @@ const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
 const STATUS_SURFACE_ID: Uuid = Uuid::from_u128(3);
 const DAMAGE_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(4);
-const TAB_MENU_SURFACE_ID: Uuid = Uuid::from_u128(5);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -7851,28 +7850,6 @@ fn retained_help_overlay_surface(
 }
 
 /// Retained surface for the tab context menu overlay.
-fn retained_tab_menu_surface(
-    menu: &AttachTabMenu,
-    appearance: &RuntimeAppearance,
-    geometry: TerminalGeometry,
-) -> Option<RetainedSurface> {
-    if geometry.cols == 0 || geometry.rows == 0 {
-        return None;
-    }
-    let rect = attach_tab_menu_rect(menu, geometry);
-    if rect.w == 0 || rect.h == 0 {
-        return None;
-    }
-    Some(
-        RetainedSurface::builder(TAB_MENU_SURFACE_ID, rect)
-            .layer(retained_layer_order(SurfaceLayer::Overlay))
-            .z(i32::MAX)
-            .opaque()
-            .render_ops(attach_tab_menu_render_ops(menu, rect, appearance))
-            .build(),
-    )
-}
-
 fn retained_prompt_overlay_surface(render: &AttachPromptOverlayRender) -> RetainedSurface {
     retained_surface_from_attach_surface(
         &render.surface,
@@ -8178,7 +8155,6 @@ struct RetainedFramePlan {
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
     prompt_surface: Option<RetainedSurface>,
-    tab_menu_surface: Option<RetainedSurface>,
     scene_repaint: bool,
     damage: RetainedDamagePlan,
     repaint_plan: Vec<RetainedRepaintSurface>,
@@ -8252,29 +8228,24 @@ fn build_retained_frame_plan(
     status_surface: Option<RetainedSurface>,
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
-    tab_menu_surface: Option<RetainedSurface>,
     viewport: DamageRect,
     damage_policy: DamageCoalescingPolicy,
 ) -> RetainedFramePlan {
     let prompt_surface = prompt_overlay_render
         .as_ref()
         .map(retained_prompt_overlay_surface);
-    let opaque_overlay_rects = [
-        help_surface.as_ref(),
-        prompt_surface.as_ref(),
-        tab_menu_surface.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|surface| {
-        ExtensionRect::new(
-            surface.rect.x,
-            surface.rect.y,
-            surface.rect.w,
-            surface.rect.h,
-        )
-    })
-    .collect::<Vec<_>>();
+    let opaque_overlay_rects = [help_surface.as_ref(), prompt_surface.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|surface| {
+            ExtensionRect::new(
+                surface.rect.x,
+                surface.rect.y,
+                surface.rect.w,
+                surface.rect.h,
+            )
+        })
+        .collect::<Vec<_>>();
     // Pane terminal graphics only need re-planning when opaque overlay
     // coverage changes. Prompt text edits commonly change retained graph
     // content while preserving these bounds; globally querying extensions for
@@ -8302,9 +8273,6 @@ fn build_retained_frame_plan(
         if let Some(surface) = prompt_surface.as_ref() {
             explicit_ui_damage_rects.push(surface.rect);
         }
-        if let Some(surface) = tab_menu_surface.as_ref() {
-            explicit_ui_damage_rects.push(surface.rect);
-        }
     }
     let explicit_ui_damage =
         retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
@@ -8313,7 +8281,6 @@ fn build_retained_frame_plan(
     retained_surfaces.extend(status_surface.iter().cloned());
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
-    retained_surfaces.extend(tab_menu_surface.iter().cloned());
     let graph_damage = replace_retained_surfaces(
         view_state,
         retained_surfaces.clone(),
@@ -8349,7 +8316,6 @@ fn build_retained_frame_plan(
         help_surface,
         prompt_overlay_render,
         prompt_surface,
-        tab_menu_surface,
         scene_repaint,
         damage: RetainedDamagePlan {
             frame: frame_retained_damage,
@@ -8475,10 +8441,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     } else {
         None
     };
-    let tab_menu_surface = view_state
-        .tab_menu
-        .as_ref()
-        .and_then(|menu| retained_tab_menu_surface(menu, runtime_appearance, geometry));
     let retained_plan = build_retained_frame_plan(
         view_state,
         layout_state,
@@ -8486,7 +8448,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         status_surface,
         help_retained_surface,
         prompt_overlay_render,
-        tab_menu_surface,
         viewport,
         damage_policy,
     );
@@ -8548,7 +8509,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let opaque_overlay_rects = [
         frame_plan.retained.help_surface.as_ref(),
         frame_plan.retained.prompt_surface.as_ref(),
-        frame_plan.retained.tab_menu_surface.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -8707,26 +8667,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             cursor.visible = true;
             cursor
         });
-    }
-
-    if let Some(menu_surface) = frame_plan.retained.tab_menu_surface.as_ref()
-        && let Some(repaint) = retained_repaint_by_id.get(&menu_surface.id)
-        && queue_retained_render_ops(
-            &mut frame_bytes,
-            menu_surface,
-            repaint,
-            retained_capabilities,
-        )?
-    {
-        overlay_rendered = true;
-        overlay_rendered |= queue_retained_extension_ops(
-            &mut frame_bytes,
-            menu_surface,
-            repaint,
-            &retained_extensions,
-            retained_capabilities,
-            &mut view_state.terminal_graphics_cache,
-        )?;
     }
 
     if damage_config.visualize
@@ -14017,31 +13957,6 @@ fn attach_tab_menu_item_index_at(
 }
 
 /// Render ops for the tab context menu overlay.
-fn attach_tab_menu_render_ops(
-    menu: &AttachTabMenu,
-    rect: DamageRect,
-    appearance: &RuntimeAppearance,
-) -> Vec<RenderOp> {
-    let area = TuiRect::new(rect.x, rect.y, rect.w, rect.h);
-    let theme = component_theme(appearance)
-        .for_surface(bmux_tui_components::theme::ComponentSurfaceDepth::Overlay);
-    let (items, state) = attach_tab_menu_components(menu);
-    let mut buffer = surface_buffer(area);
-    let mut frame = TuiFrame::new(&mut buffer);
-    frame.fill(area, " ", theme.surfaces.overlay);
-    Menu::new(&items)
-        .styles(MenuStyles {
-            normal: theme.text,
-            focused: theme.selected,
-            selected: theme.selected,
-            hovered: theme.focused,
-            pressed: theme.selected,
-            disabled: theme.disabled,
-        })
-        .render_with_fallback_style(area, &state, &mut frame, theme.surfaces.overlay);
-    buffer_render_ops(&buffer)
-}
-
 pub fn reduce_attach_status_tab_mouse_event(
     view_state: &mut AttachViewState,
     mouse_event: TerminalMouseEvent,
@@ -16647,129 +16562,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_menu_rect_opens_upward_from_a_bottom_status_bar() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 1, 3);
-        let geometry = TerminalGeometry { cols: 80, rows: 24 };
-
-        let rect = attach_tab_menu_rect(&menu, geometry);
-
-        assert!(
-            rect.y + rect.h <= 23,
-            "menu should sit above a bottom status row: {rect:?}"
-        );
-        assert_eq!(rect.x, 4);
-        assert_eq!(rect.h, menu.height());
-    }
-
-    #[test]
-    fn tab_menu_rect_opens_downward_from_a_top_status_bar() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 2, 0, 0, 2);
-        let geometry = TerminalGeometry { cols: 80, rows: 24 };
-
-        let rect = attach_tab_menu_rect(&menu, geometry);
-
-        assert!(
-            rect.y >= 1,
-            "menu should drop below a top status row: {rect:?}"
-        );
-        assert!(rect.y + rect.h <= geometry.rows, "{rect:?}");
-    }
-
-    #[test]
-    fn tab_menu_rect_clamps_to_the_right_edge() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 78, 23, 0, 2);
-        let geometry = TerminalGeometry { cols: 80, rows: 24 };
-
-        let rect = attach_tab_menu_rect(&menu, geometry);
-
-        assert!(
-            rect.x + rect.w <= geometry.cols,
-            "menu must stay on screen: {rect:?}"
-        );
-    }
-
-    #[test]
-    fn tab_menu_rect_fits_within_a_tiny_viewport() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 1, 1, 0, 1);
-        let geometry = TerminalGeometry { cols: 6, rows: 3 };
-
-        let rect = attach_tab_menu_rect(&menu, geometry);
-
-        assert!(rect.x + rect.w <= geometry.cols, "{rect:?}");
-        assert!(rect.y + rect.h <= geometry.rows, "{rect:?}");
-    }
-
-    #[test]
-    fn tab_menu_component_hit_geometry_matches_rendered_rows() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 0, 3);
-        let rect = attach_tab_menu_rect(&menu, TerminalGeometry { cols: 80, rows: 24 });
-
-        for (index, item) in menu.items.iter().enumerate() {
-            let row = rect
-                .y
-                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            assert_eq!(
-                attach_tab_menu_item_index_at(&menu, rect, rect.x, row),
-                Some(index),
-                "{} should resolve from component geometry",
-                item.action.id()
-            );
-        }
-        assert_eq!(
-            attach_tab_menu_item_index_at(&menu, rect, rect.x, rect.bottom()),
-            None
-        );
-    }
-
-    #[test]
-    fn tab_menu_render_ops_mark_focus_and_disabled_items() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 0, 3);
-        let geometry = TerminalGeometry { cols: 80, rows: 24 };
-        let rect = attach_tab_menu_rect(&menu, geometry);
-
-        let ops = attach_tab_menu_render_ops(&menu, rect, &RuntimeAppearance::default());
-
-        let runs: Vec<(String, RenderStyle)> = ops
-            .iter()
-            .filter_map(|op| match op {
-                RenderOp::TextRun { text, style, .. } => Some((text.clone(), *style)),
-                _ => None,
-            })
-            .collect();
-        let focused = runs
-            .iter()
-            .find(|(text, _)| text.contains("Rename"))
-            .expect("rename row should render");
-        assert!(
-            focused.1.bg.is_some() || focused.1.reverse,
-            "focused row should use selected styling"
-        );
-
-        let disabled = runs
-            .iter()
-            .find(|(text, _)| text.contains("Move left"))
-            .expect("move-left row should render");
-        assert!(disabled.1.dim, "disabled row should be dimmed");
-        assert!(!disabled.1.reverse, "disabled row should not be focused");
-    }
-
-    #[test]
-    fn retained_tab_menu_surface_uses_render_ops_payload() {
-        let menu = AttachTabMenu::new(Uuid::from_u128(1), 4, 23, 0, 2);
-        let geometry = TerminalGeometry { cols: 80, rows: 24 };
-
-        let surface = retained_tab_menu_surface(&menu, &RuntimeAppearance::default(), geometry)
-            .expect("menu surface should build");
-
-        assert_eq!(surface.id, TAB_MENU_SURFACE_ID);
-        assert_eq!(surface.layer, retained_layer_order(SurfaceLayer::Overlay));
-        assert!(matches!(
-            surface.payload,
-            RetainedSurfacePayload::RenderOps(_)
-        ));
-    }
-
-    #[test]
     fn status_tab_hover_tracks_tab_under_pointer() {
         let mut view_state = tab_reducer_view_state();
         let first = Uuid::from_u128(1);
@@ -17416,7 +17208,6 @@ mod tests {
             None,
             None,
             Some(prompt_render),
-            None,
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );
@@ -17515,7 +17306,6 @@ mod tests {
             &mut view_state,
             &layout_state,
             &mut frame_damage,
-            None,
             None,
             None,
             None,
@@ -17693,7 +17483,6 @@ mod tests {
             None,
             None,
             Some(prompt_render.clone()),
-            None,
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );
@@ -17713,7 +17502,6 @@ mod tests {
             None,
             None,
             Some(prompt_render),
-            None,
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );
