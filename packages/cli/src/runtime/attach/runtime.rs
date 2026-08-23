@@ -5388,7 +5388,7 @@ pub async fn retarget_attach_to_context(
     );
     let retarget_service_started = Instant::now();
     let geometry = current_attach_terminal_geometry();
-    let insets = resolved_attach_viewport_insets(geometry, view_state.status_position);
+    let insets = resolved_attach_viewport_insets(geometry);
     let attach_info = client
         .retarget_attach_context_with_insets(
             context_id,
@@ -7460,36 +7460,25 @@ struct AttachViewportInsets {
     left: u16,
 }
 
-fn resolved_attach_viewport_insets(
-    geometry: TerminalGeometry,
-    status_position: StatusPosition,
-) -> AttachViewportInsets {
+fn resolved_attach_viewport_insets(geometry: TerminalGeometry) -> AttachViewportInsets {
     let requests = global_plugin_layout_registry().requests();
-    resolved_attach_viewport_insets_for_requests(geometry, status_position, &requests)
+    resolved_attach_viewport_insets_for_requests(geometry, &requests)
 }
 
 fn resolved_attach_viewport_insets_for_requests(
     geometry: TerminalGeometry,
-    status_position: StatusPosition,
     requests: &[PluginLayoutRequest],
 ) -> AttachViewportInsets {
-    let (status_top, status_bottom) = status_insets_for_position(status_position);
     let viewport = ExtensionRect::new(0, 0, geometry.cols, geometry.rows);
-    let minimum_height = 1_u16
-        .saturating_add(status_top)
-        .saturating_add(status_bottom);
-    let remaining = resolve_plugin_layout(viewport, (1, minimum_height), requests)
+    let remaining = resolve_plugin_layout(viewport, (1, 1), requests)
         .map_or(viewport, |resolution| resolution.remaining);
     let remaining_right = remaining.x.saturating_add(remaining.w);
     let remaining_bottom = remaining.y.saturating_add(remaining.h);
 
     AttachViewportInsets {
-        top: remaining.y.saturating_add(status_top),
+        top: remaining.y,
         right: geometry.cols.saturating_sub(remaining_right),
-        bottom: geometry
-            .rows
-            .saturating_sub(remaining_bottom)
-            .saturating_add(status_bottom),
+        bottom: geometry.rows.saturating_sub(remaining_bottom),
         left: remaining.x,
     }
 }
@@ -9438,13 +9427,13 @@ pub async fn update_attach_viewport(
 pub async fn update_attach_viewport_with_geometry(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
-    status_position: StatusPosition,
+    _status_position: StatusPosition,
     geometry: TerminalGeometry,
 ) -> std::result::Result<(), ClientError> {
     if geometry.cols == 0 || geometry.rows == 0 {
         return Ok(());
     }
-    let insets = resolved_attach_viewport_insets(geometry, status_position);
+    let insets = resolved_attach_viewport_insets(geometry);
     client
         .attach_set_viewport_with_insets(
             session_id,
@@ -14464,14 +14453,13 @@ mod tests {
                 cols: 100,
                 rows: 30,
             },
-            StatusPosition::Top,
             &requests,
         );
 
         assert_eq!(
             insets,
             AttachViewportInsets {
-                top: 1,
+                top: 0,
                 right: 0,
                 bottom: 2,
                 left: 18,
@@ -14502,16 +14490,15 @@ mod tests {
 
         let insets = resolved_attach_viewport_insets_for_requests(
             TerminalGeometry { cols: 9, rows: 5 },
-            StatusPosition::Bottom,
             &requests,
         );
 
         assert_eq!(
             insets,
             AttachViewportInsets {
-                top: 3,
+                top: 4,
                 right: 0,
-                bottom: 1,
+                bottom: 0,
                 left: 8,
             }
         );
@@ -14541,7 +14528,6 @@ mod tests {
 
         let insets = resolved_attach_viewport_insets_for_requests(
             TerminalGeometry { cols: 80, rows: 24 },
-            StatusPosition::Bottom,
             &requests,
         );
 
@@ -14550,7 +14536,7 @@ mod tests {
             AttachViewportInsets {
                 top: 0,
                 right: 0,
-                bottom: 1,
+                bottom: 0,
                 left: 0,
             }
         );
@@ -14566,7 +14552,6 @@ mod tests {
 
         let insets = resolved_attach_viewport_insets_for_requests(
             TerminalGeometry { cols: 80, rows: 24 },
-            StatusPosition::Off,
             &requests,
         );
 
