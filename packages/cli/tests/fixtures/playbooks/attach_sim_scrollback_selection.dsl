@@ -1,7 +1,6 @@
 @driver attach-sim
 @viewport cols=100 rows=24
 
-seed-window-list names='one' active='one'
 seed-pane-text lines='one|  four|     five|  six' cursor_row=4 cursor_col=3
 
 send-attach key='ctrl+a ['

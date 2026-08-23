@@ -2,7 +2,6 @@
 @viewport cols=100 rows=24
 
 set-config path='status_bar.tab_order' value='mru'
-seed-window-list names='one,two,three' active='one'
 render
 locate id='one' text='1:one'
 locate id='three' text='3:three'

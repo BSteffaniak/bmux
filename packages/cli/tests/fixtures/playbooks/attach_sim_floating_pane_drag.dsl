@@ -1,7 +1,6 @@
 @driver attach-sim
 @viewport cols=100 rows=24
 
-seed-window-list names='one' active='one'
 seed-pane-layout split='floating'
 
 terminal-event kind=mouse phase=down button=left col=2 row=2

@@ -2120,18 +2120,8 @@ fn execute_attach_sim_step(
     snapshots: &mut Vec<SnapshotCapture>,
 ) -> Result<Option<String>> {
     match &step.action {
-        Action::SeedWindowList { names, active } => {
-            let resolved_names = names
-                .iter()
-                .map(|name| runtime_vars.resolve_opt(name))
-                .collect::<Vec<_>>();
-            let name_refs = resolved_names
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            let active = runtime_vars.resolve_opt(active);
-            sim.seed_window_list(&name_refs, &active);
-            Ok(Some(format!("seeded {} windows", resolved_names.len())))
+        Action::SeedWindowList { .. } => {
+            bail!("seed-window-list is obsolete; window presentation is plugin-owned")
         }
         Action::SeedPaneText {
             lines,
@@ -2211,18 +2201,6 @@ fn execute_attach_sim_step(
         }
         Action::SendAttach { key } => {
             let key = runtime_vars.resolve_opt(key);
-            // Overlays own keyboard input while open: the context menu first,
-            // then the inline tab editor, before keybindings.
-            if sim.tab_menu_active() {
-                let consumed = sim.send_menu_chord(&key);
-                return Ok(Some(format!("tab menu consumed key: {consumed}")));
-            }
-            // While the inline tab editor is open it owns keyboard input, so
-            // route chords into the editor instead of the keybinding layer.
-            if sim.tab_rename_active() {
-                let consumed = sim.send_rename_chord(&key);
-                return Ok(Some(format!("tab rename consumed {consumed} key(s)")));
-            }
             let emitted = sim.send_attach_chord(&key)?;
             Ok(Some(format!("emitted {} attach actions", emitted.len())))
         }
@@ -2250,14 +2228,18 @@ fn execute_attach_sim_step(
             let path = runtime_vars.resolve_opt(path);
             let expected = runtime_vars.resolve_opt(equals);
             let actual = match path.as_str() {
-                "windows.names" => serde_json::to_string(&sim.window_names())?,
-                "windows.active_name" => serde_json::to_string(&sim.active_window_name())?,
-                "status.tab_labels" => serde_json::to_string(&sim.rendered_tab_labels())?,
-                "tab_rename.active" => serde_json::to_string(&sim.tab_rename_active())?,
-                "tab_rename.text" => serde_json::to_string(&sim.tab_rename_text())?,
-                "tab_menu.open" => serde_json::to_string(&sim.tab_menu_active())?,
-                "tab_menu.items" => serde_json::to_string(&sim.tab_menu_items())?,
-                "tab_menu.focused" => serde_json::to_string(&sim.tab_menu_focused())?,
+                "windows.names"
+                | "windows.active_name"
+                | "status.tab_labels"
+                | "tab_rename.active"
+                | "tab_rename.text"
+                | "tab_menu.open"
+                | "tab_menu.items"
+                | "tab_menu.focused" => {
+                    bail!(
+                        "attach-sim window presentation state is obsolete; use plugin product tests"
+                    )
+                }
                 "scrollback.active" => serde_json::to_string(&sim.scrollback_active())?,
                 "help_overlay.open" => serde_json::to_string(&sim.help_overlay_open())?,
                 "help_overlay.scroll" => serde_json::to_string(&sim.help_overlay_scroll())?,
@@ -2295,28 +2277,7 @@ fn execute_attach_sim_step(
         Action::SetConfig { path, value } => {
             let path = runtime_vars.resolve_opt(path);
             let value = runtime_vars.resolve_opt(value);
-            match (path.as_str(), value.as_str()) {
-                ("status_bar.tab_order", "mru") => {
-                    sim.set_tab_order(bmux_config::StatusTabOrder::Mru);
-                }
-                ("status_bar.tab_order", "stable") => {
-                    sim.set_tab_order(bmux_config::StatusTabOrder::Stable);
-                }
-                ("appearance.status_position", "top") => {
-                    sim.set_status_position(bmux_config::StatusPosition::Top);
-                }
-                ("appearance.status_position", "bottom") => {
-                    sim.set_status_position(bmux_config::StatusPosition::Bottom);
-                }
-                ("appearance.status_position", "off") => {
-                    sim.set_status_position(bmux_config::StatusPosition::Off);
-                }
-                ("status_bar.tab_template", template) => {
-                    sim.set_tab_template(template);
-                }
-                _ => bail!("unsupported attach-sim config {path}={value}"),
-            }
-            Ok(Some(format!("{path}={value}")))
+            bail!("unsupported attach-sim config {path}={value}")
         }
         other => bail!(
             "action '{}' is not supported by @driver attach-sim",
@@ -2375,19 +2336,9 @@ const fn attach_sim_effect_operation(
     effect: &crate::runtime::attach::state::AttachUiEffect,
 ) -> &'static str {
     match effect {
-        crate::runtime::attach::state::AttachUiEffect::SwitchWindow { .. } => "switch-window",
-        crate::runtime::attach::state::AttachUiEffect::MoveWindow { .. } => "move-window",
-        crate::runtime::attach::state::AttachUiEffect::RenameWindow { .. } => "rename-window",
-        crate::runtime::attach::state::AttachUiEffect::CloseWindow { .. } => "close-window",
-        crate::runtime::attach::state::AttachUiEffect::NewWindow => "new-window",
-        crate::runtime::attach::state::AttachUiEffect::ResizePane { .. } => "resize-pane",
-        crate::runtime::attach::state::AttachUiEffect::FocusPane { .. } => "focus-pane",
-        crate::runtime::attach::state::AttachUiEffect::MoveFloatingPane { .. } => {
-            "move-floating-pane"
-        }
-        crate::runtime::attach::state::AttachUiEffect::ShowTransientStatus { .. } => {
-            "show-transient-status"
-        }
+        crate::runtime::attach::state::AttachUiEffect::Resize { .. } => "resize-pane",
+        crate::runtime::attach::state::AttachUiEffect::Focus { .. } => "focus-pane",
+        crate::runtime::attach::state::AttachUiEffect::MoveFloating { .. } => "move-floating-pane",
     }
 }
 

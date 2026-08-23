@@ -57,9 +57,6 @@ pub enum AttachCloseFallbackTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachInternalPromptAction {
     QuitSession,
-    CloseWindow {
-        context_id: Uuid,
-    },
     ClosePane {
         pane_id: Uuid,
     },

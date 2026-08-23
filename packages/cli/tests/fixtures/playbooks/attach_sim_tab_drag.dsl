@@ -1,7 +1,6 @@
 @driver attach-sim
 @viewport cols=100 rows=24
 
-seed-window-list names='one,two,three' active='one'
 render
 assert-rendered contains='one'
 

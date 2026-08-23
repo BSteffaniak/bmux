@@ -312,9 +312,7 @@ pub struct AttachViewState {
     pub force_cursor_move_next_frame: bool,
     pub mouse: AttachMouseState,
     /// Active inline tab rename editor, when a tab label is being edited.
-    pub tab_rename: Option<AttachTabRename>,
     /// Open tab context menu, when one has been summoned.
-    pub tab_menu: Option<AttachTabMenu>,
     pub visual_projection_updates: Vec<AttachVisualProjectionUpdate>,
     pub dirty: AttachDirtyFlags,
 
@@ -365,250 +363,25 @@ pub struct ClipboardSyncState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachPointerOwner {
     Plugin,
-    StatusTab,
     Resize,
     Floating,
     Selection,
 }
 
-/// Action a tab context-menu item performs when activated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachTabMenuAction {
-    Rename,
-    Close,
-    MoveLeft,
-    MoveRight,
-    MoveToFirst,
-    MoveToLast,
-    NewWindow,
-}
-
-impl AttachTabMenuAction {
-    /// Stable identifier, used by tests and playbook assertions.
-    #[must_use]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Rename => "rename",
-            Self::Close => "close",
-            Self::MoveLeft => "move-left",
-            Self::MoveRight => "move-right",
-            Self::MoveToFirst => "move-to-first",
-            Self::MoveToLast => "move-to-last",
-            Self::NewWindow => "new-window",
-        }
-    }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Rename => "Rename",
-            Self::Close => "Close",
-            Self::MoveLeft => "Move left",
-            Self::MoveRight => "Move right",
-            Self::MoveToFirst => "Move to first",
-            Self::MoveToLast => "Move to last",
-            Self::NewWindow => "New window",
-        }
-    }
-}
-
-/// One entry in the tab context menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AttachTabMenuItem {
-    pub action: AttachTabMenuAction,
-    /// Disabled entries render dimmed and cannot be activated. Position-based
-    /// moves are disabled (not hidden) at the ends so the menu keeps a stable
-    /// shape across tabs.
-    pub enabled: bool,
-}
-
-/// Open tab context menu, anchored at the click that opened it.
-#[derive(Debug, Clone)]
-pub struct AttachTabMenu {
-    /// Context (window) the menu acts on. Not necessarily the active window.
-    pub context_id: Uuid,
-    pub anchor_col: u16,
-    pub anchor_row: u16,
-    pub items: Vec<AttachTabMenuItem>,
-    pub focused: usize,
-}
-
-impl AttachTabMenu {
-    /// Build the menu for `context_id` given its position in the tab strip.
-    #[must_use]
-    pub fn new(
-        context_id: Uuid,
-        anchor_col: u16,
-        anchor_row: u16,
-        index: usize,
-        count: usize,
-    ) -> Self {
-        let first = index == 0;
-        let last = index + 1 >= count;
-        let items = vec![
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::Rename,
-                enabled: true,
-            },
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::Close,
-                enabled: true,
-            },
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::MoveLeft,
-                enabled: !first,
-            },
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::MoveRight,
-                enabled: !last,
-            },
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::MoveToFirst,
-                enabled: !first,
-            },
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::MoveToLast,
-                enabled: !last,
-            },
-            AttachTabMenuItem {
-                action: AttachTabMenuAction::NewWindow,
-                enabled: true,
-            },
-        ];
-        let focused = items
-            .iter()
-            .position(|item| item.enabled)
-            .unwrap_or_default();
-        Self {
-            context_id,
-            anchor_col,
-            anchor_row,
-            items,
-            focused,
-        }
-    }
-
-    /// Move focus by `delta`, skipping disabled entries and wrapping.
-    pub fn move_focus(&mut self, delta: isize) {
-        let len = self.items.len();
-        if len == 0 || !self.items.iter().any(|item| item.enabled) {
-            return;
-        }
-        let mut index = self.focused;
-        for _ in 0..len {
-            let next = isize::try_from(index).unwrap_or(0) + delta;
-            index = next.rem_euclid(isize::try_from(len).unwrap_or(1)) as usize;
-            if self.items.get(index).is_some_and(|item| item.enabled) {
-                self.focused = index;
-                return;
-            }
-        }
-    }
-
-    /// Focus the first or last enabled entry.
-    pub fn focus_edge(&mut self, last: bool) {
-        let found = if last {
-            self.items.iter().rposition(|item| item.enabled)
-        } else {
-            self.items.iter().position(|item| item.enabled)
-        };
-        if let Some(index) = found {
-            self.focused = index;
-        }
-    }
-
-    /// Currently focused action, when it is enabled.
-    #[must_use]
-    pub fn focused_action(&self) -> Option<AttachTabMenuAction> {
-        self.items
-            .get(self.focused)
-            .filter(|item| item.enabled)
-            .map(|item| item.action)
-    }
-
-    /// Rendered width, including borders and padding.
-    #[must_use]
-    pub fn width(&self) -> u16 {
-        let widest = self
-            .items
-            .iter()
-            .map(|item| item.action.label().chars().count())
-            .max()
-            .unwrap_or(0);
-        u16::try_from(widest.saturating_add(4)).unwrap_or(u16::MAX)
-    }
-
-    /// Rendered height, including borders.
-    #[must_use]
-    pub fn height(&self) -> u16 {
-        u16::try_from(self.items.len().saturating_add(2)).unwrap_or(u16::MAX)
-    }
-}
-
-/// Inline tab-label editor state.
-///
-/// While active, the edited tab renders the raw buffer text instead of its
-/// templated label, and keyboard input is routed to the buffer rather than the
-/// focused pane.
-#[derive(Debug, Clone)]
-pub struct AttachTabRename {
-    /// Context (window) being renamed.
-    pub context_id: Uuid,
-    /// Editable name buffer. Opens with the whole name selected so typing
-    /// replaces it, while arrow keys move to an insertion point instead.
-    pub buffer: bmux_text_edit::TextEditBuffer,
-    /// Name to restore when the edit is cancelled.
-    pub original: String,
-}
-
-impl AttachTabRename {
-    #[must_use]
-    pub fn new(context_id: Uuid, name: impl Into<String>) -> Self {
-        let original = name.into();
-        let mut buffer = bmux_text_edit::TextEditBuffer::from_text(original.clone());
-        buffer.select_all();
-        Self {
-            context_id,
-            buffer,
-            original,
-        }
-    }
-
-    /// Current buffer text.
-    #[must_use]
-    pub fn text(&self) -> &str {
-        self.buffer.text()
-    }
-
-    /// Trimmed committed name, or `None` when it is blank or unchanged.
-    #[must_use]
-    pub fn committed_name(&self) -> Option<String> {
-        let trimmed = self.buffer.text().trim();
-        if trimmed.is_empty() || trimmed == self.original {
-            return None;
-        }
-        Some(trimmed.to_string())
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
     pub config: MouseBehaviorConfig,
-    pub tab_drag_enabled: bool,
     pub last_position: Option<(u16, u16)>,
     pub last_event_at: Option<Instant>,
     pub hover_started_at: Option<Instant>,
     pub hovered_pane_id: Option<Uuid>,
-    /// Context id of the status-bar tab currently under the pointer.
-    pub hovered_tab_context_id: Option<Uuid>,
     /// Most recent left-button press cell and time, used to detect double clicks.
     pub last_click: Option<(u16, u16, Instant)>,
     pub last_focused_pane_id: Option<Uuid>,
     pub resize_drag: Option<AttachMouseResizeDrag>,
     pub floating_drag: Option<AttachMouseFloatingDrag>,
     pub selection_drag: Option<AttachMouseSelectionDrag>,
-    pub tab_drag: Option<AttachMouseTabDrag>,
     pub input_capture: Option<AttachInputHookCapture>,
     pub input_hook_last_dispatched_at: BTreeMap<String, Instant>,
 }
@@ -622,8 +395,6 @@ impl AttachMouseState {
             .is_some_and(|capture| capture.pointer)
         {
             Some(AttachPointerOwner::Plugin)
-        } else if self.tab_drag.is_some() {
-            Some(AttachPointerOwner::StatusTab)
         } else if self.resize_drag.is_some() {
             Some(AttachPointerOwner::Resize)
         } else if self.floating_drag.is_some() {
@@ -641,8 +412,7 @@ impl AttachMouseState {
             self.input_capture
                 .as_ref()
                 .is_some_and(|capture| capture.pointer),
-        ) + usize::from(self.tab_drag.is_some())
-            + usize::from(self.resize_drag.is_some())
+        ) + usize::from(self.resize_drag.is_some())
             + usize::from(self.floating_drag.is_some())
             + usize::from(self.selection_drag.is_some())
     }
@@ -663,8 +433,6 @@ impl AttachMouseState {
 
     pub(crate) fn clear_pointer_gestures(&mut self) {
         self.clear_plugin_pointer_capture();
-        self.tab_drag = None;
-        self.hovered_tab_context_id = None;
         // `last_click` is deliberately preserved: it is click *history* used for
         // double-click detection, not an in-flight gesture. Clearing it here
         // would break double-click, because arming a drag on the first press
@@ -686,31 +454,6 @@ impl AttachMouseState {
         debug_assert!(self.pointer_owner().is_none());
     }
 
-    /// Record a left-button press and report whether it completes a
-    /// double-click: the same cell pressed twice within
-    /// `behavior.mouse.double_click_ms`.
-    ///
-    /// A detected double-click consumes the stored click so a third press
-    /// starts a fresh sequence rather than chaining.
-    pub(crate) fn record_click_and_detect_double(
-        &mut self,
-        col: u16,
-        row: u16,
-        now: Instant,
-    ) -> bool {
-        let window = Duration::from_millis(self.config.double_click_ms);
-        let is_double = !window.is_zero()
-            && self.last_click.is_some_and(|(last_col, last_row, at)| {
-                last_col == col && last_row == row && now.saturating_duration_since(at) <= window
-            });
-        self.last_click = if is_double {
-            None
-        } else {
-            Some((col, row, now))
-        };
-        is_double
-    }
-
     pub(crate) fn debug_assert_single_pointer_owner(&self) {
         debug_assert!(self.has_single_pointer_owner());
     }
@@ -723,12 +466,6 @@ impl AttachMouseState {
 
         match owner {
             Some(AttachPointerOwner::Plugin) => {
-                self.tab_drag = None;
-                self.resize_drag = None;
-                self.floating_drag = None;
-                self.selection_drag = None;
-            }
-            Some(AttachPointerOwner::StatusTab) => {
                 self.resize_drag = None;
                 self.floating_drag = None;
                 self.selection_drag = None;
@@ -747,54 +484,11 @@ impl AttachMouseState {
     }
 }
 
-impl Default for AttachMouseState {
-    fn default() -> Self {
-        Self {
-            config: MouseBehaviorConfig::default(),
-            tab_drag_enabled: true,
-            last_position: None,
-            last_event_at: None,
-            hover_started_at: None,
-            hovered_pane_id: None,
-            hovered_tab_context_id: None,
-            last_click: None,
-            last_focused_pane_id: None,
-            resize_drag: None,
-            floating_drag: None,
-            selection_drag: None,
-            tab_drag: None,
-            input_capture: None,
-            input_hook_last_dispatched_at: BTreeMap::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachInputHookCapture {
     pub hook: AttachInputHook,
     pub pointer: bool,
     pub keyboard_keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AttachMouseTabDrag {
-    pub source_context_id: Uuid,
-    pub started_col: u16,
-    pub started_row: u16,
-    pub active: bool,
-    pub drop_target: Option<AttachTabDropTarget>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AttachTabDropTarget {
-    pub context_id: Uuid,
-    pub placement: AttachTabDropPlacement,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachTabDropPlacement {
-    Before,
-    After,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,37 +522,18 @@ impl AttachUiReduction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachUiEffect {
-    SwitchWindow {
-        target_context_id: Uuid,
-    },
-    MoveWindow {
-        source_context_id: Uuid,
-        target_context_id: Uuid,
-        placement: AttachTabDropPlacement,
-    },
-    RenameWindow {
-        context_id: Uuid,
-        name: String,
-    },
-    CloseWindow {
-        context_id: Uuid,
-    },
-    NewWindow,
-    ResizePane {
+    Resize {
         pane_id: Uuid,
         direction: PaneResizeDirection,
         cells: u16,
     },
-    FocusPane {
+    Focus {
         pane_id: Uuid,
     },
-    MoveFloatingPane {
+    MoveFloating {
         pane_id: Uuid,
         x: u16,
         y: u16,
-    },
-    ShowTransientStatus {
-        message: String,
     },
 }
 
@@ -948,8 +623,6 @@ impl AttachViewState {
                 config: MouseBehaviorConfig::default(),
                 ..AttachMouseState::default()
             },
-            tab_rename: None,
-            tab_menu: None,
             visual_projection_updates: Vec::new(),
             dirty: AttachDirtyFlags::default(),
             #[cfg(any(
@@ -1111,36 +784,6 @@ impl AttachViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_plugin::{AttachInputEndpoint, AttachInputHookFilter};
-
-    fn test_input_hook() -> AttachInputHook {
-        AttachInputHook {
-            id: "test-hook".to_string(),
-            owner_plugin_id: "test-plugin".to_string(),
-            priority: 0,
-            endpoint: AttachInputEndpoint {
-                capability: "test".to_string(),
-                interface_id: "test".to_string(),
-                operation: "test".to_string(),
-            },
-            filter: AttachInputHookFilter {
-                mouse_phases: Vec::new(),
-                keys: Vec::new(),
-                scope: "global".to_string(),
-                min_interval_ms: 0,
-            },
-        }
-    }
-
-    fn test_tab_drag() -> AttachMouseTabDrag {
-        AttachMouseTabDrag {
-            source_context_id: Uuid::from_u128(2),
-            started_col: 1,
-            started_row: 1,
-            active: false,
-            drop_target: None,
-        }
-    }
 
     fn test_floating_drag() -> AttachMouseFloatingDrag {
         AttachMouseFloatingDrag {
@@ -1176,96 +819,6 @@ mod tests {
             anchor: AttachScrollbackPosition { line: 0, col: 0 },
             active: false,
         }
-    }
-
-    #[test]
-    fn pointer_owner_derivation_covers_every_owner() {
-        let mut mouse = AttachMouseState::default();
-        assert_eq!(mouse.pointer_owner(), None);
-
-        mouse.selection_drag = Some(test_selection_drag());
-        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Selection));
-        mouse.selection_drag = None;
-
-        mouse.floating_drag = Some(test_floating_drag());
-        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Floating));
-        mouse.floating_drag = None;
-
-        mouse.resize_drag = Some(test_resize_drag());
-        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Resize));
-        mouse.resize_drag = None;
-
-        mouse.tab_drag = Some(test_tab_drag());
-        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::StatusTab));
-        mouse.tab_drag = None;
-
-        mouse.input_capture = Some(AttachInputHookCapture {
-            hook: test_input_hook(),
-            pointer: true,
-            keyboard_keys: Vec::new(),
-        });
-        assert_eq!(mouse.pointer_owner(), Some(AttachPointerOwner::Plugin));
-    }
-
-    #[test]
-    fn malformed_pointer_owners_are_normalized_by_precedence() {
-        let mut mouse = AttachMouseState {
-            tab_drag: Some(test_tab_drag()),
-            resize_drag: Some(test_resize_drag()),
-            floating_drag: Some(test_floating_drag()),
-            selection_drag: Some(test_selection_drag()),
-            ..AttachMouseState::default()
-        };
-        assert_eq!(mouse.pointer_owner_count(), 4);
-        assert_eq!(
-            mouse.normalize_pointer_owner(),
-            Some(AttachPointerOwner::StatusTab)
-        );
-        assert!(mouse.has_single_pointer_owner());
-        assert!(mouse.tab_drag.is_some());
-
-        mouse.input_capture = Some(AttachInputHookCapture {
-            hook: test_input_hook(),
-            pointer: true,
-            keyboard_keys: vec!["esc".to_string()],
-        });
-        mouse.tab_drag = Some(test_tab_drag());
-        mouse.resize_drag = Some(test_resize_drag());
-        mouse.floating_drag = Some(test_floating_drag());
-        mouse.selection_drag = Some(test_selection_drag());
-        assert_eq!(
-            mouse.normalize_pointer_owner(),
-            Some(AttachPointerOwner::Plugin)
-        );
-        assert!(mouse.has_single_pointer_owner());
-        assert!(mouse.input_capture.is_some());
-        assert!(mouse.tab_drag.is_none());
-        assert!(mouse.resize_drag.is_none());
-        assert!(mouse.floating_drag.is_none());
-        assert!(mouse.selection_drag.is_none());
-    }
-
-    #[test]
-    fn pointer_cancellation_preserves_keyboard_capture() {
-        let mut mouse = AttachMouseState {
-            tab_drag: Some(test_tab_drag()),
-            resize_drag: Some(test_resize_drag()),
-            floating_drag: Some(test_floating_drag()),
-            selection_drag: Some(test_selection_drag()),
-            input_capture: Some(AttachInputHookCapture {
-                hook: test_input_hook(),
-                pointer: true,
-                keyboard_keys: vec!["esc".to_string()],
-            }),
-            ..AttachMouseState::default()
-        };
-
-        mouse.clear_pointer_gestures();
-
-        assert_eq!(mouse.pointer_owner(), None);
-        let capture = mouse.input_capture.expect("keyboard capture should remain");
-        assert!(!capture.pointer);
-        assert_eq!(capture.keyboard_keys, ["esc"]);
     }
 
     #[test]

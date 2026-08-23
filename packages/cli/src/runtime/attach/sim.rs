@@ -8,12 +8,9 @@ use super::runtime::{
     build_attach_help_lines, continue_attach_builtin_pointer_owner, encode_bracketed_paste,
     focused_attach_pane_input_mode, handle_attach_ui_action_at, handle_help_overlay_key_event,
     maybe_begin_attach_mouse_selection_drag, reduce_attach_mouse_floating_drag_event,
-    reduce_attach_mouse_resize_event, reduce_attach_status_tab_mouse_event,
-    status_row_for_position,
+    reduce_attach_mouse_resize_event, status_row_for_position,
 };
-use super::state::{
-    AttachPointerOwner, AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer,
-};
+use super::state::{AttachPointerOwner, AttachUiEffect, AttachViewState, PaneRenderBuffer};
 use crate::input::{InputProcessor, RuntimeAction};
 #[cfg(test)]
 use crate::runtime::prompt::PromptRequest;
@@ -25,7 +22,7 @@ use bmux_attach_layout_protocol::{
     PaneLayoutNode, PaneState, PaneSummary,
 };
 use bmux_client::{AttachLayoutState, AttachOpenInfo};
-use bmux_config::{BmuxConfig, StatusBarConfig, StatusPosition, StatusTabOrder};
+use bmux_config::{BmuxConfig, StatusBarConfig};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -33,13 +30,6 @@ use crossterm::event::{
 };
 use std::time::Instant;
 use uuid::Uuid;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachSimWindow {
-    pub id: Uuid,
-    pub name: String,
-    pub active: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttachSimLocatedText {
@@ -53,7 +43,6 @@ pub struct AttachSimHarness {
     geometry: TerminalGeometry,
     status_config: StatusBarConfig,
     appearance: RuntimeAppearance,
-    windows: Vec<AttachSimWindow>,
     view_state: AttachViewState,
     input_processor: InputProcessor,
     effects: Vec<AttachUiEffect>,
@@ -64,21 +53,16 @@ pub struct AttachSimHarness {
 impl AttachSimHarness {
     pub fn new(cols: u16, rows: u16) -> Self {
         let session_id = Uuid::from_u128(1);
-        let status_config = StatusBarConfig {
-            tab_order: StatusTabOrder::Stable,
-            ..StatusBarConfig::default()
-        };
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
+        let status_config = StatusBarConfig::default();
+        let view_state = AttachViewState::new(AttachOpenInfo {
             context_id: None,
             session_id,
             can_write: true,
         });
-        view_state.mouse.tab_drag_enabled = true;
         Self {
             geometry: TerminalGeometry { cols, rows },
             status_config,
             appearance: RuntimeAppearance::default(),
-            windows: Vec::new(),
             view_state,
             input_processor: InputProcessor::new(crate::input::Keymap::default_runtime(), false),
             effects: Vec::new(),
@@ -87,192 +71,9 @@ impl AttachSimHarness {
         }
     }
 
-    pub fn seed_window_list(&mut self, names: &[&str], active: &str) {
-        self.windows = names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| AttachSimWindow {
-                id: Uuid::from_u128(u128::try_from(index).unwrap_or(0) + 1),
-                name: (*name).to_string(),
-                active: *name == active,
-            })
-            .collect();
-        self.view_state.attached_context_id = self
-            .windows
-            .iter()
-            .find(|window| window.active)
-            .map(|window| window.id);
-        self.sync_cached_window_list();
-        self.render();
-    }
-
-    /// Mirror the simulated window list into `cached_window_list`, matching what
-    /// the windows plugin publishes in production so code reading the cache
-    /// (such as the inline rename editor) behaves the same under simulation.
-    fn sync_cached_window_list(&mut self) {
-        use bmux_windows_plugin_api::windows_list::{WindowListEntry, WindowListSnapshot};
-        let snapshot = WindowListSnapshot {
-            windows: self
-                .windows
-                .iter()
-                .map(|window| WindowListEntry {
-                    id: window.id,
-                    name: window.name.clone(),
-                    active: window.active,
-                })
-                .collect(),
-            revision: 0,
-        };
-        self.view_state.cached_window_list = Some(std::sync::Arc::new(snapshot));
-    }
-
-    pub fn set_tab_order(&mut self, order: StatusTabOrder) {
-        self.status_config.tab_order = order;
-        self.view_state.mouse.tab_drag_enabled = !matches!(order, StatusTabOrder::Mru);
-        self.render();
-    }
-
-    pub fn set_status_position(&mut self, position: StatusPosition) {
-        self.view_state.status_position = position;
-        self.render();
-    }
-
     pub fn resize_viewport(&mut self, cols: u16, rows: u16) {
         self.geometry = TerminalGeometry { cols, rows };
         self.render();
-    }
-
-    pub fn set_tab_template(&mut self, template: &str) {
-        self.status_config.tab_template = Some(template.to_string());
-        self.render();
-    }
-
-    /// Text currently shown in the inline tab rename editor, if open.
-    pub fn tab_rename_text(&self) -> Option<&str> {
-        self.view_state
-            .tab_rename
-            .as_ref()
-            .map(super::state::AttachTabRename::text)
-    }
-
-    pub const fn tab_rename_active(&self) -> bool {
-        self.view_state.tab_rename.is_some()
-    }
-
-    /// Column of the inline editor cursor in the last rendered status line.
-    /// Feed a chord (or literal text) into the inline tab rename editor.
-    ///
-    /// Returns the number of key events applied.
-    /// Whether the tab context menu is open.
-    pub const fn tab_menu_active(&self) -> bool {
-        self.view_state.tab_menu.is_some()
-    }
-
-    /// Enabled menu item ids, in display order.
-    pub fn tab_menu_items(&self) -> Vec<String> {
-        self.view_state
-            .tab_menu
-            .as_ref()
-            .map_or_else(Vec::new, |menu| {
-                menu.items
-                    .iter()
-                    .map(|item| {
-                        if item.enabled {
-                            item.action.id().to_string()
-                        } else {
-                            format!("{}:disabled", item.action.id())
-                        }
-                    })
-                    .collect()
-            })
-    }
-
-    /// Id of the focused menu item.
-    pub fn tab_menu_focused(&self) -> Option<String> {
-        let menu = self.view_state.tab_menu.as_ref()?;
-        menu.items
-            .get(menu.focused)
-            .map(|item| item.action.id().to_string())
-    }
-
-    /// Feed a chord into the open context menu.
-    pub fn send_menu_chord(&mut self, chord: &str) -> bool {
-        use super::input::TerminalKeyCode;
-        let code = match chord {
-            "Enter" | "enter" => TerminalKeyCode::Enter,
-            "Esc" | "esc" | "Escape" => TerminalKeyCode::Esc,
-            "Up" | "up" => TerminalKeyCode::Up,
-            "Down" | "down" => TerminalKeyCode::Down,
-            "Home" | "home" => TerminalKeyCode::Home,
-            "End" | "end" => TerminalKeyCode::End,
-            other => {
-                let Some(ch) = other.chars().next().filter(|_| other.chars().count() == 1) else {
-                    return false;
-                };
-                TerminalKeyCode::Char(ch)
-            }
-        };
-        let key = super::input::TerminalKeyEvent {
-            code,
-            modifiers: super::input::TerminalModifiers::default(),
-            kind: super::input::TerminalKeyPhase::Press,
-        };
-        let Some(reduction) =
-            super::runtime::handle_attach_tab_menu_key_event(&mut self.view_state, &key)
-        else {
-            return false;
-        };
-        for effect in reduction.effects {
-            self.apply_effect(effect);
-        }
-        self.render();
-        true
-    }
-
-    pub fn send_rename_chord(&mut self, chord: &str) -> usize {
-        use super::input::TerminalKeyCode;
-
-        let code = match chord {
-            "Enter" | "enter" => Some(TerminalKeyCode::Enter),
-            "Esc" | "esc" | "Escape" => Some(TerminalKeyCode::Esc),
-            "Backspace" | "backspace" => Some(TerminalKeyCode::Backspace),
-            "Delete" | "delete" => Some(TerminalKeyCode::Delete),
-            "Left" | "left" => Some(TerminalKeyCode::Left),
-            "Right" | "right" => Some(TerminalKeyCode::Right),
-            "Home" | "home" => Some(TerminalKeyCode::Home),
-            "End" | "end" => Some(TerminalKeyCode::End),
-            _ => None,
-        };
-        let mut applied = 0usize;
-        if let Some(code) = code {
-            self.send_rename_key(&super::input::TerminalKeyEvent {
-                code,
-                modifiers: super::input::TerminalModifiers::default(),
-                kind: super::input::TerminalKeyPhase::Press,
-            });
-            return 1;
-        }
-        // Otherwise treat the chord as literal text to type.
-        for ch in chord.chars() {
-            self.send_rename_key(&super::input::TerminalKeyEvent {
-                code: TerminalKeyCode::Char(ch),
-                modifiers: super::input::TerminalModifiers::default(),
-                kind: super::input::TerminalKeyPhase::Press,
-            });
-            applied += 1;
-        }
-        applied
-    }
-
-    pub fn send_rename_key(&mut self, key: &super::input::TerminalKeyEvent) {
-        if let Some(reduction) =
-            super::runtime::handle_attach_tab_rename_key_event(&mut self.view_state, key)
-        {
-            for effect in reduction.effects {
-                self.apply_effect(effect);
-            }
-            self.render();
-        }
     }
 
     pub fn render(&mut self) -> &AttachStatusLine {
@@ -332,21 +133,6 @@ impl AttachSimHarness {
             self.view_state.mouse.clear_mutation_pointer_gestures();
         }
 
-        // An open context menu owns the pointer, matching production ordering.
-        if self.view_state.tab_menu.is_some()
-            && let Some(reduction) = super::runtime::handle_attach_tab_menu_mouse_event(
-                &mut self.view_state,
-                event,
-                self.geometry,
-            )
-        {
-            for effect in reduction.effects {
-                self.apply_effect(effect);
-            }
-            self.render();
-            return;
-        }
-
         let mut reduction = match self.view_state.mouse.pointer_owner() {
             Some(AttachPointerOwner::Plugin) => return,
             _ => match continue_attach_builtin_pointer_owner(
@@ -356,12 +142,7 @@ impl AttachSimHarness {
                 self.geometry,
             ) {
                 AttachPointerContinuation::Owned(reduction) => reduction,
-                AttachPointerContinuation::Unowned => reduce_attach_status_tab_mouse_event(
-                    &mut self.view_state,
-                    event,
-                    self.geometry,
-                    self.clock.now(),
-                ),
+                AttachPointerContinuation::Unowned => super::state::AttachUiReduction::ignored(),
             },
         };
         if !reduction.consumed {
@@ -480,7 +261,7 @@ impl AttachSimHarness {
 
     #[cfg(test)]
     pub fn focus_pane(&mut self, pane_id: Uuid) {
-        self.apply_effect(AttachUiEffect::FocusPane { pane_id });
+        self.apply_effect(AttachUiEffect::Focus { pane_id });
     }
 
     #[cfg(test)]
@@ -942,46 +723,6 @@ impl AttachSimHarness {
         &self.effects
     }
 
-    pub fn window_names(&self) -> Vec<String> {
-        self.windows
-            .iter()
-            .map(|window| window.name.clone())
-            .collect()
-    }
-
-    pub fn active_window_name(&self) -> Option<&str> {
-        self.windows
-            .iter()
-            .find(|window| window.active)
-            .map(|window| window.name.as_str())
-    }
-
-    /// Rendered text of each visible tab, taken from its hitbox columns so the
-    /// result reflects the resolved tab template.
-    pub fn rendered_tab_labels(&self) -> Vec<String> {
-        let Some(status_line) = self.view_state.cached_status_line.as_ref() else {
-            return Vec::new();
-        };
-        let plain = status_line
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        let cells = plain.chars().collect::<Vec<_>>();
-        let mut hitboxes = status_line.tab_hitboxes.iter().collect::<Vec<_>>();
-        hitboxes.sort_by_key(|hitbox| hitbox.start_col);
-        hitboxes
-            .into_iter()
-            .filter_map(|hitbox| {
-                let start = usize::from(hitbox.start_col);
-                let end = usize::from(hitbox.end_col);
-                cells
-                    .get(start..=end)
-                    .map(|token| token.iter().collect::<String>().trim().to_string())
-            })
-            .collect()
-    }
-
     pub fn scrollback_active(&self) -> bool {
         self.view_state.scrollback_active()
     }
@@ -1013,29 +754,7 @@ impl AttachSimHarness {
     }
 
     pub fn locate_text(&self, text: &str) -> Option<AttachSimLocatedText> {
-        let status_line = self.view_state.cached_status_line.as_ref()?;
-        for (index, window) in self.windows.iter().enumerate() {
-            // Accept either the bare window name or the legacy indexed form so
-            // fixtures keep working across tab-template changes.
-            let indexed_label = format!("{}:{}", index + 1, window.name);
-            if text == indexed_label || text == window.name {
-                let hitbox = status_line
-                    .tab_hitboxes
-                    .iter()
-                    .find(|hitbox| hitbox.context_id == window.id)?;
-                return Some(AttachSimLocatedText {
-                    start_col: hitbox.start_col,
-                    end_col: hitbox.end_col,
-                    center_col: hitbox
-                        .start_col
-                        .saturating_add(hitbox.end_col.saturating_sub(hitbox.start_col) / 2),
-                    row: status_row_for_position(
-                        self.view_state.status_position,
-                        self.geometry.rows,
-                    )?,
-                });
-            }
-        }
+        self.view_state.cached_status_line.as_ref()?;
         let rendered = self.rendered();
         let start = rendered.find(text)?;
         let end = start.checked_add(text.len())?.checked_sub(1)?;
@@ -1051,64 +770,8 @@ impl AttachSimHarness {
 
     fn apply_effect(&mut self, effect: AttachUiEffect) {
         match effect.clone() {
-            AttachUiEffect::SwitchWindow { target_context_id } => {
-                for window in &mut self.windows {
-                    window.active = window.id == target_context_id;
-                }
-                self.view_state.attached_context_id = Some(target_context_id);
-            }
-            AttachUiEffect::MoveWindow {
-                source_context_id,
-                target_context_id,
-                placement,
-            } => {
-                reorder_windows(
-                    &mut self.windows,
-                    source_context_id,
-                    target_context_id,
-                    placement,
-                );
-                self.sync_cached_window_list();
-            }
-            AttachUiEffect::RenameWindow { context_id, name } => {
-                if let Some(window) = self.windows.iter_mut().find(|w| w.id == context_id) {
-                    window.name = name;
-                }
-                self.sync_cached_window_list();
-            }
-            AttachUiEffect::CloseWindow { context_id } => {
-                self.windows.retain(|window| window.id != context_id);
-                if !self.windows.iter().any(|window| window.active)
-                    && let Some(first) = self.windows.first_mut()
-                {
-                    first.active = true;
-                }
-                self.view_state.attached_context_id = self
-                    .windows
-                    .iter()
-                    .find(|window| window.active)
-                    .map(|window| window.id);
-                self.sync_cached_window_list();
-            }
-            AttachUiEffect::NewWindow => {
-                let id = Uuid::from_u128(
-                    u128::try_from(self.windows.len())
-                        .unwrap_or(0)
-                        .saturating_add(1000),
-                );
-                for window in &mut self.windows {
-                    window.active = false;
-                }
-                self.windows.push(AttachSimWindow {
-                    id,
-                    name: format!("tab-{}", self.windows.len().saturating_add(1)),
-                    active: true,
-                });
-                self.view_state.attached_context_id = Some(id);
-                self.sync_cached_window_list();
-            }
-            AttachUiEffect::ResizePane { .. } | AttachUiEffect::ShowTransientStatus { .. } => {}
-            AttachUiEffect::FocusPane { pane_id } => {
+            AttachUiEffect::Resize { .. } => {}
+            AttachUiEffect::Focus { pane_id } => {
                 if let Some(layout_state) = &mut self.view_state.cached_layout_state {
                     layout_state.focused_pane_id = pane_id;
                     layout_state.scene.focus = AttachFocusTarget::Pane { pane_id };
@@ -1118,7 +781,7 @@ impl AttachSimHarness {
                 }
                 self.view_state.mouse.last_focused_pane_id = Some(pane_id);
             }
-            AttachUiEffect::MoveFloatingPane { pane_id, x, y } => {
+            AttachUiEffect::MoveFloating { pane_id, x, y } => {
                 if let Some(layout_state) = &mut self.view_state.cached_layout_state {
                     for surface in &mut layout_state.scene.surfaces {
                         if surface.pane_id == Some(pane_id)
@@ -1201,35 +864,6 @@ fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
     })
-}
-
-fn reorder_windows(
-    windows: &mut Vec<AttachSimWindow>,
-    source_context_id: Uuid,
-    target_context_id: Uuid,
-    placement: AttachTabDropPlacement,
-) {
-    if source_context_id == target_context_id {
-        return;
-    }
-    let Some(source_index) = windows
-        .iter()
-        .position(|window| window.id == source_context_id)
-    else {
-        return;
-    };
-    let source = windows.remove(source_index);
-    let Some(mut target_index) = windows
-        .iter()
-        .position(|window| window.id == target_context_id)
-    else {
-        windows.insert(source_index.min(windows.len()), source);
-        return;
-    };
-    if matches!(placement, AttachTabDropPlacement::After) {
-        target_index = target_index.saturating_add(1);
-    }
-    windows.insert(target_index.min(windows.len()), source);
 }
 
 #[cfg(test)]
@@ -1375,26 +1009,6 @@ mod tests {
         assert!(sim.effects().is_empty());
     }
 
-    fn right_mouse(phase: TerminalMousePhase, col: u16, row: u16) -> TerminalMouseEvent {
-        TerminalMouseEvent {
-            phase,
-            button: Some(super::super::input::TerminalMouseButton::Right),
-            col,
-            row,
-            modifiers: TerminalModifiers::default(),
-        }
-    }
-
-    #[test]
-    fn attach_sim_right_click_off_the_strip_is_ignored() {
-        let mut sim = AttachSimHarness::new(100, 24);
-        sim.seed_window_list(&["one", "two"], "one");
-
-        // Right-click in pane content: bmux must not open a tab menu there.
-        sim.send_mouse(right_mouse(TerminalMousePhase::Down, 10, 5));
-        assert!(!sim.tab_menu_active());
-    }
-
     #[test]
     fn attach_sim_send_attach_drives_scrollback_selection() {
         let mut sim = AttachSimHarness::new(100, 24);
@@ -1454,7 +1068,7 @@ mod tests {
         assert!(
             !sim.effects()
                 .iter()
-                .any(|effect| matches!(effect, AttachUiEffect::ResizePane { .. }))
+                .any(|effect| matches!(effect, AttachUiEffect::Resize { .. }))
         );
     }
 
@@ -1470,7 +1084,7 @@ mod tests {
         assert!(sim.effects().iter().any(|effect| {
             matches!(
                 effect,
-                AttachUiEffect::ResizePane {
+                AttachUiEffect::Resize {
                     direction:
                         bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
                     cells: 3,
@@ -1494,7 +1108,7 @@ mod tests {
         assert!(sim.effects().iter().any(|effect| {
             matches!(
                 effect,
-                AttachUiEffect::ResizePane {
+                AttachUiEffect::Resize {
                     direction:
                         bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
                     cells: 3,
@@ -1532,7 +1146,7 @@ mod tests {
         sim.send_mouse(left_mouse(TerminalMousePhase::Up, 15, 8));
 
         assert!(sim.effects().iter().any(|effect| {
-            matches!(effect, AttachUiEffect::MoveFloatingPane { pane_id, .. } if *pane_id == Uuid::from_u128(32))
+            matches!(effect, AttachUiEffect::MoveFloating { pane_id, .. } if *pane_id == Uuid::from_u128(32))
         }));
         assert!(sim.forwarded_mouse_bytes().is_empty());
         assert_eq!(sim.pointer_owner(), None);
@@ -1550,7 +1164,7 @@ mod tests {
         assert!(sim.effects().iter().any(|effect| {
             matches!(
                 effect,
-                AttachUiEffect::MoveFloatingPane {
+                AttachUiEffect::MoveFloating {
                     pane_id,
                     x: 6,
                     y: 4,

@@ -1,7 +1,6 @@
 @driver attach-sim
 @viewport cols=100 rows=24
 
-seed-window-list names='one' active='one'
 
 send-attach key='ctrl+a ?'
 assert-state path='help_overlay.open' equals='true'

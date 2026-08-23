@@ -2,7 +2,6 @@
 @viewport cols=100 rows=24
 
 set-config path='appearance.status_position' value='top'
-seed-window-list names='one,two,three' active='one'
 render
 locate id='one' text='1:one'
 locate id='three' text='3:three'
