@@ -2030,7 +2030,6 @@ pub struct FrameDamage {
     vacated_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
     extension_query_surfaces: BTreeSet<Uuid>,
     extension_query: bool,
-    status: bool,
     overlay: bool,
 }
 
@@ -2046,7 +2045,6 @@ impl FrameDamage {
             vacated_surface_rects: BTreeMap::new(),
             extension_query_surfaces: BTreeSet::new(),
             extension_query: false,
-            status: true,
             overlay: true,
         }
     }
@@ -2066,7 +2064,6 @@ impl FrameDamage {
             && self.vacated_surface_rects.is_empty()
             && self.extension_query_surfaces.is_empty()
             && !self.extension_query
-            && !self.status
             && !self.overlay
     }
 
@@ -2183,10 +2180,6 @@ impl FrameDamage {
         }
     }
 
-    pub const fn mark_status(&mut self) {
-        self.status = true;
-    }
-
     pub const fn mark_overlay(&mut self) {
         self.overlay = true;
     }
@@ -2212,11 +2205,6 @@ impl FrameDamage {
     #[must_use]
     pub fn extension_query_requested(&self) -> bool {
         self.extension_query || !self.extension_query_surfaces.is_empty()
-    }
-
-    #[must_use]
-    pub const fn status_damaged(&self) -> bool {
-        self.full_frame || self.status
     }
 
     #[must_use]
@@ -2289,7 +2277,6 @@ impl FrameDamage {
             self.mark_extension_surface_query(*surface_id);
         }
         self.extension_query |= other.extension_query;
-        self.status |= other.status;
         self.overlay |= other.overlay;
     }
 
@@ -2447,8 +2434,8 @@ pub fn frame_damage_overlay_rects(
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
-    top_inset: u16,
-    bottom_inset: u16,
+    _top_inset: u16,
+    _bottom_inset: u16,
 ) -> Vec<DamageRect> {
     let (terminal_width, terminal_height) = terminal_size;
     let mut rects = Vec::new();
@@ -2459,28 +2446,6 @@ pub fn frame_damage_overlay_rects(
             terminal_size,
         );
         return rects;
-    }
-
-    if frame_damage.status {
-        if top_inset > 0 {
-            push_overlay_rect(
-                &mut rects,
-                DamageRect::new(0, 0, terminal_width, top_inset),
-                terminal_size,
-            );
-        }
-        if bottom_inset > 0 {
-            push_overlay_rect(
-                &mut rects,
-                DamageRect::new(
-                    0,
-                    terminal_height.saturating_sub(bottom_inset),
-                    terminal_width,
-                    bottom_inset,
-                ),
-                terminal_size,
-            );
-        }
     }
 
     for surface in scene
@@ -4458,13 +4423,13 @@ fn cleanup_removed_retained_terminal_graphics<W: io::Write>(
 fn queue_full_frame_content_clear<W: io::Write>(
     stdout: &mut W,
     terminal_size: (u16, u16),
-    status_insets: (u16, u16),
+    viewport_insets: (u16, u16),
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
     render_trace: &mut Option<&mut AttachRenderTrace>,
 ) -> Result<()> {
     let (cols, rows) = terminal_size;
-    let (top_inset, bottom_inset) = status_insets;
+    let (top_inset, bottom_inset) = viewport_insets;
     let clear_start = top_inset.min(rows);
     let clear_end = rows.saturating_sub(bottom_inset).max(clear_start);
     for y in clear_start..clear_end {
@@ -4571,7 +4536,7 @@ struct PaneContentRenderStage<'a> {
 struct RenderFrameOutputPlan<'a> {
     full_frame_clear: bool,
     terminal_size: (u16, u16),
-    status_insets: (u16, u16),
+    viewport_insets: (u16, u16),
     surfaces: Vec<SurfaceOutputPlan<'a>>,
 }
 
@@ -4645,7 +4610,7 @@ fn build_render_frame_output_plan<'a>(
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
-    status_insets: (u16, u16),
+    viewport_insets: (u16, u16),
     scrollback_views: &PaneScrollbackViews,
     runtime_appearance: &'a RuntimeAppearance,
     damage_policy: DamageCoalescingPolicy,
@@ -4699,7 +4664,7 @@ fn build_render_frame_output_plan<'a>(
     RenderFrameOutputPlan {
         full_frame_clear,
         terminal_size,
-        status_insets,
+        viewport_insets,
         surfaces,
     }
 }
@@ -4921,7 +4886,7 @@ fn execute_render_frame_output_plan<W: io::Write>(
         queue_full_frame_content_clear(
             stdout,
             plan.terminal_size,
-            plan.status_insets,
+            plan.viewport_insets,
             pane_buffers,
             render_stats,
             render_trace,
@@ -5600,9 +5565,9 @@ mod tests {
         coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
         execute_pane_content_row_output_plan, frame_damage_overlay_render_ops, opaque_row_text,
         optimize_terminal_commands, previous_extension_snapshot_cleanup_damage,
-        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
-        queue_render_ops, queue_render_ops_with_capabilities, queue_render_style,
-        render_attach_scene, render_attach_scene_with_stats_and_trace, render_grid_row_segment,
+        queue_frame_damage_overlay, queue_layer_fill, queue_render_ops,
+        queue_render_ops_with_capabilities, queue_render_style, render_attach_scene,
+        render_attach_scene_with_stats_and_trace, render_grid_row_segment,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -7105,40 +7070,6 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(ops[0], RenderOp::Border { rect, .. } if rect == ExtensionRect::new(3, 2, 3, 1))
-        );
-    }
-
-    #[test]
-    fn queue_frame_damage_overlay_records_semantic_trace() {
-        let mut damage = FrameDamage::default();
-        damage.mark_status();
-        let scene = AttachScene {
-            session_id: Uuid::from_u128(9),
-            focus: AttachFocusTarget::None,
-            surfaces: Vec::new(),
-        };
-        let mut bytes = Vec::new();
-        let mut trace = AttachRenderTrace::new();
-
-        assert!(
-            queue_frame_damage_overlay_with_trace(
-                &mut bytes,
-                &scene,
-                &damage,
-                (20, 5),
-                1,
-                0,
-                Some(&mut trace),
-            )
-            .expect("damage overlay should queue")
-        );
-
-        assert_eq!(
-            trace.ops(),
-            &[AttachRenderTraceOp::DamageOverlay {
-                rects: 1,
-                cells: 20,
-            }]
         );
     }
 

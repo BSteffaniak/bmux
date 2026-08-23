@@ -95,17 +95,16 @@ The layout `order` values define deterministic composition when both plugins
 are enabled. For example, the defaults allocate the tab strip before the
 sidebar. Reversing the numeric values allocates the sidebar first.
 
-## Current compatibility behavior
+## Removed legacy status placement
 
-The legacy `[status_bar]` configuration continues to control the legacy attach
-status modules during migration. Presentation plugin settings are deliberately
-separate and do not reinterpret legacy keys. To avoid duplicate horizontal
-window tabs while using `bmux.tab_strip`, set:
+Legacy `appearance.status_position` no longer controls attach geometry and is
+rejected with a migration diagnostic. Configure the tab strip directly instead:
 
 ```toml
-[status_bar]
-enabled = false
+[plugins.settings."bmux.tab_strip"]
+placement = "top" # or "bottom"
 ```
 
-This compatibility note remains necessary until the legacy status modules and
-tab projection have fully migrated to plugin-owned surfaces.
+Legacy `[status_bar]` configuration has been removed and is rejected with a
+migration diagnostic. Configure normal attach presentation through the
+`bmux.tab_strip` and `bmux.sidebar` plugin settings documented above.

@@ -3281,6 +3281,38 @@ fn plugin_presentation_primitives_remain_domain_neutral() {
 }
 
 #[test]
+fn removed_attach_status_architecture_stays_removed() {
+    let repo = repo_root();
+    let sources = [
+        "packages/attach-layout-protocol/src/lib.rs",
+        "packages/attach-view-protocol/src/lib.rs",
+        "packages/attach_pipeline/src/compositor.rs",
+        "packages/attach_pipeline/src/render.rs",
+        "packages/cli/src/runtime/attach/runtime.rs",
+        "packages/cli/src/runtime/attach/state.rs",
+        "packages/config/src/lib.rs",
+        "plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl",
+    ];
+    for path in sources {
+        let source = std::fs::read_to_string(repo.join(path)).expect("architecture source");
+        for denied in [
+            "StatusPosition",
+            "StatusBarConfig",
+            "AttachLayer::Status",
+            "AttachViewComponent::Status",
+            "status_needs_redraw",
+            "status_top_inset",
+            "status_bottom_inset",
+        ] {
+            assert!(
+                !production_section(&source).contains(denied),
+                "{path} must not reintroduce removed attach status marker {denied}",
+            );
+        }
+    }
+}
+
+#[test]
 fn presentation_plugins_own_product_projection_and_interaction() {
     let repo = repo_root();
     let tab = std::fs::read_to_string(repo.join("plugins/tab-strip-plugin/src/lib.rs"))

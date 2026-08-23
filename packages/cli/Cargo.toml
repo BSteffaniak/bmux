@@ -187,7 +187,6 @@ tracing-subscriber = { workspace = true, features = [
     "fmt",
     "std",
 ] }
-unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -763,7 +763,6 @@ interface pane-runtime-events {
         scene,
         surface-content,
         layout,
-        status,
     }
 
     variant pane-event {

@@ -11,7 +11,6 @@ mod pane_runtime_client;
 mod runtime;
 pub(crate) mod sandbox_meta;
 mod ssh_access;
-mod status;
 
 pub mod attach;
 pub mod input;

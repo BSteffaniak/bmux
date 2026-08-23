@@ -71,88 +71,7 @@ pub(crate) fn generate_config_reference() -> String {
         .env_overrides(env_overrides)
         .toml_table_headings()
         .option_column_label("Option")
-        .section_appendix("status_bar", render_status_preset_examples())
         .render()
-}
-
-fn render_status_preset_examples() -> String {
-    let mut s = String::from("## Status Bar Preset Examples\n\n");
-    s.push_str("### Tab Rail (recommended)\n\n");
-    s.push_str(
-        "```toml\n\
-[status_bar]\n\
-enabled = true\n\
-preset = \"tab_rail\"\n\
-tab_scope = \"all_contexts\"\n\
-tab_order = \"stable\"\n\
-tab_label_max_width = 22\n\
-tab_template = \"{index}:{name}\"\n\
-show_mode = true\n\
-show_role = true\n\
-show_follow = true\n\
-show_hint = true\n\
-hover_highlight = true\n\
-hint_policy = \"scroll_only\"\n\
-\n\
-[status_bar.layout]\n\
-density = \"cozy\"\n\
-left_padding = 1\n\
-right_padding = 1\n\
-tab_gap = 1\n\
-module_gap = 1\n\
-overflow_style = \"arrows\"\n\
-align_active = \"keep_visible\"\n\
-\n\
-[status_bar.style]\n\
-separator_set = \"angled_segments\"\n\
-prefer_unicode = true\n\
-force_ascii = false\n\
-dim_inactive = true\n\
-bold_active = true\n\
-underline_active = false\n\
-```\n\n",
-    );
-    s.push_str("### Minimal\n\n");
-    s.push_str(
-        "```toml\n\
-[status_bar]\n\
-enabled = true\n\
-preset = \"minimal\"\n\
-tab_scope = \"all_contexts\"\n\
-tab_order = \"stable\"\n\
-tab_template = \"{name}\"\n\
-show_follow = false\n\
-show_hint = true\n\
-hint_policy = \"scroll_only\"\n\
-\n\
-[status_bar.layout]\n\
-density = \"compact\"\n\
-tab_gap = 1\n\
-module_gap = 1\n\
-overflow_style = \"count\"\n\
-align_active = \"keep_visible\"\n\
-\n\
-[status_bar.style]\n\
-separator_set = \"plain\"\n\
-prefer_unicode = false\n\
-force_ascii = true\n\
-dim_inactive = true\n\
-bold_active = false\n\
-underline_active = false\n\
-```\n\n",
-    );
-    s.push_str("### Status Color Override (partial)\n\n");
-    s.push_str(
-        "```toml\n\
-[status_bar.colors]\n\
-# Unset fields inherit from the runtime appearance defaults\n\
-tab_active_bg = \"#7aa2f7\"\n\
-tab_active_fg = \"#1a1b26\"\n\
-tab_inactive_bg = \"#2a2f45\"\n\
-module_bg = \"#343a55\"\n\
-```\n\n",
-    );
-    s
 }
 
 // ── CLI reference generation from clap Command tree ─────────────────────────
@@ -206,9 +125,6 @@ mod tests {
         assert!(doc.contains("images.decode_mode"));
         assert!(doc.contains("compression.remote"));
         assert!(doc.contains("export.cursor"));
-        assert!(doc.contains("layout.density"));
-        assert!(doc.contains("style.separator_set"));
-        assert!(doc.contains("colors.tab_active_bg"));
         assert!(doc.contains("routing.conflict_mode"));
         assert!(doc.contains("routing.required_paths.<index>.path"));
         assert!(doc.contains("routing.required_namespaces.<index>.namespace"));

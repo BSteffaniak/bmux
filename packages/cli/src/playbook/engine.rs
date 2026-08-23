@@ -823,7 +823,7 @@ impl PlaybookRenderTraceState {
             damage_area_cells: damage_stats.rect_area_cells,
             full_surface_fallbacks: damage_stats.full_surface_count,
             full_frame_fallback: damage.is_full_frame(),
-            status_rendered: damage.status_damaged() && !damage.is_full_frame(),
+            status_rendered: false,
             overlay_rendered: damage.overlay_damaged() && !damage.is_full_frame(),
         };
         let surface_panes = trace_surface_pane_indexes(&layout);

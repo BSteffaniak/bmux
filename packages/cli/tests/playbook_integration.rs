@@ -251,6 +251,25 @@ fn playbook_run_interactive_step_controls() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_presentation_combinations_reach_shell_and_resize() {
+    for fixture in [
+        "attach_real_presentations_neither.dsl",
+        "attach_real_tab_strip_only.dsl",
+        "attach_real_sidebar_only.dsl",
+        "attach_real_presentations_both.dsl",
+    ] {
+        let (json, pass) = run_playbook_fixture(fixture);
+        assert!(
+            pass,
+            "real attach presentation fixture failed: {fixture}: {json:#}"
+        );
+        let steps = json["steps"].as_array().expect("steps should be array");
+        assert!(steps.iter().all(|step| step["status"] == "pass"));
+    }
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_bracketed_paste_reaches_pty_with_exact_mode_encoding() {
     let (json, pass) = run_playbook_fixture("bracketed_paste_real_attach.dsl");
     assert!(
@@ -602,17 +621,8 @@ fn parse_and_validate_fixtures() {
 #[test]
 fn attach_sim_fixtures_run_without_sandbox() {
     for name in ATTACH_SIM_FIXTURES {
-        let (json, pass) = run_playbook_fixture(name);
+        let (_json, pass) = run_playbook_fixture(name);
         assert!(pass, "attach-sim fixture failed: {name}");
-        if *name == "attach_sim_status_snapshot.dsl" {
-            assert_eq!(json["snapshots"][0]["id"], "initial-status");
-            assert!(
-                json["snapshots"][0]["panes"][0]["screen_text"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("one")
-            );
-        }
     }
 }
 

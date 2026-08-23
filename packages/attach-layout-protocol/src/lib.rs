@@ -26,7 +26,6 @@ pub struct AttachRect {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AttachLayer {
-    Status,
     Pane,
     Overlay,
     FloatingPane,

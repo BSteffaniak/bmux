@@ -1,5 +1,4 @@
 use crate::input::RuntimeAction;
-use crate::status::AttachStatusLine;
 use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachMouseProtocolState, AttachScene, AttachSurface,
@@ -13,7 +12,7 @@ use bmux_attach_pipeline::{
     TerminalGraphicsCache,
 };
 use bmux_client::AttachLayoutState;
-use bmux_config::{MouseBehaviorConfig, StatusPosition};
+use bmux_config::MouseBehaviorConfig;
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
@@ -61,7 +60,6 @@ pub enum AttachDirtySource {
     LayoutChanged,
     FocusChanged,
     SceneChanged,
-    StatusChanged,
     PromptOverlay,
     HelpOverlay,
     AppearanceChanged,
@@ -75,15 +73,12 @@ pub enum AttachDirtySource {
     Scrollback,
     Selection,
     ProfileChanged,
-    ControlCatalogChanged,
-    PaneLifecycle,
     FollowTargetChanged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachDirtyKind {
     Pane,
-    Status,
     Overlay,
     FullFrame,
     Extension,
@@ -101,9 +96,10 @@ pub struct AttachDirtyEvent {
 #[allow(clippy::struct_excessive_bools)] // Dirty flags are independent repaint/fetch toggles.
 #[derive(Debug, Clone)]
 pub struct AttachDirtyFlags {
-    pub status_needs_redraw: bool,
     pub layout_needs_refresh: bool,
     pub overlay_needs_redraw: bool,
+    /// Owner-scoped retained surface snapshots changed and must be reconciled.
+    pub retained_surfaces_need_reconcile: bool,
     pub pane_dirty_ids: BTreeSet<Uuid>,
     pub full_pane_redraw: bool,
     /// Generic surface/plugin-render damage. This asks render
@@ -119,9 +115,9 @@ pub struct AttachDirtyFlags {
 impl Default for AttachDirtyFlags {
     fn default() -> Self {
         Self {
-            status_needs_redraw: true,
             layout_needs_refresh: true,
             overlay_needs_redraw: false,
+            retained_surfaces_need_reconcile: true,
             pane_dirty_ids: BTreeSet::new(),
             full_pane_redraw: true,
             extension_needs_redraw: true,
@@ -150,11 +146,6 @@ impl AttachDirtyFlags {
         self.push_event(source, AttachDirtyKind::Pane, Some(pane_id));
     }
 
-    pub fn mark_status_dirty(&mut self, source: AttachDirtySource) {
-        self.status_needs_redraw = true;
-        self.push_event(source, AttachDirtyKind::Status, None);
-    }
-
     pub fn mark_overlay_dirty(&mut self, source: AttachDirtySource) {
         self.overlay_needs_redraw = true;
         self.push_event(source, AttachDirtyKind::Overlay, None);
@@ -163,6 +154,11 @@ impl AttachDirtyFlags {
     pub fn mark_full_frame(&mut self, source: AttachDirtySource) {
         self.full_pane_redraw = true;
         self.push_event(source, AttachDirtyKind::FullFrame, None);
+    }
+
+    pub fn mark_retained_surfaces_dirty(&mut self, source: AttachDirtySource) {
+        self.retained_surfaces_need_reconcile = true;
+        self.push_event(source, AttachDirtyKind::Extension, None);
     }
 
     pub fn mark_extension_dirty(&mut self, source: AttachDirtySource) {
@@ -184,16 +180,6 @@ impl AttachDirtyFlags {
     pub fn mark_layout_frame_dirty(&mut self, source: AttachDirtySource) {
         self.mark_layout_refresh(source);
         self.mark_full_frame(source);
-    }
-
-    pub fn mark_layout_frame_and_status_dirty(&mut self, source: AttachDirtySource) {
-        self.mark_layout_frame_dirty(source);
-        self.mark_status_dirty(source);
-    }
-
-    pub fn mark_layout_refresh_and_status_dirty(&mut self, source: AttachDirtySource) {
-        self.mark_layout_refresh(source);
-        self.mark_status_dirty(source);
     }
 
     pub fn merge_precise_damage(&mut self, damage: &FrameDamage, source: AttachDirtySource) {
@@ -224,9 +210,6 @@ impl AttachDirtyFlags {
             let _ = scene;
             damage.mark_extension_query();
         }
-        if self.status_needs_redraw {
-            damage.mark_status();
-        }
         if self.overlay_needs_redraw {
             damage.mark_overlay();
         }
@@ -235,8 +218,8 @@ impl AttachDirtyFlags {
 
     #[must_use]
     pub fn needs_render(&self) -> bool {
-        self.status_needs_redraw
-            || self.full_pane_redraw
+        self.full_pane_redraw
+            || self.retained_surfaces_need_reconcile
             || self.extension_needs_redraw
             || self.overlay_needs_redraw
             || !self.precise_frame_damage.is_empty()
@@ -245,6 +228,7 @@ impl AttachDirtyFlags {
 
     pub fn clear_frame_damage(&mut self) {
         self.full_pane_redraw = false;
+        self.retained_surfaces_need_reconcile = false;
         self.extension_needs_redraw = false;
         self.overlay_needs_redraw = false;
         self.precise_frame_damage = FrameDamage::default();
@@ -262,7 +246,6 @@ pub struct AttachViewState {
     pub bracketed_paste_enabled: bool,
     pub ui_mode: AttachUiMode,
     pub active_mode_id: String,
-    pub active_mode_label: String,
     /// Per-pane scrollback view positions. A pane is in scrollback if and only
     /// if it has an entry here, so the state cannot follow focus between panes.
     ///
@@ -295,11 +278,11 @@ pub struct AttachViewState {
     pub clipboard_sync_state: ClipboardSyncState,
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
-    pub status_position: StatusPosition,
-    pub cached_status_line: Option<AttachStatusLine>,
     pub cached_layout_state: Option<AttachLayoutState>,
     pub last_attach_view_revision: Option<(Uuid, u64)>,
     pub retained_compositor: RetainedCompositor,
+    /// IDs of owner-scoped plugin surfaces committed into the retained graph.
+    pub retained_plugin_surface_ids: BTreeSet<Uuid>,
     pub plugin_pointer_router: Box<RetainedPointerRouter>,
     pub plugin_focus: RetainedFocusState,
     /// Opaque overlay coverage used to occlude pane terminal graphics on the
@@ -588,7 +571,6 @@ impl AttachViewState {
             bracketed_paste_enabled: false,
             ui_mode: AttachUiMode::Normal,
             active_mode_id: "normal".to_string(),
-            active_mode_label: "NORMAL".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
             scrollback_replay_pending: false,
             help_overlay_open: false,
@@ -607,11 +589,10 @@ impl AttachViewState {
             clipboard_sync_state: ClipboardSyncState::default(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
-            status_position: StatusPosition::Bottom,
-            cached_status_line: None,
             cached_layout_state: None,
             last_attach_view_revision: None,
             retained_compositor: RetainedCompositor::new(),
+            retained_plugin_surface_ids: BTreeSet::new(),
             plugin_pointer_router: Box::default(),
             plugin_focus: RetainedFocusState::default(),
             opaque_overlay_rects: Vec::new(),
@@ -677,8 +658,6 @@ impl AttachViewState {
     ) {
         self.transient_status = Some(message.into());
         self.transient_status_until = Some(now + ttl);
-        self.dirty
-            .mark_status_dirty(AttachDirtySource::StatusChanged);
     }
 
     pub fn clear_expired_transient_status(&mut self, now: Instant) -> bool {
@@ -690,19 +669,7 @@ impl AttachViewState {
         }
         self.transient_status = None;
         self.transient_status_until = None;
-        self.dirty
-            .mark_status_dirty(AttachDirtySource::StatusChanged);
         true
-    }
-
-    pub fn transient_status_text(&self, now: Instant) -> Option<&str> {
-        if self
-            .transient_status_until
-            .is_some_and(|until| now >= until)
-        {
-            return None;
-        }
-        self.transient_status.as_deref()
     }
 
     /// Pane that keyboard scrollback actions apply to.

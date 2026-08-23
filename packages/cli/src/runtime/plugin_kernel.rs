@@ -540,7 +540,6 @@ pub(super) fn core_provided_capabilities() -> Vec<HostScope> {
         "bmux.config.read",
         "bmux.events.subscribe",
         "bmux.key_actions",
-        "bmux.status_bar_items",
         "bmux.storage",
         "bmux.logs.write",
         "bmux.clients.read",

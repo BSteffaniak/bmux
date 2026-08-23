@@ -112,6 +112,18 @@ row erases, cell grids, borders, clipping, opacity, and semantic input regions
 all lower through this path. Terminal graphics remain runtime-owned rather than
 unbounded bytes embedded in a plugin surface snapshot.
 
+The pane-decoration compatibility path remains intentionally separate from
+independent presentation surfaces. `DecorationScene` carries decoration-owned
+semantic borders and terminal-graphics lowering that bounded `RenderOp`
+snapshots deliberately exclude; `decoration-plugin-renderer` is therefore the
+single adapter from that typed contract into retained render-extension scene
+items. Its imperative callbacks are compatibility fallbacks for unsupported
+terminal capabilities, not a second tab/sidebar surface implementation.
+Generic render extensions likewise remain the lower-level mechanism for
+pane-relative before/after-content effects and capability-aware terminal
+graphics. Product presentation plugins must use owner-scoped layout/surface
+snapshots instead.
+
 ## Design principles
 
 1. **Core is domain-agnostic.** `packages/server`, `packages/client`,

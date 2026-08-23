@@ -565,6 +565,70 @@ impl PluginSurfaceRegistry {
         Ok(PluginSurfacePublishOutcome::Applied)
     }
 
+    /// Publish a complete owner snapshot, advancing its revision atomically when
+    /// another producer for the same in-process companion has already moved it
+    /// forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same ownership, identity, and resource-limit failures as
+    /// [`Self::publish`].
+    pub fn publish_advancing(
+        &self,
+        owner_plugin_id: &str,
+        mut snapshot: PluginSurfaceSnapshot,
+    ) -> Result<PluginSurfacePublishOutcome, PluginSurfacePublishError> {
+        let mut snapshots = self
+            .snapshots
+            .write()
+            .map_err(|_| PluginSurfacePublishError::ConflictingRevision)?;
+        if let Some(current) = snapshots.get(owner_plugin_id)
+            && snapshot.revision <= current.revision
+            && snapshot != *current
+        {
+            snapshot.revision = current.revision.saturating_add(1).max(1);
+            for surface in &mut snapshot.surfaces {
+                surface.revision = snapshot.revision;
+            }
+        }
+        validate_snapshot(
+            owner_plugin_id,
+            &snapshot,
+            self.maximum_surfaces_per_owner,
+            self.maximum_retained_items_per_surface,
+            self.maximum_text_bytes,
+            self.maximum_snapshot_bytes,
+        )?;
+        if snapshots
+            .get(owner_plugin_id)
+            .is_some_and(|current| snapshot == *current)
+        {
+            return Ok(PluginSurfacePublishOutcome::Unchanged);
+        }
+        let retained_ids = snapshots
+            .iter()
+            .filter(|(owner, _)| owner.as_str() != owner_plugin_id)
+            .flat_map(|(_, current)| {
+                current
+                    .surfaces
+                    .iter()
+                    .map(|surface| surface.id.retained_id)
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(retained_id) = snapshot
+            .surfaces
+            .iter()
+            .map(|surface| surface.id.retained_id)
+            .find(|retained_id| retained_ids.contains(retained_id))
+        {
+            return Err(PluginSurfacePublishError::DuplicateRetainedId { retained_id });
+        }
+        snapshots.insert(owner_plugin_id.to_owned(), snapshot);
+        drop(snapshots);
+        self.notify_changed();
+        Ok(PluginSurfacePublishOutcome::Applied)
+    }
+
     pub fn remove_owner(&self, owner_plugin_id: &str) -> bool {
         let removed = self
             .snapshots

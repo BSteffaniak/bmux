@@ -4,6 +4,7 @@ mod display_capture;
 pub mod events;
 pub mod input;
 pub mod layout;
+mod local_presentation;
 pub mod prompt_ui;
 pub mod provider;
 pub mod render;

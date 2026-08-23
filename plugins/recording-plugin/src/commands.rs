@@ -1651,10 +1651,23 @@ fn event_kinds_include_custom(kinds: &[RecordingEventKind]) -> bool {
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
+struct PerfTimingSummary {
+    samples: usize,
+    p50_ms: u64,
+    p95_ms: u64,
+    p99_ms: u64,
+    max_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
 struct PerfAnalysisReport {
     total_events: usize,
     custom_events: usize,
+    /// Stable alias consumed by perf-audit tooling.
+    perf_events: usize,
     counters: BTreeMap<String, u64>,
+    timings_ms: BTreeMap<String, PerfTimingSummary>,
+    attach_window_counters: BTreeMap<String, u64>,
     hints: Vec<String>,
     custom_events_captured: bool,
 }
@@ -1664,6 +1677,8 @@ fn analyze_perf_events(
     custom_events_captured: bool,
 ) -> PerfAnalysisReport {
     let mut counters = BTreeMap::new();
+    let mut timing_samples = BTreeMap::<String, Vec<u64>>::new();
+    let mut attach_window_counters = BTreeMap::new();
     let mut custom_events = 0usize;
     for event in events {
         if let RecordingPayload::Custom {
@@ -1681,8 +1696,27 @@ fn analyze_perf_events(
                 && let Some(object) = value.as_object()
             {
                 for (key, value) in object {
+                    if name == "attach.window"
+                        && key == "render_ms_samples"
+                        && let Some(samples) = value.as_array()
+                    {
+                        timing_samples
+                            .entry("render_ms_max".to_string())
+                            .or_default()
+                            .extend(samples.iter().filter_map(serde_json::Value::as_u64));
+                        continue;
+                    }
                     if let Some(count) = value.as_u64() {
                         *counters.entry(format!("{name}.{key}")).or_insert(0) += count;
+                        if name == "attach.frame.trace" && key == "frame_render_ms" {
+                            timing_samples
+                                .entry("render_ms_max".to_string())
+                                .or_default()
+                                .push(count);
+                        }
+                        if name == "attach.window" {
+                            attach_window_counters.insert(key.clone(), count);
+                        }
                     }
                 }
             }
@@ -1697,13 +1731,38 @@ fn analyze_perf_events(
     } else if custom_events == 0 {
         hints.push("no bmux.perf custom events were found".to_string());
     }
+    let timings_ms = timing_samples
+        .into_iter()
+        .map(|(name, mut samples)| {
+            samples.sort_unstable();
+            let summary = PerfTimingSummary {
+                samples: samples.len(),
+                p50_ms: percentile_nearest_rank(&samples, 50),
+                p95_ms: percentile_nearest_rank(&samples, 95),
+                p99_ms: percentile_nearest_rank(&samples, 99),
+                max_ms: samples.last().copied().unwrap_or(0),
+            };
+            (name, summary)
+        })
+        .collect();
     PerfAnalysisReport {
         total_events: events.len(),
         custom_events,
+        perf_events: custom_events,
         counters,
+        timings_ms,
+        attach_window_counters,
         hints,
         custom_events_captured,
     }
+}
+
+fn percentile_nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
+    sorted[rank.saturating_sub(1).min(sorted.len().saturating_sub(1))]
 }
 
 fn print_perf_analysis_text(report: &PerfAnalysisReport) {

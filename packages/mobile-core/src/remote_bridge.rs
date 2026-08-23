@@ -1550,7 +1550,6 @@ const fn plugin_attach_view_component(
             AttachViewComponent::SurfaceContent
         }
         pane_runtime_events::AttachViewComponent::Layout => AttachViewComponent::Layout,
-        pane_runtime_events::AttachViewComponent::Status => AttachViewComponent::Status,
     }
 }
 

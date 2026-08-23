@@ -10,5 +10,4 @@ pub enum AttachViewComponent {
     Scene,
     SurfaceContent,
     Layout,
-    Status,
 }

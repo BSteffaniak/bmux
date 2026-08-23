@@ -340,7 +340,6 @@ pub(crate) fn emit_attach_view_changed_for_layout(session_id: SessionId) {
             AttachViewComponent::Scene,
             AttachViewComponent::SurfaceContent,
             AttachViewComponent::Layout,
-            AttachViewComponent::Status,
         ],
     });
 }

@@ -1660,7 +1660,7 @@ pub enum ConfigCommand {
     },
     /// Get a configuration value by dotted key path
     Get {
-        /// Dotted key path (e.g. status_bar.max_tabs, behavior.mouse.enabled)
+        /// Dotted key path (e.g. plugins.settings.bmux.tab_strip.height, behavior.mouse.enabled)
         key: String,
         /// Print output as JSON
         #[arg(long)]
@@ -1668,7 +1668,7 @@ pub enum ConfigCommand {
     },
     /// Set a configuration value in the config file
     Set {
-        /// Dotted key path (e.g. status_bar.max_tabs, behavior.mouse.enabled)
+        /// Dotted key path (e.g. plugins.settings.bmux.tab_strip.height, behavior.mouse.enabled)
         key: String,
         /// Value to set (booleans, integers, and strings are auto-detected)
         value: String,

@@ -588,13 +588,44 @@ fn resolve_config_override_path(value: &std::ffi::OsStr) -> PathBuf {
     std::env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(path.clone()))
 }
 
+fn reject_removed_presentation_settings(value: &toml::Value, path: &str) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    for (key, child) in table {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        if key == "status_bar" && path.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: child_path,
+                value: "removed; configure plugins.settings.\"bmux.tab_strip\" or plugins.settings.\"bmux.sidebar\" instead"
+                    .to_string(),
+            });
+        }
+        if key == "status_position" && path.ends_with("appearance") {
+            return Err(ConfigError::InvalidValue {
+                field: child_path,
+                value: "removed; configure plugins.settings.\"bmux.tab_strip\".placement instead"
+                    .to_string(),
+            });
+        }
+        reject_removed_presentation_settings(child, &child_path)?;
+    }
+    Ok(())
+}
+
 fn load_toml_file(path: &std::path::Path) -> Result<toml::Value> {
     let contents = std::fs::read_to_string(path).map_err(|error| ConfigError::ReadError {
         error: format!("{} ({})", error, path.display()),
     })?;
-    toml::from_str(&contents).map_err(|error| ConfigError::ParseError {
+    let value = toml::from_str(&contents).map_err(|error| ConfigError::ParseError {
         error: format!("{} ({})", error, path.display()),
-    })
+    })?;
+    reject_removed_presentation_settings(&value, "")?;
+    Ok(value)
 }
 
 fn merged_raw_config_value_with_overrides(
@@ -967,7 +998,7 @@ pub struct BmuxConfig {
     /// Local server process and gateway listener settings
     #[config_doc(nested)]
     pub server: ServerConfig,
-    /// Visual styling: pane borders, status bar placement, and window titles
+    /// Visual styling: pane borders and window titles
     #[config_doc(nested)]
     pub appearance: AppearanceConfig,
     /// Runtime behavior toggles for terminal protocol handling, layout persistence, and build compatibility
@@ -988,9 +1019,6 @@ pub struct BmuxConfig {
     /// Clipboard integration and remote sync behavior
     #[config_doc(nested)]
     pub clipboard: ClipboardConfig,
-    /// Content and layout of the status bar displayed at the top or bottom of the terminal
-    #[config_doc(nested)]
-    pub status_bar: StatusBarConfig,
     /// Session recording for terminal replay, debugging, and playbook generation
     #[config_doc(nested)]
     pub recording: RecordingConfig,
@@ -1945,14 +1973,11 @@ impl Default for ServerGatewayConfig {
     }
 }
 
-/// Visual styling: pane borders, status bar placement, and window titles
+/// Visual styling: pane borders and window titles
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "appearance")]
 #[serde(default)]
 pub struct AppearanceConfig {
-    /// Where to render the status bar. TOP places it above panes, BOTTOM below
-    /// panes, and OFF hides it entirely.
-    pub status_position: StatusPosition,
     /// Drawing style for pane borders. NONE hides borders entirely, giving
     /// panes the full terminal width.
     pub pane_border_style: BorderStyle,
@@ -2216,24 +2241,6 @@ fn validate_server_gateway_config(gateway: &ServerGatewayConfig) -> Result<()> {
             value: "enabled gateway requires quick = true or cert_file and key_file".to_string(),
         });
     }
-    Ok(())
-}
-
-fn validate_status_bar_config(status_bar: &StatusBarConfig) -> Result<()> {
-    if status_bar.max_tabs == Some(0) {
-        return Err(ConfigError::InvalidValue {
-            field: "status_bar.max_tabs".to_string(),
-            value: "0".to_string(),
-        });
-    }
-
-    if status_bar.tab_label_max_width == 0 {
-        return Err(ConfigError::InvalidValue {
-            field: "status_bar.tab_label_max_width".to_string(),
-            value: "0".to_string(),
-        });
-    }
-
     Ok(())
 }
 
@@ -2676,312 +2683,6 @@ pub struct RequiredPathClaim {
     pub path: Vec<String>,
     /// Optional owner plugin ID; when omitted, any plugin may own the path.
     pub owner: Option<String>,
-}
-
-/// Content and layout of the status bar displayed at the top or bottom
-/// of the terminal.
-#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
-#[config_doc(section = "status_bar")]
-#[serde(default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct StatusBarConfig {
-    /// Enable status bar rendering in attach UI.
-    pub enabled: bool,
-    /// High-level status bar visual preset.
-    pub preset: StatusBarPreset,
-    /// Layout and spacing options.
-    #[config_doc(nested)]
-    pub layout: StatusBarLayoutConfig,
-    /// Separator and emphasis options.
-    #[config_doc(nested)]
-    pub style: StatusBarStyleConfig,
-    /// Optional status-specific color overrides.
-    #[config_doc(nested)]
-    pub colors: StatusBarColorConfig,
-    /// Optional hard cap on tabs shown in the tab strip before overflow is
-    /// collapsed. When unset, the tab strip fills the available status-bar
-    /// width and only collapses tabs that do not fit.
-    pub max_tabs: Option<usize>,
-    /// Maximum display width for each tab label.
-    pub tab_label_max_width: usize,
-    /// Template used to render each tab label.
-    ///
-    /// Supported placeholders: `{name}` (window name), `{index}` (1-based
-    /// position), `{index0}` (0-based position), `{session}` (session name),
-    /// and `{marker}` (`*` for the active tab). Unknown placeholders render
-    /// literally; use `{{` and `}}` for literal braces.
-    ///
-    /// When unset, defaults to `{name}`, or `{index}:{name}` if the deprecated
-    /// `show_tab_index` is enabled.
-    pub tab_template: Option<String>,
-    /// Deprecated: display 1-based tab indexes before labels. Prefer
-    /// `tab_template = "{index}:{name}"`.
-    pub show_tab_index: Option<bool>,
-    /// Which context set to render as tabs.
-    pub tab_scope: StatusTabScope,
-    /// How tab entries are ordered when rendered.
-    pub tab_order: StatusTabOrder,
-    /// Display the active session name in the status bar.
-    pub show_session_name: bool,
-    /// Display the current context label in the status bar.
-    pub show_context_name: bool,
-    /// Display the current interaction mode (Normal, Scroll, Help, etc.).
-    pub show_mode: bool,
-    /// Display the current attach role (write/read-only).
-    pub show_role: bool,
-    /// Display follow target details when following another client.
-    pub show_follow: bool,
-    /// Display runtime hints on the right side.
-    pub show_hint: bool,
-    /// Highlight the tab under the mouse cursor.
-    pub hover_highlight: bool,
-    /// Hint visibility policy.
-    pub hint_policy: StatusHintPolicy,
-}
-
-impl Default for StatusBarConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            preset: StatusBarPreset::TabRail,
-            layout: StatusBarLayoutConfig::default(),
-            style: StatusBarStyleConfig::default(),
-            colors: StatusBarColorConfig::default(),
-            max_tabs: None,
-            tab_label_max_width: 20,
-            tab_template: None,
-            show_tab_index: None,
-            tab_scope: StatusTabScope::AllContexts,
-            tab_order: StatusTabOrder::Stable,
-            show_session_name: false,
-            show_context_name: false,
-            show_mode: true,
-            show_role: true,
-            show_follow: true,
-            show_hint: true,
-            hover_highlight: true,
-            hint_policy: StatusHintPolicy::ScrollOnly,
-        }
-    }
-}
-
-/// Default tab label template: just the window name.
-pub const DEFAULT_STATUS_TAB_TEMPLATE: &str = "{name}";
-/// Tab label template equivalent to the deprecated `show_tab_index = true`.
-pub const INDEXED_STATUS_TAB_TEMPLATE: &str = "{index}:{name}";
-
-impl StatusBarConfig {
-    /// Resolve the effective tab label template.
-    ///
-    /// An explicit `tab_template` always wins. Otherwise the deprecated
-    /// `show_tab_index` flag selects between the indexed and plain templates so
-    /// existing configurations keep their appearance.
-    #[must_use]
-    pub fn resolved_tab_template(&self) -> &str {
-        match self.tab_template.as_deref() {
-            Some(template) => template,
-            None if self.show_tab_index == Some(true) => INDEXED_STATUS_TAB_TEMPLATE,
-            None => DEFAULT_STATUS_TAB_TEMPLATE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc, Default)]
-#[serde(default)]
-pub struct StatusBarColorConfig {
-    /// Bar background color (hex `#RRGGBB`).
-    pub bar_bg: Option<String>,
-    /// Bar foreground color (hex `#RRGGBB`).
-    pub bar_fg: Option<String>,
-    /// Active tab background color (hex `#RRGGBB`).
-    pub tab_active_bg: Option<String>,
-    /// Active tab foreground color (hex `#RRGGBB`).
-    pub tab_active_fg: Option<String>,
-    /// Inactive tab background color (hex `#RRGGBB`).
-    pub tab_inactive_bg: Option<String>,
-    /// Inactive tab foreground color (hex `#RRGGBB`).
-    pub tab_inactive_fg: Option<String>,
-    /// Hovered inactive tab background color (hex `#RRGGBB`). Derived from
-    /// `tab_inactive_bg` when unset.
-    pub tab_hover_bg: Option<String>,
-    /// Hovered inactive tab foreground color (hex `#RRGGBB`).
-    pub tab_hover_fg: Option<String>,
-    /// Hovered active tab background color (hex `#RRGGBB`). Derived from
-    /// `tab_active_bg` when unset.
-    pub tab_active_hover_bg: Option<String>,
-    /// Hovered active tab foreground color (hex `#RRGGBB`).
-    pub tab_active_hover_fg: Option<String>,
-    /// Right-side module background color (hex `#RRGGBB`).
-    pub module_bg: Option<String>,
-    /// Right-side module foreground color (hex `#RRGGBB`).
-    pub module_fg: Option<String>,
-    /// Overflow marker background color (hex `#RRGGBB`).
-    pub overflow_bg: Option<String>,
-    /// Overflow marker foreground color (hex `#RRGGBB`).
-    pub overflow_fg: Option<String>,
-}
-
-impl StatusBarColorConfig {
-    #[must_use]
-    pub const fn config_doc_values() -> &'static [&'static str] {
-        &[]
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
-#[serde(default)]
-pub struct StatusBarLayoutConfig {
-    /// Spacing density for tabs and right modules.
-    pub density: StatusDensity,
-    /// Left padding before first tab.
-    pub left_padding: usize,
-    /// Right padding after final segment.
-    pub right_padding: usize,
-    /// Number of spaces between tabs.
-    pub tab_gap: usize,
-    /// Number of spaces between right-side modules.
-    pub module_gap: usize,
-    /// Overflow indicator style when tabs are hidden.
-    pub overflow_style: StatusOverflowStyle,
-    /// Behavior used to keep the active tab visible.
-    pub align_active: StatusAlignActive,
-}
-
-impl StatusBarLayoutConfig {
-    #[must_use]
-    pub const fn config_doc_values() -> &'static [&'static str] {
-        &[]
-    }
-}
-
-impl Default for StatusBarLayoutConfig {
-    fn default() -> Self {
-        Self {
-            density: StatusDensity::Cozy,
-            left_padding: 1,
-            right_padding: 1,
-            tab_gap: 1,
-            module_gap: 1,
-            overflow_style: StatusOverflowStyle::Arrows,
-            align_active: StatusAlignActive::KeepVisible,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
-#[serde(default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct StatusBarStyleConfig {
-    /// Separator character set for tabs and modules.
-    pub separator_set: StatusSeparatorSet,
-    /// Prefer Unicode separators when available.
-    pub prefer_unicode: bool,
-    /// Force ASCII separators even when Unicode is enabled.
-    pub force_ascii: bool,
-    /// Dim inactive tabs for stronger active emphasis.
-    pub dim_inactive: bool,
-    /// Bold active tabs for stronger active emphasis.
-    pub bold_active: bool,
-    /// Underline active tabs.
-    pub underline_active: bool,
-}
-
-impl StatusBarStyleConfig {
-    #[must_use]
-    pub const fn config_doc_values() -> &'static [&'static str] {
-        &[]
-    }
-}
-
-impl Default for StatusBarStyleConfig {
-    fn default() -> Self {
-        Self {
-            separator_set: StatusSeparatorSet::AngledSegments,
-            prefer_unicode: true,
-            force_ascii: false,
-            dim_inactive: true,
-            bold_active: true,
-            underline_active: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusBarPreset {
-    #[default]
-    TabRail,
-    Minimal,
-    Classic,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusDensity {
-    Compact,
-    #[default]
-    Cozy,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusOverflowStyle {
-    Count,
-    #[default]
-    Arrows,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusAlignActive {
-    #[default]
-    KeepVisible,
-    FocusBias,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusSeparatorSet {
-    #[default]
-    AngledSegments,
-    Plain,
-    Ascii,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusTabScope {
-    #[default]
-    AllContexts,
-    SessionContexts,
-    Mru,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusTabOrder {
-    #[default]
-    Stable,
-    Mru,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusHintPolicy {
-    #[default]
-    Always,
-    ScrollOnly,
-    Never,
-}
-
-/// Status bar position
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, ConfigDocEnum)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum StatusPosition {
-    Top,
-    #[default]
-    Bottom,
-    Off,
 }
 
 /// Border style for panes
@@ -3775,8 +3476,6 @@ impl BmuxConfig {
 
         validate_plugin_native_service_config(&self.plugins.native_service)?;
 
-        validate_status_bar_config(&self.status_bar)?;
-
         Ok(())
     }
 
@@ -3955,37 +3654,6 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "performance.max_payload_bytes_per_sec=0 -> {}",
                 self.performance.max_payload_bytes_per_sec
-            ));
-        }
-
-        if self.status_bar.max_tabs == Some(0) {
-            self.status_bar.max_tabs = None;
-            repaired_fields.push("status_bar.max_tabs=0 -> auto".to_string());
-        }
-
-        if self.status_bar.tab_label_max_width == 0 {
-            self.status_bar.tab_label_max_width = StatusBarConfig::default().tab_label_max_width;
-            repaired_fields.push(format!(
-                "status_bar.tab_label_max_width=0 -> {}",
-                self.status_bar.tab_label_max_width
-            ));
-        }
-
-        // `show_tab_index` is superseded by `tab_template`. Migrate it in place
-        // so the rendered tab strip is unchanged and the user is told once.
-        if self.status_bar.tab_template.is_none()
-            && let Some(show_tab_index) = self.status_bar.show_tab_index
-        {
-            let template = if show_tab_index {
-                INDEXED_STATUS_TAB_TEMPLATE
-            } else {
-                DEFAULT_STATUS_TAB_TEMPLATE
-            };
-            self.status_bar.tab_template = Some(template.to_string());
-            self.status_bar.show_tab_index = None;
-            repaired_fields.push(format!(
-                "status_bar.show_tab_index={show_tab_index} is deprecated -> \
-                 status_bar.tab_template=\"{template}\""
             ));
         }
 
@@ -4186,108 +3854,6 @@ key_file = "/tmp/gateway-key.pem"
         let mut config = BmuxConfig::default();
         config.plugins.native_service.buffer_resize_attempts = 0;
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn status_bar_max_tabs_defaults_to_width_aware_auto() {
-        let config = BmuxConfig::default();
-        assert_eq!(config.status_bar.max_tabs, None);
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn status_bar_max_tabs_validates_and_repairs_zero() {
-        let mut config = BmuxConfig::default();
-        config.status_bar.max_tabs = Some(0);
-        assert!(config.validate().is_err());
-
-        let repaired = config.sanitize_invalid_values();
-        assert_eq!(config.status_bar.max_tabs, None);
-        assert!(
-            repaired
-                .iter()
-                .any(|field| field == "status_bar.max_tabs=0 -> auto"),
-            "repair should report the auto fallback: {repaired:?}"
-        );
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn status_bar_max_tabs_accepts_explicit_cap() {
-        let mut config = BmuxConfig::default();
-        config.status_bar.max_tabs = Some(6);
-        assert!(config.validate().is_ok());
-        assert_eq!(config.status_bar.max_tabs, Some(6));
-    }
-
-    #[test]
-    fn status_bar_tab_template_defaults_to_name_only() {
-        let config = BmuxConfig::default();
-        assert_eq!(config.status_bar.tab_template, None);
-        assert_eq!(config.status_bar.show_tab_index, None);
-        assert_eq!(config.status_bar.resolved_tab_template(), "{name}");
-    }
-
-    #[test]
-    fn status_bar_legacy_show_tab_index_resolves_to_indexed_template() {
-        let mut config = BmuxConfig::default();
-        config.status_bar.show_tab_index = Some(true);
-        assert_eq!(config.status_bar.resolved_tab_template(), "{index}:{name}");
-
-        config.status_bar.show_tab_index = Some(false);
-        assert_eq!(config.status_bar.resolved_tab_template(), "{name}");
-    }
-
-    #[test]
-    fn status_bar_explicit_tab_template_wins_over_show_tab_index() {
-        let mut config = BmuxConfig::default();
-        config.status_bar.tab_template = Some("[{name}]".to_string());
-        config.status_bar.show_tab_index = Some(true);
-        assert_eq!(config.status_bar.resolved_tab_template(), "[{name}]");
-    }
-
-    #[test]
-    fn status_bar_show_tab_index_migrates_to_tab_template() {
-        let mut config = BmuxConfig::default();
-        config.status_bar.show_tab_index = Some(true);
-
-        let repaired = config.sanitize_invalid_values();
-
-        assert_eq!(
-            config.status_bar.tab_template.as_deref(),
-            Some("{index}:{name}")
-        );
-        assert_eq!(config.status_bar.show_tab_index, None);
-        assert!(
-            repaired
-                .iter()
-                .any(|field| field.contains("show_tab_index") && field.contains("deprecated")),
-            "migration should be reported: {repaired:?}"
-        );
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn status_bar_tab_template_is_preserved_by_sanitize() {
-        let mut config = BmuxConfig::default();
-        config.status_bar.tab_template = Some("{name}{marker}".to_string());
-        config.status_bar.show_tab_index = Some(true);
-
-        let _ = config.sanitize_invalid_values();
-
-        assert_eq!(
-            config.status_bar.tab_template.as_deref(),
-            Some("{name}{marker}"),
-            "an explicit template must not be overwritten by migration"
-        );
-    }
-
-    #[test]
-    fn status_bar_tab_template_deserializes_from_toml() {
-        let config: BmuxConfig =
-            toml::from_str("[status_bar]\ntab_template = \"{index0} {name}\"\n")
-                .expect("config with tab_template should parse");
-        assert_eq!(config.status_bar.resolved_tab_template(), "{index0} {name}");
     }
 
     #[test]
@@ -5671,16 +5237,51 @@ timeout_profile = "missing"
     }
 
     #[test]
+    fn removed_status_position_is_rejected_with_plugin_migration() {
+        let path = temp_config_path();
+        std::fs::write(&path, "[appearance]\nstatus_position = 'TOP'\n")
+            .expect("write removed setting");
+
+        let error = BmuxConfig::load_from_path(&path).expect_err("removed setting must fail");
+        let message = error.to_string();
+        assert!(message.contains("appearance.status_position"));
+        assert!(message.contains("bmux.tab_strip"));
+        std::fs::remove_dir_all(path.parent().expect("config parent")).ok();
+    }
+
+    #[test]
+    fn removed_scoped_status_position_is_rejected_with_plugin_migration() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            "[bmux.scopes.pane.config.appearance]\nstatus_position = 'TOP'\n",
+        )
+        .expect("write removed scoped setting");
+
+        let request = ScopedConfigLoadRequest::new(ConfigScopeTarget::new("pane"));
+        let error = BmuxConfig::load_from_path_for_scope_with_overrides(
+            &path,
+            &ConfigLoadOverrides::default(),
+            &request,
+        )
+        .expect_err("removed scoped setting must fail");
+        let message = error.to_string();
+        assert!(message.contains("status_position"));
+        assert!(message.contains("bmux.tab_strip"));
+        std::fs::remove_dir_all(path.parent().expect("config parent")).ok();
+    }
+
+    #[test]
     fn scoped_local_config_merges_for_pane_cwd() {
         let global_path = temp_config_path();
         let dir = global_path.parent().expect("temp config parent");
         let project = dir.join("project");
         std::fs::create_dir_all(&project).expect("create project dir");
-        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+        std::fs::write(&global_path, "[appearance]\npane_border_style = 'SINGLE'\n")
             .expect("write global config");
         std::fs::write(
             project.join("bmux.toml"),
-            "[appearance]\nstatus_position = 'TOP'\n",
+            "[appearance]\npane_border_style = 'DOUBLE'\n",
         )
         .expect("write local config");
 
@@ -5693,8 +5294,8 @@ timeout_profile = "missing"
         .expect("load scoped config");
 
         assert!(matches!(
-            config.appearance.status_position,
-            super::StatusPosition::Top
+            config.appearance.pane_border_style,
+            super::BorderStyle::Double
         ));
         std::fs::remove_dir_all(dir).ok();
     }
@@ -5705,11 +5306,11 @@ timeout_profile = "missing"
         let dir = global_path.parent().expect("temp config parent");
         let project = dir.join("project");
         std::fs::create_dir_all(&project).expect("create project dir");
-        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+        std::fs::write(&global_path, "[appearance]\npane_border_style = 'SINGLE'\n")
             .expect("write global config");
         std::fs::write(
             project.join("bmux.toml"),
-            "[appearance]\nstatus_position = 'TOP'\n",
+            "[appearance]\npane_border_style = 'DOUBLE'\n",
         )
         .expect("write local config");
 
@@ -5722,8 +5323,8 @@ timeout_profile = "missing"
         )
         .expect("load global scoped config");
         assert!(matches!(
-            global_config.appearance.status_position,
-            super::StatusPosition::Bottom
+            global_config.appearance.pane_border_style,
+            super::BorderStyle::Single
         ));
 
         let new_pane_request =
@@ -5735,8 +5336,8 @@ timeout_profile = "missing"
         )
         .expect("load new-pane scoped config");
         assert!(matches!(
-            new_pane_config.appearance.status_position,
-            super::StatusPosition::Top
+            new_pane_config.appearance.pane_border_style,
+            super::BorderStyle::Double
         ));
         std::fs::remove_dir_all(dir).ok();
     }
@@ -5747,11 +5348,11 @@ timeout_profile = "missing"
         let dir = global_path.parent().expect("temp config parent");
         let project = dir.join("project");
         std::fs::create_dir_all(&project).expect("create project dir");
-        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+        std::fs::write(&global_path, "[appearance]\npane_border_style = 'SINGLE'\n")
             .expect("write global config");
         std::fs::write(
             project.join("bmux.toml"),
-            "[bmux.config]\ndefault_scope = ['new-pane']\n\n[appearance]\nstatus_position = 'TOP'\n",
+            "[bmux.config]\ndefault_scope = ['new-pane']\n\n[appearance]\npane_border_style = 'DOUBLE'\n",
         )
         .expect("write local config");
 
@@ -5764,8 +5365,8 @@ timeout_profile = "missing"
         )
         .expect("load pane scoped config");
         assert!(matches!(
-            pane_config.appearance.status_position,
-            super::StatusPosition::Bottom
+            pane_config.appearance.pane_border_style,
+            super::BorderStyle::Single
         ));
 
         let new_pane_request =
@@ -5777,8 +5378,8 @@ timeout_profile = "missing"
         )
         .expect("load new-pane scoped config");
         assert!(matches!(
-            new_pane_config.appearance.status_position,
-            super::StatusPosition::Top
+            new_pane_config.appearance.pane_border_style,
+            super::BorderStyle::Double
         ));
         std::fs::remove_dir_all(dir).ok();
     }
@@ -5821,11 +5422,11 @@ timeout_profile = "missing"
         let dir = global_path.parent().expect("temp config parent");
         let project = dir.join("project");
         std::fs::create_dir_all(&project).expect("create project dir");
-        std::fs::write(&global_path, "[appearance]\nstatus_position = 'BOTTOM'\n")
+        std::fs::write(&global_path, "[appearance]\npane_border_style = 'SINGLE'\n")
             .expect("write global config");
         std::fs::write(
             project.join("bmux.toml"),
-            "[bmux.config]\ndefault_scope = []\n\n[bmux.scopes.pane.config.appearance]\nstatus_position = 'TOP'\n",
+            "[bmux.config]\ndefault_scope = []\n\n[bmux.scopes.pane.config.appearance]\npane_border_style = 'DOUBLE'\n",
         )
         .expect("write local config");
 
@@ -5838,8 +5439,8 @@ timeout_profile = "missing"
         )
         .expect("load pane scoped config");
         assert!(matches!(
-            pane_config.appearance.status_position,
-            super::StatusPosition::Top
+            pane_config.appearance.pane_border_style,
+            super::BorderStyle::Double
         ));
 
         let new_pane_request =
@@ -5851,8 +5452,8 @@ timeout_profile = "missing"
         )
         .expect("load new-pane scoped config");
         assert!(matches!(
-            new_pane_config.appearance.status_position,
-            super::StatusPosition::Bottom
+            new_pane_config.appearance.pane_border_style,
+            super::BorderStyle::Single
         ));
         std::fs::remove_dir_all(dir).ok();
     }

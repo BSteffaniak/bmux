@@ -14,15 +14,13 @@ use super::state::{AttachPointerOwner, AttachUiEffect, AttachViewState, PaneRend
 use crate::input::{InputProcessor, RuntimeAction};
 #[cfg(test)]
 use crate::runtime::prompt::PromptRequest;
-use crate::status::{AttachStatusLine, build_attach_status_line};
 use anyhow::{Result, bail};
-use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{
     AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
     PaneLayoutNode, PaneState, PaneSummary,
 };
 use bmux_client::{AttachLayoutState, AttachOpenInfo};
-use bmux_config::{BmuxConfig, StatusBarConfig};
+use bmux_config::BmuxConfig;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -41,8 +39,7 @@ pub struct AttachSimLocatedText {
 
 pub struct AttachSimHarness {
     geometry: TerminalGeometry,
-    status_config: StatusBarConfig,
-    appearance: RuntimeAppearance,
+    rendered_status: String,
     view_state: AttachViewState,
     input_processor: InputProcessor,
     effects: Vec<AttachUiEffect>,
@@ -53,7 +50,6 @@ pub struct AttachSimHarness {
 impl AttachSimHarness {
     pub fn new(cols: u16, rows: u16) -> Self {
         let session_id = Uuid::from_u128(1);
-        let status_config = StatusBarConfig::default();
         let view_state = AttachViewState::new(AttachOpenInfo {
             context_id: None,
             session_id,
@@ -61,8 +57,7 @@ impl AttachSimHarness {
         });
         Self {
             geometry: TerminalGeometry { cols, rows },
-            status_config,
-            appearance: RuntimeAppearance::default(),
+            rendered_status: String::new(),
             view_state,
             input_processor: InputProcessor::new(crate::input::Keymap::default_runtime(), false),
             effects: Vec::new(),
@@ -76,39 +71,15 @@ impl AttachSimHarness {
         self.render();
     }
 
-    pub fn render(&mut self) -> &AttachStatusLine {
-        let mode_label = if self.view_state.help_overlay_open {
-            "HELP"
+    pub fn render(&mut self) -> &str {
+        self.rendered_status = if self.view_state.help_overlay_open {
+            "HELP".to_string()
         } else if self.view_state.prompt.is_active() {
-            "PROMPT"
+            "PROMPT".to_string()
         } else {
-            "NORMAL"
+            String::new()
         };
-        let hint = if self.view_state.help_overlay_open {
-            "Help overlay open | ? toggles | Esc/Enter close"
-        } else {
-            self.view_state.prompt.active_hint().unwrap_or("")
-        };
-        let status_line = build_attach_status_line(
-            self.geometry.cols,
-            &self.status_config,
-            &self.appearance,
-            "sim",
-            1,
-            "sim",
-            mode_label,
-            "write",
-            None,
-            self.view_state
-                .focused_scrollback()
-                .and_then(|view| view.pin.map(|_| "FROZEN")),
-            hint,
-        );
-        self.view_state.cached_status_line = Some(status_line);
-        self.view_state
-            .cached_status_line
-            .as_ref()
-            .expect("simulation render should cache status line")
+        &self.rendered_status
     }
 
     #[cfg(test)]
@@ -713,10 +684,7 @@ impl AttachSimHarness {
     }
 
     pub fn rendered(&self) -> &str {
-        self.view_state
-            .cached_status_line
-            .as_ref()
-            .map_or("", |status_line| status_line.rendered.as_str())
+        &self.rendered_status
     }
 
     pub fn effects(&self) -> &[AttachUiEffect] {
@@ -754,7 +722,6 @@ impl AttachSimHarness {
     }
 
     pub fn locate_text(&self, text: &str) -> Option<AttachSimLocatedText> {
-        self.view_state.cached_status_line.as_ref()?;
         let rendered = self.rendered();
         let start = rendered.find(text)?;
         let end = start.checked_add(text.len())?.checked_sub(1)?;

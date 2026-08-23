@@ -1056,9 +1056,6 @@ pub fn retained_frame_damage_from_frame_damage(
         return RetainedDamage::Full { viewport };
     }
     let mut rects = Vec::new();
-    if frame_damage.status_damaged() {
-        rects.extend(layer_rects(scene, AttachLayer::Status));
-    }
     if frame_damage.overlay_damaged() {
         rects.extend(layer_rects(scene, AttachLayer::Overlay));
         rects.extend(layer_rects(scene, AttachLayer::FloatingPane));
@@ -1230,7 +1227,6 @@ const fn translate_damage_rect(rect: DamageRect, origin: DamageRect) -> DamageRe
 #[must_use]
 pub const fn retained_layer_order(layer: AttachLayer) -> i16 {
     match layer {
-        AttachLayer::Status => 0,
         AttachLayer::Pane => 10,
         AttachLayer::Overlay => 20,
         AttachLayer::FloatingPane => 30,

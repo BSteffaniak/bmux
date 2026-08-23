@@ -314,6 +314,9 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
     )
 }
 
+// The companion lock must cover registry publication so multiple retained-state
+// subscriber tasks cannot race the same owner revision.
+#[allow(clippy::significant_drop_tightening)]
 fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
     let mut guard = state()
         .lock()
@@ -324,17 +327,26 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
     companion.replace_windows(snapshot);
     let revision = companion.revision.max(1);
     let surface = build_surface(companion, revision);
-    drop(guard);
+    publish_surface(revision, &surface)
+}
+
+fn publish_surface(revision: u64, surface: &PluginSurface) -> Result<(), String> {
     global_plugin_surface_registry()
-        .publish(
+        .publish_advancing(
             OWNER,
             PluginSurfaceSnapshot {
                 revision,
-                surfaces: vec![surface],
+                surfaces: vec![surface.clone()],
             },
         )
         .map_err(|error| format!("publishing tab-strip surface: {error:?}"))?;
     Ok(())
+}
+
+fn publish_companion(companion: &CompanionState) -> Result<(), String> {
+    let revision = companion.revision.max(1);
+    let surface = build_surface(companion, revision);
+    publish_surface(revision, &surface)
 }
 
 fn compact_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFact> {
@@ -576,18 +588,7 @@ fn update_hover(event: &AttachInputEvent) -> bool {
     }
     companion.hovered_window_id = hovered;
     companion.revision = companion.revision.saturating_add(1).max(1);
-    let revision = companion.revision;
-    let surface = build_surface(companion, revision);
-    drop(guard);
-    global_plugin_surface_registry()
-        .publish(
-            OWNER,
-            PluginSurfaceSnapshot {
-                revision,
-                surfaces: vec![surface],
-            },
-        )
-        .is_ok()
+    publish_companion(companion).is_ok()
 }
 
 fn update_scroll(event: &AttachInputEvent) -> bool {
@@ -615,18 +616,7 @@ fn update_scroll(event: &AttachInputEvent) -> bool {
     }
     companion.scroll_offset = next;
     companion.revision = companion.revision.saturating_add(1).max(1);
-    let revision = companion.revision;
-    let surface = build_surface(companion, revision);
-    drop(guard);
-    global_plugin_surface_registry()
-        .publish(
-            OWNER,
-            PluginSurfaceSnapshot {
-                revision,
-                surfaces: vec![surface],
-            },
-        )
-        .is_ok()
+    publish_companion(companion).is_ok()
 }
 
 fn visible_window_start(state: &CompanionState, target: Uuid) -> Option<u16> {
@@ -755,17 +745,7 @@ fn update_drag(
 
 fn republish_companion(companion: &mut CompanionState) -> bool {
     companion.revision = companion.revision.saturating_add(1).max(1);
-    let revision = companion.revision;
-    let surface = build_surface(companion, revision);
-    global_plugin_surface_registry()
-        .publish(
-            OWNER,
-            PluginSurfaceSnapshot {
-                revision,
-                surfaces: vec![surface],
-            },
-        )
-        .is_ok()
+    publish_companion(companion).is_ok()
 }
 
 fn update_editor(
@@ -1041,6 +1021,40 @@ bmux_plugin_sdk::export_plugin!(TabStripPlugin, include_str!("../plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn republish_advances_past_retained_owner_revision() {
+        uninstall();
+        install(None).expect("install tab strip");
+        publish(windows_list::WindowListSnapshot {
+            windows: Vec::new(),
+            revision: 0,
+        })
+        .expect("initial publish");
+        global_plugin_surface_registry()
+            .publish(
+                OWNER,
+                PluginSurfaceSnapshot {
+                    revision: 9,
+                    surfaces: Vec::new(),
+                },
+            )
+            .expect("seed higher owner revision");
+
+        publish(windows_list::WindowListSnapshot {
+            windows: Vec::new(),
+            revision: 1,
+        })
+        .expect("republish above retained revision");
+        assert_eq!(
+            global_plugin_surface_registry()
+                .owner_snapshot(OWNER)
+                .expect("owner snapshot")
+                .revision,
+            10
+        );
+        uninstall();
+    }
 
     #[test]
     fn layout_request_places_strip_on_configured_edge() {

@@ -227,28 +227,6 @@ impl AttachPromptState {
         self.active.is_some() || !self.queue.is_empty()
     }
 
-    #[must_use]
-    pub fn active_hint(&self) -> Option<&'static str> {
-        let active = self.active.as_ref()?;
-        let hint = match active.envelope.request.field {
-            PromptField::Confirm { .. } => "Prompt | <-/-> choose | Enter submit | Esc cancel",
-            PromptField::TextInput { .. } => "Prompt | type text | Enter submit | Esc cancel",
-            PromptField::SingleSelect { .. } => {
-                "Prompt | Up/Down choose | Enter submit | Esc cancel"
-            }
-            PromptField::SearchSelect { .. } => {
-                "Prompt | type to search | Up/Down choose | Enter submit | Esc cancel"
-            }
-            PromptField::MultiToggle { .. } => {
-                "Prompt | Up/Down move | Space toggle | Enter submit | Esc cancel"
-            }
-            PromptField::Form { .. } => {
-                "Prompt | F6 hide/show | Up/Down move | Space edit/toggle | Enter apply | Esc cancel"
-            }
-        };
-        Some(hint)
-    }
-
     pub fn enqueue_external(&mut self, host_request: PromptHostRequest) {
         self.enqueue(AttachPromptEnvelope {
             request: host_request.request,

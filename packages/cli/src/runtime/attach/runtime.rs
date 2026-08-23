@@ -33,7 +33,6 @@ use bmux_client::{
 };
 use bmux_config::{
     BmuxConfig, ClipboardRemoteSyncMode, ConfigPaths, PaneRestoreMethod, ResolvedTimeout,
-    StatusPosition,
 };
 use bmux_context_state::ContextSelector;
 use bmux_ipc::InvokeServiceKind;
@@ -430,7 +429,6 @@ use crate::pane_runtime_client::{
     attach_pane_grid_window_state_streaming, attach_pane_scrollback_pin_streaming,
     attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
-use crate::status::{AttachStatusLine, build_attach_status_line};
 use bmux_plugin::{RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
@@ -1172,20 +1170,16 @@ struct AttachDirtyReasons {
 }
 
 impl AttachDirtyReasons {
-    const STATUS: u8 = 1 << 0;
-    const FULL_PANE: u8 = 1 << 1;
-    const OVERLAY: u8 = 1 << 2;
-    const PANE_DIRTY: u8 = 1 << 3;
-    const LAYOUT: u8 = 1 << 4;
-    const SCENE_HYDRATED: u8 = 1 << 5;
-    const EXTENSION: u8 = 1 << 6;
-    const PRECISE_DAMAGE: u8 = 1 << 7;
+    const FULL_PANE: u8 = 1 << 0;
+    const OVERLAY: u8 = 1 << 1;
+    const PANE_DIRTY: u8 = 1 << 2;
+    const LAYOUT: u8 = 1 << 3;
+    const SCENE_HYDRATED: u8 = 1 << 4;
+    const EXTENSION: u8 = 1 << 5;
+    const PRECISE_DAMAGE: u8 = 1 << 6;
 
     fn from_view_state(view_state: &AttachViewState, layout: bool, scene_hydrated: bool) -> Self {
         let mut bits = 0;
-        if view_state.dirty.status_needs_redraw {
-            bits |= Self::STATUS;
-        }
         if view_state.dirty.full_pane_redraw {
             bits |= Self::FULL_PANE;
         }
@@ -1216,9 +1210,6 @@ impl AttachDirtyReasons {
 
     fn labels(self) -> Vec<&'static str> {
         let mut labels = Vec::new();
-        if self.contains(Self::STATUS) {
-            labels.push("status");
-        }
         if self.contains(Self::FULL_PANE) {
             labels.push("full_pane");
         }
@@ -1258,6 +1249,7 @@ struct AttachPerfWindow {
     render_frames: u64,
     render_ms_sum: u64,
     render_ms_max: u64,
+    render_ms_samples: Vec<u64>,
     frame_bytes_max: u64,
     terminal_write_ms_max: u64,
     damage_rects_max: u64,
@@ -1340,6 +1332,7 @@ impl AttachPerfWindow {
             render_frames: 0,
             render_ms_sum: 0,
             render_ms_max: 0,
+            render_ms_samples: Vec::new(),
             frame_bytes_max: 0,
             terminal_write_ms_max: 0,
             damage_rects_max: 0,
@@ -1439,6 +1432,7 @@ impl AttachPerfWindow {
         self.render_frames = self.render_frames.saturating_add(1);
         self.render_ms_sum = self.render_ms_sum.saturating_add(elapsed_ms);
         self.render_ms_max = self.render_ms_max.max(elapsed_ms);
+        self.render_ms_samples.push(elapsed_ms);
         self.frame_bytes_max = self
             .frame_bytes_max
             .max(u64::try_from(stats.frame_bytes).unwrap_or(u64::MAX));
@@ -1653,9 +1647,6 @@ impl AttachPerfWindow {
     }
 
     const fn record_dirty_reasons(&mut self, reasons: AttachDirtyReasons) {
-        if reasons.contains(AttachDirtyReasons::STATUS) {
-            self.dirty_status_frames = self.dirty_status_frames.saturating_add(1);
-        }
         if reasons.contains(AttachDirtyReasons::FULL_PANE) {
             self.dirty_full_pane_frames = self.dirty_full_pane_frames.saturating_add(1);
         }
@@ -2175,6 +2166,17 @@ fn insert_attach_perf_detailed_payload(
     );
     object.insert("render_ms_sum".to_string(), window.render_ms_sum.into());
     object.insert("render_ms_max".to_string(), window.render_ms_max.into());
+    object.insert(
+        "render_ms_samples".to_string(),
+        serde_json::Value::Array(
+            window
+                .render_ms_samples
+                .iter()
+                .copied()
+                .map(serde_json::Value::from)
+                .collect(),
+        ),
+    );
     object.insert(
         "event_burst_drained_events".to_string(),
         window.event_burst_drained_events.into(),
@@ -3468,11 +3470,6 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     view_state.mouse.config = attach_config.attach_mouse_config();
     view_state.bracketed_paste_enabled =
         bracketed_paste_enabled(attach_config.behavior.bracketed_paste);
-    view_state.status_position = if attach_config.status_bar.enabled {
-        attach_config.appearance.status_position
-    } else {
-        StatusPosition::Off
-    };
     // Register the generic attach-layout state channel so any plugin
     // subscribing via `EventBus::subscribe_state::<AttachLayoutSnapshot>`
     // sees a valid initial payload. Subsequent layout refreshes update
@@ -3531,13 +3528,8 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     let mut layout_revision_rx = global_plugin_layout_registry().subscribe();
     let mut surface_revision_rx =
         bmux_plugin::surface::global_plugin_surface_registry().subscribe();
-    update_attach_viewport_with_geometry(
-        &mut client,
-        view_state.attached_id,
-        view_state.status_position,
-        terminal.geometry(),
-    )
-    .await?;
+    update_attach_viewport_with_geometry(&mut client, view_state.attached_id, terminal.geometry())
+        .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
     maybe_sync_remote_clipboard(
         &mut client,
@@ -3791,9 +3783,6 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                     view_state.prompt.enqueue_external(prompt_request);
                     view_state
                         .dirty
-                        .mark_status_dirty(AttachDirtySource::PromptOverlay);
-                    view_state
-                        .dirty
                         .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
                 }
             }
@@ -3834,10 +3823,6 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                     perf_window.record_wake(AttachWakeSource::Appearance);
                     if runtime_appearance != *appearance {
                         runtime_appearance = (*appearance).clone();
-                        view_state.cached_status_line = None;
-                        view_state
-                            .dirty
-                            .mark_status_dirty(AttachDirtySource::AppearanceChanged);
                         view_state
                             .dirty
                             .mark_full_frame(AttachDirtySource::AppearanceChanged);
@@ -3882,7 +3867,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 }
                 view_state
                     .dirty
-                    .mark_extension_dirty(AttachDirtySource::SceneChanged);
+                    .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
             }
 
             layout_revision_result = layout_revision_rx.changed() => {
@@ -3893,8 +3878,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                 update_attach_viewport_with_geometry(
                     &mut client,
                     view_state.attached_id,
-                    view_state.status_position,
-                    terminal.geometry(),
+                                terminal.geometry(),
                 )
                 .await?;
                 view_state
@@ -3918,9 +3902,6 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
                     if snapshot.revision != last_window_list_revision {
                         last_window_list_revision = snapshot.revision;
                         view_state.cached_window_list = Some(snapshot);
-                        view_state
-                            .dirty
-                            .mark_status_dirty(AttachDirtySource::StatusChanged);
                     }
                 } else {
                     // Channel closed — drop subscription; fallback
@@ -3990,6 +3971,12 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         // ── Post-event processing: layout, output fetch, render ──────
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
+        let geometry = terminal.geometry();
+        super::local_presentation::publish_notification(
+            view_state.transient_status.as_deref(),
+            geometry.cols,
+            geometry.rows,
+        );
 
         let scrollback_config = &attach_config.behavior.scrollback;
         let now = Instant::now();
@@ -4179,20 +4166,14 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             let render_geometry = terminal.geometry();
             let frame_stats = render_attach_frame_to_writer(
                 terminal,
-                &mut client,
                 &mut view_state,
                 &layout_state,
-                &attach_config.status_bar,
                 &runtime_appearance,
-                follow_target_id,
-                global,
-                &attach_keymap,
                 &attach_help_lines,
                 help_scroll,
                 &attach_config.behavior.damage,
                 attach_config.logs.client.slow_terminal_write_ms,
                 &mut display_capture,
-                render_started_at,
                 render_geometry,
                 None,
             )?;
@@ -4470,20 +4451,14 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         let render_geometry = terminal.geometry();
         let frame_stats = render_attach_frame_to_writer(
             terminal,
-            &mut client,
             &mut view_state,
             &layout_state,
-            &attach_config.status_bar,
             &runtime_appearance,
-            follow_target_id,
-            global,
-            &attach_keymap,
             &attach_help_lines,
             help_scroll,
             &attach_config.behavior.damage,
             attach_config.logs.client.slow_terminal_write_ms,
             &mut display_capture,
-            render_started_at,
             render_geometry,
             None,
         )?;
@@ -4558,6 +4533,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     );
 
     terminal.restore_after_attach_ui()?;
+    super::local_presentation::uninstall();
     bmux_plugin::surface::global_plugin_surface_registry().clear();
     bmux_plugin::layout::global_plugin_layout_registry().clear();
 
@@ -4706,9 +4682,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::CutCompleted {
                     summary,
@@ -4718,9 +4691,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::CutFailed {
                     reason,
@@ -4730,9 +4700,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Ok(
                     bmux_recording_plugin_api::recording_events::RecordingEvent::ExportStarted {
@@ -4745,9 +4712,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Ok(
                     bmux_recording_plugin_api::recording_events::RecordingEvent::ExportCompleted {
@@ -4760,9 +4724,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::JobUpdated {
                     job,
@@ -4773,9 +4734,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::ExportFailed {
                     reason,
@@ -4786,9 +4744,6 @@ async fn handle_attach_stream_server_event(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::PluginCommand);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -4831,9 +4786,6 @@ async fn handle_attach_stream_server_event(
                 }
                 Ok(bmux_sessions_plugin_api::sessions_events::SessionEvent::Renamed { .. }) => {
                     refresh_attach_status_catalog_best_effort(client, view_state).await;
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::StatusChanged);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -4895,7 +4847,10 @@ async fn handle_attach_stream_server_event(
             ) {
                 Ok(scene) => {
                     let scene_revision = scene.revision;
+                    #[cfg(feature = "bundled-plugin-decoration")]
                     bmux_decoration_plugin_renderer::publish_relayed_scene(scene);
+                    #[cfg(not(feature = "bundled-plugin-decoration"))]
+                    let _ = scene;
                     if scene_revision != *last_scene_revision {
                         *last_scene_revision = scene_revision;
                         view_state
@@ -5161,9 +5116,6 @@ fn handle_pane_runtime_plugin_event(
                 |reason| format!("pane {} exited: {reason}", short_uuid(pane_id)),
             );
             view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
             PaneRuntimePluginEventOutcome::default()
         }
         pane_events::PaneEvent::Restarted {
@@ -5175,9 +5127,6 @@ fn handle_pane_runtime_plugin_event(
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
             PaneRuntimePluginEventOutcome::default()
         }
         _ => PaneRuntimePluginEventOutcome::default(),
@@ -5191,7 +5140,6 @@ const fn plugin_attach_view_component(
         pane_events::AttachViewComponent::Scene => AttachViewComponent::Scene,
         pane_events::AttachViewComponent::SurfaceContent => AttachViewComponent::SurfaceContent,
         pane_events::AttachViewComponent::Layout => AttachViewComponent::Layout,
-        pane_events::AttachViewComponent::Status => AttachViewComponent::Status,
     }
 }
 
@@ -5355,9 +5303,6 @@ async fn handle_context_event_forwarded(
         }
         ContextEvent::Renamed { .. } => {
             refresh_attach_status_catalog_best_effort(client, view_state).await;
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::StatusChanged);
         }
         ContextEvent::Created { .. } | ContextEvent::Closed { .. } => {
             // Creation and closure are informational here. Retarget
@@ -6108,7 +6053,7 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 view_state
                     .dirty
-                    .mark_layout_refresh_and_status_dirty(AttachDirtySource::PluginCommand);
+                    .mark_layout_refresh(AttachDirtySource::PluginCommand);
                 emit_attach_plugin_command_timing(
                     plugin_id,
                     command_name,
@@ -6187,7 +6132,7 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 view_state
                     .dirty
-                    .mark_layout_refresh_and_status_dirty(AttachDirtySource::PluginCommand);
+                    .mark_layout_refresh(AttachDirtySource::PluginCommand);
                 emit_attach_plugin_command_timing(
                     plugin_id,
                     command_name,
@@ -6215,7 +6160,7 @@ pub async fn handle_attach_plugin_command_action(
             );
             view_state
                 .dirty
-                .mark_layout_refresh_and_status_dirty(AttachDirtySource::PluginCommand);
+                .mark_layout_refresh(AttachDirtySource::PluginCommand);
             emit_attach_plugin_command_timing(
                 plugin_id,
                 command_name,
@@ -7032,36 +6977,6 @@ pub fn focused_attach_pane_id(view_state: &AttachViewState) -> Option<Uuid> {
     Some(view_state.cached_layout_state.as_ref()?.focused_pane_id)
 }
 
-fn attach_view_floating_summary(view_state: &AttachViewState) -> (usize, bool, bool) {
-    let Some(layout_state) = view_state.cached_layout_state.as_ref() else {
-        return (0, false, false);
-    };
-    let focused_pane_id = focused_attach_pane_id(view_state);
-    let mut has_tiled = false;
-    let mut focused_floating = false;
-    let mut floating_panes = BTreeSet::new();
-    for surface in &layout_state.scene.surfaces {
-        if !surface.visible || surface.pane_id.is_none() {
-            continue;
-        }
-        match surface.kind {
-            AttachSurfaceKind::Pane => has_tiled = true,
-            AttachSurfaceKind::FloatingPane => {
-                if let Some(pane_id) = surface.pane_id {
-                    floating_panes.insert(pane_id);
-                    focused_floating |= Some(pane_id) == focused_pane_id;
-                }
-            }
-            AttachSurfaceKind::Modal | AttachSurfaceKind::Overlay | AttachSurfaceKind::Tooltip => {}
-        }
-    }
-    (
-        floating_panes.len(),
-        !has_tiled && !floating_panes.is_empty(),
-        focused_floating,
-    )
-}
-
 pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize, usize)> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     layout_state
@@ -7078,165 +6993,6 @@ pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(u
                 usize::from(surface.content_rect.h.max(1)),
             )
         })
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::fn_params_excessive_bools,
-    clippy::needless_pass_by_ref_mut
-)]
-pub fn build_attach_status_line_for_draw(
-    _client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    status_config: &bmux_config::StatusBarConfig,
-    runtime_appearance: &RuntimeAppearance,
-    context_id: Option<Uuid>,
-    session_id: Uuid,
-    can_write: bool,
-    ui_mode: AttachUiMode,
-    scrollback_active: bool,
-    follow_target_id: Option<Uuid>,
-    follow_global: bool,
-    prompt_active: bool,
-    prompt_hint: Option<&str>,
-    help_overlay_open: bool,
-    transient_status: Option<&str>,
-    keymap: &Keymap,
-    geometry: TerminalGeometry,
-) -> AttachStatusLine {
-    if geometry.cols == 0 {
-        return AttachStatusLine {
-            rendered: String::new(),
-            spans: Vec::new(),
-            tab_hitboxes: Vec::new(),
-            drag_marker_col: None,
-            edit_cursor_col: None,
-        };
-    }
-
-    let cached_contexts = view_state.cached_contexts.clone();
-    let cached_sessions = view_state.cached_sessions.clone();
-    let cached_context_session_bindings = view_state.cached_context_session_bindings.clone();
-
-    let (session_label, session_count) =
-        resolve_attach_session_label_and_count_from_catalog(&cached_sessions, session_id);
-    let current_context_label = resolve_attach_context_label_from_catalog(
-        &cached_contexts,
-        &cached_context_session_bindings,
-        context_id,
-        session_id,
-    );
-    let zoomed = view_state
-        .cached_layout_state
-        .as_ref()
-        .is_some_and(|s| s.zoomed);
-    let mode_label = if help_overlay_open {
-        "HELP"
-    } else if prompt_active {
-        "PROMPT"
-    } else if scrollback_active {
-        "SCROLL"
-    } else if zoomed {
-        "ZOOM"
-    } else {
-        view_state.active_mode_label.as_str()
-    };
-    let appearance_mode_id = if help_overlay_open {
-        "help"
-    } else if prompt_active {
-        "prompt"
-    } else if scrollback_active {
-        "scroll"
-    } else if zoomed {
-        "zoom"
-    } else {
-        view_state.active_mode_id.as_str()
-    };
-    let runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
-    let role_label = if can_write { "write" } else { "read-only" };
-    let follow_label = follow_target_id.map(|id| {
-        if follow_global {
-            format!("following {} (global)", short_uuid(id))
-        } else {
-            format!("following {}", short_uuid(id))
-        }
-    });
-    let hint = if prompt_active {
-        prompt_hint.unwrap_or("Prompt active").to_string()
-    } else if help_overlay_open {
-        "Help overlay open | ? toggles | Esc/Enter close".to_string()
-    } else if let Some(status) = transient_status {
-        status.to_string()
-    } else if scrollback_active {
-        attach_scrollback_hint(keymap)
-    } else {
-        let (floating_count, floating_only, focused_floating) =
-            attach_view_floating_summary(view_state);
-        if floating_only {
-            format!("{floating_count} floating pane(s) remain; close them before closing this tab")
-        } else if focused_floating {
-            format!(
-                "floating pane focused ({floating_count} visible) | {}",
-                attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
-            )
-        } else {
-            attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
-        }
-    };
-
-    build_attach_status_line(
-        geometry.cols,
-        status_config,
-        &runtime_appearance,
-        &session_label,
-        session_count,
-        &current_context_label,
-        mode_label,
-        role_label,
-        follow_label.as_deref(),
-        scrollback_active
-            .then(|| view_state.focused_scrollback())
-            .flatten()
-            .and_then(|view| view.pin.map(|_| "FROZEN")),
-        &hint,
-    )
-}
-
-pub fn attach_mode_hint(mode_id: &str, _ui_mode: AttachUiMode, keymap: &Keymap) -> String {
-    let detach = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::Detach);
-    let quit = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::Quit);
-    let help = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::ShowHelp);
-    let restart = key_hint_or_unbound(
-        keymap,
-        mode_id,
-        &RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "restart-pane".to_string(),
-            args: Vec::new(),
-        },
-    );
-    let prev = key_hint_or_unbound(
-        keymap,
-        mode_id,
-        &RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "prev-window".to_string(),
-            args: Vec::new(),
-        },
-    );
-    let next = key_hint_or_unbound(
-        keymap,
-        mode_id,
-        &RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "next-window".to_string(),
-            args: Vec::new(),
-        },
-    );
-    format!(
-        "{prev}/{next} tabs | {detach} detach | {restart} restart pane | {quit} quit | {help} help"
-    )
 }
 
 fn windows_close_active_pane_action() -> RuntimeAction {
@@ -7286,30 +7042,6 @@ pub const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str 
     }
 }
 
-pub fn attach_scrollback_hint(keymap: &Keymap) -> String {
-    let exit = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ExitScrollMode);
-    let confirm = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ConfirmScrollback);
-    let left = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorLeft);
-    let right = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorRight);
-    let up = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorUp);
-    let down = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorDown);
-    let page_up = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollUpPage);
-    let page_down = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollDownPage);
-    let top = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollTop);
-    let bottom = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollBottom);
-    let select = scroll_key_hint_or_unbound(keymap, &RuntimeAction::BeginSelection);
-    let copy = scroll_key_hint_or_unbound(keymap, &RuntimeAction::CopyScrollback);
-    format!(
-        "{up}/{down} line | {left}/{right} col | {page_up}/{page_down} page | {top}/{bottom} top/bottom | {select} select | {copy} copy | {confirm} copy+exit | {exit} cancel/exit scroll"
-    )
-}
-
-pub fn scroll_key_hint_or_unbound(keymap: &Keymap, action: &RuntimeAction) -> String {
-    keymap
-        .primary_scroll_binding_for_action(action)
-        .unwrap_or_else(|| "unbound".to_string())
-}
-
 pub fn key_hint_or_unbound(keymap: &Keymap, mode_id: &str, action: &RuntimeAction) -> String {
     keymap
         .primary_binding_for_action_in_mode(mode_id, action)
@@ -7325,24 +7057,12 @@ pub fn sync_attach_active_mode_from_processor(
         .or_else(|| keymap.initial_mode_id())
         .unwrap_or("normal")
         .to_string();
-    let mode_label = keymap
-        .mode_label(&mode_id)
-        .map_or_else(|| mode_id.to_ascii_uppercase(), ToString::to_string);
     let mode_changed = view_state.active_mode_id != mode_id;
-    let label_changed = view_state.active_mode_label != mode_label;
     view_state.active_mode_id = mode_id;
-    view_state.active_mode_label = mode_label;
     if mode_changed {
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::ActionDispatch);
-        view_state
-            .dirty
-            .mark_status_dirty(AttachDirtySource::ActionDispatch);
-    } else if label_changed {
-        view_state
-            .dirty
-            .mark_status_dirty(AttachDirtySource::ActionDispatch);
     }
 }
 
@@ -7377,7 +7097,6 @@ fn apply_attach_profile_switch_with_path(
 
     let previous_keymap = attach_input_processor.keymap().clone();
     let previous_mouse_config = view_state.mouse.config.clone();
-    let previous_status_position = view_state.status_position;
 
     if let Err(error) =
         super::super::run_config_profiles_set_active_at_path(profile_id, config_path)
@@ -7392,11 +7111,6 @@ fn apply_attach_profile_switch_with_path(
         let keymap = attach_keymap_from_config(&resolved_config);
         attach_input_processor.replace_keymap(keymap);
         attach_input_processor.set_scroll_mode(view_state.scrollback_active());
-        view_state.status_position = if resolved_config.status_bar.enabled {
-            resolved_config.appearance.status_position
-        } else {
-            StatusPosition::Off
-        };
         view_state.mouse.config = resolved_config.attach_mouse_config();
         view_state.mouse.clear_pointer_gestures();
         sync_attach_active_mode_from_processor(
@@ -7429,7 +7143,6 @@ fn apply_attach_profile_switch_with_path(
         attach_input_processor.replace_keymap(previous_keymap);
         attach_input_processor.set_scroll_mode(view_state.scrollback_active());
         view_state.mouse.config = previous_mouse_config;
-        view_state.status_position = previous_status_position;
         sync_attach_active_mode_from_processor(
             view_state,
             attach_input_processor.keymap(),
@@ -7439,14 +7152,6 @@ fn apply_attach_profile_switch_with_path(
     }
 
     Ok(())
-}
-
-pub const fn status_insets_for_position(status_position: StatusPosition) -> (u16, u16) {
-    match status_position {
-        StatusPosition::Top => (1, 0),
-        StatusPosition::Bottom => (0, 1),
-        StatusPosition::Off => (0, 0),
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -7533,9 +7238,6 @@ pub fn handle_help_overlay_key_event(
         KeyCode::Esc | KeyCode::Enter => {
             view_state.help_overlay_open = false;
             view_state.help_overlay_scroll = 0;
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::HelpOverlay);
             view_state
                 .dirty
                 .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
@@ -8189,7 +7891,21 @@ fn build_retained_frame_plan(
     let explicit_ui_damage =
         retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
     let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
-    retained_surfaces.extend(retained_plugin_surfaces(viewport));
+    if view_state.dirty.retained_surfaces_need_reconcile {
+        let plugin_surfaces = retained_plugin_surfaces(viewport);
+        view_state.retained_plugin_surface_ids =
+            plugin_surfaces.iter().map(|surface| surface.id).collect();
+        retained_surfaces.extend(plugin_surfaces);
+    } else {
+        retained_surfaces.extend(
+            view_state
+                .retained_compositor
+                .surfaces()
+                .values()
+                .filter(|surface| view_state.retained_plugin_surface_ids.contains(&surface.id))
+                .cloned(),
+        );
+    }
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
     let graph_damage = replace_retained_surfaces(
@@ -8256,20 +7972,14 @@ impl<'a> AttachAppearanceResolver<'a> {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     terminal_writer: &mut W,
-    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
-    status_config: &bmux_config::StatusBarConfig,
     runtime_appearance: &RuntimeAppearance,
-    follow_target_id: Option<Uuid>,
-    follow_global: bool,
-    keymap: &crate::input::Keymap,
     help_lines: &[String],
     help_scroll: usize,
     damage_config: &bmux_config::DamageBehaviorConfig,
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
-    now: Instant,
     geometry: TerminalGeometry,
     mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
@@ -8296,31 +8006,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let current_prompt_overlay_surface = view_state.prompt.overlay_surface(geometry);
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
 
-    if view_state.dirty.status_needs_redraw {
-        let transient_status = view_state.transient_status_text(now).map(str::to_owned);
-        view_state.cached_status_line = Some(build_attach_status_line_for_draw(
-            client,
-            view_state,
-            status_config,
-            runtime_appearance,
-            view_state.attached_context_id,
-            view_state.attached_id,
-            view_state.can_write,
-            view_state.ui_mode,
-            view_state.scrollback_active(),
-            follow_target_id,
-            follow_global,
-            view_state.prompt.is_active(),
-            view_state.prompt.active_hint(),
-            view_state.help_overlay_open,
-            transient_status.as_deref(),
-            keymap,
-            geometry,
-        ));
-        view_state.dirty.status_needs_redraw = false;
-    }
-
-    let (top_inset, bottom_inset) = status_insets_for_position(view_state.status_position);
+    let (top_inset, bottom_inset) = (0, 0);
     let terminal_size = (geometry.cols, geometry.rows);
     let viewport = DamageRect::new(0, 0, terminal_size.0, terminal_size.1);
     let help_retained_surface = current_help_overlay_surface.as_ref().map(|surface| {
@@ -8838,7 +8524,7 @@ pub async fn reconcile_attached_session_from_catalog(
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+    update_attach_viewport(client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     view_state.ui_mode = AttachUiMode::Normal;
     let status = attach_context_status_from_catalog(view_state);
@@ -9314,21 +9000,14 @@ impl Drop for RawModeGuard {
 pub async fn update_attach_viewport(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
-    status_position: StatusPosition,
 ) -> std::result::Result<(), ClientError> {
-    update_attach_viewport_with_geometry(
-        client,
-        session_id,
-        status_position,
-        current_attach_terminal_geometry(),
-    )
-    .await
+    update_attach_viewport_with_geometry(client, session_id, current_attach_terminal_geometry())
+        .await
 }
 
 pub async fn update_attach_viewport_with_geometry(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
-    _status_position: StatusPosition,
     geometry: TerminalGeometry,
 ) -> std::result::Result<(), ClientError> {
     if geometry.cols == 0 || geometry.rows == 0 {
@@ -10068,9 +9747,6 @@ async fn hydrate_attach_state_from_snapshot_mode(
     view_state
         .dirty
         .mark_full_frame(AttachDirtySource::SnapshotHydration);
-    view_state
-        .dirty
-        .mark_status_dirty(AttachDirtySource::SnapshotHydration);
     Ok(())
 }
 
@@ -10295,9 +9971,6 @@ async fn handle_control_catalog_changed(
             );
         }
     }
-    view_state
-        .dirty
-        .mark_status_dirty(AttachDirtySource::ControlCatalogChanged);
 }
 
 async fn handle_clients_plugin_event(
@@ -10334,8 +10007,7 @@ async fn handle_clients_plugin_event(
             view_state.last_attach_view_revision = None;
             view_state.attached_context_id = attach_info.context_id.or(context_id);
             view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
-                .await?;
+            update_attach_viewport(client, view_state.attached_id).await?;
             hydrate_attach_state_from_snapshot(client, view_state)
                 .await
                 .map_err(map_attach_client_error)?;
@@ -10359,7 +10031,7 @@ async fn handle_clients_plugin_event(
             }
             view_state
                 .dirty
-                .mark_layout_frame_and_status_dirty(AttachDirtySource::FollowTargetChanged);
+                .mark_layout_frame_dirty(AttachDirtySource::FollowTargetChanged);
         }
         bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetGone {
             former_leader_client_id,
@@ -10372,9 +10044,6 @@ async fn handle_clients_plugin_event(
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::FollowTargetChanged);
         }
         _ => {}
     }
@@ -10396,17 +10065,12 @@ pub fn apply_attach_view_change_components(
                 // frame needs content, surface, or full-frame damage.
                 view_state
                     .dirty
-                    .mark_layout_refresh_and_status_dirty(AttachDirtySource::SceneChanged);
+                    .mark_layout_refresh(AttachDirtySource::SceneChanged);
             }
             AttachViewComponent::SurfaceContent => {
                 view_state
                     .dirty
                     .mark_layout_refresh(AttachDirtySource::SceneChanged);
-            }
-            AttachViewComponent::Status => {
-                view_state
-                    .dirty
-                    .mark_status_dirty(AttachDirtySource::StatusChanged);
             }
         }
     }
@@ -10450,7 +10114,7 @@ pub async fn recover_attach_after_session_removed(
         view_state.last_attach_view_revision = None;
         view_state.attached_context_id = attach_info.context_id;
         view_state.can_write = attach_info.can_write;
-        update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+        update_attach_viewport(client, view_state.attached_id).await?;
         hydrate_attach_state_from_snapshot(client, view_state).await?;
         refresh_attach_status_catalog_best_effort(client, view_state).await;
         view_state.ui_mode = AttachUiMode::Normal;
@@ -10817,13 +10481,7 @@ pub async fn handle_attach_terminal_event(
         // refers to the text it was anchored on. Drop it rather than copy the
         // wrong region.
         clear_all_attach_selection_anchors(view_state);
-        update_attach_viewport_with_geometry(
-            client,
-            view_state.attached_id,
-            view_state.status_position,
-            geometry,
-        )
-        .await?;
+        update_attach_viewport_with_geometry(client, view_state.attached_id, geometry).await?;
     }
 
     if view_state.prompt.is_active() {
@@ -11044,9 +10702,9 @@ pub async fn handle_attach_terminal_event(
                         view_state,
                     ) {
                         Ok(()) => {
-                            view_state.dirty.mark_layout_frame_and_status_dirty(
-                                AttachDirtySource::ProfileChanged,
-                            );
+                            view_state
+                                .dirty
+                                .mark_layout_frame_dirty(AttachDirtySource::ProfileChanged);
                         }
                         Err(error) => {
                             view_state.set_transient_status(
@@ -11068,9 +10726,6 @@ pub async fn handle_attach_terminal_event(
                     view_state
                         .dirty
                         .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
-                    view_state
-                        .dirty
-                        .mark_status_dirty(AttachDirtySource::HelpOverlay);
                     continue;
                 }
                 if view_state.help_overlay_open {
@@ -11079,9 +10734,6 @@ pub async fn handle_attach_terminal_event(
                     {
                         view_state.help_overlay_open = false;
                         view_state.help_overlay_scroll = 0;
-                        view_state
-                            .dirty
-                            .mark_status_dirty(AttachDirtySource::HelpOverlay);
                         view_state
                             .dirty
                             .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
@@ -11112,14 +10764,8 @@ pub async fn handle_attach_terminal_event(
                         .mark_layout_frame_dirty(AttachDirtySource::UserAction);
                 }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active());
-                view_state
-                    .dirty
-                    .mark_status_dirty(AttachDirtySource::UserAction);
             }
             AttachEventAction::Redraw => {
-                view_state
-                    .dirty
-                    .mark_status_dirty(AttachDirtySource::ManualRedraw);
                 view_state
                     .dirty
                     .mark_layout_refresh(AttachDirtySource::ManualRedraw);
@@ -11163,7 +10809,7 @@ async fn retarget_attach_to_session(
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id;
     view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+    update_attach_viewport(client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     refresh_attach_status_catalog_best_effort(client, view_state).await;
     view_state.ui_mode = AttachUiMode::Normal;
@@ -11437,10 +11083,6 @@ pub async fn handle_attach_prompt_completion_at(
             },
         },
     }
-
-    view_state
-        .dirty
-        .mark_status_dirty(AttachDirtySource::PromptOverlay);
     view_state
         .dirty
         .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
@@ -11533,14 +11175,11 @@ async fn handle_attach_action_dispatch(
             view_state
                 .dirty
                 .mark_layout_frame_dirty(AttachDirtySource::ActionDispatch);
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::ActionDispatch);
         }
         AttachEventAction::Redraw => {
             view_state
                 .dirty
-                .mark_layout_frame_and_status_dirty(AttachDirtySource::ManualRedraw);
+                .mark_layout_frame_dirty(AttachDirtySource::ManualRedraw);
         }
         AttachEventAction::Paste(_) | AttachEventAction::Mouse(_) | AttachEventAction::Ignore => {}
     }
@@ -11833,14 +11472,11 @@ fn apply_attach_input_result(
             Instant::now(),
             ATTACH_TRANSIENT_STATUS_TTL,
         );
-        view_state
-            .dirty
-            .mark_status_dirty(AttachDirtySource::UserAction);
     }
     if result.dirty {
         view_state
             .dirty
-            .mark_layout_frame_and_status_dirty(AttachDirtySource::PluginCommand);
+            .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
     }
     if result.release_capture {
         view_state.mouse.input_capture = None;
@@ -13309,7 +12945,7 @@ pub async fn handle_attach_mouse_gesture_action(
             handle_attach_ui_action_with_scrollback(client, &action, view_state, now).await?;
             view_state
                 .dirty
-                .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
+                .mark_layout_frame_dirty(AttachDirtySource::Mouse);
             Ok(true)
         }
         AttachEventAction::Ignore => Ok(true),
@@ -13534,9 +13170,6 @@ fn update_attach_mouse_selection_drag_at(
     view_state
         .dirty
         .mark_full_frame(AttachDirtySource::Selection);
-    view_state
-        .dirty
-        .mark_status_dirty(AttachDirtySource::Selection);
     true
 }
 
@@ -13557,9 +13190,6 @@ fn finish_attach_mouse_selection_drag_at(view_state: &mut AttachViewState, now: 
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::Selection);
-        view_state
-            .dirty
-            .mark_status_dirty(AttachDirtySource::Selection);
     }
     true
 }
@@ -13652,9 +13282,6 @@ pub fn handle_attach_mouse_scrollback_for(
             view_state
                 .dirty
                 .mark_full_frame(AttachDirtySource::Scrollback);
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::Scrollback);
             true
         }
         MouseEventKind::ScrollDown => {
@@ -13673,9 +13300,6 @@ pub fn handle_attach_mouse_scrollback_for(
             view_state
                 .dirty
                 .mark_full_frame(AttachDirtySource::Scrollback);
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::Scrollback);
             true
         }
         _ => false,
@@ -13772,7 +13396,7 @@ pub async fn focus_attach_pane(
     }
     view_state
         .dirty
-        .mark_layout_refresh_and_status_dirty(AttachDirtySource::FocusChanged);
+        .mark_layout_refresh(AttachDirtySource::FocusChanged);
 
     Ok(())
 }
@@ -13799,7 +13423,7 @@ async fn resize_attach_pane(
 
     view_state
         .dirty
-        .mark_layout_frame_and_status_dirty(AttachDirtySource::LayoutChanged);
+        .mark_layout_frame_dirty(AttachDirtySource::LayoutChanged);
     Ok(())
 }
 
@@ -13825,7 +13449,7 @@ async fn move_attach_floating_pane(
 
     view_state
         .dirty
-        .mark_layout_frame_and_status_dirty(AttachDirtySource::LayoutChanged);
+        .mark_layout_frame_dirty(AttachDirtySource::LayoutChanged);
     Ok(())
 }
 
@@ -15352,6 +14976,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn opaque_prompt_content_edit_prunes_pane_repaint_without_extension_query() {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
@@ -15642,6 +15267,122 @@ mod tests {
 
         global_plugin_surface_registry().remove_owner(owner);
         global_plugin_layout_registry().remove_owner(owner);
+    }
+
+    #[test]
+    #[serial]
+    fn incremental_plugin_surface_output_stays_within_legacy_byte_budget() {
+        use bmux_plugin::surface::{
+            PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
+            global_plugin_surface_registry,
+        };
+
+        const OWNER: &str = "test.incremental-presentation-output";
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let geometry = TerminalGeometry {
+            cols: 100,
+            rows: 24,
+        };
+        let pane_rect = AttachRect {
+            x: 0,
+            y: 1,
+            w: 100,
+            h: 23,
+        };
+        let layout_state = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![test_pane_surface(pane_id, pane_rect)],
+            },
+            zoomed: false,
+        };
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state
+            .pane_buffers
+            .insert(pane_id, PaneRenderBuffer::default());
+        let publish = |revision, label: &str| {
+            global_plugin_surface_registry()
+                .publish(
+                    OWNER,
+                    PluginSurfaceSnapshot {
+                        revision,
+                        surfaces: vec![PluginSurface {
+                            id: PluginSurfaceId::new(OWNER, "strip", Uuid::nil()),
+                            revision,
+                            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 0, 100, 1)),
+                            clip_rect: Some(ExtensionRect::new(0, 0, 100, 1)),
+                            interactive_regions: Vec::new(),
+                            accepts_input: false,
+                            layer: 0,
+                            z: 0,
+                            opaque: true,
+                            modal: false,
+                            visible: true,
+                            ops: vec![RenderOp::text_run(0, 0, label, RenderStyle::new())],
+                        }],
+                    },
+                )
+                .expect("publish test presentation");
+        };
+
+        global_plugin_surface_registry().clear();
+        global_plugin_layout_registry().clear();
+        publish(1, "1:one 2:two 3:three");
+        let mut output = Vec::new();
+        render_attach_frame_to_writer(
+            &mut output,
+            &mut view_state,
+            &layout_state,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            geometry,
+            None,
+        )
+        .expect("initial frame");
+
+        publish(2, "1:one 2:TWO 3:three");
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+        output.clear();
+        let stats = render_attach_frame_to_writer(
+            &mut output,
+            &mut view_state,
+            &layout_state,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            geometry,
+            None,
+        )
+        .expect("incremental frame");
+
+        assert!(
+            stats.frame_bytes <= 330,
+            "incremental presentation emitted {} bytes",
+            stats.frame_bytes
+        );
+        assert!(!stats.full_frame_fallback);
+        assert_eq!(stats.full_surface_fallbacks, 0);
+        global_plugin_surface_registry().remove_owner(OWNER);
     }
 
     #[test]
@@ -16475,28 +16216,18 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             can_write: true,
         });
-        view_state.dirty.status_needs_redraw = false;
         view_state.dirty.layout_needs_refresh = false;
         view_state.dirty.full_pane_redraw = false;
 
-        apply_attach_view_change_components(&[AttachViewComponent::Status], &mut view_state);
-        assert!(view_state.dirty.status_needs_redraw);
-        assert!(!view_state.dirty.layout_needs_refresh);
-        assert!(!view_state.dirty.full_pane_redraw);
-
-        view_state.dirty.status_needs_redraw = false;
         apply_attach_view_change_components(&[AttachViewComponent::Layout], &mut view_state);
-        assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(!view_state.dirty.full_pane_redraw);
 
-        view_state.dirty.status_needs_redraw = false;
         view_state.dirty.layout_needs_refresh = false;
         apply_attach_view_change_components(
             &[AttachViewComponent::Scene, AttachViewComponent::Layout],
             &mut view_state,
         );
-        assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(!view_state.dirty.full_pane_redraw);
     }
@@ -18638,52 +18369,6 @@ mod tests {
     }
 
     #[test]
-    fn attach_mode_hint_reflects_remapped_normal_mode_keys() {
-        let mut config = BmuxConfig::default();
-        config
-            .keybindings
-            .modes
-            .get_mut("normal")
-            .expect("normal mode")
-            .bindings
-            .insert("z".to_string(), "detach".to_string());
-        config
-            .keybindings
-            .modes
-            .get_mut("normal")
-            .expect("normal mode")
-            .bindings
-            .insert("d".to_string(), "quit".to_string());
-
-        let keymap = attach_keymap_from_config(&config);
-        let hint = attach_mode_hint("normal", AttachUiMode::Normal, &keymap);
-        assert!(hint.contains("z detach"));
-        assert!(hint.contains("d quit"));
-    }
-
-    #[test]
-    fn attach_mode_hint_includes_session_navigation_overrides() {
-        let mut config = BmuxConfig::default();
-        config
-            .keybindings
-            .global
-            .insert("alt+h".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("alt+l".to_string(), "detach".to_string());
-        config
-            .keybindings
-            .global
-            .insert("q".to_string(), "quit".to_string());
-
-        let keymap = attach_keymap_from_config(&config);
-        let hint = attach_mode_hint("normal", AttachUiMode::Normal, &keymap);
-        assert!(hint.contains("Ctrl-A d quit") || hint.contains("q quit"));
-        assert!(hint.contains("detach"));
-    }
-
-    #[test]
     fn adjust_attach_scrollback_offset_clamps_within_bounds() {
         assert_eq!(adjust_attach_scrollback_offset(0, -1, 4), 1);
         assert_eq!(adjust_attach_scrollback_offset(3, -10, 4), 4);
@@ -19214,18 +18899,6 @@ mod tests {
     }
 
     #[test]
-    fn attach_scrollback_hint_uses_default_bindings() {
-        let keymap = attach_keymap_from_config(&BmuxConfig::default());
-        let hint = attach_scrollback_hint(&keymap);
-
-        assert!(hint.contains("select"));
-        assert!(hint.contains("copy"));
-        assert!(hint.contains("page"));
-        assert!(hint.contains("top/bottom"));
-        assert!(hint.contains("exit scroll"));
-    }
-
-    #[test]
     fn attach_keybindings_keep_focus_next_pane_binding() {
         let (runtime, _global, _scroll) = filtered_attach_keybindings(&BmuxConfig::default());
         assert_eq!(
@@ -19422,7 +19095,6 @@ mod tests {
         });
         view_state.help_overlay_open = true;
         view_state.help_overlay_scroll = 3;
-        view_state.dirty.status_needs_redraw = false;
         view_state.dirty.full_pane_redraw = false;
         view_state.dirty.overlay_needs_redraw = false;
 
@@ -19440,7 +19112,6 @@ mod tests {
         assert!(handled);
         assert!(!view_state.help_overlay_open);
         assert_eq!(view_state.help_overlay_scroll, 0);
-        assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.overlay_needs_redraw);
         assert!(!view_state.dirty.full_pane_redraw);
     }
@@ -19517,10 +19188,6 @@ mod tests {
 
     #[test]
     fn frame_uses_synchronized_update_only_for_scene_or_overlay_damage() {
-        let mut status_only = bmux_attach_pipeline::FrameDamage::default();
-        status_only.mark_status();
-        assert!(!frame_uses_synchronized_update(&status_only));
-
         let mut overlay = bmux_attach_pipeline::FrameDamage::default();
         overlay.mark_overlay();
         assert!(frame_uses_synchronized_update(&overlay));
@@ -19642,13 +19309,11 @@ mod tests {
             can_write: true,
         });
         view_state.dirty.clear_frame_damage();
-        view_state.dirty.status_needs_redraw = false;
 
         sync_attach_active_mode_from_processor(&mut view_state, &keymap, Some("inspect"));
 
         assert_eq!(view_state.active_mode_id, "inspect");
         assert!(view_state.dirty.full_pane_redraw);
-        assert!(view_state.dirty.status_needs_redraw);
     }
 
     #[test]

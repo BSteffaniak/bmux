@@ -1306,7 +1306,6 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
- "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
 ]

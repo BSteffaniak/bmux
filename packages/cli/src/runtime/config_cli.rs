@@ -764,8 +764,8 @@ mod tests {
     fn resolve_dotted_key_traverses_nested_tables() {
         let input: toml::Value = toml::from_str(
             r"
-            [status_bar]
-            max_tabs = 8
+            [plugins]
+            max_loaded = 2
             [behavior]
             [behavior.mouse]
             enabled = true
@@ -774,8 +774,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_dotted_key(&input, "status_bar.max_tabs"),
-            Some(&toml::Value::Integer(8))
+            resolve_dotted_key(&input, "plugins.max_loaded"),
+            Some(&toml::Value::Integer(2))
         );
         assert_eq!(
             resolve_dotted_key(&input, "behavior.mouse.enabled"),
@@ -800,13 +800,13 @@ mod tests {
         let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
         set_dotted_key(
             &mut doc,
-            "status_bar.colors.tab_active_bg",
-            toml_edit::value("dark").into_value().unwrap(),
+            "plugins.max_loaded",
+            toml_edit::value(20).into_value().unwrap(),
         )
         .unwrap();
         let output = doc.to_string();
-        assert!(output.contains("[status_bar.colors]"));
-        assert!(output.contains("tab_active_bg = \"dark\""));
+        assert!(output.contains("[plugins]"));
+        assert!(output.contains("max_loaded = 20"));
     }
 
     #[test]
