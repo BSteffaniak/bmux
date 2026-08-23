@@ -6,6 +6,7 @@ provided_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
 provided_features = ["bmux.sessions"]
 required_capabilities = [
     "bmux.attach_runtime.write",
+    "bmux.clients.read",
     "bmux.contexts.write",
     "bmux.pane_runtime.write",
 ]

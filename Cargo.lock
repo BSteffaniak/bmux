@@ -2323,6 +2323,8 @@ name = "bmux_sessions_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
+ "bmux_clients_plugin_api",
+ "bmux_context_state",
  "bmux_contexts_plugin_api",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",

@@ -664,6 +664,15 @@ impl RealAttachPlaybookRuntime {
         Ok(())
     }
 
+    async fn wait_for_retarget(&self, before_session_id: Option<Uuid>) {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if self.terminal.attached_session_id() != before_session_id {
+                break;
+            }
+        }
+    }
+
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.terminal.resize(cols, rows)
     }
@@ -2651,6 +2660,11 @@ async fn run_playbook_inner(
                     match start_real_attach_playbook_runtime(
                         sandbox.as_ref(),
                         sid,
+                        current_context_playbook(&mut client)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|context| context.id),
                         (playbook.config.viewport.cols, playbook.config.viewport.rows),
                     )
                     .await
@@ -3491,6 +3505,7 @@ pub(super) async fn start_recording(
 async fn start_real_attach_playbook_runtime(
     sandbox: Option<&SandboxServer>,
     session_id: Uuid,
+    context_id: Option<Uuid>,
     viewport: (u16, u16),
 ) -> Result<RealAttachPlaybookRuntime> {
     let attach_client = if let Some(sb) = sandbox {
@@ -3500,6 +3515,17 @@ async fn start_real_attach_playbook_runtime(
             .await
             .map_err(|error| anyhow::anyhow!("failed connecting real-attach driver: {error}"))?
     };
+    let mut attach_client = attach_client;
+    if let Some(context_id) = context_id {
+        let grant = attach_client
+            .attach_context_grant(bmux_context_state::ContextSelector::ById(context_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed selecting real-attach context: {error}"))?;
+        let _ = attach_client
+            .open_attach_stream_info(&grant)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed opening real-attach context: {error}"))?;
+    }
     let attach_config = sandbox
         .map(|sandbox| {
             BmuxConfig::load_from_path(&sandbox.paths().config_file())
@@ -4315,9 +4341,20 @@ async fn execute_real_attach_chord(
     runtime_vars: &mut RuntimeVars,
 ) -> Result<()> {
     require_session(*session_id)?;
+    let before_session_id = real_attach.terminal.attached_session_id();
     real_attach.send_chord(chord).await?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    real_attach.wait_for_retarget(before_session_id).await;
     if let Some(attached_session_id) = real_attach.terminal.attached_session_id() {
+        if Some(attached_session_id) != *session_id {
+            let grant = client
+                .attach_grant(SessionSelector::ById(attached_session_id))
+                .await
+                .map_err(|error| anyhow::anyhow!("playbook retarget grant failed: {error}"))?;
+            client
+                .open_attach_stream_info(&grant)
+                .await
+                .map_err(|error| anyhow::anyhow!("playbook retarget open failed: {error}"))?;
+        }
         *session_id = Some(attached_session_id);
     }
     let sid = require_session(*session_id)?;

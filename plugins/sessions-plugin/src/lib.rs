@@ -20,7 +20,7 @@
 pub mod session_manager;
 pub use session_manager::SessionManager;
 
-use bmux_contexts_plugin_api::contexts_commands;
+use bmux_context_state::{ContextSelector as PrimitiveContextSelector, ContextStateHandle};
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
@@ -344,7 +344,7 @@ impl RustPlugin for SessionsPlugin {
         match context.command.as_str() {
             "new-session" => {
                 let name = option_value(&context.arguments, "name");
-                match create_context_via_contexts_plugin(&context, name) {
+                match new_session_with_context(&context, name) {
                     Ok(ack) => {
                         record_selected_context_outcome(ack.id);
                         if matches!(
@@ -509,23 +509,71 @@ fn reconcile_client_membership_local(req: &ReconcileArgs) -> Result<SessionAck, 
 
 // ── IPC helpers ──────────────────────────────────────────────────────
 
-fn create_context_via_contexts_plugin(
+fn new_session_with_context(
     caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
 ) -> Result<SessionAck, NewSessionError> {
+    let client_id = resolve_current_client_id(caller)?;
+    let session = new_session_via_ipc(caller, name.clone())?;
+    let context_handle = global_plugin_state_registry()
+        .get::<ContextStateHandle>()
+        .and_then(|arc| arc.read().ok().map(|guard| (*guard).clone()))
+        .ok_or_else(|| NewSessionError::Failed {
+            reason: "context state handle not registered".to_string(),
+        })?;
+    let mut attributes = BTreeMap::from([("workspace".to_string(), "default".to_string())]);
+    attributes.insert(
+        bmux_context_state::CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+        session.id.to_string(),
+    );
+    let context = context_handle.0.create(client_id, name, attributes);
+    context_handle
+        .0
+        .bind_session(context.id, SessionId(session.id))
+        .map_err(|reason| NewSessionError::Failed {
+            reason: reason.to_string(),
+        })?;
+    let _ = context_handle
+        .0
+        .select_for_client(client_id, &PrimitiveContextSelector::ById(context.id));
+    let _ = global_event_bus().emit(
+        &bmux_contexts_plugin_api::contexts_events::EVENT_KIND,
+        bmux_contexts_plugin_api::contexts_events::ContextEvent::Created {
+            context_id: context.id,
+            name: context.name.clone(),
+        },
+    );
+    let _ = global_event_bus().emit(
+        &bmux_contexts_plugin_api::contexts_events::EVENT_KIND,
+        bmux_contexts_plugin_api::contexts_events::ContextEvent::Selected {
+            context_id: context.id,
+        },
+    );
+    let _ = global_event_bus().emit(
+        &bmux_contexts_plugin_api::contexts_events::EVENT_KIND,
+        bmux_contexts_plugin_api::contexts_events::ContextEvent::SessionActiveContextChanged {
+            session_id: session.id,
+            context_id: context.id,
+            initiator_client_id: Some(client_id.0),
+        },
+    );
+    Ok(SessionAck { id: context.id })
+}
+
+fn resolve_current_client_id(
+    caller: &(impl ServiceCaller + Sync),
+) -> Result<ClientId, NewSessionError> {
     let mut client = dispatch_client(caller);
-    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::create_context(
-        &mut client,
-        name,
-        BTreeMap::default(),
-    ))
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_state::client::current_client(&mut client),
+    )
     .map_err(|error| NewSessionError::Failed {
-        reason: format!("contexts-commands/create-context failed: {error}"),
-    })?;
-    let ack = result.map_err(|error| NewSessionError::Failed {
-        reason: format!("create-context failed: {error:?}"),
-    })?;
-    Ok(SessionAck { id: ack.id })
+        reason: format!("clients-state/current-client failed: {error}"),
+    })?
+    .map(|summary| ClientId(summary.id))
+    .map_err(|error| NewSessionError::Failed {
+        reason: format!("current client unavailable: {error:?}"),
+    })
 }
 
 fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
