@@ -791,7 +791,7 @@ fn run_command(context: &NativeCommandContext) -> Result<(), String> {
             record_outcome(&ack);
             Ok(())
         }
-        "switch-workspace" => command_switch(context, &parse_selector_argument(context, 0)?, false),
+        "switch-workspace" => command_switch(context, &parse_selector_argument(context, 0)?),
         "next-workspace" => command_cycle(context, 1),
         "prev-workspace" => command_cycle(context, -1),
         "last-workspace" => command_last(context),
@@ -864,7 +864,6 @@ fn new_workspace_for_context(
 fn command_switch(
     context: &NativeCommandContext,
     selector: &WorkspaceSelector,
-    _unused: bool,
 ) -> Result<(), String> {
     let client_id = context
         .caller_client_id
@@ -906,7 +905,6 @@ fn command_cycle(context: &NativeCommandContext, offset: isize) -> Result<(), St
             id: Some(target),
             name: None,
         },
-        false,
     )
 }
 
@@ -927,7 +925,6 @@ fn command_last(context: &NativeCommandContext) -> Result<(), String> {
             id: Some(previous),
             name: None,
         },
-        false,
     )
 }
 
@@ -1047,6 +1044,189 @@ bmux_plugin_sdk::export_plugin!(WorkspacesPlugin, include_str!("../plugin.toml")
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_clients_plugin_api::clients_state::{ClientQueryError, ClientSummary};
+    use bmux_contexts_plugin_api::contexts_commands::{ContextAck, SetContextAttributesError};
+    use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+    use bmux_plugin_sdk::{
+        PluginError, ServiceKind, StorageGetResponse, decode_service_message,
+        encode_service_message,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct MockHost {
+        current_client_id: Mutex<Uuid>,
+        contexts: Mutex<Vec<contexts_state::ContextSummary>>,
+        selected_contexts: Mutex<Vec<Uuid>>,
+        storage: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl MockHost {
+        fn new(current_client_id: Uuid, contexts: Vec<contexts_state::ContextSummary>) -> Self {
+            Self {
+                current_client_id: Mutex::new(current_client_id),
+                contexts: Mutex::new(contexts),
+                selected_contexts: Mutex::new(Vec::new()),
+                storage: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn set_current_client(&self, client_id: Uuid) {
+            *self
+                .current_client_id
+                .lock()
+                .expect("current client lock should succeed") = client_id;
+        }
+    }
+
+    impl ServiceCaller for MockHost {
+        fn call_service_raw(
+            &self,
+            _capability: &str,
+            _kind: ServiceKind,
+            interface_id: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            match (interface_id, operation) {
+                ("clients-state", "current-client") => {
+                    let id = *self
+                        .current_client_id
+                        .lock()
+                        .expect("current client lock should succeed");
+                    let result: Result<ClientSummary, ClientQueryError> = Ok(ClientSummary {
+                        id,
+                        selected_session_id: None,
+                        selected_context_id: None,
+                        following_client_id: None,
+                        following_global: false,
+                    });
+                    encode_service_message(&result)
+                }
+                ("contexts-state", "list-contexts") => encode_service_message(
+                    &self
+                        .contexts
+                        .lock()
+                        .expect("contexts lock should succeed")
+                        .clone(),
+                ),
+                ("contexts-commands", "select-context") => {
+                    #[derive(Deserialize)]
+                    struct Args {
+                        selector: contexts_state::ContextSelector,
+                    }
+                    let request: Args = decode_service_message(&payload)?;
+                    let id = request
+                        .selector
+                        .id
+                        .ok_or_else(|| PluginError::ServiceProtocol {
+                            details: "test select requires an id".to_string(),
+                        })?;
+                    self.selected_contexts
+                        .lock()
+                        .expect("selected contexts lock should succeed")
+                        .push(id);
+                    let result: Result<
+                        ContextAck,
+                        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                    > = Ok(ContextAck {
+                        id,
+                        session_id: None,
+                    });
+                    encode_service_message(&result)
+                }
+                ("contexts-commands", "set-context-attributes") => {
+                    #[derive(Deserialize)]
+                    struct Args {
+                        selector: contexts_state::ContextSelector,
+                        attributes: BTreeMap<String, String>,
+                    }
+                    let request: Args = decode_service_message(&payload)?;
+                    let id = request
+                        .selector
+                        .id
+                        .ok_or_else(|| PluginError::ServiceProtocol {
+                            details: "test attribute update requires an id".to_string(),
+                        })?;
+                    let mut contexts = self.contexts.lock().expect("contexts lock should succeed");
+                    let context = contexts
+                        .iter_mut()
+                        .find(|context| context.id == id)
+                        .ok_or_else(|| PluginError::ServiceProtocol {
+                            details: "test context not found".to_string(),
+                        })?;
+                    context.attributes = request.attributes;
+                    drop(contexts);
+                    let result: Result<ContextAck, SetContextAttributesError> = Ok(ContextAck {
+                        id,
+                        session_id: None,
+                    });
+                    encode_service_message(&result)
+                }
+                ("storage-query/v1", "get") => {
+                    let request: StorageGetRequest = decode_service_message(&payload)?;
+                    let value = self
+                        .storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .get(request.key.as_str())
+                        .cloned();
+                    encode_service_message(&StorageGetResponse { value })
+                }
+                ("storage-command/v1", "set") => {
+                    let request: StorageSetRequest = decode_service_message(&payload)?;
+                    self.storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .insert(request.key.as_str().to_string(), request.value);
+                    encode_service_message(&())
+                }
+                _ => Err(PluginError::UnsupportedHostOperation {
+                    operation: "workspaces_test_host",
+                }),
+            }
+        }
+
+        fn execute_kernel_request(
+            &self,
+            _request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            Err(PluginError::UnsupportedHostOperation {
+                operation: "workspaces_test_kernel",
+            })
+        }
+    }
+
+    // The shared test router contract uses PluginError directly; boxing it here
+    // would make the closure incompatible with install_test_service_router.
+    #[allow(clippy::result_large_err)]
+    fn install_host_router(
+        host: Arc<MockHost>,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        let router: TestServiceRouter = Arc::new(
+            move |_plugin, _client, _capability, kind, interface, operation, payload| {
+                host.call_service_raw("", kind, interface, operation, payload)
+            },
+        );
+        install_test_service_router(router)
+    }
+
+    fn context(id: u128, workspace_id: Uuid) -> contexts_state::ContextSummary {
+        contexts_state::ContextSummary {
+            id: Uuid::from_u128(id),
+            name: Some(format!("tab-{id}")),
+            attributes: BTreeMap::from([(
+                "workspace".to_string(),
+                workspace_attribute(workspace_id),
+            )]),
+        }
+    }
+
+    fn install_workspace_state(state: WorkspaceState) {
+        global_plugin_state_registry().register::<WorkspaceState>(&Arc::new(RwLock::new(state)));
+    }
 
     #[test]
     fn default_workspace_is_stable_and_selected() {
@@ -1182,6 +1362,162 @@ mod tests {
         assert_eq!(state.records.len(), 1);
         assert_eq!(state.active_id(client), replacement);
         assert_eq!(state.previous_by_client.get(&client), Some(&replacement));
+    }
+
+    #[test]
+    fn service_switches_remain_isolated_per_client() {
+        let _test_guard = TEST_STATE_LOCK
+            .lock()
+            .expect("workspace test state lock should succeed");
+        let first_client = Uuid::from_u128(1);
+        let second_client = Uuid::from_u128(2);
+        let first_workspace = Uuid::nil();
+        let second_workspace = Uuid::from_u128(20);
+        let first_context = context(101, first_workspace);
+        let second_context = context(102, second_workspace);
+        let host = Arc::new(MockHost::new(
+            first_client,
+            vec![first_context.clone(), second_context.clone()],
+        ));
+        let _router = install_host_router(Arc::clone(&host));
+        install_workspace_state(WorkspaceState {
+            records: vec![
+                WorkspaceRecord {
+                    id: first_workspace,
+                    name: DEFAULT_WORKSPACE_NAME.to_string(),
+                },
+                WorkspaceRecord {
+                    id: second_workspace,
+                    name: "second".to_string(),
+                },
+            ],
+            active_by_client: HashMap::new(),
+            previous_by_client: HashMap::new(),
+        });
+
+        let first_ack = switch_workspace(
+            host.as_ref(),
+            &WorkspaceSelector {
+                id: Some(second_workspace),
+                name: None,
+            },
+        )
+        .expect("first client should switch");
+        host.set_current_client(second_client);
+        let second_ack = switch_workspace(
+            host.as_ref(),
+            &WorkspaceSelector {
+                id: Some(first_workspace),
+                name: None,
+            },
+        )
+        .expect("second client should switch");
+
+        assert_eq!(first_ack.selected_context_id, Some(second_context.id));
+        assert_eq!(second_ack.selected_context_id, Some(first_context.id));
+        let state = state().expect("workspace state should exist");
+        let guard = state.read().expect("workspace state lock should succeed");
+        assert_eq!(guard.active_id(first_client), second_workspace);
+        assert_eq!(guard.active_id(second_client), first_workspace);
+        assert_eq!(
+            guard.previous_by_client.get(&first_client),
+            Some(&first_workspace)
+        );
+        assert!(!guard.previous_by_client.contains_key(&second_client));
+        drop(guard);
+        let selected_contexts = host
+            .selected_contexts
+            .lock()
+            .expect("selected contexts lock should succeed")
+            .clone();
+        assert_eq!(selected_contexts, vec![second_context.id, first_context.id]);
+    }
+
+    #[test]
+    fn deleting_viewed_workspace_repairs_every_client_and_moves_tabs() {
+        let _test_guard = TEST_STATE_LOCK
+            .lock()
+            .expect("workspace test state lock should succeed");
+        let deleting_client = Uuid::from_u128(1);
+        let viewing_client = Uuid::from_u128(2);
+        let removed_workspace = Uuid::from_u128(20);
+        let fallback_workspace = Uuid::nil();
+        let removed_context = context(101, removed_workspace);
+        let fallback_context = context(102, fallback_workspace);
+        let host = Arc::new(MockHost::new(
+            deleting_client,
+            vec![removed_context, fallback_context],
+        ));
+        let _router = install_host_router(Arc::clone(&host));
+        global_event_bus().register_channel::<WorkspaceEvent>(workspaces_events::EVENT_KIND);
+        let mut events = global_event_bus()
+            .subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND)
+            .expect("workspace event subscription should succeed");
+        install_workspace_state(WorkspaceState {
+            records: vec![
+                WorkspaceRecord {
+                    id: fallback_workspace,
+                    name: DEFAULT_WORKSPACE_NAME.to_string(),
+                },
+                WorkspaceRecord {
+                    id: removed_workspace,
+                    name: "removed".to_string(),
+                },
+            ],
+            active_by_client: HashMap::from([
+                (deleting_client, fallback_workspace),
+                (viewing_client, removed_workspace),
+            ]),
+            previous_by_client: HashMap::from([
+                (deleting_client, removed_workspace),
+                (viewing_client, fallback_workspace),
+            ]),
+        });
+
+        let ack = kill_workspace(
+            host.as_ref(),
+            &WorkspaceSelector {
+                id: Some(removed_workspace),
+                name: None,
+            },
+        )
+        .expect("workspace deletion should succeed");
+
+        assert_eq!(ack.id, removed_workspace);
+        let event = events
+            .try_recv()
+            .expect("workspace removal event should be emitted");
+        assert_eq!(
+            event.as_ref(),
+            &WorkspaceEvent::Removed {
+                workspace_id: removed_workspace,
+            }
+        );
+        let state = state().expect("workspace state should exist");
+        let guard = state.read().expect("workspace state lock should succeed");
+        assert_eq!(guard.active_id(deleting_client), fallback_workspace);
+        assert_eq!(guard.active_id(viewing_client), fallback_workspace);
+        assert_eq!(
+            guard.previous_by_client.get(&deleting_client),
+            Some(&fallback_workspace)
+        );
+        assert_eq!(
+            guard.previous_by_client.get(&viewing_client),
+            Some(&fallback_workspace)
+        );
+        drop(guard);
+        let contexts = host.contexts.lock().expect("contexts lock should succeed");
+        assert_eq!(context_workspace_id(&contexts[0]), fallback_workspace);
+        drop(contexts);
+        let storage = host.storage.lock().expect("storage lock should succeed");
+        let active: HashMap<Uuid, Uuid> = serde_json::from_slice(
+            storage
+                .get(ACTIVE_BY_CLIENT_KEY)
+                .expect("active client map should persist"),
+        )
+        .expect("active client map should decode");
+        drop(storage);
+        assert_eq!(active.get(&viewing_client), Some(&fallback_workspace));
     }
 
     #[test]

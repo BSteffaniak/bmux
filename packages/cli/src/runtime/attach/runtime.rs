@@ -104,6 +104,8 @@ pub trait AttachTerminal: Write {
 
     fn restore_after_attach_ui(&mut self) -> Result<()>;
 
+    fn set_attached_session_id(&self, _session_id: Uuid) {}
+
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -151,6 +153,7 @@ pub struct HeadlessAttachTerminalHandle {
     geometry: Arc<Mutex<TerminalGeometry>>,
     output: Arc<Mutex<Vec<u8>>>,
     pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+    attached_session_id: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl HeadlessAttachTerminalHandle {
@@ -177,6 +180,11 @@ impl HeadlessAttachTerminalHandle {
     }
 
     #[must_use]
+    pub fn attached_session_id(&self) -> Option<Uuid> {
+        self.attached_session_id.lock().ok().and_then(|id| *id)
+    }
+
+    #[must_use]
     pub fn drain_output_chunks(&self) -> Vec<Vec<u8>> {
         self.pending_output_chunks
             .lock()
@@ -189,6 +197,7 @@ pub struct HeadlessAttachTerminal {
     event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     output: Arc<Mutex<Vec<u8>>>,
     pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+    attached_session_id: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl HeadlessAttachTerminal {
@@ -198,18 +207,21 @@ impl HeadlessAttachTerminal {
         let geometry = Arc::new(Mutex::new(TerminalGeometry { cols, rows }));
         let output = Arc::new(Mutex::new(Vec::new()));
         let pending_output_chunks = Arc::new(Mutex::new(Vec::new()));
+        let attached_session_id = Arc::new(Mutex::new(None));
         (
             Self {
                 geometry: Arc::clone(&geometry),
                 event_rx,
                 output: Arc::clone(&output),
                 pending_output_chunks: Arc::clone(&pending_output_chunks),
+                attached_session_id: Arc::clone(&attached_session_id),
             },
             HeadlessAttachTerminalHandle {
                 event_tx,
                 geometry,
                 output,
                 pending_output_chunks,
+                attached_session_id,
             },
         )
     }
@@ -257,6 +269,12 @@ impl AttachTerminal for HeadlessAttachTerminal {
 
     fn restore_after_attach_ui(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn set_attached_session_id(&self, session_id: Uuid) {
+        if let Ok(mut attached_session_id) = self.attached_session_id.lock() {
+            *attached_session_id = Some(session_id);
+        }
     }
 
     #[cfg(any(
@@ -2573,14 +2591,14 @@ pub async fn run_session_attach_with_provider_session(
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
             let mut terminal = RealAttachTerminal::new();
-            run_session_attach_with_terminal(
+            Box::pin(run_session_attach_with_terminal(
                 client,
                 effective_target,
                 follow,
                 global,
                 kernel_client_factory,
                 &mut terminal,
-            )
+            ))
             .await
         }
         AttachProviderBackend::Session(provider_session) => {
@@ -3248,14 +3266,35 @@ const fn provider_modifier_bits(modifiers: KeyModifiers) -> u8 {
         | ((modifiers.contains(KeyModifiers::META) as u8) << 5)
 }
 
-#[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
 pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    terminal: &mut T,
+) -> Result<AttachRunOutcome> {
+    run_session_attach_with_terminal_config(
+        client,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+        terminal,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
+pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
     kernel_client_factory: Option<KernelClientFactory>,
     terminal: &mut T,
+    config: Option<BmuxConfig>,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -3283,7 +3322,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
         None => None,
     };
 
-    let attach_config = match BmuxConfig::load() {
+    let attach_config = config.unwrap_or_else(|| match BmuxConfig::load() {
         Ok(config) => config,
         Err(error) => {
             eprintln!(
@@ -3291,7 +3330,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
             );
             BmuxConfig::default()
         }
-    };
+    });
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
     let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
@@ -3466,6 +3505,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     }
 
     let mut view_state = AttachViewState::new(attach_info);
+    terminal.set_attached_session_id(view_state.attached_id);
     view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
     view_state.bracketed_paste_enabled =
@@ -3692,6 +3732,7 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
     }
 
     loop {
+        terminal.set_attached_session_id(view_state.attached_id);
         tokio::select! {
             // Server-pushed events (layout changes, session events, pane output)
             event = client.event_receiver().recv() => {

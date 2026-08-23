@@ -1,0 +1,15 @@
+[keybindings]
+initial_mode = "normal"
+
+[keybindings.global]
+"alt+c" = "plugin:bmux.sessions:new-session"
+"alt+f" = "plugin:bmux.finder:show"
+"alt+l" = "plugin:bmux.workspaces:last-workspace"
+"alt+w" = "plugin:bmux.workspaces:new-workspace"
+
+[keybindings.modes.normal]
+label       = "NORMAL"
+passthrough = true
+
+[keybindings.modes.normal.bindings]
+"c" = "plugin:bmux.windows:new-window"

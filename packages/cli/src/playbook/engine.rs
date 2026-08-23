@@ -15,6 +15,7 @@ use bmux_attach_pipeline::{
     DamageCoalescingPolicy, DamageRect, FrameDamage, PaneRenderBuffer,
 };
 use bmux_client::{AttachLayoutState, BmuxClient};
+use bmux_config::BmuxConfig;
 use bmux_contexts_plugin_api::contexts_state;
 use bmux_ipc::InvokeServiceKind;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
@@ -49,7 +50,7 @@ use uuid::Uuid;
 
 use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use crate::runtime::attach::runtime::{
-    HeadlessAttachTerminal, HeadlessAttachTerminalHandle, run_session_attach_with_terminal,
+    HeadlessAttachTerminal, HeadlessAttachTerminalHandle, run_session_attach_with_terminal_config,
 };
 
 use super::RunOptions;
@@ -3499,17 +3500,24 @@ async fn start_real_attach_playbook_runtime(
             .await
             .map_err(|error| anyhow::anyhow!("failed connecting real-attach driver: {error}"))?
     };
+    let attach_config = sandbox
+        .map(|sandbox| {
+            BmuxConfig::load_from_path(&sandbox.paths().config_file())
+                .context("failed loading sandbox config for real-attach driver")
+        })
+        .transpose()?;
     let (mut terminal, handle) = HeadlessAttachTerminal::new(viewport.0, viewport.1);
     let target = session_id.to_string();
     let task = tokio::spawn(async move {
-        run_session_attach_with_terminal(
+        Box::pin(run_session_attach_with_terminal_config(
             attach_client,
             Some(target.as_str()),
             None,
             false,
             None,
             &mut terminal,
-        )
+            attach_config,
+        ))
         .await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4087,7 +4095,7 @@ pub(super) async fn execute_step(
                     real_attach,
                     client,
                     inspector,
-                    *session_id,
+                    session_id,
                     runtime_vars,
                 )
                 .await
@@ -4126,7 +4134,7 @@ pub(super) async fn execute_step(
                     real_attach,
                     client,
                     inspector,
-                    *session_id,
+                    session_id,
                     runtime_vars,
                 )
                 .await
@@ -4303,11 +4311,16 @@ async fn execute_real_attach_chord(
     real_attach: &RealAttachPlaybookRuntime,
     client: &mut BmuxClient,
     inspector: &mut ScreenInspector,
-    session_id: Option<Uuid>,
+    session_id: &mut Option<Uuid>,
     runtime_vars: &mut RuntimeVars,
 ) -> Result<()> {
-    let sid = require_session(session_id)?;
+    require_session(*session_id)?;
     real_attach.send_chord(chord).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if let Some(attached_session_id) = real_attach.terminal.attached_session_id() {
+        *session_id = Some(attached_session_id);
+    }
+    let sid = require_session(*session_id)?;
     let snapshot = inspector.refresh(client, sid).await?;
     runtime_vars.pane_count = u32::try_from(snapshot.panes.len()).unwrap_or(u32::MAX);
     if let Some(focused) = snapshot.panes.iter().find(|pane| pane.focused) {

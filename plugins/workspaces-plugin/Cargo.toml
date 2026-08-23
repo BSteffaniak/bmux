@@ -29,3 +29,6 @@ fail-on-warnings = [
     "bmux_plugin_sdk/fail-on-warnings",
 ]
 static-bundled = []
+
+[dev-dependencies]
+bmux_ipc = { workspace = true }
