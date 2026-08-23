@@ -8,7 +8,7 @@ use super::runtime::{
     build_attach_help_lines, continue_attach_builtin_pointer_owner, encode_bracketed_paste,
     focused_attach_pane_input_mode, handle_attach_ui_action_at, handle_help_overlay_key_event,
     maybe_begin_attach_mouse_selection_drag, reduce_attach_mouse_floating_drag_event,
-    reduce_attach_mouse_resize_event, status_row_for_position,
+    reduce_attach_mouse_resize_event,
 };
 use super::state::{AttachPointerOwner, AttachUiEffect, AttachViewState, PaneRenderBuffer};
 use crate::input::{InputProcessor, RuntimeAction};
@@ -764,7 +764,7 @@ impl AttachSimHarness {
             start_col,
             end_col,
             center_col: start_col.saturating_add(end_col.saturating_sub(start_col) / 2),
-            row: status_row_for_position(self.view_state.status_position, self.geometry.rows)?,
+            row: 0,
         })
     }
 

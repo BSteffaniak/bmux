@@ -431,9 +431,7 @@ use crate::pane_runtime_client::{
     attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
 use crate::status::{AttachStatusLine, build_attach_status_line};
-use bmux_plugin::{
-    RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp, RenderStyle,
-};
+use bmux_plugin::{RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
@@ -457,7 +455,6 @@ const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
 const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
-const STATUS_SURFACE_ID: Uuid = Uuid::from_u128(3);
 const DAMAGE_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(4);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
@@ -7483,68 +7480,6 @@ fn resolved_attach_viewport_insets_for_requests(
     }
 }
 
-pub const fn status_row_for_position(status_position: StatusPosition, rows: u16) -> Option<u16> {
-    if rows == 0 {
-        return None;
-    }
-    match status_position {
-        StatusPosition::Top => Some(0),
-        StatusPosition::Bottom => Some(rows.saturating_sub(1)),
-        StatusPosition::Off => None,
-    }
-}
-
-fn status_line_render_ops(
-    status_line: &AttachStatusLine,
-    status_row: u16,
-    cols: u16,
-) -> Vec<RenderOp> {
-    let mut ops = Vec::new();
-    if status_line.spans.is_empty() {
-        ops.push(RenderOp::text_run(
-            0,
-            status_row,
-            &status_line.rendered,
-            RenderStyle::new(),
-        ));
-    } else {
-        ops.push(RenderOp::styled_text(
-            0,
-            status_row,
-            status_line.spans.clone(),
-        ));
-    }
-    if let Some(marker_col) = status_line.drag_marker_col {
-        ops.push(RenderOp::text_run(
-            marker_col.min(cols.saturating_sub(1)),
-            status_row,
-            "│",
-            RenderStyle::new(),
-        ));
-    }
-    ops
-}
-
-fn retained_status_surface(
-    status_line: &AttachStatusLine,
-    status_position: StatusPosition,
-    terminal_size: (u16, u16),
-) -> Option<RetainedSurface> {
-    let (cols, rows) = terminal_size;
-    if cols == 0 || rows == 0 {
-        return None;
-    }
-    let status_row = status_row_for_position(status_position, rows)?;
-    Some(
-        RetainedSurface::builder(STATUS_SURFACE_ID, DamageRect::new(0, status_row, cols, 1))
-            .layer(retained_layer_order(SurfaceLayer::Status))
-            .z(i32::MAX)
-            .opaque()
-            .render_ops(status_line_render_ops(status_line, status_row, cols))
-            .build(),
-    )
-}
-
 pub fn help_overlay_visible_rows(lines: &[String], geometry: TerminalGeometry) -> usize {
     let max_content_rows = (geometry.rows as usize).saturating_sub(6);
     let content_rows = lines.len().min(max_content_rows);
@@ -8135,7 +8070,6 @@ impl RenderFramePlan {
 }
 
 struct RetainedFramePlan {
-    status_surface: Option<RetainedSurface>,
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
     prompt_surface: Option<RetainedSurface>,
@@ -8209,7 +8143,6 @@ fn build_retained_frame_plan(
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     frame_damage: &mut bmux_attach_pipeline::FrameDamage,
-    status_surface: Option<RetainedSurface>,
     help_surface: Option<RetainedSurface>,
     prompt_overlay_render: Option<AttachPromptOverlayRender>,
     viewport: DamageRect,
@@ -8245,11 +8178,6 @@ fn build_retained_frame_plan(
         damage_policy,
     );
     let mut explicit_ui_damage_rects = Vec::new();
-    if frame_damage.status_damaged()
-        && let Some(surface) = status_surface.as_ref()
-    {
-        explicit_ui_damage_rects.push(surface.rect);
-    }
     if frame_damage.overlay_damaged() || frame_damage.extension_query_requested() {
         if let Some(surface) = help_surface.as_ref() {
             explicit_ui_damage_rects.push(surface.rect);
@@ -8262,7 +8190,6 @@ fn build_retained_frame_plan(
         retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
     let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
     retained_surfaces.extend(retained_plugin_surfaces(viewport));
-    retained_surfaces.extend(status_surface.iter().cloned());
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
     let graph_damage = replace_retained_surfaces(
@@ -8296,7 +8223,6 @@ fn build_retained_frame_plan(
         damage_policy,
     ));
     RetainedFramePlan {
-        status_surface,
         help_surface,
         prompt_overlay_render,
         prompt_surface,
@@ -8397,12 +8323,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let (top_inset, bottom_inset) = status_insets_for_position(view_state.status_position);
     let terminal_size = (geometry.cols, geometry.rows);
     let viewport = DamageRect::new(0, 0, terminal_size.0, terminal_size.1);
-    let status_surface = view_state
-        .cached_status_line
-        .as_ref()
-        .and_then(|status_line| {
-            retained_status_surface(status_line, view_state.status_position, terminal_size)
-        });
     let help_retained_surface = current_help_overlay_surface.as_ref().map(|surface| {
         retained_help_overlay_surface(surface, help_lines, help_scroll, runtime_appearance)
     });
@@ -8429,7 +8349,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         view_state,
         layout_state,
         &mut frame_damage,
-        status_surface,
         help_retained_surface,
         prompt_overlay_render,
         viewport,
@@ -8460,25 +8379,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     }
     queue_retained_background_clear(&mut frame_bytes, &frame_plan.retained.damage.graph)?;
     let retained_capabilities = terminal_render_capabilities(view_state);
-    let status_rendered = if let Some((surface, repaint)) = frame_plan
-        .retained
-        .status_surface
-        .as_ref()
-        .zip(retained_repaint_by_id.get(&STATUS_SURFACE_ID))
-    {
-        queue_retained_render_ops(&mut frame_bytes, surface, repaint, retained_capabilities)?
-    } else {
-        false
-    };
-    if status_rendered
-        && let Some(trace) = render_trace.as_deref_mut()
-        && let Some(row) = status_row_for_position(view_state.status_position, terminal_size.1)
-    {
-        trace.push(AttachRenderTraceOp::StatusLine {
-            row,
-            cells: terminal_size.0,
-        });
-    }
+    let status_rendered = false;
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
     } else if view_state.prompt.is_active() {
@@ -14401,6 +14302,7 @@ mod tests {
         AttachEventAction, AttachMouseSelectionDrag, AttachScrollbackCursor,
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
+    use bmux_plugin::RenderStyle;
 
     use bmux_attach_layout_protocol::{
         AttachFocusTarget, AttachInputModeState, AttachMouseProtocolState, AttachRect, AttachScene,
@@ -15517,7 +15419,6 @@ mod tests {
             &layout_state,
             &mut frame_damage,
             None,
-            None,
             Some(prompt_render),
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
@@ -15617,7 +15518,6 @@ mod tests {
             &mut view_state,
             &layout_state,
             &mut frame_damage,
-            None,
             None,
             None,
             DamageRect::new(0, 0, 80, 24),
@@ -15792,7 +15692,6 @@ mod tests {
             &layout_state,
             &mut frame_damage,
             None,
-            None,
             Some(prompt_render.clone()),
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
@@ -15810,7 +15709,6 @@ mod tests {
             &mut view_state,
             &layout_state,
             &mut unchanged_damage,
-            None,
             None,
             Some(prompt_render),
             DamageRect::new(0, 0, 80, 24),
@@ -19545,31 +19443,6 @@ mod tests {
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.overlay_needs_redraw);
         assert!(!view_state.dirty.full_pane_redraw);
-    }
-
-    #[test]
-    fn retained_status_surface_uses_render_ops_payload() {
-        let status_line = AttachStatusLine {
-            rendered: "NORMAL".to_owned(),
-            spans: vec![bmux_plugin::RenderTextSpan::new(
-                "NORMAL",
-                RenderStyle::new().bold(),
-            )],
-            tab_hitboxes: Vec::new(),
-            drag_marker_col: Some(3),
-            edit_cursor_col: None,
-        };
-
-        let surface = retained_status_surface(&status_line, StatusPosition::Bottom, (20, 5))
-            .expect("status surface");
-
-        assert_eq!(surface.id, STATUS_SURFACE_ID);
-        assert_eq!(surface.rect, DamageRect::new(0, 4, 20, 1));
-        assert_eq!(surface.opacity, RetainedOpacity::Opaque);
-        let RetainedSurfacePayload::RenderOps(ops) = surface.payload else {
-            panic!("status should lower to render ops");
-        };
-        assert_eq!(ops.len(), 2);
     }
 
     #[test]
