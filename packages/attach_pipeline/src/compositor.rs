@@ -212,12 +212,17 @@ pub fn retained_surfaces_from_plugin_surfaces(
             } else {
                 Vec::new()
             };
+            let render_ops = surface
+                .ops
+                .iter()
+                .map(|op| translate_surface_render_op(op, rect.x, rect.y))
+                .collect();
             let mut builder = RetainedSurface::builder(surface.id.retained_id, rect)
                 .layer(surface.layer)
                 .z(surface.z)
                 .modal(surface.modal)
                 .revision(surface.revision)
-                .render_ops(surface.ops.clone())
+                .render_ops(render_ops)
                 .clip_rect(clip_rect)
                 .retained_interactive_regions(interactive_regions);
             builder = if surface.opaque {
@@ -228,6 +233,59 @@ pub fn retained_surfaces_from_plugin_surfaces(
             Some(builder.build())
         })
         .collect()
+}
+
+fn translate_surface_render_op(op: &RenderOp, origin_x: u16, origin_y: u16) -> RenderOp {
+    let translate_rect = |rect: ExtensionRect| {
+        ExtensionRect::new(
+            origin_x.saturating_add(rect.x),
+            origin_y.saturating_add(rect.y),
+            rect.w,
+            rect.h,
+        )
+    };
+    match op {
+        RenderOp::TextRun { x, y, text, style } => RenderOp::TextRun {
+            x: origin_x.saturating_add(*x),
+            y: origin_y.saturating_add(*y),
+            text: text.clone(),
+            style: *style,
+        },
+        RenderOp::StyledText { x, y, spans } => RenderOp::StyledText {
+            x: origin_x.saturating_add(*x),
+            y: origin_y.saturating_add(*y),
+            spans: spans.clone(),
+        },
+        RenderOp::ClearRect { rect, style } => RenderOp::ClearRect {
+            rect: translate_rect(*rect),
+            style: *style,
+        },
+        RenderOp::EraseRowSegment { x, y, width, style } => RenderOp::EraseRowSegment {
+            x: origin_x.saturating_add(*x),
+            y: origin_y.saturating_add(*y),
+            width: *width,
+            style: *style,
+        },
+        RenderOp::FillRect { rect, ch, style } => RenderOp::FillRect {
+            rect: translate_rect(*rect),
+            ch: *ch,
+            style: *style,
+        },
+        RenderOp::Border {
+            rect,
+            glyphs,
+            style,
+        } => RenderOp::Border {
+            rect: translate_rect(*rect),
+            glyphs: *glyphs,
+            style: *style,
+        },
+        RenderOp::CellGrid { x, y, rows } => RenderOp::CellGrid {
+            x: origin_x.saturating_add(*x),
+            y: origin_y.saturating_add(*y),
+            rows: rows.clone(),
+        },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1511,7 +1569,7 @@ mod tests {
                 opaque: true,
                 modal: false,
                 visible: true,
-                ops: vec![RenderOp::text_run(4, 2, "layout", RenderStyle::new())],
+                ops: vec![RenderOp::text_run(0, 0, "layout", RenderStyle::new())],
             },
             PluginSurface {
                 id: PluginSurfaceId::new(owner, "overlay", Uuid::from_u128(502)),
@@ -1525,7 +1583,7 @@ mod tests {
                 opaque: false,
                 modal: false,
                 visible: true,
-                ops: Vec::new(),
+                ops: vec![RenderOp::text_run(0, 0, "explicit", RenderStyle::new())],
             },
         ];
 
@@ -1537,8 +1595,26 @@ mod tests {
 
         assert_eq!(lowered.len(), 2);
         assert_eq!(lowered[0].rect, DamageRect::new(4, 2, 20, 3));
+        assert_eq!(
+            lowered[0].payload,
+            RetainedSurfacePayload::RenderOps(vec![RenderOp::text_run(
+                4,
+                2,
+                "layout",
+                RenderStyle::new(),
+            )])
+        );
         assert!(lowered[0].opaque);
         assert_eq!(lowered[1].rect, DamageRect::new(30, 5, 10, 2));
+        assert_eq!(
+            lowered[1].payload,
+            RetainedSurfacePayload::RenderOps(vec![RenderOp::text_run(
+                30,
+                5,
+                "explicit",
+                RenderStyle::new(),
+            )])
+        );
         assert!(!lowered[1].opaque);
     }
 
@@ -2532,7 +2608,14 @@ mod tests {
         assert_eq!(lowered[0].revision, Some(7));
         assert_eq!(lowered[0].opacity, RetainedOpacity::Opaque);
         assert_eq!(lowered[0].clip_rect, Some(DamageRect::new(6, 4, 8, 6)));
-        assert_eq!(lowered[0].payload, RetainedSurfacePayload::RenderOps(ops));
+        let expected_ops = ops
+            .iter()
+            .map(|op| translate_surface_render_op(op, 5, 3))
+            .collect();
+        assert_eq!(
+            lowered[0].payload,
+            RetainedSurfacePayload::RenderOps(expected_ops)
+        );
     }
 
     #[test]
