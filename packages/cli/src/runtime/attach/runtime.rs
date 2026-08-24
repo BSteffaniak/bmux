@@ -8219,6 +8219,36 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     for extension in &retained_extensions {
         extension.refresh_state();
     }
+    let retained_plugin_repaints = frame_plan
+        .retained
+        .repaint_plan
+        .iter()
+        .filter(|repaint| {
+            view_state
+                .retained_plugin_surface_ids
+                .contains(&repaint.surface_id)
+        })
+        .filter_map(|repaint| {
+            view_state
+                .retained_compositor
+                .surfaces()
+                .get(&repaint.surface_id)
+                .cloned()
+                .map(|surface| (surface, repaint.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (surface, repaint) in retained_plugin_repaints {
+        overlay_rendered |=
+            queue_retained_render_ops(&mut frame_bytes, &surface, &repaint, retained_capabilities)?;
+        overlay_rendered |= queue_retained_extension_ops(
+            &mut frame_bytes,
+            &surface,
+            &repaint,
+            &retained_extensions,
+            retained_capabilities,
+            &mut view_state.terminal_graphics_cache,
+        )?;
+    }
     let mut overlay_cursor_state = None;
     if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
@@ -15418,6 +15448,10 @@ mod tests {
         )
         .expect("incremental frame");
 
+        assert!(
+            String::from_utf8_lossy(&output).contains("1:one 2:TWO 3:three"),
+            "incremental presentation output omitted plugin paint operations"
+        );
         assert!(
             stats.frame_bytes <= 330,
             "incremental presentation emitted {} bytes",
