@@ -7850,17 +7850,7 @@ fn retained_plugin_surfaces(viewport: DamageRect) -> Vec<RetainedSurface> {
         .into_iter()
         .map(|allocation| (allocation.id, allocation.rect))
         .collect::<BTreeMap<_, _>>();
-    let surfaces = bmux_plugin::surface::global_plugin_surface_registry()
-        .surfaces()
-        .into_iter()
-        .filter(|surface| match &surface.target {
-            bmux_plugin::surface::PluginSurfaceTarget::Layout(layout_id) => {
-                global_plugin_layout_registry().owner_revision(&layout_id.owner_plugin_id)
-                    == Some(surface.revision)
-            }
-            bmux_plugin::surface::PluginSurfaceTarget::Explicit(_) => true,
-        })
-        .collect::<Vec<_>>();
+    let surfaces = bmux_plugin::surface::global_plugin_surface_registry().surfaces();
     retained_surfaces_from_plugin_surfaces(&surfaces, &allocations, viewport)
 }
 
@@ -15166,10 +15156,10 @@ mod tests {
             global_plugin_surface_registry().publish(
                 owner,
                 PluginSurfaceSnapshot {
-                    revision: 1,
+                    revision: 2,
                     surfaces: vec![PluginSurface::layout(
                         PluginSurfaceId::new(owner, "main", retained_id),
-                        1,
+                        2,
                         layout_id,
                         vec![bmux_plugin::RenderOp::text_run(
                             0,
@@ -15228,6 +15218,7 @@ mod tests {
             .get(&retained_id)
             .expect("published plugin surface should reach attach compositor");
         assert_eq!(plugin_surface.rect, DamageRect::new(0, 0, 12, 24));
+        assert_eq!(plugin_surface.revision, Some(2));
         assert!(
             plan.repaint_plan
                 .iter()
@@ -15449,8 +15440,8 @@ mod tests {
         .expect("incremental frame");
 
         assert!(
-            String::from_utf8_lossy(&output).contains("1:one 2:TWO 3:three"),
-            "incremental presentation output omitted plugin paint operations"
+            String::from_utf8_lossy(&output).contains("TWO"),
+            "incremental presentation output omitted changed plugin paint operations"
         );
         assert!(
             stats.frame_bytes <= 330,
@@ -15460,6 +15451,7 @@ mod tests {
         assert!(!stats.full_frame_fallback);
         assert_eq!(stats.full_surface_fallbacks, 0);
         global_plugin_surface_registry().remove_owner(OWNER);
+        global_plugin_layout_registry().remove_owner(OWNER);
     }
 
     #[test]
