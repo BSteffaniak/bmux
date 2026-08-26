@@ -76,9 +76,7 @@ pub fn write_ansi_frame_diff(
     let mut changed_cells = 0usize;
     write!(writer, "\x1b[?25l")?;
     for y in area.y..area.bottom() {
-        let mut intervals = changed_row_intervals(previous, current, y);
-        merge_intervals(&mut intervals);
-        for (start, end) in intervals {
+        if let Some((start, end)) = changed_row_suffix(previous, current, y) {
             emit_row_span(writer, current, y, start, end, &mut active_style)?;
             changed_cells = changed_cells.saturating_add(usize::from(end.saturating_sub(start)));
         }
@@ -98,55 +96,41 @@ pub fn write_ansi_frame_diff(
     })
 }
 
-fn changed_row_intervals(previous: &Buffer, current: &Buffer, y: u16) -> Vec<(u16, u16)> {
+fn changed_row_suffix(previous: &Buffer, current: &Buffer, y: u16) -> Option<(u16, u16)> {
     let area = current.area();
-    let mut intervals = Vec::new();
-    for x in area.x..area.right() {
-        let point = Point::new(x, y);
-        let Some(previous_cell) = previous.get(point) else {
-            continue;
-        };
-        let Some(current_cell) = current.get(point) else {
-            continue;
-        };
-        if previous_cell == current_cell {
-            continue;
-        }
-        let mut start = x;
-        let mut end = x.saturating_add(1).min(area.right());
-        for (buffer, cell) in [(previous, previous_cell), (current, current_cell)] {
-            if cell.is_wide_continuation() && x > area.x {
-                start = start.min(x - 1);
-            }
-            if cell.is_wide_leader() {
-                end = end.max(x.saturating_add(2).min(area.right()));
-            }
-            if x > area.x
-                && buffer
-                    .get(Point::new(x - 1, y))
-                    .is_some_and(crate::buffer::Cell::is_wide_leader)
-            {
-                start = start.min(x - 1);
-            }
-        }
-        intervals.push((start, end));
-    }
-    intervals
-}
-
-fn merge_intervals(intervals: &mut Vec<(u16, u16)>) {
-    intervals.sort_unstable();
-    let mut merged = Vec::with_capacity(intervals.len());
-    for (start, end) in intervals.drain(..) {
-        if let Some((_, previous_end)) = merged.last_mut()
-            && start <= *previous_end
+    let mut changed = (area.x..area.right()).filter(|x| {
+        let point = Point::new(*x, y);
+        previous.get(point) != current.get(point)
+    });
+    let first_changed = changed.next()?;
+    let last_changed = changed.next_back().unwrap_or(first_changed);
+    let mut start = first_changed;
+    let mut end = last_changed.saturating_add(1).min(area.right());
+    for buffer in [previous, current] {
+        let first = Point::new(first_changed, y);
+        if buffer
+            .get(first)
+            .is_some_and(crate::buffer::Cell::is_wide_continuation)
+            && first_changed > area.x
         {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged.push((start, end));
+            start = first_changed - 1;
+        }
+        if first_changed > area.x
+            && buffer
+                .get(Point::new(first_changed - 1, y))
+                .is_some_and(crate::buffer::Cell::is_wide_leader)
+        {
+            start = first_changed - 1;
+        }
+        let last = Point::new(last_changed, y);
+        if buffer
+            .get(last)
+            .is_some_and(crate::buffer::Cell::is_wide_leader)
+        {
+            end = last_changed.saturating_add(2).min(area.right());
         }
     }
-    *intervals = merged;
+    Some((start, end))
 }
 
 fn emit_row_span(
@@ -571,7 +555,38 @@ mod tests {
     }
 
     #[test]
-    fn ansi_frame_diff_writes_only_changed_cells() {
+    fn ansi_diff_repaints_row_suffix_after_first_changed_cell() {
+        let previous = wide_buffer("prefix old stale", 20);
+        let current = wide_buffer("prefix new", 20);
+        let mut out = Vec::new();
+
+        let stats = write_ansi_frame_diff(&mut out, &previous, &current, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(!stats.full_repaint);
+        assert_eq!(stats.changed_cells, 9);
+        assert!(output.contains("\x1b[1;8Hnew"), "{output:?}");
+        assert!(output.ends_with("      \x1b[0m"), "{output:?}");
+    }
+
+    #[test]
+    fn ansi_diff_row_suffix_avoids_disjoint_cursor_drift_after_emoji() {
+        let previous = wide_buffer("👩🏽‍💻 A stale tail", 18);
+        let current = wide_buffer("👩🏽‍💻 B", 18);
+        let mut out = Vec::new();
+
+        write_ansi_frame_diff(&mut out, &previous, &current, None).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        // One absolute move begins the changed suffix; no later cursor move can
+        // accumulate a terminal/unicode-width disagreement.
+        assert_eq!(output.matches('H').count(), 1, "{output:?}");
+        assert!(output.contains('B'));
+        assert!(output.contains("          "), "{output:?}");
+    }
+
+    #[test]
+    fn ansi_frame_diff_writes_changed_row_suffix() {
         let mut previous = Buffer::empty(Rect::new(0, 0, 3, 1));
         previous.set_cell(Point::new(0, 0), "A", Style::new());
         previous.set_cell(Point::new(1, 0), "B", Style::new());
