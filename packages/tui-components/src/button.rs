@@ -216,6 +216,7 @@ impl<'a> Button<'a> {
     }
 
     /// Render button visuals without registering another interaction region.
+    #[cfg(feature = "action-row")]
     pub(crate) fn render_visual(&self, area: Rect, state: ButtonState, frame: &mut Frame<'_>) {
         self.render_line(area, state, frame, None);
     }

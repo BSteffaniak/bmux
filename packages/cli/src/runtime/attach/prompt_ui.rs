@@ -1717,6 +1717,13 @@ fn render_single_select(
     state.set_vertical_scroll(*scroll);
     SelectableList::new(&items)
         .styles(SelectableListStyles {
+            background: theme.background,
+            scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles {
+                begin: theme.muted,
+                track: theme.muted,
+                thumb: theme.focused,
+                end: theme.muted,
+            },
             normal: theme.text,
             focused: theme.focused,
             selected: theme.focused,

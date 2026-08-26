@@ -12,7 +12,9 @@ use bmux_tui::text_width::display_width;
 use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::hit_test::{HitRegion, hit_region_at};
 use crate::scroll_area::ScrollAreaScrollbarMode;
-use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
+use crate::scrollbar::{
+    Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
+};
 
 /// One selectable list item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +86,10 @@ impl SelectableListItem {
 /// Visual styles for a selectable list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectableListStyles {
+    /// Style filling the complete control area, including unused rows and gutter.
+    pub background: Style,
+    /// Styles for the integrated scrollbar.
+    pub scrollbar: ScrollbarStyles,
     /// Style used for enabled inactive items.
     pub normal: Style,
     /// Style used for the focused item.
@@ -101,6 +107,8 @@ pub struct SelectableListStyles {
 impl Default for SelectableListStyles {
     fn default() -> Self {
         Self {
+            background: Style::new(),
+            scrollbar: ScrollbarStyles::default(),
             normal: Style::new(),
             focused: Style::new().add_modifier(Modifier::REVERSED),
             selected: Style::new().add_modifier(Modifier::BOLD),
@@ -423,7 +431,7 @@ impl<'a> SelectableList<'a> {
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
-        self.render_with_fallback_style(area, state, frame, Style::new());
+        self.render_with_fallback_style(area, state, frame, self.styles.background);
     }
 
     /// Render the selectable list with a fallback style filling each item row.
@@ -434,6 +442,7 @@ impl<'a> SelectableList<'a> {
         frame: &mut Frame<'_>,
         fallback: Style,
     ) {
+        frame.fill(area, " ", fallback);
         let content_area = self.content_area(area);
         let mut skipped_rows = state.vertical_scroll;
         let mut rendered_row = 0u16;
@@ -467,6 +476,7 @@ impl<'a> SelectableList<'a> {
             .offset(u16_saturating(state.vertical_scroll));
         Scrollbar::new()
             .policy(self.policy.scrollbar_policy)
+            .styles(self.styles.scrollbar)
             .render(area, &scrollbar_state, frame);
     }
 
@@ -961,6 +971,8 @@ impl From<crate::theme::ComponentTheme> for SelectableListStyles {
     fn from(theme: crate::theme::ComponentTheme) -> Self {
         let theme = theme.for_surface(crate::theme::ComponentSurfaceDepth::Normal);
         Self {
+            background: theme.surfaces.normal,
+            scrollbar: theme.scrollbar_styles(),
             normal: theme.text,
             focused: theme.focused,
             selected: theme.selected,
@@ -986,6 +998,29 @@ mod tests {
         SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListOutcome,
         SelectableListPolicy, SelectableListState, SelectableListStyles,
     };
+
+    #[test]
+    fn opaque_theme_fills_complete_list_surface_and_scrollbar_gutter() {
+        let items = [SelectableListItem::new("one", "One")];
+        let theme = crate::theme::ComponentTheme::opaque_dark();
+        let list = SelectableList::new(&items)
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .styles(theme.selectable_list_styles());
+        let area = Rect::new(0, 0, 12, 4);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        list.render(area, &SelectableListState::new(Some(0)), &mut frame);
+
+        for cell in frame.buffer().cells() {
+            assert!(
+                cell.style
+                    .bg
+                    .is_some_and(|background| background != bmux_tui::style::Color::Default),
+                "selectable-list left an unpainted cell: {:?}",
+                cell.symbol
+            );
+        }
+    }
 
     #[test]
     fn renders_rich_line_items_preserving_span_style() {
