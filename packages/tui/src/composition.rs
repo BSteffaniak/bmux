@@ -1,6 +1,7 @@
 //! Fundamental measurable composition containers.
 
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 use crate::chrome::Border;
 use crate::component::{
@@ -71,6 +72,17 @@ pub enum VerticalAlignment {
     End,
     /// Expand the child to the assigned height.
     Stretch,
+}
+
+/// One rendered rich-text row and its UTF-8 byte range in the logical source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextProjectionRow {
+    /// Styled rendered row.
+    pub line: Line,
+    /// Zero-based source line index.
+    pub source_line: usize,
+    /// UTF-8 byte range in the newline-separated logical text.
+    pub source_range: Range<usize>,
 }
 
 /// A measurable rich-text component.
@@ -153,12 +165,48 @@ impl TextContent {
         )
     }
 
-    fn rows(&self, width: u16) -> Vec<Line> {
+    /// Project wrapped rows back to UTF-8 byte ranges in the logical text.
+    ///
+    /// Source lines are treated as newline-separated. Ranges exclude synthetic
+    /// newline separators and whitespace consumed by a word-wrap boundary.
+    #[must_use]
+    pub fn projection(&self, width: u16) -> Vec<TextProjectionRow> {
         let width = usize::from(width.max(1));
-        self.text
-            .lines
-            .iter()
-            .flat_map(|line| line.wrap(TextWrapGeometry::uniform(width), self.wrap))
+        let mut source_base = 0usize;
+        let mut output = Vec::new();
+        for (source_line, line) in self.text.lines.iter().enumerate() {
+            let source = line.plain_text();
+            let mut search_start = 0usize;
+            for rendered in line.wrap(TextWrapGeometry::uniform(width), self.wrap) {
+                let text = rendered.plain_text();
+                let relative = if text.is_empty() {
+                    search_start
+                } else {
+                    source
+                        .get(search_start..)
+                        .and_then(|remaining| remaining.find(&text))
+                        .map_or(search_start, |found| search_start.saturating_add(found))
+                };
+                let start = source_base.saturating_add(relative);
+                output.push(TextProjectionRow {
+                    line: rendered,
+                    source_line,
+                    source_range: start..start.saturating_add(text.len()),
+                });
+                search_start = relative.saturating_add(text.len());
+            }
+            source_base = source_base.saturating_add(source.len());
+            if source_line + 1 < self.text.lines.len() {
+                source_base = source_base.saturating_add(1);
+            }
+        }
+        output
+    }
+
+    fn rows(&self, width: u16) -> Vec<Line> {
+        self.projection(width)
+            .into_iter()
+            .map(|row| row.line)
             .collect()
     }
 }
@@ -510,6 +558,146 @@ impl Component for ScrollViewport<'_> {
             ),
             |cx| self.child.paint(&child.node, cx),
         );
+    }
+}
+
+/// Assign stable keyed identity to one child without changing its geometry.
+pub struct Keyed<'a> {
+    id: LayoutId,
+    child: Element<'a>,
+}
+
+impl<'a> Keyed<'a> {
+    /// Create a keyed identity wrapper.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, child: impl Component + 'a) -> Self {
+        Self {
+            id: id.into(),
+            child: Element::new(child),
+        }
+    }
+}
+
+impl Component for Keyed<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let own = ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0);
+        own.combine(self.child.revision())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let child = self.child.layout(constraints, cx);
+        LayoutNode::with_children(
+            self.id.clone(),
+            child.size,
+            vec![ChildLayout::new(0, 0, child)],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        paint_single_child(&self.child, layout, cx);
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        let Some(child) = layout.children.first() else {
+            return crate::event::EventOutcome::Ignored;
+        };
+        self.child.event(event, &child.node, cx)
+    }
+}
+
+/// Add measurable insets around one child without introducing visual chrome.
+pub struct Padding<'a> {
+    surface: Surface<'a>,
+}
+
+impl<'a> Padding<'a> {
+    /// Create a padding wrapper.
+    #[must_use]
+    pub fn new(insets: Insets, child: impl Component + 'a) -> Self {
+        Self {
+            surface: Surface::new(child).id("padding").padding(insets),
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.surface = self.surface.id(id);
+        self
+    }
+}
+
+impl Component for Padding<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.surface.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.surface.layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.surface.paint(layout, cx);
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        self.surface.event(event, layout, cx)
+    }
+}
+
+/// Fill one complete measured rectangle behind a child.
+pub struct Fill<'a> {
+    surface: Surface<'a>,
+}
+
+impl<'a> Fill<'a> {
+    /// Create a complete rectangular fill wrapper.
+    #[must_use]
+    pub fn new(style: Style, child: impl Component + 'a) -> Self {
+        Self {
+            surface: Surface::new(child).id("fill").background(style),
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.surface = self.surface.id(id);
+        self
+    }
+}
+
+impl Component for Fill<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.surface.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.surface.layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.surface.paint(layout, cx);
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        self.surface.event(event, layout, cx)
     }
 }
 
@@ -1017,6 +1205,32 @@ struct RowChild<'a> {
     flex: u16,
 }
 
+/// A child requesting a weighted share of a [`Row`]'s remaining width.
+///
+/// `Flex` is a composition descriptor rather than an independent layout node,
+/// so it does not introduce identity or geometry between the row and child.
+pub struct Flex<'a> {
+    component: Element<'a>,
+    weight: u16,
+}
+
+impl<'a> Flex<'a> {
+    /// Wrap a child with a positive flex weight. Zero is normalized to one.
+    #[must_use]
+    pub fn new(weight: u16, child: impl Component + 'a) -> Self {
+        Self {
+            component: Element::new(child),
+            weight: weight.max(1),
+        }
+    }
+
+    /// Return the normalized allocation weight.
+    #[must_use]
+    pub const fn weight(&self) -> u16 {
+        self.weight
+    }
+}
+
 /// Horizontal composition supporting intrinsic and proportionally flexible children.
 pub struct Row<'a> {
     id: LayoutId,
@@ -1070,12 +1284,18 @@ impl<'a> Row<'a> {
 
     /// Append a child receiving a proportional share of remaining width.
     #[must_use]
-    pub fn flex_child(mut self, weight: u16, child: impl Component + 'a) -> Self {
+    pub fn flex(mut self, child: Flex<'a>) -> Self {
         self.children.push(RowChild {
-            component: Element::new(child),
-            flex: weight.max(1),
+            component: child.component,
+            flex: child.weight,
         });
         self
+    }
+
+    /// Append a child receiving a proportional share of remaining width.
+    #[must_use]
+    pub fn flex_child(self, weight: u16, child: impl Component + 'a) -> Self {
+        self.flex(Flex::new(weight, child))
     }
 }
 
@@ -1317,8 +1537,8 @@ impl Component for Column<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Align, Clip, Column, HorizontalAlignment, Row, ScrollViewport, SizeBox, Stack, StyleScope,
-        Surface, TextContent, VerticalAlignment, Visibility,
+        Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, ScrollViewport,
+        SizeBox, Stack, StyleScope, Surface, TextContent, VerticalAlignment, Visibility,
     };
     use crate::buffer::Buffer;
     use crate::component::{Component, ComponentRevision, Constraints, LayoutCx, LayoutNode};
@@ -1326,6 +1546,97 @@ mod tests {
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+
+    #[test]
+    fn text_projection_preserves_utf8_source_ranges_across_wraps_and_lines() {
+        let component = TextContent::new(crate::text::Text::from_lines(vec![
+            crate::text::Line::raw("one  two"),
+            crate::text::Line::raw("éx"),
+        ]));
+        let rows = component.projection(5);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    row.line.plain_text(),
+                    row.source_line,
+                    row.source_range.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("one  ".to_owned(), 0, 0..5),
+                ("two".to_owned(), 0, 5..8),
+                ("éx".to_owned(), 1, 9..12),
+            ]
+        );
+        assert!(rows.iter().all(|row| {
+            component.text.lines[row.source_line]
+                .plain_text()
+                .is_char_boundary(
+                    row.source_range.start.saturating_sub(
+                        component.text.lines[..row.source_line]
+                            .iter()
+                            .map(|line| line.plain_text().len() + 1)
+                            .sum(),
+                    ),
+                )
+        }));
+    }
+
+    #[test]
+    fn flex_descriptor_allocates_remaining_width_without_extra_layout_node() {
+        let component = Row::new()
+            .child(TextContent::new("ab"))
+            .flex(Flex::new(2, TextContent::new("flexible").id("body")));
+        let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        assert_eq!(layout.children.len(), 2);
+        assert_eq!(layout.children[1].node.id.as_str(), "body");
+        assert_eq!(layout.children[1].node.size.width, 8);
+        assert_eq!(Flex::new(0, TextContent::new("x")).weight(), 1);
+    }
+
+    #[test]
+    fn keyed_wrapper_replaces_only_parent_identity() {
+        let component = Keyed::new("message:42", TextContent::new("hello").id("body"));
+        let layout = component.layout(Constraints::new(0, 20, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.id.as_str(), "message:42");
+        assert_eq!(layout.children[0].node.id.as_str(), "body");
+        assert_eq!(layout.size, layout.children[0].node.size);
+        assert_ne!(
+            component.revision().layout,
+            Keyed::new("message:43", TextContent::new("hello").id("body"))
+                .revision()
+                .layout
+        );
+    }
+
+    #[test]
+    fn padding_wrapper_measures_without_visual_chrome() {
+        let component = Padding::new(Insets::new(1, 2, 1, 2), TextContent::new("hello"));
+        let layout = component.layout(Constraints::new(0, 20, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 9);
+        assert_eq!(layout.size.height, 3);
+        assert_eq!(layout.children[0].x, 2);
+        assert_eq!(layout.children[0].y, 1);
+    }
+
+    #[test]
+    fn fill_wrapper_paints_complete_measured_rectangle() {
+        let component = Fill::new(
+            Style::new().bg(Color::Blue),
+            SizeBox::new(TextContent::new("x")).width(6).height(2),
+        );
+        let layout = component.layout(Constraints::new(0, 10, 0, None), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(5, 1))
+                .map(|cell| cell.style.bg),
+            Some(Some(Color::Blue))
+        );
+    }
 
     #[test]
     fn surface_measures_padding_and_paints_complete_rectangle() {

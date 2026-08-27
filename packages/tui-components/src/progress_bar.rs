@@ -1,13 +1,21 @@
 //! Generic progress bar / gauge component.
 
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
 /// Progress value model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressBarValue {
     /// Determinate progress with current value and total value.
     Determinate { value: u64, total: u64 },
@@ -52,7 +60,7 @@ impl ProgressBarValue {
 }
 
 /// Label placement for [`ProgressBar`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressLabelPlacement {
     /// Do not render a label.
     Hidden,
@@ -63,7 +71,7 @@ pub enum ProgressLabelPlacement {
 }
 
 /// Render mode for [`ProgressBar`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressBarMode {
     /// Filled bar gauge.
     Bar,
@@ -214,6 +222,121 @@ impl Default for ProgressBarStyles {
             indeterminate: Style::new().fg(Color::Cyan),
             background: Style::new(),
         }
+    }
+}
+
+/// Canonical component-lifecycle progress bar.
+pub struct ProgressBarComponent<'a> {
+    id: LayoutId,
+    bar: ProgressBar<'a>,
+}
+
+impl<'a> ProgressBarComponent<'a> {
+    /// Create a progress-bar component with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, value: ProgressBarValue) -> Self {
+        Self {
+            id: id.into(),
+            bar: ProgressBar::new(value),
+        }
+    }
+
+    /// Set explicit label.
+    #[must_use]
+    pub const fn label(mut self, label: &'a str) -> Self {
+        self.bar.label = Some(label);
+        self
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: ProgressBarPolicy) -> Self {
+        self.bar.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: ProgressBarStyles) -> Self {
+        self.bar.styles = styles;
+        self
+    }
+}
+
+impl Component for ProgressBarComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.bar.label.hash(&mut layout);
+        self.bar.policy.label.hash(&mut layout);
+        self.bar.policy.percentage.hash(&mut layout);
+        self.bar.policy.mode.hash(&mut layout);
+        self.bar.policy.filled.hash(&mut layout);
+        self.bar.policy.empty.hash(&mut layout);
+        self.bar.policy.partial.hash(&mut layout);
+        self.bar.policy.pulse.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.bar.value.hash(&mut paint);
+        self.bar.policy.pulse_width.hash(&mut paint);
+        self.bar.policy.background.hash(&mut paint);
+        self.bar.styles.filled.hash(&mut paint);
+        self.bar.styles.empty.hash(&mut paint);
+        self.bar.styles.label.hash(&mut paint);
+        self.bar.styles.complete.hash(&mut paint);
+        self.bar.styles.indeterminate.hash(&mut paint);
+        self.bar.styles.background.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let label_width = self.bar.label_text().as_deref().map_or(0, display_width);
+        let intrinsic_width = match self.bar.policy.label {
+            ProgressLabelPlacement::Right if label_width > 0 => label_width.saturating_add(2),
+            ProgressLabelPlacement::Inside => label_width.max(1),
+            ProgressLabelPlacement::Hidden | ProgressLabelPlacement::Right => 1,
+        };
+        let width = if constraints.min_width() == constraints.max_width() {
+            constraints.max_width()
+        } else {
+            u16::try_from(intrinsic_width)
+                .unwrap_or(u16::MAX)
+                .clamp(constraints.min_width(), constraints.max_width())
+        };
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, usize::from(width > 0))),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("progress"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        if self.bar.policy.background {
+            cx.fill(area, " ", self.bar.styles.background);
+        }
+        let line = match self.bar.value {
+            ProgressBarValue::Determinate { .. }
+                if matches!(self.bar.policy.mode, ProgressBarMode::LineGauge) =>
+            {
+                self.bar.line_gauge_line(layout.size.width)
+            }
+            ProgressBarValue::Determinate { .. } => self.bar.determinate_line(layout.size.width),
+            ProgressBarValue::Indeterminate { offset } => {
+                self.bar.indeterminate_line(layout.size.width, offset)
+            }
+        };
+        cx.write_line(area, &line);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "progress",
+        ));
+        cx.push_damage(area);
     }
 }
 
@@ -473,6 +596,131 @@ impl<'a> ProgressBar<'a> {
         frame.write_line_with_fallback_style(area, &Line::from(cells), self.styles.indeterminate);
     }
 
+    fn determinate_line(&self, width: u16) -> Line {
+        let label = self.label_text();
+        let label_width = label.as_ref().map_or(0, |label| display_width(label));
+        let right_label =
+            matches!(self.policy.label, ProgressLabelPlacement::Right) && label_width > 0;
+        let gap = u16::from(right_label);
+        let bar_width = if right_label {
+            width.saturating_sub(u16_saturating(label_width).saturating_add(gap))
+        } else {
+            width
+        };
+        let filled_width = self.filled_width(bar_width).min(bar_width);
+        let partial_width = self.partial_width(bar_width);
+        let mut spans = Vec::new();
+        if filled_width > 0 {
+            spans.push(Span::styled(
+                self.policy.filled.repeat(usize::from(filled_width)),
+                self.filled_style(),
+            ));
+        }
+        if partial_width > 0 {
+            spans.push(Span::styled(
+                self.policy.partial.repeat(usize::from(partial_width)),
+                self.filled_style(),
+            ));
+        }
+        let empty_width = bar_width
+            .saturating_sub(filled_width)
+            .saturating_sub(partial_width);
+        if empty_width > 0 {
+            spans.push(Span::styled(
+                self.policy.empty.repeat(usize::from(empty_width)),
+                self.styles.empty,
+            ));
+        }
+        if right_label {
+            if bar_width < width {
+                spans.push(Span::raw(" "));
+            }
+            if let Some(label) = &label {
+                spans.push(Span::styled(label.clone(), self.styles.label));
+            }
+        }
+        if matches!(self.policy.label, ProgressLabelPlacement::Inside)
+            && !matches!(self.policy.mode, ProgressBarMode::LineGauge)
+        {
+            overlay_label(
+                Line::from_spans(spans),
+                label.as_deref(),
+                self.styles.label,
+                usize::from(width),
+            )
+        } else {
+            Line::from_spans(spans)
+        }
+    }
+
+    fn line_gauge_line(&self, width: u16) -> Line {
+        let label = self.label_text();
+        let label_width = label.as_ref().map_or(0, |label| display_width(label));
+        let right_label =
+            label_width > 0 && !matches!(self.policy.label, ProgressLabelPlacement::Hidden);
+        let gap = u16::from(right_label);
+        let gauge_width = if right_label {
+            width.saturating_sub(u16_saturating(label_width).saturating_add(gap))
+        } else {
+            width
+        };
+        let filled_width = self.filled_width(gauge_width).min(gauge_width);
+        let partial_width = self.partial_width(gauge_width);
+        let mut spans = Vec::new();
+        if filled_width > 0 {
+            spans.push(Span::styled(
+                self.policy.filled.repeat(usize::from(filled_width)),
+                self.filled_style(),
+            ));
+        }
+        if partial_width > 0 {
+            spans.push(Span::styled(
+                self.policy.partial.repeat(usize::from(partial_width)),
+                self.filled_style(),
+            ));
+        }
+        let empty_width = gauge_width
+            .saturating_sub(filled_width)
+            .saturating_sub(partial_width);
+        if empty_width > 0 {
+            spans.push(Span::styled(
+                self.policy.empty.repeat(usize::from(empty_width)),
+                self.styles.empty,
+            ));
+        }
+        if right_label {
+            if gauge_width < width {
+                spans.push(Span::raw(" "));
+            }
+            if let Some(label) = label {
+                spans.push(Span::styled(
+                    truncate_to_display_width(
+                        &label,
+                        usize::from(width.saturating_sub(gauge_width).saturating_sub(gap)),
+                    ),
+                    self.styles.label,
+                ));
+            }
+        }
+        Line::from_spans(spans)
+    }
+
+    fn indeterminate_line(&self, width: u16, offset: u16) -> Line {
+        let pulse_width = self.policy.pulse_width.max(1).min(width.max(1));
+        let span = width.saturating_add(pulse_width);
+        let start = if span == 0 { 0 } else { offset % span };
+        let mut cells = String::new();
+        for x in 0..width {
+            let in_pulse = x.saturating_add(pulse_width) >= start && x < start;
+            cells.push_str(if in_pulse {
+                self.policy.pulse
+            } else {
+                self.policy.empty
+            });
+        }
+        Line::from_spans([Span::styled(cells, self.styles.indeterminate)])
+    }
+
     fn filled_style(&self) -> Style {
         if matches!(self.value.percent(), Some(100)) {
             self.styles.complete
@@ -526,10 +774,43 @@ impl From<crate::theme::ComponentTheme> for ProgressBarStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
+    use bmux_tui::paint::PaintCx;
 
-    use super::{ProgressBar, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement};
+    use super::{
+        ProgressBar, ProgressBarComponent, ProgressBarPolicy, ProgressBarValue,
+        ProgressLabelPlacement,
+    };
+
+    #[test]
+    fn component_measures_paints_and_registers_progress() {
+        let component = ProgressBarComponent::new("download", ProgressBarValue::determinate(1, 2))
+            .policy(ProgressBarPolicy::bare());
+        let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(10, 1));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█████░░░░░"));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert!(
+            !frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn component_value_changes_are_paint_only() {
+        let initial =
+            ProgressBarComponent::new("download", ProgressBarValue::determinate(1, 2)).revision();
+        let changed =
+            ProgressBarComponent::new("download", ProgressBarValue::determinate(2, 2)).revision();
+        assert_eq!(initial.layout, changed.layout);
+        assert_ne!(initial.paint, changed.paint);
+    }
 
     #[test]
     fn ratio_constructor_builds_determinate_progress() {

@@ -1,13 +1,21 @@
 //! Generic stepper / multi-step progress indicator component.
 
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
 /// Generic step status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum StepStatus {
     /// Pending step.
     #[default]
@@ -55,7 +63,7 @@ impl<'a> StepItem<'a> {
 }
 
 /// Stepper orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum StepperOrientation {
     /// Render steps left-to-right on one row.
     #[default]
@@ -139,6 +147,180 @@ impl Default for StepperStyles {
             disabled: Style::new().fg(Color::BrightBlack),
             connector: Style::new().fg(Color::BrightBlack),
         }
+    }
+}
+
+/// Canonical component-lifecycle stepper.
+pub struct StepperComponent<'a> {
+    id: LayoutId,
+    stepper: Stepper<'a>,
+}
+
+impl<'a> StepperComponent<'a> {
+    /// Create a stepper component with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, steps: &'a [StepItem<'a>]) -> Self {
+        Self {
+            id: id.into(),
+            stepper: Stepper::new(steps),
+        }
+    }
+
+    /// Set layout and rendering policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: StepperPolicy) -> Self {
+        self.stepper.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: StepperStyles) -> Self {
+        self.stepper.styles = styles;
+        self
+    }
+}
+
+impl Component for StepperComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.stepper.policy.orientation.hash(&mut layout);
+        self.stepper.policy.connector.hash(&mut layout);
+        self.stepper.policy.truncate.hash(&mut layout);
+        self.stepper.policy.markers.hash(&mut layout);
+        for step in self.stepper.steps {
+            step.id.hash(&mut layout);
+            step.label.hash(&mut layout);
+        }
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for step in self.stepper.steps {
+            step.status.hash(&mut paint);
+        }
+        self.stepper.styles.pending.hash(&mut paint);
+        self.stepper.styles.current.hash(&mut paint);
+        self.stepper.styles.complete.hash(&mut paint);
+        self.stepper.styles.warning.hash(&mut paint);
+        self.stepper.styles.error.hash(&mut paint);
+        self.stepper.styles.disabled.hash(&mut paint);
+        self.stepper.styles.connector.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let intrinsic_width = match self.stepper.policy.orientation {
+            StepperOrientation::Horizontal => self
+                .stepper
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| {
+                    display_width(&self.stepper.step_text(step))
+                        + usize::from(index > 0)
+                            * display_width(&format!(" {} ", self.stepper.policy.connector))
+                })
+                .sum(),
+            StepperOrientation::Vertical => self
+                .stepper
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| {
+                    let prefix = if index == 0 {
+                        2
+                    } else {
+                        display_width(self.stepper.policy.connector).saturating_add(1)
+                    };
+                    prefix.saturating_add(display_width(&self.stepper.step_text(step)))
+                })
+                .max()
+                .unwrap_or_default(),
+        };
+        let width = if constraints.min_width() == constraints.max_width() {
+            constraints.max_width()
+        } else {
+            u16::try_from(intrinsic_width)
+                .unwrap_or(u16::MAX)
+                .clamp(constraints.min_width(), constraints.max_width())
+        };
+        let intrinsic_height = match self.stepper.policy.orientation {
+            StepperOrientation::Horizontal => usize::from(!self.stepper.steps.is_empty()),
+            StepperOrientation::Vertical => self.stepper.steps.len(),
+        };
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, intrinsic_height)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("progress"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 || self.stepper.steps.is_empty() {
+            return;
+        }
+        match self.stepper.policy.orientation {
+            StepperOrientation::Horizontal => {
+                let mut spans = Vec::new();
+                for (index, step) in self.stepper.steps.iter().enumerate() {
+                    if index > 0 {
+                        spans.push(Span::styled(
+                            format!(" {} ", self.stepper.policy.connector),
+                            self.stepper.styles.connector,
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        self.stepper.step_text(step),
+                        self.stepper.style_for(step.status),
+                    ));
+                }
+                let mut line = Line::from_spans(spans);
+                if self.stepper.policy.truncate && line.width() > usize::from(layout.size.width) {
+                    line = line.truncate(usize::from(layout.size.width));
+                }
+                cx.write_line(LocalRect::new(0, 0, layout.size.width, 1), &line);
+            }
+            StepperOrientation::Vertical => {
+                for (index, step) in self
+                    .stepper
+                    .steps
+                    .iter()
+                    .take(layout.size.height)
+                    .enumerate()
+                {
+                    let prefix = if index > 0 {
+                        format!("{} ", self.stepper.policy.connector)
+                    } else {
+                        "  ".to_owned()
+                    };
+                    let mut line = Line::from_spans([Span::styled(
+                        format!("{prefix}{}", self.stepper.step_text(step)),
+                        self.stepper.style_for(step.status),
+                    )]);
+                    if self.stepper.policy.truncate {
+                        line = line.truncate(usize::from(layout.size.width));
+                    }
+                    cx.write_line(
+                        LocalRect::new(
+                            0,
+                            i64::try_from(index).unwrap_or(i64::MAX),
+                            layout.size.width,
+                            1,
+                        ),
+                        &line,
+                    );
+                }
+            }
+        }
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = LocalRect::new(0, 0, layout.size.width, height);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, height),
+            "progress",
+        ));
+        cx.push_damage(area);
     }
 }
 
@@ -304,10 +486,16 @@ impl From<crate::theme::ComponentTheme> for StepperStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
+    use bmux_tui::paint::PaintCx;
+    use bmux_tui::style::{Color, Style};
 
-    use super::{StepItem, StepStatus, Stepper, StepperOrientation, StepperPolicy};
+    use super::{
+        StepItem, StepStatus, Stepper, StepperComponent, StepperOrientation, StepperPolicy,
+        StepperStyles,
+    };
 
     #[test]
     fn renders_horizontal_stepper() {
@@ -378,6 +566,64 @@ mod tests {
         Stepper::new(&steps).render(Rect::new(0, 0, 4, 1), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("● L…"));
+    }
+
+    #[test]
+    fn component_measures_and_paints_horizontal_progress() {
+        let steps = [
+            StepItem::new("one", "One").status(StepStatus::Complete),
+            StepItem::new("two", "Two").status(StepStatus::Current),
+        ];
+        let component = StepperComponent::new("setup", &steps);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(20, 1));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("✓ One ── ● Two      ")
+        );
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert!(
+            !frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn component_vertical_layout_respects_height_constraint() {
+        let steps = [
+            StepItem::new("one", "One"),
+            StepItem::new("two", "Two"),
+            StepItem::new("three", "Three"),
+        ];
+        let component = StepperComponent::new("setup", &steps).policy(StepperPolicy::vertical());
+        let layout = component.layout(Constraints::new(10, 10, 0, Some(2)), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(10, 2));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("│ ○ Two   "));
+    }
+
+    #[test]
+    fn component_status_and_styles_are_paint_only() {
+        let pending = [StepItem::new("one", "One")];
+        let current = [StepItem::new("one", "One").status(StepStatus::Current)];
+        let initial = StepperComponent::new("setup", &pending).revision();
+        let status = StepperComponent::new("setup", &current).revision();
+        let styled = StepperComponent::new("setup", &pending)
+            .styles(StepperStyles {
+                current: Style::new().fg(Color::Red),
+                ..StepperStyles::default()
+            })
+            .revision();
+        assert_eq!(initial.layout, status.layout);
+        assert_ne!(initial.paint, status.paint);
+        assert_eq!(initial.layout, styled.layout);
+        assert_ne!(initial.paint, styled.paint);
     }
 
     #[test]

@@ -1,8 +1,16 @@
 //! Reusable labeled detail list component.
 
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
 
@@ -46,6 +54,116 @@ impl Default for LabeledDetailsStyles {
             value: Style::new().fg(Color::BrightWhite),
             continuation: Style::new().fg(Color::BrightBlack),
         }
+    }
+}
+
+/// Canonical component-lifecycle labeled detail list.
+pub struct LabeledDetailsComponent<'a> {
+    id: LayoutId,
+    details: LabeledDetails<'a>,
+}
+
+impl<'a> LabeledDetailsComponent<'a> {
+    /// Create a labeled-details component with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, items: &'a [DetailItem]) -> Self {
+        Self {
+            id: id.into(),
+            details: LabeledDetails::new(items),
+        }
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: LabeledDetailsStyles) -> Self {
+        self.details.styles = styles;
+        self
+    }
+
+    /// Set whether to insert a blank row between detail items.
+    #[must_use]
+    pub const fn item_spacing(mut self, item_spacing: bool) -> Self {
+        self.details.item_spacing = item_spacing;
+        self
+    }
+}
+
+impl Component for LabeledDetailsComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for item in self.details.items {
+            item.label.hash(&mut layout);
+            item.value.hash(&mut layout);
+        }
+        self.details.item_spacing.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.details.styles.label.hash(&mut paint);
+        self.details.styles.value.hash(&mut paint);
+        self.details.styles.continuation.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = if constraints.min_width() == constraints.max_width() {
+            constraints.max_width()
+        } else {
+            let intrinsic = self
+                .details
+                .items
+                .iter()
+                .flat_map(|item| {
+                    std::iter::once(display_width(&item.label)).chain(
+                        item.value
+                            .lines()
+                            .map(|line| display_width(line).saturating_add(2)),
+                    )
+                })
+                .max()
+                .unwrap_or_default();
+            u16::try_from(intrinsic)
+                .unwrap_or(u16::MAX)
+                .clamp(constraints.min_width(), constraints.max_width())
+        };
+        let height = self.details.lines(width).len();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, height)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("details"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        for (row, line) in self
+            .details
+            .lines(layout.size.width)
+            .iter()
+            .take(layout.size.height)
+            .enumerate()
+        {
+            cx.write_line(
+                LocalRect::new(
+                    0,
+                    i64::try_from(row).unwrap_or(i64::MAX),
+                    layout.size.width,
+                    1,
+                ),
+                line,
+            );
+        }
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = LocalRect::new(0, 0, layout.size.width, height);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, height),
+            "details",
+        ));
+        cx.push_damage(area);
     }
 }
 
@@ -168,7 +286,14 @@ impl From<crate::theme::ComponentTheme> for LabeledDetailsStyles {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailItem, LabeledDetails};
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::paint::PaintCx;
+    use bmux_tui::style::{Color, Style};
+
+    use super::{DetailItem, LabeledDetails, LabeledDetailsComponent, LabeledDetailsStyles};
 
     #[test]
     fn wraps_detail_values() {
@@ -178,5 +303,58 @@ mod tests {
         assert_eq!(lines[0].plain_text(), "command");
         assert_eq!(lines[1].plain_text(), "  abc");
         assert_eq!(lines[2].plain_text(), "  def");
+    }
+
+    #[test]
+    fn component_measures_wrapped_rows_and_paints_metadata() {
+        let items = [
+            DetailItem::new("command", "abcdef"),
+            DetailItem::new("state", "ready"),
+        ];
+        let component = LabeledDetailsComponent::new("details", &items);
+        let layout = component.layout(Constraints::for_width(5), &mut LayoutCx::new());
+        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(5, 7));
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 6));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("comma"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  abc"));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert!(
+            !frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn component_spacing_changes_layout_and_styles_only_change_paint() {
+        let items = [DetailItem::new("one", "1"), DetailItem::new("two", "2")];
+        let initial = LabeledDetailsComponent::new("details", &items).revision();
+        let compact = LabeledDetailsComponent::new("details", &items)
+            .item_spacing(false)
+            .revision();
+        let styled = LabeledDetailsComponent::new("details", &items)
+            .styles(LabeledDetailsStyles {
+                label: Style::new().fg(Color::Red),
+                ..LabeledDetailsStyles::default()
+            })
+            .revision();
+        assert_ne!(initial.layout, compact.layout);
+        assert_eq!(initial.layout, styled.layout);
+        assert_ne!(initial.paint, styled.paint);
+    }
+
+    #[test]
+    fn component_clips_to_constrained_height() {
+        let items = [DetailItem::new("command", "abcdef")];
+        let component = LabeledDetailsComponent::new("details", &items);
+        let layout = component.layout(Constraints::new(5, 5, 0, Some(2)), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  abc"));
     }
 }

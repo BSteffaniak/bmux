@@ -1,11 +1,20 @@
 //! Generic tab bar / segmented selector component.
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::KeyCode;
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
@@ -263,6 +272,130 @@ pub enum TabBarOutcome {
     Redraw,
     /// Selection changed to tab index.
     Selected(usize),
+}
+
+/// Canonical component-lifecycle tab bar.
+pub struct TabBarComponent<'a, 'state> {
+    id: LayoutId,
+    bar: TabBar<'a>,
+    state: &'state RefCell<TabBarState>,
+}
+
+impl<'a, 'state> TabBarComponent<'a, 'state> {
+    /// Create a tab bar with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        items: &'a [TabItem<'a>],
+        state: &'state RefCell<TabBarState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            bar: TabBar::new(items),
+            state,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: TabBarPolicy) -> Self {
+        self.bar.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: TabBarStyles) -> Self {
+        self.bar.styles = styles;
+        self
+    }
+}
+
+impl Component for TabBarComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for item in self.bar.items {
+            item.id.hash(&mut layout);
+            format!("{:?}", item.label).hash(&mut layout);
+        }
+        self.bar.policy.separator.hash(&mut layout);
+        self.bar.policy.padding_left.hash(&mut layout);
+        self.bar.policy.padding_right.hash(&mut layout);
+        format!("{:?}", self.bar.policy.overflow).hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.bar.policy.keyboard).hash(&mut paint);
+        format!("{:?}", self.bar.policy.mouse).hash(&mut paint);
+        format!("{:?}", self.bar.styles).hash(&mut paint);
+        for item in self.bar.items {
+            item.disabled.hash(&mut paint);
+        }
+        format!("{:?}", self.state.borrow()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = u16::try_from(display_width(&self.bar.text())).unwrap_or(u16::MAX);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(
+                width,
+                usize::from(!self.bar.items.is_empty()),
+            )),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("tabs"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 || self.bar.items.is_empty() {
+            return;
+        }
+        let state = self.state.borrow();
+        let area = Rect::new(0, 0, layout.size.width, 1);
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), area)
+                .role(HitRole::Action)
+                .hoverable(self.bar.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        for (index, item_area) in self.bar.hit_rects(area).into_iter().enumerate() {
+            let Some(item) = self.bar.items.get(index) else {
+                break;
+            };
+            cx.push_hit(
+                SceneRegion::new(format!("{}:{}", self.id.as_str(), item.id), item_area)
+                    .role(HitRole::Action)
+                    .hoverable(self.bar.policy.mouse.hover)
+                    .enabled(!state.interaction.disabled && !item.disabled),
+            );
+        }
+        let line = self.bar.line(&state);
+        let line = if matches!(self.bar.policy.overflow, TabBarOverflow::Truncate) {
+            line.truncate(usize::from(layout.size.width))
+        } else {
+            line
+        };
+        let local = LocalRect::new(0, 0, layout.size.width, 1);
+        cx.write_line(local, &line);
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "tabs"));
+        cx.push_damage(local);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let outcome = self
+            .bar
+            .handle_event(area, &mut self.state.borrow_mut(), event);
+        match outcome {
+            TabBarOutcome::Ignored => EventOutcome::Ignored,
+            TabBarOutcome::Redraw | TabBarOutcome::Selected(_) => EventOutcome::Redraw,
+        }
+    }
 }
 
 /// Generic tab bar / segmented selector.
@@ -636,14 +769,68 @@ impl From<crate::theme::ComponentTheme> for TabBarStyles {
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{
+        Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+    };
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
-    use super::{TabBar, TabBarOutcome, TabBarPolicy};
+    use super::{TabBar, TabBarComponent, TabBarOutcome, TabBarPolicy};
     use crate::tab_bar::{TabBarKeyboardPolicy, TabBarState, TabItem};
+
+    #[test]
+    fn component_measures_paints_and_registers_tabs() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(1)));
+        let component = TabBarComponent::new("tabs", &items, &state);
+        let layout = component.layout(Constraints::for_width(11), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(11, 1));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 11, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some(" One   Two ")
+        );
+        assert_eq!(frame.hits().regions().len(), 3);
+        assert_eq!(frame.semantics().regions().len(), 1);
+    }
+
+    #[test]
+    fn component_routes_selection_through_authoritative_layout() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+        let component = TabBarComponent::new("tabs", &items, &state);
+        let layout = LayoutNode::leaf(LayoutId::new("tabs"), LogicalSize::new(11, 1));
+        let mut event_cx = EventCx::new(&layout);
+        let outcome = component.event(
+            &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            &layout,
+            &mut event_cx,
+        );
+        assert_eq!(outcome, EventOutcome::Redraw);
+        assert_eq!(state.borrow().selected(), Some(1));
+    }
+
+    #[test]
+    fn component_disabled_tab_is_not_enabled_in_scene() {
+        let items = [
+            TabItem::new("one", "One"),
+            TabItem::new("two", "Two").disabled(true),
+        ];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+        let component = TabBarComponent::new("tabs", &items, &state);
+        let layout = component.layout(Constraints::for_width(11), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 11, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!(frame.hits().regions()[1].enabled);
+        assert!(!frame.hits().regions()[2].enabled);
+    }
 
     #[test]
     fn renders_selected_tab() {

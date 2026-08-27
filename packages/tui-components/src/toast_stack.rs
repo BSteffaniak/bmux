@@ -1,15 +1,24 @@
 //! Generic toast / notification stack component.
 
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::truncate_to_display_width;
 
 /// Generic toast severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum ToastSeverity {
     /// Default toast.
     #[default]
@@ -65,7 +74,7 @@ impl<'a> ToastItem<'a> {
 }
 
 /// Toast stack placement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum ToastPlacement {
     /// Stack from the top edge downward.
     #[default]
@@ -189,6 +198,184 @@ pub enum ToastStackOutcome<'a> {
     Redraw,
     /// Close was requested. Caller owns lifecycle/removal.
     CloseRequested { index: usize, id: &'a str },
+}
+
+/// Canonical component-lifecycle toast stack.
+pub struct ToastStackComponent<'a, 'state> {
+    id: LayoutId,
+    stack: ToastStack<'a>,
+    state: &'state Cell<ToastStackState>,
+}
+
+impl<'a, 'state> ToastStackComponent<'a, 'state> {
+    /// Create a toast stack with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        toasts: &'a [ToastItem<'a>],
+        state: &'state Cell<ToastStackState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            stack: ToastStack::new(toasts),
+            state,
+        }
+    }
+
+    /// Set layout and interaction policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: ToastStackPolicy) -> Self {
+        self.stack.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: ToastStackStyles) -> Self {
+        self.stack.styles = styles;
+        self
+    }
+}
+
+impl Component for ToastStackComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.stack.policy.width.hash(&mut layout);
+        self.stack.policy.max_visible.hash(&mut layout);
+        self.stack.policy.spacing.hash(&mut layout);
+        self.stack.policy.placement.hash(&mut layout);
+        for toast in self.stack.toasts {
+            toast.id.hash(&mut layout);
+            toast.title.hash(&mut layout);
+            toast.body.hash(&mut layout);
+        }
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.stack.policy.close_button.hash(&mut paint);
+        self.stack.policy.mouse.hash(&mut paint);
+        for toast in self.stack.toasts {
+            toast.severity.hash(&mut paint);
+        }
+        format!("{:?}", self.stack.styles).hash(&mut paint);
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let visible = self.stack.visible_count();
+        let content_width = self
+            .stack
+            .toasts
+            .iter()
+            .take(visible)
+            .flat_map(|toast| std::iter::once(toast.title).chain(toast.body))
+            .map(bmux_tui::text_width::display_width)
+            .max()
+            .unwrap_or_default()
+            .saturating_add(usize::from(self.stack.policy.close_button) * 2);
+        let width = self
+            .stack
+            .policy
+            .width
+            .min(u16::try_from(content_width).unwrap_or(u16::MAX))
+            .clamp(constraints.min_width(), constraints.max_width());
+        let content_height = self
+            .stack
+            .toasts
+            .iter()
+            .take(visible)
+            .map(|toast| usize::from(toast.body.is_some()) + 1)
+            .sum::<usize>()
+            .saturating_add(
+                usize::from(self.stack.policy.spacing).saturating_mul(visible.saturating_sub(1)),
+            );
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, content_height)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("notifications"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width,
+            u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+        );
+        for (index, toast) in self
+            .stack
+            .toasts
+            .iter()
+            .take(self.stack.visible_count())
+            .enumerate()
+        {
+            let Some(rect) = self.stack.toast_area(area, index, toast) else {
+                continue;
+            };
+            if self.stack.policy.close_button && self.stack.policy.mouse {
+                cx.push_hit(
+                    HitRegion::new(
+                        format!("{}:{}.close", self.id.as_str(), toast.id),
+                        Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
+                    )
+                    .role(HitRole::Action)
+                    .hoverable(true)
+                    .focusable(true),
+                );
+            }
+            let close = if self.stack.policy.close_button {
+                " ×"
+            } else {
+                ""
+            };
+            let title = truncate_to_display_width(
+                toast.title,
+                usize::from(rect.width).saturating_sub(close.len()),
+            );
+            cx.write_line(
+                LocalRect::new(0, i64::from(rect.y), rect.width, 1),
+                &Line::from_spans([
+                    Span::styled(title, self.stack.title_style(toast.severity)),
+                    Span::styled(close, self.stack.styles.close),
+                ]),
+            );
+            if let Some(body) = toast.body
+                && rect.height > 1
+            {
+                cx.write_line(
+                    LocalRect::new(0, i64::from(rect.y.saturating_add(1)), rect.width, 1),
+                    &Line::from_spans([Span::styled(
+                        truncate_to_display_width(body, usize::from(rect.width)),
+                        self.stack.styles.body,
+                    )]),
+                );
+            }
+        }
+        let local = LocalRect::new(0, 0, area.width, area.height);
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "notifications"));
+        cx.push_damage(local);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.stack.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            ToastStackOutcome::Ignored => EventOutcome::Ignored,
+            ToastStackOutcome::Redraw | ToastStackOutcome::CloseRequested { .. } => {
+                EventOutcome::Redraw
+            }
+        }
+    }
 }
 
 /// Generic toast / notification stack.
@@ -474,13 +661,52 @@ impl From<crate::theme::ComponentTheme> for ToastStackStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::paint::PaintCx;
 
     use super::{
-        ToastItem, ToastSeverity, ToastStack, ToastStackOutcome, ToastStackPolicy, ToastStackState,
+        ToastItem, ToastSeverity, ToastStack, ToastStackComponent, ToastStackOutcome,
+        ToastStackPolicy, ToastStackState,
     };
+
+    #[test]
+    fn component_measures_paints_and_registers_close_controls() {
+        let toasts = [ToastItem::new("one", "Saved").body("Changes persisted")];
+        let state = std::cell::Cell::new(ToastStackState::default());
+        let component = ToastStackComponent::new("toasts", &toasts, &state);
+        let layout = component.layout(Constraints::new(0, 24, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(19, 2));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 19, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("Changes persisted  ")
+        );
+        assert_eq!(frame.hits().regions().len(), 1);
+        assert_eq!(frame.semantics().regions().len(), 1);
+    }
+
+    #[test]
+    fn component_measurement_respects_visible_limit_and_spacing() {
+        let toasts = [
+            ToastItem::new("one", "One"),
+            ToastItem::new("two", "Two").body("Body"),
+            ToastItem::new("three", "Three"),
+        ];
+        let state = std::cell::Cell::new(ToastStackState::default());
+        let component =
+            ToastStackComponent::new("toasts", &toasts, &state).policy(ToastStackPolicy {
+                max_visible: 2,
+                spacing: 1,
+                ..ToastStackPolicy::compact()
+            });
+        let layout = component.layout(Constraints::new(0, 24, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 4);
+    }
 
     #[test]
     fn renders_toast_title_and_body() {

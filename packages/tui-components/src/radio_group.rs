@@ -1,11 +1,20 @@
 //! Configurable radio-group component.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
@@ -215,6 +224,134 @@ pub enum RadioGroupOutcome {
     Focused(usize),
     /// Selection changed to the contained option index.
     Selected(usize),
+}
+
+/// Canonical component-lifecycle radio group.
+pub struct RadioGroupComponent<'a, 'state> {
+    id: LayoutId,
+    group: RadioGroup<'a>,
+    state: &'state Cell<RadioGroupState>,
+}
+
+impl<'a, 'state> RadioGroupComponent<'a, 'state> {
+    /// Create a radio group with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        options: &'a [RadioOption],
+        state: &'state Cell<RadioGroupState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            group: RadioGroup::new(options),
+            state,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: RadioGroupPolicy) -> Self {
+        self.group.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: RadioGroupStyles) -> Self {
+        self.group.styles = styles;
+        self
+    }
+}
+
+impl Component for RadioGroupComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for option in self.group.options {
+            option.id.hash(&mut layout);
+            option.label.hash(&mut layout);
+        }
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.group.policy).hash(&mut paint);
+        format!("{:?}", self.group.styles).hash(&mut paint);
+        for option in self.group.options {
+            option.disabled.hash(&mut paint);
+        }
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = self
+            .group
+            .options
+            .iter()
+            .map(|option| {
+                u16::try_from(bmux_tui::text_width::display_width(&option.label))
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(4)
+            })
+            .max()
+            .unwrap_or_default();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, self.group.options.len())),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("radio-group"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let state = self.state.get();
+        for (index, option) in self
+            .group
+            .options
+            .iter()
+            .take(layout.size.height)
+            .enumerate()
+        {
+            let row = u16::try_from(index).unwrap_or(u16::MAX);
+            let area = LocalRect::new(0, i64::from(row), layout.size.width, 1);
+            cx.write_line(area, &self.group.line(index, option, state));
+            cx.push_hit(
+                SceneRegion::new(
+                    format!("{}:{}", self.id.as_str(), option.id),
+                    Rect::new(0, row, layout.size.width, 1),
+                )
+                .role(HitRole::Action)
+                .hoverable(self.group.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled && !option.disabled),
+            );
+        }
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = LocalRect::new(0, 0, layout.size.width, height);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, height),
+            "radio-group",
+        ));
+        cx.push_damage(area);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.group.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            RadioGroupOutcome::Ignored => EventOutcome::Ignored,
+            RadioGroupOutcome::Redraw
+            | RadioGroupOutcome::Focused(_)
+            | RadioGroupOutcome::Selected(_) => EventOutcome::Redraw,
+        }
+    }
 }
 
 /// Configurable radio-group control.
@@ -619,11 +756,15 @@ impl From<crate::theme::ComponentTheme> for RadioGroupStyles {
 mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{
+        Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+    };
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{RadioGroup, RadioGroupOutcome, RadioGroupState, RadioOption};
+    use super::{RadioGroup, RadioGroupComponent, RadioGroupOutcome, RadioGroupState, RadioOption};
 
     #[test]
     fn renders_selected_option() {
@@ -725,6 +866,67 @@ mod tests {
         assert_eq!(up, RadioGroupOutcome::Selected(1));
         assert_eq!(state.focused(), Some(1));
         assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn component_measures_paints_and_registers_options() {
+        let options = vec![
+            RadioOption::new("small", "Small"),
+            RadioOption::new("large", "Large"),
+        ];
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(1)));
+        let component = RadioGroupComponent::new("size", &options, &state);
+        let layout = component.layout(Constraints::for_width(12), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(12, 2));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("(*) Large   ")
+        );
+        assert_eq!(frame.hits().regions().len(), 2);
+        assert_eq!(frame.semantics().regions().len(), 1);
+    }
+
+    #[test]
+    fn component_routes_events_through_authoritative_layout() {
+        let options = vec![
+            RadioOption::new("small", "Small"),
+            RadioOption::new("large", "Large"),
+        ];
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(0)));
+        state.set({
+            let mut value = state.get();
+            value.set_focused(Some(0));
+            value
+        });
+        let component = RadioGroupComponent::new("size", &options, &state);
+        let layout = LayoutNode::leaf(LayoutId::new("size"), LogicalSize::new(12, 2));
+        let mut event_cx = EventCx::new(&layout);
+        let outcome = component.event(
+            &Event::Key(KeyStroke::simple(KeyCode::Down)),
+            &layout,
+            &mut event_cx,
+        );
+        assert_eq!(outcome, EventOutcome::Redraw);
+        assert_eq!(state.get().focused(), Some(1));
+    }
+
+    #[test]
+    fn component_disabled_option_is_not_enabled_in_scene() {
+        let options = vec![
+            RadioOption::new("small", "Small"),
+            RadioOption::new("large", "Large").disabled(true),
+        ];
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(0)));
+        let component = RadioGroupComponent::new("size", &options, &state);
+        let layout = component.layout(Constraints::for_width(12), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!(frame.hits().regions()[0].enabled);
+        assert!(!frame.hits().regions()[1].enabled);
     }
 
     #[test]
