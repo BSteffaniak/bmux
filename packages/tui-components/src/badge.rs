@@ -1,12 +1,20 @@
 //! Compact badge / pill label component.
 
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 
 /// Generic badge severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum BadgeSeverity {
     /// Default badge.
     #[default]
@@ -24,7 +32,7 @@ pub enum BadgeSeverity {
 }
 
 /// Badge chrome policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BadgePolicy {
     /// Left delimiter.
     pub left: &'static str,
@@ -130,6 +138,87 @@ pub struct Badge<'a> {
     severity: BadgeSeverity,
     policy: BadgePolicy,
     styles: BadgeStyles,
+}
+
+/// Canonical component-lifecycle badge leaf.
+pub struct BadgeComponent<'a> {
+    id: LayoutId,
+    badge: Badge<'a>,
+}
+
+impl<'a> BadgeComponent<'a> {
+    /// Create a badge component with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, label: &'a str) -> Self {
+        Self {
+            id: id.into(),
+            badge: Badge::new(label),
+        }
+    }
+
+    /// Set severity.
+    #[must_use]
+    pub const fn severity(mut self, severity: BadgeSeverity) -> Self {
+        self.badge.severity = severity;
+        self
+    }
+
+    /// Set chrome policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: BadgePolicy) -> Self {
+        self.badge.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: BadgeStyles) -> Self {
+        self.badge.styles = styles;
+        self
+    }
+}
+
+impl Component for BadgeComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.badge.label.hash(&mut layout);
+        self.badge.policy.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.badge.severity.hash(&mut paint);
+        format!("{:?}", self.badge.styles).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = u16::try_from(bmux_tui::text_width::display_width(&self.badge.text()))
+            .unwrap_or(u16::MAX);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("status"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let mut line = Line::from_spans([Span::styled(self.badge.text(), self.badge.style())]);
+        if self.badge.policy.truncate {
+            line = line.truncate(usize::from(layout.size.width));
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        cx.write_line(area, &line);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "status",
+        ));
+        cx.push_damage(area);
+    }
 }
 
 impl<'a> Badge<'a> {
@@ -245,10 +334,12 @@ impl From<crate::theme::ComponentTheme> for BadgeStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
+    use bmux_tui::geometry::{Rect, Size};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{Badge, BadgePolicy, BadgeSeverity};
+    use super::{Badge, BadgeComponent, BadgePolicy, BadgeSeverity, BadgeStyles};
 
     #[test]
     fn renders_bracketed_badge() {
@@ -297,5 +388,57 @@ mod tests {
     #[test]
     fn bare_policy_has_no_chrome() {
         assert_eq!(Badge::new("raw").policy(BadgePolicy::bare()).text(), "raw");
+    }
+
+    #[test]
+    fn canonical_component_measures_and_projects_metadata() {
+        let badge = BadgeComponent::new("health", "ok").severity(BadgeSeverity::Success);
+        let mut layout_cx = LayoutCx::new();
+        let layout = badge.layout(Constraints::loose(Size::new(20, 4)), &mut layout_cx);
+        assert_eq!(layout.size.width, 6);
+        assert_eq!(layout.size.height, 1);
+        assert_eq!(layout.metadata.semantics, ["status"]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+        let mut frame = Frame::new(&mut buffer);
+        badge.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("[ ok ]              ")
+        );
+        assert_eq!(frame.semantics().regions()[0].id, "health");
+        assert_eq!(frame.semantics().regions()[0].role, "status");
+        assert_eq!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .retained_regions(),
+            &[Rect::new(0, 0, 6, 1)]
+        );
+    }
+
+    #[test]
+    fn canonical_component_separates_layout_and_paint_revisions() {
+        let initial = BadgeComponent::new("health", "ok").revision();
+        let severity = BadgeComponent::new("health", "ok")
+            .severity(BadgeSeverity::Error)
+            .revision();
+        assert_eq!(initial.layout, severity.layout);
+        assert_ne!(initial.paint, severity.paint);
+
+        let styles = BadgeComponent::new("health", "ok")
+            .styles(BadgeStyles::default())
+            .revision();
+        assert_ne!(initial.paint, styles.paint);
+        assert_ne!(
+            initial.layout,
+            BadgeComponent::new("health", "healthy").revision().layout
+        );
+        assert_ne!(
+            initial.layout,
+            BadgeComponent::new("health", "ok")
+                .policy(BadgePolicy::bare())
+                .revision()
+                .layout
+        );
     }
 }

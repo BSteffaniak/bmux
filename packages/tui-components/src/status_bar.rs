@@ -1,8 +1,16 @@
 //! Generic status and message bar renderers.
 
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
@@ -148,6 +156,142 @@ pub struct StatusBar<'a> {
     right: &'a [StatusSegment<'a>],
     policy: StatusBarPolicy<'a>,
     styles: StatusBarStyles,
+}
+
+/// Canonical component-lifecycle status bar.
+pub struct StatusBarComponent<'a> {
+    id: LayoutId,
+    bar: StatusBar<'a>,
+}
+
+impl<'a> StatusBarComponent<'a> {
+    /// Create an empty status bar with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>) -> Self {
+        Self {
+            id: id.into(),
+            bar: StatusBar::new(),
+        }
+    }
+
+    /// Set left segments.
+    #[must_use]
+    pub const fn left(mut self, segments: &'a [StatusSegment<'a>]) -> Self {
+        self.bar.left = segments;
+        self
+    }
+
+    /// Set center segments.
+    #[must_use]
+    pub const fn center(mut self, segments: &'a [StatusSegment<'a>]) -> Self {
+        self.bar.center = segments;
+        self
+    }
+
+    /// Set right segments.
+    #[must_use]
+    pub const fn right(mut self, segments: &'a [StatusSegment<'a>]) -> Self {
+        self.bar.right = segments;
+        self
+    }
+
+    /// Set rendering policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: StatusBarPolicy<'a>) -> Self {
+        self.bar.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: StatusBarStyles) -> Self {
+        self.bar.styles = styles;
+        self
+    }
+}
+
+impl Component for StatusBarComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        format!("{:?}", (self.bar.left, self.bar.center, self.bar.right)).hash(&mut layout);
+        self.bar.policy.separator.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.bar.policy).hash(&mut paint);
+        format!("{:?}", self.bar.styles).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = [self.bar.left, self.bar.center, self.bar.right]
+            .into_iter()
+            .map(|segments| {
+                u16_saturating(display_width(&segments_text(
+                    segments,
+                    self.bar.policy.separator,
+                )))
+            })
+            .max()
+            .unwrap_or(0);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("status"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        if self.bar.policy.background {
+            cx.fill(area, " ", self.bar.styles.background);
+        }
+        self.paint_group(cx, layout.size.width, self.bar.left, BarAlign::Left);
+        self.paint_group(cx, layout.size.width, self.bar.center, BarAlign::Center);
+        self.paint_group(cx, layout.size.width, self.bar.right, BarAlign::Right);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "status",
+        ));
+        cx.push_damage(area);
+    }
+}
+
+impl StatusBarComponent<'_> {
+    fn paint_group(
+        &self,
+        cx: &mut PaintCx<'_, '_>,
+        available: u16,
+        segments: &[StatusSegment<'_>],
+        align: BarAlign,
+    ) {
+        if segments.is_empty() {
+            return;
+        }
+        let full_width = display_width(&segments_text(segments, self.bar.policy.separator));
+        let width = u16_saturating(full_width.min(usize::from(available)));
+        let x = match align {
+            BarAlign::Left => 0,
+            BarAlign::Center => available.saturating_sub(width) / 2,
+            BarAlign::Right => available.saturating_sub(width),
+        };
+        let line = self.bar.line(segments);
+        let line = if self.bar.policy.truncate && full_width > usize::from(width) {
+            line.truncate(usize::from(width))
+        } else {
+            line
+        };
+        cx.write_line_with_fallback_style(
+            LocalRect::new(i32::from(x), 0, width, 1),
+            &line,
+            self.bar.styles.default,
+        );
+    }
 }
 
 impl<'a> StatusBar<'a> {
@@ -395,10 +539,15 @@ impl From<crate::theme::ComponentTheme> for StatusBarStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
+    use bmux_tui::geometry::{Rect, Size};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{BarAlign, MessageBar, StatusBar, StatusBarPolicy, StatusSegment, StatusSeverity};
+    use super::{
+        BarAlign, MessageBar, StatusBar, StatusBarComponent, StatusBarPolicy, StatusSegment,
+        StatusSeverity,
+    };
 
     #[test]
     fn renders_left_center_and_right_segments() {
@@ -503,6 +652,49 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("info · warn · err   ")
+        );
+    }
+
+    #[test]
+    fn canonical_component_uses_one_layout_for_all_channels() {
+        let left = [StatusSegment::new("NORMAL")];
+        let right = [StatusSegment::new("RIGHT")];
+        let bar = StatusBarComponent::new("footer").left(&left).right(&right);
+        let mut layout_cx = LayoutCx::new();
+        let layout = bar.layout(Constraints::loose(Size::new(20, 2)), &mut layout_cx);
+        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(6, 1));
+        assert_eq!(layout.metadata.semantics, ["status"]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+        let mut frame = Frame::new(&mut buffer);
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 6, 1));
+        assert_eq!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .retained_regions(),
+            &[Rect::new(0, 0, 6, 1)]
+        );
+    }
+
+    #[test]
+    fn canonical_component_revision_tracks_geometry_and_paint() {
+        let left = [StatusSegment::new("ok")];
+        let initial = StatusBarComponent::new("footer").left(&left).revision();
+        let policy = StatusBarComponent::new("footer")
+            .left(&left)
+            .policy(StatusBarPolicy::compact().background(true))
+            .revision();
+        assert_eq!(initial.layout, policy.layout);
+        assert_ne!(initial.paint, policy.paint);
+
+        let longer = [StatusSegment::new("healthy")];
+        assert_ne!(
+            initial.layout,
+            StatusBarComponent::new("footer")
+                .left(&longer)
+                .revision()
+                .layout
         );
     }
 }

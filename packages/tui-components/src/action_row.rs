@@ -1,11 +1,20 @@
 //! Reusable action-button row component.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::KeyCode;
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
-use bmux_tui::prelude::Style;
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 
 use crate::button::{Button, ButtonState};
 use crate::common::{ComponentMousePolicy, InteractionState};
@@ -259,6 +268,138 @@ pub struct ActionRow<'a> {
     spacing: u16,
     policy: ActionRowPolicy,
     styles: ActionRowStyles,
+}
+
+/// Canonical component-lifecycle action row.
+pub struct ActionRowComponent<'a, 'state> {
+    id: LayoutId,
+    row: ActionRow<'a>,
+    state: &'state Cell<ActionRowState>,
+}
+
+impl<'a, 'state> ActionRowComponent<'a, 'state> {
+    /// Create an action row with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        actions: &'a [ActionButton],
+        state: &'state Cell<ActionRowState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            row: ActionRow::new(actions),
+            state,
+        }
+    }
+
+    /// Set horizontal spacing.
+    #[must_use]
+    pub const fn spacing(mut self, spacing: u16) -> Self {
+        self.row.spacing = spacing;
+        self
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: ActionRowPolicy) -> Self {
+        self.row.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: ActionRowStyles) -> Self {
+        self.row.styles = styles;
+        self
+    }
+}
+
+impl Component for ActionRowComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        format!("{:?}", self.row.actions).hash(&mut layout);
+        self.row.spacing.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.row.policy).hash(&mut paint);
+        format!("{:?}", self.row.styles).hash(&mut paint);
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = self
+            .row
+            .actions
+            .iter()
+            .map(action_width)
+            .fold(0_u16, u16::saturating_add)
+            .saturating_add(self.row.spacing.saturating_mul(
+                u16::try_from(self.row.actions.len().saturating_sub(1)).unwrap_or(u16::MAX),
+            ));
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("actions"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let state = self.state.get();
+        let area = Rect::new(0, 0, layout.size.width, 1);
+        for (index, action_area) in self.row.action_areas(area).into_iter().enumerate() {
+            let Some(action) = self.row.actions.get(index) else {
+                break;
+            };
+            let button_state = self.row.button_state(Some(&state), index);
+            let style = if button_state.interaction.disabled {
+                self.row.styles.disabled
+            } else if button_state.interaction.pressed {
+                self.row.styles.pressed
+            } else if button_state.interaction.hovered {
+                self.row.styles.hovered
+            } else if button_state.interaction.focused {
+                self.row.styles.focused
+            } else {
+                self.row.styles.normal
+            };
+            cx.write_line(
+                LocalRect::new(i32::from(action_area.x), 0, action_area.width, 1),
+                &Line::from_spans([Span::styled(format!("[ {} ]", action.label), style)]),
+            );
+            cx.push_hit(
+                SceneRegion::new(format!("{}.{}", self.id.as_str(), action.id), action_area)
+                    .role(HitRole::Action)
+                    .hoverable(self.row.policy.mouse.hover)
+                    .focusable(true)
+                    .enabled(!state.interaction.disabled),
+            );
+        }
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "actions"));
+        cx.push_damage(LocalRect::new(0, 0, layout.size.width, 1));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.row.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            ActionRowOutcome::Ignored => EventOutcome::Ignored,
+            ActionRowOutcome::Handled => EventOutcome::Handled,
+            ActionRowOutcome::Redraw
+            | ActionRowOutcome::FocusRequested { .. }
+            | ActionRowOutcome::FocusMoved { .. }
+            | ActionRowOutcome::Activated { .. } => EventOutcome::Redraw,
+        }
+    }
 }
 
 impl<'a> ActionRow<'a> {
@@ -606,13 +747,20 @@ fn action_width(action: &ActionButton) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::geometry::{Point, Rect, Size};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{ActionButton, ActionRow, ActionRowOutcome, ActionRowPolicy, ActionRowState};
+    use super::{
+        ActionButton, ActionRow, ActionRowComponent, ActionRowOutcome, ActionRowPolicy,
+        ActionRowState,
+    };
 
     #[test]
     fn action_areas_follow_rendered_button_widths() {
@@ -766,6 +914,47 @@ mod tests {
         let outcome = row.handle_event(Rect::new(0, 0, 12, 1), &mut state, &key(KeyCode::Enter));
 
         assert_eq!(outcome, ActionRowOutcome::Ignored);
+    }
+
+    #[test]
+    fn canonical_component_uses_one_layout_for_all_channels() {
+        let actions = [
+            ActionButton::new("approve", "Approve"),
+            ActionButton::new("deny", "Deny"),
+        ];
+        let state = Cell::new(ActionRowState::new());
+        let row = ActionRowComponent::new("actions", &actions, &state).spacing(2);
+        let mut layout_cx = LayoutCx::new();
+        let layout = row.layout(Constraints::loose(Size::new(30, 2)), &mut layout_cx);
+        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(21, 1));
+        assert_eq!(layout.metadata.semantics, ["actions"]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 2));
+        let mut frame = Frame::new(&mut buffer);
+        row.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 11, 1));
+        assert_eq!(frame.hits().regions()[1].area, Rect::new(13, 0, 8, 1));
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 21, 1));
+    }
+
+    #[test]
+    fn canonical_component_revision_separates_geometry_and_paint() {
+        let actions = [ActionButton::new("approve", "Approve")];
+        let state = Cell::new(ActionRowState::new());
+        let initial = ActionRowComponent::new("actions", &actions, &state).revision();
+        let mut focused_state = ActionRowState::new();
+        focused_state.set_focused(Some(0));
+        state.set(focused_state);
+        let focused = ActionRowComponent::new("actions", &actions, &state).revision();
+        assert_eq!(initial.layout, focused.layout);
+        assert_ne!(initial.paint, focused.paint);
+        assert_ne!(
+            initial.layout,
+            ActionRowComponent::new("actions", &actions, &state)
+                .spacing(2)
+                .revision()
+                .layout
+        );
     }
 
     fn key(key: KeyCode) -> Event {

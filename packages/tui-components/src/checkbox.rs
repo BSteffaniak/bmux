@@ -1,11 +1,20 @@
 //! Configurable checkbox component.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
@@ -128,6 +137,104 @@ pub struct Checkbox<'a> {
     label: &'a str,
     policy: CheckboxPolicy,
     styles: CheckboxStyles,
+}
+
+/// Canonical component-lifecycle checkbox control.
+pub struct CheckboxComponent<'a, 'state> {
+    id: LayoutId,
+    checkbox: Checkbox<'a>,
+    state: &'state Cell<CheckboxState>,
+}
+
+impl<'a, 'state> CheckboxComponent<'a, 'state> {
+    /// Create a checkbox with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        label: &'a str,
+        state: &'state Cell<CheckboxState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            checkbox: Checkbox::new(label),
+            state,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: CheckboxPolicy) -> Self {
+        self.checkbox.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: CheckboxStyles) -> Self {
+        self.checkbox.styles = styles;
+        self
+    }
+}
+
+impl Component for CheckboxComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.checkbox.label.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.checkbox.policy).hash(&mut paint);
+        format!("{:?}", self.checkbox.styles).hash(&mut paint);
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = u16::try_from(bmux_tui::text_width::display_width(self.checkbox.label))
+            .unwrap_or(u16::MAX)
+            .saturating_add(4);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("checkbox"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let state = self.state.get();
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        cx.write_line(area, &self.checkbox.line(state));
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
+                .role(HitRole::Action)
+                .hoverable(self.checkbox.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "checkbox",
+        ));
+        cx.push_damage(area);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.checkbox.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            CheckboxOutcome::Ignored => EventOutcome::Ignored,
+            CheckboxOutcome::Redraw | CheckboxOutcome::Toggled(_) => EventOutcome::Redraw,
+        }
+    }
 }
 
 impl<'a> Checkbox<'a> {
@@ -378,14 +485,18 @@ impl From<crate::theme::ComponentTheme> for CheckboxStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::PaintCx;
 
-    use super::{Checkbox, CheckboxOutcome, CheckboxState};
+    use super::{Checkbox, CheckboxComponent, CheckboxOutcome, CheckboxPolicy, CheckboxState};
 
     #[test]
     fn renders_checked_and_unchecked_states() {
@@ -522,5 +633,53 @@ mod tests {
 
         assert_eq!(outcome, CheckboxOutcome::Ignored);
         assert!(!state.checked());
+    }
+
+    #[test]
+    fn canonical_component_uses_one_layout_for_all_channels() {
+        let state = Cell::new(CheckboxState::new(true));
+        let checkbox = CheckboxComponent::new("settings.enable", "Enable", &state);
+        let mut layout_cx = LayoutCx::new();
+        let layout = checkbox.layout(Constraints::loose(Size::new(20, 2)), &mut layout_cx);
+        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(10, 1));
+        assert_eq!(layout.metadata.semantics, ["checkbox"]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+        let mut frame = Frame::new(&mut buffer);
+        checkbox.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 10, 1));
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 10, 1));
+        assert_eq!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .retained_regions(),
+            &[Rect::new(0, 0, 10, 1)]
+        );
+    }
+
+    #[test]
+    fn canonical_component_revision_separates_geometry_and_paint() {
+        let state = Cell::new(CheckboxState::new(false));
+        let initial = CheckboxComponent::new("enable", "Enable", &state).revision();
+        state.set(CheckboxState::new(true));
+        let checked = CheckboxComponent::new("enable", "Enable", &state).revision();
+        assert_eq!(initial.layout, checked.layout);
+        assert_ne!(initial.paint, checked.paint);
+
+        let keyboard = CheckboxComponent::new("enable", "Enable", &state)
+            .policy(CheckboxPolicy {
+                mouse: crate::common::ComponentMousePolicy::disabled(),
+                enter_toggles: true,
+                space_toggles: true,
+            })
+            .revision();
+        assert_eq!(checked.layout, keyboard.layout);
+        assert_ne!(checked.paint, keyboard.paint);
+        assert_ne!(
+            initial.layout,
+            CheckboxComponent::new("enable", "Enable feature", &state)
+                .revision()
+                .layout
+        );
     }
 }

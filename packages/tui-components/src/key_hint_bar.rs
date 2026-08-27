@@ -1,8 +1,16 @@
 //! Compact key/action hint bar component.
 
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
@@ -132,6 +140,92 @@ pub struct KeyHintBar<'a> {
     styles: KeyHintBarStyles,
 }
 
+/// Canonical component-lifecycle key hint bar.
+pub struct KeyHintBarComponent<'a> {
+    id: LayoutId,
+    bar: KeyHintBar<'a>,
+}
+
+impl<'a> KeyHintBarComponent<'a> {
+    /// Create a hint bar with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, hints: &'a [KeyHint<'a>]) -> Self {
+        Self {
+            id: id.into(),
+            bar: KeyHintBar::new(hints),
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: KeyHintBarPolicy<'a>) -> Self {
+        self.bar.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: KeyHintBarStyles) -> Self {
+        self.bar.styles = styles;
+        self
+    }
+}
+
+impl Component for KeyHintBarComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        format!("{:?}", self.bar.hints).hash(&mut layout);
+        self.bar.policy.separator.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.bar.policy).hash(&mut paint);
+        format!("{:?}", self.bar.styles).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = u16::try_from(display_width(&self.bar.text())).unwrap_or(u16::MAX);
+        let height = usize::from(!self.bar.hints.is_empty());
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, height)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("hint"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 || self.bar.hints.is_empty() {
+            return;
+        }
+        let text = self.bar.text();
+        if matches!(self.bar.policy.overflow, KeyHintOverflow::Hide)
+            && display_width(&text) > usize::from(layout.size.width)
+        {
+            return;
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        if self.bar.policy.background {
+            cx.fill(area, " ", self.bar.styles.background);
+        }
+        let line = if display_width(&text) > usize::from(layout.size.width) {
+            self.bar
+                .styled_line()
+                .truncate(usize::from(layout.size.width))
+        } else {
+            self.bar.styled_line()
+        };
+        cx.write_line_with_fallback_style(area, &line, self.bar.styles.background);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "hint",
+        ));
+        cx.push_damage(area);
+    }
+}
+
 impl<'a> KeyHintBar<'a> {
     /// Create a key hint bar over caller-owned hints.
     #[must_use]
@@ -253,10 +347,12 @@ impl From<crate::theme::ComponentTheme> for KeyHintBarStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
+    use bmux_tui::geometry::{Rect, Size};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{KeyHint, KeyHintBar, KeyHintBarPolicy, KeyHintOverflow};
+    use super::{KeyHint, KeyHintBar, KeyHintBarComponent, KeyHintBarPolicy, KeyHintOverflow};
 
     #[test]
     fn builds_compact_hint_text() {
@@ -326,5 +422,42 @@ mod tests {
         let hints = [KeyHint::new("x", "disabled").disabled(true)];
 
         assert_eq!(KeyHintBar::new(&hints).text(), "x disabled");
+    }
+
+    #[test]
+    fn canonical_component_uses_one_layout_for_all_channels() {
+        let hints = [KeyHint::new("q", "quit"), KeyHint::new("tab", "focus")];
+        let bar = KeyHintBarComponent::new("hints", &hints);
+        let mut layout_cx = LayoutCx::new();
+        let layout = bar.layout(Constraints::loose(Size::new(24, 2)), &mut layout_cx);
+        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(18, 1));
+        assert_eq!(layout.metadata.semantics, ["hint"]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 2));
+        let mut frame = Frame::new(&mut buffer);
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 18, 1));
+        assert_eq!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .retained_regions(),
+            &[Rect::new(0, 0, 18, 1)]
+        );
+    }
+
+    #[test]
+    fn canonical_component_revision_separates_geometry_and_paint() {
+        let hints = [KeyHint::new("q", "quit")];
+        let initial = KeyHintBarComponent::new("hints", &hints).revision();
+        let background = KeyHintBarComponent::new("hints", &hints)
+            .policy(KeyHintBarPolicy::compact().background(true))
+            .revision();
+        assert_eq!(initial.layout, background.layout);
+        assert_ne!(initial.paint, background.paint);
+
+        let separator = KeyHintBarComponent::new("hints", &hints)
+            .policy(KeyHintBarPolicy::compact().separator(" | "))
+            .revision();
+        assert_ne!(initial.layout, separator.layout);
     }
 }
