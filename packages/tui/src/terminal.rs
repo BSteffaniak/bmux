@@ -56,6 +56,7 @@ pub struct Terminal<W> {
     image_delta: ImageSceneDelta,
     cursor: Option<crate::frame::Cursor>,
     selection: SelectionScene,
+    semantics: crate::semantic::SemanticScene,
 }
 
 impl<W: Write> Terminal<W> {
@@ -74,6 +75,7 @@ impl<W: Write> Terminal<W> {
             image_delta: ImageSceneDelta::default(),
             cursor: None,
             selection: SelectionScene::new(),
+            semantics: crate::semantic::SemanticScene::new(),
         }
     }
 
@@ -105,6 +107,12 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn selection(&self) -> &SelectionScene {
         &self.selection
+    }
+
+    /// Return semantic regions from the last successfully committed draw.
+    #[must_use]
+    pub const fn semantics(&self) -> &crate::semantic::SemanticScene {
+        &self.semantics
     }
 
     /// Return ordered focus state derived from the last committed scene.
@@ -237,7 +245,7 @@ impl<W: Write> Terminal<W> {
         }
         let requested_regions = damage.retained_regions();
         let mut buffer = Buffer::empty(self.area);
-        let (cursor, hits, focus_scope, images, selection) = {
+        let (cursor, hits, focus_scope, images, selection, semantics) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut frame);
             let mut hits = if matches!(damage, Damage::Regions(_)) {
@@ -280,7 +288,13 @@ impl<W: Write> Terminal<W> {
             } else {
                 frame.selection().clone()
             };
-            (cursor, hits, focus_scope, images, selection)
+            let semantics = if matches!(damage, Damage::Regions(_)) {
+                self.semantics
+                    .merge_regions(frame.semantics(), requested_regions)
+            } else {
+                frame.semantics().clone()
+            };
+            (cursor, hits, focus_scope, images, selection, semantics)
         };
         let retained_regions =
             if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
@@ -330,6 +344,7 @@ impl<W: Write> Terminal<W> {
         self.images = images;
         self.cursor = cursor;
         self.selection = selection;
+        self.semantics = semantics;
         self.previous = Some(buffer);
         Ok(stats)
     }

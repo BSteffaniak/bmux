@@ -3,10 +3,16 @@
 //! Components resolve caller-supplied constraints into an authoritative layout
 //! tree. Painting and interaction consume that tree instead of recomputing
 //! geometry independently.
+//!
+//! Application and control state remains caller-owned and is supplied by the
+//! concrete component value. The framework retains only derived geometry in
+//! [`LayoutCache`]; cache entries are disposable and can always be recreated
+//! from caller state, revisions, constraints, and [`LayoutEnvironment`].
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::event::{Event, EventOutcome};
 use crate::geometry::{Rect, Size};
 use crate::paint::PaintCx;
 
@@ -190,6 +196,24 @@ impl ComponentRevision {
     pub const fn new(layout: u64, paint: u64) -> Self {
         Self { layout, paint }
     }
+
+    /// Deterministically combine a parent revision with one ordered child.
+    /// Layout and paint channels remain independent.
+    #[must_use]
+    pub const fn combine(self, child: Self) -> Self {
+        Self {
+            layout: combine_revision(self.layout, child.layout),
+            paint: combine_revision(self.paint, child.paint),
+        }
+    }
+}
+
+const fn combine_revision(parent: u64, child: u64) -> u64 {
+    parent
+        .wrapping_mul(0x9e37_79b1_85eb_ca87)
+        .rotate_left(17)
+        .wrapping_add(child)
+        .wrapping_add(0x517c_c1b7_2722_0a95)
 }
 
 /// Placement and resolved layout for one child node.
@@ -211,6 +235,31 @@ impl ChildLayout {
     }
 }
 
+/// Additional component-owned metadata attached to authoritative layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayoutMetadata {
+    /// Stable semantic labels/roles consumed by accessibility and inspection
+    /// layers without reconstructing component geometry.
+    pub semantics: Vec<String>,
+}
+
+impl LayoutMetadata {
+    /// Create empty metadata.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            semantics: Vec::new(),
+        }
+    }
+
+    /// Append one semantic label or role.
+    #[must_use]
+    pub fn semantic(mut self, value: impl Into<String>) -> Self {
+        self.semantics.push(value.into());
+        self
+    }
+}
+
 /// Authoritative resolved geometry for a component and its children.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutNode {
@@ -218,6 +267,8 @@ pub struct LayoutNode {
     pub id: LayoutId,
     /// Resolved logical size.
     pub size: LogicalSize,
+    /// Component-owned semantic metadata.
+    pub metadata: LayoutMetadata,
     /// Child placements in deterministic paint order.
     pub children: Vec<ChildLayout>,
 }
@@ -229,6 +280,7 @@ impl LayoutNode {
         Self {
             id,
             size,
+            metadata: LayoutMetadata::new(),
             children: Vec::new(),
         }
     }
@@ -240,7 +292,47 @@ impl LayoutNode {
         size: LogicalSize,
         children: Vec<ChildLayout>,
     ) -> Self {
-        Self { id, size, children }
+        Self {
+            id,
+            size,
+            metadata: LayoutMetadata::new(),
+            children,
+        }
+    }
+
+    /// Attach component-owned metadata to this resolved node.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: LayoutMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Find one resolved node by stable layout identity without recalculating
+    /// child placement or component measurement.
+    #[must_use]
+    pub fn find(&self, id: &LayoutId) -> Option<&Self> {
+        if &self.id == id {
+            return Some(self);
+        }
+        self.children.iter().find_map(|child| child.node.find(id))
+    }
+
+    /// Find one resolved node and its root-relative terminal rectangle without
+    /// recalculating component placement.
+    #[must_use]
+    pub fn find_rect(&self, id: &LayoutId) -> Option<Rect> {
+        self.find_rect_at(id, 0, 0)
+    }
+
+    fn find_rect_at(&self, id: &LayoutId, x: u16, y: usize) -> Option<Rect> {
+        if &self.id == id {
+            return Some(self.terminal_rect(x, u16::try_from(y).unwrap_or(u16::MAX)));
+        }
+        self.children.iter().find_map(|child| {
+            child
+                .node
+                .find_rect_at(id, x.saturating_add(child.x), y.saturating_add(child.y))
+        })
     }
 
     /// Return a visible terminal rectangle at an assigned origin, saturating
@@ -281,7 +373,39 @@ impl LayoutCx {
     }
 }
 
-/// A measurable and paintable terminal component.
+/// Read-only services available while routing events through authoritative
+/// resolved layout.
+pub struct EventCx<'a> {
+    root: &'a LayoutNode,
+}
+
+impl<'a> EventCx<'a> {
+    /// Create an event context from the exact resolved tree used for painting.
+    #[must_use]
+    pub const fn new(root: &'a LayoutNode) -> Self {
+        Self { root }
+    }
+
+    /// Complete authoritative tree for this event pass.
+    #[must_use]
+    pub const fn root(&self) -> &'a LayoutNode {
+        self.root
+    }
+
+    /// Look up resolved component metadata/geometry by stable identity.
+    #[must_use]
+    pub fn find(&self, id: &LayoutId) -> Option<&'a LayoutNode> {
+        self.root.find(id)
+    }
+
+    /// Look up root-relative resolved geometry by stable identity.
+    #[must_use]
+    pub fn find_rect(&self, id: &LayoutId) -> Option<Rect> {
+        self.root.find_rect(id)
+    }
+}
+
+/// A measurable, paintable, and event-participating terminal component.
 pub trait Component {
     /// Resolve this component under explicit constraints.
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode;
@@ -289,9 +413,36 @@ pub trait Component {
     /// Paint this component from its authoritative resolved layout.
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>);
 
+    /// Route one event using the authoritative resolved layout. Caller-owned
+    /// component/control state remains outside the framework cache.
+    fn event(&self, _event: &Event, _layout: &LayoutNode, _cx: &mut EventCx<'_>) -> EventOutcome {
+        EventOutcome::Ignored
+    }
+
     /// Caller-owned revisions used by retained layout and paint systems.
     fn revision(&self) -> ComponentRevision {
         ComponentRevision::default()
+    }
+}
+
+/// Geometry-affecting inputs supplied by the presentation environment.
+///
+/// Consumers increment `capability_revision` when a terminal capability that
+/// can change measurement changes. Paint-only capability changes do not belong
+/// here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LayoutEnvironment {
+    /// Revision of terminal capabilities that affect component geometry.
+    pub capability_revision: u64,
+}
+
+impl LayoutEnvironment {
+    /// Create layout environment inputs.
+    #[must_use]
+    pub const fn new(capability_revision: u64) -> Self {
+        Self {
+            capability_revision,
+        }
     }
 }
 
@@ -301,6 +452,7 @@ struct LayoutCacheKey {
     id: LayoutId,
     layout_revision: u64,
     constraints: Constraints,
+    environment: LayoutEnvironment,
 }
 
 /// Structural counters for retained layout behavior.
@@ -335,7 +487,8 @@ impl LayoutCache {
         }
     }
 
-    /// Resolve one component, reusing exact retained geometry when possible.
+    /// Resolve one component in the default geometry environment, reusing an
+    /// exact retained layout when possible.
     pub fn layout(
         &mut self,
         id: LayoutId,
@@ -343,10 +496,72 @@ impl LayoutCache {
         constraints: Constraints,
         cx: &mut LayoutCx,
     ) -> LayoutNode {
+        self.layout_with_revision_and_environment(
+            id,
+            component,
+            component.revision().layout,
+            constraints,
+            LayoutEnvironment::default(),
+            cx,
+        )
+    }
+
+    /// Resolve one component with an explicit caller-owned layout revision in
+    /// the default geometry environment.
+    pub fn layout_with_revision(
+        &mut self,
+        id: LayoutId,
+        component: &dyn Component,
+        layout_revision: u64,
+        constraints: Constraints,
+        cx: &mut LayoutCx,
+    ) -> LayoutNode {
+        self.layout_with_revision_and_environment(
+            id,
+            component,
+            layout_revision,
+            constraints,
+            LayoutEnvironment::default(),
+            cx,
+        )
+    }
+
+    /// Resolve one component with explicit geometry-affecting environment
+    /// inputs, reusing an exact retained layout when possible.
+    pub fn layout_with_environment(
+        &mut self,
+        id: LayoutId,
+        component: &dyn Component,
+        constraints: Constraints,
+        environment: LayoutEnvironment,
+        cx: &mut LayoutCx,
+    ) -> LayoutNode {
+        self.layout_with_revision_and_environment(
+            id,
+            component,
+            component.revision().layout,
+            constraints,
+            environment,
+            cx,
+        )
+    }
+
+    /// Resolve one component with explicit caller-owned revision and
+    /// geometry-affecting environment inputs.
+    pub fn layout_with_revision_and_environment(
+        &mut self,
+        id: LayoutId,
+        component: &dyn Component,
+        layout_revision: u64,
+        constraints: Constraints,
+        environment: LayoutEnvironment,
+        cx: &mut LayoutCx,
+    ) -> LayoutNode {
         let key = LayoutCacheKey {
             id,
-            layout_revision: component.revision().layout,
+            layout_revision,
             constraints,
+            environment,
         };
         if let Some(node) = self.entries.get(&key) {
             self.stats.hits = self.stats.hits.saturating_add(1);
@@ -358,7 +573,7 @@ impl LayoutCache {
         node
     }
 
-    /// Borrow one exact retained layout.
+    /// Borrow one exact retained layout from the default environment.
     #[must_use]
     pub fn get(
         &self,
@@ -366,10 +581,29 @@ impl LayoutCache {
         layout_revision: u64,
         constraints: Constraints,
     ) -> Option<&LayoutNode> {
+        self.get_with_environment(
+            id,
+            layout_revision,
+            constraints,
+            LayoutEnvironment::default(),
+        )
+    }
+
+    /// Borrow one exact retained layout with explicit geometry-affecting
+    /// environment inputs.
+    #[must_use]
+    pub fn get_with_environment(
+        &self,
+        id: &LayoutId,
+        layout_revision: u64,
+        constraints: Constraints,
+        environment: LayoutEnvironment,
+    ) -> Option<&LayoutNode> {
         self.entries.get(&LayoutCacheKey {
             id: id.clone(),
             layout_revision,
             constraints,
+            environment,
         })
     }
 
@@ -438,6 +672,11 @@ impl<'a> Element<'a> {
         self.component.paint(layout, cx);
     }
 
+    /// Route one event through this erased component.
+    pub fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.component.event(event, layout, cx)
+    }
+
     /// Return caller-owned revisions.
     #[must_use]
     pub fn revision(&self) -> ComponentRevision {
@@ -445,16 +684,180 @@ impl<'a> Element<'a> {
     }
 }
 
+impl Component for Element<'_> {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        Element::layout(self, constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        Element::paint(self, layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        Element::event(self, event, layout, cx)
+    }
+
+    fn revision(&self) -> ComponentRevision {
+        Element::revision(self)
+    }
+}
+
+/// Fold ordered child revisions into a parent revision so descendant changes
+/// invalidate retained parent layout/paint state.
+#[must_use]
+pub fn combine_child_revisions(
+    parent: ComponentRevision,
+    children: impl IntoIterator<Item = ComponentRevision>,
+) -> ComponentRevision {
+    children
+        .into_iter()
+        .fold(parent, ComponentRevision::combine)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        Component, ComponentRevision, Constraints, LayoutCache, LayoutCx, LayoutId, LayoutNode,
-        LogicalSize,
+        Component, ComponentRevision, Constraints, Element, EventCx, EventOutcome, LayoutCache,
+        LayoutCx, LayoutEnvironment, LayoutId, LayoutNode, LogicalSize,
     };
+    use crate::event::Event;
     use crate::geometry::Size;
     use crate::paint::PaintCx;
+
+    #[test]
+    fn event_protocol_consumes_authoritative_layout_without_remeasurement() {
+        struct InteractiveLeaf;
+
+        impl Component for InteractiveLeaf {
+            fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+                cx.record_measurement();
+                LayoutNode::leaf(
+                    LayoutId::new("interactive"),
+                    constraints.constrain(LogicalSize::new(1, 1)),
+                )
+                .with_metadata(super::LayoutMetadata::new().semantic("button"))
+            }
+
+            fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+            fn event(
+                &self,
+                event: &Event,
+                layout: &LayoutNode,
+                cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                if matches!(event, Event::User(value) if value == "activate")
+                    && layout.id.as_str() == "interactive"
+                    && cx
+                        .find(&LayoutId::new("interactive"))
+                        .is_some_and(|node| node.metadata.semantics == ["button"])
+                {
+                    EventOutcome::Handled
+                } else {
+                    EventOutcome::Ignored
+                }
+            }
+        }
+
+        let component = InteractiveLeaf;
+        let mut layout_cx = LayoutCx::new();
+        let layout = component.layout(Constraints::for_width(1), &mut layout_cx);
+        let measured = layout_cx.measured_nodes();
+        let mut event_cx = EventCx::new(&layout);
+        let outcome = component.event(&Event::User("activate".to_owned()), &layout, &mut event_cx);
+
+        assert_eq!(outcome, EventOutcome::Handled);
+        assert!(outcome.is_handled());
+        assert_eq!(layout_cx.measured_nodes(), measured);
+    }
+
+    #[test]
+    fn authoritative_tree_carries_metadata_and_supports_identity_lookup() {
+        let child = LayoutNode::leaf(LayoutId::new("child"), LogicalSize::new(2, 1))
+            .with_metadata(super::LayoutMetadata::new().semantic("button"));
+        let root = LayoutNode::with_children(
+            LayoutId::new("root"),
+            LogicalSize::new(2, 1),
+            vec![super::ChildLayout::new(0, 0, child)],
+        );
+
+        let found = root.find(&LayoutId::new("child")).unwrap();
+        assert_eq!(found.metadata.semantics, ["button"]);
+        assert_eq!(
+            root.find_rect(&LayoutId::new("child")),
+            Some(crate::geometry::Rect::new(0, 0, 2, 1))
+        );
+        assert!(root.find(&LayoutId::new("missing")).is_none());
+    }
+
+    #[test]
+    fn keyed_child_identity_survives_reorder_in_authoritative_tree() {
+        let first = crate::composition::Column::new()
+            .child(crate::composition::TextContent::new("a").id("a"))
+            .child(crate::composition::TextContent::new("b").id("b"));
+        let reordered = crate::composition::Column::new()
+            .child(crate::composition::TextContent::new("b").id("b"))
+            .child(crate::composition::TextContent::new("a").id("a"));
+        let constraints = Constraints::for_width(4);
+        let first = first.layout(constraints, &mut LayoutCx::new());
+        let reordered = reordered.layout(constraints, &mut LayoutCx::new());
+
+        assert_eq!(first.children[0].node.id.as_str(), "a");
+        assert_eq!(first.children[1].node.id.as_str(), "b");
+        assert_eq!(reordered.children[0].node.id.as_str(), "b");
+        assert_eq!(reordered.children[1].node.id.as_str(), "a");
+    }
+
+    #[test]
+    fn deep_nested_layout_is_deterministic_and_zero_size_safe() {
+        let mut component = Element::new(TestComponent {
+            revision: ComponentRevision::default(),
+        });
+        for depth in 0..512 {
+            component = Element::new(OneChild {
+                id: LayoutId::new(format!("node-{depth}")),
+                child: component,
+            });
+        }
+        let constraints = Constraints::new(0, 0, 0, Some(0));
+        let first = component.layout(constraints, &mut LayoutCx::new());
+        let second = component.layout(constraints, &mut LayoutCx::new());
+
+        assert_eq!(first, second);
+        assert_eq!(first.size, LogicalSize::default());
+        let mut depth = 0;
+        let mut node = &first;
+        while let Some(child) = node.children.first() {
+            depth += 1;
+            node = &child.node;
+        }
+        assert_eq!(depth, 512);
+    }
+
+    struct OneChild<'a> {
+        id: LayoutId,
+        child: Element<'a>,
+    }
+
+    impl Component for OneChild<'_> {
+        fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+            cx.record_measurement();
+            let child = self.child.layout(constraints, cx);
+            LayoutNode::with_children(
+                self.id.clone(),
+                constraints.constrain(child.size),
+                vec![super::ChildLayout::new(0, 0, child)],
+            )
+        }
+
+        fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn revision(&self) -> ComponentRevision {
+            self.child.revision()
+        }
+    }
 
     #[test]
     fn constraints_normalize_inverted_ranges_and_clamp_sizes() {
@@ -534,6 +937,52 @@ mod tests {
         assert_eq!(cx.measured_nodes(), 1);
         assert_eq!(cache.stats().hits, 1);
         assert_eq!(cache.stats().misses, 1);
+    }
+
+    #[test]
+    fn explicit_caller_revision_invalidates_entries() {
+        let mut cache = LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::for_width(8);
+        let component = TestComponent {
+            revision: ComponentRevision::default(),
+        };
+        for revision in [1, 1, 2] {
+            cache.layout_with_revision(
+                LayoutId::new("item"),
+                &component,
+                revision,
+                constraints,
+                &mut cx,
+            );
+        }
+
+        assert_eq!(cx.measured_nodes(), 2);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 2);
+    }
+
+    #[test]
+    fn geometry_capability_revision_invalidates_entries() {
+        let mut cache = LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::for_width(8);
+        let component = TestComponent {
+            revision: ComponentRevision::new(1, 0),
+        };
+        for capability_revision in [1, 1, 2] {
+            cache.layout_with_environment(
+                LayoutId::new("item"),
+                &component,
+                constraints,
+                LayoutEnvironment::new(capability_revision),
+                &mut cx,
+            );
+        }
+
+        assert_eq!(cx.measured_nodes(), 2);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 2);
     }
 
     #[test]

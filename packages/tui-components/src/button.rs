@@ -1,10 +1,16 @@
 //! Configurable button component.
 
+use std::cell::Cell;
+
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata, LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -147,6 +153,70 @@ pub struct Button<'a> {
     label: &'a str,
     policy: ButtonPolicy,
     styles: ButtonStyles,
+}
+
+/// Canonical component-lifecycle button leaf.
+///
+/// Interaction state remains caller-owned through an interior-mutable `Cell`,
+/// allowing the shared component protocol to update it without framework-owned
+/// application state.
+pub struct ButtonComponent<'a, 'state> {
+    id: LayoutId,
+    button: Button<'a>,
+    state: &'state Cell<ButtonState>,
+}
+
+impl<'a, 'state> ButtonComponent<'a, 'state> {
+    /// Create a button component with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, label: &'a str, state: &'state Cell<ButtonState>) -> Self {
+        Self {
+            id: id.into(),
+            button: Button::new(label),
+            state,
+        }
+    }
+}
+
+impl Component for ButtonComponent<'_, '_> {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(self.button.width(), 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("button"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let state = self.state.get();
+        let line = Line::from_spans(vec![Span::styled(
+            format!("[ {} ]", self.button.label),
+            self.button.style_for(state),
+        )]);
+        cx.write_line(LocalRect::new(0, 0, layout.size.width, 1), &line);
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
+                .role(HitRole::Action)
+                .hoverable(self.button.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.button.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            ButtonOutcome::Ignored => EventOutcome::Ignored,
+            ButtonOutcome::Handled => EventOutcome::Handled,
+            ButtonOutcome::Pressed | ButtonOutcome::Redraw => EventOutcome::Redraw,
+        }
+    }
 }
 
 impl<'a> Button<'a> {
@@ -382,13 +452,44 @@ impl From<crate::theme::ComponentTheme> for ButtonStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{Button, ButtonOutcome, ButtonState};
+    use super::{Button, ButtonComponent, ButtonOutcome, ButtonState};
+
+    #[test]
+    fn canonical_component_paints_and_routes_from_one_layout() {
+        let state = Cell::new(ButtonState::new());
+        let button = ButtonComponent::new("save", "Save", &state);
+        let mut layout_cx = LayoutCx::new();
+        let layout = button.layout(Constraints::for_width(8), &mut layout_cx);
+        let measured = layout_cx.measured_nodes();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+        button.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().regions()[0].id.as_str(), "save");
+
+        let mut event_cx = EventCx::new(&layout);
+        let outcome = button.event(
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 0),
+            )),
+            &layout,
+            &mut event_cx,
+        );
+
+        assert!(outcome.needs_redraw());
+        assert!(state.get().interaction.pressed);
+        assert_eq!(layout_cx.measured_nodes(), measured);
+    }
 
     #[test]
     fn renders_button_label() {

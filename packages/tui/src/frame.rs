@@ -1,6 +1,7 @@
 //! Frame render context.
 
 use crate::buffer::Buffer;
+use crate::damage::{Damage, DamagePolicy};
 use crate::focus::FocusScopeId;
 use crate::geometry::{Point, Rect};
 use crate::hit::{HitMap, HitRegion};
@@ -9,6 +10,7 @@ use crate::selection::{
     SelectionFragment, SelectionScene, SelectionScope, SelectionSnapshot,
     paint_selection_highlights,
 };
+use crate::semantic::{SemanticRegion, SemanticScene};
 use crate::style::Style;
 use crate::text::Line;
 
@@ -50,6 +52,8 @@ pub struct Frame<'buffer> {
     focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
     selection: SelectionScene,
+    semantics: SemanticScene,
+    damage: Vec<Rect>,
 }
 
 impl<'buffer> Frame<'buffer> {
@@ -63,6 +67,8 @@ impl<'buffer> Frame<'buffer> {
             focus_scope: None,
             images: Vec::new(),
             selection: SelectionScene::new(),
+            semantics: SemanticScene::new(),
+            damage: Vec::new(),
         }
     }
 
@@ -144,6 +150,30 @@ impl<'buffer> Frame<'buffer> {
     #[must_use]
     pub const fn selection(&self) -> &SelectionScene {
         &self.selection
+    }
+
+    /// Return semantic regions registered for this frame.
+    #[must_use]
+    pub const fn semantics(&self) -> &SemanticScene {
+        &self.semantics
+    }
+
+    /// Add one semantic region.
+    pub fn push_semantic(&mut self, region: SemanticRegion) {
+        self.semantics.push(region);
+    }
+
+    /// Add one terminal-space damage region.
+    pub fn push_damage(&mut self, area: Rect) {
+        if !area.is_empty() {
+            self.damage.push(area);
+        }
+    }
+
+    /// Return bounded damage requested by rendered components.
+    #[must_use]
+    pub fn damage(&self, policy: DamagePolicy) -> Damage {
+        Damage::regions(self.damage.iter().copied(), self.area(), policy)
     }
 
     /// Add or replace one hierarchical selection scope.

@@ -5,6 +5,7 @@ use crate::geometry::{Point, Rect};
 use crate::hit::HitRegion;
 use crate::image::ImageContribution;
 use crate::selection::{SelectionFragment, SelectionScope};
+use crate::semantic::SemanticRegion;
 use crate::style::Style;
 use crate::text::Line;
 
@@ -184,6 +185,13 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         });
     }
 
+    /// Register local damage after translation and clipping.
+    pub fn push_damage(&mut self, area: LocalRect) {
+        if let Some(area) = self.project_rect(area) {
+            self.frame.push_damage(area);
+        }
+    }
+
     /// Register a local interaction region after translation and clipping.
     pub fn push_hit(&mut self, mut region: HitRegion) {
         let Some(area) = self.project_rect(LocalRect::terminal(region.area)) else {
@@ -191,6 +199,27 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         };
         region.area = area;
         self.frame.push_hit(region);
+    }
+
+    /// Register local focus geometry without enabling pointer handling.
+    pub fn push_focus(&mut self, id: impl Into<crate::hit::HitId>, area: LocalRect) {
+        let Some(area) = self.project_rect(area) else {
+            return;
+        };
+        self.frame.push_hit(
+            HitRegion::new(id, area)
+                .pointer_events(false)
+                .focusable(true),
+        );
+    }
+
+    /// Register a local semantic region after translation and clipping.
+    pub fn push_semantic(&mut self, mut region: SemanticRegion) {
+        let Some(area) = self.project_rect(LocalRect::terminal(region.area)) else {
+            return;
+        };
+        region.area = area;
+        self.frame.push_semantic(region);
     }
 
     /// Register a local selection scope after translating and clipping both areas.
@@ -251,6 +280,49 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         self.frame.push_image(contribution);
     }
 
+    /// Project a local rectangle into the effective terminal-space clip.
+    ///
+    /// This is the bounded geometry bridge for low-level raster producers.
+    /// Callers receive only the visible terminal rectangle and never mutable
+    /// access to the backing frame or buffer.
+    #[must_use]
+    pub fn project_raster_rect(&self, area: LocalRect) -> Option<Rect> {
+        self.project_rect(area)
+    }
+
+    /// Visit each visible terminal cell corresponding to a local raster area.
+    ///
+    /// The callback supplies local coordinates and writes through scoped
+    /// [`PaintCx::set_cell`], preserving translation and clipping.
+    pub fn rasterize(
+        &mut self,
+        area: LocalRect,
+        mut cell: impl FnMut(i32, i64) -> Option<(String, Style)>,
+    ) {
+        let Some(visible) = self.project_rect(area) else {
+            return;
+        };
+        let translated_x = i64::from(self.origin_x).saturating_add(i64::from(area.x));
+        let translated_y = self.origin_y.saturating_add(area.y);
+        for terminal_y in visible.y..visible.bottom() {
+            for terminal_x in visible.x..visible.right() {
+                let local_x = i64::from(terminal_x).saturating_sub(translated_x);
+                let local_y = i64::from(terminal_y).saturating_sub(translated_y);
+                let Ok(local_x) = i32::try_from(local_x) else {
+                    continue;
+                };
+                if let Some((symbol, style)) = cell(local_x, local_y) {
+                    self.set_cell(
+                        area.x.saturating_add(local_x),
+                        area.y.saturating_add(local_y),
+                        &symbol,
+                        style,
+                    );
+                }
+            }
+        }
+    }
+
     fn project_rect(&self, area: LocalRect) -> Option<Rect> {
         let projected = translate_and_clip(self.origin_x, self.origin_y, area, self.clip);
         (!projected.is_empty()).then_some(projected)
@@ -303,6 +375,7 @@ mod tests {
     use crate::hit::HitRegion;
     use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::selection::{SelectionFragment, SelectionScope};
+    use crate::semantic::SemanticRegion;
     use crate::style::{Color, Style};
     use crate::text::Line;
 
@@ -336,6 +409,115 @@ mod tests {
         });
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("cdef"));
+    }
+
+    #[test]
+    fn focus_geometry_translates_and_clips_without_pointer_behavior() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+
+        paint.with_child(-1, 0, LocalRect::new(0, 0, 4, 1), |paint| {
+            paint.push_focus("focus", LocalRect::new(0, 0, 4, 1));
+            paint.push_damage(LocalRect::new(0, 0, 4, 1));
+        });
+
+        let focus = &frame.hits().regions()[0];
+        assert_eq!(focus.area, Rect::new(0, 0, 3, 1));
+        assert!(focus.focusable);
+        assert!(!focus.pointer_events);
+        assert_eq!(
+            frame.damage(crate::damage::DamagePolicy {
+                max_regions: 64,
+                max_area_percent: 101,
+            }),
+            crate::damage::Damage::Regions(vec![Rect::new(0, 0, 3, 1)])
+        );
+    }
+
+    #[test]
+    fn nested_negative_clips_bound_cursor_hits_and_wide_text() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+
+        paint.with_child(-1, 0, LocalRect::new(0, 0, 5, 1), |paint| {
+            paint.with_child(0, 0, LocalRect::new(1, 0, 3, 1), |paint| {
+                paint.write_line(LocalRect::new(0, 0, 5, 1), &Line::from("界abc"));
+                paint.set_cursor(Point::new(0, 0), true);
+                paint.push_hit(HitRegion::new("part", Rect::new(0, 0, 5, 1)));
+            });
+        });
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("ab "));
+        assert!(frame.cursor().is_none());
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 3, 1));
+    }
+
+    #[test]
+    fn completely_offscreen_child_contributes_no_metadata() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        let placement = ImagePlacement {
+            key: ImageKey::new("offscreen"),
+            payload: ImagePayload::Png {
+                bytes: vec![],
+                width: 1,
+                height: 1,
+            },
+            destination: Rect::new(0, 0, 1, 1),
+            clip: Rect::new(0, 0, 1, 1),
+            lifecycle: ImageLifecycle::Frame,
+        };
+
+        paint.with_child(5, 0, LocalRect::new(0, 0, 1, 1), |paint| {
+            paint.set_cursor(Point::new(0, 0), true);
+            paint.push_focus("offscreen-focus", LocalRect::new(0, 0, 1, 1));
+            paint.push_damage(LocalRect::new(0, 0, 1, 1));
+            paint.push_hit(HitRegion::new("offscreen", Rect::new(0, 0, 1, 1)));
+            paint.push_selection_scope(SelectionScope::new("offscreen", Rect::new(0, 0, 1, 1)));
+            paint.push_semantic(SemanticRegion::new(
+                "offscreen",
+                Rect::new(0, 0, 1, 1),
+                "button",
+            ));
+            paint.push_image(ImageContribution::Present(placement));
+        });
+
+        assert!(frame.cursor().is_none());
+        assert!(frame.hits().regions().is_empty());
+        assert!(
+            frame
+                .damage(crate::damage::DamagePolicy::default())
+                .is_none()
+        );
+        assert!(frame.selection().scopes().is_empty());
+        assert!(frame.semantics().regions().is_empty());
+        assert!(frame.images().is_empty());
+    }
+
+    #[test]
+    fn bounded_rasterization_visits_only_visible_local_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        let mut visited = Vec::new();
+
+        paint.with_child(-1, 0, LocalRect::new(0, 0, 4, 2), |paint| {
+            assert_eq!(
+                paint.project_raster_rect(LocalRect::new(0, 0, 4, 2)),
+                Some(Rect::new(0, 0, 3, 2))
+            );
+            paint.rasterize(LocalRect::new(0, 0, 4, 2), |x, y| {
+                visited.push((x, y));
+                Some((x.to_string(), Style::new()))
+            });
+        });
+
+        assert_eq!(visited, [(1, 0), (2, 0), (3, 0), (1, 1), (2, 1), (3, 1)]);
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("123"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("123"));
     }
 
     #[test]

@@ -95,6 +95,12 @@ where
         &self.index
     }
 
+    /// Retained layout cache diagnostics.
+    #[must_use]
+    pub const fn layout_cache(&self) -> &LayoutCache {
+        &self.layouts
+    }
+
     /// Mutable retained measured-item index.
     pub const fn index_mut(&mut self) -> &mut MeasuredListIndex<K> {
         &mut self.index
@@ -169,9 +175,10 @@ where
                 let item = by_key.get(key).expect("synchronized key must exist");
                 state
                     .layouts
-                    .layout(
+                    .layout_with_revision(
                         item_layout_id(&self.id, key),
                         item.component.as_component(),
+                        item.layout_revision,
                         Constraints::for_width(width),
                         cx,
                     )
@@ -298,11 +305,79 @@ fn item_layout_id<K: ToString>(list_id: &str, key: &K) -> LayoutId {
 mod tests {
     use super::{VirtualList, VirtualListState};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::component::LayoutCx;
+    use bmux_tui::component::{
+        Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+    };
     use bmux_tui::composition::TextContent;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
     use bmux_tui::paint::PaintCx;
+
+    struct ExternallyRevisedItem;
+
+    impl Component for ExternallyRevisedItem {
+        fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+            cx.record_measurement();
+            LayoutNode::leaf(
+                LayoutId::new("external-item"),
+                constraints.constrain(LogicalSize::new(constraints.max_width(), 1)),
+            )
+        }
+
+        fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn revision(&self) -> ComponentRevision {
+            ComponentRevision::default()
+        }
+    }
+
+    #[test]
+    fn viewport_height_does_not_remeasure_but_width_and_removed_keys_do() {
+        let list = VirtualList::new("messages")
+            .item("a", 1, TextContent::new("a message that wraps"))
+            .item("b", 1, TextContent::new("b"));
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        list.sync(8, &mut state, &mut cx);
+        let initial_measurements = cx.measured_nodes();
+
+        for viewport_height in [1, 3, 20] {
+            state.capture_anchor();
+            state.restore_anchor(viewport_height);
+            list.sync(8, &mut state, &mut cx);
+        }
+        assert_eq!(cx.measured_nodes(), initial_measurements);
+
+        let reordered = VirtualList::new("messages")
+            .item("b", 1, TextContent::new("b"))
+            .item("a", 1, TextContent::new("a message that wraps"));
+        reordered.sync(8, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), initial_measurements);
+
+        reordered.sync(6, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), initial_measurements + 2);
+        let retained_before_removal = state.layout_cache().len();
+
+        VirtualList::new("messages")
+            .item("a", 1, TextContent::new("a message that wraps"))
+            .sync(6, &mut state, &mut cx);
+        assert!(state.layout_cache().len() < retained_before_removal);
+        assert!(state.layout_cache().stats().released > 0);
+    }
+
+    #[test]
+    fn external_item_revision_invalidates_retained_layout() {
+        let mut state = VirtualListState::new(0);
+        let mut cx = LayoutCx::new();
+        VirtualList::new("messages")
+            .item("a", 1, ExternallyRevisedItem)
+            .sync(8, &mut state, &mut cx);
+        VirtualList::new("messages")
+            .item("a", 2, ExternallyRevisedItem)
+            .sync(8, &mut state, &mut cx);
+
+        assert_eq!(cx.measured_nodes(), 2);
+    }
 
     #[test]
     fn paints_and_registers_only_intersecting_variable_height_items() {

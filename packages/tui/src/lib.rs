@@ -42,6 +42,7 @@ pub mod picker;
 pub mod retained_list;
 pub mod retained_sectioned_list;
 pub mod selection;
+pub mod semantic;
 pub mod style;
 pub mod terminal;
 pub mod text;
@@ -63,10 +64,14 @@ pub mod prelude {
     };
     pub use crate::clear::Clear;
     pub use crate::component::{
-        ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCache,
-        LayoutCacheStats, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+        ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
+        LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
+        LogicalSize, combine_child_revisions,
     };
-    pub use crate::composition::{Column, Row, ScrollViewport, Surface, TextContent};
+    pub use crate::composition::{
+        Align, Clip, Column, HorizontalAlignment, Row, ScrollViewport, SizeBox, Stack, StyleScope,
+        Surface, TextContent, VerticalAlignment, Visibility,
+    };
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,

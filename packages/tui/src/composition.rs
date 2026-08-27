@@ -1,14 +1,77 @@
 //! Fundamental measurable composition containers.
 
+use std::hash::{Hash, Hasher};
+
 use crate::chrome::Border;
 use crate::component::{
-    ChildLayout, Component, Constraints, Element, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCx, LayoutId,
+    LayoutNode, LogicalSize, combine_child_revisions,
 };
 use crate::geometry::Insets;
 use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::{Line, Text, TextWrap, TextWrapGeometry};
 use crate::text_block::Alignment;
+
+fn stable_revision(hash: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> u64 {
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    hash(&mut state);
+    state.finish()
+}
+
+fn hash_insets(insets: Insets, state: &mut impl Hasher) {
+    insets.top.hash(state);
+    insets.right.hash(state);
+    insets.bottom.hash(state);
+    insets.left.hash(state);
+}
+
+fn hash_border(border: Option<&Border>, state: &mut impl Hasher) {
+    let Some(border) = border else {
+        0u8.hash(state);
+        return;
+    };
+    1u8.hash(state);
+    border.set.top_left.hash(state);
+    border.set.top_right.hash(state);
+    border.set.bottom_left.hash(state);
+    border.set.bottom_right.hash(state);
+    border.set.horizontal.hash(state);
+    border.set.vertical.hash(state);
+    border.style.hash(state);
+    border.sides.top.hash(state);
+    border.sides.right.hash(state);
+    border.sides.bottom.hash(state);
+    border.sides.left.hash(state);
+}
+
+/// Horizontal placement inside an assigned component rectangle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HorizontalAlignment {
+    /// Place the child at the leading edge.
+    #[default]
+    Start,
+    /// Center the child.
+    Center,
+    /// Place the child at the trailing edge.
+    End,
+    /// Expand the child to the assigned width.
+    Stretch,
+}
+
+/// Vertical placement inside an assigned component rectangle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VerticalAlignment {
+    /// Place the child at the top edge.
+    #[default]
+    Start,
+    /// Center the child.
+    Center,
+    /// Place the child at the bottom edge.
+    End,
+    /// Expand the child to the assigned height.
+    Stretch,
+}
 
 /// A measurable rich-text component.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +124,35 @@ impl TextContent {
         self
     }
 
+    fn own_revision(&self) -> ComponentRevision {
+        ComponentRevision::new(
+            stable_revision(|state| {
+                self.id.as_str().hash(state);
+                self.text.lines.len().hash(state);
+                for line in &self.text.lines {
+                    for span in &line.spans {
+                        span.content.hash(state);
+                        span.style.hash(state);
+                    }
+                }
+                self.style.hash(state);
+                (match self.alignment {
+                    Alignment::Left => 0u8,
+                    Alignment::Center => 1,
+                    Alignment::Right => 2,
+                })
+                .hash(state);
+                (match self.wrap {
+                    TextWrap::None => 0u8,
+                    TextWrap::Character => 1,
+                    TextWrap::Word => 2,
+                })
+                .hash(state);
+            }),
+            0,
+        )
+    }
+
     fn rows(&self, width: u16) -> Vec<Line> {
         let width = usize::from(width.max(1));
         self.text
@@ -72,6 +164,10 @@ impl TextContent {
 }
 
 impl Component for TextContent {
+    fn revision(&self) -> ComponentRevision {
+        self.own_revision()
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let width = if constraints.min_width() == constraints.max_width() {
@@ -185,9 +281,26 @@ impl<'a> Surface<'a> {
             border.left.saturating_add(self.padding.left),
         )
     }
+
+    fn own_revision(&self) -> ComponentRevision {
+        let layout = stable_revision(|state| {
+            self.id.as_str().hash(state);
+            hash_insets(self.insets(), state);
+        });
+        let paint = stable_revision(|state| {
+            self.background.hash(state);
+            self.content_style.hash(state);
+            hash_border(self.border.as_ref(), state);
+        });
+        ComponentRevision::new(layout, paint)
+    }
 }
 
 impl Component for Surface<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.own_revision().combine(self.child.revision())
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let insets = self.insets();
@@ -358,6 +471,10 @@ impl<'a> ScrollViewport<'a> {
 }
 
 impl Component for ScrollViewport<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.child.revision()
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let width = constraints.max_width();
@@ -392,6 +509,460 @@ impl Component for ScrollViewport<'_> {
     }
 }
 
+/// Constrain one child with optional fixed/minimum/maximum dimensions.
+pub struct SizeBox<'a> {
+    id: LayoutId,
+    child: Element<'a>,
+    width: Option<u16>,
+    height: Option<usize>,
+    min_width: u16,
+    max_width: Option<u16>,
+    min_height: usize,
+    max_height: Option<usize>,
+}
+
+impl<'a> SizeBox<'a> {
+    /// Create a size-constraining wrapper.
+    #[must_use]
+    pub fn new(child: impl Component + 'a) -> Self {
+        Self {
+            id: LayoutId::new("size"),
+            child: Element::new(child),
+            width: None,
+            height: None,
+            min_width: 0,
+            max_width: None,
+            min_height: 0,
+            max_height: None,
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Require an exact width, clamped by parent constraints.
+    #[must_use]
+    pub const fn width(mut self, width: u16) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    /// Require an exact logical height, clamped by parent constraints.
+    #[must_use]
+    pub const fn height(mut self, height: usize) -> Self {
+        self.height = Some(height);
+        self
+    }
+
+    /// Set a minimum width.
+    #[must_use]
+    pub const fn min_width(mut self, width: u16) -> Self {
+        self.min_width = width;
+        self
+    }
+
+    /// Set a maximum width.
+    #[must_use]
+    pub const fn max_width(mut self, width: u16) -> Self {
+        self.max_width = Some(width);
+        self
+    }
+
+    /// Set a minimum logical height.
+    #[must_use]
+    pub const fn min_height(mut self, height: usize) -> Self {
+        self.min_height = height;
+        self
+    }
+
+    /// Set a maximum logical height.
+    #[must_use]
+    pub const fn max_height(mut self, height: usize) -> Self {
+        self.max_height = Some(height);
+        self
+    }
+}
+
+impl Component for SizeBox<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.child.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let parent_min_width = constraints.min_width();
+        let parent_max_width = constraints.max_width();
+        let parent_min_height = constraints.min_height();
+        let parent_max_height = constraints.max_height();
+        let max_width = self
+            .max_width
+            .unwrap_or(parent_max_width)
+            .min(parent_max_width);
+        let min_width = self.min_width.max(parent_min_width).min(max_width);
+        let max_height = match (self.max_height, parent_max_height) {
+            (Some(own), Some(parent)) => Some(own.min(parent)),
+            (Some(own), None) => Some(own),
+            (None, parent) => parent,
+        };
+        let min_height = self.min_height.max(parent_min_height);
+        let child_constraints = match (self.width, self.height) {
+            (Some(width), Some(height)) => {
+                let width = width.clamp(min_width, max_width);
+                let height = max_height
+                    .map_or(height, |maximum| height.min(maximum))
+                    .max(min_height);
+                Constraints::new(width, width, height, Some(height))
+            }
+            (Some(width), None) => {
+                let width = width.clamp(min_width, max_width);
+                Constraints::new(width, width, min_height, max_height)
+            }
+            (None, Some(height)) => {
+                let height = max_height
+                    .map_or(height, |maximum| height.min(maximum))
+                    .max(min_height);
+                Constraints::new(min_width, max_width, height, Some(height))
+            }
+            (None, None) => Constraints::new(min_width, max_width, min_height, max_height),
+        };
+        let child = self.child.layout(child_constraints, cx);
+        LayoutNode::with_children(
+            self.id.clone(),
+            child.size,
+            vec![ChildLayout::new(0, 0, child)],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        paint_single_child(&self.child, layout, cx);
+    }
+}
+
+/// Align one intrinsically measured child inside the parent-assigned rectangle.
+pub struct Align<'a> {
+    id: LayoutId,
+    child: Element<'a>,
+    horizontal: HorizontalAlignment,
+    vertical: VerticalAlignment,
+}
+
+impl<'a> Align<'a> {
+    /// Create an alignment wrapper.
+    #[must_use]
+    pub fn new(child: impl Component + 'a) -> Self {
+        Self {
+            id: LayoutId::new("align"),
+            child: Element::new(child),
+            horizontal: HorizontalAlignment::Start,
+            vertical: VerticalAlignment::Start,
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Set horizontal alignment.
+    #[must_use]
+    pub const fn horizontal(mut self, alignment: HorizontalAlignment) -> Self {
+        self.horizontal = alignment;
+        self
+    }
+
+    /// Set vertical alignment.
+    #[must_use]
+    pub const fn vertical(mut self, alignment: VerticalAlignment) -> Self {
+        self.vertical = alignment;
+        self
+    }
+}
+
+impl Component for Align<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.child.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let child_constraints = Constraints::new(
+            if self.horizontal == HorizontalAlignment::Stretch {
+                constraints.max_width()
+            } else {
+                0
+            },
+            constraints.max_width(),
+            if self.vertical == VerticalAlignment::Stretch {
+                constraints
+                    .max_height()
+                    .unwrap_or_else(|| constraints.min_height())
+            } else {
+                0
+            },
+            constraints.max_height(),
+        );
+        let child = self.child.layout(child_constraints, cx);
+        let size = constraints.constrain(LogicalSize::new(
+            constraints.max_width(),
+            constraints.max_height().unwrap_or(child.size.height),
+        ));
+        let x = match self.horizontal {
+            HorizontalAlignment::Start | HorizontalAlignment::Stretch => 0,
+            HorizontalAlignment::Center => size.width.saturating_sub(child.size.width) / 2,
+            HorizontalAlignment::End => size.width.saturating_sub(child.size.width),
+        };
+        let y = match self.vertical {
+            VerticalAlignment::Start | VerticalAlignment::Stretch => 0,
+            VerticalAlignment::Center => size.height.saturating_sub(child.size.height) / 2,
+            VerticalAlignment::End => size.height.saturating_sub(child.size.height),
+        };
+        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(x, y, child)])
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        paint_single_child(&self.child, layout, cx);
+    }
+}
+
+/// Paint one child through an explicit local clip.
+pub struct Clip<'a> {
+    id: LayoutId,
+    child: Element<'a>,
+}
+
+impl<'a> Clip<'a> {
+    /// Create a clipping wrapper.
+    #[must_use]
+    pub fn new(child: impl Component + 'a) -> Self {
+        Self {
+            id: LayoutId::new("clip"),
+            child: Element::new(child),
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+}
+
+impl Component for Clip<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.child.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let child = self.child.layout(constraints, cx);
+        LayoutNode::with_children(
+            self.id.clone(),
+            constraints.constrain(child.size),
+            vec![ChildLayout::new(0, 0, child)],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        paint_single_child(&self.child, layout, cx);
+    }
+}
+
+/// Apply inherited style to one child without changing geometry.
+pub struct StyleScope<'a> {
+    id: LayoutId,
+    child: Element<'a>,
+    style: Style,
+}
+
+impl<'a> StyleScope<'a> {
+    /// Create an inherited-style wrapper.
+    #[must_use]
+    pub fn new(child: impl Component + 'a, style: Style) -> Self {
+        Self {
+            id: LayoutId::new("style"),
+            child: Element::new(child),
+            style,
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+}
+
+impl Component for StyleScope<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.child.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let child = self.child.layout(constraints, cx);
+        LayoutNode::with_children(
+            self.id.clone(),
+            child.size,
+            vec![ChildLayout::new(0, 0, child)],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        cx.with_style(self.style, |cx| paint_single_child(&self.child, layout, cx));
+    }
+}
+
+/// Include or omit a child while retaining ordinary composition semantics.
+pub struct Visibility<'a> {
+    id: LayoutId,
+    child: Element<'a>,
+    visible: bool,
+}
+
+impl<'a> Visibility<'a> {
+    /// Create a visibility wrapper.
+    #[must_use]
+    pub fn new(child: impl Component + 'a, visible: bool) -> Self {
+        Self {
+            id: LayoutId::new("visibility"),
+            child: Element::new(child),
+            visible,
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+}
+
+impl Component for Visibility<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.child.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        if !self.visible {
+            return LayoutNode::leaf(
+                self.id.clone(),
+                constraints.constrain(LogicalSize::default()),
+            );
+        }
+        let child = self.child.layout(constraints, cx);
+        LayoutNode::with_children(
+            self.id.clone(),
+            child.size,
+            vec![ChildLayout::new(0, 0, child)],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if self.visible {
+            paint_single_child(&self.child, layout, cx);
+        }
+    }
+}
+
+/// Overlay children in deterministic insertion/paint order.
+pub struct Stack<'a> {
+    id: LayoutId,
+    children: Vec<Element<'a>>,
+}
+
+impl<'a> Stack<'a> {
+    /// Create an empty overlay stack.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            id: LayoutId::new("stack"),
+            children: Vec::new(),
+        }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Append one overlay child.
+    #[must_use]
+    pub fn child(mut self, child: impl Component + 'a) -> Self {
+        self.children.push(Element::new(child));
+        self
+    }
+}
+
+impl Default for Stack<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Component for Stack<'_> {
+    fn revision(&self) -> ComponentRevision {
+        combine_child_revisions(
+            ComponentRevision::default(),
+            self.children.iter().map(Element::revision),
+        )
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let mut width = constraints.min_width();
+        let mut height = constraints.min_height();
+        let children = self
+            .children
+            .iter()
+            .map(|child| {
+                let node = child.layout(constraints, cx);
+                width = width.max(node.size.width);
+                height = height.max(node.size.height);
+                ChildLayout::new(0, 0, node)
+            })
+            .collect();
+        LayoutNode::with_children(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, height)),
+            children,
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        for (child, resolved) in self.children.iter().zip(&layout.children) {
+            paint_child(child, resolved, cx);
+        }
+    }
+}
+
+fn paint_single_child(child: &Element<'_>, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+    if let Some(resolved) = layout.children.first() {
+        paint_child(child, resolved, cx);
+    }
+}
+
+fn paint_child(child: &Element<'_>, resolved: &ChildLayout, cx: &mut PaintCx<'_, '_>) {
+    let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
+    cx.with_child(
+        i32::from(resolved.x),
+        i64::try_from(resolved.y).unwrap_or(i64::MAX),
+        LocalRect::new(0, 0, resolved.node.size.width, height),
+        |cx| child.paint(&resolved.node, cx),
+    );
+}
+
 /// One child in a horizontal row.
 struct RowChild<'a> {
     component: Element<'a>,
@@ -403,6 +974,7 @@ pub struct Row<'a> {
     id: LayoutId,
     children: Vec<RowChild<'a>>,
     gap: u16,
+    alignment: VerticalAlignment,
 }
 
 impl<'a> Row<'a> {
@@ -413,6 +985,7 @@ impl<'a> Row<'a> {
             id: LayoutId::new("row"),
             children: Vec::new(),
             gap: 0,
+            alignment: VerticalAlignment::Start,
         }
     }
 
@@ -427,6 +1000,13 @@ impl<'a> Row<'a> {
     #[must_use]
     pub const fn gap(mut self, gap: u16) -> Self {
         self.gap = gap;
+        self
+    }
+
+    /// Set cross-axis child alignment.
+    #[must_use]
+    pub const fn alignment(mut self, alignment: VerticalAlignment) -> Self {
+        self.alignment = alignment;
         self
     }
 
@@ -458,6 +1038,13 @@ impl Default for Row<'_> {
 }
 
 impl Component for Row<'_> {
+    fn revision(&self) -> ComponentRevision {
+        combine_child_revisions(
+            ComponentRevision::default(),
+            self.children.iter().map(|child| child.component.revision()),
+        )
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let gaps = self.gap.saturating_mul(
@@ -512,6 +1099,21 @@ impl Component for Row<'_> {
             x = x.saturating_sub(self.gap);
         }
         let size = constraints.constrain(LogicalSize::new(x, height));
+        for (index, child) in children.iter_mut().enumerate() {
+            child.y = match self.alignment {
+                VerticalAlignment::Start => 0,
+                VerticalAlignment::Center => size.height.saturating_sub(child.node.size.height) / 2,
+                VerticalAlignment::End => size.height.saturating_sub(child.node.size.height),
+                VerticalAlignment::Stretch => {
+                    let width = child.node.size.width;
+                    child.node = self.children[index].component.layout(
+                        Constraints::new(width, width, size.height, Some(size.height)),
+                        cx,
+                    );
+                    0
+                }
+            };
+        }
         LayoutNode::with_children(self.id.clone(), size, children)
     }
 
@@ -533,6 +1135,7 @@ pub struct Column<'a> {
     id: LayoutId,
     children: Vec<Element<'a>>,
     gap: usize,
+    alignment: HorizontalAlignment,
 }
 
 impl<'a> Column<'a> {
@@ -543,6 +1146,7 @@ impl<'a> Column<'a> {
             id: LayoutId::new("column"),
             children: Vec::new(),
             gap: 0,
+            alignment: HorizontalAlignment::Stretch,
         }
     }
 
@@ -557,6 +1161,13 @@ impl<'a> Column<'a> {
     #[must_use]
     pub const fn gap(mut self, gap: usize) -> Self {
         self.gap = gap;
+        self
+    }
+
+    /// Set cross-axis child alignment. Columns stretch children by default.
+    #[must_use]
+    pub const fn alignment(mut self, alignment: HorizontalAlignment) -> Self {
+        self.alignment = alignment;
         self
     }
 
@@ -575,17 +1186,34 @@ impl Default for Column<'_> {
 }
 
 impl Component for Column<'_> {
+    fn revision(&self) -> ComponentRevision {
+        combine_child_revisions(
+            ComponentRevision::default(),
+            self.children.iter().map(Element::revision),
+        )
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let mut y = 0usize;
         let width = constraints.max_width();
         let mut children = Vec::with_capacity(self.children.len());
         for child in &self.children {
+            let child_min_width = if self.alignment == HorizontalAlignment::Stretch {
+                width
+            } else {
+                0
+            };
             let node = child.layout(
-                Constraints::new(width, width, 0, constraints.max_height()),
+                Constraints::new(child_min_width, width, 0, constraints.max_height()),
                 cx,
             );
-            children.push(ChildLayout::new(0, y, node));
+            let x = match self.alignment {
+                HorizontalAlignment::Start | HorizontalAlignment::Stretch => 0,
+                HorizontalAlignment::Center => width.saturating_sub(node.size.width) / 2,
+                HorizontalAlignment::End => width.saturating_sub(node.size.width),
+            };
+            children.push(ChildLayout::new(x, y, node));
             y = y
                 .saturating_add(children.last().map_or(0, |child| child.node.size.height))
                 .saturating_add(self.gap);
@@ -612,9 +1240,12 @@ impl Component for Column<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, Row, ScrollViewport, Surface, TextContent};
+    use super::{
+        Align, Clip, Column, HorizontalAlignment, Row, ScrollViewport, SizeBox, Stack, StyleScope,
+        Surface, TextContent, VerticalAlignment, Visibility,
+    };
     use crate::buffer::Buffer;
-    use crate::component::{Component, Constraints, LayoutCx};
+    use crate::component::{Component, ComponentRevision, Constraints, LayoutCx, LayoutNode};
     use crate::frame::Frame;
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
@@ -678,6 +1309,139 @@ mod tests {
         assert_eq!(layout.children[1].x, 4);
         assert_eq!(layout.children[1].node.size.width, 8);
         assert_eq!(layout.size.width, 12);
+    }
+
+    #[test]
+    fn wrappers_constrain_align_style_clip_and_hide_children() {
+        let component = Align::new(SizeBox::new(TextContent::new("x")).width(1).height(1))
+            .horizontal(HorizontalAlignment::End)
+            .vertical(VerticalAlignment::End);
+        let layout = component.layout(Constraints::new(5, 5, 3, Some(3)), &mut LayoutCx::new());
+        assert_eq!(layout.size, crate::component::LogicalSize::new(5, 3));
+        assert_eq!((layout.children[0].x, layout.children[0].y), (4, 2));
+
+        let styled = Clip::new(StyleScope::new(
+            TextContent::new("x"),
+            Style::new().bg(Color::Blue),
+        ));
+        let styled_layout = styled.layout(Constraints::for_width(3), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        styled.paint(&styled_layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().get(Point::new(0, 0)).unwrap().style.bg,
+            Some(Color::Blue)
+        );
+
+        let hidden = Visibility::new(TextContent::new("hidden"), false);
+        let hidden_layout = hidden.layout(Constraints::new(0, 8, 0, None), &mut LayoutCx::new());
+        assert_eq!(hidden_layout.size.height, 0);
+        assert!(hidden_layout.children.is_empty());
+    }
+
+    #[test]
+    fn stack_paints_children_in_insertion_order() {
+        let component = Stack::new()
+            .child(Surface::new(TextContent::new(" ")).background(Style::new().bg(Color::Blue)))
+            .child(TextContent::new("top").style(Style::new().fg(Color::White).bg(Color::Red)));
+        let layout = component.layout(Constraints::for_width(4), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("top "));
+        assert_eq!(
+            frame.buffer().get(Point::new(0, 0)).unwrap().style.bg,
+            Some(Color::Red)
+        );
+    }
+
+    #[test]
+    fn border_visuals_are_paint_only_while_border_sides_change_layout() {
+        let plain = Surface::new(TextContent::new("x"));
+        let single = Surface::new(TextContent::new("x")).border(crate::chrome::Border::single());
+        assert_ne!(plain.revision().layout, single.revision().layout);
+
+        let blue = Surface::new(TextContent::new("x"))
+            .border(crate::chrome::Border::single().style(Style::new().fg(Color::Blue)));
+        let red = Surface::new(TextContent::new("x"))
+            .border(crate::chrome::Border::single().style(Style::new().fg(Color::Red)));
+        assert_eq!(blue.revision().layout, red.revision().layout);
+        assert_ne!(blue.revision().paint, red.revision().paint);
+
+        let top_only = Surface::new(TextContent::new("x"))
+            .border(crate::chrome::Border::single().sides(crate::chrome::BorderSides::TOP));
+        assert_ne!(single.revision().layout, top_only.revision().layout);
+    }
+
+    #[test]
+    fn text_and_surface_configuration_revisions_separate_layout_from_paint() {
+        let text_a = TextContent::new("a");
+        let text_b = TextContent::new("b");
+        assert_ne!(text_a.revision().layout, text_b.revision().layout);
+
+        let plain = Surface::new(TextContent::new("x"));
+        let painted = Surface::new(TextContent::new("x")).background(Style::new().bg(Color::Blue));
+        assert_eq!(plain.revision().layout, painted.revision().layout);
+        assert_ne!(plain.revision().paint, painted.revision().paint);
+
+        let padded = Surface::new(TextContent::new("x")).padding(Insets::all(1));
+        assert_ne!(plain.revision().layout, padded.revision().layout);
+    }
+
+    #[test]
+    fn descendant_layout_revision_invalidates_cached_parent() {
+        let constraints = Constraints::for_width(8);
+        let mut cache = crate::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        for child_revision in [1, 1, 2] {
+            let component = Surface::new(RevisedLeaf(child_revision));
+            cache.layout(
+                crate::component::LayoutId::new("parent"),
+                &component,
+                constraints,
+                &mut cx,
+            );
+        }
+
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 2);
+    }
+
+    struct RevisedLeaf(u64);
+
+    impl Component for RevisedLeaf {
+        fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+            cx.record_measurement();
+            LayoutNode::leaf(
+                crate::component::LayoutId::new("child"),
+                constraints.constrain(crate::component::LogicalSize::new(1, 1)),
+            )
+        }
+
+        fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn revision(&self) -> ComponentRevision {
+            ComponentRevision::new(self.0, 0)
+        }
+    }
+
+    #[test]
+    fn row_and_column_apply_cross_axis_alignment() {
+        let row = Row::new()
+            .alignment(VerticalAlignment::End)
+            .child(SizeBox::new(TextContent::new("one")).height(1))
+            .child(SizeBox::new(TextContent::new("two")).height(2));
+        let row_layout = row.layout(Constraints::new(0, 8, 3, Some(3)), &mut LayoutCx::new());
+        assert_eq!(row_layout.children[0].y, 2);
+        assert_eq!(row_layout.children[1].y, 1);
+
+        let column = Column::new()
+            .alignment(HorizontalAlignment::End)
+            .child(TextContent::new("x"));
+        let column_layout = column.layout(Constraints::for_width(5), &mut LayoutCx::new());
+        assert_eq!(column_layout.children[0].x, 4);
+        assert_eq!(column_layout.children[0].node.size.width, 1);
     }
 
     #[test]
