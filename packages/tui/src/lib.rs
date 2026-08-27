@@ -14,6 +14,8 @@ pub mod buffer;
 pub mod capabilities;
 pub mod chrome;
 pub mod clear;
+pub mod component;
+pub mod composition;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
 pub mod damage;
@@ -32,7 +34,9 @@ pub mod input;
 pub mod interaction;
 pub mod layout;
 pub mod list;
+pub mod measured_list;
 pub mod overlay;
+pub mod paint;
 pub mod palette;
 pub mod picker;
 pub mod retained_list;
@@ -58,6 +62,11 @@ pub mod prelude {
         Border, BorderSet, BorderSides, Modal, Panel, PanelTitle, TitlePosition,
     };
     pub use crate::clear::Clear;
+    pub use crate::component::{
+        ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCache,
+        LayoutCacheStats, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+    };
+    pub use crate::composition::{Column, Row, ScrollViewport, Surface, TextContent};
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{
         CrosstermTerminalGuard, event_from_crossterm, key_from_crossterm, mouse_from_crossterm,
@@ -94,7 +103,9 @@ pub mod prelude {
         Split, split,
     };
     pub use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
+    pub use crate::measured_list::{MeasuredListIndex, MeasuredListItem, VisibleItemRange};
     pub use crate::overlay::{OverlayLayer, OverlayStack};
+    pub use crate::paint::{LocalRect, PaintCx};
     pub use crate::palette::{
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
     };

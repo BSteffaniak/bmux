@@ -4,6 +4,7 @@ use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
 
@@ -342,6 +343,58 @@ impl Scrollbar {
                 }
                 frame.write_line(area, &Line::from_spans(spans));
             }
+        }
+    }
+
+    /// Paint scrollbar visuals through a scoped local-coordinate context.
+    pub fn paint(&self, area: Rect, state: &ScrollbarState, cx: &mut PaintCx<'_, '_>) {
+        if area.is_empty() {
+            return;
+        }
+        let layout = self.layout(area, state);
+        match self.policy.orientation {
+            ScrollbarOrientation::Vertical => {
+                for y in 0..area.height {
+                    let (symbol, style) = self.cell_style(y, area.height, layout);
+                    cx.set_cell(
+                        i32::from(area.x),
+                        i64::from(area.y.saturating_add(y)),
+                        symbol,
+                        style,
+                    );
+                }
+            }
+            ScrollbarOrientation::Horizontal => {
+                let spans = (0..area.width)
+                    .map(|x| {
+                        let (symbol, style) = self.cell_style(x, area.width, layout);
+                        Span::styled(symbol, style)
+                    })
+                    .collect::<Vec<_>>();
+                cx.write_line(
+                    LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                    &Line::from_spans(spans),
+                );
+            }
+        }
+    }
+
+    const fn cell_style(
+        &self,
+        position: u16,
+        length: u16,
+        layout: ScrollbarLayout,
+    ) -> (&'static str, Style) {
+        if position >= layout.thumb_start
+            && position < layout.thumb_start.saturating_add(layout.thumb_len)
+        {
+            (self.policy.thumb, self.styles.thumb)
+        } else if position == 0 {
+            (self.policy.begin, self.styles.begin)
+        } else if position == length.saturating_sub(1) {
+            (self.policy.end, self.styles.end)
+        } else {
+            (self.policy.track, self.styles.track)
         }
     }
 

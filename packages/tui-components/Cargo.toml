@@ -10,6 +10,10 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[[example]]
+name              = "virtual_list_benchmark"
+required-features = ["virtual-list"]
+
 [dependencies]
 bmux_keyboard        = { workspace = true, optional = true }
 bmux_terminal_grid   = { workspace = true, optional = true }
@@ -48,6 +52,7 @@ picker-frame = []
 progress-bar = []
 radio-group = ["keyboard-input"]
 scroll-area = ["keyboard-input", "scrollbar"]
+scroll-view = ["keyboard-input"]
 scrollbar = []
 select-dropdown = ["selectable-list"]
 selectable-list = ["keyboard-input", "scroll-area"]
@@ -67,6 +72,7 @@ text-input-box = ["text-input", "form-field"]
 text-view = ["keyboard-input", "scroll-area"]
 toast-stack = ["keyboard-input"]
 tree-view = ["keyboard-input"]
+virtual-list = ["scroll-view"]
 
 # Private dependency capability shared by keyboard-interactive controls.
 keyboard-input = ["dep:bmux_keyboard"]
@@ -98,6 +104,7 @@ all = [
     "progress-bar",
     "radio-group",
     "scroll-area",
+    "scroll-view",
     "scrollbar",
     "select-dropdown",
     "selectable-list",
@@ -113,6 +120,7 @@ all = [
     "text-view",
     "toast-stack",
     "tree-view",
+    "virtual-list",
 ]
 data-display = [
     "badge",

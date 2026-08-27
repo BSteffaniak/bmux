@@ -65,6 +65,8 @@ pub mod progress_bar;
 pub mod radio_group;
 #[cfg(feature = "scroll-area")]
 pub mod scroll_area;
+#[cfg(feature = "scroll-view")]
+pub mod scroll_view;
 #[cfg(feature = "scrollbar")]
 pub mod scrollbar;
 #[cfg(any(feature = "scroll-area", feature = "table", feature = "text-view"))]
@@ -99,3 +101,5 @@ pub mod theme;
 pub mod toast_stack;
 #[cfg(feature = "tree-view")]
 pub mod tree_view;
+#[cfg(feature = "virtual-list")]
+pub mod virtual_list;
