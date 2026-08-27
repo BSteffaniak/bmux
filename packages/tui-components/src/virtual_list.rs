@@ -7,6 +7,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::measured_list::MeasuredListIndex;
 use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::semantic::SemanticRegion;
 
 use crate::scroll_view::ScrollViewState;
 
@@ -80,6 +81,39 @@ where
         self.scroll
             .set_vertical_offset(start.saturating_add(*row).min(maximum));
         self.capture_anchor();
+    }
+
+    /// Scroll so one stable item begins at the viewport top.
+    pub fn scroll_to_key(&mut self, key: &K, viewport_height: usize) -> bool {
+        let Some(index) = self.index.index_of(key) else {
+            return false;
+        };
+        let start = self.index.item_offset(index).unwrap_or(0);
+        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        self.scroll.set_vertical_offset(start.min(maximum));
+        true
+    }
+
+    /// Ensure one complete stable item is visible with minimum movement.
+    pub fn ensure_key_visible(&mut self, key: &K, viewport_height: usize) -> bool {
+        let Some(index) = self.index.index_of(key) else {
+            return false;
+        };
+        let Some(item) = self.index.item(index) else {
+            return false;
+        };
+        let start = self.index.item_offset(index).unwrap_or(0);
+        let end = start.saturating_add(item.height);
+        let old = self.scroll.vertical_offset();
+        let mut offset = old;
+        if start < offset {
+            offset = start;
+        } else if end > offset.saturating_add(viewport_height) {
+            offset = end.saturating_sub(viewport_height);
+        }
+        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        self.scroll.set_vertical_offset(offset.min(maximum));
+        self.scroll.vertical_offset() != old
     }
 
     /// Clamp logical scrolling to the current collection extent.
@@ -235,13 +269,24 @@ where
                 LocalRect::new(0, -local_y, area.width, area.height),
                 |cx| {
                     item.component.paint(layout, cx);
+                    let semantic_id = format!("{}.item.{}", self.id, item.key.to_string());
                     cx.push_hit(
                         HitRegion::new(
-                            format!("{}.item.{}", self.id, item.key.to_string()),
+                            semantic_id.clone(),
                             Rect::new(0, 0, area.width, item_height),
                         )
                         .role(HitRole::ListItem),
                     );
+                    cx.push_focus(
+                        semantic_id.clone(),
+                        LocalRect::new(0, 0, area.width, item_height),
+                    );
+                    cx.push_semantic(SemanticRegion::new(
+                        semantic_id,
+                        Rect::new(0, 0, area.width, item_height),
+                        "list-item",
+                    ));
+                    cx.push_damage(LocalRect::new(0, 0, area.width, item_height));
                 },
             );
             report.painted_items = report.painted_items.saturating_add(1);
@@ -332,6 +377,25 @@ mod tests {
     }
 
     #[test]
+    fn stable_key_scroll_and_ensure_visible_use_exact_item_geometry() {
+        let list = VirtualList::new("messages")
+            .item("a", 0, TextContent::new("a"))
+            .item("b", 0, TextContent::new("b line that wraps"))
+            .item("c", 0, TextContent::new("c"));
+        let mut state = VirtualListState::new(1);
+        list.sync(6, &mut state, &mut LayoutCx::new());
+
+        assert!(state.scroll_to_key(&"b", 3));
+        assert_eq!(state.scroll.vertical_offset(), 2);
+        assert!(!state.ensure_key_visible(&"b", 3));
+        assert!(state.ensure_key_visible(&"c", 3));
+        assert_eq!(state.scroll.vertical_offset(), 4);
+        assert!(!state.scroll_to_key(&"missing", 3));
+        assert!(!state.ensure_key_visible(&"missing", 3));
+        assert_eq!(state.scroll.vertical_offset(), 4);
+    }
+
+    #[test]
     fn viewport_height_does_not_remeasure_but_width_and_removed_keys_do() {
         let list = VirtualList::new("messages")
             .item("a", 1, TextContent::new("a message that wraps"))
@@ -395,8 +459,24 @@ mod tests {
         let report = list.paint(Rect::new(0, 0, 6, 3), &state, &mut PaintCx::new(&mut frame));
 
         assert_eq!(report.painted_items, 1);
-        assert_eq!(frame.hits().regions().len(), 1);
+        assert_eq!(frame.hits().regions().len(), 2);
         assert_eq!(frame.hits().regions()[0].id.as_str(), "messages.item.b");
+        assert!(frame.hits().regions()[0].pointer_events);
+        assert_eq!(frame.hits().regions()[1].id.as_str(), "messages.item.b");
+        assert!(!frame.hits().regions()[1].pointer_events);
+        assert!(frame.hits().regions()[1].focusable);
+        assert_eq!(frame.hits().regions()[1].area, Rect::new(0, 0, 6, 3));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].id, "messages.item.b");
+        assert_eq!(frame.semantics().regions()[0].role, "list-item");
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 6, 3));
+        assert_eq!(
+            frame.damage(bmux_tui::damage::DamagePolicy {
+                max_regions: 64,
+                max_area_percent: 101,
+            }),
+            bmux_tui::damage::Damage::Regions(vec![Rect::new(0, 0, 6, 3)])
+        );
     }
 
     #[test]

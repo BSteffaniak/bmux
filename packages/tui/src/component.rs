@@ -16,6 +16,32 @@ use crate::event::{Event, EventOutcome};
 use crate::geometry::{Rect, Size};
 use crate::paint::PaintCx;
 
+/// Root-relative rectangle in logical component coordinates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct LogicalRect {
+    /// Horizontal origin in terminal cells.
+    pub x: u16,
+    /// Vertical origin in logical rows.
+    pub y: usize,
+    /// Width in terminal cells.
+    pub width: u16,
+    /// Height in logical rows.
+    pub height: usize,
+}
+
+impl LogicalRect {
+    /// Create a logical rectangle.
+    #[must_use]
+    pub const fn new(x: u16, y: usize, width: u16, height: usize) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
 /// Logical component size.
 ///
 /// Width is bounded by terminal cell coordinates. Height remains logical so a
@@ -317,8 +343,31 @@ impl LayoutNode {
         self.children.iter().find_map(|child| child.node.find(id))
     }
 
+    /// Find one resolved node and its root-relative logical rectangle without
+    /// recalculating component placement or saturating document coordinates.
+    #[must_use]
+    pub fn find_logical_rect(&self, id: &LayoutId) -> Option<LogicalRect> {
+        self.find_logical_rect_at(id, 0, 0)
+    }
+
+    fn find_logical_rect_at(&self, id: &LayoutId, x: u16, y: usize) -> Option<LogicalRect> {
+        if &self.id == id {
+            return Some(LogicalRect::new(x, y, self.size.width, self.size.height));
+        }
+        self.children.iter().find_map(|child| {
+            child.node.find_logical_rect_at(
+                id,
+                x.saturating_add(child.x),
+                y.saturating_add(child.y),
+            )
+        })
+    }
+
     /// Find one resolved node and its root-relative terminal rectangle without
     /// recalculating component placement.
+    ///
+    /// Prefer [`Self::find_logical_rect`] for scroll/document geometry; this
+    /// terminal projection saturates logical rows at the `u16` boundary.
     #[must_use]
     pub fn find_rect(&self, id: &LayoutId) -> Option<Rect> {
         self.find_rect_at(id, 0, 0)
@@ -398,7 +447,13 @@ impl<'a> EventCx<'a> {
         self.root.find(id)
     }
 
-    /// Look up root-relative resolved geometry by stable identity.
+    /// Look up root-relative logical geometry by stable identity.
+    #[must_use]
+    pub fn find_logical_rect(&self, id: &LayoutId) -> Option<LogicalRect> {
+        self.root.find_logical_rect(id)
+    }
+
+    /// Look up root-relative terminal geometry by stable identity.
     #[must_use]
     pub fn find_rect(&self, id: &LayoutId) -> Option<Rect> {
         self.root.find_rect(id)
@@ -790,6 +845,29 @@ mod tests {
             Some(crate::geometry::Rect::new(0, 0, 2, 1))
         );
         assert!(root.find(&LayoutId::new("missing")).is_none());
+    }
+
+    #[test]
+    fn logical_lookup_preserves_document_coordinates_above_terminal_limits() {
+        let child = LayoutNode::leaf(LayoutId::new("child"), LogicalSize::new(2, 70_000));
+        let root = LayoutNode::with_children(
+            LayoutId::new("root"),
+            LogicalSize::new(2, 80_000),
+            vec![super::ChildLayout::new(0, 70_000, child)],
+        );
+
+        assert_eq!(
+            root.find_logical_rect(&LayoutId::new("child")),
+            Some(super::LogicalRect::new(0, 70_000, 2, 70_000))
+        );
+        assert_eq!(
+            root.find_rect(&LayoutId::new("child")),
+            Some(crate::geometry::Rect::new(0, u16::MAX, 2, u16::MAX))
+        );
+        assert_eq!(
+            EventCx::new(&root).find_logical_rect(&LayoutId::new("child")),
+            Some(super::LogicalRect::new(0, 70_000, 2, 70_000))
+        );
     }
 
     #[test]

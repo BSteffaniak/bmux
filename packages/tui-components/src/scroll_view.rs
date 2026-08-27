@@ -1,7 +1,7 @@
 //! Interactive state and policy for arbitrary measured scroll content.
 
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::component::LayoutNode;
+use bmux_tui::component::{LayoutId, LayoutNode};
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
@@ -15,6 +15,27 @@ use crate::common::InteractionState;
 use crate::scrollbar::{
     Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
 };
+
+/// Stable layout identity and viewport-relative row used across relayout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollAnchor {
+    id: LayoutId,
+    viewport_row: i64,
+}
+
+impl ScrollAnchor {
+    /// Stable identity retained by this anchor.
+    #[must_use]
+    pub const fn id(&self) -> &LayoutId {
+        &self.id
+    }
+
+    /// Signed target row relative to the viewport top.
+    #[must_use]
+    pub const fn viewport_row(&self) -> i64 {
+        self.viewport_row
+    }
+}
 
 /// Caller-owned logical scroll state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +126,17 @@ pub enum ScrollViewOutcome {
     Ignored,
     /// Logical offset changed.
     Scrolled { vertical_offset: usize },
+}
+
+/// Result of routing one event through nested vertical scroll views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedScrollOutcome {
+    /// Neither viewport consumed the event.
+    Ignored,
+    /// The innermost viewport consumed the event.
+    Inner(ScrollViewOutcome),
+    /// The enclosing viewport consumed an event handed off at the inner edge.
+    Outer(ScrollViewOutcome),
 }
 
 /// Generic interaction controller for one measured scroll viewport.
@@ -317,7 +349,117 @@ impl ScrollView {
         outcome(old, state.vertical_offset)
     }
 
-    /// Handle one keyboard or mouse event.
+    /// Scroll to the first logical content row.
+    pub const fn scroll_to_top(&self, state: &mut ScrollViewState) -> ScrollViewOutcome {
+        let old = state.vertical_offset;
+        state.vertical_offset = 0;
+        state.follow_bottom = false;
+        outcome(old, state.vertical_offset)
+    }
+
+    /// Scroll to the final logical content row and follow subsequent appends.
+    pub fn scroll_to_bottom(
+        &self,
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+    ) -> ScrollViewOutcome {
+        let old = state.vertical_offset;
+        state.vertical_offset = Self::max_vertical_offset(layout);
+        state.follow_bottom = true;
+        outcome(old, state.vertical_offset)
+    }
+
+    /// Place one authoritative descendant's top at the viewport top.
+    pub fn scroll_to_layout(
+        &self,
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        id: &LayoutId,
+    ) -> ScrollViewOutcome {
+        let Some(rect) = layout.find_logical_rect(id) else {
+            return ScrollViewOutcome::Ignored;
+        };
+        let old = state.vertical_offset;
+        state.vertical_offset = rect.y.min(Self::max_vertical_offset(layout));
+        state.follow_bottom = state.vertical_offset == Self::max_vertical_offset(layout);
+        outcome(old, state.vertical_offset)
+    }
+
+    /// Ensure one authoritative descendant layout is visible by stable identity.
+    pub fn ensure_layout_visible(
+        &self,
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        id: &LayoutId,
+    ) -> ScrollViewOutcome {
+        layout
+            .find_logical_rect(id)
+            .map_or(ScrollViewOutcome::Ignored, |rect| {
+                self.ensure_visible(layout, state, rect.y, rect.height)
+            })
+    }
+
+    /// Capture one stable descendant's signed viewport-relative row.
+    #[must_use]
+    pub fn capture_anchor(
+        layout: &LayoutNode,
+        state: &ScrollViewState,
+        id: &LayoutId,
+    ) -> Option<ScrollAnchor> {
+        let rect = layout.find_logical_rect(id)?;
+        Some(ScrollAnchor {
+            id: id.clone(),
+            viewport_row: signed_difference(rect.y, state.vertical_offset),
+        })
+    }
+
+    /// Restore a captured stable descendant after relayout.
+    pub fn restore_anchor(
+        &self,
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        anchor: &ScrollAnchor,
+    ) -> ScrollViewOutcome {
+        let Some(rect) = layout.find_logical_rect(&anchor.id) else {
+            return ScrollViewOutcome::Ignored;
+        };
+        let old = state.vertical_offset;
+        state.vertical_offset = offset_for_viewport_row(rect.y, anchor.viewport_row)
+            .min(Self::max_vertical_offset(layout));
+        state.follow_bottom = state.vertical_offset == Self::max_vertical_offset(layout);
+        outcome(old, state.vertical_offset)
+    }
+
+    /// Route one event to the innermost viewport first, handing an unconsumed
+    /// edge event to the enclosing viewport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_nested_event(
+        inner: &Self,
+        inner_area: Rect,
+        inner_layout: &LayoutNode,
+        inner_state: &mut ScrollViewState,
+        outer: &Self,
+        outer_area: Rect,
+        outer_layout: &LayoutNode,
+        outer_state: &mut ScrollViewState,
+        event: &Event,
+    ) -> NestedScrollOutcome {
+        let inner_outcome = inner.handle_event(inner_area, inner_layout, inner_state, event);
+        if inner_outcome != ScrollViewOutcome::Ignored {
+            return NestedScrollOutcome::Inner(inner_outcome);
+        }
+        let outer_outcome = outer.handle_event(outer_area, outer_layout, outer_state, event);
+        if outer_outcome == ScrollViewOutcome::Ignored {
+            NestedScrollOutcome::Ignored
+        } else {
+            NestedScrollOutcome::Outer(outer_outcome)
+        }
+    }
+
+    /// Handle one event, returning whether this viewport consumed it.
+    ///
+    /// A wheel event at a vertical edge is intentionally ignored so an
+    /// enclosing scroll view can consume it deterministically.
     pub fn handle_event(
         &self,
         area: Rect,
@@ -439,6 +581,22 @@ fn logical_offset_from_scrollbar(
     (offset.saturating_mul(logical_maximum) / scrollbar_maximum).min(logical_maximum)
 }
 
+fn signed_difference(value: usize, base: usize) -> i64 {
+    if value >= base {
+        i64::try_from(value - base).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(base - value).unwrap_or(i64::MAX)
+    }
+}
+
+fn offset_for_viewport_row(row: usize, viewport_row: i64) -> usize {
+    if viewport_row >= 0 {
+        row.saturating_sub(usize::try_from(viewport_row).unwrap_or(usize::MAX))
+    } else {
+        row.saturating_add(usize::try_from(viewport_row.unsigned_abs()).unwrap_or(usize::MAX))
+    }
+}
+
 const fn outcome(old: usize, current: usize) -> ScrollViewOutcome {
     if old == current {
         ScrollViewOutcome::Ignored
@@ -451,7 +609,7 @@ const fn outcome(old: usize, current: usize) -> ScrollViewOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScrollView, ScrollViewOutcome, ScrollViewState};
+    use super::{NestedScrollOutcome, ScrollView, ScrollViewOutcome, ScrollViewState};
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::component::{ChildLayout, LayoutId, LayoutNode, LogicalSize};
     use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
@@ -474,6 +632,229 @@ mod tests {
                 ),
             )],
         )
+    }
+
+    #[test]
+    fn nested_keyboard_routing_respects_focus_and_edge_handoff() {
+        let inner = ScrollView::new();
+        let outer = ScrollView::new();
+        let inner_layout = layout(20, 5);
+        let outer_layout = layout(40, 10);
+        let area = Rect::new(0, 0, 10, 10);
+        let event = Event::Key(KeyStroke::simple(KeyCode::PageDown));
+        let mut inner_state = ScrollViewState::new();
+        let mut outer_state = ScrollViewState::new();
+        inner_state.interaction.focused = true;
+        outer_state.interaction.focused = true;
+
+        assert_eq!(
+            ScrollView::handle_nested_event(
+                &inner,
+                area,
+                &inner_layout,
+                &mut inner_state,
+                &outer,
+                area,
+                &outer_layout,
+                &mut outer_state,
+                &event,
+            ),
+            NestedScrollOutcome::Inner(ScrollViewOutcome::Scrolled { vertical_offset: 5 })
+        );
+        assert_eq!(outer_state.vertical_offset(), 0);
+
+        inner_state.set_vertical_offset(ScrollView::max_vertical_offset(&inner_layout));
+        assert_eq!(
+            ScrollView::handle_nested_event(
+                &inner,
+                area,
+                &inner_layout,
+                &mut inner_state,
+                &outer,
+                area,
+                &outer_layout,
+                &mut outer_state,
+                &event,
+            ),
+            NestedScrollOutcome::Outer(ScrollViewOutcome::Scrolled {
+                vertical_offset: 10
+            })
+        );
+
+        inner_state.interaction.focused = false;
+        outer_state.interaction.focused = false;
+        assert_eq!(
+            ScrollView::handle_nested_event(
+                &inner,
+                area,
+                &inner_layout,
+                &mut inner_state,
+                &outer,
+                area,
+                &outer_layout,
+                &mut outer_state,
+                &event,
+            ),
+            NestedScrollOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn nested_wheel_routing_hands_off_only_at_inner_edges() {
+        let inner = ScrollView::new();
+        let outer = ScrollView::new();
+        let inner_layout = layout(20, 5);
+        let outer_layout = layout(40, 10);
+        let inner_area = Rect::new(2, 2, 5, 5);
+        let outer_area = Rect::new(0, 0, 10, 10);
+        let event = Event::Mouse(MouseEvent::new(
+            MouseEventKind::ScrollDown,
+            Point::new(3, 3),
+        ));
+        let mut inner_state = ScrollViewState::new();
+        let mut outer_state = ScrollViewState::new();
+
+        assert_eq!(
+            ScrollView::handle_nested_event(
+                &inner,
+                inner_area,
+                &inner_layout,
+                &mut inner_state,
+                &outer,
+                outer_area,
+                &outer_layout,
+                &mut outer_state,
+                &event,
+            ),
+            NestedScrollOutcome::Inner(ScrollViewOutcome::Scrolled { vertical_offset: 3 })
+        );
+        assert_eq!(outer_state.vertical_offset(), 0);
+
+        inner_state.set_vertical_offset(ScrollView::max_vertical_offset(&inner_layout));
+        assert_eq!(
+            ScrollView::handle_nested_event(
+                &inner,
+                inner_area,
+                &inner_layout,
+                &mut inner_state,
+                &outer,
+                outer_area,
+                &outer_layout,
+                &mut outer_state,
+                &event,
+            ),
+            NestedScrollOutcome::Outer(ScrollViewOutcome::Scrolled { vertical_offset: 3 })
+        );
+    }
+
+    #[test]
+    fn explicit_top_bottom_and_layout_operations_share_canonical_offset() {
+        let target = LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(10, 2));
+        let content = LayoutNode::with_children(
+            LayoutId::new("content"),
+            LogicalSize::new(10, 80_000),
+            vec![ChildLayout::new(0, 70_000, target)],
+        );
+        let layout = LayoutNode::with_children(
+            LayoutId::new("viewport"),
+            LogicalSize::new(10, 5),
+            vec![ChildLayout::new(0, 0, content)],
+        );
+        let view = ScrollView::new();
+        let mut state = ScrollViewState::new();
+
+        assert_eq!(
+            view.scroll_to_layout(&layout, &mut state, &LayoutId::new("target")),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 70_000
+            }
+        );
+        assert!(!state.follows_bottom());
+        assert_eq!(
+            view.scroll_to_bottom(&layout, &mut state),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 79_995
+            }
+        );
+        assert!(state.follows_bottom());
+        assert_eq!(
+            view.scroll_to_top(&mut state),
+            ScrollViewOutcome::Scrolled { vertical_offset: 0 }
+        );
+        assert!(!state.follows_bottom());
+        assert_eq!(
+            view.scroll_to_layout(&layout, &mut state, &LayoutId::new("missing")),
+            ScrollViewOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn stable_anchor_restores_relative_row_after_relayout() {
+        fn anchored_layout(target_row: usize) -> LayoutNode {
+            let target = LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(10, 2));
+            let content = LayoutNode::with_children(
+                LayoutId::new("content"),
+                LogicalSize::new(10, 100_000),
+                vec![ChildLayout::new(0, target_row, target)],
+            );
+            LayoutNode::with_children(
+                LayoutId::new("viewport"),
+                LogicalSize::new(10, 10),
+                vec![ChildLayout::new(0, 0, content)],
+            )
+        }
+
+        let view = ScrollView::new();
+        let before = anchored_layout(70_000);
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(69_997);
+        let anchor = ScrollView::capture_anchor(&before, &state, &LayoutId::new("target")).unwrap();
+        assert_eq!(anchor.viewport_row(), 3);
+
+        let after = anchored_layout(75_000);
+        assert_eq!(
+            view.restore_anchor(&after, &mut state, &anchor),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 74_997
+            }
+        );
+        assert_eq!(state.vertical_offset(), 74_997);
+
+        let missing = layout(100_000, 10);
+        assert_eq!(
+            view.restore_anchor(&missing, &mut state, &anchor),
+            ScrollViewOutcome::Ignored
+        );
+        assert_eq!(state.vertical_offset(), 74_997);
+    }
+
+    #[test]
+    fn ensure_layout_visible_uses_unsaturated_authoritative_geometry() {
+        let target = LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(10, 2));
+        let content = LayoutNode::with_children(
+            LayoutId::new("content"),
+            LogicalSize::new(10, 80_000),
+            vec![ChildLayout::new(0, 70_000, target)],
+        );
+        let layout = LayoutNode::with_children(
+            LayoutId::new("viewport"),
+            LogicalSize::new(10, 5),
+            vec![ChildLayout::new(0, 0, content)],
+        );
+        let view = ScrollView::new();
+        let mut state = ScrollViewState::new();
+
+        assert_eq!(
+            view.ensure_layout_visible(&layout, &mut state, &LayoutId::new("target")),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 69_997
+            }
+        );
+        assert_eq!(state.vertical_offset(), 69_997);
+        assert_eq!(
+            view.ensure_layout_visible(&layout, &mut state, &LayoutId::new("missing")),
+            ScrollViewOutcome::Ignored
+        );
     }
 
     #[test]

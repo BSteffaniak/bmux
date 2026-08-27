@@ -66,7 +66,7 @@ pub mod prelude {
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
         LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
-        LogicalSize, combine_child_revisions,
+        LogicalRect, LogicalSize, combine_child_revisions,
     };
     pub use crate::composition::{
         Align, Clip, Column, HorizontalAlignment, Row, ScrollViewport, SizeBox, Stack, StyleScope,

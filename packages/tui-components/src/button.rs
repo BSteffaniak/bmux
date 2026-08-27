@@ -1,10 +1,12 @@
 //! Configurable button component.
 
 use std::cell::Cell;
+use std::hash::{Hash, Hasher};
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::{
-    Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata, LayoutNode, LogicalSize,
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
@@ -12,6 +14,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
 
 use crate::common::{ComponentMousePolicy, InteractionState, InteractionStyles};
@@ -176,9 +179,34 @@ impl<'a, 'state> ButtonComponent<'a, 'state> {
             state,
         }
     }
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: ButtonPolicy) -> Self {
+        self.button.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: ButtonStyles) -> Self {
+        self.button.styles = styles;
+        self
+    }
 }
 
 impl Component for ButtonComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.button.label.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.button.policy).hash(&mut paint);
+        format!("{:?}", self.button.styles).hash(&mut paint);
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         LayoutNode::leaf(
@@ -202,6 +230,12 @@ impl Component for ButtonComponent<'_, '_> {
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "button",
+        ));
+        cx.push_damage(LocalRect::new(0, 0, layout.size.width, 1));
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -465,6 +499,43 @@ mod tests {
     use super::{Button, ButtonComponent, ButtonOutcome, ButtonState};
 
     #[test]
+    fn canonical_component_separates_layout_and_paint_revisions() {
+        let state = Cell::new(ButtonState::new());
+        let button = ButtonComponent::new("save", "Save", &state);
+        let initial = button.revision();
+        state.set(ButtonState {
+            interaction: crate::common::InteractionState::new().focused(true),
+        });
+        let focused = button.revision();
+
+        assert_eq!(initial.layout, focused.layout);
+        assert_ne!(initial.paint, focused.paint);
+        assert_ne!(
+            initial.layout,
+            ButtonComponent::new("save", "Save changes", &state)
+                .revision()
+                .layout
+        );
+        assert_ne!(
+            initial.paint,
+            ButtonComponent::new("save", "Save", &state)
+                .policy(super::ButtonPolicy::keyboard())
+                .revision()
+                .paint
+        );
+        assert_ne!(
+            initial.paint,
+            ButtonComponent::new("save", "Save", &state)
+                .styles(super::ButtonStyles {
+                    normal: bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Red),
+                    ..super::ButtonStyles::default()
+                })
+                .revision()
+                .paint
+        );
+    }
+
+    #[test]
     fn canonical_component_paints_and_routes_from_one_layout() {
         let state = Cell::new(ButtonState::new());
         let button = ButtonComponent::new("save", "Save", &state);
@@ -475,6 +546,13 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         button.paint(&layout, &mut PaintCx::new(&mut frame));
         assert_eq!(frame.hits().regions()[0].id.as_str(), "save");
+        assert_eq!(frame.semantics().regions()[0].id, "save");
+        assert_eq!(frame.semantics().regions()[0].role, "button");
+        assert!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .is_full()
+        );
 
         let mut event_cx = EventCx::new(&layout);
         let outcome = button.event(

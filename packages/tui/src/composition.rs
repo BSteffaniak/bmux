@@ -472,7 +472,11 @@ impl<'a> ScrollViewport<'a> {
 
 impl Component for ScrollViewport<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        ComponentRevision::new(
+            stable_revision(|state| self.id.as_str().hash(state)),
+            stable_revision(|state| self.vertical_offset.hash(state)),
+        )
+        .combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -589,7 +593,19 @@ impl<'a> SizeBox<'a> {
 
 impl Component for SizeBox<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        ComponentRevision::new(
+            stable_revision(|state| {
+                self.id.as_str().hash(state);
+                self.width.hash(state);
+                self.height.hash(state);
+                self.min_width.hash(state);
+                self.max_width.hash(state);
+                self.min_height.hash(state);
+                self.max_height.hash(state);
+            }),
+            0,
+        )
+        .combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -686,7 +702,27 @@ impl<'a> Align<'a> {
 
 impl Component for Align<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        ComponentRevision::new(
+            stable_revision(|state| {
+                self.id.as_str().hash(state);
+                (match self.horizontal {
+                    HorizontalAlignment::Start => 0u8,
+                    HorizontalAlignment::Center => 1,
+                    HorizontalAlignment::End => 2,
+                    HorizontalAlignment::Stretch => 3,
+                })
+                .hash(state);
+                (match self.vertical {
+                    VerticalAlignment::Start => 0u8,
+                    VerticalAlignment::Center => 1,
+                    VerticalAlignment::End => 2,
+                    VerticalAlignment::Stretch => 3,
+                })
+                .hash(state);
+            }),
+            0,
+        )
+        .combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -756,7 +792,8 @@ impl<'a> Clip<'a> {
 
 impl Component for Clip<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0)
+            .combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -802,7 +839,11 @@ impl<'a> StyleScope<'a> {
 
 impl Component for StyleScope<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        ComponentRevision::new(
+            stable_revision(|state| self.id.as_str().hash(state)),
+            stable_revision(|state| self.style.hash(state)),
+        )
+        .combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -848,7 +889,14 @@ impl<'a> Visibility<'a> {
 
 impl Component for Visibility<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        ComponentRevision::new(
+            stable_revision(|state| {
+                self.id.as_str().hash(state);
+                self.visible.hash(state);
+            }),
+            0,
+        )
+        .combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -914,7 +962,7 @@ impl Default for Stack<'_> {
 impl Component for Stack<'_> {
     fn revision(&self) -> ComponentRevision {
         combine_child_revisions(
-            ComponentRevision::default(),
+            ComponentRevision::new(stable_revision(|state| self.id.as_str().hash(state)), 0),
             self.children.iter().map(Element::revision),
         )
     }
@@ -1039,8 +1087,25 @@ impl Default for Row<'_> {
 
 impl Component for Row<'_> {
     fn revision(&self) -> ComponentRevision {
+        let own = ComponentRevision::new(
+            stable_revision(|state| {
+                self.id.as_str().hash(state);
+                self.gap.hash(state);
+                (match self.alignment {
+                    VerticalAlignment::Start => 0u8,
+                    VerticalAlignment::Center => 1,
+                    VerticalAlignment::End => 2,
+                    VerticalAlignment::Stretch => 3,
+                })
+                .hash(state);
+                for child in &self.children {
+                    child.flex.hash(state);
+                }
+            }),
+            0,
+        );
         combine_child_revisions(
-            ComponentRevision::default(),
+            own,
             self.children.iter().map(|child| child.component.revision()),
         )
     }
@@ -1187,10 +1252,21 @@ impl Default for Column<'_> {
 
 impl Component for Column<'_> {
     fn revision(&self) -> ComponentRevision {
-        combine_child_revisions(
-            ComponentRevision::default(),
-            self.children.iter().map(Element::revision),
-        )
+        let own = ComponentRevision::new(
+            stable_revision(|state| {
+                self.id.as_str().hash(state);
+                self.gap.hash(state);
+                (match self.alignment {
+                    HorizontalAlignment::Start => 0u8,
+                    HorizontalAlignment::Center => 1,
+                    HorizontalAlignment::End => 2,
+                    HorizontalAlignment::Stretch => 3,
+                })
+                .hash(state);
+            }),
+            0,
+        );
+        combine_child_revisions(own, self.children.iter().map(Element::revision))
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -1442,6 +1518,91 @@ mod tests {
         let column_layout = column.layout(Constraints::for_width(5), &mut LayoutCx::new());
         assert_eq!(column_layout.children[0].x, 4);
         assert_eq!(column_layout.children[0].node.size.width, 1);
+    }
+
+    #[test]
+    fn wrapper_options_use_the_correct_revision_channel() {
+        let child = || TextContent::new("x");
+
+        assert_ne!(
+            SizeBox::new(child()).width(2).revision().layout,
+            SizeBox::new(child()).width(3).revision().layout
+        );
+        assert_ne!(
+            Align::new(child())
+                .horizontal(HorizontalAlignment::Start)
+                .revision()
+                .layout,
+            Align::new(child())
+                .horizontal(HorizontalAlignment::End)
+                .revision()
+                .layout
+        );
+        assert_ne!(
+            Visibility::new(child(), true).revision().layout,
+            Visibility::new(child(), false).revision().layout
+        );
+        assert_ne!(
+            Clip::new(child()).id("first").revision().layout,
+            Clip::new(child()).id("second").revision().layout
+        );
+        assert_ne!(
+            Stack::new().id("first").child(child()).revision().layout,
+            Stack::new().id("second").child(child()).revision().layout
+        );
+
+        let top = ScrollViewport::new(child()).vertical_offset(0).revision();
+        let scrolled = ScrollViewport::new(child()).vertical_offset(1).revision();
+        assert_eq!(top.layout, scrolled.layout);
+        assert_ne!(top.paint, scrolled.paint);
+
+        let plain = StyleScope::new(child(), Style::new()).revision();
+        let styled = StyleScope::new(child(), Style::new().fg(Color::Red)).revision();
+        assert_eq!(plain.layout, styled.layout);
+        assert_ne!(plain.paint, styled.paint);
+    }
+
+    #[test]
+    fn row_and_column_geometry_options_change_layout_revisions() {
+        let row_revision = Row::new()
+            .gap(1)
+            .alignment(VerticalAlignment::Center)
+            .flex_child(2, TextContent::new("x"))
+            .revision();
+        assert_ne!(
+            row_revision,
+            Row::new().child(TextContent::new("x")).revision()
+        );
+        assert_ne!(
+            Row::new()
+                .id("first")
+                .child(TextContent::new("x"))
+                .revision(),
+            Row::new()
+                .id("second")
+                .child(TextContent::new("x"))
+                .revision()
+        );
+
+        let column_revision = Column::new()
+            .gap(2)
+            .alignment(HorizontalAlignment::Center)
+            .child(TextContent::new("x"))
+            .revision();
+        assert_ne!(
+            column_revision,
+            Column::new().child(TextContent::new("x")).revision()
+        );
+        assert_ne!(
+            Column::new()
+                .id("first")
+                .child(TextContent::new("x"))
+                .revision(),
+            Column::new()
+                .id("second")
+                .child(TextContent::new("x"))
+                .revision()
+        );
     }
 
     #[test]
