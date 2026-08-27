@@ -8,8 +8,9 @@ use crate::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCx, LayoutId,
     LayoutNode, LogicalSize, combine_child_revisions,
 };
-use crate::geometry::Insets;
+use crate::geometry::{Insets, Rect};
 use crate::paint::{LocalRect, PaintCx};
+use crate::selection::{SelectionContentId, SelectionScopeId, plain_text_fragments};
 use crate::style::Style;
 use crate::text::{Line, Text, TextWrap, TextWrapGeometry};
 use crate::text_block::Alignment;
@@ -201,6 +202,51 @@ impl TextContent {
             }
         }
         output
+    }
+
+    /// Register selectable grapheme geometry from the authoritative projection.
+    ///
+    /// The caller owns scope/content identity and revision. Local rows are
+    /// translated and clipped by [`PaintCx`], and partially clipped graphemes
+    /// are omitted by its standard selection registration path.
+    pub fn register_selection(
+        &self,
+        layout: &LayoutNode,
+        cx: &mut PaintCx<'_, '_>,
+        scope_id: impl Into<SelectionScopeId>,
+        content_id: impl Into<SelectionContentId>,
+        order: u64,
+        revision: u64,
+    ) {
+        let scope_id = scope_id.into();
+        let content_id = content_id.into();
+        let height = layout.size.height;
+        for (row_index, row) in self
+            .projection(layout.size.width)
+            .into_iter()
+            .take(height)
+            .enumerate()
+        {
+            let text = row.line.plain_text();
+            let line_width = u16::try_from(row.line.width()).unwrap_or(u16::MAX);
+            let x = match self.alignment {
+                Alignment::Left => 0,
+                Alignment::Center => layout.size.width.saturating_sub(line_width) / 2,
+                Alignment::Right => layout.size.width.saturating_sub(line_width),
+            };
+            let y = u16::try_from(row_index).unwrap_or(u16::MAX);
+            for fragment in plain_text_fragments(
+                scope_id.clone(),
+                content_id.clone(),
+                Rect::new(x, y, layout.size.width.saturating_sub(x), 1),
+                order.saturating_add(u64::try_from(row_index).unwrap_or(u64::MAX)),
+                &text,
+                row.source_range.start,
+                revision,
+            ) {
+                cx.push_selection_fragment(fragment);
+            }
+        }
     }
 
     fn rows(&self, width: u16) -> Vec<Line> {
@@ -1546,6 +1592,29 @@ mod tests {
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+
+    #[test]
+    fn text_selection_uses_authoritative_projection_and_alignment() {
+        let component = TextContent::new("one two").alignment(crate::text_block::Alignment::Right);
+        let layout = component.layout(Constraints::for_width(6), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.register_selection(
+            &layout,
+            &mut PaintCx::new(&mut frame),
+            "messages",
+            "message:1",
+            10,
+            3,
+        );
+        let fragments = frame.selection().fragments();
+        assert_eq!(fragments.len(), 7);
+        assert_eq!(fragments[0].area, Rect::new(2, 0, 1, 1));
+        assert_eq!(fragments[0].source_range, 0..1);
+        assert_eq!(fragments[4].area, Rect::new(3, 1, 1, 1));
+        assert_eq!(fragments[4].source_range, 4..5);
+        assert!(fragments.iter().all(|fragment| fragment.revision == 3));
+    }
 
     #[test]
     fn text_projection_preserves_utf8_source_ranges_across_wraps_and_lines() {
