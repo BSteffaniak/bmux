@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
@@ -12,7 +12,9 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::breadcrumbs::{
     BreadcrumbItem, Breadcrumbs, BreadcrumbsComponent, BreadcrumbsOutcome, BreadcrumbsState,
 };
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarPolicy, KeyHintBarStyles};
+use bmux_tui_components::key_hint_bar::{
+    KeyHint, KeyHintBarComponent, KeyHintBarPolicy, KeyHintBarStyles,
+};
 use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{Pane, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState};
 use bmux_tui_components::scroll_area::{
@@ -22,9 +24,11 @@ use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
 use bmux_tui_components::status_bar::{
-    MessageBar, StatusBar, StatusBarPolicy, StatusBarStyles, StatusSegment, StatusSeverity,
+    MessageBar, StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment, StatusSeverity,
 };
-use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::tab_bar::{
+    TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
+};
 use bmux_tui_components::table::{Table, TableColumn, TableOutcome, TableRow, TableState};
 use bmux_tui_components::text_view::{
     TextView, TextViewCursor, TextViewHighlight, TextViewSelection, TextViewState,
@@ -243,8 +247,9 @@ fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_
 
 fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     let tab_items = tab_items();
-    TabBar::new(&tab_items)
-        .styles(TabBarStyles {
+    let tab_state = RefCell::new(demo.tabs.clone());
+    render_component(
+        &TabBarComponent::new("navigation.tabs", &tab_items, &tab_state).styles(TabBarStyles {
             normal: Style::new().fg(Color::BrightBlack),
             selected: Style::new()
                 .fg(Color::Black)
@@ -255,8 +260,10 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             pressed: Style::new().fg(Color::Black).bg(Color::Cyan),
             disabled: Style::new().fg(Color::BrightBlack),
             separator: Style::new().fg(Color::BrightBlack),
-        })
-        .render(Rect::new(1, 0, 26, 1), &demo.tabs, frame);
+        }),
+        Rect::new(1, 0, 26, 1),
+        frame,
+    );
 
     let breadcrumb_items = breadcrumb_items();
     let breadcrumb_state = Cell::new(demo.breadcrumbs);
@@ -343,21 +350,24 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
 
     let status_left = [StatusSegment::new("nav").severity(StatusSeverity::Info)];
     let status_right = [StatusSegment::new("ready").severity(StatusSeverity::Success)];
-    StatusBar::new()
-        .left(&status_left)
-        .right(&status_right)
-        .styles(StatusBarStyles {
-            default: Style::new().fg(Color::White).bg(Color::Blue),
-            muted: Style::new().fg(Color::BrightBlack).bg(Color::Blue),
-            info: Style::new().fg(Color::BrightCyan).bg(Color::Blue),
-            success: Style::new().fg(Color::BrightGreen).bg(Color::Blue),
-            warning: Style::new().fg(Color::Yellow).bg(Color::Blue),
-            error: Style::new().fg(Color::Red).bg(Color::Blue),
-            separator: Style::new().fg(Color::BrightBlack).bg(Color::Blue),
-            background: Style::new().bg(Color::Blue),
-        })
-        .policy(StatusBarPolicy::compact().background(true))
-        .render(Rect::new(1, 16, 68, 1), frame);
+    render_component(
+        &StatusBarComponent::new("navigation.status")
+            .left(&status_left)
+            .right(&status_right)
+            .styles(StatusBarStyles {
+                default: Style::new().fg(Color::White).bg(Color::Blue),
+                muted: Style::new().fg(Color::BrightBlack).bg(Color::Blue),
+                info: Style::new().fg(Color::BrightCyan).bg(Color::Blue),
+                success: Style::new().fg(Color::BrightGreen).bg(Color::Blue),
+                warning: Style::new().fg(Color::Yellow).bg(Color::Blue),
+                error: Style::new().fg(Color::Red).bg(Color::Blue),
+                separator: Style::new().fg(Color::BrightBlack).bg(Color::Blue),
+                background: Style::new().bg(Color::Blue),
+            })
+            .policy(StatusBarPolicy::compact().background(true)),
+        Rect::new(1, 16, 68, 1),
+        frame,
+    );
 
     let hints = [
         KeyHint::new("↑↓", "move"),
@@ -365,19 +375,22 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
         KeyHint::new("enter", "select"),
         KeyHint::new("q", "quit"),
     ];
-    KeyHintBar::new(&hints)
-        .styles(KeyHintBarStyles {
-            key: Style::new()
-                .fg(Color::BrightWhite)
-                .bg(Color::BrightBlack)
-                .add_modifier(Modifier::BOLD),
-            label: Style::new().fg(Color::BrightBlack).bg(Color::Black),
-            separator: Style::new().fg(Color::BrightBlack).bg(Color::Black),
-            disabled: Style::new().fg(Color::BrightBlack).bg(Color::Black),
-            background: Style::new().bg(Color::Black),
-        })
-        .policy(KeyHintBarPolicy::compact().background(true))
-        .render(Rect::new(1, 17, 68, 1), frame);
+    render_component(
+        &KeyHintBarComponent::new("navigation.hints", &hints)
+            .styles(KeyHintBarStyles {
+                key: Style::new()
+                    .fg(Color::BrightWhite)
+                    .bg(Color::BrightBlack)
+                    .add_modifier(Modifier::BOLD),
+                label: Style::new().fg(Color::BrightBlack).bg(Color::Black),
+                separator: Style::new().fg(Color::BrightBlack).bg(Color::Black),
+                disabled: Style::new().fg(Color::BrightBlack).bg(Color::Black),
+                background: Style::new().bg(Color::Black),
+            })
+            .policy(KeyHintBarPolicy::compact().background(true)),
+        Rect::new(1, 17, 68, 1),
+        frame,
+    );
 }
 
 pub fn demonstrate_menu_activation() -> MenuOutcome {
