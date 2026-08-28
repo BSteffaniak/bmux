@@ -205,7 +205,16 @@ where
         }
     }
 
-    /// Append one keyed item.
+    /// Append one keyed item using the component's declared layout revision.
+    #[must_use]
+    pub fn component(mut self, key: K, component: impl Component + 'a) -> Self {
+        let revision = component.revision();
+        self.items
+            .push(VirtualListItem::new(key, revision.layout, component));
+        self
+    }
+
+    /// Append one keyed item with an externally managed layout revision.
     #[must_use]
     pub fn item(mut self, key: K, layout_revision: u64, component: impl Component + 'a) -> Self {
         self.items
@@ -504,6 +513,27 @@ mod tests {
         fn revision(&self) -> ComponentRevision {
             ComponentRevision::default()
         }
+    }
+
+    struct RevisedHeightItem {
+        revision: u64,
+        height: usize,
+    }
+
+    impl Component for RevisedHeightItem {
+        fn revision(&self) -> ComponentRevision {
+            ComponentRevision::new(self.revision, 0)
+        }
+
+        fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+            cx.record_measurement();
+            LayoutNode::leaf(
+                LayoutId::new("revised-height"),
+                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
+            )
+        }
+
+        fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
     }
 
     struct MetadataItem {
@@ -978,6 +1008,62 @@ mod tests {
             .sync(6, &mut state, &mut cx);
         assert!(state.layout_cache().len() < retained_before_removal);
         assert!(state.layout_cache().stats().released > 0);
+    }
+
+    #[test]
+    fn component_item_repaints_without_remeasuring_for_paint_only_revision() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut state = VirtualListState::new(0);
+        let mut cx = LayoutCx::new();
+        let initial = VirtualList::new("messages").component(
+            "a",
+            TextContent::new("message").style(Style::new().fg(bmux_tui::style::Color::Red)),
+        );
+        initial.sync(area.width, &mut state, &mut cx);
+        let measured = cx.measured_nodes();
+
+        let changed = VirtualList::new("messages").component(
+            "a",
+            TextContent::new("message").style(Style::new().fg(bmux_tui::style::Color::Blue)),
+        );
+        changed.sync(area.width, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured);
+
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        changed.paint(area, &state, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().get(Point::new(0, 0)).unwrap().style.fg,
+            Some(bmux_tui::style::Color::Blue)
+        );
+    }
+
+    #[test]
+    fn component_item_uses_declared_layout_revision() {
+        let mut state = VirtualListState::new(0);
+        let mut cx = LayoutCx::new();
+        VirtualList::new("messages")
+            .component(
+                "a",
+                RevisedHeightItem {
+                    revision: 1,
+                    height: 1,
+                },
+            )
+            .sync(8, &mut state, &mut cx);
+        assert_eq!(state.total_height(), 1);
+
+        VirtualList::new("messages")
+            .component(
+                "a",
+                RevisedHeightItem {
+                    revision: 2,
+                    height: 3,
+                },
+            )
+            .sync(8, &mut state, &mut cx);
+        assert_eq!(state.total_height(), 3);
+        assert_eq!(cx.measured_nodes(), 2);
     }
 
     #[test]

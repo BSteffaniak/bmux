@@ -1,8 +1,11 @@
 //! Interactive state and policy for arbitrary measured scroll content.
 
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::{
-    ChildLayout, Component, Constraints, Element, EventCx, LayoutId, LayoutNode, LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutId, LayoutNode,
+    LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -194,6 +197,21 @@ impl<'a> ScrollViewComponent<'a> {
 }
 
 impl Component for ScrollViewComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let child = self.child.revision();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.viewport.hash(&mut layout);
+        self.content_width.hash(&mut layout);
+        child.layout.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.offset_x.hash(&mut paint);
+        self.offset_y.hash(&mut paint);
+        child.paint.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
     fn layout(
         &self,
         constraints: Constraints,
@@ -878,6 +896,74 @@ mod tests {
             }
         );
         assert_eq!(state.horizontal_offset(), 15);
+    }
+
+    #[test]
+    fn component_revision_tracks_child_layout_and_paint_independently() {
+        let initial = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            ScrollViewState::new(),
+            TextContent::new("abcdef"),
+        )
+        .content_width(6)
+        .revision();
+        let styled = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            ScrollViewState::new(),
+            TextContent::new("abcdef")
+                .style(bmux_tui::style::Style::new().add_modifier(bmux_tui::style::Modifier::BOLD)),
+        )
+        .content_width(6)
+        .revision();
+        assert_eq!(initial.layout, styled.layout);
+        assert_ne!(initial.paint, styled.paint);
+
+        let changed_text = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            ScrollViewState::new(),
+            TextContent::new("abcdefgh"),
+        )
+        .content_width(6)
+        .revision();
+        assert_ne!(initial.layout, changed_text.layout);
+    }
+
+    #[test]
+    fn component_revision_partitions_geometry_offsets_and_child_paint() {
+        let initial = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            ScrollViewState::new(),
+            TextContent::new("abcdef"),
+        )
+        .content_width(6)
+        .revision();
+
+        let mut scrolled = ScrollViewState::new();
+        scrolled.set_horizontal_offset(2);
+        let offset = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            scrolled,
+            TextContent::new("abcdef"),
+        )
+        .content_width(6)
+        .revision();
+        assert_eq!(initial.layout, offset.layout);
+        assert_ne!(initial.paint, offset.paint);
+
+        let wider = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            ScrollViewState::new(),
+            TextContent::new("abcdef"),
+        )
+        .content_width(8)
+        .revision();
+        assert_ne!(initial.layout, wider.layout);
     }
 
     #[test]

@@ -145,25 +145,77 @@ fn benchmark_count(count: usize) {
     state.scroll.set_vertical_offset(middle.saturating_add(40));
     let page_scroll = paint_once(&list, &state, viewport);
 
+    state.scroll.set_follow_bottom(true);
+    state.restore_anchor(usize::from(viewport.height));
     let started = Instant::now();
     let appended = build_list(count.saturating_add(1), 0);
     appended.sync(80, &mut state, &mut layout_cx);
+    state.restore_anchor(usize::from(viewport.height));
+    let append_follows_bottom = state.scroll.follows_bottom();
+    let append_offset = state.scroll.vertical_offset();
+    let append_maximum = state
+        .total_height()
+        .saturating_sub(usize::from(viewport.height));
     let append = started.elapsed();
     let append_measured = layout_cx
         .measured_nodes()
         .saturating_sub(initial_measured.saturating_add(steady_measured));
 
+    state.scroll.set_follow_bottom(false);
+    state.scroll.set_vertical_offset(middle);
+    state.capture_anchor();
+    let insert_anchor_key = state
+        .key_at_offset(state.scroll.vertical_offset())
+        .copied()
+        .expect("middle offset must resolve to an item");
+    let insert_anchor_row = state
+        .scroll
+        .vertical_offset()
+        .saturating_sub(state.item_offset(&insert_anchor_key).unwrap());
     let before_insert = layout_cx.measured_nodes();
     let started = Instant::now();
     let inserted = build_list_with_prefix(count, 0);
     inserted.sync(80, &mut state, &mut layout_cx);
+    state.restore_anchor(usize::from(viewport.height));
+    let insert_anchor_offset = state.item_offset(&insert_anchor_key).unwrap();
+    let insert_restored_offset = state.scroll.vertical_offset();
     let insert = started.elapsed();
     let insert_measured = layout_cx.measured_nodes().saturating_sub(before_insert);
 
+    let before_remove = layout_cx.measured_nodes();
+    state.capture_anchor();
+    let remove_anchor_key = state
+        .key_at_offset(state.scroll.vertical_offset())
+        .copied()
+        .expect("inserted-list offset must resolve to an item");
+    let remove_anchor_row = state
+        .scroll
+        .vertical_offset()
+        .saturating_sub(state.item_offset(&remove_anchor_key).unwrap());
+    let started = Instant::now();
+    list.sync(80, &mut state, &mut layout_cx);
+    state.restore_anchor(usize::from(viewport.height));
+    let remove = started.elapsed();
+    let remove_measured = layout_cx.measured_nodes().saturating_sub(before_remove);
+    let remove_anchor_offset = state.item_offset(&remove_anchor_key).unwrap();
+    let remove_restored_offset = state.scroll.vertical_offset();
+
+    state.capture_anchor();
+    let reorder_anchor_key = state
+        .key_at_offset(state.scroll.vertical_offset())
+        .copied()
+        .expect("pre-reorder offset must resolve to an item");
+    let reorder_anchor_row = state
+        .scroll
+        .vertical_offset()
+        .saturating_sub(state.item_offset(&reorder_anchor_key).unwrap());
     let before_reorder = layout_cx.measured_nodes();
     let started = Instant::now();
     let reordered = build_reordered_list(count, 0);
     reordered.sync(80, &mut state, &mut layout_cx);
+    state.restore_anchor(usize::from(viewport.height));
+    let reorder_anchor_offset = state.item_offset(&reorder_anchor_key).unwrap();
+    let reorder_restored_offset = state.scroll.vertical_offset();
     let reorder = started.elapsed();
     let reorder_measured = layout_cx.measured_nodes().saturating_sub(before_reorder);
 
@@ -176,14 +228,84 @@ fn benchmark_count(count: usize) {
         .measured_nodes()
         .saturating_sub(before_paint_revision);
 
+    state.capture_anchor();
+    let resize_anchor_key = state
+        .key_at_offset(state.scroll.vertical_offset())
+        .copied()
+        .expect("pre-resize offset must resolve to an item");
+    let resize_anchor_row = state
+        .scroll
+        .vertical_offset()
+        .saturating_sub(state.item_offset(&resize_anchor_key).unwrap());
     let before_resize = layout_cx.measured_nodes();
     let started = Instant::now();
     list.sync(64, &mut state, &mut layout_cx);
+    state.restore_anchor(usize::from(viewport.height));
+    let resize_anchor_offset = state.item_offset(&resize_anchor_key).unwrap();
+    let resize_restored_offset = state.scroll.vertical_offset();
     let resize = started.elapsed();
     let resize_measured = layout_cx.measured_nodes().saturating_sub(before_resize);
 
+    assert_eq!(
+        steady_measured, 0,
+        "unchanged layout must reuse measurements"
+    );
+    assert_eq!(append_measured, 1, "append must measure only the new item");
+    assert!(append_follows_bottom, "append must preserve bottom follow");
+    assert_eq!(
+        append_offset, append_maximum,
+        "append must restore the exact bottom anchor"
+    );
+    assert_eq!(insert_measured, 1, "prepend must measure only the new item");
+    assert_eq!(
+        insert_restored_offset,
+        insert_anchor_offset.saturating_add(insert_anchor_row),
+        "prepend must preserve the stable top item and intra-item row"
+    );
+    assert_eq!(
+        remove_measured, 0,
+        "removal must retain every unaffected measurement"
+    );
+    assert_eq!(
+        remove_restored_offset,
+        remove_anchor_offset.saturating_add(remove_anchor_row),
+        "removal above must preserve the stable top item and intra-item row"
+    );
+    assert_eq!(
+        reorder_measured, 0,
+        "reorder must retain keyed measurements"
+    );
+    assert_eq!(
+        reorder_restored_offset,
+        reorder_anchor_offset.saturating_add(reorder_anchor_row),
+        "reorder must preserve the stable top item and intra-item row"
+    );
+    assert_eq!(
+        paint_revision_measured, 0,
+        "paint-only revisions must not invalidate geometry"
+    );
+    assert_eq!(
+        resize_measured, count,
+        "width changes must remeasure each width-dependent item exactly once"
+    );
+    assert_eq!(
+        resize_restored_offset,
+        resize_anchor_offset.saturating_add(resize_anchor_row),
+        "width reflow must restore the stable top item and intra-item row"
+    );
+    for report in [&initial_paint, &row_scroll, &page_scroll] {
+        assert!(
+            report.rendered.painted_items <= usize::from(viewport.height).saturating_add(2),
+            "paint work must remain bounded by viewport-intersecting items"
+        );
+        assert_eq!(
+            report.rendered.registered_items, report.rendered.painted_items,
+            "interaction registration must remain visible-item bounded"
+        );
+    }
+
     println!(
-        "items={count} build_us={} initial_layout_us={} initial_measured={} steady_layout_us={} steady_measured={} initial_paint_us={} initial_painted={} row_scroll_us={} row_painted={} page_scroll_us={} page_painted={} allocations={} allocation_bytes={} hit_regions={} focus_targets={} semantic_regions={} selection_fragments={} image_contributions={} damage_regions={} damaged_cells={} frame_output_bytes={} append_us={} append_measured={} insert_us={} insert_measured={} reorder_us={} reorder_measured={} paint_revision_us={} paint_revision_measured={} resize_us={} resize_measured={} cache_hits={} cache_misses={} cache_released={} total_rows={}",
+        "items={count} build_us={} initial_layout_us={} initial_measured={} steady_layout_us={} steady_measured={} initial_paint_us={} initial_painted={} row_scroll_us={} row_painted={} page_scroll_us={} page_painted={} allocations={} allocation_bytes={} hit_regions={} focus_targets={} semantic_regions={} selection_fragments={} image_contributions={} damage_regions={} damaged_cells={} frame_output_bytes={} append_us={} append_measured={} insert_us={} insert_measured={} remove_us={} remove_measured={} reorder_us={} reorder_measured={} paint_revision_us={} paint_revision_measured={} resize_us={} resize_measured={} cache_hits={} cache_misses={} cache_released={} total_rows={}",
         micros(build),
         micros(initial_layout),
         initial_measured,
@@ -209,6 +331,8 @@ fn benchmark_count(count: usize) {
         append_measured,
         micros(insert),
         insert_measured,
+        micros(remove),
+        remove_measured,
         micros(reorder),
         reorder_measured,
         micros(paint_revision),
@@ -311,18 +435,15 @@ fn damage_counts(damage: Damage, viewport: Rect) -> (usize, usize) {
 
 fn build_list(count: usize, paint_revision: u64) -> VirtualList<'static, usize> {
     (0..count).fold(VirtualList::new("benchmark"), |list, index| {
-        list.item(index, 0, benchmark_item(index, paint_revision))
+        list.component(index, benchmark_item(index, paint_revision))
     })
 }
 
 fn build_list_with_prefix(count: usize, paint_revision: u64) -> VirtualList<'static, usize> {
     (0..count).fold(
-        VirtualList::new("benchmark").item(
-            usize::MAX,
-            0,
-            benchmark_item(usize::MAX, paint_revision),
-        ),
-        |list, index| list.item(index, 0, benchmark_item(index, paint_revision)),
+        VirtualList::new("benchmark")
+            .component(usize::MAX, benchmark_item(usize::MAX, paint_revision)),
+        |list, index| list.component(index, benchmark_item(index, paint_revision)),
     )
 }
 
@@ -330,7 +451,7 @@ fn build_reordered_list(count: usize, paint_revision: u64) -> VirtualList<'stati
     (0..count)
         .rev()
         .fold(VirtualList::new("benchmark"), |list, index| {
-            list.item(index, 0, benchmark_item(index, paint_revision))
+            list.component(index, benchmark_item(index, paint_revision))
         })
 }
 
