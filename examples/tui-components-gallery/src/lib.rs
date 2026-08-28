@@ -1,16 +1,20 @@
+use std::cell::Cell;
+
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Clear, Line, Span, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::widget::Widget;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
-use bmux_tui_components::badge::{Badge, BadgePolicy, BadgeSeverity};
+use bmux_tui_components::badge::{BadgeComponent, BadgePolicy, BadgeSeverity};
 use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement,
 };
-use bmux_tui_components::button::{Button, ButtonState};
+use bmux_tui_components::button::{ButtonComponent, ButtonState};
 use bmux_tui_components::canvas::{
     Canvas, CanvasBounds, CanvasCircle, CanvasLine, CanvasPoint, CanvasRect,
 };
@@ -82,14 +86,19 @@ pub fn render_gallery_interactive(frame: &mut Frame<'_>, focused: Option<&str>) 
 fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
     let mut focused = ButtonState::new();
     focused.interaction.focused = focused_id == Some("gallery.save");
-    Button::new("Save").render_with_id("gallery.save", Rect::new(1, 1, 10, 1), &focused, frame);
+    let focused = Cell::new(focused);
+    render_component(
+        &ButtonComponent::new("gallery.save", "Save", &focused),
+        Rect::new(1, 1, 10, 1),
+        frame,
+    );
 
     let mut disabled = ButtonState::new();
     disabled.interaction.disabled = true;
-    Button::new("Disabled").render_with_id(
-        "gallery.disabled",
+    let disabled = Cell::new(disabled);
+    render_component(
+        &ButtonComponent::new("gallery.disabled", "Disabled", &disabled),
         Rect::new(13, 1, 14, 1),
-        &disabled,
         frame,
     );
 
@@ -112,17 +121,40 @@ fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
     );
 }
 
+fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+    let mut layout_cx = LayoutCx::new();
+    let layout = component.layout(Constraints::tight(area.size()), &mut layout_cx);
+    let mut paint_cx = PaintCx::new(frame);
+    paint_cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 fn render_badges(frame: &mut Frame<'_>) {
-    Badge::new("info")
-        .severity(BadgeSeverity::Info)
-        .policy(BadgePolicy::pill().uppercase(true))
-        .render(Rect::new(1, 3, 10, 1), frame);
-    Badge::new("ok")
-        .severity(BadgeSeverity::Success)
-        .render(Rect::new(12, 3, 8, 1), frame);
-    Badge::new("warn")
-        .severity(BadgeSeverity::Warning)
-        .render(Rect::new(21, 3, 10, 1), frame);
+    render_badge_component(
+        BadgeComponent::new("gallery.badge.info", "info")
+            .severity(BadgeSeverity::Info)
+            .policy(BadgePolicy::pill().uppercase(true)),
+        Rect::new(1, 3, 10, 1),
+        frame,
+    );
+    render_badge_component(
+        BadgeComponent::new("gallery.badge.ok", "ok").severity(BadgeSeverity::Success),
+        Rect::new(12, 3, 8, 1),
+        frame,
+    );
+    render_badge_component(
+        BadgeComponent::new("gallery.badge.warn", "warn").severity(BadgeSeverity::Warning),
+        Rect::new(21, 3, 10, 1),
+        frame,
+    );
+}
+
+fn render_badge_component(component: BadgeComponent<'_>, area: Rect, frame: &mut Frame<'_>) {
+    render_component(&component, area, frame);
 }
 
 fn render_details(frame: &mut Frame<'_>) {
@@ -293,9 +325,12 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
     ])])];
     Table::new(&columns, &rows).render(Rect::new(41, 24, 10, 3), &TableState::new(Some(0)), frame);
 
-    Badge::new("truncated-style")
-        .severity(BadgeSeverity::Info)
-        .render(Rect::new(53, 24, 12, 1), frame);
+    render_badge_component(
+        BadgeComponent::new("gallery.badge.truncated", "truncated-style")
+            .severity(BadgeSeverity::Info),
+        Rect::new(53, 24, 12, 1),
+        frame,
+    );
 }
 
 fn render_toasts(frame: &mut Frame<'_>) {
@@ -473,6 +508,27 @@ mod tests {
                 .map(bmux_tui::hit::HitId::as_str),
             Some("gallery.save")
         );
+    }
+
+    #[test]
+    fn gallery_badges_publish_stable_canonical_semantics() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        let semantics = {
+            let mut frame = Frame::new(&mut buffer);
+            render_gallery_interactive(&mut frame, None);
+            frame.semantics().regions().to_vec()
+        };
+
+        for (id, area) in [
+            ("gallery.badge.info", Rect::new(1, 3, 10, 1)),
+            ("gallery.badge.ok", Rect::new(12, 3, 8, 1)),
+            ("gallery.badge.warn", Rect::new(21, 3, 10, 1)),
+            ("gallery.badge.truncated", Rect::new(53, 24, 12, 1)),
+        ] {
+            let region = semantics.iter().find(|region| region.id == id).unwrap();
+            assert_eq!(region.role, "status");
+            assert_eq!(region.area, area);
+        }
     }
 
     #[test]

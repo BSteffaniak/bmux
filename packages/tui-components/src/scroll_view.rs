@@ -140,8 +140,10 @@ impl Default for ScrollViewPolicy {
 pub enum ScrollViewOutcome {
     /// Event was ignored.
     Ignored,
-    /// Logical offset changed.
+    /// Logical vertical offset changed.
     Scrolled { vertical_offset: usize },
+    /// Logical horizontal offset changed.
+    HorizontalScrolled { horizontal_offset: usize },
 }
 
 /// Result of routing one event through nested vertical scroll views.
@@ -159,6 +161,7 @@ pub enum NestedScrollOutcome {
 pub struct ScrollViewComponent<'a> {
     id: LayoutId,
     viewport: LogicalSize,
+    content_width: u16,
     offset_x: usize,
     offset_y: usize,
     child: Element<'a>,
@@ -176,10 +179,17 @@ impl<'a> ScrollViewComponent<'a> {
         Self {
             id: id.into(),
             viewport,
+            content_width: viewport.width,
             offset_x: state.horizontal_offset(),
             offset_y: state.vertical_offset(),
             child: Element::new(child),
         }
+    }
+    /// Set the logical content width used to measure the child subtree.
+    #[must_use]
+    pub const fn content_width(mut self, width: u16) -> Self {
+        self.content_width = width;
+        self
     }
 }
 
@@ -191,7 +201,7 @@ impl Component for ScrollViewComponent<'_> {
     ) -> LayoutNode {
         let child = self
             .child
-            .layout(Constraints::for_width(self.viewport.width), cx);
+            .layout(Constraints::for_width(self.content_width), cx);
         let size = constraints.constrain(self.viewport);
         LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(0, 0, child)])
     }
@@ -388,6 +398,43 @@ impl ScrollView {
         layout.children.first().map_or(0, |child| {
             usize::from(child.node.size.width.saturating_sub(layout.size.width))
         })
+    }
+
+    /// Move horizontally by a signed logical-cell delta and clamp to layout.
+    pub fn scroll_horizontal_by(
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        delta: isize,
+    ) -> ScrollViewOutcome {
+        let maximum = Self::max_horizontal_offset(layout);
+        let old = state.horizontal_offset;
+        state.horizontal_offset = if delta < 0 {
+            old.saturating_sub(delta.unsigned_abs())
+        } else {
+            old.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
+                .min(maximum)
+        };
+        horizontal_outcome(old, state.horizontal_offset)
+    }
+
+    /// Ensure one horizontal logical range is visible with minimum movement.
+    pub fn ensure_horizontal_visible(
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        start: usize,
+        width: usize,
+    ) -> ScrollViewOutcome {
+        let old = state.horizontal_offset;
+        let viewport = usize::from(layout.size.width);
+        if start < old {
+            state.horizontal_offset = start;
+        } else if start.saturating_add(width) > old.saturating_add(viewport) {
+            state.horizontal_offset = start.saturating_add(width).saturating_sub(viewport);
+        }
+        state.horizontal_offset = state
+            .horizontal_offset
+            .min(Self::max_horizontal_offset(layout));
+        horizontal_outcome(old, state.horizontal_offset)
     }
 
     /// Reconcile state after content or viewport layout changes.
@@ -587,7 +634,8 @@ impl ScrollView {
             return ScrollViewOutcome::Ignored;
         }
         let maximum = Self::max_vertical_offset(layout);
-        let old = state.vertical_offset;
+        let old_vertical = state.vertical_offset;
+        let old_horizontal = state.horizontal_offset;
         match event {
             Event::Key(stroke) if self.policy.keyboard && state.interaction.focused => {
                 Self::handle_key(*stroke, layout.size.height, maximum, state);
@@ -612,7 +660,11 @@ impl ScrollView {
             _ => return ScrollViewOutcome::Ignored,
         }
         self.reconcile(layout, state);
-        outcome(old, state.vertical_offset)
+        if state.vertical_offset == old_vertical {
+            horizontal_outcome(old_horizontal, state.horizontal_offset)
+        } else {
+            outcome(old_vertical, state.vertical_offset)
+        }
     }
 
     fn handle_key(
@@ -622,6 +674,12 @@ impl ScrollView {
         state: &mut ScrollViewState,
     ) {
         match stroke.key {
+            KeyCode::Left => {
+                state.horizontal_offset = state.horizontal_offset.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                state.horizontal_offset = state.horizontal_offset.saturating_add(1);
+            }
             KeyCode::Up => {
                 state.vertical_offset = state.vertical_offset.saturating_sub(1);
                 state.follow_bottom = false;
@@ -729,6 +787,16 @@ const fn outcome(old: usize, current: usize) -> ScrollViewOutcome {
     }
 }
 
+const fn horizontal_outcome(old: usize, current: usize) -> ScrollViewOutcome {
+    if old == current {
+        ScrollViewOutcome::Ignored
+    } else {
+        ScrollViewOutcome::HorizontalScrolled {
+            horizontal_offset: current,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -773,6 +841,76 @@ mod tests {
                 EventOutcome::Ignored
             }
         }
+    }
+
+    #[test]
+    fn horizontal_navigation_and_visibility_share_canonical_offset() {
+        let child = LayoutNode::leaf("content".into(), LogicalSize::new(20, 1));
+        let layout = LayoutNode::with_children(
+            "viewport".into(),
+            LogicalSize::new(5, 1),
+            vec![ChildLayout::new(0, 0, child)],
+        );
+        let mut state = ScrollViewState::new();
+
+        assert_eq!(
+            ScrollView::scroll_horizontal_by(&layout, &mut state, 3),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 3
+            }
+        );
+        assert_eq!(
+            ScrollView::ensure_horizontal_visible(&layout, &mut state, 10, 2),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 7
+            }
+        );
+        assert_eq!(
+            ScrollView::ensure_horizontal_visible(&layout, &mut state, 2, 1),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 2
+            }
+        );
+        assert_eq!(
+            ScrollView::scroll_horizontal_by(&layout, &mut state, isize::MAX),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 15
+            }
+        );
+        assert_eq!(state.horizontal_offset(), 15);
+    }
+
+    #[test]
+    fn arbitrary_component_subtree_scrolls_horizontally() {
+        let mut state = ScrollViewState::new();
+        state.set_horizontal_offset(2);
+        let component = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 1),
+            state,
+            TextContent::new("abcdef"),
+        )
+        .content_width(6);
+        let mut layout_cx = LayoutCx::new();
+        let layout = component.layout(Constraints::tight(Size::new(4, 1)), &mut layout_cx);
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        let rendered = (0..4)
+            .map(|x| {
+                frame
+                    .buffer()
+                    .get(Point::new(x, 0))
+                    .unwrap()
+                    .symbol
+                    .as_str()
+            })
+            .collect::<String>();
+        assert_eq!(rendered, "cdef");
+        assert_eq!(layout.children[0].node.size.width, 6);
     }
 
     #[test]
@@ -1104,6 +1242,56 @@ mod tests {
         assert_eq!(
             view.ensure_layout_visible(&layout, &mut state, &LayoutId::new("missing")),
             ScrollViewOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn keyboard_horizontal_navigation_uses_canonical_offset() {
+        let view = ScrollView::new();
+        let layout = LayoutNode::with_children(
+            LayoutId::new("viewport"),
+            LogicalSize::new(5, 1),
+            vec![ChildLayout::new(
+                0,
+                0,
+                LayoutNode::leaf(LayoutId::new("content"), LogicalSize::new(8, 1)),
+            )],
+        );
+        let mut state = ScrollViewState::new();
+        state.interaction.focused = true;
+
+        assert_eq!(
+            view.handle_event(
+                Rect::new(0, 0, 5, 1),
+                &layout,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            ),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 1
+            }
+        );
+        state.set_horizontal_offset(3);
+        assert_eq!(
+            view.handle_event(
+                Rect::new(0, 0, 5, 1),
+                &layout,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            ),
+            ScrollViewOutcome::Ignored
+        );
+        assert_eq!(state.horizontal_offset(), 3);
+        assert_eq!(
+            view.handle_event(
+                Rect::new(0, 0, 5, 1),
+                &layout,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Left)),
+            ),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 2
+            }
         );
     }
 
