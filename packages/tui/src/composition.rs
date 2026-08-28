@@ -516,7 +516,7 @@ impl Component for Surface<'_> {
             self.background,
         );
         if let Some(border) = &self.border {
-            paint_border(layout.size.width, height, border, cx);
+            paint_border(layout.size.width, height, border, self.background, cx);
         }
         let Some(child_layout) = layout.children.first() else {
             return;
@@ -542,21 +542,23 @@ impl Component for Surface<'_> {
     }
 }
 
-fn paint_border(width: u16, height: u16, border: &Border, cx: &mut PaintCx<'_, '_>) {
+fn paint_border(
+    width: u16,
+    height: u16,
+    border: &Border,
+    background: Style,
+    cx: &mut PaintCx<'_, '_>,
+) {
     if width == 0 || height == 0 {
         return;
     }
+    let style = background.patch(border.style);
     let right = width.saturating_sub(1);
     let bottom = height.saturating_sub(1);
     let sides = border.sides;
     if sides.top {
         for x in 0..width {
-            cx.set_cell(
-                i32::from(x),
-                0,
-                &border.set.horizontal.to_string(),
-                border.style,
-            );
+            cx.set_cell(i32::from(x), 0, &border.set.horizontal.to_string(), style);
         }
     }
     if sides.bottom && bottom != 0 {
@@ -565,18 +567,13 @@ fn paint_border(width: u16, height: u16, border: &Border, cx: &mut PaintCx<'_, '
                 i32::from(x),
                 i64::from(bottom),
                 &border.set.horizontal.to_string(),
-                border.style,
+                style,
             );
         }
     }
     if sides.left {
         for y in 0..height {
-            cx.set_cell(
-                0,
-                i64::from(y),
-                &border.set.vertical.to_string(),
-                border.style,
-            );
+            cx.set_cell(0, i64::from(y), &border.set.vertical.to_string(), style);
         }
     }
     if sides.right && right != 0 {
@@ -585,20 +582,20 @@ fn paint_border(width: u16, height: u16, border: &Border, cx: &mut PaintCx<'_, '
                 i32::from(right),
                 i64::from(y),
                 &border.set.vertical.to_string(),
-                border.style,
+                style,
             );
         }
     }
     if width > 1 && height > 1 {
         if sides.top && sides.left {
-            cx.set_cell(0, 0, &border.set.top_left.to_string(), border.style);
+            cx.set_cell(0, 0, &border.set.top_left.to_string(), style);
         }
         if sides.top && sides.right {
             cx.set_cell(
                 i32::from(right),
                 0,
                 &border.set.top_right.to_string(),
-                border.style,
+                style,
             );
         }
         if sides.bottom && sides.left {
@@ -606,7 +603,7 @@ fn paint_border(width: u16, height: u16, border: &Border, cx: &mut PaintCx<'_, '
                 0,
                 i64::from(bottom),
                 &border.set.bottom_left.to_string(),
-                border.style,
+                style,
             );
         }
         if sides.bottom && sides.right {
@@ -614,7 +611,7 @@ fn paint_border(width: u16, height: u16, border: &Border, cx: &mut PaintCx<'_, '
                 i32::from(right),
                 i64::from(bottom),
                 &border.set.bottom_right.to_string(),
-                border.style,
+                style,
             );
         }
     }
@@ -1802,6 +1799,7 @@ mod tests {
         SizeBox, Stack, StyleScope, Surface, TextContent, VerticalAlignment, Visibility,
     };
     use crate::buffer::Buffer;
+    use crate::chrome::Border;
     use crate::component::{
         Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
         LogicalSize,
@@ -1836,6 +1834,57 @@ mod tests {
             } else {
                 EventOutcome::Ignored
             }
+        }
+    }
+
+    #[test]
+    fn full_width_message_card_composes_without_precomputed_height() {
+        let card = Surface::new(
+            Column::new()
+                .gap(1)
+                .child(
+                    Row::new()
+                        .gap(1)
+                        .child(TextContent::new("Alice"))
+                        .flex_child(1, TextContent::new("10:42")),
+                )
+                .child(TextContent::new(
+                    "A long message wraps naturally from constraints without a caller-owned height.",
+                )),
+        )
+        .id("message-card")
+        .background(Style::new().bg(Color::Blue))
+        .border(Border::single())
+        .padding(Insets::all(1));
+        let mut cx = LayoutCx::new();
+        let layout = card.layout(Constraints::for_width(24), &mut cx);
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width,
+            u16::try_from(layout.size.height).unwrap(),
+        );
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+
+        card.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        assert_eq!(layout.size.width, 24);
+        assert!(layout.size.height > 5);
+        for y in 0..area.height {
+            assert_eq!(
+                frame.buffer().get(Point::new(0, y)).unwrap().style.bg,
+                Some(Color::Blue)
+            );
+            assert_eq!(
+                frame
+                    .buffer()
+                    .get(Point::new(area.width - 1, y))
+                    .unwrap()
+                    .style
+                    .bg,
+                Some(Color::Blue)
+            );
         }
     }
 
