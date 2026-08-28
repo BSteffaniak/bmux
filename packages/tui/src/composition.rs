@@ -21,6 +21,53 @@ fn stable_revision(hash: impl FnOnce(&mut std::collections::hash_map::DefaultHas
     state.finish()
 }
 
+fn event_single_child(
+    child: &Element<'_>,
+    event: &crate::event::Event,
+    layout: &LayoutNode,
+    cx: &mut crate::component::EventCx<'_>,
+) -> crate::event::EventOutcome {
+    layout
+        .children
+        .first()
+        .map_or(crate::event::EventOutcome::Ignored, |resolved| {
+            let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
+            cx.with_transform(
+                resolved.x,
+                resolved.y,
+                i32::from(resolved.x),
+                i64::try_from(resolved.y).unwrap_or(i64::MAX),
+                Rect::new(0, 0, resolved.node.size.width, height),
+                |cx| child.event(event, &resolved.node, cx),
+            )
+        })
+}
+
+fn event_children(
+    children: &[Element<'_>],
+    event: &crate::event::Event,
+    layout: &LayoutNode,
+    cx: &mut crate::component::EventCx<'_>,
+) -> crate::event::EventOutcome {
+    children
+        .iter()
+        .rev()
+        .zip(layout.children.iter().rev())
+        .find_map(|(child, resolved)| {
+            let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
+            let outcome = cx.with_transform(
+                resolved.x,
+                resolved.y,
+                i32::from(resolved.x),
+                i64::try_from(resolved.y).unwrap_or(i64::MAX),
+                Rect::new(0, 0, resolved.node.size.width, height),
+                |cx| child.event(event, &resolved.node, cx),
+            );
+            outcome.is_handled().then_some(outcome)
+        })
+        .unwrap_or(crate::event::EventOutcome::Ignored)
+}
+
 fn hash_insets(insets: Insets, state: &mut impl Hasher) {
     insets.top.hash(state);
     insets.right.hash(state);
@@ -94,6 +141,7 @@ pub struct TextContent {
     style: Style,
     alignment: Alignment,
     wrap: TextWrap,
+    trim: bool,
 }
 
 impl TextContent {
@@ -106,6 +154,7 @@ impl TextContent {
             style: Style::new(),
             alignment: Alignment::Left,
             wrap: TextWrap::Word,
+            trim: false,
         }
     }
 
@@ -137,33 +186,51 @@ impl TextContent {
         self
     }
 
+    /// Set whether trailing whitespace is removed from each projected row.
+    #[must_use]
+    pub const fn trim(mut self, trim: bool) -> Self {
+        self.trim = trim;
+        self
+    }
+
+    /// Return this component's canonical rich text.
+    #[must_use]
+    pub const fn text(&self) -> &Text {
+        &self.text
+    }
+
     fn own_revision(&self) -> ComponentRevision {
-        ComponentRevision::new(
-            stable_revision(|state| {
-                self.id.as_str().hash(state);
-                self.text.lines.len().hash(state);
-                for line in &self.text.lines {
-                    for span in &line.spans {
-                        span.content.hash(state);
-                        span.style.hash(state);
-                    }
+        let layout = stable_revision(|state| {
+            self.id.as_str().hash(state);
+            self.text.lines.len().hash(state);
+            for line in &self.text.lines {
+                for span in &line.spans {
+                    span.content.hash(state);
                 }
-                self.style.hash(state);
-                (match self.alignment {
-                    Alignment::Left => 0u8,
-                    Alignment::Center => 1,
-                    Alignment::Right => 2,
-                })
-                .hash(state);
-                (match self.wrap {
-                    TextWrap::None => 0u8,
-                    TextWrap::Character => 1,
-                    TextWrap::Word => 2,
-                })
-                .hash(state);
-            }),
-            0,
-        )
+            }
+            (match self.wrap {
+                TextWrap::None => 0u8,
+                TextWrap::Character => 1,
+                TextWrap::Word => 2,
+            })
+            .hash(state);
+            self.trim.hash(state);
+        });
+        let paint = stable_revision(|state| {
+            self.style.hash(state);
+            for line in &self.text.lines {
+                for span in &line.spans {
+                    span.style.hash(state);
+                }
+            }
+            (match self.alignment {
+                Alignment::Left => 0u8,
+                Alignment::Center => 1,
+                Alignment::Right => 2,
+            })
+            .hash(state);
+        });
+        ComponentRevision::new(layout, paint)
     }
 
     /// Project wrapped rows back to UTF-8 byte ranges in the logical text.
@@ -179,6 +246,11 @@ impl TextContent {
             let source = line.plain_text();
             let mut search_start = 0usize;
             for rendered in line.wrap(TextWrapGeometry::uniform(width), self.wrap) {
+                let rendered = if self.trim {
+                    trim_line_end(&rendered)
+                } else {
+                    rendered
+                };
                 let text = rendered.plain_text();
                 let relative = if text.is_empty() {
                     search_start
@@ -255,6 +327,22 @@ impl TextContent {
             .map(|row| row.line)
             .collect()
     }
+}
+
+fn trim_line_end(line: &Line) -> Line {
+    let mut spans = line.spans.clone();
+    while let Some(last) = spans.last_mut() {
+        let trimmed_len = last.content.trim_end().len();
+        if trimmed_len == last.content.len() {
+            break;
+        }
+        last.content.truncate(trimmed_len);
+        if !last.content.is_empty() {
+            break;
+        }
+        spans.pop();
+    }
+    Line::from_spans(spans)
 }
 
 impl Component for TextContent {
@@ -443,6 +531,15 @@ impl Component for Surface<'_> {
             );
         });
     }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_single_child(&self.child, event, layout, cx)
+    }
 }
 
 fn paint_border(width: u16, height: u16, border: &Border, cx: &mut PaintCx<'_, '_>) {
@@ -604,6 +701,32 @@ impl Component for ScrollViewport<'_> {
             ),
             |cx| self.child.paint(&child.node, cx),
         );
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        let Some(child) = layout.children.first() else {
+            return crate::event::EventOutcome::Ignored;
+        };
+        let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let offset = self.vertical_offset.min(Self::max_vertical_offset(layout));
+        cx.with_transform(
+            0,
+            0,
+            0,
+            -i64::try_from(offset).unwrap_or(i64::MAX),
+            Rect::new(
+                0,
+                u16::try_from(offset).unwrap_or(u16::MAX),
+                layout.size.width,
+                viewport_height,
+            ),
+            |cx| self.child.event(event, &child.node, cx),
+        )
     }
 }
 
@@ -890,6 +1013,15 @@ impl Component for SizeBox<'_> {
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         paint_single_child(&self.child, layout, cx);
     }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_single_child(&self.child, event, layout, cx)
+    }
 }
 
 /// Align one intrinsically measured child inside the parent-assigned rectangle.
@@ -998,6 +1130,15 @@ impl Component for Align<'_> {
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         paint_single_child(&self.child, layout, cx);
     }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_single_child(&self.child, event, layout, cx)
+    }
 }
 
 /// Paint one child through an explicit local clip.
@@ -1042,6 +1183,15 @@ impl Component for Clip<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         paint_single_child(&self.child, layout, cx);
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_single_child(&self.child, event, layout, cx)
     }
 }
 
@@ -1092,6 +1242,15 @@ impl Component for StyleScope<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         cx.with_style(self.style, |cx| paint_single_child(&self.child, layout, cx));
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_single_child(&self.child, event, layout, cx)
     }
 }
 
@@ -1152,6 +1311,19 @@ impl Component for Visibility<'_> {
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         if self.visible {
             paint_single_child(&self.child, layout, cx);
+        }
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        if self.visible {
+            event_single_child(&self.child, event, layout, cx)
+        } else {
+            crate::event::EventOutcome::Ignored
         }
     }
 }
@@ -1226,6 +1398,15 @@ impl Component for Stack<'_> {
         for (child, resolved) in self.children.iter().zip(&layout.children) {
             paint_child(child, resolved, cx);
         }
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_children(&self.children, event, layout, cx)
     }
 }
 
@@ -1459,6 +1640,31 @@ impl Component for Row<'_> {
             );
         }
     }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        self.children
+            .iter()
+            .rev()
+            .zip(layout.children.iter().rev())
+            .find_map(|(child, resolved)| {
+                let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
+                let outcome = cx.with_transform(
+                    resolved.x,
+                    resolved.y,
+                    i32::from(resolved.x),
+                    i64::try_from(resolved.y).unwrap_or(i64::MAX),
+                    Rect::new(0, 0, resolved.node.size.width, height),
+                    |cx| child.component.event(event, &resolved.node, cx),
+                );
+                outcome.is_handled().then_some(outcome)
+            })
+            .unwrap_or(crate::event::EventOutcome::Ignored)
+    }
 }
 
 /// Vertical composition of variable-height children.
@@ -1578,6 +1784,15 @@ impl Component for Column<'_> {
             );
         }
     }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        event_children(&self.children, event, layout, cx)
+    }
 }
 
 #[cfg(test)]
@@ -1587,11 +1802,108 @@ mod tests {
         SizeBox, Stack, StyleScope, Surface, TextContent, VerticalAlignment, Visibility,
     };
     use crate::buffer::Buffer;
-    use crate::component::{Component, ComponentRevision, Constraints, LayoutCx, LayoutNode};
+    use crate::component::{
+        Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
+        LogicalSize,
+    };
+    use crate::event::{Event, EventOutcome};
     use crate::frame::Frame;
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+
+    struct EventLeaf {
+        id: &'static str,
+        outcome: EventOutcome,
+    }
+
+    impl Component for EventLeaf {
+        fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+            cx.record_measurement();
+            LayoutNode::leaf(
+                LayoutId::new(self.id),
+                constraints.constrain(LogicalSize::new(1, 1)),
+            )
+        }
+
+        fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+            if matches!(event, Event::User(value) if value == self.id)
+                && cx.find(&layout.id).is_some()
+            {
+                self.outcome
+            } else {
+                EventOutcome::Ignored
+            }
+        }
+    }
+
+    #[test]
+    fn nested_composition_routes_events_through_authoritative_layout() {
+        let component = Surface::new(
+            Padding::new(
+                Insets::all(1),
+                Column::new().child(StyleScope::new(
+                    Keyed::new(
+                        "action-key",
+                        EventLeaf {
+                            id: "action",
+                            outcome: EventOutcome::Redraw,
+                        },
+                    ),
+                    Style::new().fg(Color::Green),
+                )),
+            )
+            .id("padding"),
+        )
+        .id("surface");
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut event_cx = EventCx::new(&layout);
+
+        assert_eq!(
+            component.event(&Event::User("action".into()), &layout, &mut event_cx),
+            EventOutcome::Redraw
+        );
+    }
+
+    #[test]
+    fn overlay_event_routing_prefers_topmost_handled_child() {
+        let component = Stack::new()
+            .child(EventLeaf {
+                id: "action",
+                outcome: EventOutcome::Handled,
+            })
+            .child(EventLeaf {
+                id: "action",
+                outcome: EventOutcome::Redraw,
+            });
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut event_cx = EventCx::new(&layout);
+
+        assert_eq!(
+            component.event(&Event::User("action".into()), &layout, &mut event_cx),
+            EventOutcome::Redraw
+        );
+    }
+
+    #[test]
+    fn hidden_children_do_not_receive_events() {
+        let component = Visibility::new(
+            EventLeaf {
+                id: "action",
+                outcome: EventOutcome::Handled,
+            },
+            false,
+        );
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut event_cx = EventCx::new(&layout);
+
+        assert_eq!(
+            component.event(&Event::User("action".into()), &layout, &mut event_cx),
+            EventOutcome::Ignored
+        );
+    }
 
     #[test]
     fn text_selection_uses_authoritative_projection_and_alignment() {
@@ -1614,6 +1926,58 @@ mod tests {
         assert_eq!(fragments[4].area, Rect::new(3, 1, 1, 1));
         assert_eq!(fragments[4].source_range, 4..5);
         assert!(fragments.iter().all(|fragment| fragment.revision == 3));
+    }
+
+    #[test]
+    fn wrapped_utf8_selection_survives_nested_scroll_clipping() {
+        let component = TextContent::new("aé🙂b");
+        let layout = component.layout(Constraints::for_width(2), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(4, 7, 2, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        paint.with_child(4, 6, crate::paint::LocalRect::new(0, 1, 2, 1), |cx| {
+            component.register_selection(&layout, cx, "messages", "message:1", 10, 3);
+        });
+
+        let fragments = frame.selection().fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].scope_id.as_str(), "messages");
+        assert_eq!(fragments[0].content_id.as_str(), "message:1");
+        assert_eq!(fragments[0].area, Rect::new(4, 7, 2, 1));
+        assert_eq!(fragments[0].source_range, 3..7);
+        assert_eq!(fragments[0].revision, 3);
+    }
+
+    #[test]
+    fn text_trim_preserves_styles_and_projects_trimmed_source_ranges() {
+        let component = TextContent::new(crate::text::Text::from_lines(vec![
+            crate::text::Line::from_spans(vec![
+                crate::text::Span::styled("ab", Style::new().fg(Color::Green)),
+                crate::text::Span::styled("  ", Style::new().fg(Color::Blue)),
+            ]),
+            crate::text::Line::raw("cd  ef"),
+        ]))
+        .wrap(crate::text::TextWrap::Character)
+        .trim(true);
+        let rows = component.projection(4);
+
+        assert_eq!(
+            component
+                .text()
+                .lines
+                .iter()
+                .map(crate::text::Line::plain_text)
+                .collect::<Vec<_>>(),
+            ["ab  ", "cd  ef"]
+        );
+        assert_eq!(rows[0].line.plain_text(), "ab");
+        assert_eq!(rows[0].line.spans.len(), 1);
+        assert_eq!(rows[0].line.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(rows[0].source_range, 0..2);
+        assert_eq!(rows[1].line.plain_text(), "cd");
+        assert_eq!(rows[1].source_range, 5..7);
+        assert_eq!(rows[2].line.plain_text(), "ef");
+        assert_eq!(rows[2].source_range, 9..11);
     }
 
     #[test]
@@ -1835,6 +2199,18 @@ mod tests {
         let text_a = TextContent::new("a");
         let text_b = TextContent::new("b");
         assert_ne!(text_a.revision().layout, text_b.revision().layout);
+
+        let text_plain = TextContent::new("same");
+        let text_painted = TextContent::new(crate::text::Text::from_lines(vec![
+            crate::text::Line::from_spans(vec![crate::text::Span::styled(
+                "same",
+                Style::new().fg(Color::Blue),
+            )]),
+        ]))
+        .style(Style::new().bg(Color::Blue))
+        .alignment(crate::text_block::Alignment::Right);
+        assert_eq!(text_plain.revision().layout, text_painted.revision().layout);
+        assert_ne!(text_plain.revision().paint, text_painted.revision().paint);
 
         let plain = Surface::new(TextContent::new("x"));
         let painted = Surface::new(TextContent::new("x")).background(Style::new().bg(Color::Blue));

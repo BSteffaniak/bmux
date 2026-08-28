@@ -375,6 +375,7 @@ mod tests {
     use crate::hit::HitRegion;
     use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::selection::{SelectionFragment, SelectionScope};
+    use crate::semantic::SemanticRegion;
     use crate::style::Style;
     use std::io::{self, Write};
 
@@ -664,6 +665,15 @@ mod tests {
             .draw(|frame| {
                 frame.fill(frame.area(), "A", Style::new());
                 frame.push_hit(HitRegion::new("committed", frame.area()));
+                frame.push_selection_scope(SelectionScope::new("committed", frame.area()));
+                frame.push_selection_fragment(SelectionFragment::new(
+                    "committed",
+                    "committed-content",
+                    frame.area(),
+                    0,
+                    0..1,
+                ));
+                frame.push_semantic(SemanticRegion::new("committed", frame.area(), "content"));
                 frame.set_cursor(Cursor::visible(Point::new(1, 0)));
             })
             .unwrap();
@@ -672,11 +682,27 @@ mod tests {
         let result = terminal.draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |frame| {
             frame.fill(frame.area(), "B", Style::new());
             frame.push_hit(HitRegion::new("uncommitted", frame.area()));
+            frame.push_selection_scope(SelectionScope::new("uncommitted", frame.area()));
+            frame.push_selection_fragment(SelectionFragment::new(
+                "uncommitted",
+                "uncommitted-content",
+                frame.area(),
+                0,
+                0..1,
+            ));
+            frame.push_semantic(SemanticRegion::new("uncommitted", frame.area(), "content"));
             frame.set_cursor(Cursor::hidden(Point::new(0, 0)));
         });
 
         assert!(result.is_err());
         assert_eq!(terminal.hits().regions()[0].id.as_str(), "committed");
+        assert_eq!(terminal.selection().scopes()[0].id.as_str(), "committed");
+        assert_eq!(
+            terminal.selection().fragments()[0].content_id.as_str(),
+            "committed-content"
+        );
+        assert_eq!(terminal.semantics().regions()[0].id.as_str(), "committed");
+        assert_eq!(terminal.cursor(), Some(Cursor::visible(Point::new(1, 0))));
         terminal.writer_mut().fail = false;
         let recovered = terminal.draw(|frame| frame.fill(frame.area(), "C", Style::new()));
         assert!(recovered.expect("full recovery draw succeeds").full_repaint);
@@ -688,6 +714,18 @@ mod tests {
             frame.fill(frame.area(), "A", Style::new());
             frame.push_hit(HitRegion::new("left", Rect::new(0, 0, 2, 1)));
             frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 1)));
+            frame.push_selection_scope(SelectionScope::new("left-scope", Rect::new(0, 0, 2, 1)));
+            frame.push_selection_scope(SelectionScope::new("right-scope", Rect::new(2, 0, 2, 1)));
+            frame.push_semantic(SemanticRegion::new(
+                "left-semantic",
+                Rect::new(0, 0, 2, 1),
+                "content",
+            ));
+            frame.push_semantic(SemanticRegion::new(
+                "right-semantic",
+                Rect::new(2, 0, 2, 1),
+                "content",
+            ));
             frame.set_cursor(Cursor::visible(Point::new(3, 0)));
         }
         fn second(frame: &mut crate::frame::Frame<'_>) {
@@ -695,6 +733,20 @@ mod tests {
             frame.fill(Rect::new(2, 0, 2, 1), "A", Style::new());
             frame.push_hit(HitRegion::new("new-left", Rect::new(0, 0, 2, 1)));
             frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 1)));
+            frame.push_selection_scope(
+                SelectionScope::new("left-scope", Rect::new(0, 0, 2, 1)).revision(1),
+            );
+            frame.push_selection_scope(SelectionScope::new("right-scope", Rect::new(2, 0, 2, 1)));
+            frame.push_semantic(SemanticRegion::new(
+                "left-semantic",
+                Rect::new(0, 0, 2, 1),
+                "new-content",
+            ));
+            frame.push_semantic(SemanticRegion::new(
+                "right-semantic",
+                Rect::new(2, 0, 2, 1),
+                "content",
+            ));
             frame.set_cursor(Cursor::visible(Point::new(3, 0)));
         }
 
@@ -722,6 +774,21 @@ mod tests {
             );
         }
         assert_eq!(partial.cursor(), complete.cursor());
+        assert_eq!(partial.selection(), complete.selection());
+        assert_eq!(
+            partial.semantics().regions().len(),
+            complete.semantics().regions().len()
+        );
+        for expected in complete.semantics().regions() {
+            assert_eq!(
+                partial
+                    .semantics()
+                    .regions()
+                    .iter()
+                    .find(|region| region.id == expected.id),
+                Some(expected)
+            );
+        }
         assert_eq!(partial.image_scene(), complete.image_scene());
     }
 

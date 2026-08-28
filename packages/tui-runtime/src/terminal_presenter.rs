@@ -151,8 +151,10 @@ mod tests {
     use std::io::{self, Write};
     use std::rc::Rc;
 
-    use bmux_tui::geometry::Rect;
-    use bmux_tui::hit::HitRegion;
+    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::{HitId, HitRegion};
+    use bmux_tui::interaction::InteractionRouter;
 
     use super::TerminalPresenter;
     use crate::presenter::Presenter;
@@ -187,6 +189,8 @@ mod tests {
         );
         let committed = Rc::new(RefCell::new(Vec::new()));
         let observed = Rc::clone(&committed);
+        let router = Rc::new(RefCell::new(InteractionRouter::new()));
+        let committed_router = Rc::clone(&router);
         let mut presenter = TerminalPresenter::with_commit(
             terminal,
             |program: &mut &'static str, frame: &mut bmux_tui::frame::Frame<'_>| {
@@ -198,6 +202,9 @@ mod tests {
                 observed
                     .borrow_mut()
                     .push(hits.regions()[0].id.as_str().to_owned());
+                committed_router
+                    .borrow_mut()
+                    .commit_scene(hits.clone(), None);
             },
         );
         let mut program = "committed";
@@ -209,6 +216,12 @@ mod tests {
         program = "speculative";
         assert!(presenter.present(&mut program).is_err());
         assert_eq!(committed.borrow().as_slice(), ["committed"]);
+        let route = router.borrow_mut().route(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(0, 0),
+        )));
+        assert!(route.targets(&HitId::new("committed")));
+        assert!(!route.targets(&HitId::new("speculative")));
         assert_eq!(
             presenter.interactions().regions()[0].id.as_str(),
             "committed"

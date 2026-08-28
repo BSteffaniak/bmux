@@ -426,13 +426,38 @@ impl LayoutCx {
 /// resolved layout.
 pub struct EventCx<'a> {
     root: &'a LayoutNode,
+    translation_x: i32,
+    translation_y: i64,
+    logical_x: u16,
+    logical_y: usize,
+    clip: Option<Rect>,
 }
 
 impl<'a> EventCx<'a> {
     /// Create an event context from the exact resolved tree used for painting.
     #[must_use]
     pub const fn new(root: &'a LayoutNode) -> Self {
-        Self { root }
+        Self {
+            root,
+            translation_x: 0,
+            translation_y: 0,
+            logical_x: 0,
+            logical_y: 0,
+            clip: None,
+        }
+    }
+
+    /// Create an event context with a terminal-space clip for one presented tree.
+    #[must_use]
+    pub const fn with_clip(root: &'a LayoutNode, clip: Rect) -> Self {
+        Self {
+            root,
+            translation_x: 0,
+            translation_y: 0,
+            logical_x: 0,
+            logical_y: 0,
+            clip: Some(clip),
+        }
     }
 
     /// Complete authoritative tree for this event pass.
@@ -453,11 +478,94 @@ impl<'a> EventCx<'a> {
         self.root.find_logical_rect(id)
     }
 
+    /// Current terminal-space clip, when event routing is viewport-scoped.
+    #[must_use]
+    pub const fn clip(&self) -> Option<Rect> {
+        self.clip
+    }
+
+    /// Route a transformed child event with a terminal-space clip.
+    pub fn with_transform<R>(
+        &mut self,
+        logical_x: u16,
+        logical_y: usize,
+        dx: i32,
+        dy: i64,
+        clip: Rect,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let old_x = self.translation_x;
+        let old_y = self.translation_y;
+        let old_logical_x = self.logical_x;
+        let old_logical_y = self.logical_y;
+        let old_clip = self.clip;
+        self.translation_x = self.translation_x.saturating_add(dx);
+        self.translation_y = self.translation_y.saturating_add(dy);
+        self.logical_x = self.logical_x.saturating_add(logical_x);
+        self.logical_y = self.logical_y.saturating_add(logical_y);
+        self.clip = Some(old_clip.map_or(clip, |parent| parent.intersection(clip)));
+        let result = f(self);
+        self.translation_x = old_x;
+        self.translation_y = old_y;
+        self.logical_x = old_logical_x;
+        self.logical_y = old_logical_y;
+        self.clip = old_clip;
+        result
+    }
+
+    /// Route against a separately retained subtree while preserving the current
+    /// terminal transform and clip. The subtree becomes the geometry root for
+    /// the duration of the callback.
+    pub fn with_root<R>(&mut self, root: &LayoutNode, f: impl FnOnce(&mut EventCx<'_>) -> R) -> R {
+        let mut nested = EventCx {
+            root,
+            translation_x: self.translation_x,
+            translation_y: self.translation_y,
+            logical_x: 0,
+            logical_y: 0,
+            clip: self.clip,
+        };
+        f(&mut nested)
+    }
+
+    /// Look up translated, clipped terminal geometry by stable identity.
+    #[must_use]
+    pub fn find_visible_rect(&self, id: &LayoutId) -> Option<Rect> {
+        let logical = self.find_logical_rect(id)?;
+        let local = LogicalRect::new(
+            logical.x.saturating_sub(self.logical_x),
+            logical.y.saturating_sub(self.logical_y),
+            logical.width,
+            logical.height,
+        );
+        let rect = translate_logical_rect(local, self.translation_x, self.translation_y);
+        Some(self.clip.map_or(rect, |clip| clip.intersection(rect)))
+    }
+
     /// Look up root-relative terminal geometry by stable identity.
     #[must_use]
     pub fn find_rect(&self, id: &LayoutId) -> Option<Rect> {
-        self.root.find_rect(id)
+        self.find_visible_rect(id)
     }
+}
+
+fn translate_logical_rect(rect: LogicalRect, dx: i32, dy: i64) -> Rect {
+    let x = i64::from(rect.x).saturating_add(i64::from(dx));
+    let y = i64::try_from(rect.y).unwrap_or(i64::MAX).saturating_add(dy);
+    let left = x.clamp(0, i64::from(u16::MAX));
+    let top = y.clamp(0, i64::from(u16::MAX));
+    let right = x
+        .saturating_add(i64::from(rect.width))
+        .clamp(0, i64::from(u16::MAX));
+    let bottom = y
+        .saturating_add(i64::try_from(rect.height).unwrap_or(i64::MAX))
+        .clamp(0, i64::from(u16::MAX));
+    Rect::new(
+        u16::try_from(left).unwrap_or(0),
+        u16::try_from(top).unwrap_or(0),
+        u16::try_from(right.saturating_sub(left)).unwrap_or(u16::MAX),
+        u16::try_from(bottom.saturating_sub(top)).unwrap_or(u16::MAX),
+    )
 }
 
 /// A measurable, paintable, and event-participating terminal component.
@@ -778,7 +886,7 @@ mod tests {
         LayoutCx, LayoutEnvironment, LayoutId, LayoutNode, LogicalSize,
     };
     use crate::event::Event;
-    use crate::geometry::Size;
+    use crate::geometry::{Rect, Size};
     use crate::paint::PaintCx;
 
     #[test]
@@ -804,10 +912,7 @@ mod tests {
                 cx: &mut EventCx<'_>,
             ) -> EventOutcome {
                 if matches!(event, Event::User(value) if value == "activate")
-                    && layout.id.as_str() == "interactive"
-                    && cx
-                        .find(&LayoutId::new("interactive"))
-                        .is_some_and(|node| node.metadata.semantics == ["button"])
+                    && cx.find_visible_rect(&layout.id) == Some(Rect::new(4, 3, 1, 1))
                 {
                     EventOutcome::Handled
                 } else {
@@ -820,12 +925,34 @@ mod tests {
         let mut layout_cx = LayoutCx::new();
         let layout = component.layout(Constraints::for_width(1), &mut layout_cx);
         let measured = layout_cx.measured_nodes();
-        let mut event_cx = EventCx::new(&layout);
-        let outcome = component.event(&Event::User("activate".to_owned()), &layout, &mut event_cx);
+        let mut event_cx = EventCx::with_clip(&layout, Rect::new(0, 0, 10, 10));
+        let outcome = event_cx.with_transform(0, 0, 4, 3, Rect::new(0, 0, 10, 10), |cx| {
+            component.event(&Event::User("activate".to_owned()), &layout, cx)
+        });
 
         assert_eq!(outcome, EventOutcome::Handled);
         assert!(outcome.is_handled());
         assert_eq!(layout_cx.measured_nodes(), measured);
+    }
+
+    #[test]
+    fn event_context_clips_translated_logical_geometry() {
+        let child = LayoutNode::leaf(LayoutId::new("child"), LogicalSize::new(4, 3));
+        let root = LayoutNode::with_children(
+            LayoutId::new("root"),
+            LogicalSize::new(8, 6),
+            vec![super::ChildLayout::new(2, 4, child)],
+        );
+        let mut cx = EventCx::with_clip(&root, Rect::new(0, 0, 8, 2));
+        let visible = cx.with_transform(2, 4, 2, 1, Rect::new(0, 0, 8, 2), |cx| {
+            cx.find_visible_rect(&LayoutId::new("child"))
+        });
+
+        assert_eq!(visible, Some(Rect::new(2, 1, 4, 1)));
+        assert_eq!(
+            cx.find_rect(&LayoutId::new("child")),
+            Some(Rect::new(2, 4, 4, 0))
+        );
     }
 
     #[test]

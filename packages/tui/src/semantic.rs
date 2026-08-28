@@ -67,7 +67,17 @@ impl SemanticScene {
     pub fn merge_regions(&self, replacement: &Self, replaced: &[Rect]) -> Self {
         let mut merged = self.clone();
         merged.retain_outside(replaced);
-        merged.regions.extend(replacement.regions.iter().cloned());
+        merged.regions.extend(
+            replacement
+                .regions
+                .iter()
+                .filter(|region| {
+                    replaced
+                        .iter()
+                        .any(|area| !region.area.intersection(*area).is_empty())
+                })
+                .cloned(),
+        );
         merged
     }
 }

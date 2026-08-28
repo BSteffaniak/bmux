@@ -1,14 +1,17 @@
 //! Interactive state and policy for arbitrary measured scroll content.
 
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::component::{LayoutId, LayoutNode};
-use bmux_tui::event::{Event, MouseEventKind};
+use bmux_tui::component::{
+    ChildLayout, Component, Constraints, Element, EventCx, LayoutId, LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
-use bmux_tui::paint::PaintCx;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::selection::{
     SelectionAutoScrollRequest, SelectionScrollAxis, SelectionScrollDirection,
 };
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Style};
 
 use crate::common::InteractionState;
@@ -43,6 +46,7 @@ pub struct ScrollViewState {
     /// Common enabled and focus state.
     pub interaction: InteractionState,
     vertical_offset: usize,
+    horizontal_offset: usize,
     follow_bottom: bool,
 }
 
@@ -53,6 +57,7 @@ impl ScrollViewState {
         Self {
             interaction: InteractionState::new(),
             vertical_offset: 0,
+            horizontal_offset: 0,
             follow_bottom: false,
         }
     }
@@ -67,6 +72,17 @@ impl ScrollViewState {
     pub const fn set_vertical_offset(&mut self, offset: usize) {
         self.vertical_offset = offset;
         self.follow_bottom = false;
+    }
+
+    /// Current logical horizontal offset.
+    #[must_use]
+    pub const fn horizontal_offset(self) -> usize {
+        self.horizontal_offset
+    }
+
+    /// Set a logical horizontal offset before clamping against layout.
+    pub const fn set_horizontal_offset(&mut self, offset: usize) {
+        self.horizontal_offset = offset;
     }
 
     /// Select whether layout changes remain anchored at the bottom.
@@ -137,6 +153,88 @@ pub enum NestedScrollOutcome {
     Inner(ScrollViewOutcome),
     /// The enclosing viewport consumed an event handed off at the inner edge.
     Outer(ScrollViewOutcome),
+}
+
+/// A generic scroll viewport over one arbitrary component subtree.
+pub struct ScrollViewComponent<'a> {
+    id: LayoutId,
+    viewport: LogicalSize,
+    offset_x: usize,
+    offset_y: usize,
+    child: Element<'a>,
+}
+
+impl<'a> ScrollViewComponent<'a> {
+    /// Create a viewport with caller-owned logical offsets.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        viewport: LogicalSize,
+        state: ScrollViewState,
+        child: impl Component + 'a,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            viewport,
+            offset_x: state.horizontal_offset(),
+            offset_y: state.vertical_offset(),
+            child: Element::new(child),
+        }
+    }
+}
+
+impl Component for ScrollViewComponent<'_> {
+    fn layout(
+        &self,
+        constraints: Constraints,
+        cx: &mut bmux_tui::component::LayoutCx,
+    ) -> LayoutNode {
+        let child = self
+            .child
+            .layout(Constraints::for_width(self.viewport.width), cx);
+        let size = constraints.constrain(self.viewport);
+        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(0, 0, child)])
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let Some(child) = layout.children.first() else {
+            return;
+        };
+        let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        cx.with_child(
+            -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
+            -i64::try_from(self.offset_y).unwrap_or(i64::MAX),
+            LocalRect::new(
+                i32::try_from(self.offset_x).unwrap_or(i32::MAX),
+                i64::try_from(self.offset_y).unwrap_or(i64::MAX),
+                layout.size.width,
+                viewport_height,
+            ),
+            |cx| self.child.paint(&child.node, cx),
+        );
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(child) = layout.children.first() else {
+            return EventOutcome::Ignored;
+        };
+        let clip = cx.clip().unwrap_or_else(|| {
+            Rect::new(
+                0,
+                0,
+                layout.size.width,
+                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+            )
+        });
+        cx.with_transform(
+            u16::try_from(self.offset_x).unwrap_or(u16::MAX),
+            self.offset_y,
+            -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
+            -i64::try_from(self.offset_y).unwrap_or(i64::MAX),
+            clip,
+            |cx| self.child.event(event, &child.node, cx),
+        )
+    }
 }
 
 /// Generic interaction controller for one measured scroll viewport.
@@ -210,13 +308,19 @@ impl ScrollView {
         cx: &mut PaintCx<'_, '_>,
     ) {
         let content = self.content_area(area);
+        let id = id.into();
         cx.push_hit(
-            HitRegion::new(id.into(), Rect::new(0, 0, content.width, content.height))
+            HitRegion::new(id.clone(), Rect::new(0, 0, content.width, content.height))
                 .role(HitRole::Scroll)
                 .pointer_events(self.policy.mouse_wheel)
                 .focusable(self.policy.keyboard)
                 .enabled(!state.interaction.disabled),
         );
+        cx.push_semantic(SemanticRegion::new(
+            id,
+            Rect::new(0, 0, content.width, content.height),
+            "scroll",
+        ));
         let Some(scrollbar_area) = self.scrollbar_area(area) else {
             return;
         };
@@ -277,6 +381,14 @@ impl ScrollView {
         })
     }
 
+    /// Return the maximum logical horizontal offset from an authoritative viewport layout.
+    #[must_use]
+    pub fn max_horizontal_offset(layout: &LayoutNode) -> usize {
+        layout.children.first().map_or(0, |child| {
+            usize::from(child.node.size.width.saturating_sub(layout.size.width))
+        })
+    }
+
     /// Reconcile state after content or viewport layout changes.
     pub fn reconcile(&self, layout: &LayoutNode, state: &mut ScrollViewState) {
         let maximum = Self::max_vertical_offset(layout);
@@ -285,6 +397,9 @@ impl ScrollView {
         } else {
             state.vertical_offset.min(maximum)
         };
+        state.horizontal_offset = state
+            .horizontal_offset
+            .min(Self::max_horizontal_offset(layout));
     }
 
     /// Apply a selection edge-autoscroll request owned by this viewport.
@@ -544,7 +659,7 @@ impl Default for ScrollView {
     }
 }
 
-fn scrollbar_state(total: usize, viewport: usize, offset: usize) -> ScrollbarState {
+pub(crate) fn scrollbar_state(total: usize, viewport: usize, offset: usize) -> ScrollbarState {
     let maximum = total.saturating_sub(viewport);
     let scaled_total = u16::try_from(total).unwrap_or(u16::MAX);
     let scaled_viewport = if maximum == 0 {
@@ -578,7 +693,13 @@ fn logical_offset_from_scrollbar(
     if logical_maximum == 0 || scrollbar_maximum == 0 {
         return 0;
     }
-    (offset.saturating_mul(logical_maximum) / scrollbar_maximum).min(logical_maximum)
+    usize::try_from(
+        (u128::try_from(offset).unwrap_or(u128::MAX)
+            * u128::try_from(logical_maximum).unwrap_or(u128::MAX))
+            / u128::try_from(scrollbar_maximum).unwrap_or(u128::MAX),
+    )
+    .unwrap_or(logical_maximum)
+    .min(logical_maximum)
 }
 
 fn signed_difference(value: usize, base: usize) -> i64 {
@@ -609,15 +730,89 @@ const fn outcome(old: usize, current: usize) -> ScrollViewOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{NestedScrollOutcome, ScrollView, ScrollViewOutcome, ScrollViewState};
+    use super::{
+        NestedScrollOutcome, ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewState,
+        logical_offset_from_scrollbar, scrollbar_state,
+    };
     use bmux_keyboard::{KeyCode, KeyStroke};
-    use bmux_tui::component::{ChildLayout, LayoutId, LayoutNode, LogicalSize};
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{
+        ChildLayout, Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+    };
+    use bmux_tui::composition::TextContent;
     use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::{Point, Rect, Size};
+    use bmux_tui::hit::HitRole;
     use bmux_tui::paint::PaintCx;
     use bmux_tui::selection::{
         SelectionAutoScrollRequest, SelectionScopeId, SelectionScrollAxis, SelectionScrollDirection,
     };
+
+    #[test]
+    fn arbitrary_component_subtree_paints_through_translation_and_clip() {
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(1);
+        let component = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(6, 2),
+            state,
+            TextContent::new("first\nsecond\nthird"),
+        );
+        let mut layout_cx = LayoutCx::new();
+        let layout = component.layout(Constraints::tight(Size::new(6, 2)), &mut layout_cx);
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        assert_eq!(frame.buffer().get(Point::new(0, 0)).unwrap().symbol, "s");
+        assert_eq!(frame.buffer().get(Point::new(0, 1)).unwrap().symbol, "t");
+        assert_eq!(layout.children.len(), 1);
+        assert_eq!(layout.children[0].node.size.height, 3);
+    }
+
+    #[test]
+    fn reconcile_clamps_both_logical_axes_without_terminal_saturation() {
+        let content = LayoutNode::leaf(
+            LayoutId::new("content"),
+            LogicalSize::new(u16::MAX, 100_000),
+        );
+        let layout = LayoutNode::with_children(
+            LayoutId::new("scroll"),
+            LogicalSize::new(80, 24),
+            vec![ChildLayout::new(0, 0, content)],
+        );
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(usize::MAX);
+        state.set_horizontal_offset(usize::MAX);
+
+        ScrollView::new().reconcile(&layout, &mut state);
+
+        assert_eq!(state.vertical_offset(), 99_976);
+        assert_eq!(state.horizontal_offset(), usize::from(u16::MAX) - 80);
+    }
+
+    #[test]
+    fn huge_logical_extent_round_trips_through_terminal_scrollbar_scale() {
+        let total = usize::MAX / 4;
+        let viewport = 37usize;
+        let maximum = total - viewport;
+        for offset in [0, maximum / 4, maximum / 2, maximum * 3 / 4, maximum] {
+            let bar = scrollbar_state(total, viewport, offset);
+            assert_eq!(bar.content_len, u16::MAX);
+            assert!(bar.viewport_len >= 1);
+            assert!(bar.offset <= bar.max_offset());
+            let restored = logical_offset_from_scrollbar(
+                usize::from(bar.offset),
+                usize::from(bar.max_offset()),
+                maximum,
+            );
+            let tolerance = maximum / usize::from(bar.max_offset().max(1)) + 1;
+            assert!(restored.abs_diff(offset) <= tolerance);
+        }
+    }
 
     fn layout(content_height: usize, viewport_height: usize) -> LayoutNode {
         LayoutNode::with_children(
@@ -956,6 +1151,11 @@ mod tests {
 
         assert_eq!(view.content_area(Rect::new(0, 0, 10, 5)).width, 9);
         assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 9, 5));
+        assert_eq!(frame.hits().regions()[0].role, HitRole::Scroll);
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].id.as_str(), "view");
+        assert_eq!(frame.semantics().regions()[0].role, "scroll");
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 9, 5));
         assert_ne!(
             frame
                 .buffer()

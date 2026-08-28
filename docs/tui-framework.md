@@ -46,6 +46,57 @@ BMUX's TUI framework has three domain-neutral layers:
 
 The runtime depends on `bmux_tui` but not `bmux_tui_components`. Applications may use all three while retaining product state and behavior. See [`tui-runtime.md`](tui-runtime.md) for the runtime contract.
 
+## Canonical component and composition model
+
+The long-term rendering entry point is the domain-neutral `Component` lifecycle. A component:
+
+1. resolves a `LayoutNode` from explicit `Constraints` in `Component::layout`;
+2. paints only from that resolved node through `PaintCx` in `Component::paint`; and
+3. routes input against the same resolved node through `EventCx` in `Component::event`.
+
+Measurement and painting are separate operations. Painting and event routing must not recalculate wrapping, child placement, or viewport geometry. Application and control state remains caller-owned; framework caches retain only derived layout and collection indexes.
+
+### Constraints and logical geometry
+
+`Constraints` carries a bounded terminal width and a logical `usize` height range. `LayoutNode` and `LogicalRect` retain document dimensions and vertical positions without terminal `u16` saturation. Conversion to terminal `Rect` happens only when geometry reaches a visible terminal boundary. Parents assign child placement through `ChildLayout`; children lay themselves out in local coordinates and do not know their eventual terminal origin.
+
+Rows, columns, surfaces, wrappers, scroll viewports, and virtualized items all produce the same authoritative tree shape. `Surface` owns complete rectangular background, border, padding, inherited content style, and one measured child. `Row`, `Column`, and `Stack` own child ordering and placement. Wrapper components add one orthogonal behavior such as size bounds, alignment, clipping, style, visibility, or stable identity rather than introducing application-specific layout rules.
+
+### Scoped painting and interaction geometry
+
+`PaintCx` is the ordinary raster and metadata boundary. A child scope combines signed translation, clip intersection, and inherited style. Cell writes, fills, text, cursor placement, hit regions, focus targets, selection scopes/fragments, semantic regions, images, and damage all pass through that scope. Components that genuinely need cell-level rasterization use the bounded clip-aware raster API; ordinary components must not bypass scope correctness through direct buffer mutation.
+
+`EventCx` projects the same resolved child placement and viewport clipping into event geometry. Containers route against resolved descendants rather than maintaining another hit-layout map. Overlay-like containers traverse topmost-first. Scroll and virtual-list routing applies the same content translation and visible clipping as painting, and offscreen virtualized children do not receive pointer events.
+
+### Stable identity, revisions, and retention
+
+`LayoutId` is stable semantic layout identity. A keyed child keeps identity across insertion, removal, and reorder. `ComponentRevision` separates geometry-affecting `layout` revisions from `paint` revisions. Layout-affecting inputs include content, wrapping, border/padding, constraints, and geometry capability changes. Theme or other paint-only changes must repaint without invalidating geometry.
+
+`LayoutCache` keys derived layouts by stable identity, layout revision, exact constraints, and layout environment. Parent revisions include ordered descendant revisions so invalidation propagates upward. Consumers explicitly retain active identities so removed entries are released. The cache never owns application state or decides product behavior.
+
+### Scrolling and variable-height virtualization
+
+`ScrollViewState` is caller-owned logical scroll state shared by arbitrary measured content and keyed collections. Scrolling is projection: content remains in logical coordinates while painting and event routing apply a signed offset and viewport clip. Anchors use stable layout/item identity and relative position rather than a raw framebuffer row. Focus visibility and selection edge autoscroll use the same minimum-distance viewport projection.
+
+`VirtualList` uses `MeasuredListIndex` for exact keyed variable-height geometry. Current-width item measurements and retained item layouts are authoritative; visible-range lookup is sublinear. Only viewport-intersecting items are painted and registered for interaction, including correctly clipped boundary items. Item components remain ordinary components, and collection state contains only derived measurement/index data plus caller-owned scroll state.
+
+This model replaces, rather than adapts indefinitely to, the area-assigned `Widget`/`StatefulWidget`, independent line-scroller, and retained-rendered-row architectures. Those APIs may coexist only while in-repository and downstream consumers are actively migrated; they are not part of the architectural endpoint.
+
+### Testable architectural invariants
+
+The replacement is accepted only while these invariants remain mechanically testable:
+
+- **Constraint satisfaction:** every resolved node size is inside its normalized constraints; inverted ranges normalize deterministically, zero dimensions remain valid, unbounded logical height remains `usize`, and terminal conversion saturates only at a visible boundary.
+- **Deterministic authoritative layout:** identical component input, layout revision, constraints, and layout environment resolve the same tree. Paint and event passes consume that tree without invoking measurement or independently deriving placement or wrapping.
+- **Local transforms and clipping:** a child contribution is translated exactly once from local to terminal coordinates and intersected with every ancestor clip. Cells, cursor, hits, focus, selection, semantics, images, damage, and event-visible geometry use the same effective transform and clip. Empty/offscreen intersections emit no contribution.
+- **Stable keyed retention:** insertion, removal, and reorder preserve the retained measurements and semantic identity of unchanged keys. Duplicate keys are rejected. Removed identities release cache entries and cannot continue contributing interaction metadata.
+- **Revision invalidation:** a matching identity/layout revision/constraints/environment is a cache hit; content, geometry style, width, or geometry capability changes miss exactly the affected entries. Paint-only revisions repaint without measuring. Viewport-height-only projection does not invalidate width-dependent item measurement.
+- **Scroll anchoring:** top-item and bottom-follow anchors restore stable semantic position through append, insertion above, removal, reorder, and exact width reflow. `ensure_visible` performs the minimum logical movement and all offsets clamp to exact content extent.
+- **Visible-only virtualization:** visible-range lookup is sublinear in collection size. Paint and event work, interaction/selection registration, damage, and output are bounded by viewport-intersecting items plus required boundary items, not total collection length. Partially visible first and last items use exact clipping.
+- **Committed metadata:** terminal cells and every metadata scene advance atomically only after successful presentation. Failed output publishes none of the attempted frame and invalidates uncertain retained output so the next successful presentation is complete. Regional damage restores committed cells and metadata outside damaged regions.
+
+Unit, property, integration, and structural benchmark tests may divide coverage across crates, but no invariant may be replaced by an application-owned correction or manual-only assertion. Performance tests assert structural work counts alongside observational timings; machine-dependent latency alone is not a correctness gate.
+
 ## Initial primitive crate boundary
 
 The primitive crate is `packages/tui`, published in the workspace as `bmux_tui`.

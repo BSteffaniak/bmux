@@ -819,6 +819,15 @@ mod tests {
 
         assert_eq!(outcome, ActionRowOutcome::FocusMoved { index: 1 });
         assert_eq!(state.focused(), Some(1));
+
+        let wrapped = row.handle_event(Rect::new(0, 0, 30, 1), &mut state, &key(KeyCode::Right));
+        assert_eq!(wrapped, ActionRowOutcome::FocusMoved { index: 0 });
+        assert_eq!(state.focused(), Some(0));
+
+        let reverse_wrapped =
+            row.handle_event(Rect::new(0, 0, 30, 1), &mut state, &key(KeyCode::Left));
+        assert_eq!(reverse_wrapped, ActionRowOutcome::FocusMoved { index: 1 });
+        assert_eq!(state.focused(), Some(1));
     }
 
     #[test]

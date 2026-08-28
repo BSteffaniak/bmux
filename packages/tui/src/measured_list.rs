@@ -6,6 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+static UPPER_BOUND_STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// One retained variable-height item measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasuredListItem<K> {
@@ -15,6 +18,8 @@ pub struct MeasuredListItem<K> {
     pub layout_revision: u64,
     /// Width at which `height` was measured.
     pub width: u16,
+    /// Geometry-affecting terminal capability revision at measurement time.
+    pub capability_revision: u64,
     /// Exact logical item height, excluding collection gap.
     pub height: usize,
 }
@@ -22,11 +27,18 @@ pub struct MeasuredListItem<K> {
 impl<K> MeasuredListItem<K> {
     /// Create one exact item measurement.
     #[must_use]
-    pub const fn new(key: K, layout_revision: u64, width: u16, height: usize) -> Self {
+    pub const fn new(
+        key: K,
+        layout_revision: u64,
+        width: u16,
+        capability_revision: u64,
+        height: usize,
+    ) -> Self {
         Self {
             key,
             layout_revision,
             width,
+            capability_revision,
             height,
         }
     }
@@ -79,6 +91,7 @@ where
         &mut self,
         entries: impl IntoIterator<Item = (K, u64)>,
         width: u16,
+        capability_revision: u64,
         mut measure: impl FnMut(&K) -> usize,
     ) {
         let mut retained = std::mem::take(&mut self.items)
@@ -92,12 +105,14 @@ where
                 seen.insert(key.clone()),
                 "measured-list keys must be unique"
             );
-            let item = retained
-                .remove(&key)
-                .filter(|item| item.layout_revision == layout_revision && item.width == width);
+            let item = retained.remove(&key).filter(|item| {
+                item.layout_revision == layout_revision
+                    && item.width == width
+                    && item.capability_revision == capability_revision
+            });
             items.push(item.unwrap_or_else(|| {
                 let height = measure(&key);
-                MeasuredListItem::new(key, layout_revision, width, height)
+                MeasuredListItem::new(key, layout_revision, width, capability_revision, height)
             }));
         }
         self.items = items;
@@ -282,6 +297,8 @@ impl FenwickTree {
             1usize << self.values.len().ilog2()
         };
         while step > 0 {
+            #[cfg(test)]
+            UPPER_BOUND_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let next = index.saturating_add(step);
             if next < self.tree.len() && accumulated.saturating_add(self.tree[next]) <= target {
                 index = next;
@@ -295,23 +312,24 @@ impl FenwickTree {
 
 #[cfg(test)]
 mod tests {
-    use super::MeasuredListIndex;
+    use super::{MeasuredListIndex, UPPER_BOUND_STEPS, VisibleItemRange};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn synchronizes_by_stable_key_revision_and_width() {
         let mut index = MeasuredListIndex::new(1);
         let mut measured = Vec::new();
-        index.sync([("a", 1), ("b", 1)], 10, |key| {
+        index.sync([("a", 1), ("b", 1)], 10, 0, |key| {
             measured.push(*key);
             if *key == "a" { 2 } else { 3 }
         });
-        index.sync([("b", 1), ("a", 1)], 10, |key| {
+        index.sync([("b", 1), ("a", 1)], 10, 0, |key| {
             measured.push(*key);
             9
         });
         assert_eq!(measured, ["a", "b"]);
         assert_eq!(index.item(0).map(|item| item.height), Some(3));
-        index.sync([("b", 2), ("a", 1)], 10, |key| {
+        index.sync([("b", 2), ("a", 1)], 10, 0, |key| {
             measured.push(*key);
             4
         });
@@ -321,7 +339,7 @@ mod tests {
     #[test]
     fn reports_offsets_total_height_and_visible_boundaries() {
         let mut index = MeasuredListIndex::new(1);
-        index.sync([("a", 0), ("b", 0), ("c", 0)], 8, |key| match *key {
+        index.sync([("a", 0), ("b", 0), ("c", 0)], 8, 0, |key| match *key {
             "a" => 2,
             "b" => 4,
             _ => 3,
@@ -384,6 +402,7 @@ mod tests {
             index.sync(
                 keys.iter().map(|key| (*key, heights[key] as u64)),
                 20,
+                0,
                 |key| heights[key],
             );
             let mut expected_offset = 0usize;
@@ -401,6 +420,78 @@ mod tests {
                 let expected = naive_item_at_offset(&keys, &heights, 2, offset);
                 assert_eq!(index.item_at_offset(offset), expected);
             }
+        }
+    }
+
+    #[test]
+    fn visible_lookup_steps_are_logarithmic() {
+        let mut index = MeasuredListIndex::new(1);
+        index.sync((0..1_000_000usize).map(|key| (key, 0)), 80, 0, |_| 1);
+        UPPER_BOUND_STEPS.store(0, Ordering::Relaxed);
+
+        let range = index.visible_range(1_234_567, 40);
+        let steps = UPPER_BOUND_STEPS.load(Ordering::Relaxed);
+
+        assert!(range.start < range.end);
+        assert!(steps <= 40, "two Fenwick lookups took {steps} steps");
+    }
+
+    #[test]
+    fn randomized_viewports_match_naive_visible_ranges() {
+        let mut seed = 0x00c0_ffee_u64;
+        for _ in 0..500 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let len = usize::try_from(seed % 40).unwrap_or(0);
+            let gap = usize::try_from((seed >> 8) % 5).unwrap_or(0);
+            let viewport = usize::try_from((seed >> 16) % 20).unwrap_or(0);
+            let mut heights = std::collections::BTreeMap::new();
+            let keys = (0..len)
+                .map(|key| {
+                    let key = u32::try_from(key).unwrap();
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    heights.insert(key, usize::try_from(seed % 12 + 1).unwrap());
+                    key
+                })
+                .collect::<Vec<_>>();
+            let mut index = MeasuredListIndex::new(gap);
+            index.sync(
+                keys.iter().map(|key| (*key, heights[key] as u64)),
+                u16::try_from((seed >> 24) % 80 + 1).unwrap(),
+                0,
+                |key| heights[key],
+            );
+            let offset = if index.total_height() == 0 {
+                0
+            } else {
+                usize::try_from(seed >> 32).unwrap_or(0) % (index.total_height() + 3)
+            };
+
+            let actual = index.visible_range(offset, viewport);
+            let expected_start = naive_item_at_offset(&keys, &heights, gap, offset);
+            let expected = match expected_start {
+                Some(start) if viewport > 0 && offset < index.total_height() => {
+                    let start_offset = keys[..start].iter().fold(0usize, |sum, key| {
+                        sum.saturating_add(heights[key]).saturating_add(gap)
+                    });
+                    let end_offset = offset
+                        .saturating_add(viewport)
+                        .saturating_sub(1)
+                        .min(index.total_height() - 1);
+                    let end = naive_item_at_offset(&keys, &heights, gap, end_offset)
+                        .map_or(keys.len(), |item| item + 1);
+                    VisibleItemRange {
+                        start,
+                        end,
+                        first_item_offset: offset.saturating_sub(start_offset),
+                    }
+                }
+                _ => VisibleItemRange {
+                    start: 0,
+                    end: 0,
+                    first_item_offset: 0,
+                },
+            };
+            assert_eq!(actual, expected);
         }
     }
 
@@ -424,7 +515,7 @@ mod tests {
     #[test]
     fn updates_height_without_rebuilding_identity_index() {
         let mut index = MeasuredListIndex::new(0);
-        index.sync([("a", 0), ("b", 0)], 8, |_| 2);
+        index.sync([("a", 0), ("b", 0)], 8, 0, |_| 2);
         assert!(index.update_height(&"a", 5));
         assert_eq!(index.item_offset(1), Some(5));
         assert_eq!(index.total_height(), 7);
