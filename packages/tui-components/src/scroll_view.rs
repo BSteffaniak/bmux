@@ -218,14 +218,15 @@ impl Component for ScrollViewComponent<'_> {
         let Some(child) = layout.children.first() else {
             return EventOutcome::Ignored;
         };
-        let clip = cx.clip().unwrap_or_else(|| {
-            Rect::new(
-                0,
-                0,
-                layout.size.width,
-                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
-            )
-        });
+        let viewport = Rect::new(
+            0,
+            0,
+            layout.size.width,
+            u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+        );
+        let clip = cx
+            .clip()
+            .map_or(viewport, |parent| parent.intersection(viewport));
         cx.with_transform(
             u16::try_from(self.offset_x).unwrap_or(u16::MAX),
             self.offset_y,
@@ -737,10 +738,10 @@ mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{
-        ChildLayout, Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+        ChildLayout, Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
     };
     use bmux_tui::composition::TextContent;
-    use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
+    use bmux_tui::event::{Event, EventOutcome, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::hit::HitRole;
@@ -748,6 +749,60 @@ mod tests {
     use bmux_tui::selection::{
         SelectionAutoScrollRequest, SelectionScopeId, SelectionScrollAxis, SelectionScrollDirection,
     };
+
+    struct EventProbe;
+
+    impl Component for EventProbe {
+        fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+            LayoutNode::leaf(
+                LayoutId::new("probe"),
+                constraints.constrain(LogicalSize::new(6, 3)),
+            )
+        }
+
+        fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+
+        fn event(&self, event: &Event, _layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+            let Event::Mouse(mouse) = event else {
+                return EventOutcome::Ignored;
+            };
+            let visible = cx.find_visible_rect(&LayoutId::new("probe"));
+            if visible.is_some_and(|area| area.contains(mouse.position)) {
+                EventOutcome::Handled
+            } else {
+                EventOutcome::Ignored
+            }
+        }
+    }
+
+    #[test]
+    fn arbitrary_component_subtree_events_share_partial_visibility_clip() {
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(1);
+        let component =
+            ScrollViewComponent::new("scroll", LogicalSize::new(6, 2), state, EventProbe);
+        let mut layout_cx = LayoutCx::new();
+        let layout = component.layout(Constraints::tight(Size::new(6, 2)), &mut layout_cx);
+        let mut event_cx = EventCx::with_clip(&layout, Rect::new(0, 0, 6, 2));
+
+        let inside = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            Point::new(1, 1),
+        ));
+        let outside = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            Point::new(1, 2),
+        ));
+
+        assert_eq!(
+            component.event(&inside, &layout, &mut event_cx),
+            EventOutcome::Handled
+        );
+        assert_eq!(
+            component.event(&outside, &layout, &mut event_cx),
+            EventOutcome::Ignored
+        );
+    }
 
     #[test]
     fn arbitrary_component_subtree_paints_through_translation_and_clip() {
