@@ -24,7 +24,8 @@ use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
 use bmux_tui_components::status_bar::{
-    MessageBar, StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment, StatusSeverity,
+    MessageBarComponent, StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment,
+    StatusSeverity,
 };
 use bmux_tui_components::tab_bar::{
     TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
@@ -331,22 +332,25 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )))
         .render(Rect::new(1, 13, 68, 2), &demo.text, frame);
-    MessageBar::new(&demo.message)
-        .severity(StatusSeverity::Info)
-        .styles(StatusBarStyles {
-            default: Style::new().fg(Color::BrightYellow),
-            muted: Style::new().fg(Color::BrightBlack),
-            info: Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-            success: Style::new().fg(Color::Green),
-            warning: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            error: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            separator: Style::new().fg(Color::BrightBlack),
-            background: Style::new().bg(Color::Black),
-        })
-        .policy(StatusBarPolicy::compact().background(true))
-        .render(Rect::new(1, 15, 60, 1), frame);
+    render_component(
+        &MessageBarComponent::new("navigation.message", &demo.message)
+            .severity(StatusSeverity::Info)
+            .styles(StatusBarStyles {
+                default: Style::new().fg(Color::BrightYellow),
+                muted: Style::new().fg(Color::BrightBlack),
+                info: Style::new()
+                    .fg(Color::BrightYellow)
+                    .add_modifier(Modifier::BOLD),
+                success: Style::new().fg(Color::Green),
+                warning: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                error: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                separator: Style::new().fg(Color::BrightBlack),
+                background: Style::new().bg(Color::Black),
+            })
+            .policy(StatusBarPolicy::compact().background(true)),
+        Rect::new(1, 15, 60, 1),
+        frame,
+    );
 
     let status_left = [StatusSegment::new("nav").severity(StatusSeverity::Info)];
     let status_right = [StatusSegment::new("ready").severity(StatusSeverity::Success)];

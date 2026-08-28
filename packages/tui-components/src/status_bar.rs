@@ -437,6 +437,95 @@ pub struct MessageBar<'a> {
     styles: StatusBarStyles,
 }
 
+/// Canonical component-lifecycle single message bar.
+pub struct MessageBarComponent<'a> {
+    id: LayoutId,
+    bar: MessageBar<'a>,
+}
+
+impl<'a> MessageBarComponent<'a> {
+    /// Create a message bar with stable identity.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, message: &'a str) -> Self {
+        Self {
+            id: id.into(),
+            bar: MessageBar::new(message),
+        }
+    }
+
+    /// Set message severity.
+    #[must_use]
+    pub const fn severity(mut self, severity: StatusSeverity) -> Self {
+        self.bar.message.severity = severity;
+        self
+    }
+
+    /// Set alignment.
+    #[must_use]
+    pub const fn align(mut self, align: BarAlign) -> Self {
+        self.bar.align = align;
+        self
+    }
+
+    /// Set rendering policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: StatusBarPolicy<'a>) -> Self {
+        self.bar.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: StatusBarStyles) -> Self {
+        self.bar.styles = styles;
+        self
+    }
+}
+
+impl Component for MessageBarComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.bar.message.text.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.bar).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(
+                u16_saturating(display_width(self.bar.message.text)),
+                1,
+            )),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("status"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        if self.bar.policy.background {
+            cx.fill(area, " ", self.bar.styles.background);
+        }
+        StatusBarComponent::new(self.id.clone())
+            .policy(self.bar.policy)
+            .styles(self.bar.styles)
+            .paint_group(cx, layout.size.width, &[self.bar.message], self.bar.align);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "status",
+        ));
+        cx.push_damage(area);
+    }
+}
+
 impl<'a> MessageBar<'a> {
     /// Create a message bar.
     #[must_use]
@@ -545,8 +634,8 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{
-        BarAlign, MessageBar, StatusBar, StatusBarComponent, StatusBarPolicy, StatusSegment,
-        StatusSeverity,
+        BarAlign, MessageBar, MessageBarComponent, StatusBar, StatusBarComponent, StatusBarPolicy,
+        StatusSegment, StatusSeverity,
     };
 
     #[test]
@@ -652,6 +741,43 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("info · warn · err   ")
+        );
+    }
+
+    #[test]
+    fn canonical_message_component_preserves_alignment_and_channels() {
+        let bar = MessageBarComponent::new("message", "ok").align(BarAlign::Right);
+        let layout = bar.layout(Constraints::tight(Size::new(12, 1)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut frame = Frame::new(&mut buffer);
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("          ok")
+        );
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 12, 1));
+        assert_eq!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .retained_regions(),
+            &[Rect::new(0, 0, 12, 1)]
+        );
+    }
+
+    #[test]
+    fn canonical_message_component_revision_tracks_geometry_and_paint() {
+        let initial = MessageBarComponent::new("message", "ok").revision();
+        let severity = MessageBarComponent::new("message", "ok")
+            .severity(StatusSeverity::Warning)
+            .revision();
+        assert_eq!(initial.layout, severity.layout);
+        assert_ne!(initial.paint, severity.paint);
+        assert_ne!(
+            initial.layout,
+            MessageBarComponent::new("message", "healthy")
+                .revision()
+                .layout
         );
     }
 
