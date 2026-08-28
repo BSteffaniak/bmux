@@ -338,8 +338,12 @@ impl Component for ToastStackComponent<'_, '_> {
                 toast.title,
                 usize::from(rect.width).saturating_sub(close.len()),
             );
+            let title_width = u16::try_from(bmux_tui::text_width::display_width(&title))
+                .unwrap_or(u16::MAX)
+                .saturating_add(u16::try_from(close.len()).unwrap_or(u16::MAX))
+                .min(rect.width);
             cx.write_line(
-                LocalRect::new(0, i64::from(rect.y), rect.width, 1),
+                LocalRect::new(i32::from(rect.x), i64::from(rect.y), title_width, 1),
                 &Line::from_spans([
                     Span::styled(title, self.stack.title_style(toast.severity)),
                     Span::styled(close, self.stack.styles.close),
@@ -349,7 +353,14 @@ impl Component for ToastStackComponent<'_, '_> {
                 && rect.height > 1
             {
                 cx.write_line(
-                    LocalRect::new(0, i64::from(rect.y.saturating_add(1)), rect.width, 1),
+                    LocalRect::new(
+                        i32::from(rect.x),
+                        i64::from(rect.y.saturating_add(1)),
+                        u16::try_from(bmux_tui::text_width::display_width(body))
+                            .unwrap_or(u16::MAX)
+                            .min(rect.width),
+                        1,
+                    ),
                     &Line::from_spans([Span::styled(
                         truncate_to_display_width(body, usize::from(rect.width)),
                         self.stack.styles.body,
@@ -664,7 +675,7 @@ mod tests {
     use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::paint::PaintCx;
 
     use super::{
@@ -688,6 +699,24 @@ mod tests {
         );
         assert_eq!(frame.hits().regions().len(), 1);
         assert_eq!(frame.semantics().regions().len(), 1);
+    }
+
+    #[test]
+    fn component_respects_nonzero_local_toast_placement() {
+        let toasts = [ToastItem::new("one", "Saved")];
+        let state = std::cell::Cell::new(ToastStackState::default());
+        let component =
+            ToastStackComponent::new("toasts", &toasts, &state).policy(ToastStackPolicy::compact());
+        let layout = component.layout(Constraints::tight(Size::new(24, 2)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("Saved ×                 ")
+        );
     }
 
     #[test]

@@ -12,10 +12,22 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-anyhow              = { workspace = true, features = ["std"] }
-bmux_keyboard       = { workspace = true }
-bmux_tui            = { workspace = true, features = ["crossterm"] }
-bmux_tui_components = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
+bmux_keyboard = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui_components = { workspace = true, features = [
+    "breadcrumbs",
+    "key-hint-bar",
+    "menu",
+    "pane",
+    "scroll-area",
+    "selectable-list",
+    "status-bar",
+    "tab-bar",
+    "table",
+    "text-view",
+    "tree-view",
+] }
 
 [features]
 fail-on-warnings = ["bmux_tui_components/fail-on-warnings"]

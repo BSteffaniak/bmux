@@ -1,12 +1,16 @@
+use std::cell::Cell;
+
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::breadcrumbs::{
-    BreadcrumbItem, Breadcrumbs, BreadcrumbsOutcome, BreadcrumbsState,
+    BreadcrumbItem, Breadcrumbs, BreadcrumbsComponent, BreadcrumbsOutcome, BreadcrumbsState,
 };
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarPolicy, KeyHintBarStyles};
 use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
@@ -227,6 +231,16 @@ pub fn render_navigation() -> Buffer {
     buffer
 }
 
+fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     let tab_items = tab_items();
     TabBar::new(&tab_items)
@@ -245,7 +259,16 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
         .render(Rect::new(1, 0, 26, 1), &demo.tabs, frame);
 
     let breadcrumb_items = breadcrumb_items();
-    Breadcrumbs::new(&breadcrumb_items).render(Rect::new(30, 0, 38, 1), &demo.breadcrumbs, frame);
+    let breadcrumb_state = Cell::new(demo.breadcrumbs);
+    render_component(
+        &BreadcrumbsComponent::new(
+            "navigation.breadcrumbs",
+            &breadcrumb_items,
+            &breadcrumb_state,
+        ),
+        Rect::new(30, 0, 38, 1),
+        frame,
+    );
 
     let list_items = list_items();
     SelectableList::new(&list_items).render(Rect::new(1, 1, 24, 4), &demo.list, frame);

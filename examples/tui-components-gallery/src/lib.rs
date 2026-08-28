@@ -2,17 +2,18 @@ use std::cell::Cell;
 
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
-use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
+use bmux_tui::composition::TextContent;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Clear, Line, Span, TextWrap};
+use bmux_tui::prelude::{Clear, Line, Span, Text, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::widget::Widget;
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
+use bmux_tui_components::action_row::{ActionButton, ActionRowComponent, ActionRowState};
 use bmux_tui_components::badge::{BadgeComponent, BadgePolicy, BadgeSeverity};
 use bmux_tui_components::bar_chart::{
-    BarChart, BarChartItem, BarChartPolicy, BarChartValuePlacement,
+    BarChartComponent, BarChartItem, BarChartPolicy, BarChartValuePlacement,
 };
 use bmux_tui_components::button::{ButtonComponent, ButtonState};
 use bmux_tui_components::canvas::{
@@ -23,29 +24,28 @@ use bmux_tui_components::chart::{
     ChartLegendPlacement, ChartPoint, ChartPolicy,
 };
 use bmux_tui_components::dialog::{Dialog, DialogState};
-use bmux_tui_components::empty_state::{EmptyState, EmptyStatePolicy};
+use bmux_tui_components::empty_state::{EmptyStateComponent, EmptyStatePolicy};
 use bmux_tui_components::filtered_list::FilteredListState;
-use bmux_tui_components::form_field::FormField;
-use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails};
+use bmux_tui_components::form_field::FormFieldComponent;
+use bmux_tui_components::labeled_details::{DetailItem, LabeledDetailsComponent};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 use bmux_tui_components::pane::{Pane, PaneState};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
 use bmux_tui_components::progress_bar::{
-    ProgressBar, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement,
+    ProgressBarComponent, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement,
 };
-use bmux_tui_components::scroll_area::{
-    ScrollArea, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
-};
+use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState,
 };
-use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy};
-use bmux_tui_components::stepper::{StepItem, StepStatus, Stepper, StepperPolicy};
+use bmux_tui_components::sparkline::{SparklineComponent, SparklinePolicy};
+use bmux_tui_components::stepper::{StepItem, StepStatus, StepperComponent, StepperPolicy};
 use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState};
-use bmux_tui_components::toast_stack::{ToastItem, ToastSeverity, ToastStack, ToastStackState};
+use bmux_tui_components::toast_stack::{
+    ToastItem, ToastSeverity, ToastStackComponent, ToastStackState,
+};
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 30;
@@ -113,11 +113,11 @@ fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
         _ => None,
     });
     state.set_focused(action_focus);
-    ActionRow::new(&actions).render_state_with_id_prefix(
+    let state = Cell::new(state);
+    render_component(
+        &ActionRowComponent::new("gallery.actions", &actions, &state),
         Rect::new(1, 3, 30, 1),
-        &state,
         frame,
-        "gallery.actions",
     );
 }
 
@@ -162,16 +162,26 @@ fn render_details(frame: &mut Frame<'_>) {
         DetailItem::new("Component", "LabeledDetails"),
         DetailItem::new("Purpose", "Wrapped labels and values"),
     ];
-    LabeledDetails::new(&items).render(Rect::new(1, 5, 34, 5), frame);
+    render_component(
+        &LabeledDetailsComponent::new("gallery.details", &items),
+        Rect::new(1, 5, 34, 5),
+        frame,
+    );
 }
 
 fn render_field(frame: &mut Frame<'_>) {
-    let field = FormField::new("Project")
+    render_component(
+        &FormFieldComponent::new(
+            "gallery.form-field",
+            "Project",
+            TextContent::new("bmux").id("gallery.form-field.control"),
+        )
         .required(true)
         .help("Shown with a required marker")
-        .error("Example error text");
-    let control_area = field.render(Rect::new(38, 1, 30, 5), frame);
-    frame.write_line(control_area, &Line::from("bmux"));
+        .error("Example error text"),
+        Rect::new(38, 1, 30, 5),
+        frame,
+    );
 }
 
 fn render_pane(frame: &mut Frame<'_>) {
@@ -182,39 +192,63 @@ fn render_pane(frame: &mut Frame<'_>) {
 }
 
 fn render_progress(frame: &mut Frame<'_>) {
-    ProgressBar::new(ProgressBarValue::determinate(7, 10))
+    render_component(
+        &ProgressBarComponent::new(
+            "gallery.progress.indexed",
+            ProgressBarValue::determinate(7, 10),
+        )
         .label("70% indexed")
         .policy(
             ProgressBarPolicy::compact()
                 .background(true)
                 .label(ProgressLabelPlacement::Right),
+        ),
+        Rect::new(1, 20, 28, 1),
+        frame,
+    );
+    render_component(
+        &ProgressBarComponent::new(
+            "gallery.progress.ratio",
+            ProgressBarValue::determinate(1, 3),
         )
-        .render(Rect::new(1, 20, 28, 1), frame);
-    ProgressBar::ratio(1, 3)
         .policy(
             ProgressBarPolicy::compact()
                 .line_gauge()
                 .symbols("━", "─", "╸"),
+        ),
+        Rect::new(1, 21, 28, 1),
+        frame,
+    );
+    render_component(
+        &ProgressBarComponent::new(
+            "gallery.progress.indeterminate",
+            ProgressBarValue::indeterminate(4),
         )
-        .render(Rect::new(1, 21, 28, 1), frame);
-    ProgressBar::new(ProgressBarValue::indeterminate(4))
-        .policy(ProgressBarPolicy::bare())
-        .render(Rect::new(1, 22, 28, 1), frame);
+        .policy(ProgressBarPolicy::bare()),
+        Rect::new(1, 22, 28, 1),
+        frame,
+    );
     let samples = [1, 2, 3, 5, 8, 13, 8, 5, 3, 2, 1];
-    Sparkline::new(&samples)
-        .policy(SparklinePolicy::bare().max(Some(13)))
-        .render(Rect::new(1, 23, 28, 1), frame);
+    render_component(
+        &SparklineComponent::new("gallery.sparkline", &samples)
+            .policy(SparklinePolicy::bare().max(Some(13))),
+        Rect::new(1, 23, 28, 1),
+        frame,
+    );
 }
 
 fn render_empty_state(frame: &mut Frame<'_>) {
     let body = [Line::from("No matching components yet")];
     let actions = [Line::from("Press / to filter")];
-    EmptyState::new("Empty State")
-        .icon("∅")
-        .body(&body)
-        .actions(&actions)
-        .policy(EmptyStatePolicy::centered())
-        .render(Rect::new(2, 14, 26, 4), frame);
+    render_component(
+        &EmptyStateComponent::new("gallery.empty-state", "Empty State")
+            .icon("∅")
+            .body(&body)
+            .actions(&actions)
+            .policy(EmptyStatePolicy::centered()),
+        Rect::new(2, 14, 26, 4),
+        frame,
+    );
 }
 
 fn render_stepper(frame: &mut Frame<'_>) {
@@ -223,9 +257,11 @@ fn render_stepper(frame: &mut Frame<'_>) {
         StepItem::new("build", "Build").status(StepStatus::Current),
         StepItem::new("ship", "Ship"),
     ];
-    Stepper::new(&steps)
-        .policy(StepperPolicy::horizontal())
-        .render(Rect::new(35, 12, 33, 1), frame);
+    render_component(
+        &StepperComponent::new("gallery.stepper", &steps).policy(StepperPolicy::horizontal()),
+        Rect::new(35, 12, 33, 1),
+        frame,
+    );
 }
 
 fn render_bar_chart(frame: &mut Frame<'_>) {
@@ -234,15 +270,17 @@ fn render_bar_chart(frame: &mut Frame<'_>) {
         BarChartItem::new("CPU", 7),
         BarChartItem::new("Mem", 4).group(&mem_group),
     ];
-    BarChart::new(&items)
-        .policy(
+    render_component(
+        &BarChartComponent::new("gallery.bar-chart", &items).policy(
             BarChartPolicy::with_values()
                 .max(Some(10))
                 .bar_width(Some(12))
                 .bar_gap(1)
                 .value_placement(BarChartValuePlacement::Right),
-        )
-        .render(Rect::new(35, 13, 32, 3), frame);
+        ),
+        Rect::new(35, 13, 32, 3),
+        frame,
+    );
 }
 
 fn render_chart(frame: &mut Frame<'_>) {
@@ -295,28 +333,33 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
         Line::from("wide content with gutter"),
         Line::from("bottom row visible"),
     ];
-    let mut scroll_state = ScrollAreaState::new();
+    let mut scroll_state = ScrollViewState::new();
     scroll_state.set_vertical_offset(1);
     scroll_state.set_horizontal_offset(5);
-    ScrollArea::new(&scroll_lines)
-        .policy(
-            ScrollAreaPolicy::interactive()
-                .scrollbar(ScrollAreaScrollbarMode::Gutter)
-                .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+    render_component(
+        &ScrollViewComponent::new(
+            "gallery.scroll",
+            LogicalSize::new(21, 3),
+            scroll_state,
+            TextContent::new(Text::from_lines(scroll_lines)).wrap(TextWrap::None),
         )
-        .render(Rect::new(1, 24, 22, 3), &scroll_state, frame);
+        .content_width(24),
+        Rect::new(1, 24, 22, 3),
+        frame,
+    );
 
     let text_lines = [Line::from_spans([
         Span::styled("Styled ", Style::new().fg(Color::Yellow)),
         Span::styled("wrapping ", Style::new().fg(Color::Cyan)),
         Span::styled("demo", Style::new().fg(Color::Magenta)),
     ])];
-    TextView::new(&text_lines)
-        .policy(TextViewPolicy {
-            wrap: TextWrap::Word,
-            ..TextViewPolicy::bare()
-        })
-        .render(Rect::new(25, 24, 14, 3), &TextViewState::new(), frame);
+    render_component(
+        &TextContent::new(Text::from_lines(text_lines))
+            .id("gallery.styled-text")
+            .wrap(TextWrap::Word),
+        Rect::new(25, 24, 14, 3),
+        frame,
+    );
 
     let columns = [TableColumn::new("Rich").fixed(8)];
     let rows = [TableRow::rich([Line::from_spans([
@@ -340,7 +383,12 @@ fn render_toasts(frame: &mut Frame<'_>) {
             .severity(ToastSeverity::Success),
         ToastItem::new("sync", "Syncing").severity(ToastSeverity::Info),
     ];
-    ToastStack::new(&toasts).render(Rect::new(1, 20, 30, 4), &ToastStackState::default(), frame);
+    let state = Cell::new(ToastStackState::default());
+    render_component(
+        &ToastStackComponent::new("gallery.toasts", &toasts, &state),
+        Rect::new(1, 20, 30, 4),
+        frame,
+    );
 }
 
 fn render_picker(frame: &mut Frame<'_>) {
