@@ -1,3 +1,4 @@
+use bmux_plugin::layout::{global_plugin_layout_registry, resolve_plugin_layout};
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
     global_plugin_surface_registry,
@@ -17,12 +18,20 @@ pub fn publish_notification(message: Option<&str>, cols: u16, rows: u16) {
     let surfaces = message
         .filter(|message| !message.is_empty() && cols > 0 && rows > 0)
         .map(|message| {
-            let rect = ExtensionRect::new(0, rows.saturating_sub(1), cols, 1);
+            let viewport = ExtensionRect::new(0, 0, cols, rows);
+            let remaining = resolve_plugin_layout(
+                viewport,
+                (1, 1),
+                &global_plugin_layout_registry().requests(),
+            )
+            .map_or(viewport, |layout| layout.remaining);
+            let row = remaining.y.saturating_add(remaining.h).saturating_sub(1);
+            let rect = ExtensionRect::new(remaining.x, row, remaining.w, 1);
             PluginSurface {
                 id: PluginSurfaceId::new(OWNER, SURFACE_ID, Uuid::nil()),
                 revision,
                 target: PluginSurfaceTarget::Explicit(rect),
-                clip_rect: Some(ExtensionRect::new(0, 0, cols, 1)),
+                clip_rect: Some(ExtensionRect::new(0, 0, remaining.w, 1)),
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 40,
@@ -76,12 +85,20 @@ fn snapshots_match(previous: &[PluginSurface], current: &[PluginSurface]) -> boo
 mod tests {
     use super::*;
 
+    use bmux_plugin::layout::{
+        LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
+    };
     use serial_test::serial;
+
+    fn clear_presentation_registries() {
+        uninstall();
+        global_plugin_layout_registry().clear();
+    }
 
     #[test]
     #[serial]
     fn notification_uses_generic_explicit_surface_and_removes_cleanly() {
-        uninstall();
+        clear_presentation_registries();
         publish_notification(Some("saved"), 80, 24);
         let snapshot = global_plugin_surface_registry()
             .owner_snapshot(OWNER)
@@ -98,5 +115,36 @@ mod tests {
             .expect("empty replacement snapshot");
         assert!(removed.surfaces.is_empty());
         uninstall();
+    }
+
+    #[test]
+    #[serial]
+    fn notification_avoids_bottom_layout_reservations() {
+        clear_presentation_registries();
+        global_plugin_layout_registry()
+            .publish(
+                "test.bottom",
+                PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![PluginLayoutRequest::split(
+                        PluginLayoutId::new("test.bottom", "bar"),
+                        0,
+                        LayoutEdge::Bottom,
+                        LayoutExtent::Cells(1),
+                    )],
+                },
+            )
+            .expect("bottom layout should publish");
+
+        publish_notification(Some("saved"), 80, 24);
+        let snapshot = global_plugin_surface_registry()
+            .owner_snapshot(OWNER)
+            .expect("notification snapshot");
+        assert_eq!(
+            snapshot.surfaces[0].target,
+            PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 22, 80, 1))
+        );
+
+        clear_presentation_registries();
     }
 }
