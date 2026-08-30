@@ -693,11 +693,13 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         state.hovered_window_id,
         &projection_interaction(state),
     );
-    let mut ops = vec![RenderOp::fill_rect(
-        ExtensionRect::new(0, 0, u16::MAX, state.settings.height),
-        ' ',
-        styles.base,
-    )];
+    let rect = ExtensionRect::new(
+        0,
+        0,
+        state.local_presentation.viewport_cols,
+        state.settings.height,
+    );
+    let mut ops = vec![RenderOp::fill_rect(rect, ' ', styles.base)];
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
     let mut x = 0_u16;
     for segment in projected.segments {

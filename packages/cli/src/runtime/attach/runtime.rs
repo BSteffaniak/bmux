@@ -8389,35 +8389,41 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     for extension in &retained_extensions {
         extension.refresh_state();
     }
-    let retained_plugin_repaints = frame_plan
-        .retained
-        .repaint_plan
-        .iter()
-        .filter(|repaint| {
-            view_state
-                .retained_plugin_surface_ids
-                .contains(&repaint.surface_id)
-        })
-        .filter_map(|repaint| {
-            view_state
-                .retained_compositor
-                .surfaces()
-                .get(&repaint.surface_id)
-                .cloned()
-                .map(|surface| (surface, repaint.clone()))
-        })
-        .collect::<Vec<_>>();
+    let retained_plugin_repaints = if frame_plan.render_scene {
+        view_state
+            .retained_compositor
+            .surfaces()
+            .values()
+            .filter(|surface| view_state.retained_plugin_surface_ids.contains(&surface.id))
+            .cloned()
+            .map(|surface| {
+                let repaint = retained_full_surface_repaint(&surface);
+                (surface, repaint)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        frame_plan
+            .retained
+            .repaint_plan
+            .iter()
+            .filter(|repaint| {
+                view_state
+                    .retained_plugin_surface_ids
+                    .contains(&repaint.surface_id)
+            })
+            .filter_map(|repaint| {
+                view_state
+                    .retained_compositor
+                    .surfaces()
+                    .get(&repaint.surface_id)
+                    .cloned()
+                    .map(|surface| (surface, repaint.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
     for (surface, repaint) in retained_plugin_repaints {
         overlay_rendered |=
             queue_retained_render_ops(&mut frame_bytes, &surface, &repaint, retained_capabilities)?;
-        overlay_rendered |= queue_retained_extension_ops(
-            &mut frame_bytes,
-            &surface,
-            &repaint,
-            &retained_extensions,
-            retained_capabilities,
-            &mut view_state.terminal_graphics_cache,
-        )?;
     }
     let mut overlay_cursor_state = None;
     if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
@@ -14366,6 +14372,31 @@ mod tests {
                 )]
             })
         }
+    }
+
+    #[test]
+    fn retained_plugin_surface_content_is_not_overpainted_by_pane_extensions() {
+        let surface = RetainedSurface::builder(Uuid::from_u128(99), DamageRect::new(0, 29, 80, 1))
+            .opaque()
+            .render_ops(vec![RenderOp::text_run(
+                0,
+                29,
+                "tab-1 NORMAL write",
+                RenderStyle::new(),
+            )])
+            .build();
+        let repaint = retained_full_surface_repaint(&surface);
+        let mut output = Vec::new();
+
+        queue_retained_render_ops(
+            &mut output,
+            &surface,
+            &repaint,
+            bmux_plugin::TerminalRenderCapabilities::default(),
+        )
+        .expect("plugin surface render");
+
+        assert!(String::from_utf8_lossy(&output).contains("tab-1 NORMAL write"));
     }
 
     #[test]
