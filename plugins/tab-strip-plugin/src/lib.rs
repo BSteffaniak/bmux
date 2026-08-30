@@ -3,9 +3,12 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+mod projection;
 mod settings;
 
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
+#[cfg(test)]
+use bmux_plugin::RenderNamedColor;
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
     global_plugin_layout_registry,
@@ -15,7 +18,7 @@ use bmux_plugin::surface::{
     global_plugin_surface_registry,
 };
 use bmux_plugin::{
-    AttachInputEvent, AttachInputResult, ExtensionRect, RenderNamedColor, RenderOp, RenderStyle,
+    AttachInputEvent, AttachInputResult, ExtensionRect, RenderOp, RenderStyle,
     ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::prelude::*;
@@ -466,6 +469,7 @@ const fn compact_role_rank(role: PresentationFactRole) -> u8 {
     }
 }
 
+#[cfg(test)]
 const fn compact_fact_style(role: PresentationFactRole, fallback: RenderStyle) -> RenderStyle {
     match role {
         PresentationFactRole::Neutral => fallback,
@@ -537,116 +541,146 @@ fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index:
     )
 }
 
+#[derive(Clone, Copy)]
+struct BarStyles {
+    base: RenderStyle,
+    active: RenderStyle,
+    inactive: RenderStyle,
+    hovered_active: RenderStyle,
+    hovered_inactive: RenderStyle,
+    mode: RenderStyle,
+    module: RenderStyle,
+    overflow: RenderStyle,
+}
+
+impl BarStyles {
+    #[allow(clippy::similar_names)] // Foreground/background pairs intentionally mirror legacy color roles.
+    fn resolve(settings: &Settings) -> Self {
+        let color = |value: Option<&str>, fallback: (u8, u8, u8)| {
+            value.and_then(parse_hex_color).unwrap_or(fallback)
+        };
+        let bar_bg = color(settings.colors.bar_bg.as_deref(), (30, 30, 30));
+        let bar_fg = color(settings.colors.bar_fg.as_deref(), (220, 220, 220));
+        let active_bg = color(settings.colors.tab_active_bg.as_deref(), (110, 170, 240));
+        let active_fg = color(settings.colors.tab_active_fg.as_deref(), (20, 20, 20));
+        let inactive_bg = color(settings.colors.tab_inactive_bg.as_deref(), (48, 48, 48));
+        let inactive_fg = color(settings.colors.tab_inactive_fg.as_deref(), bar_fg);
+        let hovered_active_bg = color(
+            settings.colors.tab_active_hover_bg.as_deref(),
+            adjust_rgb(active_bg, 12),
+        );
+        let hovered_active_fg = color(settings.colors.tab_active_hover_fg.as_deref(), active_fg);
+        let hovered_inactive_bg = color(
+            settings.colors.tab_hover_bg.as_deref(),
+            adjust_rgb(inactive_bg, 18),
+        );
+        let hovered_inactive_fg = color(settings.colors.tab_hover_fg.as_deref(), inactive_fg);
+        let module_bg = color(settings.colors.module_bg.as_deref(), bar_bg);
+        let module_fg = color(settings.colors.module_fg.as_deref(), bar_fg);
+        let overflow_bg = color(
+            settings.colors.overflow_bg.as_deref(),
+            adjust_rgb(bar_bg, 26),
+        );
+        let overflow_fg = color(settings.colors.overflow_fg.as_deref(), bar_fg);
+        let style = |foreground: (u8, u8, u8), background: (u8, u8, u8)| {
+            RenderStyle::new()
+                .rgb_foreground(foreground.0, foreground.1, foreground.2)
+                .rgb_background(background.0, background.1, background.2)
+        };
+        let mut active = style(active_fg, active_bg);
+        active.bold = settings.bold_active;
+        active.underline = settings.underline_active;
+        let mut inactive = style(inactive_fg, inactive_bg);
+        inactive.dim = settings.dim_inactive;
+        let mut hovered_active = style(hovered_active_fg, hovered_active_bg);
+        hovered_active.bold = settings.bold_active;
+        hovered_active.underline = settings.underline_active;
+        Self {
+            base: style(bar_fg, bar_bg),
+            active,
+            inactive,
+            hovered_active,
+            hovered_inactive: style(hovered_inactive_fg, hovered_inactive_bg),
+            mode: style(active_fg, active_bg).bold(),
+            module: style(module_fg, module_bg),
+            overflow: style(overflow_fg, overflow_bg),
+        }
+    }
+
+    const fn for_kind(self, kind: projection::SegmentKind) -> RenderStyle {
+        match kind {
+            projection::SegmentKind::Base => self.base,
+            projection::SegmentKind::ActiveTab => self.active,
+            projection::SegmentKind::InactiveTab => self.inactive,
+            projection::SegmentKind::HoveredActiveTab => self.hovered_active,
+            projection::SegmentKind::HoveredInactiveTab => self.hovered_inactive,
+            projection::SegmentKind::Mode => self.mode,
+            projection::SegmentKind::Module => self.module,
+            projection::SegmentKind::Overflow => self.overflow,
+        }
+    }
+}
+
+fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
+fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
+    let adjust =
+        |channel: u8| u8::try_from((i16::from(channel) + delta).clamp(0, 255)).unwrap_or(channel);
+    (adjust(value.0), adjust(value.1), adjust(value.2))
+}
+
 #[allow(clippy::too_many_lines)] // One ordered retained projection keeps tab, overflow, editor, and menu geometry consistent.
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
-    let active_style = RenderStyle::new()
-        .named_foreground(RenderNamedColor::BrightWhite)
-        .named_background(RenderNamedColor::Blue)
-        .bold();
-    let inactive_style = RenderStyle::new()
-        .named_foreground(RenderNamedColor::White)
-        .named_background(RenderNamedColor::BrightBlack);
+    let styles = BarStyles::resolve(&state.settings);
+    let projected = projection::project_bar(
+        &state.settings,
+        &state.snapshot.windows,
+        &state.local_presentation,
+        state.hovered_window_id,
+    );
     let mut ops = vec![RenderOp::fill_rect(
         ExtensionRect::new(0, 0, u16::MAX, state.settings.height),
         ' ',
-        inactive_style,
+        styles.base,
     )];
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
     let mut x = 0_u16;
-    let visible = state
-        .snapshot
-        .windows
-        .iter()
-        .enumerate()
-        .skip(state.scroll_offset)
-        .take(state.visible_limit())
-        .collect::<Vec<_>>();
-    let hidden_before = state.scroll_offset > 0;
-    let hidden_after =
-        state.scroll_offset.saturating_add(visible.len()) < state.snapshot.windows.len();
-    if hidden_before {
-        ops.push(RenderOp::text_run(x, 0, " ‹ ", inactive_style));
-        x = x.saturating_add(3);
-    }
-    for (index, window) in visible {
-        let label = if state.editing_window_id == Some(window.id) {
-            format!(
-                " [{}] ",
-                truncate_to_width(
-                    &state.edit_buffer,
-                    usize::from(state.settings.maximum_label_width)
-                )
-            )
-        } else {
-            format!(" {} ", tab_label(&state.settings, window, index))
-        };
-        let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str()))
+    for segment in projected.segments {
+        let width = u16::try_from(unicode_width::UnicodeWidthStr::width(segment.text.as_str()))
             .unwrap_or(u16::MAX);
-        let fact = state
-            .settings
-            .show_compact_facts
-            .then(|| compact_fact(window))
-            .flatten();
-        let style = if let Some(fact) = fact {
-            compact_fact_style(
-                fact.role,
-                if window.active {
-                    active_style
-                } else {
-                    inactive_style
-                },
-            )
-        } else if window.active {
-            active_style
-        } else if state.hovered_window_id == Some(window.id) {
-            inactive_style
-                .named_foreground(RenderNamedColor::BrightWhite)
-                .named_background(RenderNamedColor::Blue)
-        } else {
-            inactive_style
-        };
-        ops.push(RenderOp::text_run(x, 0, label, style));
-        regions.push(
-            PluginSurfaceRegion::new(
-                format!("window:{}", window.id),
-                ExtensionRect::new(x, 0, width, state.settings.height),
-            )
-            .endpoint(bmux_plugin::AttachInputEndpoint {
-                capability: "bmux.tab_strip.input".to_string(),
-                interface_id: "presentation-input".to_string(),
-                operation: "handle-input".to_string(),
-            })
-            .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
-        );
-        x = x.saturating_add(width);
-    }
-    if hidden_after {
-        ops.push(RenderOp::text_run(x, 0, " › ", inactive_style));
-    }
-    if let Some(target) = state.menu_window_id {
-        let menu_style = RenderStyle::new()
-            .named_foreground(RenderNamedColor::BrightWhite)
-            .named_background(RenderNamedColor::Black);
-        let selected_style = menu_style.named_background(RenderNamedColor::Blue).bold();
-        let menu_x = visible_window_start(state, target).unwrap_or(0);
-        let mut menu_x = menu_x;
-        for (index, label) in ["Switch", "Rename", "Close"].iter().enumerate() {
-            let text = format!(" {label} ");
+        if !segment.text.is_empty() {
             ops.push(RenderOp::text_run(
-                menu_x,
+                x,
                 0,
-                &text,
-                if index == state.menu_selected {
-                    selected_style
-                } else {
-                    menu_style
-                },
+                segment.text,
+                styles.for_kind(segment.kind),
             ));
-            menu_x = menu_x.saturating_add(
-                u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str()))
-                    .unwrap_or(u16::MAX),
+        }
+        if let Some(window_id) = segment.window_id {
+            regions.push(
+                PluginSurfaceRegion::new(
+                    format!("window:{window_id}"),
+                    ExtensionRect::new(x, 0, width, state.settings.height),
+                )
+                .endpoint(bmux_plugin::AttachInputEndpoint {
+                    capability: "bmux.tab_strip.input".to_string(),
+                    interface_id: "presentation-input".to_string(),
+                    operation: "handle-input".to_string(),
+                })
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
             );
         }
+        x = x.saturating_add(width);
     }
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
@@ -711,27 +745,6 @@ fn update_scroll(event: &AttachInputEvent) -> bool {
     companion.scroll_offset = next;
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
-}
-
-fn visible_window_start(state: &CompanionState, target: Uuid) -> Option<u16> {
-    let mut x = if state.scroll_offset > 0 { 3 } else { 0 };
-    for (index, window) in state
-        .snapshot
-        .windows
-        .iter()
-        .enumerate()
-        .skip(state.scroll_offset)
-        .take(state.visible_limit())
-    {
-        if window.id == target {
-            return Some(x);
-        }
-        let label = format!(" {} ", tab_label(&state.settings, window, index));
-        x = x.saturating_add(
-            u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str())).ok()?,
-        );
-    }
-    None
 }
 
 fn visible_window_at_col(state: &CompanionState, col: u16) -> Option<Uuid> {
@@ -1252,6 +1265,7 @@ bar_bg = "#112233"
             session_label: Some("session".to_string()),
             session_count: 2,
             context_label: Some("context".to_string()),
+            viewport_cols: 80,
         });
         assert!(state.revision > initial_revision);
         assert_eq!(state.local_presentation.mode_label, "SCROLL");
@@ -1285,8 +1299,17 @@ bar_bg = "#112233"
         let before = build_surface(&state, 1);
         state.hovered_window_id = Some(second);
         let after = build_surface(&state, 2);
-        assert_eq!(before.ops[1], after.ops[1]);
-        assert_ne!(before.ops[2], after.ops[2]);
+        let before_second = before
+            .ops
+            .iter()
+            .find(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains("two")))
+            .expect("second tab operation");
+        let after_second = after
+            .ops
+            .iter()
+            .find(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains("two")))
+            .expect("hovered second tab operation");
+        assert_ne!(before_second, after_second);
     }
 
     #[test]
@@ -1319,7 +1342,7 @@ bar_bg = "#112233"
             surface
                 .ops
                 .iter()
-                .any(|op| matches!(op, RenderOp::TextRun { text, .. } if text == " ‹ "))
+                .any(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains('◀')))
         );
     }
 
@@ -1352,7 +1375,7 @@ bar_bg = "#112233"
     #[test]
     fn compact_fact_style_maps_warning_role() {
         assert_eq!(
-            compact_fact_style(PresentationFactRole::Warning, RenderStyle::new()).fg,
+            compact_fact_style(PresentationFactRole::Warning, RenderStyle::new(),).fg,
             Some(bmux_plugin::RenderColor::Named(
                 RenderNamedColor::BrightYellow
             ))

@@ -29,6 +29,9 @@ pub struct AttachLocalPresentationSnapshot {
     pub session_label: Option<String>,
     pub session_count: u32,
     pub context_label: Option<String>,
+    /// Current terminal width in cells. Layout-owning companions use this for
+    /// width-aware retained projection; zero means no usable viewport yet.
+    pub viewport_cols: u16,
 }
 
 impl AttachLocalPresentationSnapshot {
@@ -45,6 +48,7 @@ impl AttachLocalPresentationSnapshot {
             session_label: None,
             session_count: 0,
             context_label: None,
+            viewport_cols: 0,
         }
     }
 }

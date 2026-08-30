@@ -4023,13 +4023,14 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         // ── Post-event processing: layout, output fetch, render ──────
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
+        let geometry = terminal.geometry();
         publish_attach_local_presentation(
             &mut view_state,
             &attach_keymap,
             follow_target_id,
             global,
+            geometry.cols,
         );
-        let geometry = terminal.geometry();
         super::local_presentation::publish_notification(
             view_state.transient_status.as_deref(),
             geometry.cols,
@@ -7081,6 +7082,7 @@ fn publish_attach_local_presentation(
     keymap: &Keymap,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
+    viewport_cols: u16,
 ) {
     let zoomed = view_state
         .cached_layout_state
@@ -7145,6 +7147,7 @@ fn publish_attach_local_presentation(
         session_label: Some(session_label),
         session_count: u32::try_from(session_count).unwrap_or(u32::MAX),
         context_label: Some(context_label),
+        viewport_cols,
     };
     let _ = bmux_plugin::global_event_bus()
         .publish_state(&ATTACH_LOCAL_PRESENTATION_STATE_KIND, snapshot);
