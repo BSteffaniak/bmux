@@ -245,6 +245,10 @@ pub struct AttachViewState {
     pub can_write: bool,
     pub bracketed_paste_enabled: bool,
     pub ui_mode: AttachUiMode,
+    /// Revision of the last attach-local presentation snapshot published for
+    /// this view. Kept per attach so independent/repeated attaches never share
+    /// process-global revision state.
+    pub local_presentation_revision: u64,
     pub active_mode_id: String,
     /// Per-pane scrollback view positions. A pane is in scrollback if and only
     /// if it has an entry here, so the state cannot follow focus between panes.
@@ -570,6 +574,7 @@ impl AttachViewState {
             can_write: attach_info.can_write,
             bracketed_paste_enabled: false,
             ui_mode: AttachUiMode::Normal,
+            local_presentation_revision: 0,
             active_mode_id: "normal".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
             scrollback_replay_pending: false,

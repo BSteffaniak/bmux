@@ -3,6 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+mod settings;
+
+use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
     global_plugin_layout_registry,
@@ -29,6 +32,8 @@ const OWNER: &str = "bmux.tab_strip";
 const LAYOUT_ID: &str = "strip";
 const SURFACE_ID: &str = "strip";
 const RETAINED_ID: Uuid = Uuid::from_u128(0x626d_7578_5f74_6162_5f73_7472_6970_0001);
+const ATTACH_LOCAL_PRESENTATION_STATE_KIND: bmux_plugin_sdk::PluginEventKind =
+    bmux_plugin_sdk::PluginEventKind::from_static("bmux.attach/local-presentation");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -36,16 +41,111 @@ enum Placement {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preset {
+    TabRail,
+    Minimal,
+    Classic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Density {
+    Compact,
+    Cozy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverflowStyle {
+    Count,
+    Arrows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveAlignment {
+    KeepVisible,
+    FocusBias,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparatorSet {
+    AngledSegments,
+    Plain,
+    Ascii,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabScope {
+    AllContexts,
+    SessionContexts,
+    Mru,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabOrder {
+    Stable,
+    Mru,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintPolicy {
+    Always,
+    ScrollOnly,
+    Never,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ColorSettings {
+    bar_bg: Option<String>,
+    bar_fg: Option<String>,
+    tab_active_bg: Option<String>,
+    tab_active_fg: Option<String>,
+    tab_inactive_bg: Option<String>,
+    tab_inactive_fg: Option<String>,
+    tab_hover_bg: Option<String>,
+    tab_hover_fg: Option<String>,
+    tab_active_hover_bg: Option<String>,
+    tab_active_hover_fg: Option<String>,
+    module_bg: Option<String>,
+    module_fg: Option<String>,
+    overflow_bg: Option<String>,
+    overflow_fg: Option<String>,
+}
+
+#[allow(clippy::struct_excessive_bools)] // Independent legacy-compatible visibility and emphasis settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
     placement: Placement,
     height: u16,
     order: i32,
-    show_index: bool,
-    label_template: String,
+    preset: Preset,
+    density: Density,
+    left_padding: usize,
+    right_padding: usize,
+    tab_gap: usize,
+    module_gap: usize,
+    overflow_style: OverflowStyle,
+    align_active: ActiveAlignment,
+    separator_set: SeparatorSet,
+    prefer_unicode: bool,
+    force_ascii: bool,
+    dim_inactive: bool,
+    bold_active: bool,
+    underline_active: bool,
+    maximum_visible_tabs: Option<usize>,
     maximum_label_width: u16,
-    maximum_visible_tabs: usize,
+    label_template: String,
+    tab_scope: TabScope,
+    tab_order: TabOrder,
+    show_session_name: bool,
+    show_context_name: bool,
+    show_mode: bool,
+    show_role: bool,
+    show_follow: bool,
+    show_hint: bool,
+    hover_highlight: bool,
+    hint_policy: HintPolicy,
     show_compact_facts: bool,
+    colors: ColorSettings,
 }
 
 impl Default for Settings {
@@ -54,91 +154,42 @@ impl Default for Settings {
             placement: Placement::Bottom,
             height: 1,
             order: 100,
-            show_index: true,
-            label_template: "{index}{name}".to_string(),
-            maximum_label_width: 32,
-            maximum_visible_tabs: 8,
+            preset: Preset::TabRail,
+            density: Density::Cozy,
+            left_padding: 1,
+            right_padding: 1,
+            tab_gap: 1,
+            module_gap: 1,
+            overflow_style: OverflowStyle::Arrows,
+            align_active: ActiveAlignment::KeepVisible,
+            separator_set: SeparatorSet::AngledSegments,
+            prefer_unicode: true,
+            force_ascii: false,
+            dim_inactive: true,
+            bold_active: true,
+            underline_active: false,
+            maximum_visible_tabs: None,
+            maximum_label_width: 20,
+            label_template: "{name}".to_string(),
+            tab_scope: TabScope::AllContexts,
+            tab_order: TabOrder::Stable,
+            show_session_name: false,
+            show_context_name: false,
+            show_mode: true,
+            show_role: true,
+            show_follow: true,
+            show_hint: true,
+            hover_highlight: true,
+            hint_policy: HintPolicy::ScrollOnly,
             show_compact_facts: false,
+            colors: ColorSettings::default(),
         }
     }
 }
 
 impl Settings {
     fn parse(value: Option<&toml::Value>) -> Result<Self, PluginCommandError> {
-        let mut settings = Self::default();
-        let Some(table) = value.and_then(toml::Value::as_table) else {
-            return Ok(settings);
-        };
-        if let Some(placement) = table.get("placement").and_then(toml::Value::as_str) {
-            settings.placement = match placement {
-                "top" => Placement::Top,
-                "bottom" => Placement::Bottom,
-                other => {
-                    return Err(PluginCommandError::invalid_arguments(format!(
-                        "bmux.tab_strip placement must be 'top' or 'bottom', got {other:?}"
-                    )));
-                }
-            };
-        }
-        if let Some(height) = table.get("height").and_then(toml::Value::as_integer) {
-            settings.height = u16::try_from(height)
-                .ok()
-                .filter(|height| (1..=4).contains(height))
-                .ok_or_else(|| {
-                    PluginCommandError::invalid_arguments(
-                        "bmux.tab_strip height must be between 1 and 4",
-                    )
-                })?;
-        }
-        if let Some(order) = table.get("order").and_then(toml::Value::as_integer) {
-            settings.order = i32::try_from(order).map_err(|_| {
-                PluginCommandError::invalid_arguments("bmux.tab_strip order must fit in an i32")
-            })?;
-        }
-        if let Some(show_index) = table.get("show_index").and_then(toml::Value::as_bool) {
-            settings.show_index = show_index;
-        }
-        if let Some(template) = table.get("label_template").and_then(toml::Value::as_str) {
-            if template.len() > 4_096 {
-                return Err(PluginCommandError::invalid_arguments(
-                    "bmux.tab_strip label_template must not exceed 4096 bytes",
-                ));
-            }
-            settings.label_template = template.to_string();
-        }
-        if let Some(width) = table
-            .get("maximum_label_width")
-            .and_then(toml::Value::as_integer)
-        {
-            settings.maximum_label_width = u16::try_from(width)
-                .ok()
-                .filter(|width| *width > 0)
-                .ok_or_else(|| {
-                    PluginCommandError::invalid_arguments(
-                        "bmux.tab_strip maximum_label_width must be positive",
-                    )
-                })?;
-        }
-        if let Some(count) = table
-            .get("maximum_visible_tabs")
-            .and_then(toml::Value::as_integer)
-        {
-            settings.maximum_visible_tabs = usize::try_from(count)
-                .ok()
-                .filter(|count| *count > 0 && *count <= 1_024)
-                .ok_or_else(|| {
-                    PluginCommandError::invalid_arguments(
-                        "bmux.tab_strip maximum_visible_tabs must be between 1 and 1024",
-                    )
-                })?;
-        }
-        if let Some(show_facts) = table
-            .get("show_compact_facts")
-            .and_then(toml::Value::as_bool)
-        {
-            settings.show_compact_facts = show_facts;
-        }
-        Ok(settings)
+        settings::parse_settings(value)
     }
 }
 
@@ -155,10 +206,11 @@ struct CompanionState {
     edit_buffer: String,
     menu_window_id: Option<Uuid>,
     menu_selected: usize,
+    local_presentation: AttachLocalPresentationSnapshot,
 }
 
 impl CompanionState {
-    const fn new(settings: Settings) -> Self {
+    fn new(settings: Settings) -> Self {
         Self {
             settings,
             revision: 0,
@@ -174,17 +226,19 @@ impl CompanionState {
             edit_buffer: String::new(),
             menu_window_id: None,
             menu_selected: 0,
+            local_presentation: AttachLocalPresentationSnapshot::initial(),
         }
+    }
+
+    fn visible_limit(&self) -> usize {
+        self.settings.maximum_visible_tabs.unwrap_or(usize::MAX)
     }
 
     fn replace_windows(&mut self, snapshot: windows_list::WindowListSnapshot) {
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
-            let maximum_offset = self
-                .snapshot
-                .windows
-                .len()
-                .saturating_sub(self.settings.maximum_visible_tabs);
+            let visible_limit = self.visible_limit();
+            let maximum_offset = self.snapshot.windows.len().saturating_sub(visible_limit);
             self.scroll_offset = self.scroll_offset.min(maximum_offset);
             if let Some(active) = self
                 .snapshot
@@ -194,16 +248,17 @@ impl CompanionState {
             {
                 if active < self.scroll_offset {
                     self.scroll_offset = active;
-                } else if active
-                    >= self
-                        .scroll_offset
-                        .saturating_add(self.settings.maximum_visible_tabs)
-                {
-                    self.scroll_offset = active
-                        .saturating_add(1)
-                        .saturating_sub(self.settings.maximum_visible_tabs);
+                } else if active >= self.scroll_offset.saturating_add(visible_limit) {
+                    self.scroll_offset = active.saturating_add(1).saturating_sub(visible_limit);
                 }
             }
+            self.revision = self.revision.saturating_add(1).max(1);
+        }
+    }
+
+    fn replace_local_presentation(&mut self, snapshot: AttachLocalPresentationSnapshot) {
+        if self.local_presentation != snapshot {
+            self.local_presentation = snapshot;
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -280,7 +335,14 @@ pub fn start() -> Result<(), String> {
     let (initial, mut receiver) = bmux_plugin::global_event_bus()
         .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
         .map_err(|error| format!("subscribing to windows list: {error}"))?;
+    let (initial_local_presentation, mut local_presentation_receiver) =
+        bmux_plugin::global_event_bus()
+            .subscribe_state::<AttachLocalPresentationSnapshot>(
+                &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+            )
+            .map_err(|error| format!("subscribing to attach-local presentation: {error}"))?;
     publish(initial.as_ref().clone())?;
+    publish_local_presentation(initial_local_presentation.as_ref().clone())?;
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("tab-strip companion requires an async runtime: {error}"))?;
     handle.spawn(async move {
@@ -288,6 +350,17 @@ pub fn start() -> Result<(), String> {
             let snapshot = receiver.borrow_and_update().as_ref().clone();
             if let Err(error) = publish(snapshot) {
                 tracing::warn!(%error, "tab-strip publication failed");
+            }
+        }
+    });
+    handle.spawn(async move {
+        while local_presentation_receiver.changed().await.is_ok() {
+            let snapshot = local_presentation_receiver
+                .borrow_and_update()
+                .as_ref()
+                .clone();
+            if let Err(error) = publish_local_presentation(snapshot) {
+                tracing::warn!(%error, "tab-strip local presentation publication failed");
             }
         }
     });
@@ -327,6 +400,22 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
     companion.replace_windows(snapshot);
     let revision = companion.revision.max(1);
     let surface = build_surface(companion, revision);
+    publish_surface(revision, &surface)
+}
+
+#[allow(clippy::significant_drop_tightening)] // The state lock must cover projection so snapshot fields remain coherent.
+fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Result<(), String> {
+    let (revision, surface) = {
+        let mut guard = state()
+            .lock()
+            .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+        let Some(companion) = guard.as_mut() else {
+            return Ok(());
+        };
+        companion.replace_local_presentation(snapshot);
+        let revision = companion.revision.max(1);
+        (revision, build_surface(companion, revision))
+    };
     publish_surface(revision, &surface)
 }
 
@@ -413,12 +502,14 @@ fn component_label(id: &str, label: &str) -> String {
 
 fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index: usize) -> String {
     const INDEX_TOKEN: &str = concat!("{", "index}");
+    const INDEX0_TOKEN: &str = concat!("{", "index0}");
+    const SESSION_TOKEN: &str = concat!("{", "session}");
+    const MARKER_TOKEN: &str = concat!("{", "marker}");
     const FACT_TOKEN: &str = concat!("{", "fact}");
-    let index = if settings.show_index {
-        format!("{}:", index.saturating_add(1))
-    } else {
-        String::new()
-    };
+    let display_index = index.saturating_add(1).to_string();
+    let zero_index = index.to_string();
+    let marker = if window.active { "*" } else { "" };
+    let session = "";
     let fact = settings
         .show_compact_facts
         .then(|| compact_fact(window))
@@ -427,8 +518,11 @@ fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index:
         .label_template
         .replace("{{", "\u{0}")
         .replace("}}", "\u{1}")
-        .replace(INDEX_TOKEN, &index)
+        .replace(INDEX_TOKEN, &display_index)
+        .replace(INDEX0_TOKEN, &zero_index)
         .replace("{name}", &window.name)
+        .replace(SESSION_TOKEN, session)
+        .replace(MARKER_TOKEN, marker)
         .replace("{id}", &window.id.to_string())
         .replace("{active}", if window.active { "active" } else { "idle" })
         .replace(
@@ -465,7 +559,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         .iter()
         .enumerate()
         .skip(state.scroll_offset)
-        .take(state.settings.maximum_visible_tabs)
+        .take(state.visible_limit())
         .collect::<Vec<_>>();
     let hidden_before = state.scroll_offset > 0;
     let hidden_after =
@@ -605,7 +699,7 @@ fn update_scroll(event: &AttachInputEvent) -> bool {
         .snapshot
         .windows
         .len()
-        .saturating_sub(companion.settings.maximum_visible_tabs);
+        .saturating_sub(companion.visible_limit());
     let next = if event.wheel_delta > 0 {
         companion.scroll_offset.saturating_sub(1)
     } else {
@@ -627,7 +721,7 @@ fn visible_window_start(state: &CompanionState, target: Uuid) -> Option<u16> {
         .iter()
         .enumerate()
         .skip(state.scroll_offset)
-        .take(state.settings.maximum_visible_tabs)
+        .take(state.visible_limit())
     {
         if window.id == target {
             return Some(x);
@@ -648,7 +742,7 @@ fn visible_window_at_col(state: &CompanionState, col: u16) -> Option<Uuid> {
         .iter()
         .enumerate()
         .skip(state.scroll_offset)
-        .take(state.settings.maximum_visible_tabs)
+        .take(state.visible_limit())
     {
         let label = format!(" {} ", tab_label(&state.settings, window, index));
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str())).ok()?;
@@ -1080,24 +1174,50 @@ mod tests {
     }
 
     #[test]
-    fn settings_validate_placement_and_height() {
-        let settings: toml::Value =
-            toml::from_str("placement = 'bottom'\nheight = 2\nshow_index = false").unwrap();
-        assert_eq!(
-            Settings::parse(Some(&settings)).unwrap(),
-            Settings {
-                placement: Placement::Bottom,
-                height: 2,
-                order: 100,
-                show_index: false,
-                label_template: "{index}{name}".to_string(),
-                maximum_label_width: 32,
-                maximum_visible_tabs: 8,
-                show_compact_facts: false,
-            }
-        );
+    fn settings_validate_legacy_defaults_aliases_and_nested_values() {
+        let value: toml::Value = toml::from_str(
+            r##"
+placement = "bottom"
+height = 2
+show_index = true
+maximum_visible_tabs = 8
+show_mode = false
+hint_policy = "always"
+
+[layout]
+density = "compact"
+overflow_style = "count"
+align_active = "focus_bias"
+
+[style]
+separator_set = "ascii"
+force_ascii = true
+
+[colors]
+bar_bg = "#112233"
+"##,
+        )
+        .unwrap();
+        let settings = Settings::parse(Some(&value)).unwrap();
+        assert_eq!(settings.placement, Placement::Bottom);
+        assert_eq!(settings.height, 2);
+        assert_eq!(settings.label_template, "{index}:{name}");
+        assert_eq!(settings.maximum_visible_tabs, Some(8));
+        assert_eq!(settings.maximum_label_width, 20);
+        assert!(!settings.show_mode);
+        assert_eq!(settings.hint_policy, HintPolicy::Always);
+        assert_eq!(settings.density, Density::Compact);
+        assert_eq!(settings.overflow_style, OverflowStyle::Count);
+        assert_eq!(settings.align_active, ActiveAlignment::FocusBias);
+        assert_eq!(settings.separator_set, SeparatorSet::Ascii);
+        assert!(settings.force_ascii);
+        assert_eq!(settings.colors.bar_bg.as_deref(), Some("#112233"));
+
         let invalid: toml::Value = toml::from_str("height = 0").unwrap();
         assert!(Settings::parse(Some(&invalid)).is_err());
+        let invalid_color: toml::Value =
+            toml::from_str("[colors]\nbar_bg = 'not-a-color'").unwrap();
+        assert!(Settings::parse(Some(&invalid_color)).is_err());
     }
 
     #[test]
@@ -1110,10 +1230,32 @@ mod tests {
             workspace_id: uuid::Uuid::nil(),
         };
         let settings = Settings {
+            label_template: "{index}:{name}".to_string(),
             maximum_label_width: 5,
             ..Settings::default()
         };
         assert_eq!(tab_label(&settings, &window, 0), "1:界");
+    }
+
+    #[test]
+    fn local_presentation_updates_advance_retained_projection() {
+        let mut state = CompanionState::new(Settings::default());
+        let initial_revision = state.revision;
+        state.replace_local_presentation(AttachLocalPresentationSnapshot {
+            revision: 1,
+            mode_id: "scroll".to_string(),
+            mode_label: "SCROLL".to_string(),
+            role_label: "read-only".to_string(),
+            follow_label: Some("following abcdef12".to_string()),
+            mode_modifier: Some("FROZEN".to_string()),
+            hint: "scroll hint".to_string(),
+            session_label: Some("session".to_string()),
+            session_count: 2,
+            context_label: Some("context".to_string()),
+        });
+        assert!(state.revision > initial_revision);
+        assert_eq!(state.local_presentation.mode_label, "SCROLL");
+        assert_eq!(state.local_presentation.role_label, "read-only");
     }
 
     #[test]
@@ -1150,7 +1292,7 @@ mod tests {
     #[test]
     fn overflow_window_keeps_active_tab_visible_and_bounded() {
         let settings = Settings {
-            maximum_visible_tabs: 2,
+            maximum_visible_tabs: Some(2),
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
@@ -1184,7 +1326,7 @@ mod tests {
     #[test]
     fn visible_window_lookup_accounts_for_overflow_marker() {
         let settings = Settings {
-            maximum_visible_tabs: 2,
+            maximum_visible_tabs: Some(2),
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);

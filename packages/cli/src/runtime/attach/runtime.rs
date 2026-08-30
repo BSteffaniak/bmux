@@ -22,7 +22,7 @@ use bmux_attach_pipeline::{
     retained_surfaces_from_attach_scene, retained_surfaces_from_plugin_surfaces,
     update_protocol_hints_from_state,
 };
-use bmux_attach_view_protocol::AttachViewComponent;
+use bmux_attach_view_protocol::{AttachLocalPresentationSnapshot, AttachViewComponent};
 use bmux_client::{
     AttachContinuityValidator, AttachControlValidator, AttachInputPayload, AttachLayoutState,
     AttachMouseButton as ProviderMouseButton, AttachMouseInput as ProviderMouseInput,
@@ -413,6 +413,10 @@ use super::super::{
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
 use super::display_capture;
+
+const ATTACH_LOCAL_PRESENTATION_STATE_KIND: bmux_plugin_sdk::PluginEventKind =
+    bmux_plugin_sdk::PluginEventKind::from_static("bmux.attach/local-presentation");
+
 use super::events::{AttachLoopControl, AttachLoopEvent, AttachTerminalEvent};
 use super::input::{
     TerminalGeometry, TerminalInputEvent, TerminalKeyEvent, TerminalMouseButton,
@@ -3534,6 +3538,11 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     //
     // Re-registration is a no-op, so harmless if this runs twice.
     let _ = bmux_plugin::global_event_bus()
+        .register_state_channel::<AttachLocalPresentationSnapshot>(
+            ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+            AttachLocalPresentationSnapshot::initial(),
+        );
+    let _ = bmux_plugin::global_event_bus()
         .register_state_channel::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
         bmux_windows_plugin_api::windows_list::STATE_KIND,
         bmux_windows_plugin_api::windows_list::WindowListSnapshot {
@@ -4014,6 +4023,12 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         // ── Post-event processing: layout, output fetch, render ──────
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
+        publish_attach_local_presentation(
+            &mut view_state,
+            &attach_keymap,
+            follow_target_id,
+            global,
+        );
         let geometry = terminal.geometry();
         super::local_presentation::publish_notification(
             view_state.transient_status.as_deref(),
@@ -7059,6 +7074,80 @@ fn is_windows_close_active_pane_action(action: &RuntimeAction) -> bool {
             ..
         } if is_windows_close_active_pane_command(plugin_id, command_name)
     )
+}
+
+fn publish_attach_local_presentation(
+    view_state: &mut AttachViewState,
+    keymap: &Keymap,
+    follow_target_id: Option<Uuid>,
+    follow_global: bool,
+) {
+    let zoomed = view_state
+        .cached_layout_state
+        .as_ref()
+        .is_some_and(|state| state.zoomed);
+    let scrollback_active = view_state.scrollback_active();
+    let mode_label = if view_state.help_overlay_open {
+        "HELP".to_string()
+    } else if view_state.prompt.is_active() {
+        "PROMPT".to_string()
+    } else if scrollback_active {
+        "SCROLL".to_string()
+    } else if zoomed {
+        "ZOOM".to_string()
+    } else {
+        view_state.active_mode_id.to_ascii_uppercase()
+    };
+    let (session_label, session_count) = resolve_attach_session_label_and_count_from_catalog(
+        &view_state.cached_sessions,
+        view_state.attached_id,
+    );
+    let context_label = resolve_attach_context_label_from_catalog(
+        &view_state.cached_contexts,
+        &view_state.cached_context_session_bindings,
+        view_state.attached_context_id,
+        view_state.attached_id,
+    );
+    let follow_label = follow_target_id.map(|id| {
+        if follow_global {
+            format!("following {} (global)", short_uuid(id))
+        } else {
+            format!("following {}", short_uuid(id))
+        }
+    });
+    let mode_modifier = scrollback_active
+        .then(|| view_state.focused_scrollback())
+        .flatten()
+        .and_then(|view| view.pin.map(|_| "FROZEN".to_string()));
+    let hint = view_state.transient_status.clone().unwrap_or_else(|| {
+        let help =
+            key_hint_or_unbound(keymap, &view_state.active_mode_id, &RuntimeAction::ShowHelp);
+        let detach =
+            key_hint_or_unbound(keymap, &view_state.active_mode_id, &RuntimeAction::Detach);
+        format!("{help} help | {detach} detach")
+    });
+    view_state.local_presentation_revision = view_state
+        .local_presentation_revision
+        .saturating_add(1)
+        .max(1);
+    let snapshot = AttachLocalPresentationSnapshot {
+        revision: view_state.local_presentation_revision,
+        mode_id: view_state.active_mode_id.clone(),
+        mode_label,
+        role_label: if view_state.can_write {
+            "write".to_string()
+        } else {
+            "read-only".to_string()
+        },
+        follow_label,
+        mode_modifier,
+        hint,
+        session_label: Some(session_label),
+        session_count: u32::try_from(session_count).unwrap_or(u32::MAX),
+        context_label: Some(context_label),
+    };
+    let _ = bmux_plugin::global_event_bus()
+        .publish_state(&ATTACH_LOCAL_PRESENTATION_STATE_KIND, snapshot);
 }
 
 pub fn initial_attach_status(keymap: &Keymap, mode_id: &str, can_write: bool) -> String {

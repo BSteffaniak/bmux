@@ -216,6 +216,7 @@ default = [
 fail-on-warnings = [
     "bmux_cli_schema/fail-on-warnings",
     "bmux_appearance/fail-on-warnings",
+    "bmux_attach_view_protocol/fail-on-warnings",
     "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_attach_pipeline/fail-on-warnings",
     "bmux_client/fail-on-warnings",

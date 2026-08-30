@@ -2433,6 +2433,7 @@ dependencies = [
 name = "bmux_tab_strip_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "bmux_attach_view_protocol",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
