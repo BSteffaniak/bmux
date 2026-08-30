@@ -11,6 +11,7 @@ use bmux_attach_pipeline::{
     FrameDamage, RetainedCompositor, RetainedFocusState, RetainedPointerRouter,
     TerminalGraphicsCache,
 };
+use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
 use bmux_client::AttachLayoutState;
 use bmux_config::MouseBehaviorConfig;
 use bmux_control_catalog_plugin_api::control_catalog_state::{
@@ -245,10 +246,9 @@ pub struct AttachViewState {
     pub can_write: bool,
     pub bracketed_paste_enabled: bool,
     pub ui_mode: AttachUiMode,
-    /// Revision of the last attach-local presentation snapshot published for
-    /// this view. Kept per attach so independent/repeated attaches never share
-    /// process-global revision state.
-    pub local_presentation_revision: u64,
+    /// Last client-local presentation snapshot published by this attach. The
+    /// revision advances only when semantic presentation state changes.
+    pub local_presentation: Option<AttachLocalPresentationSnapshot>,
     pub active_mode_id: String,
     /// Per-pane scrollback view positions. A pane is in scrollback if and only
     /// if it has an entry here, so the state cannot follow focus between panes.
@@ -574,7 +574,7 @@ impl AttachViewState {
             can_write: attach_info.can_write,
             bracketed_paste_enabled: false,
             ui_mode: AttachUiMode::Normal,
-            local_presentation_revision: 0,
+            local_presentation: None,
             active_mode_id: "normal".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
             scrollback_replay_pending: false,

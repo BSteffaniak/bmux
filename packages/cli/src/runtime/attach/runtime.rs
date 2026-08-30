@@ -3635,8 +3635,10 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
     let _prompt_host_guard = prompt::register_host(prompt_host_tx);
+    let mut prompt_host_open = true;
     let (action_dispatch_tx, mut action_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
     let _action_dispatch_guard = action_dispatch::register_host(action_dispatch_tx);
+    let mut action_dispatch_open = true;
     // Default exit reason; always overwritten before the loop breaks, but the
     // compiler cannot prove this through the tokio::select! macro expansion.
     #[allow(unused_assignments)]
@@ -3839,7 +3841,13 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 }
             }
 
-            prompt_request = prompt_host_rx.recv() => {
+            prompt_request = async {
+                if prompt_host_open {
+                    prompt_host_rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
                 if let Some(prompt_request) = prompt_request {
                     perf_window.record_wake(AttachWakeSource::Prompt);
                     view_state.mouse.clear_pointer_gestures();
@@ -3847,10 +3855,18 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                     view_state
                         .dirty
                         .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
+                } else {
+                    prompt_host_open = false;
                 }
             }
 
-            dispatch_request = action_dispatch_rx.recv() => {
+            dispatch_request = async {
+                if action_dispatch_open {
+                    action_dispatch_rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
                 if let Some(dispatch_request) = dispatch_request {
                     perf_window.record_wake(AttachWakeSource::ActionDispatch);
                     match handle_attach_loop_event(
@@ -3873,6 +3889,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                             break;
                         }
                     }
+                } else {
+                    action_dispatch_open = false;
                 }
             }
 
@@ -7108,14 +7126,14 @@ fn snapshot_mode_id(view_state: &AttachViewState, zoomed: bool) -> String {
     }
 }
 
-fn publish_attach_local_presentation(
-    view_state: &mut AttachViewState,
+fn build_attach_local_presentation_snapshot(
+    view_state: &AttachViewState,
     keymap: &Keymap,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     viewport_cols: u16,
     runtime_appearance: &RuntimeAppearance,
-) {
+) -> AttachLocalPresentationSnapshot {
     let zoomed = view_state
         .cached_layout_state
         .as_ref()
@@ -7160,13 +7178,9 @@ fn publish_attach_local_presentation(
             key_hint_or_unbound(keymap, &view_state.active_mode_id, &RuntimeAction::Detach);
         format!("{help} help | {detach} detach")
     });
-    view_state.local_presentation_revision = view_state
-        .local_presentation_revision
-        .saturating_add(1)
-        .max(1);
     let resolved_appearance = runtime_appearance.for_mode(&snapshot_mode_id(view_state, zoomed));
-    let snapshot = AttachLocalPresentationSnapshot {
-        revision: view_state.local_presentation_revision,
+    AttachLocalPresentationSnapshot {
+        revision: 0,
         mode_id: view_state.active_mode_id.clone(),
         mode_label,
         role_label: if view_state.can_write {
@@ -7187,7 +7201,42 @@ fn publish_attach_local_presentation(
         status_active: resolved_appearance.status.active_window,
         status_mode: resolved_appearance.status.mode_indicator,
         viewport_cols,
-    };
+    }
+}
+
+fn publish_attach_local_presentation(
+    view_state: &mut AttachViewState,
+    keymap: &Keymap,
+    follow_target_id: Option<Uuid>,
+    follow_global: bool,
+    viewport_cols: u16,
+    runtime_appearance: &RuntimeAppearance,
+) {
+    let semantic_snapshot = build_attach_local_presentation_snapshot(
+        view_state,
+        keymap,
+        follow_target_id,
+        follow_global,
+        viewport_cols,
+        runtime_appearance,
+    );
+    if view_state
+        .local_presentation
+        .as_ref()
+        .is_some_and(|previous| {
+            let mut previous = previous.clone();
+            previous.revision = 0;
+            previous == semantic_snapshot
+        })
+    {
+        return;
+    }
+    let mut snapshot = semantic_snapshot;
+    snapshot.revision = view_state
+        .local_presentation
+        .as_ref()
+        .map_or(1, |previous| previous.revision.saturating_add(1).max(1));
+    view_state.local_presentation = Some(snapshot.clone());
     let _ = bmux_plugin::global_event_bus()
         .publish_state(&ATTACH_LOCAL_PRESENTATION_STATE_KIND, snapshot);
 }
@@ -8295,7 +8344,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         scene_render_stats = stats;
         cursor_state
     } else {
-        view_state.last_cursor_state
+        cursor_state_before_forced_hide
     };
 
     // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
@@ -15002,6 +15051,27 @@ mod tests {
         };
 
         assert!(is_attach_stream_closed_error(&error));
+    }
+
+    #[test]
+    fn local_presentation_snapshot_ignores_revision_for_semantic_equality() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            session_id: Uuid::from_u128(1),
+            context_id: Some(Uuid::from_u128(2)),
+            can_write: true,
+        });
+        let keymap = attach_keymap_from_config(&BmuxConfig::default());
+        let appearance = RuntimeAppearance::default();
+        publish_attach_local_presentation(&mut view_state, &keymap, None, false, 80, &appearance);
+        let first = view_state.local_presentation.clone().unwrap();
+        publish_attach_local_presentation(&mut view_state, &keymap, None, false, 80, &appearance);
+        assert_eq!(view_state.local_presentation.as_ref(), Some(&first));
+
+        view_state.active_mode_id = "insert".to_string();
+        publish_attach_local_presentation(&mut view_state, &keymap, None, false, 80, &appearance);
+        let changed = view_state.local_presentation.as_ref().unwrap();
+        assert_eq!(changed.revision, first.revision + 1);
+        assert_eq!(changed.mode_label, "INSERT");
     }
 
     #[test]
