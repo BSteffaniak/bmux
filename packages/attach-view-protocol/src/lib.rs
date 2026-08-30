@@ -29,6 +29,13 @@ pub struct AttachLocalPresentationSnapshot {
     pub session_label: Option<String>,
     pub session_count: u32,
     pub context_label: Option<String>,
+    /// Resolved neutral appearance colors for the active local mode.
+    pub foreground: String,
+    pub background: String,
+    pub status_background: String,
+    pub status_foreground: String,
+    pub status_active: String,
+    pub status_mode: String,
     /// Current terminal width in cells. Layout-owning companions use this for
     /// width-aware retained projection; zero means no usable viewport yet.
     pub viewport_cols: u16,
@@ -48,6 +55,12 @@ impl AttachLocalPresentationSnapshot {
             session_label: None,
             session_count: 0,
             context_label: None,
+            foreground: "#ffffff".to_string(),
+            background: "#000000".to_string(),
+            status_background: "#1e1e1e".to_string(),
+            status_foreground: "#ffffff".to_string(),
+            status_active: "#00ff00".to_string(),
+            status_mode: "#ffff00".to_string(),
             viewport_cols: 0,
         }
     }

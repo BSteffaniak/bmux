@@ -649,7 +649,7 @@ impl RealAttachPlaybookRuntime {
     async fn send_paste(&self, text: &str) -> Result<()> {
         self.terminal
             .send_event(CrosstermEvent::Paste(text.to_string()))?;
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         Ok(())
     }
 

@@ -144,16 +144,34 @@ fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value
         bmux_cluster_plugin_client::install();
     }
     #[cfg(feature = "bundled-plugin-tab-strip")]
-    if plugin_id == "bmux.tab_strip"
-        && let Err(error) = bmux_tab_strip_plugin::install(settings)
-    {
-        tracing::warn!(%error, "failed installing tab-strip attach companion");
+    if plugin_id == "bmux.tab_strip" {
+        if let Err(error) = bmux_tab_strip_plugin::install(settings) {
+            tracing::warn!(%error, "failed installing tab-strip attach companion");
+        } else {
+            bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::new(
+                plugin_id,
+                std::sync::Arc::new(bmux_tab_strip_plugin::start),
+                std::sync::Arc::new(|| {
+                    bmux_tab_strip_plugin::uninstall();
+                    Ok(())
+                }),
+            ));
+        }
     }
     #[cfg(feature = "bundled-plugin-sidebar")]
-    if plugin_id == "bmux.sidebar"
-        && let Err(error) = bmux_sidebar_plugin::install(settings)
-    {
-        tracing::warn!(%error, "failed installing sidebar attach companion");
+    if plugin_id == "bmux.sidebar" {
+        if let Err(error) = bmux_sidebar_plugin::install(settings) {
+            tracing::warn!(%error, "failed installing sidebar attach companion");
+        } else {
+            bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::new(
+                plugin_id,
+                std::sync::Arc::new(bmux_sidebar_plugin::start),
+                std::sync::Arc::new(|| {
+                    bmux_sidebar_plugin::uninstall();
+                    Ok(())
+                }),
+            ));
+        }
     }
 }
 

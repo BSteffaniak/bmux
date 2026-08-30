@@ -24,6 +24,7 @@ pub struct ProjectedSegment {
     pub(super) text: String,
     pub(super) kind: SegmentKind,
     pub(super) window_id: Option<Uuid>,
+    pub(super) edit_cursor_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,18 @@ pub struct ProjectedBar {
 }
 
 impl ProjectedBar {
+    pub fn window_at_col(&self, col: u16) -> Option<Uuid> {
+        let mut x = 0_u16;
+        for segment in &self.segments {
+            let width = u16::try_from(UnicodeWidthStr::width(segment.text.as_str())).ok()?;
+            if col >= x && col < x.saturating_add(width) {
+                return segment.window_id;
+            }
+            x = x.saturating_add(width);
+        }
+        None
+    }
+
     #[cfg(test)]
     fn plain_text(&self) -> String {
         self.segments
@@ -47,6 +60,7 @@ struct TabToken {
     active: bool,
     hovered: bool,
     window_id: Uuid,
+    edit_cursor_offset: Option<usize>,
 }
 
 struct TabWindow {
@@ -144,11 +158,22 @@ impl RenderStyle {
     }
 }
 
+#[derive(Default)]
+pub struct ProjectionInteraction<'a> {
+    pub(super) editing_window_id: Option<Uuid>,
+    pub(super) edit_buffer: &'a str,
+    pub(super) edit_cursor: usize,
+    pub(super) menu_window_id: Option<Uuid>,
+    pub(super) menu_selected: usize,
+}
+
+#[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
 pub fn project_bar(
     settings: &Settings,
     windows: &[windows_list::WindowListEntry],
     local: &AttachLocalPresentationSnapshot,
     hovered_window_id: Option<Uuid>,
+    interaction: &ProjectionInteraction<'_>,
 ) -> ProjectedBar {
     let style = RenderStyle::from_settings(settings);
     let right = right_segments(settings, local, &style);
@@ -170,7 +195,12 @@ pub fn project_bar(
         .iter()
         .enumerate()
         .map(|(index, window)| {
-            let label = render_tab_template(settings, window, index, local);
+            let editing = interaction.editing_window_id == Some(window.id);
+            let label = if editing {
+                format!("[{}]", interaction.edit_buffer)
+            } else {
+                render_tab_template(settings, window, index, local)
+            };
             let text = style.tab(&label, window.active);
             TabToken {
                 width: UnicodeWidthStr::width(text.as_str()),
@@ -178,6 +208,14 @@ pub fn project_bar(
                 active: window.active,
                 hovered: settings.hover_highlight && hovered_window_id == Some(window.id),
                 window_id: window.id,
+                edit_cursor_offset: editing.then_some(
+                    UnicodeWidthStr::width(style.active_prefix)
+                        .saturating_add(1)
+                        .saturating_add(UnicodeWidthStr::width(
+                            &interaction.edit_buffer
+                                [..interaction.edit_cursor.min(interaction.edit_buffer.len())],
+                        )),
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -186,18 +224,26 @@ pub fn project_bar(
         text: " ".repeat(settings.left_padding),
         kind: SegmentKind::Base,
         window_id: None,
+        edit_cursor_offset: None,
     }];
     if tokens.is_empty() {
         left.push(ProjectedSegment {
             text: "[no tabs]".to_string(),
             kind: SegmentKind::Base,
             window_id: None,
+            edit_cursor_offset: None,
         });
     } else {
         append_tabs(&mut left, &tokens, &window, settings, &style);
     }
     left.extend(tail);
 
+    let minimum_spacer = usize::from(!right.is_empty());
+    let available_left = width
+        .saturating_sub(settings.right_padding)
+        .saturating_sub(right_width)
+        .saturating_sub(minimum_spacer);
+    truncate_segments(&mut left, available_left);
     let mut segments = left;
     let left_width = segments_width(&segments);
     let spacer = width
@@ -209,6 +255,7 @@ pub fn project_bar(
             text: " ".repeat(spacer),
             kind: SegmentKind::Base,
             window_id: None,
+            edit_cursor_offset: None,
         });
     }
     segments.extend(right);
@@ -217,8 +264,10 @@ pub fn project_bar(
             text: " ".repeat(settings.right_padding),
             kind: SegmentKind::Base,
             window_id: None,
+            edit_cursor_offset: None,
         });
     }
+    append_menu(&mut segments, interaction, &style);
     truncate_segments(&mut segments, width);
     let current_width = segments_width(&segments);
     if current_width < width {
@@ -226,9 +275,36 @@ pub fn project_bar(
             text: " ".repeat(width - current_width),
             kind: SegmentKind::Base,
             window_id: None,
+            edit_cursor_offset: None,
         });
     }
     ProjectedBar { segments }
+}
+
+fn append_menu(
+    segments: &mut Vec<ProjectedSegment>,
+    interaction: &ProjectionInteraction<'_>,
+    style: &RenderStyle,
+) {
+    if interaction.menu_window_id.is_none() {
+        return;
+    }
+    segments.clear();
+    for (index, label) in ["Switch", "Rename", "Close"].iter().enumerate() {
+        if index > 0 {
+            push_separator(segments, &style.module_separator);
+        }
+        segments.push(ProjectedSegment {
+            text: style.badge(label),
+            kind: if index == interaction.menu_selected {
+                SegmentKind::Mode
+            } else {
+                SegmentKind::Module
+            },
+            window_id: None,
+            edit_cursor_offset: None,
+        });
+    }
 }
 
 fn append_tabs(
@@ -245,6 +321,7 @@ fn append_tabs(
             text: style.overflow(hidden_left, settings.overflow_style),
             kind: SegmentKind::Overflow,
             window_id: None,
+            edit_cursor_offset: None,
         });
         push_separator(output, &style.tab_separator);
     }
@@ -261,6 +338,7 @@ fn append_tabs(
                 (false, false) => SegmentKind::InactiveTab,
             },
             window_id: Some(token.window_id),
+            edit_cursor_offset: token.edit_cursor_offset,
         });
     }
     if hidden_right > 0 {
@@ -269,6 +347,7 @@ fn append_tabs(
             text: style.overflow(hidden_right, settings.overflow_style),
             kind: SegmentKind::Overflow,
             window_id: None,
+            edit_cursor_offset: None,
         });
     }
 }
@@ -329,6 +408,7 @@ fn right_segments(
             text,
             kind,
             window_id: None,
+            edit_cursor_offset: None,
         });
     }
     result
@@ -348,6 +428,7 @@ fn values_to_segments(
             text,
             kind,
             window_id: None,
+            edit_cursor_offset: None,
         });
     }
     result
@@ -358,6 +439,7 @@ fn push_separator(output: &mut Vec<ProjectedSegment>, separator: &str) {
         text: separator.to_string(),
         kind: SegmentKind::Base,
         window_id: None,
+        edit_cursor_offset: None,
     });
 }
 
@@ -576,6 +658,7 @@ mod tests {
             &[window(1, "main", true)],
             &local(40),
             None,
+            &ProjectionInteraction::default(),
         );
         let text = projected.plain_text();
         assert_eq!(UnicodeWidthStr::width(text.as_str()), 40);
@@ -589,11 +672,235 @@ mod tests {
         let windows = (0..8)
             .map(|index| window(index + 1, &format!("window-{index}"), index == 7))
             .collect::<Vec<_>>();
-        let projected = project_bar(&Settings::default(), &windows, &local(40), None);
+        let projected = project_bar(
+            &Settings::default(),
+            &windows,
+            &local(40),
+            None,
+            &ProjectionInteraction::default(),
+        );
         let text = projected.plain_text();
         assert_eq!(UnicodeWidthStr::width(text.as_str()), 40);
         assert!(text.contains("window-7"));
         assert!(text.contains('◀'));
+    }
+
+    #[test]
+    fn right_module_zone_survives_every_representative_width() {
+        let windows = (0..12)
+            .map(|index| window(index + 1, &format!("window-{index}"), index == 11))
+            .collect::<Vec<_>>();
+        for width in [20, 40, 80, 120, 240] {
+            let projected = project_bar(
+                &Settings::default(),
+                &windows,
+                &local(width),
+                None,
+                &ProjectionInteraction::default(),
+            );
+            let text = projected.plain_text();
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), usize::from(width));
+            assert!(text.contains("NORMAL"), "width {width}: {text:?}");
+            assert!(text.contains("write"), "width {width}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn local_modes_follow_hint_policy_and_optional_modules() {
+        let settings = Settings {
+            show_session_name: true,
+            show_context_name: true,
+            ..Settings::default()
+        };
+        let local = AttachLocalPresentationSnapshot {
+            mode_id: "scroll".to_string(),
+            mode_label: "SCROLL".to_string(),
+            role_label: "read-only".to_string(),
+            follow_label: Some("following abcdef12".to_string()),
+            mode_modifier: Some("FROZEN".to_string()),
+            hint: "scroll hint".to_string(),
+            session_label: Some("session".to_string()),
+            session_count: 2,
+            context_label: Some("context".to_string()),
+            viewport_cols: 120,
+            ..AttachLocalPresentationSnapshot::initial()
+        };
+        let text = project_bar(
+            &settings,
+            &[window(1, "main", true)],
+            &local,
+            None,
+            &ProjectionInteraction::default(),
+        )
+        .plain_text();
+        for expected in [
+            "session:session (2)",
+            "ctx:context",
+            "SCROLL",
+            "FROZEN",
+            "read-only",
+            "following abcdef12",
+            "scroll hint",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn editing_and_menu_state_are_projected() {
+        let mut interaction = ProjectionInteraction {
+            editing_window_id: Some(Uuid::from_u128(1)),
+            edit_buffer: "renamed",
+            edit_cursor: 4,
+            ..ProjectionInteraction::default()
+        };
+        let settings = Settings::default();
+        let windows = [window(1, "main", true)];
+        let edited = project_bar(&settings, &windows, &local(80), None, &interaction);
+        assert!(edited.plain_text().contains("[renamed]"));
+        assert!(
+            edited
+                .segments
+                .iter()
+                .any(|segment| segment.edit_cursor_offset.is_some())
+        );
+
+        interaction.menu_window_id = Some(Uuid::from_u128(1));
+        interaction.menu_selected = 1;
+        let menu = project_bar(&settings, &windows, &local(120), None, &interaction);
+        let text = menu.plain_text();
+        assert!(text.contains("Switch"));
+        assert!(text.contains("Rename"));
+        assert!(text.contains("Close"));
+    }
+
+    #[test]
+    fn empty_unicode_hover_and_notification_cases_are_stable() {
+        let settings = Settings::default();
+        let empty = project_bar(
+            &settings,
+            &[],
+            &local(40),
+            None,
+            &ProjectionInteraction::default(),
+        );
+        assert!(empty.plain_text().contains("[no tabs]"));
+
+        let unicode = [window(1, "界e\u{301}", true), window(2, "other", false)];
+        let hovered = project_bar(
+            &settings,
+            &unicode,
+            &local(80),
+            Some(Uuid::from_u128(2)),
+            &ProjectionInteraction::default(),
+        );
+        assert!(hovered.plain_text().contains("界e\u{301}"));
+        assert!(hovered.segments.iter().any(|segment| {
+            segment.window_id == Some(Uuid::from_u128(2))
+                && segment.kind == SegmentKind::HoveredInactiveTab
+        }));
+
+        let notification_settings = Settings {
+            hint_policy: HintPolicy::Always,
+            ..Settings::default()
+        };
+        let notification = AttachLocalPresentationSnapshot {
+            hint: "saved".to_string(),
+            viewport_cols: 80,
+            ..AttachLocalPresentationSnapshot::initial()
+        };
+        assert!(
+            project_bar(
+                &notification_settings,
+                &unicode,
+                &notification,
+                None,
+                &ProjectionInteraction::default(),
+            )
+            .plain_text()
+            .contains("saved")
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release projection benchmark; run with --release --ignored --nocapture"]
+    fn projection_performance_baseline() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 20_000;
+        let one_window = vec![window(1, "one", true)];
+        let windows = (0..64)
+            .map(|index| window(index + 1, &format!("window-{index}"), index == 32))
+            .collect::<Vec<_>>();
+        let settings = Settings::default();
+        let local = local(240);
+        let measure = |windows: &[windows_list::WindowListEntry],
+                       hovered: Option<Uuid>,
+                       interaction: &ProjectionInteraction<'_>,
+                       local: &AttachLocalPresentationSnapshot| {
+            let started = Instant::now();
+            let mut bytes = 0_usize;
+            for _ in 0..ITERATIONS {
+                let projected = project_bar(
+                    black_box(&settings),
+                    black_box(windows),
+                    black_box(local),
+                    hovered,
+                    interaction,
+                );
+                bytes = bytes.saturating_add(projected.plain_text().len());
+                black_box(projected);
+            }
+            (started.elapsed().as_nanos() / u128::from(ITERATIONS), bytes)
+        };
+        let default_interaction = ProjectionInteraction::default();
+        let (one_ns, one_bytes) = measure(&one_window, None, &default_interaction, &local);
+        let (many_ns, many_bytes) = measure(&windows, None, &default_interaction, &local);
+        let (idle_ns, idle_bytes) = measure(&windows, None, &default_interaction, &local);
+        let (hover_ns, hover_bytes) = measure(
+            &windows,
+            Some(Uuid::from_u128(41)),
+            &default_interaction,
+            &local,
+        );
+        let mut reordered = windows.clone();
+        reordered.rotate_left(17);
+        let (reorder_ns, reorder_bytes) = measure(&reordered, None, &default_interaction, &local);
+        let editing = ProjectionInteraction {
+            editing_window_id: Some(Uuid::from_u128(33)),
+            edit_buffer: "renamed-window-with-a-long-label",
+            edit_cursor: 14,
+            ..ProjectionInteraction::default()
+        };
+        let (rename_ns, rename_bytes) = measure(&windows, None, &editing, &local);
+        let module_local = AttachLocalPresentationSnapshot {
+            mode_label: "SCROLL".to_string(),
+            role_label: "read-only".to_string(),
+            mode_modifier: Some("FROZEN".to_string()),
+            hint: "scroll hint".to_string(),
+            viewport_cols: 240,
+            ..AttachLocalPresentationSnapshot::initial()
+        };
+        let (module_ns, module_bytes) =
+            measure(&windows, None, &default_interaction, &module_local);
+        println!(
+            "projection iterations={ITERATIONS} one_ns={one_ns} one_bytes={one_bytes} many_ns={many_ns} many_bytes={many_bytes} idle_ns={idle_ns} idle_bytes={idle_bytes} hover_ns={hover_ns} hover_bytes={hover_bytes} reorder_ns={reorder_ns} reorder_bytes={reorder_bytes} rename_ns={rename_ns} rename_bytes={rename_bytes} module_ns={module_ns} module_bytes={module_bytes}"
+        );
+        for (label, average_ns) in [
+            ("one", one_ns),
+            ("many", many_ns),
+            ("idle", idle_ns),
+            ("hover", hover_ns),
+            ("reorder", reorder_ns),
+            ("rename", rename_ns),
+            ("module", module_ns),
+        ] {
+            assert!(
+                average_ns <= 35_000,
+                "{label} projection average {average_ns}ns exceeded 35us budget"
+            );
+        }
     }
 
     #[test]
@@ -602,7 +909,13 @@ mod tests {
             label_template: "{{{index}}}:{name}:{unknown}".to_string(),
             ..Settings::default()
         };
-        let projected = project_bar(&settings, &[window(1, "main", true)], &local(80), None);
+        let projected = project_bar(
+            &settings,
+            &[window(1, "main", true)],
+            &local(80),
+            None,
+            &ProjectionInteraction::default(),
+        );
         let text = projected.plain_text();
         assert!(text.contains("{1}:main:{unknown}"));
     }

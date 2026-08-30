@@ -21,6 +21,7 @@ use bmux_presentation_state::{
     global_presentation_fact_host_service,
 };
 use bmux_windows_plugin_api::{windows_commands, windows_list};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -279,12 +280,17 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     Ok(())
 }
 
+static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Subscribe the configured companion to authoritative window state.
 ///
 /// # Errors
 ///
 /// Returns an error when state subscription, initial publication, or task startup fails.
 pub fn start() -> Result<(), String> {
+    let generation = ATTACH_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
     let (initial, mut receiver) = bmux_plugin::global_event_bus()
         .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
         .map_err(|error| format!("subscribing to windows list: {error}"))?;
@@ -292,7 +298,9 @@ pub fn start() -> Result<(), String> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("sidebar companion requires an async runtime: {error}"))?;
     handle.spawn(async move {
-        while receiver.changed().await.is_ok() {
+        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
+            && receiver.changed().await.is_ok()
+        {
             let snapshot = receiver.borrow_and_update().as_ref().clone();
             if let Err(error) = publish(snapshot) {
                 tracing::warn!(%error, "sidebar publication failed");
@@ -303,6 +311,7 @@ pub fn start() -> Result<(), String> {
 }
 
 pub fn uninstall() {
+    ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
     let _ = global_plugin_layout_registry().remove_owner(OWNER);
     let _ = global_plugin_surface_registry().remove_owner(OWNER);
     if let Ok(mut guard) = state().lock() {

@@ -14,6 +14,7 @@
 //! in the host-side dependencies.
 
 pub mod action_dispatch;
+mod attach_companion;
 mod declaration;
 mod discovery;
 mod event_bus;
@@ -33,6 +34,10 @@ pub mod test_support;
 mod typed_dispatch_bridge;
 mod typed_service_caller;
 
+pub use attach_companion::{
+    AttachCompanion, AttachCompanionCallback, AttachCompanionRegistry,
+    global_attach_companion_registry, register_attach_companion, registered_attach_companions,
+};
 pub use bmux_plugin_runtime::{
     ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,
 };

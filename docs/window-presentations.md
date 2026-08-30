@@ -2,63 +2,91 @@
 
 BMUX ships two independent window presentation plugins for normal `bmux attach`:
 
-- `bmux.tab_strip` reserves a horizontal row at the top or bottom.
-- `bmux.sidebar` reserves a bounded vertical region at the left or right.
+- `bmux.tab_strip` is enabled by default and owns the full horizontal
+  status/tab row at the bottom.
+- `bmux.sidebar` is bundled but opt-in and reserves a bounded vertical region
+  at the left or right.
 
-Both are bundled and enabled by default. They consume the authoritative ordered
-window state from `bmux.windows`; disabling a presentation does not change
-window lifecycle or ordering.
+Both consume the authoritative ordered window state from `bmux.windows`;
+presentation enablement does not change window lifecycle or ordering.
 
 ## Enablement combinations
 
-Disable either plugin with the normal plugin configuration:
+The default is the full tab/status bar without the sidebar.
 
 ```toml
-# Tab strip only
+# Enable the optional sidebar as well
 [plugins]
-disabled = ["bmux.sidebar"]
+enabled = ["bmux.sidebar"]
 ```
 
 ```toml
 # Sidebar only
 [plugins]
+enabled = ["bmux.sidebar"]
 disabled = ["bmux.tab_strip"]
 ```
 
 ```toml
-# Neither presentation (baseline terminal attach remains available)
+# Neither presentation; baseline attach remains available
 [plugins]
 disabled = ["bmux.tab_strip", "bmux.sidebar"]
 ```
 
-With neither ID disabled, both presentations are enabled. Disable
-`bmux.windows` separately only when intentionally using baseline attach without
-the authoritative window facade.
-
-## Tab strip settings
+## Full tab/status bar
 
 ```toml
 [plugins.settings."bmux.tab_strip"]
-placement = "top"               # "top" or "bottom"
+placement = "bottom"            # "top" or "bottom"
 height = 1                       # 1..=4 cells
-order = 100                      # lower layout order is allocated first
-show_index = true
-label_template = "{index}{name}"
-maximum_label_width = 32
-maximum_visible_tabs = 8
-show_compact_facts = false
+order = 100                      # lower layout order allocates first
+preset = "tab_rail"             # "minimal" or "classic"
+tab_label_max_width = 20
+tab_template = "{name}"
+show_session_name = false
+show_context_name = false
+show_mode = true
+show_role = true
+show_follow = true
+show_hint = true
+hover_highlight = true
+hint_policy = "scroll_only"     # "always" or "never"
+
+[plugins.settings."bmux.tab_strip".layout]
+density = "cozy"               # or "compact"
+left_padding = 1
+right_padding = 1
+tab_gap = 1
+module_gap = 1
+overflow_style = "arrows"       # or "count"
+align_active = "keep_visible"   # or "focus_bias"
+
+[plugins.settings."bmux.tab_strip".style]
+separator_set = "angled_segments" # "plain" or "ascii"
+prefer_unicode = true
+force_ascii = false
+dim_inactive = true
+bold_active = true
+underline_active = false
 ```
 
-The label template supports `{index}`, `{name}`, `{id}`, `{active}`, and
-`{fact}`. When `show_compact_facts` is enabled, the highest-priority retained
-window fact supplies `{fact}` and its semantic role styles the compact tab.
-Double braces render literal braces. `maximum_visible_tabs` bounds retained tab
-projection; overflow markers show hidden leading/trailing items, wheel input
-scrolls the visible window, and authoritative active-window changes realign it.
-Clicking a visible item switches to that window through the typed
-`bmux.windows` command service.
+The bar composes width-packed tabs with right-aligned mode, role, follow, and
+conditional hint/message modules. Optional session/context modules occupy the
+left side after tabs. Templates support `{name}`, `{index}`, `{index0}`,
+`{session}`, `{marker}`, `{id}`, and `{active}` with Unicode-cell-safe width
+limits and literal double braces.
 
-## Sidebar settings
+Optional color keys under `[plugins.settings."bmux.tab_strip".colors]` cover
+the bar, active/inactive/hover tabs, modules, and overflow using `#RRGGBB`
+values. Migration-era aliases (`label_template`, `maximum_label_width`,
+`maximum_visible_tabs`, `show_index`, `show_compact_facts`) remain accepted
+when their canonical setting is absent.
+
+Interactions include click switching, hover, drag reorder, wheel navigation,
+middle-click inline rename, and a right-click Switch/Rename/Close menu. Domain
+mutations use generated `bmux.windows` service clients.
+
+## Sidebar
 
 ```toml
 [plugins.settings."bmux.sidebar"]
@@ -79,32 +107,11 @@ collapsed_width = 8
 ```
 
 Sidebar templates support `{marker}`, `{index}`, `{name}`, `{id}`, `{active}`,
-`{fact}`, `{fact_detail}`, and `{fact_icon}`. The highest priority retained fact
-for entity `("bmux.windows", window UUID)` supplies text and semantic role;
-roles map to neutral/idle/active/success/warning/attention/error terminal styles.
-Descriptions wrap to a bounded two-line region using Unicode display width;
-status text receives its own row. `maximum_visible_items` bounds retained
-card projection; wheel input scrolls the virtual window and authoritative active
-window changes realign it automatically. `content_height = false` paints the
-full resolved allocation; enabling it clips background/border paint to the
-bounded visible-card height while retaining the same layout reservation. Below `collapse_below_width` terminal
-columns, generic layout reserves `collapsed_width` instead of the preferred
-width. Clicking an item switches windows.
+`{fact}`, `{fact_detail}`, and `{fact_icon}`. The generic layout resolver
+composes it with the bar when enabled.
 
-The layout `order` values define deterministic composition when both plugins
-are enabled. For example, the defaults allocate the tab strip before the
-sidebar. Reversing the numeric values allocates the sidebar first.
+## Legacy configuration
 
-## Removed legacy status placement
-
-Legacy `appearance.status_position` no longer controls attach geometry and is
-rejected with a migration diagnostic. Configure the tab strip directly instead:
-
-```toml
-[plugins.settings."bmux.tab_strip"]
-placement = "top" # or "bottom"
-```
-
-Legacy `[status_bar]` configuration has been removed and is rejected with a
-migration diagnostic. Configure normal attach presentation through the
-`bmux.tab_strip` and `bmux.sidebar` plugin settings documented above.
+Legacy `appearance.status_position` and `[status_bar]` are rejected with
+migration diagnostics. Move those values into
+`plugins.settings."bmux.tab_strip"` using the equivalent fields above.

@@ -1018,12 +1018,18 @@ mod tests {
 
     impl TestCertificate {
         fn create() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should follow epoch")
                 .as_nanos();
-            let directory = std::env::temp_dir()
-                .join(format!("bmux-gateway-test-{}-{unique}", std::process::id()));
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "bmux-gateway-test-{}-{unique}-{sequence}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&directory).expect("create test certificate directory");
             let cert_file = directory.join("cert.pem");
             let key_file = directory.join("key.pem");

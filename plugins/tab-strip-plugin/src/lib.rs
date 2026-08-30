@@ -22,12 +22,15 @@ use bmux_plugin::{
     ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::prelude::*;
+#[cfg(test)]
 use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole,
     global_presentation_fact_host_service,
 };
+#[cfg(test)]
 use bmux_tui_components::tab_bar::TabItem;
 use bmux_windows_plugin_api::{windows_commands, windows_list};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -207,6 +210,7 @@ struct CompanionState {
     pointer_moved: bool,
     editing_window_id: Option<Uuid>,
     edit_buffer: String,
+    edit_cursor: usize,
     menu_window_id: Option<Uuid>,
     menu_selected: usize,
     local_presentation: AttachLocalPresentationSnapshot,
@@ -227,6 +231,7 @@ impl CompanionState {
             pointer_moved: false,
             editing_window_id: None,
             edit_buffer: String::new(),
+            edit_cursor: 0,
             menu_window_id: None,
             menu_selected: 0,
             local_presentation: AttachLocalPresentationSnapshot::initial(),
@@ -329,12 +334,17 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     Ok(())
 }
 
+static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Subscribe the configured companion to authoritative window state.
 ///
 /// # Errors
 ///
 /// Returns an error when state subscription, initial publication, or task startup fails.
 pub fn start() -> Result<(), String> {
+    let generation = ATTACH_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
     let (initial, mut receiver) = bmux_plugin::global_event_bus()
         .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
         .map_err(|error| format!("subscribing to windows list: {error}"))?;
@@ -349,7 +359,9 @@ pub fn start() -> Result<(), String> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("tab-strip companion requires an async runtime: {error}"))?;
     handle.spawn(async move {
-        while receiver.changed().await.is_ok() {
+        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
+            && receiver.changed().await.is_ok()
+        {
             let snapshot = receiver.borrow_and_update().as_ref().clone();
             if let Err(error) = publish(snapshot) {
                 tracing::warn!(%error, "tab-strip publication failed");
@@ -357,7 +369,9 @@ pub fn start() -> Result<(), String> {
         }
     });
     handle.spawn(async move {
-        while local_presentation_receiver.changed().await.is_ok() {
+        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
+            && local_presentation_receiver.changed().await.is_ok()
+        {
             let snapshot = local_presentation_receiver
                 .borrow_and_update()
                 .as_ref()
@@ -371,6 +385,7 @@ pub fn start() -> Result<(), String> {
 }
 
 pub fn uninstall() {
+    ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
     let _ = global_plugin_layout_registry().remove_owner(OWNER);
     let _ = global_plugin_surface_registry().remove_owner(OWNER);
     if let Ok(mut guard) = state().lock() {
@@ -441,6 +456,7 @@ fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     publish_surface(revision, &surface)
 }
 
+#[cfg(test)]
 fn compact_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFact> {
     let entity = PresentationEntityRef::new("bmux.windows", window.id.to_string());
     global_presentation_fact_host_service()
@@ -457,6 +473,7 @@ fn compact_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFa
         })
 }
 
+#[cfg(test)]
 const fn compact_role_rank(role: PresentationFactRole) -> u8 {
     match role {
         PresentationFactRole::Neutral => 0,
@@ -484,6 +501,7 @@ const fn compact_fact_style(role: PresentationFactRole, fallback: RenderStyle) -
     }
 }
 
+#[cfg(test)]
 fn truncate_to_width(value: &str, maximum: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
 
@@ -500,10 +518,12 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
     result
 }
 
+#[cfg(test)]
 fn component_label(id: &str, label: &str) -> String {
     TabItem::new(id, label).label()
 }
 
+#[cfg(test)]
 fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index: usize) -> String {
     const INDEX_TOKEN: &str = concat!("{", "index}");
     const INDEX0_TOKEN: &str = concat!("{", "index0}");
@@ -555,14 +575,26 @@ struct BarStyles {
 
 impl BarStyles {
     #[allow(clippy::similar_names)] // Foreground/background pairs intentionally mirror legacy color roles.
-    fn resolve(settings: &Settings) -> Self {
+    fn resolve(settings: &Settings, local: &AttachLocalPresentationSnapshot) -> Self {
         let color = |value: Option<&str>, fallback: (u8, u8, u8)| {
             value.and_then(parse_hex_color).unwrap_or(fallback)
         };
-        let bar_bg = color(settings.colors.bar_bg.as_deref(), (30, 30, 30));
-        let bar_fg = color(settings.colors.bar_fg.as_deref(), (220, 220, 220));
-        let active_bg = color(settings.colors.tab_active_bg.as_deref(), (110, 170, 240));
-        let active_fg = color(settings.colors.tab_active_fg.as_deref(), (20, 20, 20));
+        let bar_bg = color(
+            settings.colors.bar_bg.as_deref(),
+            parse_hex_color(&local.status_background).unwrap_or((30, 30, 30)),
+        );
+        let bar_fg = color(
+            settings.colors.bar_fg.as_deref(),
+            parse_hex_color(&local.status_foreground).unwrap_or((220, 220, 220)),
+        );
+        let active_bg = color(
+            settings.colors.tab_active_bg.as_deref(),
+            parse_hex_color(&local.status_active).unwrap_or((110, 170, 240)),
+        );
+        let active_fg = color(
+            settings.colors.tab_active_fg.as_deref(),
+            parse_hex_color(&local.background).unwrap_or((20, 20, 20)),
+        );
         let inactive_bg = color(settings.colors.tab_inactive_bg.as_deref(), (48, 48, 48));
         let inactive_fg = color(settings.colors.tab_inactive_fg.as_deref(), bar_fg);
         let hovered_active_bg = color(
@@ -595,13 +627,15 @@ impl BarStyles {
         let mut hovered_active = style(hovered_active_fg, hovered_active_bg);
         hovered_active.bold = settings.bold_active;
         hovered_active.underline = settings.underline_active;
+        let mode_bg = parse_hex_color(&local.status_mode).unwrap_or(active_bg);
+        let mode_fg = parse_hex_color(&local.background).unwrap_or(active_fg);
         Self {
             base: style(bar_fg, bar_bg),
             active,
             inactive,
             hovered_active,
             hovered_inactive: style(hovered_inactive_fg, hovered_inactive_bg),
-            mode: style(active_fg, active_bg).bold(),
+            mode: style(mode_fg, mode_bg).bold(),
             module: style(module_fg, module_bg),
             overflow: style(overflow_fg, overflow_bg),
         }
@@ -639,14 +673,25 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
     (adjust(value.0), adjust(value.1), adjust(value.2))
 }
 
+fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
+    projection::ProjectionInteraction {
+        editing_window_id: state.editing_window_id,
+        edit_buffer: &state.edit_buffer,
+        edit_cursor: state.edit_cursor,
+        menu_window_id: state.menu_window_id,
+        menu_selected: state.menu_selected,
+    }
+}
+
 #[allow(clippy::too_many_lines)] // One ordered retained projection keeps tab, overflow, editor, and menu geometry consistent.
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
-    let styles = BarStyles::resolve(&state.settings);
+    let styles = BarStyles::resolve(&state.settings, &state.local_presentation);
     let projected = projection::project_bar(
         &state.settings,
         &state.snapshot.windows,
         &state.local_presentation,
         state.hovered_window_id,
+        &projection_interaction(state),
     );
     let mut ops = vec![RenderOp::fill_rect(
         ExtensionRect::new(0, 0, u16::MAX, state.settings.height),
@@ -748,23 +793,14 @@ fn update_scroll(event: &AttachInputEvent) -> bool {
 }
 
 fn visible_window_at_col(state: &CompanionState, col: u16) -> Option<Uuid> {
-    let mut x = if state.scroll_offset > 0 { 3 } else { 0 };
-    for (index, window) in state
-        .snapshot
-        .windows
-        .iter()
-        .enumerate()
-        .skip(state.scroll_offset)
-        .take(state.visible_limit())
-    {
-        let label = format!(" {} ", tab_label(&state.settings, window, index));
-        let width = u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str())).ok()?;
-        if col >= x && col < x.saturating_add(width) {
-            return Some(window.id);
-        }
-        x = x.saturating_add(width);
-    }
-    None
+    projection::project_bar(
+        &state.settings,
+        &state.snapshot.windows,
+        &state.local_presentation,
+        state.hovered_window_id,
+        &projection_interaction(state),
+    )
+    .window_at_col(col)
 }
 
 fn update_drag(
@@ -870,9 +906,23 @@ fn update_editor(
         "esc" => {
             companion.editing_window_id = None;
             companion.edit_buffer.clear();
+            companion.edit_cursor = 0;
+        }
+        "left" => {
+            companion.edit_cursor =
+                previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+        }
+        "right" => {
+            companion.edit_cursor =
+                next_char_boundary(&companion.edit_buffer, companion.edit_cursor);
         }
         "backspace" => {
-            companion.edit_buffer.pop();
+            if companion.edit_cursor > 0 {
+                let previous =
+                    previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+                companion.edit_buffer.drain(previous..companion.edit_cursor);
+                companion.edit_cursor = previous;
+            }
         }
         "enter" => {
             let name = companion.edit_buffer.trim().to_string();
@@ -885,6 +935,7 @@ fn update_editor(
             }
             companion.editing_window_id = None;
             companion.edit_buffer.clear();
+            companion.edit_cursor = 0;
             drop(guard);
             let mut client = ServiceCallerDispatchClient::new(context);
             return Some(
@@ -912,7 +963,10 @@ fn update_editor(
             );
         }
         value if value.chars().count() == 1 && companion.edit_buffer.len() < 4_096 => {
-            companion.edit_buffer.push_str(value);
+            companion
+                .edit_buffer
+                .insert_str(companion.edit_cursor, value);
+            companion.edit_cursor = companion.edit_cursor.saturating_add(value.len());
         }
         _ => {
             return Some(AttachInputResult {
@@ -927,6 +981,21 @@ fn update_editor(
         dirty,
         ..AttachInputResult::default()
     })
+}
+
+fn previous_char_boundary(value: &str, cursor: usize) -> usize {
+    value[..cursor.min(value.len())]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_char_boundary(value: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(value.len());
+    value[cursor..]
+        .char_indices()
+        .nth(1)
+        .map_or(value.len(), |(offset, _)| cursor.saturating_add(offset))
 }
 
 fn begin_rename(event: &AttachInputEvent) -> bool {
@@ -959,6 +1028,7 @@ fn begin_rename(event: &AttachInputEvent) -> bool {
     };
     companion.editing_window_id = Some(target);
     companion.edit_buffer.clone_from(&window.name);
+    companion.edit_cursor = companion.edit_buffer.len();
     republish_companion(companion)
 }
 
@@ -1017,6 +1087,7 @@ fn update_menu(
                 };
                 companion.editing_window_id = Some(target);
                 companion.edit_buffer.clone_from(&window.name);
+                companion.edit_cursor = companion.edit_buffer.len();
                 let dirty = republish_companion(companion);
                 return Some(AttachInputResult {
                     consumed: true,
@@ -1251,6 +1322,52 @@ bar_bg = "#112233"
     }
 
     #[test]
+    fn runtime_appearance_fallback_and_explicit_colors_resolve_in_order() {
+        let local = AttachLocalPresentationSnapshot {
+            background: "#010203".to_string(),
+            status_background: "#112233".to_string(),
+            status_foreground: "#ddeeff".to_string(),
+            status_active: "#224466".to_string(),
+            status_mode: "#778899".to_string(),
+            ..AttachLocalPresentationSnapshot::initial()
+        };
+        let fallback = BarStyles::resolve(&Settings::default(), &local);
+        assert_eq!(
+            fallback.base.bg,
+            Some(bmux_plugin::RenderColor::Rgb {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+            })
+        );
+        assert_eq!(
+            fallback.mode.bg,
+            Some(bmux_plugin::RenderColor::Rgb {
+                r: 0x77,
+                g: 0x88,
+                b: 0x99,
+            })
+        );
+
+        let settings = Settings {
+            colors: ColorSettings {
+                bar_bg: Some("#abcdef".to_string()),
+                ..ColorSettings::default()
+            },
+            ..Settings::default()
+        };
+        let overridden = BarStyles::resolve(&settings, &local);
+        assert_eq!(
+            overridden.base.bg,
+            Some(bmux_plugin::RenderColor::Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef,
+            })
+        );
+    }
+
+    #[test]
     fn local_presentation_updates_advance_retained_projection() {
         let mut state = CompanionState::new(Settings::default());
         let initial_revision = state.revision;
@@ -1266,6 +1383,7 @@ bar_bg = "#112233"
             session_count: 2,
             context_label: Some("context".to_string()),
             viewport_cols: 80,
+            ..AttachLocalPresentationSnapshot::initial()
         });
         assert!(state.revision > initial_revision);
         assert_eq!(state.local_presentation.mode_label, "SCROLL");
@@ -1358,13 +1476,21 @@ bar_bg = "#112233"
             .map(|index| windows_list::WindowListEntry {
                 id: Uuid::from_u128(index),
                 name: format!("w{index}"),
-                active: false,
+                active: index == 2,
                 workspace: "default".to_string(),
                 workspace_id: uuid::Uuid::nil(),
             })
             .collect();
-        assert_eq!(visible_window_at_col(&state, 4), Some(Uuid::from_u128(1)));
-        assert_eq!(visible_window_at_col(&state, 10), Some(Uuid::from_u128(2)));
+        let surface = build_surface(&state, 1);
+        let second_region = surface
+            .interactive_regions
+            .iter()
+            .find(|region| region.local_id == format!("window:{}", Uuid::from_u128(2)))
+            .expect("active window region");
+        assert_eq!(
+            visible_window_at_col(&state, second_region.rect.x),
+            Some(Uuid::from_u128(2))
+        );
     }
 
     #[test]

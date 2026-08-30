@@ -2,13 +2,43 @@
 
 This inventory records the production ownership that the plugin-owned presentation migration must remove or deliberately preserve. It is intentionally a migration map, not a new architecture contract.
 
+## Restoration status (2026-08-30)
+
+The premature cutover has now been repaired through the plugin-owned path:
+
+- `bmux.tab_strip` is enabled by default at the bottom and renders a full-width
+  row containing width-packed tabs plus mode, role, follow, hints/messages, and
+  optional session/context modules.
+- `bmux.sidebar` remains independently bundled and opt-in.
+- Legacy presets, spacing, separators, templates, colors, visibility controls,
+  overflow, active alignment, and migration-era aliases are plugin-private.
+- Tab click, hover, drag reorder, wheel navigation, inline rename, and menu
+  workflows remain plugin-owned and dispatch domain mutations through generated
+  `bmux.windows` clients.
+- Attach-local mode/role/follow/hint/catalog labels flow through the neutral
+  `AttachLocalPresentationSnapshot` protocol; no core status model was restored.
+- Generic attach companion lifecycle in `packages/plugin` now owns start/stop
+  orchestration without naming presentation domains.
+- Release PTY evidence confirms the default bottom row contains `tab-1`,
+  `NORMAL`, and `write` with expected RGB segment transitions.
+- Projection fixtures cover 20/40/80/120/240 columns, empty/one/many windows,
+  active anchoring, overflow, Unicode, hover, local modes, read-only, follow,
+  transient messages, editor, and menu state.
+- The release 64-window projection benchmark measured 15.098 µs average over
+  20,000 iterations against the retained 35 µs projection budget.
+
+Remaining evidence tracked in `restore-full-tab-strip-parity-progress.md`
+includes robust automated host-composited capture and the broader retained
+frame/output/latency performance budgets. Those evidence gaps do not restore or
+justify any legacy core presentation ownership.
+
 ## Configuration and projection
 
 | Concern | Production owners | Migration obligation |
 | --- | --- | --- |
-| `StatusBarConfig` | Removed from `packages/config`; `[status_bar]` is rejected with a diagnostic pointing to the tab-strip/sidebar plugin settings. The compatibility CLI status module and simulation tab fixtures are deleted. | Tab-strip/sidebar settings are plugin-owned. Local notifications remain attach-client state until their generic presentation companion is complete; they no longer preserve status-row geometry or legacy config. |
-| `StatusPosition` | Removed from `packages/config`; legacy `appearance.status_position` is rejected during file loading with a diagnostic pointing to `plugins.settings.\"bmux.tab_strip\".placement`. | Generic plugin layout is authoritative for top/bottom placement; no attach runtime/state, simulation, playbook, layer, or damage path reserves a status row. |
-| `AttachTab` and tab projection | `packages/cli/src/status.rs`; constructed by attach runtime from windows snapshots or raw contexts; mirrored by attach state/simulation | Move projection/rendering into the tab-strip plugin and leave only baseline terminal attach behavior in core. |
+| `StatusBarConfig` | Removed from `packages/config`; `[status_bar]` is rejected with a diagnostic pointing to plugin settings. | Full legacy-equivalent settings now live privately in `bmux.tab_strip`; migration-era aliases remain accepted when canonical keys are absent. |
+| `StatusPosition` | Removed from `packages/config`; legacy `appearance.status_position` is rejected with a migration diagnostic. | Generic plugin layout is authoritative; `bmux.tab_strip.placement` defaults to `bottom`. |
+| Tab/status projection | `plugins/tab-strip-plugin` | Width-aware full-row projection, modules, styling, hitboxes, editor, menu, and interactions are plugin-owned. |
 | Windows state consumption | `packages/cli/src/runtime/attach/runtime.rs`, state, simulation, bootstrap, and playbook support import `bmux_windows_plugin_api`; runtime decodes `bmux.windows/windows-list` and projects it into `AttachTab` | Presentation consumption must move to the tab-strip companion using generated windows contracts. CLI bootstrap/runtime must stop interpreting window state for presentation. Other domain-owned plugin/mobile consumers are not part of this removal. |
 
 The generic four-edge viewport migration already removed production

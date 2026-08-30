@@ -179,6 +179,20 @@ impl HeadlessAttachTerminalHandle {
             .map_or_else(|_| Vec::new(), |out| out.clone())
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub fn output_screen_text(&self, cols: u16, rows: u16) -> String {
+        let Ok(mut stream) = bmux_terminal_grid::TerminalGridStream::new(
+            cols,
+            rows,
+            bmux_terminal_grid::GridLimits::default(),
+        ) else {
+            return String::new();
+        };
+        stream.process(&self.output_bytes());
+        bmux_terminal_grid::visible_text(stream.grid(), 0, usize::from(rows))
+    }
+
     #[must_use]
     pub fn attached_session_id(&self) -> Option<Uuid> {
         self.attached_session_id.lock().ok().and_then(|id| *id)
@@ -3550,13 +3564,10 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             revision: 0,
         },
     );
-    #[cfg(feature = "bundled-plugin-tab-strip")]
-    if let Err(error) = bmux_tab_strip_plugin::start() {
-        tracing::warn!(%error, "failed starting tab-strip attach companion");
-    }
-    #[cfg(feature = "bundled-plugin-sidebar")]
-    if let Err(error) = bmux_sidebar_plugin::start() {
-        tracing::warn!(%error, "failed starting sidebar attach companion");
+    for companion in bmux_plugin::registered_attach_companions() {
+        if let Err(error) = companion.start() {
+            tracing::warn!(companion_id = companion.id(), %error, "failed starting attach companion");
+        }
     }
 
     // Honour any startup gates plugins have self-registered via
@@ -4030,6 +4041,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             follow_target_id,
             global,
             geometry.cols,
+            &runtime_appearance,
         );
         super::local_presentation::publish_notification(
             view_state.transient_status.as_deref(),
@@ -4592,6 +4604,11 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     );
 
     terminal.restore_after_attach_ui()?;
+    for companion in bmux_plugin::registered_attach_companions() {
+        if let Err(error) = companion.stop() {
+            tracing::warn!(companion_id = companion.id(), %error, "failed stopping attach companion");
+        }
+    }
     super::local_presentation::uninstall();
     bmux_plugin::surface::global_plugin_surface_registry().clear();
     bmux_plugin::layout::global_plugin_layout_registry().clear();
@@ -7077,12 +7094,27 @@ fn is_windows_close_active_pane_action(action: &RuntimeAction) -> bool {
     )
 }
 
+fn snapshot_mode_id(view_state: &AttachViewState, zoomed: bool) -> String {
+    if view_state.help_overlay_open {
+        "help".to_string()
+    } else if view_state.prompt.is_active() {
+        "prompt".to_string()
+    } else if view_state.scrollback_active() {
+        "scroll".to_string()
+    } else if zoomed {
+        "zoom".to_string()
+    } else {
+        view_state.active_mode_id.clone()
+    }
+}
+
 fn publish_attach_local_presentation(
     view_state: &mut AttachViewState,
     keymap: &Keymap,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     viewport_cols: u16,
+    runtime_appearance: &RuntimeAppearance,
 ) {
     let zoomed = view_state
         .cached_layout_state
@@ -7132,6 +7164,7 @@ fn publish_attach_local_presentation(
         .local_presentation_revision
         .saturating_add(1)
         .max(1);
+    let resolved_appearance = runtime_appearance.for_mode(&snapshot_mode_id(view_state, zoomed));
     let snapshot = AttachLocalPresentationSnapshot {
         revision: view_state.local_presentation_revision,
         mode_id: view_state.active_mode_id.clone(),
@@ -7147,6 +7180,12 @@ fn publish_attach_local_presentation(
         session_label: Some(session_label),
         session_count: u32::try_from(session_count).unwrap_or(u32::MAX),
         context_label: Some(context_label),
+        foreground: resolved_appearance.foreground,
+        background: resolved_appearance.background,
+        status_background: resolved_appearance.status.background,
+        status_foreground: resolved_appearance.status.foreground,
+        status_active: resolved_appearance.status.active_window,
+        status_mode: resolved_appearance.status.mode_indicator,
         viewport_cols,
     };
     let _ = bmux_plugin::global_event_bus()
@@ -14963,6 +15002,19 @@ mod tests {
         };
 
         assert!(is_attach_stream_closed_error(&error));
+    }
+
+    #[test]
+    fn headless_terminal_replays_host_composited_row() {
+        let (mut terminal, handle) = HeadlessAttachTerminal::new(40, 3);
+        terminal
+            .write_all(b"\x1b[3;1H tab-1     NORMAL write")
+            .unwrap();
+        let screen = handle.output_screen_text(40, 3);
+        let bottom = screen.lines().nth(2).unwrap_or_default();
+        assert!(bottom.contains("tab-1"), "{screen:?}");
+        assert!(bottom.contains("NORMAL"), "{screen:?}");
+        assert!(bottom.contains("write"), "{screen:?}");
     }
 
     fn focus_action(direction: &str) -> RuntimeAction {
