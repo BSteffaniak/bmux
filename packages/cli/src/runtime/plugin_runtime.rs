@@ -682,7 +682,7 @@ pub(super) fn effective_enabled_plugins(
     // entry file to check).
     let mut static_bundled = registry
         .iter()
-        .filter(|&plugin| plugin.bundled_static)
+        .filter(|&plugin| plugin.bundled_static && plugin.manifest.enabled_by_default)
         .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
     static_bundled.sort();
@@ -701,6 +701,7 @@ pub(super) fn effective_enabled_plugins(
         .iter()
         .filter(|&plugin| {
             !plugin.bundled_static
+                && plugin.manifest.enabled_by_default
                 && bundled_roots.contains(&plugin.search_root)
                 && registered_plugin_entry_exists(plugin)
         })
@@ -2421,16 +2422,53 @@ mod tests {
     }
 
     #[test]
+    fn bundled_opt_in_plugin_requires_explicit_enablement() {
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_bundled_manifest(
+                r#"
+id = "test.opt_in"
+name = "Opt In"
+version = "0.1.0"
+enabled_by_default = false
+"#,
+            )
+            .expect("opt-in bundled plugin should register");
+
+        let mut config = BmuxConfig::default();
+        assert!(
+            !effective_enabled_plugins(&config, &registry).contains(&"test.opt_in".to_string())
+        );
+
+        config.plugins.enabled.push("test.opt_in".to_string());
+        assert!(effective_enabled_plugins(&config, &registry).contains(&"test.opt_in".to_string()));
+    }
+
+    #[test]
+    fn presentation_defaults_to_bottom_tab_strip_without_sidebar() {
+        let mut registry = PluginRegistry::new();
+        register_static_bundled_plugins(&mut registry);
+
+        let enabled = effective_enabled_plugins(&BmuxConfig::default(), &registry);
+        assert!(enabled.iter().any(|plugin| plugin == "bmux.tab_strip"));
+        assert!(!enabled.iter().any(|plugin| plugin == "bmux.sidebar"));
+    }
+
+    #[test]
     fn presentation_plugins_support_all_enablement_combinations() {
         let mut registry = PluginRegistry::new();
         register_static_bundled_plugins(&mut registry);
         let combinations = [(true, true), (true, false), (false, true), (false, false)];
         for (tab_strip, sidebar) in combinations {
             let mut config = BmuxConfig::default();
-            if !tab_strip {
+            if tab_strip {
+                config.plugins.enabled.push("bmux.tab_strip".to_string());
+            } else {
                 config.plugins.disabled.push("bmux.tab_strip".to_string());
             }
-            if !sidebar {
+            if sidebar {
+                config.plugins.enabled.push("bmux.sidebar".to_string());
+            } else {
                 config.plugins.disabled.push("bmux.sidebar".to_string());
             }
             let enabled = effective_enabled_plugins(&config, &registry);

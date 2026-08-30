@@ -4,7 +4,7 @@ Bundled horizontal presentation of the authoritative ordered window list.
 
 ```toml
 [plugins.settings."bmux.tab_strip"]
-placement = "top" # or "bottom"
+placement = "bottom" # or "top"
 height = 1
 order = 100
 show_index = true

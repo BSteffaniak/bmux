@@ -24,5 +24,5 @@ Templates support `{marker}`, `{index}`, `{name}`, `{id}`, and `{active}`.
 Descriptions wrap to two display-cell-safe lines; status renders on a separate
 line when configured.
 
-Disable it with `plugins.disabled = ["bmux.sidebar"]`. It composes through the
+Enable it with `plugins.enabled = ["bmux.sidebar"]`. It composes through the
 generic layout resolver with the independent tab-strip plugin.

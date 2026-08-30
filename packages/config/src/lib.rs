@@ -2587,15 +2587,15 @@ pub struct MultiClientConfig {
     pub sync_client_modes: bool,
 }
 
-/// Plugin discovery, enablement, and per-plugin settings. Bundled plugins
-/// (like bmux.windows and bmux.permissions) are enabled by default.
+/// Plugin discovery, enablement, and per-plugin settings. Bundled plugins are
+/// enabled by default unless their manifest marks them as opt-in.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "plugins")]
 #[serde(default)]
 pub struct PluginConfig {
     /// Plugin IDs to enable in addition to the bundled defaults. Bundled
-    /// plugins like bmux.windows and bmux.permissions are enabled automatically
-    /// without being listed here.
+    /// plugins are enabled automatically unless their manifest marks them as
+    /// opt-in; explicitly listing an opt-in bundled plugin enables it.
     pub enabled: Vec<String>,
     /// Plugin IDs to explicitly disable, including bundled ones. Overrides
     /// both bundled defaults and the enabled list.

@@ -82,6 +82,11 @@ pub struct PluginManifest {
     pub homepage: Option<String>,
     #[serde(default)]
     pub provider_priority: i32,
+    /// Whether a bundled plugin is activated automatically when the user has
+    /// not explicitly enabled or disabled it. Non-bundled plugins still
+    /// require explicit enablement.
+    #[serde(default = "default_true")]
+    pub enabled_by_default: bool,
     #[serde(default)]
     pub execution_class: PluginExecutionClass,
     #[serde(default)]
@@ -482,6 +487,30 @@ minimum = "1.5"
 
         let declaration = manifest.to_declaration().expect("declaration should build");
         assert_eq!(declaration.id.as_str(), "test.custom_compat");
+    }
+
+    #[test]
+    fn enabled_by_default_defaults_true_and_can_be_disabled() {
+        let default_manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.default_enabled"
+name = "Default Enabled"
+version = "0.1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        assert!(default_manifest.enabled_by_default);
+
+        let opt_in_manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.opt_in"
+name = "Opt In"
+version = "0.1.0"
+enabled_by_default = false
+"#,
+        )
+        .expect("manifest should parse");
+        assert!(!opt_in_manifest.enabled_by_default);
     }
 
     #[test]

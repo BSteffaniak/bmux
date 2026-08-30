@@ -51,7 +51,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            placement: Placement::Top,
+            placement: Placement::Bottom,
             height: 1,
             order: 100,
             show_index: true,
@@ -1058,22 +1058,22 @@ mod tests {
 
     #[test]
     fn layout_request_places_strip_on_configured_edge() {
-        let top = layout_request(&Settings::default());
-        let bottom = layout_request(&Settings {
-            placement: Placement::Bottom,
+        let bottom = layout_request(&Settings::default());
+        let top = layout_request(&Settings {
+            placement: Placement::Top,
             ..Settings::default()
         });
-        assert!(matches!(
-            top.operation,
-            bmux_plugin::layout::LayoutOperation::Split {
-                edge: LayoutEdge::Top,
-                ..
-            }
-        ));
         assert!(matches!(
             bottom.operation,
             bmux_plugin::layout::LayoutOperation::Split {
                 edge: LayoutEdge::Bottom,
+                ..
+            }
+        ));
+        assert!(matches!(
+            top.operation,
+            bmux_plugin::layout::LayoutOperation::Split {
+                edge: LayoutEdge::Top,
                 ..
             }
         ));
