@@ -314,9 +314,9 @@ pub trait SnapshotOrchestrator: Send + Sync {
     ///
     /// Returns [`SnapshotOrchestratorError::Io`] /
     /// [`SnapshotOrchestratorError::Codec`] on file-level failures.
-    /// Per-participant failures are absorbed into
-    /// [`RestoreSummary::failed_plugins`]; orchestrator continues
-    /// past them.
+    /// Participant failures may be applied independently, but the operation
+    /// returns an error and keeps snapshot writes blocked so partial state
+    /// cannot replace the source snapshot.
     fn restore_if_present(
         &self,
     ) -> impl Future<Output = SnapshotOrchestratorResult<Option<RestoreSummary>>> + Send;

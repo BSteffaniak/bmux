@@ -1308,7 +1308,9 @@ impl BmuxServer {
             }
             Ok(None) => {}
             Err(error) => {
-                warn!("bmux snapshot restore failed: {error}");
+                warn!(
+                    "bmux snapshot restore failed; persisted snapshot writes remain blocked: {error}"
+                );
             }
         }
 

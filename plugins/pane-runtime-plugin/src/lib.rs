@@ -21,6 +21,7 @@ mod padding;
 mod padding_api;
 mod runtime;
 mod snapshot;
+mod snapshot_v1_migration;
 
 #[derive(Default)]
 pub struct PaneRuntimePlugin;

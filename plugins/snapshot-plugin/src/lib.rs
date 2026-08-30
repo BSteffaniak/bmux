@@ -253,9 +253,13 @@ fn spawn_debounce_loop(
                     // going away, exit the loop.
                     break;
                 }
+                if !orchestrator.writes_allowed().unwrap_or(false) {
+                    continue;
+                }
                 if dirty_flag.take_dirty_after_debounce(debounce_ms).is_some()
                     && let Err(err) = orchestrator.save_now_blocking()
                 {
+                    dirty_flag.mark_dirty();
                     warn!("snapshot debounce flush failed: {err}");
                 }
             }

@@ -211,24 +211,31 @@ impl StatefulPlugin for SessionsStatefulPlugin {
         ))
     }
 
+    fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        decode_sessions_snapshot(snapshot).map(|_| ())
+    }
+
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-        if snapshot.version != SESSIONS_STATEFUL_VERSION {
-            return Err(StatefulPluginError::UnsupportedVersion {
-                plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
-                version: snapshot.version,
-                expected: vec![SESSIONS_STATEFUL_VERSION],
-            });
-        }
-        let decoded: SessionManagerSnapshot =
-            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
-                StatefulPluginError::RestoreFailed {
-                    plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
-                    details: err.to_string(),
-                }
-            })?;
-        self.writer.restore_snapshot(decoded);
+        self.writer
+            .restore_snapshot(decode_sessions_snapshot(&snapshot)?);
         Ok(())
     }
+}
+
+fn decode_sessions_snapshot(
+    snapshot: &StatefulPluginSnapshot,
+) -> StatefulPluginResult<SessionManagerSnapshot> {
+    if snapshot.version != SESSIONS_STATEFUL_VERSION {
+        return Err(StatefulPluginError::UnsupportedVersion {
+            plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
+            version: snapshot.version,
+            expected: vec![SESSIONS_STATEFUL_VERSION],
+        });
+    }
+    serde_json::from_slice(&snapshot.bytes).map_err(|err| StatefulPluginError::RestoreFailed {
+        plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
+        details: err.to_string(),
+    })
 }
 
 /// Wire-format argument for the typed `new-session` byte-dispatch call.

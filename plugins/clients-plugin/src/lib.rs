@@ -320,24 +320,31 @@ impl StatefulPlugin for ClientsStatefulPlugin {
         ))
     }
 
+    fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        decode_clients_snapshot(snapshot).map(|_| ())
+    }
+
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-        if snapshot.version != CLIENTS_STATEFUL_VERSION {
-            return Err(StatefulPluginError::UnsupportedVersion {
-                plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
-                version: snapshot.version,
-                expected: vec![CLIENTS_STATEFUL_VERSION],
-            });
-        }
-        let decoded: FollowStateSnapshot =
-            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
-                StatefulPluginError::RestoreFailed {
-                    plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
-                    details: err.to_string(),
-                }
-            })?;
-        self.writer.restore_snapshot(decoded);
+        self.writer
+            .restore_snapshot(decode_clients_snapshot(&snapshot)?);
         Ok(())
     }
+}
+
+fn decode_clients_snapshot(
+    snapshot: &StatefulPluginSnapshot,
+) -> StatefulPluginResult<FollowStateSnapshot> {
+    if snapshot.version != CLIENTS_STATEFUL_VERSION {
+        return Err(StatefulPluginError::UnsupportedVersion {
+            plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
+            version: snapshot.version,
+            expected: vec![CLIENTS_STATEFUL_VERSION],
+        });
+    }
+    serde_json::from_slice(&snapshot.bytes).map_err(|err| StatefulPluginError::RestoreFailed {
+        plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
+        details: err.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

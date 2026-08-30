@@ -27,6 +27,8 @@ struct Status {
     last_write_epoch_ms: Option<u64>,
     last_restore_epoch_ms: Option<u64>,
     last_restore_error: Option<String>,
+    writes_allowed: bool,
+    restore_started: bool,
 }
 
 /// Default file name used when a parent dir is given but no explicit
@@ -57,11 +59,15 @@ impl BmuxSnapshotOrchestrator {
         dirty_flag: Arc<SnapshotDirtyFlag>,
         stateful_registry: Arc<RwLock<StatefulPluginRegistry>>,
     ) -> Self {
+        let writes_allowed = path.is_none();
         Self {
             path,
             dirty_flag,
             stateful_registry,
-            status: Mutex::new(Status::default()),
+            status: Mutex::new(Status {
+                writes_allowed,
+                ..Status::default()
+            }),
         }
     }
 
@@ -72,6 +78,11 @@ impl BmuxSnapshotOrchestrator {
         let Some(path) = self.path.clone() else {
             return Ok(None);
         };
+        if !self.writes_allowed()? {
+            return Err(SnapshotOrchestratorError::Other(
+                "snapshot writes are blocked until startup restore completes successfully".into(),
+            ));
+        }
         let sections = self.collect_sections()?;
         let envelope = CombinedSnapshotEnvelope::build(sections)?;
         write_envelope_atomic(&path, &envelope)?;
@@ -82,6 +93,56 @@ impl BmuxSnapshotOrchestrator {
         Ok(Some(path))
     }
 
+    pub(crate) fn writes_allowed(&self) -> SnapshotOrchestratorResult<bool> {
+        self.status
+            .lock()
+            .map(|status| status.writes_allowed)
+            .map_err(|_| SnapshotOrchestratorError::Other("snapshot status lock poisoned".into()))
+    }
+
+    fn begin_restore(&self) -> SnapshotOrchestratorResult<()> {
+        let mut status = self.status.lock().map_err(|_| {
+            SnapshotOrchestratorError::Other("snapshot status lock poisoned".into())
+        })?;
+        if status.restore_started {
+            return Err(SnapshotOrchestratorError::Other(
+                "snapshot restore has already been attempted for this server instance".into(),
+            ));
+        }
+        status.restore_started = true;
+        status.writes_allowed = false;
+        Ok(())
+    }
+
+    fn record_restore_result(&self, summary: RestoreSummary) -> SnapshotOrchestratorResult<()> {
+        let mut status = self.status.lock().map_err(|_| {
+            SnapshotOrchestratorError::Other("snapshot status lock poisoned".into())
+        })?;
+        status.last_restore_epoch_ms = Some(epoch_millis_now());
+        if summary.failed_plugins == 0 {
+            status.last_restore_error = None;
+            status.writes_allowed = true;
+            return Ok(());
+        }
+        status.last_restore_error = Some(format!(
+            "{} snapshot participant(s) failed to restore; writes remain blocked to preserve the source snapshot",
+            summary.failed_plugins
+        ));
+        Err(SnapshotOrchestratorError::Other(
+            status
+                .last_restore_error
+                .clone()
+                .expect("partial restore records an error"),
+        ))
+    }
+
+    fn record_restore_error(&self, error: &SnapshotOrchestratorError) {
+        if let Ok(mut status) = self.status.lock() {
+            status.last_restore_error = Some(error.to_string());
+            status.writes_allowed = false;
+        }
+    }
+
     /// Gather one section per registered participant.
     fn collect_sections(&self) -> SnapshotOrchestratorResult<Vec<SectionV1>> {
         let registry = self.stateful_registry.read().map_err(|_| {
@@ -89,18 +150,17 @@ impl BmuxSnapshotOrchestrator {
         })?;
         let mut sections = Vec::with_capacity(registry.len());
         for handle in registry.as_slice() {
-            match handle.as_dyn().snapshot() {
-                Ok(payload) => {
-                    sections.push(SectionV1 {
-                        id: payload.id.as_str().to_string(),
-                        version: payload.version,
-                        bytes: payload.bytes,
-                    });
+            let payload = handle.as_dyn().snapshot().map_err(|error| {
+                SnapshotOrchestratorError::Participant {
+                    plugin: handle.as_dyn().id().as_str().to_string(),
+                    details: StatefulErrorDisplay(&error).to_string(),
                 }
-                Err(err) => {
-                    warn!("stateful plugin snapshot failed (skipped in envelope): {err}");
-                }
-            }
+            })?;
+            sections.push(SectionV1 {
+                id: payload.id.as_str().to_string(),
+                version: payload.version,
+                bytes: payload.bytes,
+            });
         }
         Ok(sections)
     }
@@ -265,24 +325,32 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
         if self.path.is_none() {
             return Ok(None);
         }
-        let Some(envelope) = self.read_envelope()? else {
-            return Ok(None);
+        self.begin_restore()?;
+        let envelope = match self.read_envelope() {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                self.status
+                    .lock()
+                    .map_err(|_| {
+                        SnapshotOrchestratorError::Other("snapshot status lock poisoned".into())
+                    })?
+                    .writes_allowed = true;
+                return Ok(None);
+            }
+            Err(error) => {
+                self.record_restore_error(&error);
+                return Err(error);
+            }
         };
-        match self.apply_envelope(envelope) {
-            Ok(summary) => {
-                if let Ok(mut status) = self.status.lock() {
-                    status.last_restore_epoch_ms = Some(epoch_millis_now());
-                    status.last_restore_error = None;
-                }
-                Ok(Some(summary))
+        let summary = match self.apply_envelope(envelope) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.record_restore_error(&error);
+                return Err(error);
             }
-            Err(err) => {
-                if let Ok(mut status) = self.status.lock() {
-                    status.last_restore_error = Some(err.to_string());
-                }
-                Err(err)
-            }
-        }
+        };
+        self.record_restore_result(summary)?;
+        Ok(Some(summary))
     }
 
     async fn save_now(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
@@ -295,6 +363,34 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
         }
         match self.read_envelope()? {
             Some(envelope) => {
+                let registry = self.stateful_registry.read().map_err(|_| {
+                    SnapshotOrchestratorError::Other(
+                        "stateful plugin registry lock poisoned".into(),
+                    )
+                })?;
+                let mut validated = 0usize;
+                for section in &envelope.sections {
+                    let Some(participant) = registry
+                        .as_slice()
+                        .iter()
+                        .find(|handle| handle.as_dyn().id().as_str() == section.id)
+                    else {
+                        continue;
+                    };
+                    let payload = StatefulPluginSnapshot::new(
+                        participant.as_dyn().id(),
+                        section.version,
+                        section.bytes.clone(),
+                    );
+                    participant
+                        .as_dyn()
+                        .validate_snapshot(&payload)
+                        .map_err(|error| SnapshotOrchestratorError::Participant {
+                            plugin: section.id.clone(),
+                            details: StatefulErrorDisplay(&error).to_string(),
+                        })?;
+                    validated += 1;
+                }
                 let section_count = envelope.sections.len();
                 let ids = envelope
                     .sections
@@ -304,7 +400,9 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
                     .join(", ");
                 Ok(DryRunReport {
                     ok: true,
-                    message: format!("{section_count} sections: [{ids}]"),
+                    message: format!(
+                        "{section_count} sections, {validated} registered payloads validated: [{ids}]"
+                    ),
                 })
             }
             None => Ok(DryRunReport {
@@ -323,24 +421,23 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
         // what the payload encodes. Stateful plugins already honor
         // this (e.g. `FollowStateWriter::restore_snapshot` overwrites
         // every field).
-        let Some(envelope) = self.read_envelope()? else {
-            return Ok(RestoreSummary::default());
+        let envelope = match self.read_envelope() {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return Ok(RestoreSummary::default()),
+            Err(error) => {
+                self.record_restore_error(&error);
+                return Err(error);
+            }
         };
-        match self.apply_envelope(envelope) {
-            Ok(summary) => {
-                if let Ok(mut status) = self.status.lock() {
-                    status.last_restore_epoch_ms = Some(epoch_millis_now());
-                    status.last_restore_error = None;
-                }
-                Ok(summary)
+        let summary = match self.apply_envelope(envelope) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.record_restore_error(&error);
+                return Err(error);
             }
-            Err(err) => {
-                if let Ok(mut status) = self.status.lock() {
-                    status.last_restore_error = Some(err.to_string());
-                }
-                Err(err)
-            }
-        }
+        };
+        self.record_restore_result(summary)?;
+        Ok(summary)
     }
 
     fn status(&self) -> SnapshotStatusReport {
@@ -432,8 +529,8 @@ impl core::fmt::Display for StatefulErrorDisplay<'_> {
 mod tests {
     use super::{BmuxSnapshotOrchestrator, DEFAULT_SNAPSHOT_FILENAME};
     use bmux_plugin_sdk::{
-        PluginEventKind, StatefulPlugin, StatefulPluginHandle, StatefulPluginResult,
-        StatefulPluginSnapshot,
+        PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+        StatefulPluginResult, StatefulPluginSnapshot,
     };
     use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotOrchestrator, StatefulPluginRegistry};
     use std::collections::BTreeMap;
@@ -574,11 +671,24 @@ mod tests {
             ))
         }
 
+        fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+            decode_counter_snapshot(snapshot).map(|_| ())
+        }
+
         fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-            let bytes: [u8; 4] = snapshot.bytes.try_into().unwrap();
-            *self.value.lock().unwrap() = u32::from_le_bytes(bytes);
+            *self.value.lock().unwrap() = decode_counter_snapshot(&snapshot)?;
             Ok(())
         }
+    }
+
+    fn decode_counter_snapshot(snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<u32> {
+        let bytes: [u8; 4] = snapshot.bytes.as_slice().try_into().map_err(|_| {
+            StatefulPluginError::RestoreFailed {
+                plugin: TEST_ID.as_str().to_string(),
+                details: "expected 4 bytes".into(),
+            }
+        })?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn new_registry_with_counter(
@@ -604,14 +714,24 @@ mod tests {
             Arc::clone(&dirty),
             Arc::clone(&registry),
         );
+        assert!(orchestrator.save_now().await.is_err());
+        assert!(
+            orchestrator
+                .restore_if_present()
+                .await
+                .expect("initial restore")
+                .is_none()
+        );
 
         let saved = orchestrator.save_now().await.expect("save");
         assert_eq!(saved.as_deref(), Some(path.as_path()));
         assert!(path.exists());
 
-        // Mutate, then restore.
+        // Mutate, then simulate a new server instance restoring the saved file.
         *counter.value.lock().unwrap() = 999;
-        let summary = orchestrator
+        let restoring_orchestrator =
+            BmuxSnapshotOrchestrator::new(Some(path), Arc::clone(&dirty), Arc::clone(&registry));
+        let summary = restoring_orchestrator
             .restore_if_present()
             .await
             .expect("restore")
@@ -650,29 +770,60 @@ mod tests {
         assert!(dirty.is_dirty());
 
         let orchestrator = BmuxSnapshotOrchestrator::new(Some(path), Arc::clone(&dirty), registry);
+        assert!(
+            orchestrator
+                .restore_if_present()
+                .await
+                .expect("initial restore")
+                .is_none()
+        );
         orchestrator.save_now().await.expect("save");
         assert!(!dirty.is_dirty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_participant_snapshot_does_not_replace_existing_file() {
+        struct FailingSnapshotter;
+
+        impl StatefulPlugin for FailingSnapshotter {
+            fn id(&self) -> PluginEventKind {
+                PluginEventKind::from_static("bmux.test/failing-snapshot")
+            }
+
+            fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+                Err(StatefulPluginError::SnapshotFailed {
+                    plugin: self.id().to_string(),
+                    details: "simulated snapshot failure".into(),
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(DEFAULT_SNAPSHOT_FILENAME);
+        let original = b"complete previous snapshot";
+        std::fs::write(&path, original).unwrap();
+        let mut registry = StatefulPluginRegistry::new();
+        registry.push(StatefulPluginHandle::new(FailingSnapshotter));
+        let orchestrator = BmuxSnapshotOrchestrator::new(
+            Some(path.clone()),
+            Arc::new(SnapshotDirtyFlag::new()),
+            Arc::new(RwLock::new(registry)),
+        );
+        orchestrator.status.lock().unwrap().writes_allowed = true;
+
+        assert!(orchestrator.save_now().await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     /// The orchestrator must tolerate snapshot envelopes that
     /// reference participant ids no plugin has registered (e.g. an
     /// older bmux version wrote a section whose owning plugin has
     /// since been removed, or a user disabled one of the bundled
-    /// plugins). It should also survive sections whose opaque bytes
-    /// are corrupt — that participant's `restore_snapshot` returns
-    /// `Err`, but the orchestrator must continue restoring the rest
-    /// of the envelope.
-    ///
-    /// Replaces the deleted
-    /// `persistence::tests::decode_rejects_invalid_references` test.
-    /// The old schema validated cross-section references at decode
-    /// time (monolithic `validate_snapshot_v4`); the new envelope is
-    /// decoded per-section, and reference integrity is the
-    /// participant's responsibility. This test documents the new
-    /// "graceful degradation" contract: unknown + malformed sections
-    /// are logged + skipped, they never panic or abort the restore.
+    /// plugins). A malformed registered section still allows independent
+    /// participants to restore, but the overall restore fails and snapshot
+    /// writes remain blocked so degraded state cannot replace the source.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restore_gracefully_skips_unknown_and_malformed_sections() {
+    async fn partial_restore_blocks_snapshot_replacement() {
         use bmux_snapshot_plugin_api::envelope::{CombinedSnapshotEnvelope, SectionV1};
         use std::io::Write;
 
@@ -687,6 +838,15 @@ mod tests {
             }
             fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
                 Ok(StatefulPluginSnapshot::new(FAILING_ID, 1, vec![]))
+            }
+            fn validate_snapshot(
+                &self,
+                _snapshot: &StatefulPluginSnapshot,
+            ) -> StatefulPluginResult<()> {
+                Err(bmux_plugin_sdk::StatefulPluginError::RestoreFailed {
+                    plugin: FAILING_ID.as_str().to_string(),
+                    details: "simulated malformed payload".into(),
+                })
             }
             fn restore_snapshot(
                 &self,
@@ -744,23 +904,30 @@ mod tests {
         file.write_all(&bytes).unwrap();
         file.sync_all().unwrap();
 
-        let orchestrator =
-            BmuxSnapshotOrchestrator::new(Some(path), Arc::clone(&dirty), Arc::clone(&registry));
+        let original_bytes = std::fs::read(&path).unwrap();
+        let orchestrator = BmuxSnapshotOrchestrator::new(
+            Some(path.clone()),
+            Arc::clone(&dirty),
+            Arc::clone(&registry),
+        );
 
-        let summary = orchestrator
+        let error = orchestrator
             .restore_if_present()
             .await
-            .expect("restore does not error")
-            .expect("envelope present");
-
-        // Counter restored cleanly; FailingRestorer counted as
-        // failed; ghost section silently skipped with no increment.
-        assert_eq!(summary.restored_plugins, 1, "counter restored");
-        assert_eq!(summary.failed_plugins, 1, "failing restorer counted");
-        assert_eq!(
-            *counter.value.lock().unwrap(),
-            7,
-            "counter got the new value"
+            .expect_err("partial restore must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("1 snapshot participant(s) failed to restore")
         );
+
+        // Independent participants still restore before the failure is
+        // reported, but no subsequent save may replace the source snapshot.
+        assert_eq!(*counter.value.lock().unwrap(), 7);
+        assert!(orchestrator.dry_run().await.is_err());
+        assert!(orchestrator.save_now().await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        let status = orchestrator.status();
+        assert!(status.last_restore_error.is_some());
     }
 }

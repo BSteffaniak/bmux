@@ -112,10 +112,24 @@ pub trait StatefulPlugin: Send + Sync {
     ///
     /// Returns [`StatefulPluginError::SnapshotFailed`] if the plugin
     /// cannot serialize its state (lock poisoned, serde failure,
-    /// referenced resource gone). The orchestration plugin treats this
-    /// as a per-plugin failure and continues snapshotting other
-    /// plugins.
+    /// referenced resource gone). Snapshot orchestration must treat this
+    /// as a failure for the whole save so an incomplete envelope cannot
+    /// replace a previously complete snapshot.
     fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot>;
+
+    /// Validate a saved payload without mutating live plugin state.
+    ///
+    /// Implementations with versioned or structured payloads should decode and
+    /// validate the same invariants as [`Self::restore_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same compatibility or codec errors that restore would
+    /// return for the supplied payload.
+    fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        let _ = snapshot;
+        Ok(())
+    }
 
     /// Restore the plugin's state from a previously saved snapshot.
     ///

@@ -21,9 +21,13 @@ pub struct AttachContentRegion {
 pub struct AttachViewport {
     pub cols: u16,
     pub rows: u16,
+    #[serde(default)]
     pub top_inset: u16,
+    #[serde(default)]
     pub right_inset: u16,
+    #[serde(default)]
     pub bottom_inset: u16,
+    #[serde(default)]
     pub left_inset: u16,
 }
 
@@ -146,6 +150,23 @@ mod tests {
                 y: 0,
                 cols: 1,
                 rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn viewport_decodes_missing_insets_as_zero() {
+        let decoded: AttachViewport =
+            serde_json::from_value(serde_json::json!({ "cols": 120, "rows": 40 })).unwrap();
+        assert_eq!(
+            decoded,
+            AttachViewport {
+                cols: 120,
+                rows: 40,
+                top_inset: 0,
+                right_inset: 0,
+                bottom_inset: 0,
+                left_inset: 0,
             }
         );
     }

@@ -31,7 +31,7 @@ const PANE_RUNTIME_PLUGIN_SNAPSHOT_ID: PluginEventKind =
 
 /// Current schema version for pane-runtime snapshots. Bump on any
 /// breaking change to [`PaneRuntimeSnapshotV1`] or its descendants.
-const PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION: u32 = 1;
+const PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION: u32 = 2;
 
 /// Combined pane-runtime snapshot — one entry per session.
 ///
@@ -436,21 +436,12 @@ impl StatefulPlugin for PaneRuntimeStateful {
         ))
     }
 
+    fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        decode_pane_runtime_snapshot(snapshot).map(|_| ())
+    }
+
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-        if snapshot.version != PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION {
-            return Err(StatefulPluginError::UnsupportedVersion {
-                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
-                version: snapshot.version,
-                expected: vec![PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION],
-            });
-        }
-        let decoded: PaneRuntimeSnapshotV1 =
-            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
-                StatefulPluginError::RestoreFailed {
-                    plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
-                    details: err.to_string(),
-                }
-            })?;
+        let decoded = decode_pane_runtime_snapshot(&snapshot)?;
         apply_pane_runtime_payload(&decoded).map_err(|error| {
             StatefulPluginError::RestoreFailed {
                 plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
@@ -461,19 +452,98 @@ impl StatefulPlugin for PaneRuntimeStateful {
     }
 }
 
+fn decode_pane_runtime_snapshot(
+    snapshot: &StatefulPluginSnapshot,
+) -> StatefulPluginResult<PaneRuntimeSnapshotV1> {
+    if ![1, PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION].contains(&snapshot.version) {
+        return Err(StatefulPluginError::UnsupportedVersion {
+            plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+            version: snapshot.version,
+            expected: vec![1, PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION],
+        });
+    }
+    let bytes = if snapshot.version == 1 {
+        crate::snapshot_v1_migration::migrate(&snapshot.bytes).map_err(|err| {
+            StatefulPluginError::RestoreFailed {
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+                details: err.to_string(),
+            }
+        })?
+    } else {
+        snapshot.bytes.clone()
+    };
+    serde_json::from_slice(&bytes).map_err(|err| StatefulPluginError::RestoreFailed {
+        plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+        details: err.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PaneRuntimeSessionSnapshotV1, PaneRuntimeSnapshotV1, PaneRuntimeSnapshotV1FloatingSurface,
-        PaneRuntimeSnapshotV1Layout, PaneRuntimeSnapshotV1Pane,
-        PaneRuntimeSnapshotV1SplitDirection,
+        PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION, PaneRuntimeSessionSnapshotV1, PaneRuntimeSnapshotV1,
+        PaneRuntimeSnapshotV1FloatingSurface, PaneRuntimeSnapshotV1Layout,
+        PaneRuntimeSnapshotV1Pane, PaneRuntimeSnapshotV1SplitDirection,
+        decode_pane_runtime_snapshot,
     };
     use bmux_attach_layout_protocol::PaneLaunchCommand;
     use bmux_pane_runtime_state::{
         AttachViewport, FloatingPaneLayer, FloatingPaneScope, PaneCommandSource,
     };
+    use bmux_plugin_sdk::StatefulPluginSnapshot;
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    #[test]
+    fn version_one_snapshot_migrates_to_generic_viewport_fields() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let legacy_viewport = serde_json::json!({
+            "cols": 120,
+            "rows": 40,
+        });
+        let mut legacy_viewport = legacy_viewport.as_object().unwrap().clone();
+        legacy_viewport.insert(["status", "top", "inset"].join("_"), serde_json::json!(2));
+        legacy_viewport.insert(
+            ["status", "bottom", "inset"].join("_"),
+            serde_json::json!(1),
+        );
+        let legacy = serde_json::json!({
+            "sessions": [{
+                "session_id": session_id,
+                "panes": [{
+                    "id": pane_id,
+                    "name": "pane-1",
+                    "shell": "/bin/sh",
+                }],
+                "focused_pane_id": pane_id,
+                "layout_root": { "kind": "leaf", "pane_id": pane_id },
+                "attach_viewport": legacy_viewport,
+            }]
+        });
+        let snapshot = StatefulPluginSnapshot::new(
+            super::PANE_RUNTIME_PLUGIN_SNAPSHOT_ID,
+            1,
+            serde_json::to_vec(&legacy).unwrap(),
+        );
+        let decoded = decode_pane_runtime_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            decoded.sessions[0].attach_viewport,
+            Some(AttachViewport {
+                cols: 120,
+                rows: 40,
+                top_inset: 2,
+                right_inset: 0,
+                bottom_inset: 1,
+                left_inset: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn current_snapshot_version_is_two() {
+        assert_eq!(PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION, 2);
+    }
 
     #[test]
     fn decoded_snapshot_viewport_normalizes_before_runtime_restore() {
