@@ -252,6 +252,18 @@ impl RustPlugin for SidebarPlugin {
     }
 }
 
+const fn input_endpoint_capability() -> &'static str {
+    "bmux.sidebar.input"
+}
+
+fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
+    bmux_plugin::AttachInputEndpoint {
+        capability: input_endpoint_capability().to_string(),
+        interface_id: "presentation-input".to_string(),
+        operation: "handle-input".to_string(),
+    }
+}
+
 /// Configure this process-local attach companion.
 ///
 /// # Errors
@@ -277,6 +289,10 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             },
         )
         .map_err(|error| format!("publishing sidebar layout: {error:?}"))?;
+    bmux_plugin::register_attach_presentation_input_handler(
+        input_endpoint(),
+        std::sync::Arc::new(handle_local_input),
+    );
     Ok(())
 }
 
@@ -312,6 +328,7 @@ pub fn start() -> Result<(), String> {
 
 pub fn uninstall() {
     ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
+    bmux_plugin::remove_attach_presentation_input_handler(&input_endpoint());
     let _ = global_plugin_layout_registry().remove_owner(OWNER);
     let _ = global_plugin_surface_registry().remove_owner(OWNER);
     if let Ok(mut guard) = state().lock() {
@@ -633,11 +650,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                     row.saturating_sub(start_row).max(1),
                 ),
             )
-            .endpoint(bmux_plugin::AttachInputEndpoint {
-                capability: "bmux.sidebar.input".to_string(),
-                interface_id: "presentation-input".to_string(),
-                operation: "handle-input".to_string(),
-            })
+            .endpoint(input_endpoint())
             .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
         );
     }
@@ -785,23 +798,30 @@ fn update_keyboard(
     })
 }
 
+fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if event.event_kind != "pointer" {
+        return None;
+    }
+    if update_scroll(event) {
+        return Some(AttachInputResult {
+            consumed: true,
+            dirty: true,
+            ..AttachInputResult::default()
+        });
+    }
+    if update_hover(event) {
+        return Some(AttachInputResult {
+            consumed: false,
+            dirty: true,
+            ..AttachInputResult::default()
+        });
+    }
+    None
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
     if let Some(result) = update_keyboard(context, event) {
         return result;
-    }
-    if update_scroll(event) {
-        return AttachInputResult {
-            consumed: true,
-            dirty: true,
-            ..AttachInputResult::default()
-        };
-    }
-    if update_hover(event) {
-        return AttachInputResult {
-            consumed: true,
-            dirty: true,
-            ..AttachInputResult::default()
-        };
     }
     if event.event_kind != "pointer"
         || event.phase != "down"
