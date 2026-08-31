@@ -415,8 +415,8 @@ use super::super::prompt::{self, PromptOption, PromptRequest, PromptResponse, Pr
 use super::super::{
     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS, ATTACH_SELECTION_CLEARED_STATUS,
     ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
-    ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL, BmuxClient, HELP_OVERLAY_SURFACE_ID,
-    InputProcessor, KernelClientFactory, Keymap, RuntimeAction, action_dispatch, attach,
+    ATTACH_TRANSIENT_STATUS_TTL, BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor,
+    KernelClientFactory, Keymap, RuntimeAction, action_dispatch, attach,
     attach_quit_failure_status, available_capability_providers, available_service_descriptors,
     command_accepts_repeat, effective_enabled_plugins, enter_host_kernel_connection,
     host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
@@ -3450,18 +3450,6 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             .map_err(map_attach_client_error)?
     };
 
-    if let Some(leader_client_id) = follow_target_id {
-        writeln!(
-            terminal,
-            "attached to session: {} (following {}{})",
-            attach_info.session_id,
-            leader_client_id,
-            if global { ", global" } else { "" }
-        )?;
-    } else {
-        writeln!(terminal, "attached to session: {}", attach_info.session_id)?;
-    }
-
     let capture_targets = match recording_state::client::capture_targets(&mut client).await {
         Ok(targets) => targets.into_iter().map(Into::into).collect(),
         Err(error) => {
@@ -3608,24 +3596,6 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         .await;
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     sync_attach_active_mode_from_processor(&mut view_state, &attach_keymap, None);
-    view_state.set_transient_status(
-        initial_attach_status(
-            &attach_keymap,
-            &view_state.active_mode_id,
-            view_state.can_write,
-        ),
-        Instant::now(),
-        ATTACH_WELCOME_STATUS_TTL,
-    );
-
-    if !view_state.can_write {
-        writeln!(terminal, "read-only attach: input disabled")?;
-    }
-    if let Some(detach_key) = attach_keymap.primary_binding_for_action(&RuntimeAction::Detach) {
-        writeln!(terminal, "press {detach_key} to detach")?;
-    } else {
-        writeln!(terminal, "detach is unbound in current keymap")?;
-    }
 
     let keyboard_enhanced = terminal.enter_attach_mode(
         attach_config.behavior.kitty_keyboard,
@@ -7262,15 +7232,6 @@ fn publish_attach_local_presentation(
     view_state.local_presentation = Some(snapshot.clone());
     let _ = bmux_plugin::global_event_bus()
         .publish_state(&ATTACH_LOCAL_PRESENTATION_STATE_KIND, snapshot);
-}
-
-pub fn initial_attach_status(keymap: &Keymap, mode_id: &str, can_write: bool) -> String {
-    let help = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::ShowHelp);
-    if can_write {
-        format!("{help} help | modal input enabled")
-    } else {
-        format!("read-only attach | {help} help")
-    }
 }
 
 pub const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {

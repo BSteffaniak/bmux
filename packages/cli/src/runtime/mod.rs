@@ -164,7 +164,6 @@ const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";
 const ATTACH_SELECTION_COPIED_STATUS: &str = "selection copied";
 const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
-const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 
 pub fn active_runtime_name() -> String {

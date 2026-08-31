@@ -986,10 +986,8 @@ fn resolve_logging_paths() -> moosicbox_log_runtime::LogRuntimePaths {
 mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
-    use crate::runtime::attach::runtime::{attach_keymap_from_config, initial_attach_status};
     use crate::runtime::session_cli::attach_quit_failure_status;
     use bmux_client::ClientError;
-    use bmux_config::BmuxConfig;
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
 
@@ -1056,13 +1054,5 @@ mod tests {
         });
 
         assert_eq!(status, "quit blocked by session policy");
-    }
-
-    #[test]
-    fn initial_attach_status_mentions_help_and_typing() {
-        let keymap = attach_keymap_from_config(&BmuxConfig::default());
-        let status = initial_attach_status(&keymap, "normal", true);
-        assert!(status.contains("help"));
-        assert!(status.contains("modal input enabled"));
     }
 }
