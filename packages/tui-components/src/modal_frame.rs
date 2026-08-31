@@ -6,8 +6,17 @@
 //! rows or short text lines.
 
 use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId, LayoutNode,
+    LogicalSize,
+};
+use bmux_tui::composition::{
+    Align, HorizontalAlignment, SizeBox, Stack, Surface, VerticalAlignment,
+};
+use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::Widget;
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::Line;
@@ -266,6 +275,125 @@ impl ModalFrame {
     }
 }
 
+struct ComponentRef<'a>(&'a Element<'a>);
+
+impl Component for ComponentRef<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.0.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.0.layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.0.paint(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.0.event(event, layout, cx)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Scrim(Style);
+
+impl Component for Scrim {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        LayoutNode::leaf(
+            LayoutId::new("modal-scrim"),
+            LogicalSize::new(
+                constraints.max_width(),
+                constraints
+                    .max_height()
+                    .unwrap_or_else(|| constraints.min_height()),
+            ),
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        cx.fill(
+            bmux_tui::paint::LocalRect::new(
+                0,
+                0,
+                layout.size.width,
+                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+            ),
+            " ",
+            self.0,
+        );
+    }
+}
+
+/// Canonical child-owning modal surface.
+pub struct ModalFrameComponent<'a> {
+    id: LayoutId,
+    frame: ModalFrame,
+    child: Element<'a>,
+}
+
+impl<'a> ModalFrameComponent<'a> {
+    /// Create a modal frame around one measurable child.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, frame: ModalFrame, child: impl Component + 'a) -> Self {
+        Self {
+            id: id.into(),
+            frame,
+            child: Element::new(child),
+        }
+    }
+
+    fn tree(&self) -> Stack<'_> {
+        let sizing = self.frame.sizing;
+        let panel = Surface::new(ComponentRef(&self.child))
+            .id(format!("{}.surface", self.id.as_str()))
+            .background(self.frame.theme.background)
+            .content_style(self.frame.theme.text)
+            .border(self.frame.border.clone())
+            .padding(self.frame.padding);
+        let panel = SizeBox::new(panel)
+            .id(format!("{}.size", self.id.as_str()))
+            .min_width(sizing.min.width)
+            .max_width(sizing.max.width)
+            .min_height(usize::from(sizing.min.height))
+            .max_height(usize::from(sizing.max.height));
+        let (horizontal, vertical) = match self.frame.placement {
+            ModalPlacement::Centered => (HorizontalAlignment::Center, VerticalAlignment::Center),
+            ModalPlacement::UpperThird => (HorizontalAlignment::Center, VerticalAlignment::Start),
+            ModalPlacement::LowerThird => (HorizontalAlignment::Center, VerticalAlignment::End),
+            ModalPlacement::Anchored(_) => (HorizontalAlignment::Start, VerticalAlignment::Start),
+        };
+        let aligned = Align::new(panel)
+            .id(format!("{}.placement", self.id.as_str()))
+            .horizontal(horizontal)
+            .vertical(vertical);
+        let mut stack = Stack::new().id(self.id.clone());
+        if let Some(scrim) = self.frame.theme.scrim {
+            stack = stack.child(Scrim(scrim));
+        }
+        stack.child(aligned)
+    }
+}
+
+impl Component for ModalFrameComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.tree().revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.tree().layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.tree().paint(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.tree().event(event, layout, cx)
+    }
+}
+
 fn clamp_axis(available: u16, min: u16, max: u16) -> u16 {
     available.clamp(min.min(available), max)
 }
@@ -295,11 +423,50 @@ impl From<crate::theme::ComponentTheme> for ModalTheme {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+    use super::{ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::composition::TextContent;
+    use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::style::{Color, Style};
+
+    #[test]
+    fn component_composes_scrim_surface_and_child() {
+        let theme = ModalTheme::dark(Color::Cyan).with_scrim(Style::new().bg(Color::BrightBlack));
+        let frame = ModalFrame::new(ModalSizing::fixed(Size::new(12, 5), Insets::all(0)), theme)
+            .padding(Insets::new(1, 1, 1, 1));
+        let component = ModalFrameComponent::new(
+            "confirm",
+            frame,
+            TextContent::new("Proceed?").id("confirm.body"),
+        );
+        let layout = component.layout(Constraints::new(30, 30, 10, Some(10)), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 30);
+        assert_eq!(layout.size.height, 10);
+        assert!(layout.find(&"confirm.surface".into()).is_some());
+        assert!(layout.find(&"confirm.body".into()).is_some());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 10));
+        let mut terminal = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut terminal));
+        assert_eq!(
+            component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
+            bmux_tui::event::EventOutcome::Ignored
+        );
+        assert_eq!(
+            terminal.buffer().get(Point::new(0, 0)).unwrap().style.bg,
+            Some(Color::BrightBlack)
+        );
+        assert!((0..10).any(|row| {
+            terminal
+                .buffer()
+                .row_symbols(row)
+                .is_some_and(|symbols| symbols.contains("Proceed?"))
+        }));
+    }
 
     #[test]
     fn modal_frame_fills_entire_panel_area_with_background() {
