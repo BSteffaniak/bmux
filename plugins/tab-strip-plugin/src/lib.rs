@@ -1416,6 +1416,7 @@ bar_bg = "#112233"
             ],
             revision: 1,
         });
+        state.local_presentation.viewport_cols = 80;
         let before = build_surface(&state, 1);
         state.hovered_window_id = Some(second);
         let after = build_surface(&state, 2);

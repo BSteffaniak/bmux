@@ -3730,23 +3730,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     // falls through to the raw-contexts render path, which is the
     // baseline-fallback behavior per AGENTS.md.
     if let Ok(entries) = typed_list_windows_attach(&mut client).await {
-        let windows: Vec<bmux_windows_plugin_api::windows_list::WindowListEntry> = entries
-            .into_iter()
-            .filter_map(|entry| {
-                let id = Uuid::parse_str(&entry.id).ok()?;
-                Some(bmux_windows_plugin_api::windows_list::WindowListEntry {
-                    id,
-                    name: entry.name,
-                    active: entry.active,
-                    workspace: entry.workspace,
-                    workspace_id: entry.workspace_id,
-                })
-            })
-            .collect();
-        let snapshot = bmux_windows_plugin_api::windows_list::WindowListSnapshot {
-            windows,
-            revision: 0,
-        };
+        let snapshot = authoritative_window_list_snapshot(entries, 0);
         last_window_list_revision = snapshot.revision;
         view_state.cached_window_list = Some(std::sync::Arc::new(snapshot.clone()));
         let _ = bmux_plugin::global_event_bus()
@@ -4987,6 +4971,18 @@ async fn handle_attach_stream_server_event(
                 payload,
             ) {
                 Ok(snapshot) => {
+                    let current = bmux_plugin::global_event_bus()
+                        .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+                            &bmux_windows_plugin_api::windows_list::STATE_KIND,
+                        )
+                        .map_or_else(
+                            |_| bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                                windows: Vec::new(),
+                                revision: 0,
+                            },
+                            |(snapshot, _)| snapshot.as_ref().clone(),
+                        );
+                    let snapshot = prefer_nonempty_window_list_snapshot(&current, snapshot);
                     let _ = bmux_plugin::global_event_bus().publish_state(
                         &bmux_windows_plugin_api::windows_list::STATE_KIND,
                         snapshot,
@@ -7110,6 +7106,39 @@ fn is_windows_close_active_pane_action(action: &RuntimeAction) -> bool {
             ..
         } if is_windows_close_active_pane_command(plugin_id, command_name)
     )
+}
+
+fn authoritative_window_list_snapshot(
+    entries: Vec<windows_state::WindowEntry>,
+    revision: u64,
+) -> bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+    let windows = entries
+        .into_iter()
+        .filter_map(|entry| {
+            Some(bmux_windows_plugin_api::windows_list::WindowListEntry {
+                id: Uuid::parse_str(&entry.id).ok()?,
+                name: entry.name,
+                active: entry.active,
+                workspace: entry.workspace,
+                workspace_id: entry.workspace_id,
+            })
+        })
+        .collect();
+    bmux_windows_plugin_api::windows_list::WindowListSnapshot { windows, revision }
+}
+
+fn prefer_nonempty_window_list_snapshot(
+    current: &bmux_windows_plugin_api::windows_list::WindowListSnapshot,
+    candidate: bmux_windows_plugin_api::windows_list::WindowListSnapshot,
+) -> bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+    if candidate.windows.is_empty() && !current.windows.is_empty() && current.revision == 0 {
+        bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+            windows: current.windows.clone(),
+            revision: candidate.revision,
+        }
+    } else {
+        candidate
+    }
 }
 
 fn snapshot_mode_id(view_state: &AttachViewState, zoomed: bool) -> String {
@@ -11509,11 +11538,12 @@ async fn invoke_plugin_surface_pointer_event(
         focused_pane: None,
         hovered_pane: None,
     };
-    let payload =
-        bmux_codec::to_positional_vec(&input).map_err(|error| ClientError::ServerError {
+    let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
+        ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("encoding plugin surface pointer event: {error}"),
-        })?;
+        }
+    })?;
     let response = client
         .invoke_service_raw(
             endpoint.capability,
@@ -11523,13 +11553,12 @@ async fn invoke_plugin_surface_pointer_event(
             payload,
         )
         .await?;
-    let result =
-        bmux_codec::from_positional_bytes::<AttachInputResult>(&response).map_err(|error| {
-            ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("decoding plugin surface pointer result: {error}"),
-            }
-        })?;
+    let result = bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
+        |error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decoding plugin surface pointer result: {error}"),
+        },
+    )?;
     if result.capture_pointer {
         view_state.plugin_pointer_router.capture(event.hit.clone());
     }
@@ -11634,11 +11663,12 @@ async fn try_handle_plugin_surface_key(
         focused_pane: attach_input_focused_context(view_state),
         hovered_pane: None,
     };
-    let payload =
-        bmux_codec::to_positional_vec(&input).map_err(|error| ClientError::ServerError {
+    let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
+        ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("encoding plugin surface keyboard event: {error}"),
-        })?;
+        }
+    })?;
     let response = client
         .invoke_service_raw(
             endpoint.capability,
@@ -11648,13 +11678,12 @@ async fn try_handle_plugin_surface_key(
             payload,
         )
         .await?;
-    let result =
-        bmux_codec::from_positional_bytes::<AttachInputResult>(&response).map_err(|error| {
-            ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("decoding plugin surface keyboard result: {error}"),
-            }
-        })?;
+    let result = bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
+        |error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decoding plugin surface keyboard result: {error}"),
+        },
+    )?;
     if result.release_capture {
         let _ = view_state.plugin_focus.clear();
     }
@@ -11688,11 +11717,12 @@ async fn invoke_attach_input_hook(
     hook: &AttachInputHook,
     event: AttachInputEvent,
 ) -> std::result::Result<AttachInputResult, ClientError> {
-    let payload =
-        bmux_codec::to_positional_vec(&event).map_err(|error| ClientError::ServerError {
+    let payload = bmux_plugin_sdk::encode_service_message(&event).map_err(|error| {
+        ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("encoding attach input hook event: {error}"),
-        })?;
+        }
+    })?;
     let response = client
         .invoke_service_raw(
             hook.endpoint.capability.clone(),
@@ -11702,7 +11732,7 @@ async fn invoke_attach_input_hook(
             payload,
         )
         .await?;
-    bmux_codec::from_positional_bytes::<AttachInputResult>(&response).map_err(|error| {
+    bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(|error| {
         ClientError::ServerError {
             code: bmux_ipc::ErrorCode::Internal,
             message: format!("decoding attach input hook result: {error}"),
@@ -15082,6 +15112,65 @@ mod tests {
         };
 
         assert!(is_attach_stream_closed_error(&error));
+    }
+
+    #[test]
+    fn typed_service_codec_round_trips_attach_input_result() {
+        let result = AttachInputResult {
+            consumed: true,
+            dirty: true,
+            capture_pointer: true,
+            ..AttachInputResult::default()
+        };
+        let bytes = bmux_plugin_sdk::encode_service_message(&result).unwrap();
+        let decoded = bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&bytes).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn initial_authoritative_windows_survive_empty_forwarded_seed() {
+        let current = authoritative_window_list_snapshot(
+            vec![windows_state::WindowEntry {
+                id: Uuid::from_u128(11).to_string(),
+                name: "main".to_string(),
+                active: true,
+                workspace: "default".to_string(),
+                workspace_id: Uuid::nil(),
+            }],
+            0,
+        );
+        let preferred = prefer_nonempty_window_list_snapshot(
+            &current,
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: Vec::new(),
+                revision: 7,
+            },
+        );
+        assert_eq!(preferred.revision, 7);
+        assert_eq!(preferred.windows.len(), 1);
+        assert_eq!(preferred.windows[0].name, "main");
+    }
+
+    #[test]
+    fn later_empty_windows_snapshot_is_authoritative() {
+        let current = bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+            windows: vec![bmux_windows_plugin_api::windows_list::WindowListEntry {
+                id: Uuid::from_u128(11),
+                name: "main".to_string(),
+                active: true,
+                workspace: "default".to_string(),
+                workspace_id: Uuid::nil(),
+            }],
+            revision: 6,
+        };
+        let preferred = prefer_nonempty_window_list_snapshot(
+            &current,
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: Vec::new(),
+                revision: 7,
+            },
+        );
+        assert!(preferred.windows.is_empty());
     }
 
     #[test]
