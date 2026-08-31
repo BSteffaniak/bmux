@@ -9,8 +9,10 @@
 //! overlays written after rasterized geometry, so the point marker and style win
 //! for that cell.
 
+use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::Style;
 
 /// Canvas coordinate bounds.
@@ -361,12 +363,17 @@ impl<'a> Canvas<'a> {
 
     /// Render the canvas through one mixed-glyph raster/composition pipeline.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
-        let Some(mut raster) = CanvasRaster::new(area, self.bounds, self.policy) else {
-            return;
-        };
+        let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| self.paint(&layout, cx),
+        );
+    }
+
+    fn raster(&self, area: Rect) -> Option<CanvasRaster<'a>> {
+        let mut raster = CanvasRaster::new(area, self.bounds, self.policy)?;
         for line in self.lines {
             if let (Some(start), Some(end)) = (
                 raster.map_point(line.x0, line.y0),
@@ -396,7 +403,32 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
-        raster.flush(frame);
+        Some(raster)
+    }
+}
+
+impl Component for Canvas<'_> {
+    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+        LayoutNode::leaf(
+            LayoutId::new("canvas"),
+            constraints.constrain(LogicalSize::new(
+                constraints.max_width(),
+                constraints.max_height().unwrap_or_default(),
+            )),
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let width = layout.size.width;
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let Some(raster) = self.raster(Rect::new(0, 0, width, height)) else {
+            return;
+        };
+        cx.rasterize(LocalRect::new(0, 0, width, height), |x, y| {
+            let x = u16::try_from(x).ok()?;
+            let y = u16::try_from(y).ok()?;
+            raster.output_cell(x, y)
+        });
     }
 }
 
@@ -591,34 +623,17 @@ impl<'a> CanvasRaster<'a> {
         }
     }
 
-    fn flush(&self, frame: &mut Frame<'_>) {
-        for cell_y in 0..self.area.height {
-            for cell_x in 0..self.area.width {
-                let Some(index) = self.cell_index(cell_x, cell_y) else {
-                    continue;
-                };
-                let Some(cell) = self.cells.get(index).copied() else {
-                    continue;
-                };
-                let (symbol, style) = if let Some((symbol, style)) = cell.symbol {
-                    (symbol.to_owned(), style)
-                } else if cell.mask == 0 {
-                    continue;
-                } else {
-                    (
-                        compose_mask(cell.mask, self.policy.glyph_preference).to_string(),
-                        cell.style,
-                    )
-                };
-                frame.buffer_mut().set_cell(
-                    Point::new(
-                        self.area.x.saturating_add(cell_x),
-                        self.area.y.saturating_add(cell_y),
-                    ),
-                    symbol,
-                    style,
-                );
-            }
+    fn output_cell(&self, cell_x: u16, cell_y: u16) -> Option<(String, Style)> {
+        let cell = self.cells.get(self.cell_index(cell_x, cell_y)?)?;
+        if let Some((symbol, style)) = cell.symbol {
+            Some((symbol.to_owned(), style))
+        } else if cell.mask == 0 {
+            None
+        } else {
+            Some((
+                compose_mask(cell.mask, self.policy.glyph_preference).to_string(),
+                cell.style,
+            ))
         }
     }
 }
@@ -755,9 +770,42 @@ mod tests {
         CanvasPolicy, CanvasRect,
     };
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::style::{Color, Style};
+
+    #[test]
+    fn component_paint_clips_raster_output_to_the_scoped_viewport() {
+        let points = [CanvasPoint::new(1.0, 0.0, "x")];
+        let canvas = Canvas::new(&points, CanvasBounds::new(0.0, 1.0, 0.0, 1.0));
+        let layout = canvas.layout(
+            Constraints::tight(bmux_tui::geometry::Size::new(2, 2)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        PaintCx::new(&mut frame).with_child(1, 0, LocalRect::new(0, 0, 1, 2), |cx| {
+            canvas.paint(&layout, cx);
+        });
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(1, 1))
+                .map(|cell| cell.symbol.as_str()),
+            Some(" ")
+        );
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(2, 1))
+                .map(|cell| cell.symbol.as_str()),
+            Some(" ")
+        );
+    }
 
     #[test]
     fn maps_canvas_coordinates_to_cells() {

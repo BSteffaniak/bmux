@@ -1,11 +1,14 @@
 //! Lightweight generic chart component.
 
+use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, display_width};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::truncate_line_to_display_width;
 use bmux_tui::text_width::truncate_to_display_width;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// One chart point.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -411,8 +414,18 @@ impl<'a> Chart<'a> {
         map_point(area, self.bounds, point, clipping)
     }
 
-    /// Render chart datasets.
+    /// Render chart datasets through authoritative layout and scoped painting.
     pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| self.paint(&layout, cx),
+        );
+    }
+
+    fn paint_area(&self, area: Rect, cx: &mut PaintCx<'_, '_>) {
         if area.is_empty() {
             return;
         }
@@ -421,15 +434,15 @@ impl<'a> Chart<'a> {
             .iter()
             .all(|dataset| dataset.points.is_empty())
         {
-            frame.write_line_with_fallback_style(
-                area,
+            cx.write_line_with_fallback_style(
+                LocalRect::terminal(area),
                 &bmux_tui::prelude::Line::from(self.empty),
                 self.styles.empty,
             );
             return;
         }
         if matches!(self.policy.axes, ChartAxisVisibility::Visible) {
-            render_axes(frame, area, self.axes, self.styles.dataset);
+            render_axes(cx, area, self.axes, self.styles.dataset);
         }
         let plot_area = self.plot_area(area);
         for dataset in self.datasets {
@@ -447,14 +460,7 @@ impl<'a> Chart<'a> {
                                 self.map_point(plot_area, pair[0]),
                                 self.map_point(plot_area, pair[1]),
                             ) {
-                                draw_line(
-                                    frame,
-                                    plot_area,
-                                    (x0, y0),
-                                    (x1, y1),
-                                    dataset.marker,
-                                    style,
-                                );
+                                draw_line(cx, plot_area, (x0, y0), (x1, y1), dataset.marker, style);
                             }
                         }
                     }
@@ -465,22 +471,8 @@ impl<'a> Chart<'a> {
                                 self.map_point(plot_area, pair[1]),
                             ) {
                                 let corner = (x1, y0);
-                                draw_line(
-                                    frame,
-                                    plot_area,
-                                    (x0, y0),
-                                    corner,
-                                    dataset.marker,
-                                    style,
-                                );
-                                draw_line(
-                                    frame,
-                                    plot_area,
-                                    corner,
-                                    (x1, y1),
-                                    dataset.marker,
-                                    style,
-                                );
+                                draw_line(cx, plot_area, (x0, y0), corner, dataset.marker, style);
+                                draw_line(cx, plot_area, corner, (x1, y1), dataset.marker, style);
                             }
                         }
                     }
@@ -488,13 +480,13 @@ impl<'a> Chart<'a> {
             }
             for point in dataset.points {
                 if let Some((x, y)) = self.map_point(plot_area, *point) {
-                    draw_cell(frame, plot_area, x, y, dataset.marker, style);
+                    draw_cell(cx, plot_area, x, y, dataset.marker, style);
                 }
             }
         }
         if !matches!(self.policy.legend, ChartLegendPlacement::Hidden) {
             render_legend(
-                frame,
+                cx,
                 area,
                 self.datasets,
                 self.policy.legend,
@@ -503,6 +495,30 @@ impl<'a> Chart<'a> {
                 self.styles.dataset,
             );
         }
+    }
+}
+
+impl Component for Chart<'_> {
+    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+        LayoutNode::leaf(
+            LayoutId::new("chart"),
+            constraints.constrain(LogicalSize::new(
+                constraints.max_width(),
+                constraints.max_height().unwrap_or_default(),
+            )),
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.paint_area(
+            Rect::new(
+                0,
+                0,
+                layout.size.width,
+                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+            ),
+            cx,
+        );
     }
 }
 
@@ -521,33 +537,40 @@ fn plot_area(area: Rect, axes: ChartAxes<'_>, visibility: ChartAxisVisibility) -
     )
 }
 
-fn render_axes(frame: &mut Frame<'_>, area: Rect, axes: ChartAxes<'_>, style: Style) {
+fn render_axes(cx: &mut PaintCx<'_, '_>, area: Rect, axes: ChartAxes<'_>, style: Style) {
     if let Some(title) = axes.x.title {
-        frame.write_line(
-            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+        write_line(
+            cx,
+            LocalRect::terminal(Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                1,
+            )),
             &Line::from_spans([Span::styled(title, axes.x.style_or(style))]),
         );
     }
     if let Some(title) = axes.y.title {
-        frame.write_line(
-            Rect::new(area.x, area.y, area.width, 1),
+        write_line(
+            cx,
+            LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
             &Line::from_spans([Span::styled(title, axes.y.style_or(style))]),
         );
     }
     if !axes.x.labels.is_empty() {
         render_even_labels(
-            frame,
+            cx,
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
             axes.x.labels,
             axes.x.style_or(style),
         );
     }
     if !axes.y.labels.is_empty() {
-        render_vertical_labels(frame, area, axes.y.labels, axes.y.style_or(style));
+        render_vertical_labels(cx, area, axes.y.labels, axes.y.style_or(style));
     }
 }
 
-fn render_even_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style: Style) {
+fn render_even_labels(cx: &mut PaintCx<'_, '_>, area: Rect, labels: &[&str], style: Style) {
     if area.is_empty() || labels.is_empty() {
         return;
     }
@@ -574,15 +597,16 @@ fn render_even_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style:
         if width == 0 {
             continue;
         }
-        frame.write_line(
-            Rect::new(x, area.y, area.right().saturating_sub(x), 1),
+        write_line(
+            cx,
+            LocalRect::terminal(Rect::new(x, area.y, area.right().saturating_sub(x), 1)),
             &Line::from_spans([Span::styled(label, style)]),
         );
         next_free_x = x.saturating_add(width).saturating_add(1);
     }
 }
 
-fn render_vertical_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], style: Style) {
+fn render_vertical_labels(cx: &mut PaintCx<'_, '_>, area: Rect, labels: &[&str], style: Style) {
     if area.is_empty() || labels.is_empty() {
         return;
     }
@@ -605,15 +629,16 @@ fn render_vertical_labels(frame: &mut Frame<'_>, area: Rect, labels: &[&str], st
         }
         last_y = Some(y);
         let label = truncate_to_display_width(label, usize::from(area.width));
-        frame.write_line(
-            Rect::new(area.x, y, area.width, 1),
+        write_line(
+            cx,
+            LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
             &Line::from_spans([Span::styled(label, style)]),
         );
     }
 }
 
 fn render_legend(
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     area: Rect,
     datasets: &[ChartDataset<'_>],
     placement: ChartLegendPlacement,
@@ -653,7 +678,28 @@ fn render_legend(
     let x = area.right().saturating_sub(width).max(area.x);
     let available = usize::from(area.right().saturating_sub(x));
     let line = truncate_line_to_display_width(&line, available);
-    frame.write_line(Rect::new(x, y, area.right().saturating_sub(x), 1), &line);
+    write_line(
+        cx,
+        LocalRect::terminal(Rect::new(x, y, area.right().saturating_sub(x), 1)),
+        &line,
+    );
+}
+
+fn write_line(cx: &mut PaintCx<'_, '_>, area: LocalRect, line: &Line) {
+    let mut x = area.x;
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let width = u16::try_from(display_width(grapheme)).unwrap_or(u16::MAX);
+            if width == 0 {
+                continue;
+            }
+            if i64::from(x) >= i64::from(area.x).saturating_add(i64::from(area.width)) {
+                return;
+            }
+            cx.set_cell(x, area.y, grapheme, span.style);
+            x = x.saturating_add(i32::from(width));
+        }
+    }
 }
 
 impl ChartAxis<'_> {
@@ -667,7 +713,7 @@ impl ChartAxis<'_> {
 }
 
 fn draw_line(
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     area: Rect,
     start: (u16, u16),
     end: (u16, u16),
@@ -687,7 +733,7 @@ fn draw_line(
     let mut y = y0;
     loop {
         if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
-            draw_cell(frame, area, x, y, marker, style);
+            draw_cell(cx, area, x, y, marker, style);
         }
         if x == x1 && y == y1 {
             break;
@@ -704,9 +750,10 @@ fn draw_line(
     }
 }
 
-fn draw_cell(frame: &mut Frame<'_>, area: Rect, x: u16, y: u16, marker: &str, style: Style) {
-    frame.buffer_mut().set_cell(
-        Point::new(area.x.saturating_add(x), area.y.saturating_add(y)),
+fn draw_cell(cx: &mut PaintCx<'_, '_>, area: Rect, x: u16, y: u16, marker: &str, style: Style) {
+    cx.set_cell(
+        i32::from(area.x.saturating_add(x)),
+        i64::from(area.y.saturating_add(y)),
         marker,
         style,
     );
@@ -773,8 +820,10 @@ impl From<crate::theme::ComponentTheme> for ChartStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point as TuiPoint, Rect};
+    use bmux_tui::geometry::{Point as TuiPoint, Rect, Size};
+    use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::style::{Color, Style};
 
     use super::{
@@ -782,6 +831,28 @@ mod tests {
         ChartInterpolation, ChartLegendPlacement, ChartPoint, ChartPolicy, render_even_labels,
         render_vertical_labels,
     };
+
+    #[test]
+    fn component_paint_clips_chart_output_to_the_scoped_viewport() {
+        let points = [ChartPoint::new(1.0, 0.0)];
+        let datasets = [ChartDataset::scatter("points", &points).marker("x")];
+        let chart = Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0));
+        let layout = chart.layout(Constraints::tight(Size::new(2, 2)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        PaintCx::new(&mut frame).with_child(1, 0, LocalRect::new(0, 0, 1, 2), |cx| {
+            chart.paint(&layout, cx);
+        });
+
+        assert_eq!(
+            frame
+                .buffer()
+                .get(TuiPoint::new(2, 1))
+                .map(|cell| cell.symbol.as_str()),
+            Some(" ")
+        );
+    }
 
     #[test]
     fn maps_points_to_chart_cells() {
@@ -1169,7 +1240,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
 
         render_even_labels(
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
             Rect::new(0, 0, 8, 1),
             &["first", "second", "third"],
             Style::new(),
@@ -1184,7 +1255,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
 
         render_vertical_labels(
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
             Rect::new(0, 0, 4, 2),
             &["long", "skip", "tail"],
             Style::new(),
