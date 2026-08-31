@@ -1,12 +1,25 @@
 //! Configurable dialog composition built from modal frame, action row, and text primitives.
 
+use std::cell::Cell;
+
+use bmux_tui::component::{
+    ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::composition::TextContent;
+use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::focus::FocusScopeId;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::Line;
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Text};
 
-use crate::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
-use crate::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use crate::action_row::{
+    ActionButton, ActionRow, ActionRowComponent, ActionRowOutcome, ActionRowState,
+};
+use crate::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
+};
 
 /// Runtime dialog state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +66,172 @@ pub enum DialogOutcome {
     Redraw,
     /// Dialog action was activated.
     Action { index: usize, id: String },
+}
+
+/// Canonical child-owning dialog component.
+pub struct DialogComponent<'a, 'state> {
+    id: LayoutId,
+    dialog: Dialog<'a>,
+    state: &'state Cell<ActionRowState>,
+}
+
+impl<'a, 'state> DialogComponent<'a, 'state> {
+    /// Create a dialog component with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        dialog: Dialog<'a>,
+        state: &'state Cell<ActionRowState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            dialog,
+            state,
+        }
+    }
+}
+
+struct DialogContent<'a, 'state> {
+    id: LayoutId,
+    body: Element<'a>,
+    actions: Option<Element<'a>>,
+    _state: std::marker::PhantomData<&'state ()>,
+}
+
+impl<'a, 'state: 'a> DialogContent<'a, 'state> {
+    fn new(id: &LayoutId, dialog: &Dialog<'a>, state: &'state Cell<ActionRowState>) -> Self {
+        let body = TextContent::new(Text::from_lines(dialog.body.to_vec()))
+            .id(format!("{}.body", id.as_str()));
+        let actions = (!dialog.actions.is_empty()).then(|| {
+            Element::new(
+                ActionRowComponent::new(format!("{}.actions", id.as_str()), dialog.actions, state)
+                    .spacing(dialog.action_spacing),
+            )
+        });
+        Self {
+            id: LayoutId::new(format!("{}.content", id.as_str())),
+            body: Element::new(body),
+            actions,
+            _state: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Component for DialogContent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        self.body.revision().combine(
+            self.actions
+                .as_ref()
+                .map_or_else(ComponentRevision::default, Element::revision),
+        )
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let action_height = usize::from(self.actions.is_some());
+        let body = self.body.layout(
+            Constraints::new(
+                constraints.min_width(),
+                constraints.max_width(),
+                constraints.min_height().saturating_sub(action_height),
+                constraints
+                    .max_height()
+                    .map(|height| height.saturating_sub(action_height)),
+            ),
+            cx,
+        );
+        let width = body.size.width.max(constraints.min_width());
+        let mut children = vec![ChildLayout::new(0, 0, body)];
+        if let Some(actions) = &self.actions {
+            let actions = actions.layout(Constraints::tight(Size::new(width, 1)), cx);
+            let y = children[0].node.size.height;
+            children.push(ChildLayout::new(0, y, actions));
+        }
+        let height = children
+            .iter()
+            .map(|child| child.y.saturating_add(child.node.size.height))
+            .max()
+            .unwrap_or(0);
+        LayoutNode::with_children(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, height)),
+            children,
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        for (index, child) in layout.children.iter().enumerate() {
+            let component = if index == 0 {
+                &self.body
+            } else if let Some(actions) = &self.actions {
+                actions
+            } else {
+                continue;
+            };
+            cx.with_child(
+                i32::from(child.x),
+                i64::try_from(child.y).unwrap_or(i64::MAX),
+                LocalRect::new(
+                    0,
+                    0,
+                    child.node.size.width,
+                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+                ),
+                |cx| component.paint(&child.node, cx),
+            );
+        }
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(actions) = &self.actions else {
+            return EventOutcome::Ignored;
+        };
+        let Some(child) = layout.children.get(1) else {
+            return EventOutcome::Ignored;
+        };
+        let clip = Rect::new(
+            child.x,
+            u16::try_from(child.y).unwrap_or(u16::MAX),
+            child.node.size.width,
+            u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+        );
+        cx.with_transform(
+            child.x,
+            child.y,
+            i32::from(child.x),
+            i64::try_from(child.y).unwrap_or(i64::MAX),
+            clip,
+            |cx| actions.event(event, &child.node, cx),
+        )
+    }
+}
+
+impl Component for DialogComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        self.tree().revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.tree().layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.tree().paint(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.tree().event(event, layout, cx)
+    }
+}
+
+impl<'a, 'state: 'a> DialogComponent<'a, 'state> {
+    fn tree(&self) -> ModalFrameComponent<'_> {
+        ModalFrameComponent::new(
+            self.id.clone(),
+            self.dialog.modal(),
+            DialogContent::new(&self.id, &self.dialog, self.state),
+        )
+    }
 }
 
 /// Modal dialog with body text and optional action row.
@@ -227,18 +406,63 @@ impl<'a> Dialog<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
     use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Rect, Size};
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::prelude::Line;
     use bmux_tui::style::Color;
 
-    use crate::action_row::ActionButton;
+    use crate::action_row::{ActionButton, ActionRowState};
     use crate::modal_frame::{ModalSizing, ModalTheme};
 
-    use super::{Dialog, DialogOutcome, DialogState};
+    use super::{Dialog, DialogComponent, DialogOutcome, DialogState};
+
+    #[test]
+    fn component_composes_modal_body_actions_and_routes_events() {
+        let body = vec![Line::from("Proceed?")];
+        let actions = vec![ActionButton::new("ok", "OK")];
+        let state = Cell::new(ActionRowState::new());
+        let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan))
+            .title("Confirm")
+            .sizing(ModalSizing::fixed(Size::new(20, 7), Insets::all(0)));
+        let component = DialogComponent::new("confirm", dialog, &state);
+        let layout = component.layout(Constraints::new(30, 30, 10, Some(10)), &mut LayoutCx::new());
+        assert!(layout.find(&"confirm.surface".into()).is_some());
+        assert!(layout.find(&"confirm.body".into()).is_some());
+        assert!(layout.find(&"confirm.actions".into()).is_some());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 10));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!((0..10).any(|row| {
+            frame
+                .buffer()
+                .row_symbols(row)
+                .is_some_and(|symbols| symbols.contains("Proceed?"))
+        }));
+        assert!((0..10).any(|row| {
+            frame
+                .buffer()
+                .row_symbols(row)
+                .is_some_and(|symbols| symbols.contains("[ OK ]"))
+        }));
+
+        assert!(
+            component
+                .event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                    &layout,
+                    &mut EventCx::new(&layout),
+                )
+                .is_handled()
+        );
+    }
 
     #[test]
     fn layout_reserves_last_content_row_for_actions() {
