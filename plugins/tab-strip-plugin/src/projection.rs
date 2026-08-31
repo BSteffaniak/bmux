@@ -652,6 +652,30 @@ mod tests {
     }
 
     #[test]
+    fn default_projection_omits_session_and_context_modules() {
+        let settings = Settings::default();
+        let windows = [window(1, "main", true)];
+        let local = AttachLocalPresentationSnapshot {
+            session_label: Some("bcode".to_string()),
+            session_count: 1,
+            context_label: Some("bcode".to_string()),
+            viewport_cols: 80,
+            ..AttachLocalPresentationSnapshot::initial()
+        };
+        let projected = project_bar(
+            &settings,
+            &windows,
+            &local,
+            None,
+            &ProjectionInteraction::default(),
+        );
+        let text = projected.plain_text();
+        assert!(!text.contains("session:"), "{text}");
+        assert!(!text.contains("context:"), "{text}");
+        assert!(!text.contains("ctx:"), "{text}");
+    }
+
+    #[test]
     fn default_projection_is_full_width_and_includes_mode_and_role() {
         let projected = project_bar(
             &Settings::default(),

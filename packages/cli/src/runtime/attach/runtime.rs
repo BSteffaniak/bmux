@@ -5447,13 +5447,7 @@ pub async fn retarget_attach_to_context(
     refresh_attach_status_catalog_best_effort(client, view_state).await;
     let catalog_us = catalog_started.elapsed().as_micros();
     view_state.ui_mode = AttachUiMode::Normal;
-    let status = attach_context_status_from_catalog(view_state);
-    set_attach_context_status(
-        view_state,
-        status,
-        Instant::now(),
-        ATTACH_TRANSIENT_STATUS_TTL,
-    );
+
     debug!(
         to_context_id = ?view_state.attached_context_id,
         to_session_id = %view_state.attached_id,
@@ -8703,29 +8697,6 @@ pub fn session_summary_label(session: &SessionRow) -> String {
         .unwrap_or_else(|| format!("session-{}", short_uuid(session.id)))
 }
 
-pub fn attach_context_status_from_catalog(view_state: &AttachViewState) -> String {
-    let (session_label, _count) = resolve_attach_session_label_and_count_from_catalog(
-        &view_state.cached_sessions,
-        view_state.attached_id,
-    );
-    let context_label = resolve_attach_context_label_from_catalog(
-        &view_state.cached_contexts,
-        &view_state.cached_context_session_bindings,
-        view_state.attached_context_id,
-        view_state.attached_id,
-    );
-    format!("session: {session_label} | context: {context_label}")
-}
-
-pub fn set_attach_context_status(
-    view_state: &mut AttachViewState,
-    status: String,
-    now: Instant,
-    ttl: Duration,
-) {
-    view_state.set_transient_status(status, now, ttl);
-}
-
 pub fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
@@ -8805,13 +8776,6 @@ pub async fn reconcile_attached_session_from_catalog(
     update_attach_viewport(client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     view_state.ui_mode = AttachUiMode::Normal;
-    let status = attach_context_status_from_catalog(view_state);
-    set_attach_context_status(
-        view_state,
-        status,
-        Instant::now(),
-        ATTACH_TRANSIENT_STATUS_TTL,
-    );
 
     trace!(
         context_id = ?view_state.attached_context_id,
@@ -10291,13 +10255,6 @@ async fn handle_clients_plugin_event(
                 .map_err(map_attach_client_error)?;
             refresh_attach_status_catalog_best_effort(client, view_state).await;
             view_state.ui_mode = AttachUiMode::Normal;
-            let status = attach_context_status_from_catalog(view_state);
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
             if !view_state.can_write {
                 // Route the read-only notice to the status line; raw
                 // mode is active and `println!` would overwrite pane content.
@@ -10396,13 +10353,6 @@ pub async fn recover_attach_after_session_removed(
         hydrate_attach_state_from_snapshot(client, view_state).await?;
         refresh_attach_status_catalog_best_effort(client, view_state).await;
         view_state.ui_mode = AttachUiMode::Normal;
-        let status = attach_context_status_from_catalog(view_state);
-        set_attach_context_status(
-            view_state,
-            status,
-            Instant::now(),
-            ATTACH_TRANSIENT_STATUS_TTL,
-        );
         return Ok(true);
     }
 
@@ -11091,13 +11041,7 @@ async fn retarget_attach_to_session(
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     refresh_attach_status_catalog_best_effort(client, view_state).await;
     view_state.ui_mode = AttachUiMode::Normal;
-    let status = attach_context_status_from_catalog(view_state);
-    set_attach_context_status(
-        view_state,
-        status,
-        Instant::now(),
-        ATTACH_TRANSIENT_STATUS_TTL,
-    );
+
     Ok(())
 }
 

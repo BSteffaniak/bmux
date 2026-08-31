@@ -627,6 +627,10 @@ impl BarStyles {
         let mut hovered_active = style(hovered_active_fg, hovered_active_bg);
         hovered_active.bold = settings.bold_active;
         hovered_active.underline = settings.underline_active;
+        let mut hovered_inactive = style(hovered_inactive_fg, hovered_inactive_bg);
+        // Inactive tabs are dimmed by default; undimming on hover is part of
+        // the legacy visual contract and keeps hover visible on low-contrast themes.
+        hovered_inactive.dim = false;
         let mode_bg = parse_hex_color(&local.status_mode).unwrap_or(active_bg);
         let mode_fg = parse_hex_color(&local.background).unwrap_or(active_fg);
         Self {
@@ -634,7 +638,7 @@ impl BarStyles {
             active,
             inactive,
             hovered_active,
-            hovered_inactive: style(hovered_inactive_fg, hovered_inactive_bg),
+            hovered_inactive,
             mode: style(mode_fg, mode_bg).bold(),
             module: style(module_fg, module_bg),
             overflow: style(overflow_fg, overflow_bg),
@@ -1431,6 +1435,14 @@ bar_bg = "#112233"
             .find(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains("two")))
             .expect("hovered second tab operation");
         assert_ne!(before_second, after_second);
+        let RenderOp::TextRun {
+            style: hovered_style,
+            ..
+        } = after_second
+        else {
+            panic!("hovered tab should remain a text run");
+        };
+        assert!(!hovered_style.dim, "hover must remove inactive dimming");
     }
 
     #[test]
