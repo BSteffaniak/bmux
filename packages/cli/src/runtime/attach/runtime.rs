@@ -601,28 +601,9 @@ async fn typed_kill_session_attach(
     >,
     ClientError,
 > {
-    let args = sessions_commands::client::KillSessionRequest {
-        selector: ipc_to_session_selector(selector),
-        force_local,
-    };
-    let payload =
-        bmux_codec::to_positional_vec(&args).map_err(|error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding kill-session args: {error}"),
-        })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            sessions_commands::client::KillSessionEndpoint::CAPABILITY.as_str(),
-            sessions_commands::client::KillSessionEndpoint::KIND,
-            sessions_commands::client::KillSessionEndpoint::INTERFACE_ID.as_str(),
-            sessions_commands::client::KillSessionEndpoint::OPERATION.as_str(),
-            payload,
-        )
-        .await?;
-    bmux_codec::from_positional_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding kill-session response: {error}"),
-    })
+    sessions_commands::client::kill_session(client, ipc_to_session_selector(selector), force_local)
+        .await
+        .map_err(|error| typed_client_error(&error))
 }
 
 /// Typed dispatch wrapper for `contexts-state:list-contexts`.
@@ -6256,8 +6237,14 @@ fn next_context_fallback(view_state: &AttachViewState) -> Option<AttachCloseFall
         .iter()
         .filter(|entry| Some(entry.id) != current_context)
         .filter(|entry| {
+            view_state
+                .cached_contexts
+                .iter()
+                .any(|context| context.id == entry.id)
+        })
+        .filter(|entry| {
             context_session_id(&view_state.cached_context_session_bindings, entry.id)
-                != Some(view_state.attached_id)
+                .is_some_and(|session_id| session_id != view_state.attached_id)
         })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -11039,20 +11026,63 @@ async fn close_pane_by_id_for_prompt(
     Ok(())
 }
 
+async fn retarget_attach_to_close_fallback(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    target: AttachCloseFallbackTarget,
+) -> std::result::Result<(), ClientError> {
+    refresh_attach_status_catalog(client, view_state)
+        .await
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("refreshing close fallback catalog failed: {error:#}"),
+        })?;
+    match target {
+        AttachCloseFallbackTarget::Context { context_id }
+            if view_state
+                .cached_contexts
+                .iter()
+                .any(|context| context.id == context_id)
+                && context_session_id(&view_state.cached_context_session_bindings, context_id)
+                    .is_some_and(|session_id| session_id != view_state.attached_id) =>
+        {
+            retarget_attach_to_context(client, view_state, context_id).await
+        }
+        AttachCloseFallbackTarget::Session { session_id }
+            if session_id != view_state.attached_id
+                && view_state
+                    .cached_sessions
+                    .iter()
+                    .any(|session| session.id == session_id) =>
+        {
+            retarget_attach_to_session(client, view_state, session_id).await
+        }
+        _ => {
+            let Some(fallback) = next_close_fallback(view_state) else {
+                return Err(ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::Internal,
+                    message: "close fallback is no longer available".to_string(),
+                });
+            };
+            match fallback.target {
+                AttachCloseFallbackTarget::Context { context_id } => {
+                    retarget_attach_to_context(client, view_state, context_id).await
+                }
+                AttachCloseFallbackTarget::Session { session_id } => {
+                    retarget_attach_to_session(client, view_state, session_id).await
+                }
+            }
+        }
+    }
+}
+
 async fn close_last_pane_after_retarget(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     old_session_id: Uuid,
     target: AttachCloseFallbackTarget,
 ) -> std::result::Result<(), ClientError> {
-    match target {
-        AttachCloseFallbackTarget::Context { context_id } => {
-            retarget_attach_to_context(client, view_state, context_id).await?;
-        }
-        AttachCloseFallbackTarget::Session { session_id } => {
-            retarget_attach_to_session(client, view_state, session_id).await?;
-        }
-    }
+    retarget_attach_to_close_fallback(client, view_state, target).await?;
     kill_session_for_safe_close(client, old_session_id).await
 }
 
@@ -15036,6 +15066,87 @@ mod tests {
         let bytes = bmux_plugin_sdk::encode_service_message(&result).unwrap();
         let decoded = bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&bytes).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn close_fallback_rejects_window_without_live_catalog_binding() {
+        let current_context = Uuid::from_u128(10);
+        let stale_context = Uuid::from_u128(11);
+        let current_session = Uuid::from_u128(20);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: Some(current_context),
+            session_id: current_session,
+            can_write: true,
+        });
+        view_state.cached_window_list = Some(Arc::new(
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: vec![
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: current_context,
+                        name: "current".to_string(),
+                        active: true,
+                        workspace: "default".to_string(),
+                        workspace_id: Uuid::nil(),
+                    },
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: stale_context,
+                        name: "stale".to_string(),
+                        active: false,
+                        workspace: "default".to_string(),
+                        workspace_id: Uuid::nil(),
+                    },
+                ],
+                revision: 1,
+            },
+        ));
+        view_state.cached_contexts = vec![ContextRow {
+            id: current_context,
+            name: Some("current".to_string()),
+        }];
+        view_state.cached_context_session_bindings = vec![ContextSessionBinding {
+            context_id: current_context,
+            session_id: current_session,
+        }];
+
+        assert!(next_context_fallback(&view_state).is_none());
+    }
+
+    #[test]
+    fn close_fallback_accepts_live_context_in_another_session() {
+        let current_context = Uuid::from_u128(10);
+        let fallback_context = Uuid::from_u128(11);
+        let current_session = Uuid::from_u128(20);
+        let fallback_session = Uuid::from_u128(21);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: Some(current_context),
+            session_id: current_session,
+            can_write: true,
+        });
+        view_state.cached_window_list = Some(Arc::new(
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: vec![bmux_windows_plugin_api::windows_list::WindowListEntry {
+                    id: fallback_context,
+                    name: "fallback".to_string(),
+                    active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                }],
+                revision: 1,
+            },
+        ));
+        view_state.cached_contexts = vec![ContextRow {
+            id: fallback_context,
+            name: Some("fallback".to_string()),
+        }];
+        view_state.cached_context_session_bindings = vec![ContextSessionBinding {
+            context_id: fallback_context,
+            session_id: fallback_session,
+        }];
+
+        assert!(matches!(
+            next_context_fallback(&view_state).map(|fallback| fallback.target),
+            Some(AttachCloseFallbackTarget::Context { context_id }) if context_id == fallback_context
+        ));
     }
 
     #[test]
