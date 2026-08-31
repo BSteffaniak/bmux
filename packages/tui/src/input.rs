@@ -1,12 +1,18 @@
 //! Text input widget and key handling.
 
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_text_edit::{TextEditBuffer, TextSelection, VisualCursor};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+};
 use crate::frame::Frame;
-use crate::geometry::Rect;
+use crate::geometry::{Point, Rect};
+use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::Line;
 use crate::widget::Widget;
@@ -177,27 +183,22 @@ impl<'buffer> TextInput<'buffer> {
             },
         }
     }
-}
-
-impl Widget for TextInput<'_> {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
+    fn paint_scoped(&self, area: LocalRect, cx: &mut PaintCx<'_, '_>) {
+        if area.width == 0 || area.height == 0 {
             return;
         }
 
         if self.buffer.is_empty() {
             if let Some(placeholder) = &self.placeholder {
                 let styled = placeholder.with_fallback_style(self.placeholder_style);
-                frame.write_line_with_fallback_style(
-                    Rect::new(area.x, area.y, area.width, 1),
+                cx.write_line_with_fallback_style(
+                    LocalRect::new(area.x, area.y, area.width, 1),
                     &styled,
                     self.placeholder_style,
                 );
             }
             if self.cursor_visible {
-                frame.set_cursor(crate::frame::Cursor::visible(crate::geometry::Point::new(
-                    area.x, area.y,
-                )));
+                cx.set_cursor(Point::new(0, 0), true);
             }
             return;
         }
@@ -222,11 +223,11 @@ impl Widget for TextInput<'_> {
             .take(usize::from(area.height))
             .enumerate()
         {
-            let Ok(row) = u16::try_from(row) else {
+            let Ok(row) = i64::try_from(row) else {
                 return;
             };
-            frame.write_line_with_fallback_style(
-                Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+            cx.write_line_with_fallback_style(
+                LocalRect::new(area.x, area.y.saturating_add(row), area.width, 1),
                 &line,
                 self.style,
             );
@@ -237,11 +238,81 @@ impl Widget for TextInput<'_> {
                 .unwrap_or(u16::MAX)
                 .min(area.width);
             let cursor_row = u16::try_from(projection.cursor.row).unwrap_or(u16::MAX);
-            frame.set_cursor(crate::frame::Cursor::visible(crate::geometry::Point::new(
-                area.x.saturating_add(cursor_col),
-                area.y.saturating_add(cursor_row),
-            )));
+            cx.set_cursor_local(cursor_col, cursor_row, true);
         }
+    }
+
+    fn layout_revision(&self) -> u64 {
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        self.buffer.text().hash(&mut state);
+        self.vertical_scroll.hash(&mut state);
+        self.placeholder
+            .as_ref()
+            .map(Line::plain_text)
+            .hash(&mut state);
+        state.finish()
+    }
+
+    fn paint_revision(&self) -> u64 {
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        if let Some(selection) = self.buffer.selection() {
+            selection.start.hash(&mut state);
+            selection.end.hash(&mut state);
+        }
+        self.buffer.cursor_grapheme_index().hash(&mut state);
+        self.style.hash(&mut state);
+        self.selection_style.hash(&mut state);
+        self.placeholder_style.hash(&mut state);
+        self.cursor_visible.hash(&mut state);
+        state.finish()
+    }
+}
+
+impl Component for TextInput<'_> {
+    fn revision(&self) -> ComponentRevision {
+        ComponentRevision::new(self.layout_revision(), self.paint_revision())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = constraints.max_width();
+        let rows = if self.buffer.is_empty() {
+            usize::from(self.placeholder.is_some())
+        } else {
+            self.buffer
+                .wrapped_layout(usize::from(width.max(1)))
+                .lines
+                .len()
+                .max(1)
+        };
+        LayoutNode::leaf(
+            LayoutId::new("text-input"),
+            constraints.constrain(LogicalSize::new(width, rows)),
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.paint_scoped(
+            LocalRect::new(
+                0,
+                0,
+                layout.size.width,
+                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+            ),
+            cx,
+        );
+    }
+}
+
+impl Widget for TextInput<'_> {
+    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| self.paint(&layout, cx),
+        );
     }
 }
 
@@ -295,8 +366,10 @@ fn push_styled_grapheme(line: &mut Line, grapheme: &str, style: Style) {
 mod tests {
     use super::{TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
     use crate::buffer::Buffer;
+    use crate::component::{Component, Constraints, LayoutCx};
     use crate::frame::Frame;
-    use crate::geometry::Rect;
+    use crate::geometry::{Rect, Size};
+    use crate::paint::{LocalRect, PaintCx};
     use crate::style::{Modifier, Style};
     use crate::widget::Widget;
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
@@ -368,6 +441,23 @@ mod tests {
             ),
             TextInputKeyOutcome::Ignored
         );
+    }
+
+    #[test]
+    fn component_paint_clips_text_and_cursor_to_the_scoped_viewport() {
+        let edit = TextEditBuffer::from_text("abcdef");
+        let input = TextInput::new(&edit);
+        let layout = input.layout(Constraints::tight(Size::new(3, 2)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        PaintCx::new(&mut frame).with_child(1, 0, LocalRect::new(0, 0, 2, 2), |cx| {
+            input.paint(&layout, cx);
+        });
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" ab  "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some(" de  "));
+        assert_eq!(frame.cursor(), None);
     }
 
     #[test]

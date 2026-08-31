@@ -185,6 +185,30 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         });
     }
 
+    /// Request a cursor at a local coordinate. A cursor at the right edge is
+    /// allowed because terminal cursors may occupy the insertion position just
+    /// beyond the final painted cell.
+    pub fn set_cursor_local(&mut self, x: u16, y: u16, visible: bool) {
+        let x = i64::from(self.origin_x).saturating_add(i64::from(x));
+        let y = self.origin_y.saturating_add(i64::from(y));
+        if x < i64::from(self.clip.x)
+            || x > i64::from(self.clip.right())
+            || y < i64::from(self.clip.y)
+            || y >= i64::from(self.clip.bottom())
+        {
+            return;
+        }
+        let position = Point::new(
+            u16::try_from(x).unwrap_or(u16::MAX),
+            u16::try_from(y).unwrap_or(u16::MAX),
+        );
+        self.frame.set_cursor(if visible {
+            Cursor::visible(position)
+        } else {
+            Cursor::hidden(position)
+        });
+    }
+
     /// Register local damage after translation and clipping.
     pub fn push_damage(&mut self, area: LocalRect) {
         if let Some(area) = self.project_rect(area) {
