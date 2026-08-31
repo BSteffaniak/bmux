@@ -6081,11 +6081,6 @@ pub async fn handle_attach_plugin_command_action(
                     return Ok(());
                 }
                 let retarget_us = retarget_started.elapsed().as_micros();
-                view_state.set_transient_status(
-                    format!("plugin action: {plugin_id}:{command_name} (fallback retarget)"),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
                 view_state
                     .dirty
                     .mark_layout_refresh(AttachDirtySource::PluginCommand);
@@ -6160,11 +6155,6 @@ pub async fn handle_attach_plugin_command_action(
                     return Ok(());
                 }
                 let retarget_us = retarget_started.elapsed().as_micros();
-                view_state.set_transient_status(
-                    format!("plugin action: {plugin_id}:{command_name} (new context retarget)"),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
                 view_state
                     .dirty
                     .mark_layout_refresh(AttachDirtySource::PluginCommand);
@@ -6187,12 +6177,13 @@ pub async fn handle_attach_plugin_command_action(
                 return Ok(());
             }
 
-            view_state.set_transient_status(
-                outcome_status_message
-                    .unwrap_or_else(|| format!("plugin action: {plugin_id}:{command_name}")),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
+            if let Some(message) = outcome_status_message {
+                view_state.set_transient_status(
+                    message,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
             view_state
                 .dirty
                 .mark_layout_refresh(AttachDirtySource::PluginCommand);
