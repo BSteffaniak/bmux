@@ -1,12 +1,23 @@
 //! Higher-level text-input control with opt-in behavior policies.
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::{HitRegion, HitRole};
+use bmux_tui::input::TextInput;
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::semantic::SemanticRegion;
+use bmux_tui::style::Style;
 use unicode_segmentation::UnicodeSegmentation;
 
 const DEFAULT_MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
@@ -95,6 +106,164 @@ impl TextInputState {
     #[must_use]
     pub const fn mouse_selection_active(&self) -> bool {
         !matches!(self.mouse_selection.active, SelectionGranularity::Disabled)
+    }
+}
+
+/// Canonical component-lifecycle editable text leaf.
+///
+/// The edit buffer, selection, scroll, and pointer gesture state remain
+/// caller-owned through the supplied `RefCell`.
+pub struct TextInputComponent<'policy, 'state> {
+    id: LayoutId,
+    state: &'state RefCell<TextInputState>,
+    policy: &'policy TextInputPolicy,
+    style: Style,
+    selection_style: Style,
+    placeholder: Option<&'policy str>,
+    placeholder_style: Style,
+    focused: bool,
+    disabled: bool,
+}
+
+impl<'policy, 'state> TextInputComponent<'policy, 'state> {
+    /// Create an editable text component with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        state: &'state RefCell<TextInputState>,
+        policy: &'policy TextInputPolicy,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            state,
+            policy,
+            style: Style::new(),
+            selection_style: Style::new().add_modifier(bmux_tui::style::Modifier::REVERSED),
+            placeholder: None,
+            placeholder_style: Style::new(),
+            focused: false,
+            disabled: false,
+        }
+    }
+
+    /// Set rendered text style.
+    #[must_use]
+    pub const fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Set selected text style.
+    #[must_use]
+    pub const fn selection_style(mut self, style: Style) -> Self {
+        self.selection_style = style;
+        self
+    }
+
+    /// Set placeholder text and style.
+    #[must_use]
+    pub const fn placeholder(mut self, text: &'policy str, style: Style) -> Self {
+        self.placeholder = Some(text);
+        self.placeholder_style = style;
+        self
+    }
+
+    /// Set focus presentation and cursor visibility.
+    #[must_use]
+    pub const fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// Disable editing and pointer interaction.
+    #[must_use]
+    pub const fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+impl Component for TextInputComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let state = self.state.borrow();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        state.buffer().text().hash(&mut layout);
+        self.policy.viewport.min_rows.hash(&mut layout);
+        self.policy.viewport.max_rows.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        state.buffer().cursor_grapheme_index().hash(&mut paint);
+        if let Some(selection) = state.buffer().selection() {
+            selection.start.hash(&mut paint);
+            selection.end.hash(&mut paint);
+        }
+        state.vertical_scroll().hash(&mut paint);
+        self.style.hash(&mut paint);
+        self.selection_style.hash(&mut paint);
+        self.placeholder.hash(&mut paint);
+        self.placeholder_style.hash(&mut paint);
+        self.focused.hash(&mut paint);
+        self.disabled.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = constraints.max_width();
+        let state = self.state.borrow();
+        let rows = TextInputControl::new(self.policy).visible_rows_for_width(&state, width);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, usize::from(rows))),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("text-input"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let local = LocalRect::new(0, 0, layout.size.width, height);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        let mut state = self.state.borrow_mut();
+        state.set_content_area(area, self.policy);
+        let mut input = TextInput::new(state.buffer())
+            .style(self.style)
+            .selection_style(self.selection_style)
+            .placeholder_style(self.placeholder_style)
+            .cursor_visible(self.focused && !self.disabled)
+            .vertical_scroll(state.vertical_scroll());
+        if let Some(placeholder) = self.placeholder {
+            input = input.placeholder(placeholder);
+        }
+        input.paint(layout, cx);
+        cx.push_hit(
+            HitRegion::new(self.id.as_str(), area)
+                .role(HitRole::TextInput)
+                .hoverable(true)
+                .focusable(true)
+                .enabled(!self.disabled),
+        );
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "text-input"));
+        cx.push_damage(local);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        if self.disabled {
+            return EventOutcome::Ignored;
+        }
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.borrow_mut();
+        state.set_content_area(area, self.policy);
+        match TextInputControl::new(self.policy).handle_event(&mut state, event) {
+            TextInputOutcome::Ignored => EventOutcome::Ignored,
+            TextInputOutcome::Edited
+            | TextInputOutcome::Redraw
+            | TextInputOutcome::Submitted
+            | TextInputOutcome::EdgeUp
+            | TextInputOutcome::EdgeDown => EventOutcome::Redraw,
+        }
     }
 }
 
@@ -901,7 +1070,11 @@ fn usize_to_u16_saturating(value: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_tui::geometry::Point;
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::{Point, Size};
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
     fn key(key: KeyCode) -> KeyStroke {
         KeyStroke::simple(key)
@@ -919,6 +1092,38 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
         MouseEvent::new(kind, Point::new(x, y))
+    }
+
+    #[test]
+    fn component_measures_paints_and_handles_events_from_authoritative_layout() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "hello world",
+        )));
+        let component = TextInputComponent::new("editor", &state, &policy).focused(true);
+        let layout = component.layout(Constraints::tight(Size::new(5, 2)), &mut LayoutCx::new());
+        assert_eq!(layout.size, LogicalSize::new(5, 2));
+        assert_eq!(layout.metadata.semantics, vec!["text-input"]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 7, 2));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(1, 0, LocalRect::new(0, 0, 5, 2), |cx| {
+            component.paint(&layout, cx);
+        });
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" hello "));
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(1, 0, 5, 2));
+        assert_eq!(state.borrow().content_area(), Rect::new(0, 0, 5, 2));
+
+        let mut event_cx = EventCx::with_clip(&layout, Rect::new(0, 0, 5, 2));
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Char('!'))),
+                &layout,
+                &mut event_cx,
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().buffer().text(), "hello world!");
     }
 
     #[test]

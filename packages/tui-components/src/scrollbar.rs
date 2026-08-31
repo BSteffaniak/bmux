@@ -1,6 +1,13 @@
 //! Explicit scrollbar primitive component.
 
-use bmux_tui::event::{Event, MouseButton, MouseEventKind};
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
@@ -11,7 +18,7 @@ use bmux_tui::style::{Color, Style};
 use crate::hit_test::HitRegion;
 
 /// Scrollbar orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ScrollbarOrientation {
     /// Vertical scrollbar.
     #[default]
@@ -21,7 +28,7 @@ pub enum ScrollbarOrientation {
 }
 
 /// Runtime scrollbar state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ScrollbarState {
     /// Current content offset.
     pub offset: u16,
@@ -191,6 +198,92 @@ pub enum ScrollbarOutcome {
     Redraw,
     /// Offset changed.
     Changed { offset: u16 },
+}
+
+/// Canonical scrollbar component with stable identity and caller-owned state.
+pub struct ScrollbarComponent<'state> {
+    id: LayoutId,
+    scrollbar: Scrollbar,
+    state: &'state Cell<ScrollbarState>,
+}
+
+impl<'state> ScrollbarComponent<'state> {
+    /// Create a scrollbar component.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, state: &'state Cell<ScrollbarState>) -> Self {
+        Self {
+            id: id.into(),
+            scrollbar: Scrollbar::new(),
+            state,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: ScrollbarPolicy) -> Self {
+        self.scrollbar.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: ScrollbarStyles) -> Self {
+        self.scrollbar.styles = styles;
+        self
+    }
+}
+
+impl Component for ScrollbarComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.scrollbar.policy.orientation.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.scrollbar.policy).hash(&mut paint);
+        format!("{:?}", self.scrollbar.styles).hash(&mut paint);
+        self.state.get().hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let natural = match self.scrollbar.policy.orientation {
+            ScrollbarOrientation::Vertical => LogicalSize::new(1, constraints.min_height().max(1)),
+            ScrollbarOrientation::Horizontal => LogicalSize::new(constraints.min_width().max(1), 1),
+        };
+        LayoutNode::leaf(self.id.clone(), constraints.constrain(natural))
+            .with_metadata(LayoutMetadata::new().semantic("scrollbar"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        let state = self.state.get();
+        self.scrollbar.paint(area, &state, cx);
+        if self.scrollbar.policy.mouse_drag && state.max_offset() > 0 {
+            cx.push_hit(
+                SceneRegion::new(self.id.as_str(), area)
+                    .role(HitRole::Scroll)
+                    .hoverable(false)
+                    .focusable(false),
+            );
+        }
+        cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.scrollbar.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            ScrollbarOutcome::Ignored => EventOutcome::Ignored,
+            ScrollbarOutcome::Redraw | ScrollbarOutcome::Changed { .. } => EventOutcome::Redraw,
+        }
+    }
 }
 
 /// Explicit scrollbar primitive.
@@ -495,15 +588,48 @@ impl From<crate::theme::ComponentTheme> for ScrollbarStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
-
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::style::{Color, Style};
 
-    use super::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
+    use super::{
+        Scrollbar, ScrollbarComponent, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState,
+        ScrollbarStyles,
+    };
+
+    #[test]
+    fn component_uses_authoritative_layout_for_paint_and_drag() {
+        let state = Cell::new(ScrollbarState::new(100, 20).offset(20));
+        let component = ScrollbarComponent::new("messages-scroll", &state);
+        let layout = component.layout(Constraints::new(1, 1, 8, Some(8)), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 1);
+        assert_eq!(layout.size.height, 8);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 8));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().regions().len(), 1);
+
+        assert_eq!(
+            component.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(0, 7),
+                )),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            bmux_tui::event::EventOutcome::Redraw
+        );
+        assert_eq!(state.get().offset, state.get().max_offset());
+    }
 
     #[test]
     fn computes_thumb_size_and_position() {

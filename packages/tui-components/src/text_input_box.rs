@@ -1,17 +1,26 @@
 //! Visible text-input box composition around [`TextInputState`].
 
+use std::cell::RefCell;
+
 use bmux_tui::chrome::{Border, Panel};
-use bmux_tui::event::Event;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
+};
+use bmux_tui::composition::{SizeBox, Surface};
+use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::input::TextInput;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::widget::Widget;
 
-use crate::form_field::FormField;
-use crate::text_input::{TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState};
+use crate::form_field::{FormField, FormFieldComponent};
+use crate::text_input::{
+    TextInputComponent, TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
+};
 
 /// Behavior policy for [`TextInputBox`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +215,152 @@ pub struct TextInputBox<'a> {
     policy: TextInputBoxPolicy,
     text_policy: TextInputPolicy,
     styles: TextInputBoxStyles,
+}
+
+/// Canonical component-lifecycle text input box.
+pub struct TextInputBoxComponent<'a, 'state> {
+    id: LayoutId,
+    box_control: TextInputBox<'a>,
+    state: &'state RefCell<TextInputState>,
+}
+
+impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
+    /// Create a text input box with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        text_policy: TextInputPolicy,
+        state: &'state RefCell<TextInputState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            box_control: TextInputBox::new(text_policy),
+            state,
+        }
+    }
+
+    /// Set optional label.
+    #[must_use]
+    pub const fn label(mut self, label: &'a str) -> Self {
+        self.box_control.label = Some(label);
+        self
+    }
+
+    /// Set required marker visibility.
+    #[must_use]
+    pub const fn required(mut self, required: bool) -> Self {
+        self.box_control.required = required;
+        self
+    }
+
+    /// Set optional help text.
+    #[must_use]
+    pub const fn help(mut self, help: &'a str) -> Self {
+        self.box_control.help = Some(help);
+        self
+    }
+
+    /// Set optional error text.
+    #[must_use]
+    pub const fn error(mut self, error: &'a str) -> Self {
+        self.box_control.error = Some(error);
+        self
+    }
+
+    /// Set placeholder text.
+    #[must_use]
+    pub const fn placeholder(mut self, placeholder: &'a str) -> Self {
+        self.box_control.placeholder = Some(placeholder);
+        self
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: TextInputBoxPolicy) -> Self {
+        self.box_control.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: TextInputBoxStyles) -> Self {
+        self.box_control.styles = styles;
+        self
+    }
+
+    fn tree(&self) -> bmux_tui::component::Element<'_> {
+        let input = TextInputComponent::new(
+            format!("{}.input", self.id.as_str()),
+            self.state,
+            &self.box_control.text_policy,
+        )
+        .style(self.box_control.text_style())
+        .selection_style(self.box_control.styles.selection)
+        .focused(self.box_control.policy.cursor && self.box_control.policy.focused)
+        .disabled(self.box_control.policy.disabled);
+        let input = if let Some(placeholder) = self.box_control.placeholder {
+            input.placeholder(placeholder, self.box_control.styles.placeholder)
+        } else {
+            input
+        };
+        let bounded = SizeBox::new(input)
+            .id(format!("{}.rows", self.id.as_str()))
+            .min_height(usize::from(self.box_control.policy.min_rows))
+            .max_height(usize::from(
+                self.box_control.policy.max_rows.unwrap_or(u16::MAX),
+            ));
+        let control = if self.box_control.policy.panel_chrome {
+            let mut surface = Surface::new(bounded)
+                .id(format!("{}.surface", self.id.as_str()))
+                .padding(Insets::new(0, 1, 0, 1));
+            if self.box_control.policy.background {
+                surface = surface.background(self.box_control.background_style());
+            }
+            surface = surface.border(Border::single().style(if self.box_control.policy.focused {
+                self.box_control.styles.focused_border
+            } else {
+                self.box_control.styles.border
+            }));
+            bmux_tui::component::Element::new(surface)
+        } else {
+            bmux_tui::component::Element::new(bounded)
+        };
+        if self.box_control.policy.field_chrome {
+            let mut field = FormFieldComponent::new(
+                self.id.clone(),
+                self.box_control.label.unwrap_or_default(),
+                control,
+            )
+            .required(self.box_control.required);
+            if let Some(help) = self.box_control.help {
+                field = field.help(help);
+            }
+            if let Some(error) = self.box_control.error {
+                field = field.error(error);
+            }
+            bmux_tui::component::Element::new(field)
+        } else {
+            control
+        }
+    }
+}
+
+impl Component for TextInputBoxComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        self.tree().revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.tree().layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.tree().paint(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.tree().event(event, layout, cx)
+    }
 }
 
 impl<'a> TextInputBox<'a> {
@@ -455,16 +610,20 @@ impl From<crate::theme::ComponentTheme> for TextInputBoxStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
     use bmux_text_edit::TextEditBuffer;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
     use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
     use bmux_tui::hit::HitId;
     use bmux_tui::interaction::InteractionRouter;
+    use bmux_tui::paint::PaintCx;
 
-    use super::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
+    use super::{TextInputBox, TextInputBoxComponent, TextInputBoxOutcome, TextInputBoxPolicy};
     use crate::text_input::{TextInputPolicy, TextInputState};
 
     #[test]
@@ -644,6 +803,38 @@ mod tests {
 
         assert_eq!(outcome, TextInputBoxOutcome::Ignored);
         assert_eq!(state.buffer().text(), "Ada");
+    }
+
+    #[test]
+    fn component_composes_field_surface_and_input_through_runtime() {
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::new()));
+        let policy = TextInputPolicy::chat_composer();
+        let component = TextInputBoxComponent::new("composer", policy, &state)
+            .label("Message")
+            .required(true)
+            .help("Markdown supported")
+            .placeholder("Type a message")
+            .policy(
+                TextInputBoxPolicy::labeled_field()
+                    .focused(true)
+                    .rows(2, Some(2)),
+            );
+        let layout = component.layout(Constraints::new(24, 24, 0, Some(8)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 8));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!(layout.find(&"composer".into()).is_some());
+        assert!(layout.find(&"composer.surface".into()).is_some());
+        assert!(layout.find(&"composer.input".into()).is_some());
+        assert_eq!(
+            component.event(
+                &Event::Paste("hello".to_owned()),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            bmux_tui::event::EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().buffer().text(), "hello");
     }
 
     #[test]
