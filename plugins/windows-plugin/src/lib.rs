@@ -1182,42 +1182,42 @@ impl RustPlugin for WindowsPlugin {
                 Ok::<_, ServiceResponse>(active_window_panes(ctx))
             },
             "windows-commands", "new-window" => |req: NewWindowArgs, ctx| {
-                create_window(ctx, &self.runtime_state, req.name)
-                    .map_err(|e| ServiceResponse::error("new_failed", e))
+                Ok::<_, ServiceResponse>(create_window(ctx, &self.runtime_state, req.name)
+                    .map_err(|reason| WindowError::Failed { reason }))
             },
             "windows-commands", "rename-window" => |req: RenameWindowArgs, ctx| {
-                rename_window(ctx, &self.runtime_state, &req.name)
-                    .map_err(|e| ServiceResponse::error("rename_failed", e))
+                Ok::<_, ServiceResponse>(rename_window(ctx, &self.runtime_state, &req.name)
+                    .map_err(|reason| WindowError::Failed { reason }))
             },
             "windows-commands", "rename-window-by-id" => |req: RenameWindowByIdArgs, ctx| {
-                rename_window_by_id(ctx, &self.runtime_state, req.id, &req.name)
-                    .map_err(|e| ServiceResponse::error("rename_failed", e))
+                Ok::<_, ServiceResponse>(rename_window_by_id(ctx, &self.runtime_state, req.id, &req.name)
+                    .map_err(|reason| WindowError::Failed { reason }))
             },
             "windows-commands", "kill-window" => |req: KillWindowArgs, ctx| {
-                let selector = parse_selector(&req.target)
-                    .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                kill_window(ctx, &self.runtime_state, selector, req.force_local)
-                    .map_err(|e| ServiceResponse::error("kill_failed", e))
+                let result = parse_selector(&req.target)
+                    .and_then(|selector| kill_window(ctx, &self.runtime_state, selector, req.force_local))
+                    .map_err(|reason| WindowError::Failed { reason });
+                Ok::<_, ServiceResponse>(result)
             },
             "windows-commands", "kill-all-windows" => |req: KillAllWindowsArgs, ctx| {
-                kill_all_windows(ctx, &self.runtime_state, req.force_local)
-                    .map_err(|e| ServiceResponse::error("kill_failed", e))
+                Ok::<_, ServiceResponse>(kill_all_windows(ctx, &self.runtime_state, req.force_local)
+                    .map_err(|reason| WindowError::Failed { reason }))
             },
             "windows-commands", "switch-window" => |req: SwitchWindowArgs, ctx| {
-                let selector = parse_selector(&req.target)
-                    .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                switch_window(
-                    ctx,
-                    &self.runtime_state,
-                    selector,
-                    &self.last_selected_by_client,
-                    ctx.caller_client_id,
-                )
-                    .map_err(|e| ServiceResponse::error("switch_failed", e))
+                let result = parse_selector(&req.target).and_then(|selector| {
+                    switch_window(
+                        ctx,
+                        &self.runtime_state,
+                        selector,
+                        &self.last_selected_by_client,
+                        ctx.caller_client_id,
+                    )
+                }).map_err(|reason| WindowError::Failed { reason });
+                Ok::<_, ServiceResponse>(result)
             },
             "windows-commands", "move-window" => |req: MoveWindowArgs, ctx| {
-                move_window(ctx, &self.runtime_state, req.source, req.target, req.placement)
-                    .map_err(|e| ServiceResponse::error("move_failed", e))
+                Ok::<_, ServiceResponse>(move_window(ctx, &self.runtime_state, req.source, req.target, req.placement)
+                    .map_err(|reason| WindowError::Failed { reason }))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
                 let target = Selector { id: Some(req.id), name: None, index: None };
@@ -5891,7 +5891,9 @@ mod tests {
             "unexpected error: {:?}",
             response.error
         );
-        let ack: WindowAck = decode_service_message(&response.payload).expect("ack should decode");
+        let result: Result<WindowAck, WindowError> =
+            decode_service_message(&response.payload).expect("result should decode");
+        let ack = result.expect("new-window should succeed");
         assert!(ack.ok);
         assert!(ack.id.is_some());
     }
@@ -5912,9 +5914,13 @@ mod tests {
         );
 
         let response = plugin.invoke_service(context);
-        let error = response.error.expect("expected service error");
-        assert_eq!(error.code, "new_failed");
-        assert!(error.message.contains("session policy denied"));
+        assert!(response.error.is_none());
+        let result: Result<WindowAck, WindowError> =
+            decode_service_message(&response.payload).expect("result should decode");
+        let error = result.expect_err("expected window error");
+        assert!(
+            matches!(error, WindowError::Failed { reason } if reason.contains("session policy denied"))
+        );
     }
 
     #[test]
@@ -5938,7 +5944,9 @@ mod tests {
             "unexpected error: {:?}",
             response.error
         );
-        let ack: WindowAck = decode_service_message(&response.payload).expect("ack should decode");
+        let result: Result<WindowAck, WindowError> =
+            decode_service_message(&response.payload).expect("result should decode");
+        let ack = result.expect("switch-window should succeed");
         assert!(ack.ok);
         assert!(ack.id.is_some_and(|id| !id.is_empty()));
     }
@@ -6041,9 +6049,13 @@ mod tests {
         );
 
         let response = plugin.invoke_service(context);
-        let error = response.error.expect("expected kill failure");
-        assert_eq!(error.code, "kill_failed");
-        assert!(error.message.contains("session policy denied"));
+        assert!(response.error.is_none());
+        let result: Result<WindowAck, WindowError> =
+            decode_service_message(&response.payload).expect("result should decode");
+        let error = result.expect_err("expected window error");
+        assert!(
+            matches!(error, WindowError::Failed { reason } if reason.contains("session policy denied"))
+        );
     }
 
     #[test]

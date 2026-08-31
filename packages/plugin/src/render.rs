@@ -164,7 +164,7 @@ impl ExtensionRect {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct AttachInputEndpoint {
     pub capability: String,
     pub interface_id: String,

@@ -15,6 +15,7 @@
 
 pub mod action_dispatch;
 mod attach_companion;
+mod attach_presentation_input;
 mod declaration;
 mod discovery;
 mod event_bus;
@@ -37,6 +38,11 @@ mod typed_service_caller;
 pub use attach_companion::{
     AttachCompanion, AttachCompanionCallback, AttachCompanionRegistry,
     global_attach_companion_registry, register_attach_companion, registered_attach_companions,
+};
+pub use attach_presentation_input::{
+    AttachPresentationInputHandler, AttachPresentationInputRegistry,
+    global_attach_presentation_input_registry, invoke_attach_presentation_input_handler,
+    register_attach_presentation_input_handler, remove_attach_presentation_input_handler,
 };
 pub use bmux_plugin_runtime::{
     ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,

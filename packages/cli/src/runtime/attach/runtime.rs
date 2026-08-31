@@ -11482,27 +11482,33 @@ async fn invoke_plugin_surface_pointer_event(
         focused_pane: None,
         hovered_pane: None,
     };
-    let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding plugin surface pointer event: {error}"),
-        }
-    })?;
-    let response = client
-        .invoke_service_raw(
-            endpoint.capability,
-            InvokeServiceKind::Command,
-            endpoint.interface_id,
-            endpoint.operation,
-            payload,
-        )
-        .await?;
-    let result = bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
-        |error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("decoding plugin surface pointer result: {error}"),
-        },
-    )?;
+    let result = if let Some(result) =
+        bmux_plugin::invoke_attach_presentation_input_handler(&endpoint, &input)
+    {
+        result
+    } else {
+        let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("encoding plugin surface pointer event: {error}"),
+            }
+        })?;
+        let response = client
+            .invoke_service_raw(
+                endpoint.capability,
+                InvokeServiceKind::Command,
+                endpoint.interface_id,
+                endpoint.operation,
+                payload,
+            )
+            .await?;
+        bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
+            |error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("decoding plugin surface pointer result: {error}"),
+            },
+        )?
+    };
     if result.capture_pointer {
         view_state.plugin_pointer_router.capture(event.hit.clone());
     }

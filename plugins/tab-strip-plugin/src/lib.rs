@@ -306,6 +306,14 @@ impl RustPlugin for TabStripPlugin {
     }
 }
 
+fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
+    bmux_plugin::AttachInputEndpoint {
+        capability: "bmux.tab_strip.input".to_string(),
+        interface_id: "presentation-input".to_string(),
+        operation: "handle-input".to_string(),
+    }
+}
+
 /// Configure this process-local attach companion.
 ///
 /// # Errors
@@ -331,6 +339,10 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             },
         )
         .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
+    bmux_plugin::register_attach_presentation_input_handler(
+        input_endpoint(),
+        std::sync::Arc::new(handle_local_input),
+    );
     Ok(())
 }
 
@@ -386,6 +398,7 @@ pub fn start() -> Result<(), String> {
 
 pub fn uninstall() {
     ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
+    bmux_plugin::remove_attach_presentation_input_handler(&input_endpoint());
     let _ = global_plugin_layout_registry().remove_owner(OWNER);
     let _ = global_plugin_surface_registry().remove_owner(OWNER);
     if let Ok(mut guard) = state().lock() {
@@ -723,11 +736,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                     format!("window:{window_id}"),
                     ExtensionRect::new(x, 0, width, state.settings.height),
                 )
-                .endpoint(bmux_plugin::AttachInputEndpoint {
-                    capability: "bmux.tab_strip.input".to_string(),
-                    interface_id: "presentation-input".to_string(),
-                    operation: "handle-input".to_string(),
-                })
+                .endpoint(input_endpoint())
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
             );
         }
@@ -1148,6 +1157,29 @@ fn update_menu(
     })
 }
 
+fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if event.event_kind != "pointer" {
+        return None;
+    }
+    if update_scroll(event) {
+        return Some(AttachInputResult {
+            consumed: true,
+            dirty: true,
+            ..AttachInputResult::default()
+        });
+    }
+    if update_hover(event) {
+        return Some(AttachInputResult {
+            // Legacy hover updated presentation but remained unconsumed so
+            // pane hover/focus behavior could still run.
+            consumed: false,
+            dirty: true,
+            ..AttachInputResult::default()
+        });
+    }
+    None
+}
+
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
     if let Some(result) = update_menu(context, event) {
         return result;
@@ -1182,20 +1214,6 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     }
     if let Some(result) = update_drag(context, event) {
         return result;
-    }
-    if update_scroll(event) {
-        return AttachInputResult {
-            consumed: true,
-            dirty: true,
-            ..AttachInputResult::default()
-        };
-    }
-    if update_hover(event) {
-        return AttachInputResult {
-            consumed: true,
-            dirty: true,
-            ..AttachInputResult::default()
-        };
     }
     AttachInputResult::default()
 }
