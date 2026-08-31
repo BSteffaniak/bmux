@@ -14,14 +14,16 @@ use bmux_attach_layout_protocol::{
 use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use bmux_tui::chrome::Panel;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::HitMap;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::checkbox::{Checkbox, CheckboxState, CheckboxStyles};
-use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
 use bmux_tui_components::select_dropdown::{
@@ -1622,20 +1624,23 @@ fn render_confirm(
     ];
     let mut actions_state = ActionRowState::new();
     actions_state.set_focused(Some(usize::from(!selected_yes)));
-    Dialog::new(&body, &actions, theme)
+    let actions_state = std::cell::Cell::new(actions_state);
+    let dialog = Dialog::new(&body, &actions, theme)
         .title(active.envelope.request.title.clone())
         .sizing(ModalSizing::fixed(
             Size::new(area.width, area.height),
             Insets::new(0, 0, 0, 0),
         ))
-        .padding(Insets::new(0, 1, 0, 1))
-        .render(
-            area,
-            &DialogState {
-                actions: actions_state,
-            },
-            frame,
-        );
+        .padding(Insets::new(0, 1, 0, 1));
+    let component = DialogComponent::new("prompt.confirm", dialog, &actions_state);
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    let mut paint = PaintCx::new(frame);
+    paint.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
     true
 }
 

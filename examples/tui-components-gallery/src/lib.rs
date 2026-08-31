@@ -7,9 +7,8 @@ use bmux_tui::composition::TextContent;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Clear, Line, Span, Text, TextWrap};
+use bmux_tui::prelude::{Line, Span, Text, TextWrap};
 use bmux_tui::style::{Color, Style};
-use bmux_tui::widget::Widget;
 use bmux_tui_components::action_row::{ActionButton, ActionRowComponent, ActionRowState};
 use bmux_tui_components::badge::{BadgeComponent, BadgePolicy, BadgeSeverity};
 use bmux_tui_components::bar_chart::{
@@ -23,12 +22,14 @@ use bmux_tui_components::chart::{
     Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset,
     ChartLegendPlacement, ChartPoint, ChartPolicy,
 };
-use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::empty_state::{EmptyStateComponent, EmptyStatePolicy};
 use bmux_tui_components::filtered_list::FilteredListState;
 use bmux_tui_components::form_field::FormFieldComponent;
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetailsComponent};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
+};
 use bmux_tui_components::pane::{Pane, PaneState};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
 use bmux_tui_components::progress_bar::{
@@ -429,16 +430,15 @@ fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
     )
     .title("Anchored modal")
     .placement(ModalPlacement::Anchored(bmux_tui::geometry::Point::new(
-        36, 18,
+        2, 0,
     )));
-    let modal_area = Rect::new(34, 18, 34, 6);
-    Clear::new()
-        .style(Style::new().bg(Color::Black))
-        .render(modal_area, frame);
-    modal.render(modal_area, frame);
-    modal.render_line(
-        modal.content_area(modal_area),
-        &Line::from("Opaque modal frame"),
+    render_component(
+        &ModalFrameComponent::new(
+            "gallery.modal",
+            modal,
+            TextContent::new("Opaque modal frame").id("gallery.modal.body"),
+        ),
+        Rect::new(34, 18, 34, 6),
         frame,
     );
 }
@@ -446,16 +446,21 @@ fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
 fn render_dialog(frame: &mut Frame<'_>, theme: ModalTheme) {
     let body = [Line::from("Dialog body with actions")];
     let actions = [ActionButton::new("ok", "OK")];
-    let mut state = DialogState::new();
-    state.actions.set_focused(Some(0));
-    Dialog::new(&body, &actions, theme)
+    let mut action_state = ActionRowState::new();
+    action_state.set_focused(Some(0));
+    let state = Cell::new(action_state);
+    let dialog = Dialog::new(&body, &actions, theme)
         .title("Dialog")
         .sizing(ModalSizing::new(
             Size::new(30, 7),
             Size::new(30, 7),
             Insets::all(0),
-        ))
-        .render(Rect::new(35, 13, 34, 9), &state, frame);
+        ));
+    render_component(
+        &DialogComponent::new("gallery.dialog", dialog, &state),
+        Rect::new(35, 13, 34, 9),
+        frame,
+    );
 }
 
 pub fn rows(buffer: &Buffer) -> Vec<String> {

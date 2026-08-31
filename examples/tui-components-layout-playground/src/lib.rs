@@ -1,8 +1,11 @@
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextContent;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Border, Line, Panel, PanelTitle};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text_block::Alignment;
@@ -10,7 +13,9 @@ use bmux_tui::widget::Widget;
 use bmux_tui_components::common::{
     ComponentHitRegion, DragState, HitRegionId, ResizeBounds, hit_region_at,
 };
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
+};
 use bmux_tui_components::pane::{
     Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
 };
@@ -182,16 +187,20 @@ fn render_playground(
         &Line::from("Drag title or resize border"),
     );
 
+    let modal_area = Rect::new(36, 1, 32, 14);
     let modal = ModalFrame::new(
         ModalSizing::new(Size::new(26, 7), Size::new(26, 7), Insets::all(0)),
         ModalTheme::dark(Color::Magenta),
     )
     .placement(ModalPlacement::UpperThird)
     .title("Upper third");
-    modal.render(Rect::new(36, 1, 32, 14), frame);
-    modal.render_line(
-        modal.content_area(Rect::new(36, 1, 32, 14)),
-        &Line::from("Modal placement"),
+    render_component(
+        &ModalFrameComponent::new(
+            "playground.modal",
+            modal,
+            TextContent::new("Modal placement").id("playground.modal.body"),
+        ),
+        modal_area,
         frame,
     );
 
@@ -221,6 +230,16 @@ fn render_playground(
     group.render_dividers(group_area, panel_group_state, frame);
 
     frame.write_line(Rect::new(1, 16, 68, 1), &Line::from(message));
+}
+
+fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
 }
 
 fn panel_group_area() -> Rect {
