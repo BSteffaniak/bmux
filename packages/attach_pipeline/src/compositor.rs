@@ -687,7 +687,23 @@ impl RetainedPointerRouter {
         button: RetainedPointerButton,
         pressed: bool,
     ) -> Option<RetainedPointerEvent> {
-        compositor.hit_test(x, y).map(|hit| RetainedPointerEvent {
+        let hit = if pressed {
+            compositor.hit_test(x, y)
+        } else {
+            self.captured
+                .as_ref()
+                .and_then(|captured| {
+                    retarget_hit(
+                        compositor,
+                        captured,
+                        x,
+                        y,
+                        self.preserve_capture_across_revisions,
+                    )
+                })
+                .or_else(|| compositor.hit_test(x, y))
+        }?;
+        Some(RetainedPointerEvent {
             phase: if pressed {
                 RetainedPointerPhase::Down
             } else {
@@ -1953,6 +1969,11 @@ mod tests {
             .route_drag(&compositor, 40, 20, RetainedPointerButton::Primary)
             .unwrap();
         assert_eq!(dragged.hit.surface_id, Uuid::from_u128(614));
+        let released = router
+            .route_button(&compositor, 40, 20, RetainedPointerButton::Primary, false)
+            .expect("release routes to captured gesture owner");
+        assert_eq!(released.hit.surface_id, Uuid::from_u128(614));
+        assert_eq!(released.hit.absolute_x, 40);
         assert_eq!(dragged.hit.absolute_x, 40);
         assert_eq!(dragged.hit.surface_x, 38);
         assert!(router.release_capture().is_some());

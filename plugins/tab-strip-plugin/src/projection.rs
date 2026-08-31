@@ -14,6 +14,7 @@ pub enum SegmentKind {
     InactiveTab,
     HoveredActiveTab,
     HoveredInactiveTab,
+    EditingTab,
     Mode,
     Module,
     Overflow,
@@ -122,6 +123,7 @@ struct TabToken {
     hovered: bool,
     window_id: Uuid,
     edit_cursor_offset: Option<usize>,
+    edit_selection: Option<(usize, usize)>,
 }
 
 struct TabWindow {
@@ -224,6 +226,7 @@ pub struct ProjectionInteraction<'a> {
     pub(super) editing_window_id: Option<Uuid>,
     pub(super) edit_buffer: &'a str,
     pub(super) edit_cursor: usize,
+    pub(super) edit_selection: Option<(usize, usize)>,
     pub(super) menu_window_id: Option<Uuid>,
     pub(super) menu_selected: usize,
     pub(super) drag_marker_col: Option<u16>,
@@ -278,6 +281,11 @@ pub fn project_bar(
                                 [..interaction.edit_cursor.min(interaction.edit_buffer.len())],
                         )),
                 ),
+                edit_selection: if editing {
+                    interaction.edit_selection
+                } else {
+                    None
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -393,11 +401,15 @@ fn append_tabs(
         }
         output.push(ProjectedSegment {
             text: token.text.clone(),
-            kind: match (token.active, token.hovered) {
-                (true, true) => SegmentKind::HoveredActiveTab,
-                (true, false) => SegmentKind::ActiveTab,
-                (false, true) => SegmentKind::HoveredInactiveTab,
-                (false, false) => SegmentKind::InactiveTab,
+            kind: if token.edit_cursor_offset.is_some() || token.edit_selection.is_some() {
+                SegmentKind::EditingTab
+            } else {
+                match (token.active, token.hovered) {
+                    (true, true) => SegmentKind::HoveredActiveTab,
+                    (true, false) => SegmentKind::ActiveTab,
+                    (false, true) => SegmentKind::HoveredInactiveTab,
+                    (false, false) => SegmentKind::InactiveTab,
+                }
             },
             window_id: Some(token.window_id),
             edit_cursor_offset: token.edit_cursor_offset,
@@ -861,18 +873,16 @@ mod tests {
             editing_window_id: Some(Uuid::from_u128(1)),
             edit_buffer: "renamed",
             edit_cursor: 4,
+            edit_selection: Some((0, 7)),
             ..ProjectionInteraction::default()
         };
         let settings = Settings::default();
         let windows = [window(1, "main", true)];
         let edited = project_bar(&settings, &windows, &local(80), None, &interaction);
         assert!(edited.plain_text().contains("[renamed]"));
-        assert!(
-            edited
-                .segments
-                .iter()
-                .any(|segment| segment.edit_cursor_offset.is_some())
-        );
+        assert!(edited.segments.iter().any(|segment| {
+            segment.kind == SegmentKind::EditingTab && segment.edit_cursor_offset.is_some()
+        }));
 
         interaction.menu_window_id = Some(Uuid::from_u128(1));
         interaction.menu_selected = 1;

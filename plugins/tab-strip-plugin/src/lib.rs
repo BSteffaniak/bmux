@@ -214,8 +214,7 @@ struct CompanionState {
     drag_target: Option<(Uuid, windows_commands::WindowMovePlacement)>,
     last_left_click: Option<(Uuid, u16, u16, Instant)>,
     editing_window_id: Option<Uuid>,
-    edit_buffer: String,
-    edit_cursor: usize,
+    edit_buffer: bmux_text_edit::TextEditBuffer,
     menu_window_id: Option<Uuid>,
     menu_selected: usize,
     local_presentation: AttachLocalPresentationSnapshot,
@@ -239,8 +238,7 @@ impl CompanionState {
             drag_target: None,
             last_left_click: None,
             editing_window_id: None,
-            edit_buffer: String::new(),
-            edit_cursor: 0,
+            edit_buffer: bmux_text_edit::TextEditBuffer::new(),
             menu_window_id: None,
             menu_selected: 0,
             local_presentation: AttachLocalPresentationSnapshot::initial(),
@@ -590,6 +588,7 @@ struct BarStyles {
     inactive: RenderStyle,
     hovered_active: RenderStyle,
     hovered_inactive: RenderStyle,
+    editing: RenderStyle,
     mode: RenderStyle,
     module: RenderStyle,
     overflow: RenderStyle,
@@ -661,6 +660,7 @@ impl BarStyles {
             inactive,
             hovered_active,
             hovered_inactive,
+            editing: style(active_bg, active_fg),
             mode: style(mode_fg, mode_bg).bold(),
             module: style(module_fg, module_bg),
             overflow: style(overflow_fg, overflow_bg),
@@ -674,6 +674,7 @@ impl BarStyles {
             projection::SegmentKind::InactiveTab => self.inactive,
             projection::SegmentKind::HoveredActiveTab => self.hovered_active,
             projection::SegmentKind::HoveredInactiveTab => self.hovered_inactive,
+            projection::SegmentKind::EditingTab => self.editing,
             projection::SegmentKind::Mode => self.mode,
             projection::SegmentKind::Module => self.module,
             projection::SegmentKind::Overflow => self.overflow,
@@ -702,8 +703,12 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         editing_window_id: state.editing_window_id,
-        edit_buffer: &state.edit_buffer,
-        edit_cursor: state.edit_cursor,
+        edit_buffer: state.edit_buffer.text(),
+        edit_cursor: state.edit_buffer.cursor_byte_index(),
+        edit_selection: state
+            .edit_buffer
+            .selection()
+            .map(|selection| (selection.start, selection.end)),
         menu_window_id: state.menu_window_id,
         menu_selected: state.menu_selected,
         drag_marker_col: state.drag_target.and_then(|(target, placement)| {
@@ -854,8 +859,12 @@ fn projection_interaction_without_marker(
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         editing_window_id: state.editing_window_id,
-        edit_buffer: &state.edit_buffer,
-        edit_cursor: state.edit_cursor,
+        edit_buffer: state.edit_buffer.text(),
+        edit_cursor: state.edit_buffer.cursor_byte_index(),
+        edit_selection: state
+            .edit_buffer
+            .selection()
+            .map(|selection| (selection.start, selection.end)),
         menu_window_id: state.menu_window_id,
         menu_selected: state.menu_selected,
         drag_marker_col: None,
@@ -913,8 +922,9 @@ fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
                 companion.pointer_moved = false;
                 companion.drag_target = None;
                 companion.editing_window_id = Some(source);
-                companion.edit_buffer.clone_from(&window.name);
-                companion.edit_cursor = companion.edit_buffer.len();
+                companion.edit_buffer =
+                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
+                companion.edit_buffer.select_all();
                 let dirty = republish_companion(companion);
                 return Some(AttachInputResult {
                     consumed: true,
@@ -1041,26 +1051,22 @@ fn update_editor(
         "esc" => {
             companion.editing_window_id = None;
             companion.edit_buffer.clear();
-            companion.edit_cursor = 0;
         }
         "left" => {
-            companion.edit_cursor =
-                previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+            companion
+                .edit_buffer
+                .move_cursor(bmux_text_edit::TextMotion::Left);
         }
         "right" => {
-            companion.edit_cursor =
-                next_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+            companion
+                .edit_buffer
+                .move_cursor(bmux_text_edit::TextMotion::Right);
         }
         "backspace" => {
-            if companion.edit_cursor > 0 {
-                let previous =
-                    previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
-                companion.edit_buffer.drain(previous..companion.edit_cursor);
-                companion.edit_cursor = previous;
-            }
+            companion.edit_buffer.delete_backward();
         }
         "enter" => {
-            let name = companion.edit_buffer.trim().to_string();
+            let name = companion.edit_buffer.text().trim().to_string();
             if name.is_empty() {
                 return Some(AttachInputResult {
                     consumed: true,
@@ -1070,7 +1076,6 @@ fn update_editor(
             }
             companion.editing_window_id = None;
             companion.edit_buffer.clear();
-            companion.edit_cursor = 0;
             drop(guard);
             let mut client = ServiceCallerDispatchClient::new(context);
             return Some(
@@ -1097,11 +1102,8 @@ fn update_editor(
                 },
             );
         }
-        value if value.chars().count() == 1 && companion.edit_buffer.len() < 4_096 => {
-            companion
-                .edit_buffer
-                .insert_str(companion.edit_cursor, value);
-            companion.edit_cursor = companion.edit_cursor.saturating_add(value.len());
+        value if value.chars().count() == 1 && companion.edit_buffer.text().len() < 4_096 => {
+            companion.edit_buffer.insert_str(value);
         }
         _ => {
             return Some(AttachInputResult {
@@ -1116,21 +1118,6 @@ fn update_editor(
         dirty,
         ..AttachInputResult::default()
     })
-}
-
-fn previous_char_boundary(value: &str, cursor: usize) -> usize {
-    value[..cursor.min(value.len())]
-        .char_indices()
-        .next_back()
-        .map_or(0, |(index, _)| index)
-}
-
-fn next_char_boundary(value: &str, cursor: usize) -> usize {
-    let cursor = cursor.min(value.len());
-    value[cursor..]
-        .char_indices()
-        .nth(1)
-        .map_or(value.len(), |(offset, _)| cursor.saturating_add(offset))
 }
 
 fn begin_rename(event: &AttachInputEvent) -> bool {
@@ -1162,8 +1149,8 @@ fn begin_rename(event: &AttachInputEvent) -> bool {
         return false;
     };
     companion.editing_window_id = Some(target);
-    companion.edit_buffer.clone_from(&window.name);
-    companion.edit_cursor = companion.edit_buffer.len();
+    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
+    companion.edit_buffer.select_all();
     republish_companion(companion)
 }
 
@@ -1221,8 +1208,9 @@ fn update_menu(
                     return Some(AttachInputResult::default());
                 };
                 companion.editing_window_id = Some(target);
-                companion.edit_buffer.clone_from(&window.name);
-                companion.edit_cursor = companion.edit_buffer.len();
+                companion.edit_buffer =
+                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
+                companion.edit_buffer.select_all();
                 let dirty = republish_companion(companion);
                 return Some(AttachInputResult {
                     consumed: true,
@@ -1307,27 +1295,23 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
         "esc" => {
             companion.editing_window_id = None;
             companion.edit_buffer.clear();
-            companion.edit_cursor = 0;
             release_capture = true;
         }
         "left" => {
-            companion.edit_cursor =
-                previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+            companion
+                .edit_buffer
+                .move_cursor(bmux_text_edit::TextMotion::Left);
         }
         "right" => {
-            companion.edit_cursor =
-                next_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+            companion
+                .edit_buffer
+                .move_cursor(bmux_text_edit::TextMotion::Right);
         }
         "backspace" => {
-            if companion.edit_cursor > 0 {
-                let previous =
-                    previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
-                companion.edit_buffer.drain(previous..companion.edit_cursor);
-                companion.edit_cursor = previous;
-            }
+            companion.edit_buffer.delete_backward();
         }
         "enter" => {
-            let name = companion.edit_buffer.trim().to_string();
+            let name = companion.edit_buffer.text().trim().to_string();
             if name.is_empty() {
                 return Some(AttachInputResult {
                     consumed: true,
@@ -1338,14 +1322,10 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
             service_invocation = rename_window_invocation(editing, name);
             companion.editing_window_id = None;
             companion.edit_buffer.clear();
-            companion.edit_cursor = 0;
             release_capture = true;
         }
-        value if value.chars().count() == 1 && companion.edit_buffer.len() < 4_096 => {
-            companion
-                .edit_buffer
-                .insert_str(companion.edit_cursor, value);
-            companion.edit_cursor = companion.edit_cursor.saturating_add(value.len());
+        value if value.chars().count() == 1 && companion.edit_buffer.text().len() < 4_096 => {
+            companion.edit_buffer.insert_str(value);
         }
         _ => {
             return Some(AttachInputResult {
