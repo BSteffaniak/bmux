@@ -225,6 +225,12 @@ pub struct AttachInputEvent {
     pub hovered_pane: Option<AttachInputPaneContext>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputServiceInvocation {
+    pub endpoint: AttachInputEndpoint,
+    pub payload: Vec<u8>,
+}
+
 #[allow(clippy::struct_excessive_bools)] // Independent routing flags returned by plugin input hooks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttachInputResult {
@@ -232,6 +238,10 @@ pub struct AttachInputResult {
     pub capture_pointer: bool,
     pub capture_keyboard: Vec<String>,
     pub release_capture: bool,
+    /// Keep a stable-region pointer capture across retained surface revisions.
+    /// Presentation-owned gestures use this while redrawing drag feedback.
+    #[serde(default)]
+    pub preserve_capture_across_revisions: bool,
     pub dirty: bool,
     /// Optional user-facing status emitted by best-effort input hooks.
     ///
@@ -239,6 +249,10 @@ pub struct AttachInputResult {
     /// explain that they deferred work without failing the input path.
     #[serde(default)]
     pub status_message: Option<String>,
+    /// Optional generic service invocation requested by a process-local
+    /// presentation handler after updating its retained interaction state.
+    #[serde(default)]
+    pub service_invocation: Option<AttachInputServiceInvocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

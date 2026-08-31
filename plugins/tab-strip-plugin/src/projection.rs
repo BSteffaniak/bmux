@@ -32,7 +32,68 @@ pub struct ProjectedBar {
     pub(super) segments: Vec<ProjectedSegment>,
 }
 
+pub struct ProjectedWindowRange {
+    pub(super) window_id: Uuid,
+    pub(super) start: u16,
+    pub(super) end: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropSide {
+    Before,
+    After,
+}
+
 impl ProjectedBar {
+    pub fn window_ranges(&self) -> Vec<ProjectedWindowRange> {
+        let mut ranges: Vec<ProjectedWindowRange> = Vec::new();
+        let mut x = 0_u16;
+        for segment in &self.segments {
+            let width =
+                u16::try_from(UnicodeWidthStr::width(segment.text.as_str())).unwrap_or(u16::MAX);
+            if let Some(window_id) = segment.window_id {
+                if let Some(last) = ranges.last_mut()
+                    && last.window_id == window_id
+                    && last.end == x
+                {
+                    last.end = x.saturating_add(width);
+                } else {
+                    ranges.push(ProjectedWindowRange {
+                        window_id,
+                        start: x,
+                        end: x.saturating_add(width),
+                    });
+                }
+            }
+            x = x.saturating_add(width);
+        }
+        ranges
+    }
+
+    pub fn drop_target_at_col(&self, col: u16) -> Option<(Uuid, DropSide, u16)> {
+        let ranges = self.window_ranges();
+        let containing = ranges
+            .iter()
+            .find(|range| col >= range.start && col < range.end);
+        if let Some(range) = containing {
+            let midpoint = range
+                .start
+                .saturating_add(range.end.saturating_sub(range.start) / 2);
+            return if col < midpoint {
+                Some((range.window_id, DropSide::Before, range.start))
+            } else {
+                Some((range.window_id, DropSide::After, range.end))
+            };
+        }
+        let first = ranges.first()?;
+        if col < first.start {
+            return Some((first.window_id, DropSide::Before, first.start));
+        }
+        let last = ranges.last()?;
+        Some((last.window_id, DropSide::After, last.end))
+    }
+
+    #[cfg(test)]
     pub fn window_at_col(&self, col: u16) -> Option<Uuid> {
         let mut x = 0_u16;
         for segment in &self.segments {
@@ -165,6 +226,7 @@ pub struct ProjectionInteraction<'a> {
     pub(super) edit_cursor: usize,
     pub(super) menu_window_id: Option<Uuid>,
     pub(super) menu_selected: usize,
+    pub(super) drag_marker_col: Option<u16>,
 }
 
 #[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
@@ -768,6 +830,29 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text:?}");
         }
+    }
+
+    #[test]
+    fn drop_target_uses_tab_halves_and_exposes_insertion_column() {
+        let settings = Settings::default();
+        let windows = [window(1, "one", true), window(2, "two", false)];
+        let projected = project_bar(
+            &settings,
+            &windows,
+            &local(80),
+            None,
+            &ProjectionInteraction::default(),
+        );
+        let ranges = projected.window_ranges();
+        let second = &ranges[1];
+        assert_eq!(
+            projected.drop_target_at_col(second.start),
+            Some((second.window_id, DropSide::Before, second.start))
+        );
+        assert_eq!(
+            projected.drop_target_at_col(second.end.saturating_sub(1)),
+            Some((second.window_id, DropSide::After, second.end))
+        );
     }
 
     #[test]

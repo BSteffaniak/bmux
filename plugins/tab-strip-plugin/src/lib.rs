@@ -18,10 +18,10 @@ use bmux_plugin::surface::{
     global_plugin_surface_registry,
 };
 use bmux_plugin::{
-    AttachInputEvent, AttachInputResult, ExtensionRect, RenderOp, RenderStyle,
-    ServiceCallerDispatchClient, block_on_typed_dispatch,
+    AttachInputEvent, AttachInputResult, AttachInputServiceInvocation, ExtensionRect, RenderOp,
+    RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
-use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::{TypedServiceEndpoint, prelude::*};
 #[cfg(test)]
 use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole,
@@ -32,6 +32,7 @@ use bmux_tui_components::tab_bar::TabItem;
 use bmux_windows_plugin_api::{windows_commands, windows_list};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const OWNER: &str = "bmux.tab_strip";
@@ -207,7 +208,11 @@ struct CompanionState {
     hovered_window_id: Option<Uuid>,
     scroll_offset: usize,
     pointer_source: Option<Uuid>,
+    pointer_started_col: u16,
+    pointer_started_row: u16,
     pointer_moved: bool,
+    drag_target: Option<(Uuid, windows_commands::WindowMovePlacement)>,
+    last_left_click: Option<(Uuid, u16, u16, Instant)>,
     editing_window_id: Option<Uuid>,
     edit_buffer: String,
     edit_cursor: usize,
@@ -228,7 +233,11 @@ impl CompanionState {
             hovered_window_id: None,
             scroll_offset: 0,
             pointer_source: None,
+            pointer_started_col: 0,
+            pointer_started_row: 0,
             pointer_moved: false,
+            drag_target: None,
+            last_left_click: None,
             editing_window_id: None,
             edit_buffer: String::new(),
             edit_cursor: 0,
@@ -697,6 +706,21 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
         edit_cursor: state.edit_cursor,
         menu_window_id: state.menu_window_id,
         menu_selected: state.menu_selected,
+        drag_marker_col: state.drag_target.and_then(|(target, placement)| {
+            let projected = projection::project_bar(
+                &state.settings,
+                &state.snapshot.windows,
+                &state.local_presentation,
+                state.hovered_window_id,
+                &projection::ProjectionInteraction::default(),
+            );
+            projected.window_ranges().into_iter().find_map(|range| {
+                (range.window_id == target).then_some(match placement {
+                    windows_commands::WindowMovePlacement::Before => range.start,
+                    windows_commands::WindowMovePlacement::After => range.end,
+                })
+            })
+        }),
     }
 }
 
@@ -741,6 +765,14 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             );
         }
         x = x.saturating_add(width);
+    }
+    if let Some(marker_col) = projection_interaction(state).drag_marker_col {
+        ops.push(RenderOp::text_run(
+            marker_col.min(rect.w.saturating_sub(1)),
+            0,
+            "│",
+            styles.mode,
+        ));
     }
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
@@ -807,94 +839,182 @@ fn update_scroll(event: &AttachInputEvent) -> bool {
     publish_companion(companion).is_ok()
 }
 
-fn visible_window_at_col(state: &CompanionState, col: u16) -> Option<Uuid> {
+fn projected_bar(state: &CompanionState) -> projection::ProjectedBar {
     projection::project_bar(
         &state.settings,
         &state.snapshot.windows,
         &state.local_presentation,
         state.hovered_window_id,
-        &projection_interaction(state),
+        &projection_interaction_without_marker(state),
     )
-    .window_at_col(col)
 }
 
-fn update_drag(
-    context: &NativeServiceContext,
-    event: &AttachInputEvent,
-) -> Option<AttachInputResult> {
+fn projection_interaction_without_marker(
+    state: &CompanionState,
+) -> projection::ProjectionInteraction<'_> {
+    projection::ProjectionInteraction {
+        editing_window_id: state.editing_window_id,
+        edit_buffer: &state.edit_buffer,
+        edit_cursor: state.edit_cursor,
+        menu_window_id: state.menu_window_id,
+        menu_selected: state.menu_selected,
+        drag_marker_col: None,
+    }
+}
+
+fn command_invocation<Request: serde::Serialize>(
+    endpoint: bmux_plugin::AttachInputEndpoint,
+    request: &Request,
+) -> Option<AttachInputServiceInvocation> {
+    // This local gesture owns the move_window interaction and emits the
+    // generated endpoint request for generic attach-side dispatch.
+    Some(AttachInputServiceInvocation {
+        endpoint,
+        payload: bmux_plugin_sdk::encode_service_message(request).ok()?,
+    })
+}
+
+#[allow(clippy::significant_drop_tightening)] // The companion lock intentionally spans state mutation and retained publication.
+#[allow(clippy::too_many_lines)] // Gesture transition logic is clearer as one phase state machine.
+fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
     let source = event
         .hook_id
         .strip_prefix("bmux.tab_strip:strip:window:")
         .and_then(|target| Uuid::parse_str(target).ok())?;
+    let col = event.col.unwrap_or_default();
+    let row = event.row.unwrap_or_default();
     let mut guard = state().lock().ok()?;
     let companion = guard.as_mut()?;
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
+            let double_click_window =
+                Duration::from_millis(companion.local_presentation.double_click_ms);
+            let is_double = !double_click_window.is_zero()
+                && companion
+                    .last_left_click
+                    .is_some_and(|(last, last_col, last_row, at)| {
+                        last == source
+                            && last_col == col
+                            && last_row == row
+                            && Instant::now().saturating_duration_since(at) <= double_click_window
+                    });
+            companion.last_left_click = if is_double {
+                None
+            } else {
+                Some((source, col, row, Instant::now()))
+            };
+            if is_double {
+                let window = companion
+                    .snapshot
+                    .windows
+                    .iter()
+                    .find(|window| window.id == source)?;
+                companion.pointer_source = None;
+                companion.pointer_moved = false;
+                companion.drag_target = None;
+                companion.editing_window_id = Some(source);
+                companion.edit_buffer.clone_from(&window.name);
+                companion.edit_cursor = companion.edit_buffer.len();
+                let dirty = republish_companion(companion);
+                return Some(AttachInputResult {
+                    consumed: true,
+                    release_capture: true,
+                    capture_keyboard: vec!["*".to_string()],
+                    dirty,
+                    ..AttachInputResult::default()
+                });
+            }
             companion.pointer_source = Some(source);
+            companion.pointer_started_col = col;
+            companion.pointer_started_row = row;
             companion.pointer_moved = false;
+            companion.drag_target = None;
             Some(AttachInputResult {
                 consumed: true,
                 capture_pointer: true,
+                preserve_capture_across_revisions: true,
                 ..AttachInputResult::default()
             })
         }
         "drag" if companion.pointer_source == Some(source) => {
-            companion.pointer_moved = true;
+            let target = projected_bar(companion).drop_target_at_col(col);
+            let moved = companion.pointer_moved
+                || col
+                    .abs_diff(companion.pointer_started_col)
+                    .max(row.abs_diff(companion.pointer_started_row))
+                    > 1
+                || target.is_some_and(|(target, _, _)| target != source);
+            companion.pointer_moved = moved;
+            companion.drag_target = moved.then_some(target).flatten().map(|(target, side, _)| {
+                (
+                    target,
+                    match side {
+                        projection::DropSide::Before => {
+                            windows_commands::WindowMovePlacement::Before
+                        }
+                        projection::DropSide::After => windows_commands::WindowMovePlacement::After,
+                    },
+                )
+            });
+            let dirty = republish_companion(companion);
             Some(AttachInputResult {
                 consumed: true,
                 capture_pointer: true,
+                preserve_capture_across_revisions: true,
+                dirty,
                 ..AttachInputResult::default()
             })
         }
         "up" if companion.pointer_source == Some(source) => {
             let moved = companion.pointer_moved;
-            let target = event
-                .col
-                .and_then(|col| visible_window_at_col(companion, col));
+            let target = companion.drag_target;
             companion.pointer_source = None;
             companion.pointer_moved = false;
-            drop(guard);
-            let result = if moved {
-                target.filter(|target| *target != source).map_or_else(
-                    || Ok(Ok(None)),
-                    |target| {
-                        let mut client = ServiceCallerDispatchClient::new(context);
-                        block_on_typed_dispatch(windows_commands::client::move_window(
-                            &mut client,
-                            source,
-                            target,
-                            windows_commands::WindowMovePlacement::Before,
-                        ))
-                        .map(|result| result.map(Some))
+            companion.drag_target = None;
+            let dirty = republish_companion(companion);
+            let service_invocation = if moved {
+                target
+                    .filter(|(target, _)| *target != source)
+                    .and_then(|(target, placement)| {
+                        command_invocation(
+                            bmux_plugin::AttachInputEndpoint {
+                                capability:
+                                    windows_commands::client::MoveWindowEndpoint::CAPABILITY
+                                        .to_string(),
+                                interface_id:
+                                    windows_commands::client::MoveWindowEndpoint::INTERFACE_ID
+                                        .to_string(),
+                                operation: windows_commands::client::MoveWindowEndpoint::OPERATION
+                                    .to_string(),
+                            },
+                            &windows_commands::client::MoveWindowRequest {
+                                source,
+                                target,
+                                placement,
+                            },
+                        )
+                    })
+            } else {
+                command_invocation(
+                    bmux_plugin::AttachInputEndpoint {
+                        capability: windows_commands::client::SwitchWindowEndpoint::CAPABILITY
+                            .to_string(),
+                        interface_id: windows_commands::client::SwitchWindowEndpoint::INTERFACE_ID
+                            .to_string(),
+                        operation: windows_commands::client::SwitchWindowEndpoint::OPERATION
+                            .to_string(),
+                    },
+                    &windows_commands::client::SwitchWindowRequest {
+                        target: source.to_string(),
                     },
                 )
-            } else {
-                let mut client = ServiceCallerDispatchClient::new(context);
-                block_on_typed_dispatch(windows_commands::client::switch_window(
-                    &mut client,
-                    source.to_string(),
-                ))
-                .map(|result| result.map(Some))
             };
-            Some(match result {
-                Ok(Ok(_)) => AttachInputResult {
-                    consumed: true,
-                    release_capture: true,
-                    dirty: true,
-                    ..AttachInputResult::default()
-                },
-                Ok(Err(error)) => AttachInputResult {
-                    consumed: true,
-                    release_capture: true,
-                    status_message: Some(format!("window action failed: {error:?}")),
-                    ..AttachInputResult::default()
-                },
-                Err(error) => AttachInputResult {
-                    consumed: true,
-                    release_capture: true,
-                    status_message: Some(format!("window action unavailable: {error}")),
-                    ..AttachInputResult::default()
-                },
+            Some(AttachInputResult {
+                consumed: true,
+                release_capture: true,
+                dirty,
+                service_invocation,
+                ..AttachInputResult::default()
             })
         }
         _ => None,
@@ -1157,9 +1277,115 @@ fn update_menu(
     })
 }
 
+fn rename_window_invocation(window_id: Uuid, name: String) -> Option<AttachInputServiceInvocation> {
+    command_invocation(
+        bmux_plugin::AttachInputEndpoint {
+            capability: windows_commands::client::RenameWindowByIdEndpoint::CAPABILITY.to_string(),
+            interface_id: windows_commands::client::RenameWindowByIdEndpoint::INTERFACE_ID
+                .to_string(),
+            operation: windows_commands::client::RenameWindowByIdEndpoint::OPERATION.to_string(),
+        },
+        &windows_commands::client::RenameWindowByIdRequest {
+            id: window_id,
+            name,
+        },
+    )
+}
+
+#[allow(clippy::significant_drop_tightening)] // The companion lock intentionally spans editor mutation and retained publication.
+fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
+        return None;
+    }
+    let mut guard = state().lock().ok()?;
+    let companion = guard.as_mut()?;
+    let editing = companion.editing_window_id?;
+    let key = event.key.as_deref()?;
+    let mut release_capture = false;
+    let mut service_invocation = None;
+    match key {
+        "esc" => {
+            companion.editing_window_id = None;
+            companion.edit_buffer.clear();
+            companion.edit_cursor = 0;
+            release_capture = true;
+        }
+        "left" => {
+            companion.edit_cursor =
+                previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+        }
+        "right" => {
+            companion.edit_cursor =
+                next_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+        }
+        "backspace" => {
+            if companion.edit_cursor > 0 {
+                let previous =
+                    previous_char_boundary(&companion.edit_buffer, companion.edit_cursor);
+                companion.edit_buffer.drain(previous..companion.edit_cursor);
+                companion.edit_cursor = previous;
+            }
+        }
+        "enter" => {
+            let name = companion.edit_buffer.trim().to_string();
+            if name.is_empty() {
+                return Some(AttachInputResult {
+                    consumed: true,
+                    status_message: Some("window name must not be empty".to_string()),
+                    ..AttachInputResult::default()
+                });
+            }
+            service_invocation = rename_window_invocation(editing, name);
+            companion.editing_window_id = None;
+            companion.edit_buffer.clear();
+            companion.edit_cursor = 0;
+            release_capture = true;
+        }
+        value if value.chars().count() == 1 && companion.edit_buffer.len() < 4_096 => {
+            companion
+                .edit_buffer
+                .insert_str(companion.edit_cursor, value);
+            companion.edit_cursor = companion.edit_cursor.saturating_add(value.len());
+        }
+        _ => {
+            return Some(AttachInputResult {
+                consumed: true,
+                ..AttachInputResult::default()
+            });
+        }
+    }
+    let dirty = republish_companion(companion);
+    Some(AttachInputResult {
+        consumed: true,
+        capture_keyboard: if release_capture {
+            Vec::new()
+        } else {
+            vec!["*".to_string()]
+        },
+        release_capture,
+        dirty,
+        service_invocation,
+        ..AttachInputResult::default()
+    })
+}
+
 fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if let Some(result) = update_editor_local(event) {
+        return Some(result);
+    }
     if event.event_kind != "pointer" {
         return None;
+    }
+    if begin_rename(event) {
+        return Some(AttachInputResult {
+            consumed: true,
+            capture_keyboard: vec!["*".to_string()],
+            dirty: true,
+            ..AttachInputResult::default()
+        });
+    }
+    if let Some(result) = update_drag_local(event) {
+        return Some(result);
     }
     if update_scroll(event) {
         return Some(AttachInputResult {
@@ -1211,9 +1437,6 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     }
     if event.event_kind != "pointer" {
         return AttachInputResult::default();
-    }
-    if let Some(result) = update_drag(context, event) {
-        return result;
     }
     AttachInputResult::default()
 }
@@ -1521,7 +1744,7 @@ bar_bg = "#112233"
             .find(|region| region.local_id == format!("window:{}", Uuid::from_u128(2)))
             .expect("active window region");
         assert_eq!(
-            visible_window_at_col(&state, second_region.rect.x),
+            projected_bar(&state).window_at_col(second_region.rect.x),
             Some(Uuid::from_u128(2))
         );
     }

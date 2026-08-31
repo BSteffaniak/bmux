@@ -36,6 +36,8 @@ pub struct AttachLocalPresentationSnapshot {
     pub status_foreground: String,
     pub status_active: String,
     pub status_mode: String,
+    /// Configured maximum interval between presses for a double-click.
+    pub double_click_ms: u64,
     /// Current terminal width in cells. Layout-owning companions use this for
     /// width-aware retained projection; zero means no usable viewport yet.
     pub viewport_cols: u16,
@@ -61,6 +63,7 @@ impl AttachLocalPresentationSnapshot {
             status_foreground: "#ffffff".to_string(),
             status_active: "#00ff00".to_string(),
             status_mode: "#ffff00".to_string(),
+            double_click_ms: 400,
             viewport_cols: 0,
         }
     }

@@ -7171,6 +7171,7 @@ fn build_attach_local_presentation_snapshot(
         status_foreground: resolved_appearance.status.foreground,
         status_active: resolved_appearance.status.active_window,
         status_mode: resolved_appearance.status.mode_indicator,
+        double_click_ms: view_state.mouse.config.double_click_ms,
         viewport_cols,
     }
 }
@@ -11418,6 +11419,7 @@ pub const fn record_attach_mouse_event(
     view_state.mouse.last_event_at = Some(now);
 }
 
+#[allow(clippy::too_many_lines)] // Pointer routing, local dispatch, and generic service follow-up form one ordered transaction.
 async fn invoke_plugin_surface_pointer_event(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -11491,8 +11493,22 @@ async fn invoke_plugin_surface_pointer_event(
             },
         )?
     };
+    if let Some(invocation) = result.service_invocation.as_ref() {
+        client
+            .invoke_service_raw(
+                invocation.endpoint.capability.clone(),
+                InvokeServiceKind::Command,
+                invocation.endpoint.interface_id.clone(),
+                invocation.endpoint.operation.clone(),
+                invocation.payload.clone(),
+            )
+            .await?;
+    }
     if result.capture_pointer {
         view_state.plugin_pointer_router.capture(event.hit.clone());
+        view_state
+            .plugin_pointer_router
+            .preserve_capture_across_revisions(result.preserve_capture_across_revisions);
     }
     if result.release_capture {
         let _ = view_state.plugin_pointer_router.release_capture();
@@ -11595,27 +11611,44 @@ async fn try_handle_plugin_surface_key(
         focused_pane: attach_input_focused_context(view_state),
         hovered_pane: None,
     };
-    let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding plugin surface keyboard event: {error}"),
-        }
-    })?;
-    let response = client
-        .invoke_service_raw(
-            endpoint.capability,
-            InvokeServiceKind::Command,
-            endpoint.interface_id,
-            endpoint.operation,
-            payload,
-        )
-        .await?;
-    let result = bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
-        |error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("decoding plugin surface keyboard result: {error}"),
-        },
-    )?;
+    let result = if let Some(result) =
+        bmux_plugin::invoke_attach_presentation_input_handler(&endpoint, &input)
+    {
+        result
+    } else {
+        let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("encoding plugin surface keyboard event: {error}"),
+            }
+        })?;
+        let response = client
+            .invoke_service_raw(
+                endpoint.capability,
+                InvokeServiceKind::Command,
+                endpoint.interface_id,
+                endpoint.operation,
+                payload,
+            )
+            .await?;
+        bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
+            |error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("decoding plugin surface keyboard result: {error}"),
+            },
+        )?
+    };
+    if let Some(invocation) = result.service_invocation.as_ref() {
+        client
+            .invoke_service_raw(
+                invocation.endpoint.capability.clone(),
+                InvokeServiceKind::Command,
+                invocation.endpoint.interface_id.clone(),
+                invocation.endpoint.operation.clone(),
+                invocation.payload.clone(),
+            )
+            .await?;
+    }
     if result.release_capture {
         let _ = view_state.plugin_focus.clear();
     }
@@ -11986,7 +12019,12 @@ async fn try_handle_attach_input_hook_key(
         return Ok(false);
     };
     let hooks = if let Some(capture) = view_state.mouse.input_capture.clone() {
-        if capture.keyboard_keys.iter().any(|item| item == &key_name) || key_name == "esc" {
+        if capture
+            .keyboard_keys
+            .iter()
+            .any(|item| item == "*" || item == &key_name)
+            || key_name == "esc"
+        {
             vec![capture.hook]
         } else {
             attach_input_hooks()

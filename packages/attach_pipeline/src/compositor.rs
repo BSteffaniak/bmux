@@ -560,6 +560,7 @@ impl RetainedInputQueue {
 pub struct RetainedPointerRouter {
     hovered: Option<RetainedSurfaceHit>,
     captured: Option<RetainedSurfaceHit>,
+    preserve_capture_across_revisions: bool,
 }
 
 impl RetainedPointerRouter {
@@ -575,9 +576,15 @@ impl RetainedPointerRouter {
 
     pub fn capture(&mut self, hit: RetainedSurfaceHit) {
         self.captured = Some(hit);
+        self.preserve_capture_across_revisions = false;
+    }
+
+    pub const fn preserve_capture_across_revisions(&mut self, preserve: bool) {
+        self.preserve_capture_across_revisions = preserve;
     }
 
     pub const fn release_capture(&mut self) -> Option<RetainedSurfaceHit> {
+        self.preserve_capture_across_revisions = false;
         self.captured.take()
     }
 
@@ -718,7 +725,15 @@ impl RetainedPointerRouter {
     ) -> Option<RetainedPointerEvent> {
         self.captured
             .as_ref()
-            .and_then(|captured| retarget_hit(compositor, captured, x, y))
+            .and_then(|captured| {
+                retarget_hit(
+                    compositor,
+                    captured,
+                    x,
+                    y,
+                    self.preserve_capture_across_revisions,
+                )
+            })
             .or_else(|| compositor.hit_test(x, y))
             .map(|hit| RetainedPointerEvent {
                 phase: RetainedPointerPhase::Drag,
@@ -732,7 +747,7 @@ impl RetainedPointerRouter {
     pub fn reconcile(&mut self, compositor: &RetainedCompositor) -> Vec<RetainedPointerEvent> {
         let mut events = Vec::new();
         if let Some(hovered) = self.hovered.as_ref()
-            && !hit_target_is_present(compositor, hovered)
+            && !hit_target_is_present(compositor, hovered, false)
             && let Some(hit) = self.hovered.take()
         {
             events.push(RetainedPointerEvent {
@@ -742,25 +757,27 @@ impl RetainedPointerRouter {
                 wheel_delta: 0,
             });
         }
-        if self
-            .captured
-            .as_ref()
-            .is_some_and(|captured| !hit_target_is_present(compositor, captured))
-        {
+        if self.captured.as_ref().is_some_and(|captured| {
+            !hit_target_is_present(compositor, captured, self.preserve_capture_across_revisions)
+        }) {
             self.captured = None;
         }
         events
     }
 }
 
-fn hit_target_is_present(compositor: &RetainedCompositor, hit: &RetainedSurfaceHit) -> bool {
+fn hit_target_is_present(
+    compositor: &RetainedCompositor,
+    hit: &RetainedSurfaceHit,
+    preserve_across_revisions: bool,
+) -> bool {
     compositor.surfaces().values().any(|surface| {
         surface.id == hit.surface_id
-            && surface.revision == hit.surface_revision
+            && (preserve_across_revisions || surface.revision == hit.surface_revision)
             && surface
                 .interactive_regions
-                .get(hit.region_index)
-                .is_some_and(|region| region.id == hit.region_id)
+                .iter()
+                .any(|region| region.id == hit.region_id)
     })
 }
 
@@ -769,16 +786,21 @@ fn retarget_hit(
     captured: &RetainedSurfaceHit,
     x: u16,
     y: u16,
+    preserve_across_revisions: bool,
 ) -> Option<RetainedSurfaceHit> {
     let surface = compositor.surfaces().get(&captured.surface_id)?;
-    let region = surface.interactive_regions.get(captured.region_index)?;
-    if region.id != captured.region_id || surface.revision != captured.surface_revision {
+    if !preserve_across_revisions && surface.revision != captured.surface_revision {
         return None;
     }
+    let (region_index, _) = surface
+        .interactive_regions
+        .iter()
+        .enumerate()
+        .find(|(_, region)| region.id == captured.region_id)?;
     Some(RetainedSurfaceHit {
         surface_id: captured.surface_id,
-        surface_revision: captured.surface_revision,
-        region_index: captured.region_index,
+        surface_revision: surface.revision,
+        region_index,
         region_id: captured.region_id.clone(),
         absolute_x: x,
         absolute_y: y,
@@ -1939,6 +1961,23 @@ mod tests {
                 .route_drag(&compositor, 40, 20, RetainedPointerButton::Primary)
                 .is_none()
         );
+
+        router.capture(compositor.hit_test(4, 3).unwrap());
+        router.preserve_capture_across_revisions(true);
+        compositor.replace_surfaces(
+            [
+                RetainedSurface::builder(Uuid::from_u128(614), DamageRect::new(2, 2, 8, 4))
+                    .revision(2)
+                    .interactive_region(DamageRect::new(2, 2, 8, 4))
+                    .build(),
+            ],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let dragged = router
+            .route_drag(&compositor, 30, 10, RetainedPointerButton::Primary)
+            .expect("stable region capture survives surface revision");
+        assert_eq!(dragged.hit.surface_revision, Some(2));
 
         router.capture(compositor.hit_test(4, 3).unwrap());
         compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());

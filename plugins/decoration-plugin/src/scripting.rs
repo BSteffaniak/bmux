@@ -846,8 +846,10 @@ mod lua_backend {
             capture_pointer,
             capture_keyboard,
             release_capture,
+            preserve_capture_across_revisions: false,
             dirty,
             status_message: None,
+            service_invocation: None,
         }))
     }
 
