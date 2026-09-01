@@ -6,7 +6,6 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
@@ -131,19 +130,13 @@ impl Default for BadgeStyles {
     }
 }
 
-/// Compact badge / pill label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Badge<'a> {
+/// Canonical component-lifecycle badge leaf.
+pub struct BadgeComponent<'a> {
+    id: LayoutId,
     label: &'a str,
     severity: BadgeSeverity,
     policy: BadgePolicy,
     styles: BadgeStyles,
-}
-
-/// Canonical component-lifecycle badge leaf.
-pub struct BadgeComponent<'a> {
-    id: LayoutId,
-    badge: Badge<'a>,
 }
 
 impl<'a> BadgeComponent<'a> {
@@ -152,89 +145,9 @@ impl<'a> BadgeComponent<'a> {
     pub fn new(id: impl Into<LayoutId>, label: &'a str) -> Self {
         Self {
             id: id.into(),
-            badge: Badge::new(label),
-        }
-    }
-
-    /// Set severity.
-    #[must_use]
-    pub const fn severity(mut self, severity: BadgeSeverity) -> Self {
-        self.badge.severity = severity;
-        self
-    }
-
-    /// Set chrome policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: BadgePolicy) -> Self {
-        self.badge.policy = policy;
-        self
-    }
-
-    /// Set visual styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: BadgeStyles) -> Self {
-        self.badge.styles = styles;
-        self
-    }
-}
-
-impl Component for BadgeComponent<'_> {
-    fn revision(&self) -> ComponentRevision {
-        let mut layout = std::collections::hash_map::DefaultHasher::new();
-        self.id.as_str().hash(&mut layout);
-        self.badge.label.hash(&mut layout);
-        self.badge.policy.hash(&mut layout);
-
-        let mut paint = std::collections::hash_map::DefaultHasher::new();
-        self.badge.severity.hash(&mut paint);
-        format!("{:?}", self.badge.styles).hash(&mut paint);
-        ComponentRevision::new(layout.finish(), paint.finish())
-    }
-
-    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        cx.record_measurement();
-        let width = u16::try_from(bmux_tui::text_width::display_width(&self.badge.text()))
-            .unwrap_or(u16::MAX);
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, 1)),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("status"))
-    }
-
-    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        if layout.size.width == 0 || layout.size.height == 0 {
-            return;
-        }
-        let mut line = Line::from_spans([Span::styled(self.badge.text(), self.badge.style())]);
-        if self.badge.policy.truncate {
-            line = line.truncate(usize::from(layout.size.width));
-        }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
-        cx.write_line(area, &line);
-        cx.push_semantic(SemanticRegion::new(
-            self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
-            "status",
-        ));
-        cx.push_damage(area);
-    }
-}
-
-impl<'a> Badge<'a> {
-    /// Create a badge.
-    #[must_use]
-    pub const fn new(label: &'a str) -> Self {
-        Self {
             label,
             severity: BadgeSeverity::Default,
-            policy: BadgePolicy {
-                left: "[",
-                right: "]",
-                padding: 1,
-                uppercase: false,
-                truncate: true,
-            },
+            policy: BadgePolicy::bracketed(),
             styles: BadgeStyles {
                 default: Style::new(),
                 info: Style::new(),
@@ -253,23 +166,23 @@ impl<'a> Badge<'a> {
         self
     }
 
-    /// Set policy.
+    /// Set chrome policy.
     #[must_use]
     pub const fn policy(mut self, policy: BadgePolicy) -> Self {
         self.policy = policy;
         self
     }
 
-    /// Set styles.
+    /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: BadgeStyles) -> Self {
         self.styles = styles;
         self
     }
+}
 
-    /// Rendered badge text before area truncation.
-    #[must_use]
-    pub fn text(&self) -> String {
+impl BadgeComponent<'_> {
+    fn text(&self) -> String {
         let label = if self.policy.uppercase {
             self.label.to_uppercase()
         } else {
@@ -285,18 +198,6 @@ impl<'a> Badge<'a> {
         )
     }
 
-    /// Render the badge.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
-        let mut line = Line::from_spans([Span::styled(self.text(), self.style())]);
-        if self.policy.truncate {
-            line = line.truncate(usize::from(area.width));
-        }
-        frame.write_line(area, &line);
-    }
-
     const fn style(&self) -> Style {
         match self.severity {
             BadgeSeverity::Default => self.styles.default,
@@ -306,6 +207,49 @@ impl<'a> Badge<'a> {
             BadgeSeverity::Error => self.styles.error,
             BadgeSeverity::Muted => self.styles.muted,
         }
+    }
+}
+
+impl Component for BadgeComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.label.hash(&mut layout);
+        self.policy.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.severity.hash(&mut paint);
+        format!("{:?}", self.styles).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width =
+            u16::try_from(bmux_tui::text_width::display_width(&self.text())).unwrap_or(u16::MAX);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("status"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let mut line = Line::from_spans([Span::styled(self.text(), self.style())]);
+        if self.policy.truncate {
+            line = line.truncate(usize::from(layout.size.width));
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        cx.write_line(area, &line);
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "status",
+        ));
+        cx.push_damage(area);
     }
 }
 
@@ -339,25 +283,22 @@ mod tests {
     use bmux_tui::geometry::{Rect, Size};
     use bmux_tui::paint::PaintCx;
 
-    use super::{Badge, BadgeComponent, BadgePolicy, BadgeSeverity, BadgeStyles};
+    use super::{BadgeComponent, BadgePolicy, BadgeSeverity, BadgeStyles};
 
     #[test]
-    fn renders_bracketed_badge() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Badge::new("ok").render(Rect::new(0, 0, 10, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ ok ]    "));
-    }
-
-    #[test]
-    fn renders_uppercase_pill() {
+    fn computes_configured_text() {
+        assert_eq!(BadgeComponent::new("info", "info").text(), "[ info ]");
         assert_eq!(
-            Badge::new("info")
+            BadgeComponent::new("info", "info")
                 .policy(BadgePolicy::pill().uppercase(true))
                 .text(),
             "‹ INFO ›"
+        );
+        assert_eq!(
+            BadgeComponent::new("raw", "raw")
+                .policy(BadgePolicy::bare())
+                .text(),
+            "raw"
         );
     }
 
@@ -371,23 +312,23 @@ mod tests {
             BadgeSeverity::Error,
             BadgeSeverity::Muted,
         ] {
-            assert_eq!(Badge::new("x").severity(severity).text(), "[ x ]");
+            assert_eq!(
+                BadgeComponent::new("badge", "x").severity(severity).text(),
+                "[ x ]"
+            );
         }
     }
 
     #[test]
-    fn truncates_to_tiny_width() {
+    fn canonical_paint_truncates_to_tiny_width() {
+        let badge = BadgeComponent::new("tiny", "abcdef");
+        let layout = badge.layout(Constraints::tight(Size::new(3, 1)), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        Badge::new("abcdef").render(Rect::new(0, 0, 3, 1), &mut frame);
+        badge.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ …"));
-    }
-
-    #[test]
-    fn bare_policy_has_no_chrome() {
-        assert_eq!(Badge::new("raw").policy(BadgePolicy::bare()).text(), "raw");
     }
 
     #[test]

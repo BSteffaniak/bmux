@@ -1,11 +1,13 @@
 #![cfg(feature = "all")]
 
 use bmux_tui::buffer::Buffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, TextWrap};
 use bmux_tui::style::{Color, Style};
-use bmux_tui_components::badge::Badge;
+use bmux_tui_components::badge::BadgeComponent;
 use bmux_tui_components::breadcrumbs::{BreadcrumbItem, Breadcrumbs, BreadcrumbsState};
 use bmux_tui_components::chart::{
     Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
@@ -34,7 +36,14 @@ fn golden_styled_truncation_components() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
     let mut frame = Frame::new(&mut buffer);
 
-    Badge::new("very-long").render(Rect::new(0, 0, 6, 1), &mut frame);
+    let badge = BadgeComponent::new("golden.badge", "very-long");
+    let badge_layout = badge.layout(
+        Constraints::tight(Rect::new(0, 0, 6, 1).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut frame).with_child(0, 0, LocalRect::new(0, 0, 6, 1), |cx| {
+        badge.paint(&badge_layout, cx);
+    });
 
     let breadcrumbs_items = [
         BreadcrumbItem::new("home", "Home"),
