@@ -2,11 +2,19 @@
 //!
 //! This pane is a neutral UI surface. It has no BMUX product semantics.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_tui::chrome::{Border, Panel};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId, LayoutNode,
+};
+use bmux_tui::composition::Surface;
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui::widget::Widget;
@@ -613,6 +621,180 @@ impl Pane<'_> {
     }
 }
 
+/// Canonical child-owning pane component.
+///
+/// Pane interaction state remains caller-owned. Layout, chrome, child placement,
+/// hit geometry, and event routing all consume the same resolved tree.
+pub struct PaneComponent<'a, 'state> {
+    id: LayoutId,
+    pane: Pane<'a>,
+    state: &'state Cell<PaneState>,
+    child: Element<'a>,
+}
+
+impl<'a, 'state> PaneComponent<'a, 'state> {
+    /// Create a pane component with stable identity, caller-owned state, and one child.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        pane: Pane<'a>,
+        state: &'state Cell<PaneState>,
+        child: impl Component + 'a,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            pane,
+            state,
+            child: Element::new(child),
+        }
+    }
+
+    fn surface(&self) -> Surface<'_> {
+        let state = self.state.get();
+        let border_style = if state.interaction.focused {
+            self.pane.styles.focused_border
+        } else {
+            self.pane.styles.border
+        };
+        let mut surface = Surface::new(ComponentRef(&self.child))
+            .id(format!("{}.surface", self.id.as_str()))
+            .padding(self.pane.padding);
+        if self.pane.border {
+            surface = surface.border(Border::single().style(border_style));
+        }
+        if let Some(background) = self.pane.styles.background {
+            surface = surface.background(background);
+        }
+        surface
+    }
+}
+
+impl Component for PaneComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let child = self.child.revision();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        format!("{:?}", self.pane.title).hash(&mut layout);
+        format!("{:?}", self.pane.padding).hash(&mut layout);
+        self.pane.border.hash(&mut layout);
+        let state = self.state.get();
+        state.area.width.hash(&mut layout);
+        state.area.height.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.pane.styles).hash(&mut paint);
+        format!("{:?}", self.pane.policy).hash(&mut paint);
+        format!("{:?}", state.interaction).hash(&mut paint);
+        ComponentRevision::new(layout.finish() ^ child.layout, paint.finish() ^ child.paint)
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.surface().layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.surface().paint(layout, cx);
+        let state = self.state.get();
+        let size = Rect::new(
+            0,
+            0,
+            layout.size.width,
+            u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+        );
+        if self.pane.policy.mouse.enabled && !size.is_empty() {
+            cx.push_hit(
+                SceneRegion::new(self.id.as_str(), size)
+                    .role(HitRole::Background)
+                    .hoverable(true)
+                    .focusable(false)
+                    .enabled(!state.interaction.disabled),
+            );
+            if self.pane.policy.mouse.title_bar_drag {
+                cx.push_hit(
+                    SceneRegion::new(format!("{}.title", self.id.as_str()), title_bar_area(size))
+                        .role(HitRole::DragHandle)
+                        .hoverable(true)
+                        .focusable(false)
+                        .enabled(!state.interaction.disabled),
+                );
+            }
+            for (suffix, area) in self.pane.resize_regions(size) {
+                cx.push_hit(
+                    SceneRegion::new(format!("{}.resize.{suffix}", self.id.as_str()), area)
+                        .role(HitRole::ResizeHandle)
+                        .hoverable(true)
+                        .focusable(false)
+                        .enabled(!state.interaction.disabled),
+                );
+            }
+        }
+        if let Some(title) = &self.pane.title {
+            cx.write_line(
+                LocalRect::new(1, 0, layout.size.width.saturating_sub(2), 1),
+                title,
+            );
+        }
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let mut state = self.state.get();
+        let surface_id = LayoutId::new(format!("{}.surface", self.id.as_str()));
+        state.area = cx.find_visible_rect(&surface_id).unwrap_or_else(|| {
+            Rect::new(
+                0,
+                0,
+                layout.size.width,
+                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+            )
+        });
+        let outcome = self.pane.handle_event(&mut state, event);
+        self.state.set(state);
+        if outcome != PaneOutcome::Ignored {
+            return EventOutcome::Handled;
+        }
+        let Some(child) = layout.children.first() else {
+            return EventOutcome::Ignored;
+        };
+        let clip = Rect::new(
+            state.area.x.saturating_add(child.x),
+            state
+                .area
+                .y
+                .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
+            child.node.size.width,
+            u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+        );
+        cx.with_transform(
+            child.x,
+            child.y,
+            i32::from(state.area.x.saturating_add(child.x)),
+            i64::from(state.area.y).saturating_add(i64::try_from(child.y).unwrap_or(i64::MAX)),
+            clip,
+            |cx| self.child.event(event, &child.node, cx),
+        )
+    }
+}
+
+struct ComponentRef<'a>(&'a Element<'a>);
+
+impl Component for ComponentRef<'_> {
+    fn revision(&self) -> ComponentRevision {
+        self.0.revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.0.layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.0.paint(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.0.event(event, layout, cx)
+    }
+}
+
 impl Default for Pane<'_> {
     fn default() -> Self {
         Self::new()
@@ -766,15 +948,21 @@ impl From<crate::theme::ComponentTheme> for PaneStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::composition::TextContent;
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::selection::SelectionCapture;
 
     use super::{
-        Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
+        Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
+        ResizeHandles,
     };
     use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
 
@@ -1051,6 +1239,79 @@ mod tests {
             PaneOutcome::FocusRequested
         );
         assert!(state.is_dragging());
+    }
+
+    #[test]
+    fn component_owns_layout_chrome_child_and_interaction_geometry() {
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 12, 5)));
+        let component = PaneComponent::new(
+            "pane",
+            Pane::new()
+                .title("Pane")
+                .padding(Insets::all(1))
+                .policy(PanePolicy {
+                    mouse: PaneMousePolicy {
+                        enabled: true,
+                        click_to_focus: true,
+                        title_bar_drag: true,
+                        scroll_wheel: false,
+                        resize_handles: ResizeHandles::ALL,
+                    },
+                    bounds: PaneBoundsPolicy::default(),
+                }),
+            &state,
+            TextContent::new("body").id("pane.body"),
+        );
+        let layout = component.layout(Constraints::new(12, 12, 5, Some(5)), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 12);
+        assert_eq!(layout.size.height, 5);
+        assert!(layout.find(&"pane.surface".into()).is_some());
+        assert!(layout.find(&"pane.body".into()).is_some());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 5));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).unwrap(), "┌Pane      ┐");
+        assert!(frame.buffer().row_symbols(2).unwrap().contains("body"));
+        assert!(frame.hits().regions().iter().any(|region| {
+            region.id.as_str() == "pane" && region.area == Rect::new(0, 0, 12, 5)
+        }));
+
+        assert_eq!(
+            component.event(
+                &mouse(MouseEventKind::Down(MouseButton::Left), 1, 0),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Handled
+        );
+        assert!(state.get().interaction.focused);
+        assert!(state.get().is_dragging());
+    }
+
+    #[test]
+    fn component_clips_nested_paint_and_hit_geometry() {
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 8, 4)));
+        let component = PaneComponent::new(
+            "pane",
+            Pane::new().policy(PanePolicy {
+                mouse: PaneMousePolicy {
+                    enabled: true,
+                    click_to_focus: true,
+                    title_bar_drag: false,
+                    scroll_wheel: false,
+                    resize_handles: ResizeHandles::NONE,
+                },
+                bounds: PaneBoundsPolicy::default(),
+            }),
+            &state,
+            TextContent::new("inside").id("pane.body"),
+        );
+        let layout = component.layout(Constraints::new(8, 8, 4, Some(4)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 4));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 5, 4));
     }
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
