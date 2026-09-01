@@ -6,13 +6,12 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text_width::display_width;
 
 /// Generic step status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -153,7 +152,9 @@ impl Default for StepperStyles {
 /// Canonical component-lifecycle stepper.
 pub struct StepperComponent<'a> {
     id: LayoutId,
-    stepper: Stepper<'a>,
+    steps: &'a [StepItem<'a>],
+    policy: StepperPolicy,
+    styles: StepperStyles,
 }
 
 impl<'a> StepperComponent<'a> {
@@ -162,21 +163,31 @@ impl<'a> StepperComponent<'a> {
     pub fn new(id: impl Into<LayoutId>, steps: &'a [StepItem<'a>]) -> Self {
         Self {
             id: id.into(),
-            stepper: Stepper::new(steps),
+            steps,
+            policy: StepperPolicy::horizontal(),
+            styles: StepperStyles {
+                pending: Style::new(),
+                current: Style::new(),
+                complete: Style::new(),
+                warning: Style::new(),
+                error: Style::new(),
+                disabled: Style::new(),
+                connector: Style::new(),
+            },
         }
     }
 
     /// Set layout and rendering policy.
     #[must_use]
     pub const fn policy(mut self, policy: StepperPolicy) -> Self {
-        self.stepper.policy = policy;
+        self.policy = policy;
         self
     }
 
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: StepperStyles) -> Self {
-        self.stepper.styles = styles;
+        self.styles = styles;
         self
     }
 }
@@ -185,45 +196,43 @@ impl Component for StepperComponent<'_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        self.stepper.policy.orientation.hash(&mut layout);
-        self.stepper.policy.connector.hash(&mut layout);
-        self.stepper.policy.truncate.hash(&mut layout);
-        self.stepper.policy.markers.hash(&mut layout);
-        for step in self.stepper.steps {
+        self.policy.orientation.hash(&mut layout);
+        self.policy.connector.hash(&mut layout);
+        self.policy.truncate.hash(&mut layout);
+        self.policy.markers.hash(&mut layout);
+        for step in self.steps {
             step.id.hash(&mut layout);
             step.label.hash(&mut layout);
         }
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
-        for step in self.stepper.steps {
+        for step in self.steps {
             step.status.hash(&mut paint);
         }
-        self.stepper.styles.pending.hash(&mut paint);
-        self.stepper.styles.current.hash(&mut paint);
-        self.stepper.styles.complete.hash(&mut paint);
-        self.stepper.styles.warning.hash(&mut paint);
-        self.stepper.styles.error.hash(&mut paint);
-        self.stepper.styles.disabled.hash(&mut paint);
-        self.stepper.styles.connector.hash(&mut paint);
+        self.styles.pending.hash(&mut paint);
+        self.styles.current.hash(&mut paint);
+        self.styles.complete.hash(&mut paint);
+        self.styles.warning.hash(&mut paint);
+        self.styles.error.hash(&mut paint);
+        self.styles.disabled.hash(&mut paint);
+        self.styles.connector.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let intrinsic_width = match self.stepper.policy.orientation {
+        let intrinsic_width = match self.policy.orientation {
             StepperOrientation::Horizontal => self
-                .stepper
                 .steps
                 .iter()
                 .enumerate()
                 .map(|(index, step)| {
-                    display_width(&self.stepper.step_text(step))
+                    display_width(&self.step_text(step))
                         + usize::from(index > 0)
-                            * display_width(&format!(" {} ", self.stepper.policy.connector))
+                            * display_width(&format!(" {} ", self.policy.connector))
                 })
                 .sum(),
             StepperOrientation::Vertical => self
-                .stepper
                 .steps
                 .iter()
                 .enumerate()
@@ -231,9 +240,9 @@ impl Component for StepperComponent<'_> {
                     let prefix = if index == 0 {
                         2
                     } else {
-                        display_width(self.stepper.policy.connector).saturating_add(1)
+                        display_width(self.policy.connector).saturating_add(1)
                     };
-                    prefix.saturating_add(display_width(&self.stepper.step_text(step)))
+                    prefix.saturating_add(display_width(&self.step_text(step)))
                 })
                 .max()
                 .unwrap_or_default(),
@@ -245,9 +254,9 @@ impl Component for StepperComponent<'_> {
                 .unwrap_or(u16::MAX)
                 .clamp(constraints.min_width(), constraints.max_width())
         };
-        let intrinsic_height = match self.stepper.policy.orientation {
-            StepperOrientation::Horizontal => usize::from(!self.stepper.steps.is_empty()),
-            StepperOrientation::Vertical => self.stepper.steps.len(),
+        let intrinsic_height = match self.policy.orientation {
+            StepperOrientation::Horizontal => usize::from(!self.steps.is_empty()),
+            StepperOrientation::Vertical => self.steps.len(),
         };
         LayoutNode::leaf(
             self.id.clone(),
@@ -257,48 +266,42 @@ impl Component for StepperComponent<'_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        if layout.size.width == 0 || layout.size.height == 0 || self.stepper.steps.is_empty() {
+        if layout.size.width == 0 || layout.size.height == 0 || self.steps.is_empty() {
             return;
         }
-        match self.stepper.policy.orientation {
+        match self.policy.orientation {
             StepperOrientation::Horizontal => {
                 let mut spans = Vec::new();
-                for (index, step) in self.stepper.steps.iter().enumerate() {
+                for (index, step) in self.steps.iter().enumerate() {
                     if index > 0 {
                         spans.push(Span::styled(
-                            format!(" {} ", self.stepper.policy.connector),
-                            self.stepper.styles.connector,
+                            format!(" {} ", self.policy.connector),
+                            self.styles.connector,
                         ));
                     }
                     spans.push(Span::styled(
-                        self.stepper.step_text(step),
-                        self.stepper.style_for(step.status),
+                        self.step_text(step),
+                        self.style_for(step.status),
                     ));
                 }
                 let mut line = Line::from_spans(spans);
-                if self.stepper.policy.truncate && line.width() > usize::from(layout.size.width) {
+                if self.policy.truncate && line.width() > usize::from(layout.size.width) {
                     line = line.truncate(usize::from(layout.size.width));
                 }
                 cx.write_line(LocalRect::new(0, 0, layout.size.width, 1), &line);
             }
             StepperOrientation::Vertical => {
-                for (index, step) in self
-                    .stepper
-                    .steps
-                    .iter()
-                    .take(layout.size.height)
-                    .enumerate()
-                {
+                for (index, step) in self.steps.iter().take(layout.size.height).enumerate() {
                     let prefix = if index > 0 {
-                        format!("{} ", self.stepper.policy.connector)
+                        format!("{} ", self.policy.connector)
                     } else {
                         "  ".to_owned()
                     };
                     let mut line = Line::from_spans([Span::styled(
-                        format!("{prefix}{}", self.stepper.step_text(step)),
-                        self.stepper.style_for(step.status),
+                        format!("{prefix}{}", self.step_text(step)),
+                        self.style_for(step.status),
                     )]);
-                    if self.stepper.policy.truncate {
+                    if self.policy.truncate {
                         line = line.truncate(usize::from(layout.size.width));
                     }
                     cx.write_line(
@@ -324,111 +327,7 @@ impl Component for StepperComponent<'_> {
     }
 }
 
-/// Generic stepper component.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stepper<'a> {
-    steps: &'a [StepItem<'a>],
-    policy: StepperPolicy,
-    styles: StepperStyles,
-}
-
-impl<'a> Stepper<'a> {
-    /// Create a stepper over caller-owned steps.
-    #[must_use]
-    pub const fn new(steps: &'a [StepItem<'a>]) -> Self {
-        Self {
-            steps,
-            policy: StepperPolicy {
-                orientation: StepperOrientation::Horizontal,
-                connector: "──",
-                truncate: true,
-                markers: true,
-            },
-            styles: StepperStyles {
-                pending: Style::new(),
-                current: Style::new(),
-                complete: Style::new(),
-                warning: Style::new(),
-                error: Style::new(),
-                disabled: Style::new(),
-                connector: Style::new(),
-            },
-        }
-    }
-
-    /// Set policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: StepperPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    /// Set styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: StepperStyles) -> Self {
-        self.styles = styles;
-        self
-    }
-
-    /// Render stepper.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() || self.steps.is_empty() {
-            return;
-        }
-        match self.policy.orientation {
-            StepperOrientation::Horizontal => self.render_horizontal(area, frame),
-            StepperOrientation::Vertical => self.render_vertical(area, frame),
-        }
-    }
-
-    fn render_horizontal(&self, area: Rect, frame: &mut Frame<'_>) {
-        let mut spans = Vec::new();
-        for (index, step) in self.steps.iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::styled(
-                    format!(" {} ", self.policy.connector),
-                    self.styles.connector,
-                ));
-            }
-            spans.push(Span::styled(
-                self.step_text(step),
-                self.style_for(step.status),
-            ));
-        }
-        let mut line = Line::from_spans(spans);
-        if self.policy.truncate {
-            let text = line.plain_text();
-            if display_width(&text) > usize::from(area.width) {
-                line = Line::from(truncate_to_display_width(&text, usize::from(area.width)));
-            }
-        }
-        frame.write_line(area, &line);
-    }
-
-    fn render_vertical(&self, area: Rect, frame: &mut Frame<'_>) {
-        for (index, step) in self.steps.iter().take(usize::from(area.height)).enumerate() {
-            let Ok(y_offset) = u16::try_from(index) else {
-                return;
-            };
-            let y = area.y.saturating_add(y_offset);
-            let prefix = if index > 0 {
-                format!("{} ", self.policy.connector)
-            } else {
-                "  ".to_owned()
-            };
-            let text = format!("{prefix}{}", self.step_text(step));
-            let text = if self.policy.truncate {
-                truncate_to_display_width(&text, usize::from(area.width))
-            } else {
-                text
-            };
-            frame.write_line(
-                Rect::new(area.x, y, area.width, 1),
-                &Line::from_spans([Span::styled(text, self.style_for(step.status))]),
-            );
-        }
-    }
-
+impl StepperComponent<'_> {
     fn step_text(&self, step: &StepItem<'_>) -> String {
         if self.policy.markers {
             format!("{} {}", marker_for(step.status), step.label)
@@ -493,80 +392,8 @@ mod tests {
     use bmux_tui::style::{Color, Style};
 
     use super::{
-        StepItem, StepStatus, Stepper, StepperComponent, StepperOrientation, StepperPolicy,
-        StepperStyles,
+        StepItem, StepStatus, StepperComponent, StepperOrientation, StepperPolicy, StepperStyles,
     };
-
-    #[test]
-    fn renders_horizontal_stepper() {
-        let steps = [
-            StepItem::new("one", "One").status(StepStatus::Complete),
-            StepItem::new("two", "Two").status(StepStatus::Current),
-        ];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Stepper::new(&steps).render(Rect::new(0, 0, 20, 1), &mut frame);
-
-        assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
-            Some("✓ One ── ● Two      ")
-        );
-    }
-
-    #[test]
-    fn renders_vertical_stepper() {
-        let steps = [
-            StepItem::new("one", "One").status(StepStatus::Complete),
-            StepItem::new("two", "Two").status(StepStatus::Current),
-        ];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
-        let mut frame = Frame::new(&mut buffer);
-
-        Stepper::new(&steps)
-            .policy(StepperPolicy::vertical())
-            .render(Rect::new(0, 0, 10, 2), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  ✓ One   "));
-        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("│ ● Two   "));
-    }
-
-    #[test]
-    fn supports_all_status_markers() {
-        let statuses = [
-            (StepStatus::Pending, "○"),
-            (StepStatus::Current, "●"),
-            (StepStatus::Complete, "✓"),
-            (StepStatus::Warning, "!"),
-            (StepStatus::Error, "×"),
-            (StepStatus::Disabled, "-"),
-        ];
-        for (status, marker) in statuses {
-            let steps = [StepItem::new("id", "Label").status(status)];
-            let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-            let mut frame = Frame::new(&mut buffer);
-
-            Stepper::new(&steps).render(Rect::new(0, 0, 8, 1), &mut frame);
-
-            assert!(
-                frame
-                    .buffer()
-                    .row_symbols(0)
-                    .is_some_and(|row| row.starts_with(marker))
-            );
-        }
-    }
-
-    #[test]
-    fn truncates_tiny_area() {
-        let steps = [StepItem::new("one", "Long label").status(StepStatus::Current)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Stepper::new(&steps).render(Rect::new(0, 0, 4, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("● L…"));
-    }
 
     #[test]
     fn component_measures_and_paints_horizontal_progress() {
@@ -634,13 +461,11 @@ mod tests {
             orientation: StepperOrientation::Horizontal,
             ..StepperPolicy::horizontal()
         };
+        let component = StepperComponent::new("setup", &steps).policy(policy);
+        let layout = component.layout(Constraints::for_width(6), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
         let mut frame = Frame::new(&mut buffer);
-
-        Stepper::new(&steps)
-            .policy(policy)
-            .render(Rect::new(0, 0, 6, 1), &mut frame);
-
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("One   "));
     }
 }

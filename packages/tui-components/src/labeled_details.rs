@@ -6,7 +6,6 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
@@ -60,7 +59,9 @@ impl Default for LabeledDetailsStyles {
 /// Canonical component-lifecycle labeled detail list.
 pub struct LabeledDetailsComponent<'a> {
     id: LayoutId,
-    details: LabeledDetails<'a>,
+    items: &'a [DetailItem],
+    styles: LabeledDetailsStyles,
+    item_spacing: bool,
 }
 
 impl<'a> LabeledDetailsComponent<'a> {
@@ -69,21 +70,23 @@ impl<'a> LabeledDetailsComponent<'a> {
     pub fn new(id: impl Into<LayoutId>, items: &'a [DetailItem]) -> Self {
         Self {
             id: id.into(),
-            details: LabeledDetails::new(items),
+            items,
+            styles: LabeledDetailsStyles::default(),
+            item_spacing: true,
         }
     }
 
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: LabeledDetailsStyles) -> Self {
-        self.details.styles = styles;
+        self.styles = styles;
         self
     }
 
     /// Set whether to insert a blank row between detail items.
     #[must_use]
     pub const fn item_spacing(mut self, item_spacing: bool) -> Self {
-        self.details.item_spacing = item_spacing;
+        self.item_spacing = item_spacing;
         self
     }
 }
@@ -92,16 +95,16 @@ impl Component for LabeledDetailsComponent<'_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        for item in self.details.items {
+        for item in self.items {
             item.label.hash(&mut layout);
             item.value.hash(&mut layout);
         }
-        self.details.item_spacing.hash(&mut layout);
+        self.item_spacing.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
-        self.details.styles.label.hash(&mut paint);
-        self.details.styles.value.hash(&mut paint);
-        self.details.styles.continuation.hash(&mut paint);
+        self.styles.label.hash(&mut paint);
+        self.styles.value.hash(&mut paint);
+        self.styles.continuation.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -111,7 +114,6 @@ impl Component for LabeledDetailsComponent<'_> {
             constraints.max_width()
         } else {
             let intrinsic = self
-                .details
                 .items
                 .iter()
                 .flat_map(|item| {
@@ -127,7 +129,7 @@ impl Component for LabeledDetailsComponent<'_> {
                 .unwrap_or(u16::MAX)
                 .clamp(constraints.min_width(), constraints.max_width())
         };
-        let height = self.details.lines(width).len();
+        let height = self.lines(width).len();
         LayoutNode::leaf(
             self.id.clone(),
             constraints.constrain(LogicalSize::new(width, height)),
@@ -140,7 +142,6 @@ impl Component for LabeledDetailsComponent<'_> {
             return;
         }
         for (row, line) in self
-            .details
             .lines(layout.size.width)
             .iter()
             .take(layout.size.height)
@@ -167,40 +168,8 @@ impl Component for LabeledDetailsComponent<'_> {
     }
 }
 
-/// Vertical list of labeled, wrapped details.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LabeledDetails<'a> {
-    items: &'a [DetailItem],
-    styles: LabeledDetailsStyles,
-    item_spacing: bool,
-}
-
-impl<'a> LabeledDetails<'a> {
-    /// Create a labeled details component.
-    #[must_use]
-    pub fn new(items: &'a [DetailItem]) -> Self {
-        Self {
-            items,
-            styles: LabeledDetailsStyles::default(),
-            item_spacing: true,
-        }
-    }
-
-    /// Set styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: LabeledDetailsStyles) -> Self {
-        self.styles = styles;
-        self
-    }
-
-    /// Set whether to insert a blank row between detail items.
-    #[must_use]
-    pub const fn item_spacing(mut self, item_spacing: bool) -> Self {
-        self.item_spacing = item_spacing;
-        self
-    }
-
-    /// Render this detail list to lines for a given width.
+impl LabeledDetailsComponent<'_> {
+    /// Build this detail list's rows for a given width.
     #[must_use]
     pub fn lines(&self, width: u16) -> Vec<Line> {
         let mut rows = Vec::new();
@@ -217,38 +186,6 @@ impl<'a> LabeledDetails<'a> {
             }
         }
         rows
-    }
-
-    /// Render this detail list directly.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        self.render_lines(area, frame, None);
-    }
-
-    /// Render this detail list directly with a fallback style for each row.
-    pub fn render_with_fallback_style(&self, area: Rect, frame: &mut Frame<'_>, style: Style) {
-        self.render_lines(area, frame, Some(style));
-    }
-
-    fn render_lines(&self, area: Rect, frame: &mut Frame<'_>, fallback: Option<Style>) {
-        if area.is_empty() {
-            return;
-        }
-        for (index, line) in self
-            .lines(area.width)
-            .iter()
-            .take(usize::from(area.height))
-            .enumerate()
-        {
-            let Ok(offset) = u16::try_from(index) else {
-                return;
-            };
-            let line_area = Rect::new(area.x, area.y.saturating_add(offset), area.width, 1);
-            if let Some(fallback) = fallback {
-                frame.write_line_with_fallback_style(line_area, line, fallback);
-            } else {
-                frame.write_line(line_area, line);
-            }
-        }
     }
 }
 
@@ -293,12 +230,12 @@ mod tests {
     use bmux_tui::paint::PaintCx;
     use bmux_tui::style::{Color, Style};
 
-    use super::{DetailItem, LabeledDetails, LabeledDetailsComponent, LabeledDetailsStyles};
+    use super::{DetailItem, LabeledDetailsComponent, LabeledDetailsStyles};
 
     #[test]
     fn wraps_detail_values() {
         let items = [DetailItem::new("command", "abcdef")];
-        let lines = LabeledDetails::new(&items).lines(5);
+        let lines = LabeledDetailsComponent::new("details", &items).lines(5);
 
         assert_eq!(lines[0].plain_text(), "command");
         assert_eq!(lines[1].plain_text(), "  abc");
