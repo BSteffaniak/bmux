@@ -20,7 +20,7 @@ use bmux_tui_components::scroll_area::{
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListPolicy, SelectableListState,
 };
-use bmux_tui_components::status_bar::{StatusBar, StatusSegment, StatusSeverity};
+use bmux_tui_components::status_bar::{StatusBarComponent, StatusSegment, StatusSeverity};
 use bmux_tui_components::tab_bar::{TabBarComponent, TabBarPolicy, TabBarState};
 use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState};
@@ -74,9 +74,14 @@ fn golden_styled_truncation_components() {
         StatusSegment::new("ready"),
         StatusSegment::new("warning").severity(StatusSeverity::Warning),
     ];
-    StatusBar::new()
-        .left(&status_segments)
-        .render(Rect::new(0, 3, 9, 1), &mut frame);
+    let status = StatusBarComponent::new("golden.status").left(&status_segments);
+    let status_layout = status.layout(
+        Constraints::tight(Rect::new(0, 3, 9, 1).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut frame).with_child(0, 3, LocalRect::new(0, 0, 9, 1), |cx| {
+        status.paint(&status_layout, cx);
+    });
 
     let tabs = [
         bmux_tui_components::tab_bar::TabItem::new("one", "One"),

@@ -6,7 +6,6 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
@@ -355,50 +354,6 @@ impl<'a> StatusBar<'a> {
         self
     }
 
-    /// Render status bar into one row.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
-        if self.policy.background {
-            frame.fill(area, " ", self.styles.background);
-        }
-        self.render_group(area, self.left, BarAlign::Left, frame);
-        self.render_group(area, self.center, BarAlign::Center, frame);
-        self.render_group(area, self.right, BarAlign::Right, frame);
-    }
-
-    fn render_group(
-        &self,
-        area: Rect,
-        segments: &[StatusSegment<'_>],
-        align: BarAlign,
-        frame: &mut Frame<'_>,
-    ) {
-        if segments.is_empty() {
-            return;
-        }
-        let text = segments_text(segments, self.policy.separator);
-        let full_width = display_width(&text);
-        let width = full_width.min(usize::from(area.width));
-        let x = match align {
-            BarAlign::Left => area.x,
-            BarAlign::Center => area
-                .x
-                .saturating_add(area.width.saturating_sub(u16_saturating(width)) / 2),
-            BarAlign::Right => area
-                .x
-                .saturating_add(area.width.saturating_sub(u16_saturating(width))),
-        };
-        let rect = Rect::new(x, area.y, u16_saturating(width), 1);
-        let line = self.line(segments);
-        if self.policy.truncate && full_width > usize::from(rect.width) {
-            frame.write_line(rect, &line.truncate(usize::from(rect.width)));
-        } else {
-            frame.write_line_with_fallback_style(rect, &line, self.styles.default);
-        }
-    }
-
     fn line(&self, segments: &[StatusSegment<'_>]) -> Line {
         let mut spans = Vec::new();
         for (index, segment) in segments.iter().copied().enumerate() {
@@ -578,15 +533,6 @@ impl<'a> MessageBar<'a> {
         self.styles = styles;
         self
     }
-
-    /// Render message into one row.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        let bar = StatusBar::new().policy(self.policy).styles(self.styles);
-        if self.policy.background {
-            frame.fill(area, " ", self.styles.background);
-        }
-        bar.render_group(area, &[self.message], self.align, frame);
-    }
 }
 
 fn segments_text(segments: &[StatusSegment<'_>], separator: &str) -> String {
@@ -634,8 +580,8 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{
-        BarAlign, MessageBar, MessageBarComponent, StatusBar, StatusBarComponent, StatusBarPolicy,
-        StatusSegment, StatusSeverity,
+        BarAlign, MessageBarComponent, StatusBarComponent, StatusBarPolicy, StatusSegment,
+        StatusSeverity,
     };
 
     #[test]
@@ -646,11 +592,12 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        StatusBar::new()
+        let bar = StatusBarComponent::new("status")
             .left(&left)
             .center(&center)
-            .right(&right)
-            .render(Rect::new(0, 0, 30, 1), &mut frame);
+            .right(&right);
+        let layout = bar.layout(Constraints::tight(Size::new(30, 1)), &mut LayoutCx::new());
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -664,10 +611,11 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        StatusBar::new()
+        let bar = StatusBarComponent::new("status")
             .left(&left)
-            .policy(StatusBarPolicy::compact().separator(" | "))
-            .render(Rect::new(0, 0, 12, 1), &mut frame);
+            .policy(StatusBarPolicy::compact().separator(" | "));
+        let layout = bar.layout(Constraints::tight(Size::new(12, 1)), &mut LayoutCx::new());
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -681,9 +629,9 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        StatusBar::new()
-            .left(&left)
-            .render(Rect::new(0, 0, 8, 1), &mut frame);
+        let bar = StatusBarComponent::new("status").left(&left);
+        let layout = bar.layout(Constraints::tight(Size::new(8, 1)), &mut LayoutCx::new());
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("very lo…"));
     }
@@ -693,12 +641,18 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
         let mut frame = Frame::new(&mut buffer);
 
-        MessageBar::new("ok")
-            .align(BarAlign::Center)
-            .render(Rect::new(0, 0, 12, 1), &mut frame);
-        MessageBar::new("ok")
-            .align(BarAlign::Right)
-            .render(Rect::new(0, 1, 12, 1), &mut frame);
+        let centered = MessageBarComponent::new("centered", "ok").align(BarAlign::Center);
+        let centered_layout =
+            centered.layout(Constraints::tight(Size::new(12, 1)), &mut LayoutCx::new());
+        centered.paint(&centered_layout, &mut PaintCx::new(&mut frame));
+        let right = MessageBarComponent::new("right", "ok").align(BarAlign::Right);
+        let right_layout = right.layout(Constraints::tight(Size::new(12, 1)), &mut LayoutCx::new());
+        PaintCx::new(&mut frame).with_child(
+            0,
+            1,
+            bmux_tui::paint::LocalRect::new(0, 0, 12, 1),
+            |cx| right.paint(&right_layout, cx),
+        );
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -716,10 +670,11 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        StatusBar::new()
+        let bar = StatusBarComponent::new("status")
             .left(&left)
-            .policy(StatusBarPolicy::compact().background(true))
-            .render(Rect::new(0, 0, 4, 1), &mut frame);
+            .policy(StatusBarPolicy::compact().background(true));
+        let layout = bar.layout(Constraints::tight(Size::new(4, 1)), &mut LayoutCx::new());
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("x   "));
     }
@@ -734,9 +689,9 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        StatusBar::new()
-            .left(&left)
-            .render(Rect::new(0, 0, 20, 1), &mut frame);
+        let bar = StatusBarComponent::new("status").left(&left);
+        let layout = bar.layout(Constraints::tight(Size::new(20, 1)), &mut LayoutCx::new());
+        bar.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
