@@ -9,9 +9,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
@@ -366,7 +365,7 @@ impl Component for TabBarComponent<'_, '_> {
                 break;
             };
             cx.push_hit(
-                SceneRegion::new(format!("{}:{}", self.id.as_str(), item.id), item_area)
+                SceneRegion::new(format!("{}.{}", self.id.as_str(), item.id), item_area)
                     .role(HitRole::Action)
                     .hoverable(self.bar.policy.mouse.hover)
                     .enabled(!state.interaction.disabled && !item.disabled),
@@ -468,55 +467,6 @@ impl<'a> TabBar<'a> {
             x = x.saturating_add(width);
         }
         rects
-    }
-
-    /// Render tabs into one row.
-    pub fn render(&self, area: Rect, state: &TabBarState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("tab-bar");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render and register this tab list as one roving-focus tab stop.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &TabBarState,
-        frame: &mut Frame<'_>,
-    ) {
-        let id = id.into();
-        frame.push_hit(
-            SceneRegion::new(id.clone(), area)
-                .role(HitRole::Action)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
-        for (index, item_area) in self.hit_rects(area).into_iter().enumerate() {
-            let Some(item) = self.items.get(index) else {
-                break;
-            };
-            frame.push_hit(
-                SceneRegion::new(
-                    HitId::new(format!("{}.{}", id.as_str(), item.id)),
-                    item_area,
-                )
-                .role(HitRole::Action)
-                .hoverable(self.policy.mouse.hover)
-                .enabled(!state.interaction.disabled && !item.disabled),
-            );
-        }
-        if area.is_empty() || self.items.is_empty() {
-            return;
-        }
-        let text = self.text();
-        if display_width(&text) > usize::from(area.width)
-            && matches!(self.policy.overflow, TabBarOverflow::Truncate)
-        {
-            frame.write_line(area, &self.line(state).truncate(usize::from(area.width)));
-        } else {
-            frame.write_line(area, &self.line(state));
-        }
     }
 
     /// Return unstyled rendered text.
@@ -775,12 +725,34 @@ mod tests {
     use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
-    use bmux_tui::paint::PaintCx;
+    use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
     use super::{TabBar, TabBarComponent, TabBarOutcome, TabBarPolicy};
     use crate::tab_bar::{TabBarKeyboardPolicy, TabBarState, TabItem};
+
+    trait TabBarTestRender {
+        fn render(&self, area: Rect, state: &TabBarState, frame: &mut Frame<'_>);
+    }
+
+    impl TabBarTestRender for TabBar<'_> {
+        fn render(&self, area: Rect, state: &TabBarState, frame: &mut Frame<'_>) {
+            let state = std::cell::RefCell::new(state.clone());
+            let component = TabBarComponent {
+                id: "test.tabs".into(),
+                bar: *self,
+                state: &state,
+            };
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn component_measures_paints_and_registers_tabs() {

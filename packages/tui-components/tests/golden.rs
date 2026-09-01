@@ -21,7 +21,7 @@ use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListPolicy, SelectableListState,
 };
 use bmux_tui_components::status_bar::{StatusBar, StatusSegment, StatusSeverity};
-use bmux_tui_components::tab_bar::{TabBar, TabBarPolicy, TabBarState};
+use bmux_tui_components::tab_bar::{TabBarComponent, TabBarPolicy, TabBarState};
 use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState};
 
@@ -85,11 +85,16 @@ fn golden_styled_truncation_components() {
             Line::from_spans([Span::styled("VeryLong", Style::new().fg(Color::Green))]),
         ),
     ];
-    TabBar::new(&tabs).policy(TabBarPolicy::bare()).render(
-        Rect::new(0, 4, 9, 1),
-        &TabBarState::new(Some(1)),
-        &mut frame,
+    let tabs_state = std::cell::RefCell::new(TabBarState::new(Some(1)));
+    let tabs_component =
+        TabBarComponent::new("golden.tabs", &tabs, &tabs_state).policy(TabBarPolicy::bare());
+    let tabs_layout = tabs_component.layout(
+        Constraints::tight(Rect::new(0, 4, 9, 1).size()),
+        &mut LayoutCx::new(),
     );
+    PaintCx::new(&mut frame).with_child(0, 4, LocalRect::new(0, 0, 9, 1), |cx| {
+        tabs_component.paint(&tabs_layout, cx);
+    });
 
     assert_eq!(
         buffer_rows(frame.buffer()),
