@@ -2,25 +2,18 @@
 
 use std::cell::RefCell;
 
-use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::chrome::Border;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
 };
 use bmux_tui::composition::{SizeBox, Surface};
 use bmux_tui::event::{Event, EventOutcome};
-use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
-use bmux_tui::input::TextInput;
+use bmux_tui::geometry::Insets;
 use bmux_tui::paint::PaintCx;
-use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui::widget::Widget;
 
-use crate::form_field::{FormField, FormFieldComponent};
-use crate::text_input::{
-    TextInputComponent, TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
-};
+use crate::form_field::FormFieldComponent;
+use crate::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
 
 /// Behavior policy for [`TextInputBox`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,49 +150,6 @@ impl Default for TextInputBoxStyles {
             background: Style::new(),
             focused_background: Style::new().bg(Color::Black),
             disabled_background: Style::new().bg(Color::Black),
-        }
-    }
-}
-
-/// Layout produced by [`TextInputBox`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextInputBoxLayout {
-    /// Full outer area passed to the component.
-    pub outer: Rect,
-    /// Area used by optional field chrome.
-    pub field_control: Rect,
-    /// Area used by optional panel chrome.
-    pub panel: Rect,
-    /// Editable text content area.
-    pub content: Rect,
-}
-
-/// Outcome from [`TextInputBox`] event handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextInputBoxOutcome {
-    /// Event was ignored.
-    Ignored,
-    /// Text or cursor/selection changed.
-    Edited,
-    /// Redraw requested.
-    Redraw,
-    /// Submit was requested.
-    Submitted,
-    /// Up edge reached.
-    EdgeUp,
-    /// Down edge reached.
-    EdgeDown,
-}
-
-impl From<TextInputOutcome> for TextInputBoxOutcome {
-    fn from(value: TextInputOutcome) -> Self {
-        match value {
-            TextInputOutcome::Ignored => Self::Ignored,
-            TextInputOutcome::Edited => Self::Edited,
-            TextInputOutcome::Redraw => Self::Redraw,
-            TextInputOutcome::Submitted => Self::Submitted,
-            TextInputOutcome::EdgeUp => Self::EdgeUp,
-            TextInputOutcome::EdgeDown => Self::EdgeDown,
         }
     }
 }
@@ -428,132 +378,6 @@ impl<'a> TextInputBox<'a> {
         self
     }
 
-    /// Return layout for `area`.
-    #[must_use]
-    pub fn layout(&self, area: Rect) -> TextInputBoxLayout {
-        let field_control = if self.policy.field_chrome {
-            self.form_field().layout(area).control
-        } else {
-            area
-        };
-        let panel = field_control;
-        let content = if self.policy.panel_chrome {
-            self.panel().inner_area(panel)
-        } else {
-            panel
-        };
-        let content = self.apply_row_bounds(content);
-        TextInputBoxLayout {
-            outer: area,
-            field_control,
-            panel,
-            content,
-        }
-    }
-
-    /// Render the text input box and update state's content area.
-    pub fn render(&self, area: Rect, state: &mut TextInputState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("text-input");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render and register this text field as a keyboard focus target.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &mut TextInputState,
-        frame: &mut Frame<'_>,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, self.layout(area).field_control)
-                .role(HitRole::TextInput)
-                .hoverable(true)
-                .focusable(true)
-                .enabled(!self.policy.disabled),
-        );
-        self.render_body(area, state, frame);
-    }
-
-    fn render_body(&self, area: Rect, state: &mut TextInputState, frame: &mut Frame<'_>) {
-        let field_control = if self.policy.field_chrome {
-            self.form_field().render(area, frame)
-        } else {
-            area
-        };
-        let panel = self.panel();
-        let content = if self.policy.panel_chrome {
-            panel.render(field_control, frame);
-            panel.inner_area(field_control)
-        } else {
-            field_control
-        };
-        let content = self.apply_row_bounds(content);
-        if self.policy.background {
-            frame.fill(content, " ", self.background_style());
-        }
-        state.set_content_area(content, &self.text_policy);
-        let mut input = TextInput::new(state.buffer())
-            .style(self.text_style())
-            .selection_style(self.styles.selection)
-            .placeholder_style(self.styles.placeholder)
-            .cursor_visible(self.policy.cursor && self.policy.focused && !self.policy.disabled)
-            .vertical_scroll(state.vertical_scroll());
-        if let Some(placeholder) = self.placeholder {
-            input = input.placeholder(Line::from_spans([Span::styled(
-                placeholder,
-                self.styles.placeholder,
-            )]));
-        }
-        input.render(content, frame);
-    }
-
-    /// Handle one input event already dispatched to this control.
-    ///
-    /// Global focus ownership belongs to the caller or [`bmux_tui::interaction::InteractionRouter`].
-    /// The local focus policy controls cursor and focused visual presentation; it does not veto an
-    /// event that was explicitly dispatched here.
-    pub fn handle_event(
-        &self,
-        area: Rect,
-        state: &mut TextInputState,
-        event: &Event,
-    ) -> TextInputBoxOutcome {
-        if self.policy.disabled {
-            return TextInputBoxOutcome::Ignored;
-        }
-        state.set_content_area(self.layout(area).content, &self.text_policy);
-        TextInputControl::new(&self.text_policy)
-            .handle_event(state, event)
-            .into()
-    }
-
-    fn form_field(&self) -> FormField<'a> {
-        let mut field = FormField::new(self.label.unwrap_or_default()).required(self.required);
-        if let Some(help) = self.help {
-            field = field.help(help);
-        }
-        if let Some(error) = self.error {
-            field = field.error(error);
-        }
-        field
-    }
-
-    const fn panel(&self) -> Panel {
-        let mut panel = Panel::new();
-        if self.policy.panel_chrome {
-            panel = panel.border(Border::single().style(if self.policy.focused {
-                self.styles.focused_border
-            } else {
-                self.styles.border
-            }));
-        }
-        if self.policy.background {
-            panel = panel.background(self.background_style());
-        }
-        panel.padding(Insets::new(0, 1, 0, 1))
-    }
-
     const fn background_style(&self) -> Style {
         if self.policy.disabled {
             self.styles.disabled_background
@@ -572,13 +396,6 @@ impl<'a> TextInputBox<'a> {
         } else {
             self.styles.text
         }
-    }
-
-    fn apply_row_bounds(&self, area: Rect) -> Rect {
-        let min_height = self.policy.min_rows;
-        let max_height = self.policy.max_rows.unwrap_or(u16::MAX);
-        let requested = area.height.max(min_height).min(max_height);
-        Rect::new(area.x, area.y, area.width, requested.min(area.height))
     }
 }
 
@@ -612,202 +429,61 @@ impl From<crate::theme::ComponentTheme> for TextInputBoxStyles {
 mod tests {
     use std::cell::RefCell;
 
-    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
     use bmux_text_edit::TextEditBuffer;
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
-    use bmux_tui::event::Event;
+    use bmux_tui::event::{Event, EventOutcome};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
-    use bmux_tui::hit::HitId;
-    use bmux_tui::interaction::InteractionRouter;
     use bmux_tui::paint::PaintCx;
 
-    use super::{TextInputBox, TextInputBoxComponent, TextInputBoxOutcome, TextInputBoxPolicy};
+    use super::{TextInputBoxComponent, TextInputBoxPolicy};
     use crate::text_input::{TextInputPolicy, TextInputState};
 
-    #[test]
-    fn renders_bare_text_input() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        TextInputBox::new(policy)
-            .policy(TextInputBoxPolicy::bare().focused(true))
-            .render(Rect::new(0, 0, 8, 1), &mut state, &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Ada     "));
-        assert_eq!(state.content_area(), Rect::new(0, 0, 8, 1));
+    fn paint(
+        component: &impl Component,
+        width: u16,
+        height: u16,
+    ) -> (Buffer, bmux_tui::component::LayoutNode) {
+        let layout = component.layout(
+            Constraints::tight(bmux_tui::geometry::Size::new(width, height)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        (buffer, layout)
     }
 
     #[test]
-    fn renders_visible_focused_field() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
-        let mut frame = Frame::new(&mut buffer);
+    fn component_renders_bare_text_input() {
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("Ada")));
+        let component =
+            TextInputBoxComponent::new("name", TextInputPolicy::chat_composer(), &state)
+                .policy(TextInputBoxPolicy::bare().focused(true));
 
-        TextInputBox::new(policy)
-            .policy(TextInputBoxPolicy::field().focused(true))
-            .render(Rect::new(0, 0, 12, 3), &mut state, &mut frame);
+        let (buffer, _) = paint(&component, 8, 1);
 
-        assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
-            Some("┌──────────┐")
-        );
-        assert_eq!(
-            frame.buffer().row_symbols(1).as_deref(),
-            Some("│ Ada      │")
-        );
-        assert_eq!(state.content_area(), Rect::new(2, 1, 8, 1));
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("Ada     "));
+        assert_eq!(state.borrow().content_area(), Rect::new(0, 0, 8, 1));
     }
 
     #[test]
-    fn renders_placeholder_when_empty() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::default();
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 3));
-        let mut frame = Frame::new(&mut buffer);
+    fn component_renders_visible_focused_field() {
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("Ada")));
+        let component =
+            TextInputBoxComponent::new("name", TextInputPolicy::chat_composer(), &state)
+                .policy(TextInputBoxPolicy::field().focused(true));
 
-        TextInputBox::new(policy)
-            .placeholder("Name")
-            .policy(TextInputBoxPolicy::field())
-            .render(Rect::new(0, 0, 14, 3), &mut state, &mut frame);
+        let (buffer, _) = paint(&component, 12, 3);
 
-        assert_eq!(
-            frame.buffer().row_symbols(1).as_deref(),
-            Some("│ Name       │")
-        );
-    }
-
-    #[test]
-    fn handles_uppercase_input_through_text_control() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let outcome = TextInputBox::new(policy)
-            .policy(TextInputBoxPolicy::field().focused(true))
-            .handle_event(
-                Rect::new(0, 0, 12, 3),
-                &mut state,
-                &Event::Key(KeyStroke::with_modifiers(
-                    KeyCode::Char('b'),
-                    Modifiers {
-                        shift: true,
-                        ..Modifiers::NONE
-                    },
-                )),
-            );
-
-        assert_eq!(outcome, TextInputBoxOutcome::Edited);
-        assert_eq!(state.buffer().text(), "AdaB");
-    }
-
-    #[test]
-    fn renders_labeled_error_state() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 18, 6));
-        let mut frame = Frame::new(&mut buffer);
-
-        TextInputBox::new(policy)
-            .label("Name")
-            .error("Required")
-            .policy(TextInputBoxPolicy::labeled_field())
-            .render(Rect::new(0, 0, 18, 6), &mut state, &mut frame);
-
-        assert!(
-            frame
-                .buffer()
-                .row_symbols(5)
-                .is_some_and(|row| row.contains("Required"))
-        );
-    }
-
-    #[test]
-    fn router_dispatches_typing_only_to_the_default_focused_input() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut first = TextInputState::default();
-        let mut second = TextInputState::default();
-        let first_id = HitId::new("first");
-        let second_id = HitId::new("second");
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
-        let mut frame = Frame::new(&mut buffer);
-        TextInputBox::new(policy).render_with_id(
-            first_id.clone(),
-            Rect::new(0, 0, 12, 3),
-            &mut first,
-            &mut frame,
-        );
-        TextInputBox::new(policy).render_with_id(
-            second_id.clone(),
-            Rect::new(0, 3, 12, 3),
-            &mut second,
-            &mut frame,
-        );
-        let mut router = InteractionRouter::new();
-        router.commit_scene(frame.hits().clone(), None);
-
-        let route = router.route(Event::Key(KeyStroke::simple(KeyCode::Char('x'))));
-        if let Some(event) = route.event_for(&first_id) {
-            assert_eq!(
-                TextInputBox::new(policy).handle_event(Rect::new(0, 0, 12, 3), &mut first, event,),
-                TextInputBoxOutcome::Edited
-            );
-        }
-        if let Some(event) = route.event_for(&second_id) {
-            let _outcome =
-                TextInputBox::new(policy).handle_event(Rect::new(0, 3, 12, 3), &mut second, event);
-        }
-
-        assert_eq!(first.buffer().text(), "x");
-        assert_eq!(second.buffer().text(), "");
-    }
-
-    #[test]
-    fn directly_dispatched_text_input_accepts_keyboard_and_paste_without_visual_focus() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let input = TextInputBox::new(policy);
-
-        assert_eq!(
-            input.handle_event(
-                Rect::new(0, 0, 12, 3),
-                &mut state,
-                &Event::Key(KeyStroke::simple(KeyCode::Char('!'))),
-            ),
-            TextInputBoxOutcome::Edited
-        );
-        assert_eq!(
-            input.handle_event(
-                Rect::new(0, 0, 12, 3),
-                &mut state,
-                &Event::Paste(" Lovelace".to_owned()),
-            ),
-            TextInputBoxOutcome::Edited
-        );
-        assert_eq!(state.buffer().text(), "Ada! Lovelace");
-    }
-
-    #[test]
-    fn disabled_policy_ignores_events() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let outcome = TextInputBox::new(policy)
-            .policy(TextInputBoxPolicy::field().disabled(true))
-            .handle_event(
-                Rect::new(0, 0, 12, 3),
-                &mut state,
-                &Event::Key(KeyStroke::simple(KeyCode::Char('!'))),
-            );
-
-        assert_eq!(outcome, TextInputBoxOutcome::Ignored);
-        assert_eq!(state.buffer().text(), "Ada");
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌──────────┐"));
+        assert_eq!(buffer.row_symbols(1).as_deref(), Some("│ Ada      │"));
+        assert_eq!(state.borrow().content_area(), Rect::new(0, 0, 8, 1));
     }
 
     #[test]
     fn component_composes_field_surface_and_input_through_runtime() {
-        let state = RefCell::new(TextInputState::new(TextEditBuffer::new()));
+        let state = RefCell::new(TextInputState::default());
         let policy = TextInputPolicy::chat_composer();
         let component = TextInputBoxComponent::new("composer", policy, &state)
             .label("Message")
@@ -819,10 +495,7 @@ mod tests {
                     .focused(true)
                     .rows(2, Some(2)),
             );
-        let layout = component.layout(Constraints::new(24, 24, 0, Some(8)), &mut LayoutCx::new());
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 8));
-        let mut frame = Frame::new(&mut buffer);
-        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let (_, layout) = paint(&component, 24, 8);
         assert!(layout.find(&"composer".into()).is_some());
         assert!(layout.find(&"composer.surface".into()).is_some());
         assert!(layout.find(&"composer.input".into()).is_some());
@@ -832,38 +505,43 @@ mod tests {
                 &layout,
                 &mut EventCx::new(&layout),
             ),
-            bmux_tui::event::EventOutcome::Redraw
+            EventOutcome::Redraw
         );
         assert_eq!(state.borrow().buffer().text(), "hello");
     }
 
     #[test]
-    fn paste_events_delegate_to_text_control() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("Ada"));
-        let outcome = TextInputBox::new(policy)
-            .policy(TextInputBoxPolicy::field().focused(true))
-            .handle_event(
-                Rect::new(0, 0, 12, 3),
-                &mut state,
-                &Event::Paste(" Lovelace".to_owned()),
-            );
+    fn disabled_component_ignores_events() {
+        let state = RefCell::new(TextInputState::default());
+        let component =
+            TextInputBoxComponent::new("disabled", TextInputPolicy::chat_composer(), &state)
+                .policy(TextInputBoxPolicy::field().disabled(true));
+        let (_, layout) = paint(&component, 12, 3);
 
-        assert_eq!(outcome, TextInputBoxOutcome::Edited);
-        assert_eq!(state.buffer().text(), "Ada Lovelace");
+        assert_eq!(
+            component.event(
+                &Event::Paste("ignored".to_owned()),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Ignored
+        );
+        assert!(state.borrow().buffer().is_empty());
     }
 
     #[test]
-    fn content_area_respects_max_rows() {
-        let policy = TextInputPolicy::chat_composer();
-        let mut state = TextInputState::new(TextEditBuffer::from_text("one\ntwo\nthree"));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 8));
-        let mut frame = Frame::new(&mut buffer);
+    fn component_respects_max_content_rows() {
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "one\ntwo\nthree",
+        )));
+        let component =
+            TextInputBoxComponent::new("bounded", TextInputPolicy::chat_composer(), &state)
+                .policy(TextInputBoxPolicy::field().rows(1, Some(2)));
 
-        TextInputBox::new(policy)
-            .policy(TextInputBoxPolicy::field().rows(1, Some(2)))
-            .render(Rect::new(0, 0, 16, 8), &mut state, &mut frame);
+        let (_, layout) = paint(&component, 16, 8);
+        let input = layout.find(&"bounded.input".into()).expect("input layout");
 
-        assert_eq!(state.content_area(), Rect::new(2, 1, 12, 2));
+        assert_eq!(input.size.height, 2);
+        assert_eq!(state.borrow().content_area().height, 2);
     }
 }
