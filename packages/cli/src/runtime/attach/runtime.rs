@@ -55,12 +55,13 @@ use bmux_recording_plugin_api::recording_state;
 use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextContent;
 use bmux_tui::frame::Frame as TuiFrame;
 use bmux_tui::geometry::{Insets as TuiInsets, Rect as TuiRect, Size as TuiSize};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
@@ -7573,7 +7574,16 @@ fn help_overlay_render_ops(
     .padding(TuiInsets::new(0, 1, 0, 1));
     let mut buffer = surface_buffer(area);
     let mut frame = TuiFrame::new(&mut buffer);
-    modal.render(area, &mut frame);
+    let modal_component =
+        ModalFrameComponent::new("attach.help", modal.clone(), TextContent::new(""));
+    let modal_layout =
+        modal_component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    PaintCx::new(&mut frame).with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| modal_component.paint(&modal_layout, cx),
+    );
     let content = modal.content_area(area);
     let hints_height = u16::from(content.height > 2);
     let body_area = TuiRect::new(

@@ -399,6 +399,7 @@ pub struct Surface<'a> {
     background: Style,
     content_style: Style,
     border: Option<Border>,
+    paint_border: bool,
     padding: Insets,
 }
 
@@ -412,6 +413,7 @@ impl<'a> Surface<'a> {
             background: Style::new(),
             content_style: Style::new(),
             border: None,
+            paint_border: true,
             padding: Insets::all(0),
         }
     }
@@ -444,6 +446,13 @@ impl<'a> Surface<'a> {
         self
     }
 
+    /// Control whether the configured border is painted while retaining its layout insets.
+    #[must_use]
+    pub const fn paint_border(mut self, paint_border: bool) -> Self {
+        self.paint_border = paint_border;
+        self
+    }
+
     /// Set child padding.
     #[must_use]
     pub const fn padding(mut self, padding: Insets) -> Self {
@@ -472,6 +481,7 @@ impl<'a> Surface<'a> {
         let paint = stable_revision(|state| {
             self.background.hash(state);
             self.content_style.hash(state);
+            self.paint_border.hash(state);
             hash_border(self.border.as_ref(), state);
         });
         ComponentRevision::new(layout, paint)
@@ -515,7 +525,9 @@ impl Component for Surface<'_> {
             " ",
             self.background,
         );
-        if let Some(border) = &self.border {
+        if self.paint_border
+            && let Some(border) = &self.border
+        {
             paint_border(layout.size.width, height, border, self.background, cx);
         }
         let Some(child_layout) = layout.children.first() else {

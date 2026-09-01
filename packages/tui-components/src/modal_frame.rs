@@ -424,6 +424,7 @@ pub struct ModalFrameComponent<'a> {
     id: LayoutId,
     frame: ModalFrame,
     child: Element<'a>,
+    chrome: bool,
 }
 
 impl<'a> ModalFrameComponent<'a> {
@@ -434,7 +435,15 @@ impl<'a> ModalFrameComponent<'a> {
             id: id.into(),
             frame,
             child: Element::new(child),
+            chrome: true,
         }
+    }
+
+    /// Preserve modal geometry and opacity while leaving border decoration to the host.
+    #[must_use]
+    pub const fn chrome(mut self, chrome: bool) -> Self {
+        self.chrome = chrome;
+        self
     }
 
     fn tree(&self) -> Stack<'_> {
@@ -444,6 +453,7 @@ impl<'a> ModalFrameComponent<'a> {
             .background(self.frame.theme.background)
             .content_style(self.frame.theme.text)
             .border(self.frame.border.clone())
+            .paint_border(self.chrome)
             .padding(self.frame.padding);
         let panel = SizeBox::new(panel)
             .id(format!("{}.size", self.id.as_str()))

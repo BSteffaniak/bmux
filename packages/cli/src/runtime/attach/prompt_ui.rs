@@ -15,6 +15,7 @@ use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use bmux_tui::chrome::Panel;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextContent;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::HitMap;
@@ -24,8 +25,10 @@ use bmux_tui::prelude::{Line, Span};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
 use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState, CheckboxStyles};
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
-use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
+use bmux_tui_components::scrollbar::{
+    ScrollbarComponent, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
+};
 use bmux_tui_components::select_dropdown::{
     SelectDropdown, SelectDropdownState, SelectDropdownStyles, SelectOption,
 };
@@ -1169,11 +1172,10 @@ impl AttachPromptState {
         });
         let mut buffer = surface_buffer(area);
         let mut frame = Frame::new(&mut buffer);
-        if extension_chrome {
-            modal.render_without_chrome(area, &mut frame);
-        } else {
-            modal.render(area, &mut frame);
-        }
+        let modal_component =
+            ModalFrameComponent::new("prompt.overlay", modal.clone(), TextContent::new(""))
+                .chrome(!extension_chrome);
+        paint_component(&modal_component, area, &mut frame);
         let content = modal.content_area(area);
         let mut component_cursor = None;
         let rendered_palette = render_command_palette(active, content, &mut frame, theme);
@@ -1904,20 +1906,22 @@ fn render_command_palette(
             1,
             list_viewport,
         );
-        let scrollbar_state = ScrollbarState::new(
-            u16::try_from(filtered.len()).unwrap_or(u16::MAX),
-            list_viewport,
-        )
-        .offset(u16::try_from(palette.list.offset).unwrap_or(u16::MAX));
-        Scrollbar::new()
+        let scrollbar_state = std::cell::Cell::new(
+            ScrollbarState::new(
+                u16::try_from(filtered.len()).unwrap_or(u16::MAX),
+                list_viewport,
+            )
+            .offset(u16::try_from(palette.list.offset).unwrap_or(u16::MAX)),
+        );
+        let scrollbar = ScrollbarComponent::new("command-palette-scrollbar", &scrollbar_state)
             .policy(ScrollbarPolicy::bare())
             .styles(ScrollbarStyles {
                 begin: theme.muted,
                 track: theme.muted,
                 thumb: theme.focused,
                 end: theme.muted,
-            })
-            .render(scrollbar_area, &scrollbar_state, frame);
+            });
+        paint_component(&scrollbar, scrollbar_area, frame);
     }
     if footer_rows > 0 {
         let selected = palette.list.selected.map_or(0, |index| index + 1);
@@ -3046,14 +3050,23 @@ mod tests {
             .expect("prompt should render");
         let top_y = render.surface.rect.y;
         let top_x = render.surface.rect.x;
-        let top = render.ops.iter().find_map(|op| match op {
-            bmux_plugin::RenderOp::TextRun { x, y, text, .. } if *x == top_x && *y == top_y => {
-                Some(text.as_str())
-            }
-            _ => None,
-        });
+        let top_runs = render
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                bmux_plugin::RenderOp::TextRun { x, y, text, .. } if *y == top_y => {
+                    Some((*x, text.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
 
-        assert!(top.is_some_and(|line| line.starts_with('╭') && line.ends_with('╮')));
+        assert!(
+            top_runs
+                .first()
+                .is_some_and(|(x, text)| *x == top_x && text.starts_with('╭'))
+                && top_runs.last().is_some_and(|(_, text)| text.ends_with('╮'))
+        );
         assert!(
             !render
                 .ops
