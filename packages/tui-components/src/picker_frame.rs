@@ -1,8 +1,16 @@
 //! Generic picker/palette frame layout and chrome.
 
+use std::hash::{Hash, Hasher};
+
 use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::component::{
+    ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
+    LayoutNode, LogicalSize, combine_child_revisions,
+};
+use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Widget};
 use bmux_tui::style::{Color, Modifier, Style};
 
@@ -102,7 +110,7 @@ impl Default for PickerFramePolicy {
 }
 
 /// Visual styles for [`PickerFrame`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PickerFrameStyles {
     /// Border/title style.
     pub border: Style,
@@ -288,6 +296,301 @@ impl<'a> PickerFrame<'a> {
     }
 }
 
+/// Canonical child-owning picker frame composition.
+pub struct PickerFrameComponent<'a> {
+    id: LayoutId,
+    frame: PickerFrame<'a>,
+    input: Option<Element<'a>>,
+    list: Element<'a>,
+}
+
+impl<'a> PickerFrameComponent<'a> {
+    /// Create a picker frame around list content.
+    #[must_use]
+    pub fn new(id: impl Into<LayoutId>, frame: PickerFrame<'a>, list: impl Component + 'a) -> Self {
+        Self {
+            id: id.into(),
+            frame,
+            input: None,
+            list: Element::new(list),
+        }
+    }
+
+    /// Set optional input content. Its presence follows the frame input policy.
+    #[must_use]
+    pub fn input(mut self, input: impl Component + 'a) -> Self {
+        self.input = Some(Element::new(input));
+        self
+    }
+
+    fn panel_size(&self, constraints: Constraints) -> LogicalSize {
+        let width = self
+            .frame
+            .policy
+            .max_size
+            .width
+            .min(constraints.max_width())
+            .max(
+                self.frame
+                    .policy
+                    .min_size
+                    .width
+                    .min(constraints.max_width()),
+            );
+        let available_height = constraints
+            .max_height()
+            .unwrap_or_else(|| constraints.min_height());
+        let height = usize::from(self.frame.policy.max_size.height)
+            .min(available_height)
+            .max(usize::from(self.frame.policy.min_size.height).min(available_height));
+        LogicalSize::new(width, height)
+    }
+
+    fn panel_origin(&self, outer: LogicalSize, panel: LogicalSize) -> (u16, usize) {
+        let margin = self.frame.policy.margin;
+        let available_width = outer.width.saturating_sub(margin.horizontal());
+        let available_height = outer.height.saturating_sub(usize::from(margin.vertical()));
+        let remaining_x = available_width.saturating_sub(panel.width);
+        let remaining_y = available_height.saturating_sub(panel.height);
+        let x = match self.frame.policy.placement {
+            PickerFramePlacement::Center
+            | PickerFramePlacement::UpperThird
+            | PickerFramePlacement::LowerThird => remaining_x / 2,
+            PickerFramePlacement::Anchored(point) => point.x.min(remaining_x),
+        };
+        let y = match self.frame.policy.placement {
+            PickerFramePlacement::Center => remaining_y / 2,
+            PickerFramePlacement::UpperThird => remaining_y / 3,
+            PickerFramePlacement::LowerThird => remaining_y.saturating_mul(2) / 3,
+            PickerFramePlacement::Anchored(point) => usize::from(point.y).min(remaining_y),
+        };
+        (
+            margin.left.saturating_add(x),
+            usize::from(margin.top).saturating_add(y),
+        )
+    }
+
+    fn local_layout(&self, size: LogicalSize) -> PickerFrameLayout {
+        let mut frame = self.frame.clone();
+        frame.policy.margin = Insets::all(0);
+        frame.layout(Rect::new(
+            0,
+            0,
+            size.width,
+            u16::try_from(size.height).unwrap_or(u16::MAX),
+        ))
+    }
+
+    fn paint_chrome(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let Some(panel) = layout.children.first() else {
+            return;
+        };
+        let local = self.local_layout(panel.node.size);
+        cx.with_child(
+            i32::from(panel.x),
+            i64::try_from(panel.y).unwrap_or(i64::MAX),
+            LocalRect::new(
+                0,
+                0,
+                panel.node.size.width,
+                u16::try_from(panel.node.size.height).unwrap_or(u16::MAX),
+            ),
+            |cx| {
+                if self.frame.policy.background {
+                    cx.fill(
+                        LocalRect::terminal(local.panel),
+                        " ",
+                        self.frame.styles.background,
+                    );
+                }
+                if self.frame.policy.chrome {
+                    paint_picker_border(
+                        local.panel,
+                        self.frame.styles.border,
+                        self.frame.title,
+                        cx,
+                    );
+                }
+                if let (Some(area), Some(header)) = (local.header, &self.frame.header) {
+                    cx.write_line_with_fallback_style(
+                        LocalRect::terminal(area),
+                        header,
+                        self.frame.styles.header,
+                    );
+                }
+                if local.input.is_some() {
+                    cx.fill(
+                        LocalRect::terminal(local.input.unwrap_or_default()),
+                        " ",
+                        self.frame.styles.input,
+                    );
+                }
+                cx.fill(LocalRect::terminal(local.list), " ", self.frame.styles.list);
+                if let (Some(area), Some(footer)) = (local.footer, &self.frame.footer) {
+                    cx.write_line_with_fallback_style(
+                        LocalRect::terminal(area),
+                        footer,
+                        self.frame.styles.footer,
+                    );
+                }
+            },
+        );
+    }
+}
+
+impl Component for PickerFrameComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        format!("{:?}", self.frame.policy).hash(&mut layout);
+        self.frame.header.is_some().hash(&mut layout);
+        self.frame.footer.is_some().hash(&mut layout);
+        self.input.is_some().hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.frame.title.hash(&mut paint);
+        format!("{:?}", self.frame.header).hash(&mut paint);
+        format!("{:?}", self.frame.footer).hash(&mut paint);
+        self.frame.styles.hash(&mut paint);
+        let own = ComponentRevision::new(layout.finish(), paint.finish());
+        combine_child_revisions(
+            own,
+            self.input
+                .iter()
+                .map(Element::revision)
+                .chain(std::iter::once(self.list.revision())),
+        )
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let outer = constraints.constrain(LogicalSize::new(
+            constraints.max_width(),
+            constraints
+                .max_height()
+                .unwrap_or_else(|| constraints.min_height()),
+        ));
+        let panel_size = self.panel_size(constraints.inset(
+            self.frame.policy.margin.horizontal(),
+            usize::from(self.frame.policy.margin.vertical()),
+        ));
+        let local = self.local_layout(panel_size);
+        let mut children = Vec::with_capacity(2);
+        if let (Some(input), Some(area)) = (&self.input, local.input) {
+            let node = input.layout(Constraints::new(area.width, area.width, 1, Some(1)), cx);
+            children.push(ChildLayout::new(area.x, usize::from(area.y), node));
+        }
+        let list = self.list.layout(
+            Constraints::new(
+                local.list.width,
+                local.list.width,
+                usize::from(local.list.height),
+                Some(usize::from(local.list.height)),
+            ),
+            cx,
+        );
+        children.push(ChildLayout::new(
+            local.list.x,
+            usize::from(local.list.y),
+            list,
+        ));
+        let panel = LayoutNode::with_children(
+            LayoutId::new(format!("{}.panel", self.id.as_str())),
+            panel_size,
+            children,
+        );
+        let (x, y) = self.panel_origin(outer, panel_size);
+        LayoutNode::with_children(self.id.clone(), outer, vec![ChildLayout::new(x, y, panel)])
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.paint_chrome(layout, cx);
+        let Some(panel) = layout.children.first() else {
+            return;
+        };
+        let mut components = self.input.iter().chain(std::iter::once(&self.list));
+        for child in &panel.node.children {
+            let Some(component) = components.next() else {
+                break;
+            };
+            cx.with_child(
+                i32::from(panel.x.saturating_add(child.x)),
+                i64::try_from(panel.y.saturating_add(child.y)).unwrap_or(i64::MAX),
+                LocalRect::new(
+                    0,
+                    0,
+                    child.node.size.width,
+                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+                ),
+                |cx| component.paint(&child.node, cx),
+            );
+        }
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(panel) = layout.children.first() else {
+            return EventOutcome::Ignored;
+        };
+        let mut components = self.input.iter().chain(std::iter::once(&self.list));
+        for child in panel.node.children.iter().rev() {
+            let Some(component) = components.next_back() else {
+                break;
+            };
+            let x = panel.x.saturating_add(child.x);
+            let y = panel.y.saturating_add(child.y);
+            let outcome = cx.with_transform(
+                x,
+                y,
+                i32::from(x),
+                i64::try_from(y).unwrap_or(i64::MAX),
+                Rect::new(
+                    x,
+                    u16::try_from(y).unwrap_or(u16::MAX),
+                    child.node.size.width,
+                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+                ),
+                |cx| component.event(event, &child.node, cx),
+            );
+            if outcome != EventOutcome::Ignored {
+                return outcome;
+            }
+        }
+        EventOutcome::Ignored
+    }
+}
+
+fn paint_picker_border(area: Rect, style: Style, title: Option<&str>, cx: &mut PaintCx<'_, '_>) {
+    if area.is_empty() {
+        return;
+    }
+    let right = area.right().saturating_sub(1);
+    let bottom = area.bottom().saturating_sub(1);
+    for x in area.x..area.right() {
+        cx.set_cell(i32::from(x), i64::from(area.y), "─", style);
+        cx.set_cell(i32::from(x), i64::from(bottom), "─", style);
+    }
+    for y in area.y..area.bottom() {
+        cx.set_cell(i32::from(area.x), i64::from(y), "│", style);
+        cx.set_cell(i32::from(right), i64::from(y), "│", style);
+    }
+    cx.set_cell(i32::from(area.x), i64::from(area.y), "┌", style);
+    cx.set_cell(i32::from(right), i64::from(area.y), "┐", style);
+    cx.set_cell(i32::from(area.x), i64::from(bottom), "└", style);
+    cx.set_cell(i32::from(right), i64::from(bottom), "┘", style);
+    if let Some(title) = title {
+        cx.write_line_with_fallback_style(
+            LocalRect::new(
+                i32::from(area.x.saturating_add(1)),
+                i64::from(area.y),
+                area.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from(title),
+            style,
+        );
+    }
+}
+
 impl Default for PickerFrame<'_> {
     fn default() -> Self {
         Self::new()
@@ -359,10 +662,13 @@ impl From<crate::theme::ComponentTheme> for PickerFrameStyles {
 #[cfg(test)]
 mod tests {
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
+    use bmux_tui::composition::TextContent;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
+    use bmux_tui::paint::PaintCx;
 
-    use super::{PickerFrame, PickerFramePlacement, PickerFramePolicy};
+    use super::{PickerFrame, PickerFrameComponent, PickerFramePlacement, PickerFramePolicy};
 
     #[test]
     fn computes_full_palette_layout() {
@@ -441,6 +747,79 @@ mod tests {
         assert!(layout.panel.height <= 3);
         assert!(layout.inner.width <= layout.panel.width);
         assert!(layout.inner.height <= layout.panel.height);
+    }
+
+    #[test]
+    fn component_owns_picker_geometry_and_child_placement() {
+        let picker = PickerFrame::new()
+            .title("Pick")
+            .header("Header")
+            .footer("Footer")
+            .policy(PickerFramePolicy {
+                margin: Insets::all(0),
+                min_size: Size::new(20, 8),
+                max_size: Size::new(20, 8),
+                placement: PickerFramePlacement::Anchored(Point::new(3, 2)),
+                ..PickerFramePolicy::palette()
+            });
+        let component = PickerFrameComponent::new(
+            "picker",
+            picker,
+            TextContent::new("first\nsecond").id("picker.list"),
+        )
+        .input(TextContent::new("query").id("picker.input"));
+
+        let layout = component.layout(Constraints::new(40, 40, 12, Some(12)), &mut LayoutCx::new());
+        let panel = &layout.children[0];
+        assert_eq!((panel.x, panel.y), (3, 2));
+        assert_eq!(panel.node.size.width, 20);
+        assert_eq!(panel.node.size.height, 8);
+        assert_eq!(panel.node.children.len(), 2);
+        assert_eq!(panel.node.children[0].node.id.as_str(), "picker.input");
+        assert_eq!(panel.node.children[1].node.id.as_str(), "picker.list");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 12));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(2)
+                .is_some_and(|row| row.contains("Pick"))
+        );
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(4)
+                .is_some_and(|row| row.contains("Header"))
+        );
+        assert!(
+            frame
+                .buffer()
+                .row_symbols(6)
+                .is_some_and(|row| row.contains("query"))
+        );
+    }
+
+    #[test]
+    fn component_without_input_places_only_the_list_child() {
+        let component = PickerFrameComponent::new(
+            "picker",
+            PickerFrame::new().policy(PickerFramePolicy {
+                margin: Insets::all(0),
+                min_size: Size::new(12, 5),
+                max_size: Size::new(12, 5),
+                ..PickerFramePolicy::palette()
+            }),
+            TextContent::new("item").id("picker.list"),
+        );
+        let layout = component.layout(Constraints::new(12, 12, 5, Some(5)), &mut LayoutCx::new());
+
+        assert_eq!(layout.children[0].node.children.len(), 1);
+        assert_eq!(
+            layout.children[0].node.children[0].node.id.as_str(),
+            "picker.list"
+        );
     }
 
     #[test]

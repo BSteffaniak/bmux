@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
@@ -24,26 +24,22 @@ use bmux_tui_components::chart::{
 };
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::empty_state::{EmptyStateComponent, EmptyStatePolicy};
-use bmux_tui_components::filtered_list::FilteredListState;
 use bmux_tui_components::form_field::FormFieldComponent;
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetailsComponent};
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
 use bmux_tui_components::pane::{Pane, PaneState};
-use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
+use bmux_tui_components::picker_frame::{PickerFrame, PickerFrameComponent, PickerFramePolicy};
 use bmux_tui_components::progress_bar::{
     ProgressBarComponent, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement,
 };
 use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
-use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListItem, SelectableListState,
-};
 use bmux_tui_components::sparkline::{SparklineComponent, SparklinePolicy};
 use bmux_tui_components::stepper::{StepItem, StepStatus, StepperComponent, StepperPolicy};
 use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
-use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
+use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 use bmux_tui_components::toast_stack::{
     ToastItem, ToastSeverity, ToastStackComponent, ToastStackState,
 };
@@ -398,29 +394,19 @@ fn render_picker(frame: &mut Frame<'_>) {
         .header("Commands")
         .footer("enter select · esc close")
         .policy(PickerFramePolicy::palette().max_size(Size::new(30, 12)));
-    let layout = picker.render(Rect::new(34, 6, 34, 12), frame);
-
-    if let Some(input_area) = layout.input {
-        let mut input_state = TextInputState::new(TextEditBuffer::from_text("open"));
-        TextInputBox::new(TextInputPolicy::chat_composer())
-            .policy(TextInputBoxPolicy::bare().focused(true))
-            .render(input_area, &mut input_state, frame);
-    }
-
-    let items = [
-        SelectableListItem::new("open", "Open file"),
-        SelectableListItem::new("switch", "Switch tab"),
-        SelectableListItem::new("close", "Close window"),
-    ];
-    let mut filtered = FilteredListState::from_indices([0, 2]);
-    let visible_items = filtered
-        .indices()
-        .iter()
-        .map(|index| items[*index].clone())
-        .collect::<Vec<_>>();
-    filtered.select_visible(0);
-    let list_state = SelectableListState::new(filtered.selected_visible());
-    SelectableList::new(&visible_items).render(layout.list, &list_state, frame);
+    let input_state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("open")));
+    let input = TextInputBoxComponent::new(
+        "gallery.picker.input",
+        TextInputPolicy::chat_composer(),
+        &input_state,
+    )
+    .policy(TextInputBoxPolicy::bare().focused(true));
+    let list = TextContent::new("Open file\nClose window").id("gallery.picker.list");
+    render_component(
+        &PickerFrameComponent::new("gallery.picker", picker, list).input(input),
+        Rect::new(34, 6, 34, 12),
+        frame,
+    );
 }
 
 fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
