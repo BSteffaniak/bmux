@@ -12,11 +12,17 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-anyhow              = { workspace = true, features = ["std"] }
-bmux_keyboard       = { workspace = true }
-bmux_text_edit      = { workspace = true }
-bmux_tui            = { workspace = true, features = ["crossterm"] }
-bmux_tui_components = { workspace = true, features = ["text-input"] }
+anyhow = { workspace = true, features = ["std"] }
+bmux_keyboard = { workspace = true }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui_components = { workspace = true, features = [
+    "checkbox",
+    "form",
+    "radio-group",
+    "select-dropdown",
+    "text-input-box",
+] }
 
 [features]
 fail-on-warnings = ["bmux_tui_components/fail-on-warnings"]

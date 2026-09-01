@@ -9,9 +9,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::semantic::SemanticRegion;
@@ -144,6 +143,7 @@ pub struct CheckboxComponent<'a, 'state> {
     id: LayoutId,
     checkbox: Checkbox<'a>,
     state: &'state Cell<CheckboxState>,
+    fallback: Style,
 }
 
 impl<'a, 'state> CheckboxComponent<'a, 'state> {
@@ -158,6 +158,7 @@ impl<'a, 'state> CheckboxComponent<'a, 'state> {
             id: id.into(),
             checkbox: Checkbox::new(label),
             state,
+            fallback: Style::new(),
         }
     }
 
@@ -174,6 +175,13 @@ impl<'a, 'state> CheckboxComponent<'a, 'state> {
         self.checkbox.styles = styles;
         self
     }
+
+    /// Set the style inherited by otherwise unstyled cells across the assigned row.
+    #[must_use]
+    pub const fn fallback_style(mut self, fallback: Style) -> Self {
+        self.fallback = fallback;
+        self
+    }
 }
 
 impl Component for CheckboxComponent<'_, '_> {
@@ -185,6 +193,7 @@ impl Component for CheckboxComponent<'_, '_> {
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.checkbox.policy).hash(&mut paint);
         format!("{:?}", self.checkbox.styles).hash(&mut paint);
+        format!("{:?}", self.fallback).hash(&mut paint);
         format!("{:?}", self.state.get()).hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
@@ -207,7 +216,7 @@ impl Component for CheckboxComponent<'_, '_> {
         }
         let state = self.state.get();
         let area = LocalRect::new(0, 0, layout.size.width, 1);
-        cx.write_line(area, &self.checkbox.line(state));
+        cx.write_line_with_fallback_style(area, &self.checkbox.line(state), self.fallback);
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
                 .role(HitRole::Action)
@@ -268,68 +277,6 @@ impl<'a> Checkbox<'a> {
         u16::try_from(bmux_tui::text_width::display_width(self.label))
             .unwrap_or(u16::MAX)
             .saturating_add(4)
-    }
-
-    /// Render the checkbox and register its default interaction semantics.
-    ///
-    /// Use [`Self::render_with_id`] when focus must survive responsive reflow
-    /// or callers route events by semantic identity.
-    pub fn render(&self, area: Rect, state: &CheckboxState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("checkbox");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render the checkbox with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &CheckboxState,
-        frame: &mut Frame<'_>,
-    ) {
-        self.register_interaction(id, area, *state, frame);
-        frame.write_line(area, &self.line(*state));
-    }
-
-    /// Render the checkbox with a fallback style filling its area.
-    pub fn render_with_fallback_style(
-        &self,
-        area: Rect,
-        state: &CheckboxState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        let id = frame.next_interaction_id("checkbox");
-        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
-    }
-
-    /// Render with a stable interaction identifier and fallback style.
-    pub fn render_with_id_and_fallback_style(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &CheckboxState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        self.register_interaction(id, area, *state, frame);
-        frame.write_line_with_fallback_style(area, &self.line(*state), fallback);
-    }
-
-    fn register_interaction(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: CheckboxState,
-        frame: &mut Frame<'_>,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::Action)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
     }
 
     /// Handle one input event.
@@ -494,24 +441,37 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::hit::HitRole;
-    use bmux_tui::paint::PaintCx;
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
     use super::{Checkbox, CheckboxComponent, CheckboxOutcome, CheckboxPolicy, CheckboxState};
+
+    fn paint_checkbox(id: &'static str, area: Rect, state: CheckboxState, frame: &mut Frame<'_>) {
+        let state = Cell::new(state);
+        let checkbox = CheckboxComponent::new(id, "Enable", &state);
+        let layout = checkbox.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| checkbox.paint(&layout, cx),
+        );
+    }
 
     #[test]
     fn renders_checked_and_unchecked_states() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 2));
         let mut frame = Frame::new(&mut buffer);
-        let checkbox = Checkbox::new("Enable");
 
-        checkbox.render(
+        paint_checkbox(
+            "unchecked",
             Rect::new(0, 0, 16, 1),
-            &CheckboxState::new(false),
+            CheckboxState::new(false),
             &mut frame,
         );
-        checkbox.render(
+        paint_checkbox(
+            "checked",
             Rect::new(0, 1, 16, 1),
-            &CheckboxState::new(true),
+            CheckboxState::new(true),
             &mut frame,
         );
 
@@ -529,23 +489,21 @@ mod tests {
     fn render_registers_exact_interaction_geometry_and_state() {
         let mut buffer = Buffer::empty(Rect::new(4, 3, 20, 4));
         let mut frame = Frame::new(&mut buffer);
-        let checkbox = Checkbox::new("Enable");
         let enabled = CheckboxState::new(false);
         let mut disabled = CheckboxState::new(true);
         disabled.set_disabled(true);
 
-        checkbox.render_with_id(
+        paint_checkbox(
             "settings.enable",
             Rect::new(7, 4, 11, 1),
-            &enabled,
+            enabled,
             &mut frame,
         );
-        checkbox.render_with_id_and_fallback_style(
+        paint_checkbox(
             "settings.disabled",
             Rect::new(7, 5, 13, 1),
-            &disabled,
+            disabled,
             &mut frame,
-            bmux_tui::style::Style::new(),
         );
 
         let regions = frame.hits().regions();

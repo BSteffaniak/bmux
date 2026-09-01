@@ -1,14 +1,16 @@
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line;
-use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome, CheckboxState};
+use bmux_tui_components::checkbox::{Checkbox, CheckboxComponent, CheckboxOutcome, CheckboxState};
 use bmux_tui_components::form::{Form, FormFieldItem, FormOutcome, FormState};
 use bmux_tui_components::radio_group::{
-    RadioGroup, RadioGroupOutcome, RadioGroupState, RadioOption,
+    RadioGroup, RadioGroupComponent, RadioGroupOutcome, RadioGroupState, RadioOption,
 };
 use bmux_tui_components::select_dropdown::{
     SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption,
@@ -185,10 +187,30 @@ fn render_inputs_with_state(
         .policy(TextInputBoxPolicy::labeled_field().focused(focused == 0))
         .render(Rect::new(1, 1, 34, 5), &mut text_state, frame);
 
-    Checkbox::new("Subscribe to updates").render(CHECKBOX_AREA, checkbox, frame);
+    let checkbox_state = std::cell::Cell::new(*checkbox);
+    let component =
+        CheckboxComponent::new("inputs.subscribe", "Subscribe to updates", &checkbox_state);
+    let layout = component.layout(
+        Constraints::tight(CHECKBOX_AREA.size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(frame).with_child(
+        i32::from(CHECKBOX_AREA.x),
+        i64::from(CHECKBOX_AREA.y),
+        LocalRect::new(0, 0, CHECKBOX_AREA.width, CHECKBOX_AREA.height),
+        |cx| component.paint(&layout, cx),
+    );
 
     let radios = radio_options();
-    RadioGroup::new(&radios).render(RADIO_AREA, radio, frame);
+    let radio_state = std::cell::Cell::new(*radio);
+    let component = RadioGroupComponent::new("inputs.frequency", &radios, &radio_state);
+    let layout = component.layout(Constraints::tight(RADIO_AREA.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(RADIO_AREA.x),
+        i64::from(RADIO_AREA.y),
+        LocalRect::new(0, 0, RADIO_AREA.width, RADIO_AREA.height),
+        |cx| component.paint(&layout, cx),
+    );
 
     let options = select_options();
     SelectDropdown::new(&options).render(SELECT_AREA, select, frame);

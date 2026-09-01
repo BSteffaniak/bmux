@@ -22,7 +22,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
-use bmux_tui_components::checkbox::{Checkbox, CheckboxState, CheckboxStyles};
+use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState, CheckboxStyles};
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy, ScrollbarState, ScrollbarStyles};
@@ -1275,6 +1275,28 @@ impl AttachPromptState {
     }
 }
 
+fn paint_checkbox(
+    id: impl Into<bmux_tui::component::LayoutId>,
+    label: &str,
+    state: CheckboxState,
+    styles: CheckboxStyles,
+    fallback: bmux_tui::style::Style,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let state = std::cell::Cell::new(state);
+    let component = CheckboxComponent::new(id, label, &state)
+        .styles(styles)
+        .fallback_style(fallback);
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Rendering one field keeps all concrete control projections together over canonical form state.
 fn render_form_control(
     field: &PromptFormField,
@@ -1291,15 +1313,21 @@ fn render_form_control(
             let mut state = CheckboxState::new(*value);
             state.set_focused(focused);
             state.set_disabled(field.disabled);
-            Checkbox::new(&field.label)
-                .styles(CheckboxStyles {
+            paint_checkbox(
+                format!("prompt.form.{}", field.id),
+                &field.label,
+                state,
+                CheckboxStyles {
                     normal: theme.text,
                     focused: theme.focused,
                     hovered: theme.focused,
                     pressed: theme.focused,
                     disabled: theme.muted,
-                })
-                .render_with_fallback_style(area, &state, frame, theme.background);
+                },
+                theme.background,
+                area,
+                frame,
+            );
             true
         }
         (
@@ -1399,15 +1427,22 @@ fn render_form_control(
             let mut state = CheckboxState::new(!selected.is_empty());
             state.set_focused(focused);
             state.set_disabled(field.disabled);
-            Checkbox::new(&format!("{}: {summary}", field.label))
-                .styles(CheckboxStyles {
+            let label = format!("{}: {summary}", field.label);
+            paint_checkbox(
+                format!("prompt.form.{}", field.id),
+                &label,
+                state,
+                CheckboxStyles {
                     normal: theme.text,
                     focused: theme.focused,
                     hovered: theme.focused,
                     pressed: theme.focused,
                     disabled: theme.muted,
-                })
-                .render_with_fallback_style(area, &state, frame, theme.background);
+                },
+                theme.background,
+                area,
+                frame,
+            );
             true
         }
         _ => false,
@@ -1576,20 +1611,21 @@ fn render_multi_toggle(
         };
         let mut state = CheckboxState::new(selected.contains(&index));
         state.set_focused(index == *cursor);
-        Checkbox::new(&option.label)
-            .styles(CheckboxStyles {
+        paint_checkbox(
+            format!("prompt.multi-toggle.{index}"),
+            &option.label,
+            state,
+            CheckboxStyles {
                 normal: theme.text,
                 focused: theme.focused,
                 hovered: theme.focused,
                 pressed: theme.focused,
                 disabled: theme.muted,
-            })
-            .render_with_fallback_style(
-                Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
-                &state,
-                frame,
-                theme.background,
-            );
+            },
+            theme.background,
+            Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
+            frame,
+        );
     }
     true
 }

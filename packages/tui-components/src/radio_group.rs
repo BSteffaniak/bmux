@@ -9,9 +9,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::semantic::SemanticRegion;
@@ -231,6 +230,7 @@ pub struct RadioGroupComponent<'a, 'state> {
     id: LayoutId,
     group: RadioGroup<'a>,
     state: &'state Cell<RadioGroupState>,
+    fallback: Style,
 }
 
 impl<'a, 'state> RadioGroupComponent<'a, 'state> {
@@ -245,6 +245,7 @@ impl<'a, 'state> RadioGroupComponent<'a, 'state> {
             id: id.into(),
             group: RadioGroup::new(options),
             state,
+            fallback: Style::new(),
         }
     }
 
@@ -261,6 +262,13 @@ impl<'a, 'state> RadioGroupComponent<'a, 'state> {
         self.group.styles = styles;
         self
     }
+
+    /// Set the style inherited by otherwise unstyled cells in each option row.
+    #[must_use]
+    pub const fn fallback_style(mut self, fallback: Style) -> Self {
+        self.fallback = fallback;
+        self
+    }
 }
 
 impl Component for RadioGroupComponent<'_, '_> {
@@ -275,6 +283,7 @@ impl Component for RadioGroupComponent<'_, '_> {
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.group.policy).hash(&mut paint);
         format!("{:?}", self.group.styles).hash(&mut paint);
+        format!("{:?}", self.fallback).hash(&mut paint);
         for option in self.group.options {
             option.disabled.hash(&mut paint);
         }
@@ -316,7 +325,11 @@ impl Component for RadioGroupComponent<'_, '_> {
         {
             let row = u16::try_from(index).unwrap_or(u16::MAX);
             let area = LocalRect::new(0, i64::from(row), layout.size.width, 1);
-            cx.write_line(area, &self.group.line(index, option, state));
+            cx.write_line_with_fallback_style(
+                area,
+                &self.group.line(index, option, state),
+                self.fallback,
+            );
             cx.push_hit(
                 SceneRegion::new(
                     format!("{}:{}", self.id.as_str(), option.id),
@@ -400,73 +413,6 @@ impl<'a> RadioGroup<'a> {
             u16::try_from(width).unwrap_or(u16::MAX).saturating_add(4),
             u16::try_from(self.options.len()).unwrap_or(u16::MAX),
         )
-    }
-
-    /// Render the radio group.
-    pub fn render(&self, area: Rect, state: &RadioGroupState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("radio-group");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render and register this composite as one roving-focus tab stop.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &RadioGroupState,
-        frame: &mut Frame<'_>,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::ListItem)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
-        self.render_body(area, state, frame, Style::new());
-    }
-
-    /// Render the radio group with a fallback style filling each option row.
-    pub fn render_with_fallback_style(
-        &self,
-        area: Rect,
-        state: &RadioGroupState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        let id = frame.next_interaction_id("radio-group");
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::ListItem)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
-        self.render_body(area, state, frame, fallback);
-    }
-
-    fn render_body(
-        &self,
-        area: Rect,
-        state: &RadioGroupState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        for (index, option) in self
-            .options
-            .iter()
-            .take(usize::from(area.height))
-            .enumerate()
-        {
-            let row = area
-                .y
-                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            frame.write_line_with_fallback_style(
-                Rect::new(area.x, row, area.width, 1),
-                &self.line(index, option, *state),
-                fallback,
-            );
-        }
     }
 
     /// Handle one input event.
@@ -772,18 +718,18 @@ mod tests {
             RadioOption::new("small", "Small"),
             RadioOption::new("large", "Large"),
         ];
-        let group = RadioGroup::new(&options);
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(1)));
+        let component = RadioGroupComponent::new("size", &options, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 12, 2).size()),
+            &mut LayoutCx::new(),
+        );
         let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
         let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
 
-        group.render(
-            Rect::new(0, 0, 12, 2),
-            &RadioGroupState::new(Some(1)),
-            &mut frame,
-        );
-
-        assert_eq!(frame.hits().focus_targets(None).len(), 1);
-        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 12, 2));
+        assert_eq!(frame.hits().focus_targets(None).len(), 2);
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 12, 1));
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("( ) Small   ")
