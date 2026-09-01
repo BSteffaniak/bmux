@@ -1,9 +1,17 @@
 //! Resizable panel-group layout and divider interaction.
 
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+
+use bmux_tui::component::{
+    ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 
 use crate::common::DragState;
@@ -13,7 +21,7 @@ use crate::selection::{
 };
 
 /// Direction panels are laid out in a [`PanelGroup`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelGroupAxis {
     /// Panels are laid left-to-right with vertical dividers.
     Horizontal,
@@ -22,7 +30,7 @@ pub enum PanelGroupAxis {
 }
 
 /// Requested panel size along the group's primary axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelSize {
     /// Fixed cell count.
     Fixed(u16),
@@ -45,7 +53,7 @@ impl PanelSize {
 }
 
 /// Per-panel resize limits along the group's primary axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PanelGroupConstraints {
     /// Minimum panel size in cells.
     pub min: u16,
@@ -387,6 +395,288 @@ pub struct PanelGroup {
     axis: PanelGroupAxis,
     policy: PanelGroupPolicy,
     styles: PanelGroupStyles,
+}
+
+/// Child-owning panel group on the canonical component lifecycle.
+///
+/// Panel placement, divider painting, hit registration, and event routing all
+/// consume the same resolved [`LayoutNode`]. Interactive state remains
+/// caller-owned.
+pub struct PanelGroupComponent<'a> {
+    id: LayoutId,
+    group: PanelGroup,
+    state: &'a RefCell<PanelGroupState>,
+    children: Vec<Element<'a>>,
+}
+
+impl<'a> PanelGroupComponent<'a> {
+    /// Create a component using `group` policy and caller-owned `state`.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        group: PanelGroup,
+        state: &'a RefCell<PanelGroupState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            group,
+            state,
+            children: Vec::new(),
+        }
+    }
+
+    /// Append one panel child in primary-axis order.
+    #[must_use]
+    pub fn child(mut self, child: impl Component + 'a) -> Self {
+        self.children.push(Element::new(child));
+        self
+    }
+
+    fn local_area(layout: &LayoutNode) -> Rect {
+        Rect::new(
+            0,
+            0,
+            layout.size.width,
+            u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+        )
+    }
+
+    fn panel_rects(layout: &LayoutNode) -> Vec<Rect> {
+        layout
+            .children
+            .iter()
+            .map(|child| {
+                Rect::new(
+                    child.x,
+                    u16::try_from(child.y).unwrap_or(u16::MAX),
+                    child.node.size.width,
+                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+                )
+            })
+            .collect()
+    }
+
+    fn divider_rects(&self, layout: &LayoutNode) -> Vec<Rect> {
+        layout
+            .children
+            .windows(2)
+            .map(|pair| match self.group.axis {
+                PanelGroupAxis::Horizontal => Rect::new(
+                    pair[0].x.saturating_add(pair[0].node.size.width),
+                    0,
+                    1,
+                    u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+                ),
+                PanelGroupAxis::Vertical => Rect::new(
+                    0,
+                    u16::try_from(pair[0].y.saturating_add(pair[0].node.size.height))
+                        .unwrap_or(u16::MAX),
+                    layout.size.width,
+                    1,
+                ),
+            })
+            .collect()
+    }
+
+    fn resolved_layout(&self, layout: &LayoutNode) -> PanelGroupLayout {
+        PanelGroupLayout {
+            panels: Self::panel_rects(layout),
+            dividers: self.divider_rects(layout),
+        }
+    }
+
+    fn paint_interaction(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let resolved = self.resolved_layout(layout);
+        let state = self.state.borrow();
+        if self.group.policy.focus.enabled && self.group.policy.mouse.click_to_focus {
+            for (index, panel) in resolved.panels.iter().copied().enumerate() {
+                cx.push_hit(
+                    SceneRegion::new(format!("{}.panel.{index}", self.id.as_str()), panel)
+                        .role(HitRole::Background)
+                        .focusable(false),
+                );
+            }
+        }
+        let divider_interactive = self.group.policy.mouse.enabled
+            && (self.group.policy.mouse.hover_dividers
+                || (self.group.policy.mouse.drag_dividers && self.group.policy.resize.enabled));
+        for (index, divider) in resolved.dividers.iter().copied().enumerate() {
+            if divider_interactive {
+                cx.push_hit(
+                    SceneRegion::new(format!("{}.divider.{index}", self.id.as_str()), divider)
+                        .role(HitRole::ResizeHandle)
+                        .hoverable(self.group.policy.mouse.hover_dividers)
+                        .focusable(false),
+                );
+            }
+            let style = if state.active_divider() == Some(index) {
+                self.group.styles.active_divider
+            } else if state.hovered_divider == Some(index) {
+                self.group.styles.hovered_divider
+            } else {
+                self.group.styles.divider
+            };
+            let symbol = match self.group.axis {
+                PanelGroupAxis::Horizontal => "│",
+                PanelGroupAxis::Vertical => "─",
+            };
+            cx.fill(
+                LocalRect::new(
+                    i32::from(divider.x),
+                    i64::from(divider.y),
+                    divider.width,
+                    divider.height,
+                ),
+                symbol,
+                style,
+            );
+        }
+    }
+}
+
+impl Component for PanelGroupComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let state = self.state.borrow();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.group.axis.hash(&mut layout);
+        state.sizes.hash(&mut layout);
+        state.constraints.hash(&mut layout);
+        for child in &self.children {
+            child.revision().layout.hash(&mut layout);
+        }
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.group.policy).hash(&mut paint);
+        format!("{:?}", self.group.styles).hash(&mut paint);
+        state.focused_panel.hash(&mut paint);
+        state.hovered_divider.hash(&mut paint);
+        format!("{:?}", state.active_drag).hash(&mut paint);
+        for child in &self.children {
+            child.revision().paint.hash(&mut paint);
+        }
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let state = self.state.borrow();
+        let count = self.children.len().min(state.sizes.len());
+        if count == 0 {
+            return LayoutNode::leaf(
+                self.id.clone(),
+                constraints.constrain(LogicalSize::new(constraints.max_width(), 0)),
+            );
+        }
+        let divider_count = count.saturating_sub(1);
+        let primary_max = match self.group.axis {
+            PanelGroupAxis::Horizontal => constraints.max_width(),
+            PanelGroupAxis::Vertical => u16::try_from(
+                constraints
+                    .max_height()
+                    .unwrap_or_else(|| usize::from(u16::MAX)),
+            )
+            .unwrap_or(u16::MAX),
+        };
+        let available = primary_max.saturating_sub(u16_saturating(divider_count));
+        let lengths = allocated_lengths_for_count(available, &state, count);
+        let mut children = Vec::with_capacity(count);
+        let mut cursor = 0usize;
+        let mut cross = 0usize;
+        for (index, child) in self.children.iter().take(count).enumerate() {
+            let primary = lengths[index];
+            let child_constraints = match self.group.axis {
+                PanelGroupAxis::Horizontal => Constraints::new(
+                    primary,
+                    primary,
+                    constraints.min_height(),
+                    constraints.max_height(),
+                ),
+                PanelGroupAxis::Vertical => Constraints::new(
+                    constraints.min_width(),
+                    constraints.max_width(),
+                    usize::from(primary),
+                    Some(usize::from(primary)),
+                ),
+            };
+            let node = child.layout(child_constraints, cx);
+            match self.group.axis {
+                PanelGroupAxis::Horizontal => {
+                    cross = cross.max(node.size.height);
+                    children.push(ChildLayout::new(
+                        u16::try_from(cursor).unwrap_or(u16::MAX),
+                        0,
+                        node,
+                    ));
+                }
+                PanelGroupAxis::Vertical => {
+                    cross = cross.max(usize::from(node.size.width));
+                    children.push(ChildLayout::new(0, cursor, node));
+                }
+            }
+            cursor = cursor
+                .saturating_add(usize::from(primary))
+                .saturating_add(usize::from(index + 1 < count));
+        }
+        let proposed = match self.group.axis {
+            PanelGroupAxis::Horizontal => {
+                LogicalSize::new(u16::try_from(cursor).unwrap_or(u16::MAX), cross)
+            }
+            PanelGroupAxis::Vertical => {
+                LogicalSize::new(u16::try_from(cross).unwrap_or(u16::MAX), cursor)
+            }
+        };
+        LayoutNode::with_children(self.id.clone(), constraints.constrain(proposed), children)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        for (child, component) in layout.children.iter().zip(&self.children) {
+            cx.with_child(
+                i32::from(child.x),
+                i64::try_from(child.y).unwrap_or(i64::MAX),
+                LocalRect::new(
+                    0,
+                    0,
+                    child.node.size.width,
+                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+                ),
+                |cx| component.paint(&child.node, cx),
+            );
+        }
+        self.paint_interaction(layout, cx);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let area = cx
+            .find_visible_rect(&self.id)
+            .unwrap_or_else(|| Self::local_area(layout));
+        let outcome = self
+            .group
+            .handle_event(area, &mut self.state.borrow_mut(), event);
+        if outcome != PanelGroupOutcome::Ignored {
+            return EventOutcome::Handled;
+        }
+        for (child, component) in layout.children.iter().zip(&self.children).rev() {
+            let clip = Rect::new(
+                area.x.saturating_add(child.x),
+                area.y
+                    .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
+                child.node.size.width,
+                u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+            );
+            let outcome = cx.with_transform(
+                child.x,
+                child.y,
+                i32::from(clip.x),
+                i64::from(clip.y),
+                clip,
+                |cx| component.event(event, &child.node, cx),
+            );
+            if outcome != EventOutcome::Ignored {
+                return outcome;
+            }
+        }
+        EventOutcome::Ignored
+    }
 }
 
 impl PanelGroup {
@@ -745,10 +1035,15 @@ const fn primary_len(axis: PanelGroupAxis, area: Rect) -> u16 {
 }
 
 fn allocated_lengths(available: u16, state: &PanelGroupState) -> Vec<u16> {
-    let mut lengths = vec![0; state.sizes.len()];
+    allocated_lengths_for_count(available, state, state.sizes.len())
+}
+
+fn allocated_lengths_for_count(available: u16, state: &PanelGroupState, count: usize) -> Vec<u16> {
+    let count = count.min(state.sizes.len());
+    let mut lengths = vec![0; count];
     let mut remaining = available;
     let mut total_weight: u16 = 0;
-    for (index, size) in state.sizes.iter().copied().enumerate() {
+    for (index, size) in state.sizes.iter().copied().take(count).enumerate() {
         match size {
             PanelSize::Fixed(cells) => {
                 let clamped = state.constraint(index).clamp(cells).min(remaining);
@@ -766,6 +1061,7 @@ fn allocated_lengths(available: u16, state: &PanelGroupState) -> Vec<u16> {
     let flex_indices = state
         .sizes
         .iter()
+        .take(count)
         .enumerate()
         .filter_map(|(index, size)| matches!(size, PanelSize::Flex(_)).then_some(index))
         .collect::<Vec<_>>();
@@ -838,19 +1134,24 @@ impl From<crate::theme::ComponentTheme> for PanelGroupStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::composition::TextContent;
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::selection::{
         SelectionCapture, SelectionController, SelectionFragment, SelectionGesturePhase,
         SelectionOutcome,
     };
 
     use super::{
-        PanelGroup, PanelGroupAxis, PanelGroupConstraints, PanelGroupOutcome, PanelGroupPolicy,
-        PanelGroupState, PanelSize,
+        PanelGroup, PanelGroupAxis, PanelGroupComponent, PanelGroupConstraints, PanelGroupOutcome,
+        PanelGroupPolicy, PanelGroupState, PanelSize,
     };
     use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
 
@@ -1157,6 +1458,74 @@ mod tests {
         assert_eq!(snapshot.slices.len(), 2);
         assert_eq!(snapshot.slices[0].content_id.as_str(), "panel-0");
         assert_eq!(snapshot.slices[1].content_id.as_str(), "panel-1");
+    }
+
+    #[test]
+    fn component_layout_paint_and_events_share_resolved_panel_geometry() {
+        let state = RefCell::new(PanelGroupState::new([
+            PanelSize::fixed(4),
+            PanelSize::flex(1),
+        ]));
+        let component = PanelGroupComponent::new(
+            "workspace",
+            PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::interactive()),
+            &state,
+        )
+        .child(TextContent::new("left").id("left"))
+        .child(TextContent::new("right").id("right"));
+        let layout = component.layout(Constraints::new(10, 10, 2, Some(2)), &mut LayoutCx::new());
+
+        assert_eq!(layout.children.len(), 2);
+        assert_eq!(layout.children[0].x, 0);
+        assert_eq!(layout.children[0].node.size.width, 4);
+        assert_eq!(layout.children[1].x, 5);
+        assert_eq!(layout.children[1].node.size.width, 5);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame
+                .buffer()
+                .get(Point::new(4, 0))
+                .map(|cell| cell.symbol.as_str()),
+            Some("│")
+        );
+        assert!(frame.hits().regions().iter().any(|region| {
+            region.id.as_str() == "workspace.divider.0" && region.area == Rect::new(4, 0, 1, 2)
+        }));
+
+        let mut event_cx = EventCx::new(&layout);
+        assert_eq!(
+            component.event(
+                &mouse_event(MouseEventKind::Move, 4, 0),
+                &layout,
+                &mut event_cx,
+            ),
+            EventOutcome::Handled
+        );
+        assert_eq!(state.borrow().hovered_divider(), Some(0));
+    }
+
+    #[test]
+    fn component_vertical_layout_respects_exact_requested_panel_sizes() {
+        let state = RefCell::new(PanelGroupState::new([
+            PanelSize::fixed(2),
+            PanelSize::flex(1),
+        ]));
+        let component = PanelGroupComponent::new(
+            "vertical",
+            PanelGroup::new(PanelGroupAxis::Vertical),
+            &state,
+        )
+        .child(TextContent::new("top"))
+        .child(TextContent::new("bottom"));
+        let layout = component.layout(Constraints::new(6, 6, 6, Some(6)), &mut LayoutCx::new());
+
+        assert_eq!(layout.children[0].y, 0);
+        assert_eq!(layout.children[0].node.size.height, 2);
+        assert_eq!(layout.children[1].y, 3);
+        assert_eq!(layout.children[1].node.size.height, 3);
     }
 
     fn mouse_event(kind: MouseEventKind, x: u16, y: u16) -> Event {

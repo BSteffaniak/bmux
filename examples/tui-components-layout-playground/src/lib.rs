@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
@@ -20,7 +22,8 @@ use bmux_tui_components::pane::{
     Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
 };
 use bmux_tui_components::panel_group::{
-    PanelGroup, PanelGroupAxis, PanelGroupOutcome, PanelGroupPolicy, PanelGroupState, PanelSize,
+    PanelGroup, PanelGroupAxis, PanelGroupComponent, PanelGroupOutcome, PanelGroupPolicy,
+    PanelGroupState, PanelSize,
 };
 
 pub const WIDTH: u16 = 72;
@@ -58,7 +61,7 @@ impl LayoutPlaygroundDemo {
             frame,
             self.terminal_area,
             &self.pane_state,
-            &self.panel_group_state,
+            &RefCell::new(self.panel_group_state.clone()),
             &self.message,
         );
     }
@@ -177,7 +180,7 @@ fn render_playground(
     frame: &mut Frame<'_>,
     terminal_area: Rect,
     pane_state: &PaneState,
-    panel_group_state: &PanelGroupState,
+    panel_group_state: &RefCell<PanelGroupState>,
     message: &str,
 ) {
     let pane = interactive_pane(terminal_area);
@@ -213,21 +216,16 @@ fn render_playground(
         .content_style(Style::new().bg(Color::Black))
         .render(block_area, frame);
 
-    let group = interactive_panel_group();
     let group_area = panel_group_area();
-    let group_layout = group.layout(group_area, panel_group_state);
-    for (index, area) in group_layout.panels.iter().copied().enumerate() {
-        frame.write_line(
-            Rect::new(
-                area.x.saturating_add(1),
-                area.y,
-                area.width.saturating_sub(1),
-                1,
-            ),
-            &Line::from(format!("Panel {index}")),
-        );
-    }
-    group.render_dividers(group_area, panel_group_state, frame);
+    let group = PanelGroupComponent::new(
+        "playground.panel-group",
+        interactive_panel_group(),
+        panel_group_state,
+    )
+    .child(TextContent::new(" Panel 0").id("playground.panel.0"))
+    .child(TextContent::new(" Panel 1").id("playground.panel.1"))
+    .child(TextContent::new(" Panel 2").id("playground.panel.2"));
+    render_component(&group, group_area, frame);
 
     frame.write_line(Rect::new(1, 16, 68, 1), &Line::from(message));
 }
