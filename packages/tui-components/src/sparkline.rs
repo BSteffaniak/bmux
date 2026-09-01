@@ -6,7 +6,6 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
@@ -175,7 +174,10 @@ impl Default for SparklineStyles {
 /// Canonical component-lifecycle sparkline.
 pub struct SparklineComponent<'a> {
     id: LayoutId,
-    sparkline: Sparkline<'a>,
+    samples: &'a [u64],
+    policy: SparklinePolicy,
+    styles: SparklineStyles,
+    empty: &'a str,
 }
 
 impl<'a> SparklineComponent<'a> {
@@ -184,181 +186,8 @@ impl<'a> SparklineComponent<'a> {
     pub fn new(id: impl Into<LayoutId>, samples: &'a [u64]) -> Self {
         Self {
             id: id.into(),
-            sparkline: Sparkline::new(samples),
-        }
-    }
-
-    /// Set rendering policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: SparklinePolicy) -> Self {
-        self.sparkline.policy = policy;
-        self
-    }
-
-    /// Set visual styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: SparklineStyles) -> Self {
-        self.sparkline.styles = styles;
-        self
-    }
-
-    /// Set empty message.
-    #[must_use]
-    pub const fn empty(mut self, empty: &'a str) -> Self {
-        self.sparkline.empty = empty;
-        self
-    }
-}
-
-impl Component for SparklineComponent<'_> {
-    fn revision(&self) -> ComponentRevision {
-        let mut layout = std::collections::hash_map::DefaultHasher::new();
-        self.id.as_str().hash(&mut layout);
-        self.sparkline.samples.hash(&mut layout);
-        self.sparkline.empty.hash(&mut layout);
-        self.sparkline.policy.max.hash(&mut layout);
-        self.sparkline.policy.window.hash(&mut layout);
-        self.sparkline.policy.symbols.hash(&mut layout);
-
-        let mut paint = std::collections::hash_map::DefaultHasher::new();
-        self.sparkline.policy.direction.hash(&mut paint);
-        self.sparkline.policy.highlight_latest.hash(&mut paint);
-        self.sparkline.policy.highlight_first.hash(&mut paint);
-        self.sparkline.policy.highlight_high.hash(&mut paint);
-        self.sparkline.policy.highlight_low.hash(&mut paint);
-        self.sparkline.policy.background.hash(&mut paint);
-        self.sparkline.styles.normal.hash(&mut paint);
-        self.sparkline.styles.latest.hash(&mut paint);
-        self.sparkline.styles.first.hash(&mut paint);
-        self.sparkline.styles.high.hash(&mut paint);
-        self.sparkline.styles.low.hash(&mut paint);
-        self.sparkline.styles.empty.hash(&mut paint);
-        self.sparkline.styles.background.hash(&mut paint);
-        ComponentRevision::new(layout.finish(), paint.finish())
-    }
-
-    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        cx.record_measurement();
-        let maximum_samples = self
-            .sparkline
-            .policy
-            .window
-            .unwrap_or(self.sparkline.samples.len())
-            .min(self.sparkline.samples.len());
-        let intrinsic_width = if maximum_samples == 0 || self.sparkline.policy.symbols.is_empty() {
-            bmux_tui::text_width::display_width(self.sparkline.empty)
-        } else {
-            let samples = &self.sparkline.samples
-                [self.sparkline.samples.len().saturating_sub(maximum_samples)..];
-            let max = self
-                .sparkline
-                .policy
-                .max
-                .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
-            samples
-                .iter()
-                .map(|sample| {
-                    bmux_tui::text_width::display_width(self.sparkline.glyph_for(*sample, max))
-                })
-                .sum()
-        };
-        let width = if constraints.min_width() == constraints.max_width() {
-            constraints.max_width()
-        } else {
-            u16::try_from(intrinsic_width)
-                .unwrap_or(u16::MAX)
-                .clamp(constraints.min_width(), constraints.max_width())
-        };
-        let height = usize::from(width > 0);
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("chart"))
-    }
-
-    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        if layout.size.width == 0 || layout.size.height == 0 {
-            return;
-        }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
-        if self.sparkline.policy.background {
-            cx.fill(area, " ", self.sparkline.styles.background);
-        }
-        let samples = self.sparkline.visible_samples(layout.size.width);
-        if samples.is_empty() || self.sparkline.policy.symbols.is_empty() {
-            cx.write_line_with_fallback_style(
-                area,
-                &Line::from(self.sparkline.empty),
-                self.sparkline.styles.empty,
-            );
-        } else {
-            let max = self
-                .sparkline
-                .policy
-                .max
-                .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
-            let high = samples.iter().copied().max().unwrap_or(0);
-            let low = samples.iter().copied().min().unwrap_or(0);
-            let last = samples.len().saturating_sub(1);
-            let iter: Box<dyn Iterator<Item = (usize, &u64)> + '_> =
-                match self.sparkline.policy.direction {
-                    SparklineDirection::LeftToRight => Box::new(samples.iter().enumerate()),
-                    SparklineDirection::RightToLeft => Box::new(samples.iter().enumerate().rev()),
-                };
-            let spans = iter
-                .map(|(index, sample)| {
-                    let style = if self.sparkline.policy.highlight_latest && index == last {
-                        self.sparkline.styles.latest
-                    } else if self.sparkline.policy.highlight_first && index == 0 {
-                        self.sparkline.styles.first
-                    } else if self.sparkline.policy.highlight_high && *sample == high {
-                        self.sparkline.styles.high
-                    } else if self.sparkline.policy.highlight_low && *sample == low {
-                        self.sparkline.styles.low
-                    } else {
-                        self.sparkline.styles.normal
-                    };
-                    Span::styled(self.sparkline.glyph_for(*sample, max), style)
-                })
-                .collect::<Vec<_>>();
-            cx.write_line(area, &Line::from_spans(spans));
-        }
-        cx.push_semantic(SemanticRegion::new(
-            self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
-            "chart",
-        ));
-        cx.push_damage(area);
-    }
-}
-
-/// Compact sparkline over caller-owned samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Sparkline<'a> {
-    samples: &'a [u64],
-    policy: SparklinePolicy,
-    styles: SparklineStyles,
-    empty: &'a str,
-}
-
-impl<'a> Sparkline<'a> {
-    /// Create a sparkline over caller-owned samples.
-    #[must_use]
-    pub const fn new(samples: &'a [u64]) -> Self {
-        Self {
             samples,
-            policy: SparklinePolicy {
-                max: None,
-                window: None,
-                direction: SparklineDirection::LeftToRight,
-                symbols: &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
-                highlight_latest: true,
-                highlight_first: false,
-                highlight_high: false,
-                highlight_low: false,
-                background: false,
-            },
+            policy: SparklinePolicy::compact(),
             styles: SparklineStyles {
                 normal: Style::new(),
                 latest: Style::new(),
@@ -392,7 +221,121 @@ impl<'a> Sparkline<'a> {
         self.empty = empty;
         self
     }
+}
 
+impl Component for SparklineComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.samples.hash(&mut layout);
+        self.empty.hash(&mut layout);
+        self.policy.max.hash(&mut layout);
+        self.policy.window.hash(&mut layout);
+        self.policy.symbols.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.policy.direction.hash(&mut paint);
+        self.policy.highlight_latest.hash(&mut paint);
+        self.policy.highlight_first.hash(&mut paint);
+        self.policy.highlight_high.hash(&mut paint);
+        self.policy.highlight_low.hash(&mut paint);
+        self.policy.background.hash(&mut paint);
+        self.styles.normal.hash(&mut paint);
+        self.styles.latest.hash(&mut paint);
+        self.styles.first.hash(&mut paint);
+        self.styles.high.hash(&mut paint);
+        self.styles.low.hash(&mut paint);
+        self.styles.empty.hash(&mut paint);
+        self.styles.background.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let maximum_samples = self
+            .policy
+            .window
+            .unwrap_or(self.samples.len())
+            .min(self.samples.len());
+        let intrinsic_width = if maximum_samples == 0 || self.policy.symbols.is_empty() {
+            bmux_tui::text_width::display_width(self.empty)
+        } else {
+            let samples = &self.samples[self.samples.len().saturating_sub(maximum_samples)..];
+            let max = self
+                .policy
+                .max
+                .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
+            samples
+                .iter()
+                .map(|sample| bmux_tui::text_width::display_width(self.glyph_for(*sample, max)))
+                .sum()
+        };
+        let width = if constraints.min_width() == constraints.max_width() {
+            constraints.max_width()
+        } else {
+            u16::try_from(intrinsic_width)
+                .unwrap_or(u16::MAX)
+                .clamp(constraints.min_width(), constraints.max_width())
+        };
+        let height = usize::from(width > 0);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, height)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("chart"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        if self.policy.background {
+            cx.fill(area, " ", self.styles.background);
+        }
+        let samples = self.visible_samples(layout.size.width);
+        if samples.is_empty() || self.policy.symbols.is_empty() {
+            cx.write_line_with_fallback_style(area, &Line::from(self.empty), self.styles.empty);
+        } else {
+            let max = self
+                .policy
+                .max
+                .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
+            let high = samples.iter().copied().max().unwrap_or(0);
+            let low = samples.iter().copied().min().unwrap_or(0);
+            let last = samples.len().saturating_sub(1);
+            let iter: Box<dyn Iterator<Item = (usize, &u64)> + '_> = match self.policy.direction {
+                SparklineDirection::LeftToRight => Box::new(samples.iter().enumerate()),
+                SparklineDirection::RightToLeft => Box::new(samples.iter().enumerate().rev()),
+            };
+            let spans = iter
+                .map(|(index, sample)| {
+                    let style = if self.policy.highlight_latest && index == last {
+                        self.styles.latest
+                    } else if self.policy.highlight_first && index == 0 {
+                        self.styles.first
+                    } else if self.policy.highlight_high && *sample == high {
+                        self.styles.high
+                    } else if self.policy.highlight_low && *sample == low {
+                        self.styles.low
+                    } else {
+                        self.styles.normal
+                    };
+                    Span::styled(self.glyph_for(*sample, max), style)
+                })
+                .collect::<Vec<_>>();
+            cx.write_line(area, &Line::from_spans(spans));
+        }
+        cx.push_semantic(SemanticRegion::new(
+            self.id.as_str(),
+            Rect::new(0, 0, layout.size.width, 1),
+            "chart",
+        ));
+        cx.push_damage(area);
+    }
+}
+
+impl<'a> SparklineComponent<'a> {
     /// Return visible samples for `width`.
     #[must_use]
     pub fn visible_samples(&self, width: u16) -> &'a [u64] {
@@ -403,49 +346,6 @@ impl<'a> Sparkline<'a> {
     #[must_use]
     pub fn glyph_for(&self, value: u64, max: u64) -> &'static str {
         glyph_for(value, max, self.policy.symbols)
-    }
-
-    /// Render sparkline.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
-        if self.policy.background {
-            frame.fill(area, " ", self.styles.background);
-        }
-        let samples = self.visible_samples(area.width);
-        if samples.is_empty() || self.policy.symbols.is_empty() {
-            frame.write_line_with_fallback_style(area, &Line::from(self.empty), self.styles.empty);
-            return;
-        }
-        let max = self
-            .policy
-            .max
-            .unwrap_or_else(|| samples.iter().copied().max().unwrap_or(0));
-        let high = samples.iter().copied().max().unwrap_or(0);
-        let low = samples.iter().copied().min().unwrap_or(0);
-        let last = samples.len().saturating_sub(1);
-        let iter: Box<dyn Iterator<Item = (usize, &u64)> + '_> = match self.policy.direction {
-            SparklineDirection::LeftToRight => Box::new(samples.iter().enumerate()),
-            SparklineDirection::RightToLeft => Box::new(samples.iter().enumerate().rev()),
-        };
-        let spans = iter
-            .map(|(index, sample)| {
-                let style = if self.policy.highlight_latest && index == last {
-                    self.styles.latest
-                } else if self.policy.highlight_first && index == 0 {
-                    self.styles.first
-                } else if self.policy.highlight_high && *sample == high {
-                    self.styles.high
-                } else if self.policy.highlight_low && *sample == low {
-                    self.styles.low
-                } else {
-                    self.styles.normal
-                };
-                Span::styled(self.glyph_for(*sample, max), style)
-            })
-            .collect::<Vec<_>>();
-        frame.write_line(area, &Line::from_spans(spans));
     }
 }
 
@@ -499,157 +399,88 @@ mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::paint::PaintCx;
     use bmux_tui::style::{Color, Style};
 
-    use super::{
-        Sparkline, SparklineComponent, SparklineDirection, SparklinePolicy, SparklineStyles,
-    };
+    use super::{SparklineComponent, SparklineDirection, SparklinePolicy, SparklineStyles};
 
-    #[test]
-    fn tiny_area_does_not_panic() {
-        let samples = [1, 2, 3];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+    fn render(component: &SparklineComponent<'_>, width: u16) -> Buffer {
+        let layout = component.layout(
+            Constraints::tight(Size::new(width, 1)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
         let mut frame = Frame::new(&mut buffer);
-
-        Sparkline::new(&samples).render(Rect::new(0, 0, 0, 0), &mut frame);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        buffer
     }
 
     #[test]
-    fn maps_empty_samples_to_empty_message() {
-        let samples = [];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-        let mut frame = Frame::new(&mut buffer);
+    fn canonical_paint_maps_empty_and_ascending_samples() {
+        let empty = render(&SparklineComponent::new("empty", &[]), 8);
+        assert_eq!(empty.row_symbols(0).as_deref(), Some("No data "));
 
-        Sparkline::new(&samples).render(Rect::new(0, 0, 8, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("No data "));
-    }
-
-    #[test]
-    fn renders_ascending_samples() {
         let samples = [0, 1, 2, 3];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Sparkline::new(&samples)
-            .policy(SparklinePolicy::bare().max(Some(3)))
-            .render(Rect::new(0, 0, 4, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▁▃▅█"));
+        let ascending = render(
+            &SparklineComponent::new("ascending", &samples)
+                .policy(SparklinePolicy::bare().max(Some(3))),
+            4,
+        );
+        assert_eq!(ascending.row_symbols(0).as_deref(), Some("▁▃▅█"));
     }
 
     #[test]
-    fn renders_descending_samples() {
-        let samples = [3, 2, 1, 0];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
-        let mut frame = Frame::new(&mut buffer);
+    fn canonical_paint_supports_direction_window_and_highlights() {
+        let samples = [0, 1, 2, 3, 4];
+        let reversed = render(
+            &SparklineComponent::new("reversed", &samples).policy(
+                SparklinePolicy::bare()
+                    .max(Some(4))
+                    .window(Some(4))
+                    .direction(SparklineDirection::RightToLeft),
+            ),
+            4,
+        );
+        assert_eq!(reversed.row_symbols(0).as_deref(), Some("█▆▄▂"));
 
-        Sparkline::new(&samples)
-            .policy(SparklinePolicy::bare().max(Some(3)))
-            .render(Rect::new(0, 0, 4, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█▅▃▁"));
-    }
-
-    #[test]
-    fn flat_zero_samples_use_lowest_symbol() {
-        let samples = [0, 0, 0];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Sparkline::new(&samples).render(Rect::new(0, 0, 3, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▁▁▁"));
-    }
-
-    #[test]
-    fn max_override_scales_non_zero_flat_samples() {
-        let samples = [5, 5, 5];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Sparkline::new(&samples)
-            .policy(SparklinePolicy::bare().max(Some(10)))
-            .render(Rect::new(0, 0, 3, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("▄▄▄"));
-    }
-
-    #[test]
-    fn first_latest_and_high_samples_can_be_styled() {
-        let samples = [2, 3, 1];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
-        let mut frame = Frame::new(&mut buffer);
         let styles = SparklineStyles {
-            first: Style::new().fg(Color::Blue),
             high: Style::new().fg(Color::Green),
             low: Style::new().fg(Color::Red),
-            latest: Style::new().fg(Color::Yellow),
             ..SparklineStyles::default()
         };
-
-        Sparkline::new(&samples)
-            .policy(
-                SparklinePolicy::bare()
-                    .highlight_first(true)
-                    .highlight_high(true)
-                    .highlight_low(true),
-            )
-            .styles(styles)
-            .render(Rect::new(0, 0, 3, 1), &mut frame);
-
-        assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(0, 0))
-                .map(|cell| cell.style.fg),
-            Some(Some(Color::Blue))
+        let highlighted = render(
+            &SparklineComponent::new("highlighted", &samples)
+                .policy(
+                    SparklinePolicy::bare()
+                        .max(Some(4))
+                        .highlight_high(true)
+                        .highlight_low(true),
+                )
+                .styles(styles),
+            5,
         );
         assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(1, 0))
-                .map(|cell| cell.style.fg),
-            Some(Some(Color::Green))
+            highlighted.get(Point::new(0, 0)).expect("low").style.fg,
+            Some(Color::Red)
         );
         assert_eq!(
-            frame
-                .buffer()
-                .get(Point::new(2, 0))
-                .map(|cell| cell.style.fg),
-            Some(Some(Color::Red))
+            highlighted.get(Point::new(4, 0)).expect("high").style.fg,
+            Some(Color::Green)
         );
     }
 
     #[test]
-    fn right_to_left_direction_renders_latest_first() {
-        let samples = [1, 2, 3];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        Sparkline::new(&samples)
-            .policy(
-                SparklinePolicy::bare()
-                    .max(Some(3))
-                    .direction(SparklineDirection::RightToLeft),
-            )
-            .render(Rect::new(0, 0, 3, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█▅▃"));
-    }
-
-    #[test]
-    fn window_and_width_clip_to_latest_samples() {
+    fn component_queries_visible_samples_and_glyphs() {
         let samples = [1, 2, 3, 4, 5];
-        let sparkline = Sparkline::new(&samples).policy(SparklinePolicy::bare().window(Some(4)));
-
-        assert_eq!(sparkline.visible_samples(2), &[4, 5]);
+        let component = SparklineComponent::new("traffic", &samples)
+            .policy(SparklinePolicy::bare().window(Some(4)));
+        assert_eq!(component.visible_samples(2), &[4, 5]);
+        assert_eq!(component.glyph_for(3, 5), "▅");
     }
 
     #[test]
-    fn component_measures_and_paints_chart_metadata() {
+    fn component_measures_paints_and_registers_chart() {
         let samples = [0, 1, 2, 3];
         let component = SparklineComponent::new("traffic", &samples)
             .policy(SparklinePolicy::bare().max(Some(3)));
@@ -694,11 +525,12 @@ mod tests {
     }
 
     #[test]
-    fn tiny_width_does_not_panic() {
+    fn zero_width_canonical_layout_and_paint_do_not_panic() {
         let samples = [1, 2, 3];
+        let component = SparklineComponent::new("tiny", &samples);
+        let layout = component.layout(Constraints::tight(Size::new(0, 0)), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
         let mut frame = Frame::new(&mut buffer);
-
-        Sparkline::new(&samples).render(Rect::new(0, 0, 0, 0), &mut frame);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
     }
 }
