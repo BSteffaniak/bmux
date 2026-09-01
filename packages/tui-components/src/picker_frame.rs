@@ -2,16 +2,14 @@
 
 use std::hash::{Hash, Hasher};
 
-use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode, LogicalSize, combine_child_revisions,
 };
 use bmux_tui::event::{Event, EventOutcome};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Line, Widget};
+use bmux_tui::prelude::Line;
 use bmux_tui::style::{Color, Modifier, Style};
 
 /// Picker overlay placement.
@@ -139,9 +137,8 @@ impl Default for PickerFrameStyles {
     }
 }
 
-/// Computed picker frame layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PickerFrameLayout {
+struct PickerFrameLayout {
     /// Full picker panel area.
     pub panel: Rect,
     /// Inner content area after chrome/padding.
@@ -221,16 +218,20 @@ impl<'a> PickerFrame<'a> {
         self
     }
 
-    /// Compute layout inside `area`.
-    #[must_use]
-    pub fn layout(&self, area: Rect) -> PickerFrameLayout {
+    fn resolved_layout(&self, area: Rect) -> PickerFrameLayout {
         let available = area.inset(self.policy.margin);
         let panel = place_rect(
             available,
             desired_size(available, self.policy),
             self.policy.placement,
         );
-        let inner = self.panel().inner_area(panel);
+        let border = u16::from(self.policy.chrome);
+        let inner = panel.inset(Insets::new(
+            self.policy.padding.top.saturating_add(border),
+            self.policy.padding.right.saturating_add(border),
+            self.policy.padding.bottom.saturating_add(border),
+            self.policy.padding.left.saturating_add(border),
+        ));
         let mut y = inner.y;
         let header =
             (self.policy.header && self.header.is_some() && y < inner.bottom()).then(|| {
@@ -262,37 +263,6 @@ impl<'a> PickerFrame<'a> {
             list,
             footer,
         }
-    }
-
-    /// Render frame chrome and configured header/footer text, returning layout.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) -> PickerFrameLayout {
-        let layout = self.layout(area);
-        self.panel().render(layout.panel, frame);
-        if let (Some(header_area), Some(header)) = (layout.header, &self.header) {
-            frame.write_line_with_fallback_style(header_area, header, self.styles.header);
-        }
-        if layout.input.is_some() {
-            frame.fill(layout.input.unwrap_or_default(), " ", self.styles.input);
-        }
-        frame.fill(layout.list, " ", self.styles.list);
-        if let (Some(footer_area), Some(footer)) = (layout.footer, &self.footer) {
-            frame.write_line_with_fallback_style(footer_area, footer, self.styles.footer);
-        }
-        layout
-    }
-
-    fn panel(&self) -> Panel {
-        let mut panel = Panel::new();
-        if self.policy.chrome {
-            panel = panel.border(Border::single().style(self.styles.border));
-            if let Some(title) = self.title {
-                panel = panel.title(title);
-            }
-        }
-        if self.policy.background {
-            panel = panel.background(self.styles.background);
-        }
-        panel.padding(self.policy.padding)
     }
 }
 
@@ -373,7 +343,7 @@ impl<'a> PickerFrameComponent<'a> {
     fn local_layout(&self, size: LogicalSize) -> PickerFrameLayout {
         let mut frame = self.frame.clone();
         frame.policy.margin = Insets::all(0);
-        frame.layout(Rect::new(
+        frame.resolved_layout(Rect::new(
             0,
             0,
             size.width,
@@ -670,6 +640,10 @@ mod tests {
 
     use super::{PickerFrame, PickerFrameComponent, PickerFramePlacement, PickerFramePolicy};
 
+    fn resolved_layout(frame: &PickerFrame<'_>, area: Rect) -> super::PickerFrameLayout {
+        frame.resolved_layout(area)
+    }
+
     #[test]
     fn computes_full_palette_layout() {
         let frame = PickerFrame::new()
@@ -678,7 +652,7 @@ mod tests {
             .footer("enter select")
             .policy(PickerFramePolicy::palette().max_size(Size::new(40, 10)));
 
-        let layout = frame.layout(Rect::new(0, 0, 80, 24));
+        let layout = resolved_layout(&frame, Rect::new(0, 0, 80, 24));
 
         assert_eq!(layout.panel, Rect::new(20, 5, 40, 10));
         assert_eq!(layout.inner, Rect::new(22, 7, 36, 6));
@@ -701,7 +675,7 @@ mod tests {
                 ..PickerFramePolicy::palette()
             });
 
-        let layout = frame.layout(Rect::new(0, 0, 40, 10));
+        let layout = resolved_layout(&frame, Rect::new(0, 0, 40, 10));
 
         assert_eq!(layout.input, None);
         assert_eq!(layout.footer, None);
@@ -712,7 +686,7 @@ mod tests {
     fn bare_layout_uses_whole_area_without_chrome() {
         let frame = PickerFrame::new().policy(PickerFramePolicy::bare());
 
-        let layout = frame.layout(Rect::new(1, 2, 12, 4));
+        let layout = resolved_layout(&frame, Rect::new(1, 2, 12, 4));
 
         assert_eq!(layout.panel, Rect::new(1, 2, 12, 4));
         assert_eq!(layout.inner, Rect::new(1, 2, 12, 4));
@@ -732,7 +706,7 @@ mod tests {
             ..PickerFramePolicy::palette()
         });
 
-        let layout = frame.layout(Rect::new(0, 0, 40, 10));
+        let layout = resolved_layout(&frame, Rect::new(0, 0, 40, 10));
 
         assert_eq!(layout.panel, Rect::new(30, 5, 10, 5));
     }
@@ -741,7 +715,7 @@ mod tests {
     fn tiny_area_degrades_without_invalid_rects() {
         let frame = PickerFrame::new().header("H").footer("F");
 
-        let layout = frame.layout(Rect::new(0, 0, 4, 3));
+        let layout = resolved_layout(&frame, Rect::new(0, 0, 4, 3));
 
         assert!(layout.panel.width <= 4);
         assert!(layout.panel.height <= 3);
@@ -819,41 +793,6 @@ mod tests {
         assert_eq!(
             layout.children[0].node.children[0].node.id.as_str(),
             "picker.list"
-        );
-    }
-
-    #[test]
-    fn render_writes_configured_chrome_and_text() {
-        let picker = PickerFrame::new()
-            .title("Pick")
-            .header("Header")
-            .footer("Footer")
-            .policy(PickerFramePolicy {
-                margin: Insets::all(0),
-                max_size: Size::new(20, 10),
-                ..PickerFramePolicy::palette()
-            });
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 12));
-        let mut frame = Frame::new(&mut buffer);
-
-        picker.render(Rect::new(0, 0, 40, 12), &mut frame);
-        assert!(
-            frame
-                .buffer()
-                .row_symbols(0)
-                .is_some_and(|row| row.contains("Pick"))
-        );
-        assert!(
-            frame
-                .buffer()
-                .row_symbols(2)
-                .is_some_and(|row| row.contains("Header"))
-        );
-        assert!(
-            frame
-                .buffer()
-                .row_symbols(7)
-                .is_some_and(|row| row.contains("Footer"))
         );
     }
 }

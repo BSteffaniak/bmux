@@ -1,11 +1,14 @@
 use bmux_tui::buffer::Buffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextContent;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Size};
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::button::{Button, ButtonState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
-use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy};
+use bmux_tui_components::picker_frame::{PickerFrame, PickerFrameComponent, PickerFramePolicy};
 use bmux_tui_components::theme::ComponentTheme;
 
 fn rendered(theme: ComponentTheme) -> Buffer {
@@ -22,11 +25,22 @@ fn rendered(theme: ComponentTheme) -> Buffer {
         &mut frame,
     );
 
-    PickerFrame::new()
-        .title("Picker")
-        .policy(PickerFramePolicy::palette().max_size(Size::new(18, 6)))
-        .styles(theme.picker_frame_styles())
-        .render(Rect::new(1, 3, 20, 7), &mut frame);
+    let picker = PickerFrameComponent::new(
+        "theme.picker",
+        PickerFrame::new()
+            .title("Picker")
+            .policy(PickerFramePolicy::palette().max_size(Size::new(18, 6)))
+            .styles(theme.picker_frame_styles()),
+        TextContent::new("").id("theme.picker.list"),
+    );
+    let picker_area = Rect::new(1, 3, 20, 7);
+    let layout = picker.layout(Constraints::tight(picker_area.size()), &mut LayoutCx::new());
+    PaintCx::new(&mut frame).with_child(
+        i32::from(picker_area.x),
+        i64::from(picker_area.y),
+        LocalRect::new(0, 0, picker_area.width, picker_area.height),
+        |cx| picker.paint(&layout, cx),
+    );
 
     ModalFrame::new(
         ModalSizing::fixed(Size::new(14, 5), Insets::all(0)),
