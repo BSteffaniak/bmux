@@ -18,7 +18,7 @@ use bmux_tui_components::select_dropdown::{
 use bmux_tui_components::text_input::{
     TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
-use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
+use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 16;
@@ -179,13 +179,21 @@ fn render_inputs_with_state(
     focused: usize,
     message: &str,
 ) {
-    let mut text_state = text.clone();
-    TextInputBox::new(TextInputPolicy::chat_composer())
-        .label("Name")
-        .required(true)
-        .help("Click the field, then type")
-        .policy(TextInputBoxPolicy::labeled_field().focused(focused == 0))
-        .render(Rect::new(1, 1, 34, 5), &mut text_state, frame);
+    let text_state = std::cell::RefCell::new(text.clone());
+    let component =
+        TextInputBoxComponent::new("inputs.name", TextInputPolicy::chat_composer(), &text_state)
+            .label("Name")
+            .required(true)
+            .help("Click the field, then type")
+            .policy(TextInputBoxPolicy::labeled_field().focused(focused == 0));
+    let text_area = Rect::new(1, 1, 34, 5);
+    let layout = component.layout(Constraints::tight(text_area.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(text_area.x),
+        i64::from(text_area.y),
+        LocalRect::new(0, 0, text_area.width, text_area.height),
+        |cx| component.paint(&layout, cx),
+    );
 
     let checkbox_state = std::cell::Cell::new(*checkbox);
     let component =

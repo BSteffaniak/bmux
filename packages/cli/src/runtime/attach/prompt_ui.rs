@@ -33,7 +33,9 @@ use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
 };
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
-use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy, TextInputBoxStyles};
+use bmux_tui_components::text_input_box::{
+    TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
+};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1275,6 +1277,16 @@ impl AttachPromptState {
     }
 }
 
+fn paint_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 fn paint_checkbox(
     id: impl Into<bmux_tui::component::LayoutId>,
     label: &str,
@@ -1288,13 +1300,7 @@ fn paint_checkbox(
     let component = CheckboxComponent::new(id, label, &state)
         .styles(styles)
         .fallback_style(fallback);
-    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
-        i32::from(area.x),
-        i64::from(area.y),
-        LocalRect::new(0, 0, area.width, area.height),
-        |cx| component.paint(&layout, cx),
-    );
+    paint_component(&component, area, frame);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Rendering one field keeps all concrete control projections together over canonical form state.
@@ -1335,22 +1341,26 @@ fn render_form_control(
             Some(PromptFormValue::Text(_) | PromptFormValue::Number(_)),
         ) => {
             let display = form_field_display(field, values, editors);
-            let mut state = TextInputState::new(
+            let state = std::cell::RefCell::new(TextInputState::new(
                 editors
                     .get(&field.id)
                     .cloned()
                     .unwrap_or_else(|| TextEditBuffer::from_text(display)),
-            );
-            let mut component = TextInputBox::new(TextInputPolicy::chat_composer())
-                .label(&field.label)
-                .required(field.required)
-                .policy(
-                    TextInputBoxPolicy::bare()
-                        .focused(focused)
-                        .disabled(field.disabled)
-                        .rows(1, Some(1)),
-                )
-                .styles(form_text_input_styles(theme));
+            ));
+            let mut component = TextInputBoxComponent::new(
+                format!("prompt.form.{}", field.id),
+                TextInputPolicy::chat_composer(),
+                &state,
+            )
+            .label(&field.label)
+            .required(field.required)
+            .policy(
+                TextInputBoxPolicy::bare()
+                    .focused(focused)
+                    .disabled(field.disabled)
+                    .rows(1, Some(1)),
+            )
+            .styles(form_text_input_styles(theme));
             if let PromptFormFieldKind::Text {
                 placeholder: Some(placeholder),
                 ..
@@ -1361,7 +1371,7 @@ fn render_form_control(
             if let Some(error) = errors.get(&field.id) {
                 component = component.error(error);
             }
-            component.render(area, &mut state, frame);
+            paint_component(&component, area, frame);
             true
         }
         (
@@ -1388,26 +1398,30 @@ fn render_form_control(
             true
         }
         (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
-            let mut state = TextInputState::new(
+            let state = std::cell::RefCell::new(TextInputState::new(
                 editors
                     .get(&field.id)
                     .cloned()
                     .unwrap_or_else(|| TextEditBuffer::from_text(value.to_string())),
-            );
-            let mut component = TextInputBox::new(TextInputPolicy::chat_composer())
-                .label(&field.label)
-                .required(field.required)
-                .policy(
-                    TextInputBoxPolicy::bare()
-                        .focused(focused)
-                        .disabled(field.disabled)
-                        .rows(1, Some(1)),
-                )
-                .styles(form_text_input_styles(theme));
+            ));
+            let mut component = TextInputBoxComponent::new(
+                format!("prompt.form.{}", field.id),
+                TextInputPolicy::chat_composer(),
+                &state,
+            )
+            .label(&field.label)
+            .required(field.required)
+            .policy(
+                TextInputBoxPolicy::bare()
+                    .focused(focused)
+                    .disabled(field.disabled)
+                    .rows(1, Some(1)),
+            )
+            .styles(form_text_input_styles(theme));
             if let Some(error) = errors.get(&field.id) {
                 component = component.error(error);
             }
-            component.render(area, &mut state, frame);
+            paint_component(&component, area, frame);
             true
         }
         (
@@ -1697,29 +1711,33 @@ fn render_text_input(
     let PromptWidgetState::TextInput { buffer, error } = &active.state else {
         return false;
     };
-    let mut state = TextInputState::new(buffer.clone());
-    let mut component = TextInputBox::new(TextInputPolicy::chat_composer())
-        .required(*required)
-        .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)))
-        .styles(TextInputBoxStyles {
-            text: theme.text,
-            focused_text: theme.text,
-            disabled_text: theme.muted,
-            placeholder: theme.muted,
-            selection: theme.focused,
-            border: theme.border,
-            focused_border: theme.focused,
-            background: theme.background,
-            focused_background: theme.background,
-            disabled_background: theme.background,
-        });
+    let state = std::cell::RefCell::new(TextInputState::new(buffer.clone()));
+    let mut component = TextInputBoxComponent::new(
+        "prompt.text-input",
+        TextInputPolicy::chat_composer(),
+        &state,
+    )
+    .required(*required)
+    .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)))
+    .styles(TextInputBoxStyles {
+        text: theme.text,
+        focused_text: theme.text,
+        disabled_text: theme.muted,
+        placeholder: theme.muted,
+        selection: theme.focused,
+        border: theme.border,
+        focused_border: theme.focused,
+        background: theme.background,
+        focused_background: theme.background,
+        disabled_background: theme.background,
+    });
     if let Some(placeholder) = placeholder {
         component = component.placeholder(placeholder);
     }
     if let Some(error) = error {
         component = component.error(error);
     }
-    component.render(content, &mut state, frame);
+    paint_component(&component, content, frame);
     true
 }
 
