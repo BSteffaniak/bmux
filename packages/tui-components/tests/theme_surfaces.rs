@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextContent;
@@ -6,7 +8,7 @@ use bmux_tui::geometry::{Insets, Size};
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Style};
-use bmux_tui_components::button::{Button, ButtonState};
+use bmux_tui_components::button::{ButtonComponent, ButtonState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFrameComponent, PickerFramePolicy};
 use bmux_tui_components::theme::ComponentTheme;
@@ -19,11 +21,13 @@ fn rendered(theme: ComponentTheme) -> Buffer {
 
     let mut focused = ButtonState::new();
     focused.set_focused(true);
-    Button::new("Action").styles(theme.button_styles()).render(
-        Rect::new(1, 1, 12, 1),
-        &focused,
-        &mut frame,
-    );
+    let focused = Cell::new(focused);
+    let button =
+        ButtonComponent::new("theme.action", "Action", &focused).styles(theme.button_styles());
+    let button_layout = button.layout(Constraints::for_width(12), &mut LayoutCx::new());
+    PaintCx::new(&mut frame).with_child(1, 1, LocalRect::new(0, 0, 12, 1), |cx| {
+        button.paint(&button_layout, cx)
+    });
 
     let picker = PickerFrameComponent::new(
         "theme.picker",

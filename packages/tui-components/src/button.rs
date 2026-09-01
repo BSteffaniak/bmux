@@ -9,7 +9,6 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -292,68 +291,6 @@ impl<'a> Button<'a> {
             .saturating_add(4)
     }
 
-    /// Render the button and register its default interaction semantics.
-    ///
-    /// Use [`Self::render_with_id`] when stable focus preservation or semantic
-    /// routing across responsive reflow is required.
-    pub fn render(&self, area: Rect, state: &ButtonState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("button");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render the button with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<bmux_tui::hit::HitId>,
-        area: Rect,
-        state: &ButtonState,
-        frame: &mut Frame<'_>,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::Action)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
-        self.render_line(area, *state, frame, None);
-    }
-
-    /// Render button visuals without registering another interaction region.
-    #[cfg(feature = "action-row")]
-    pub(crate) fn render_visual(&self, area: Rect, state: ButtonState, frame: &mut Frame<'_>) {
-        self.render_line(area, state, frame, None);
-    }
-
-    fn render_line(
-        &self,
-        area: Rect,
-        state: ButtonState,
-        frame: &mut Frame<'_>,
-        fallback: Option<Style>,
-    ) {
-        let line = Line::from_spans(vec![Span::styled(
-            format!("[ {} ]", self.label),
-            self.style_for(state),
-        )]);
-        if let Some(fallback) = fallback {
-            frame.write_line_with_fallback_style(area, &line, fallback);
-        } else {
-            frame.write_line(area, &line);
-        }
-    }
-
-    /// Render the button with a fallback style filling its area.
-    pub fn render_with_fallback_style(
-        &self,
-        area: Rect,
-        state: &ButtonState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        self.render_line(area, *state, frame, Some(fallback));
-    }
-
     /// Handle one input event.
     pub const fn handle_event(
         &self,
@@ -571,13 +508,18 @@ mod tests {
 
     #[test]
     fn renders_button_label() {
-        let button = Button::new("Save");
-        let mut state = ButtonState::new();
-        state.set_focused(true);
+        let state = Cell::new(ButtonState::new());
+        state.set({
+            let mut focused = state.get();
+            focused.set_focused(true);
+            focused
+        });
+        let button = ButtonComponent::new("save", "Save", &state);
+        let layout = button.layout(Constraints::for_width(10), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        button.render(Rect::new(0, 0, 10, 1), &state, &mut frame);
+        button.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ Save ]  "));
     }

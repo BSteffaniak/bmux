@@ -357,17 +357,7 @@ impl Component for ActionRowComponent<'_, '_> {
                 break;
             };
             let button_state = self.row.button_state(Some(&state), index);
-            let style = if button_state.interaction.disabled {
-                self.row.styles.disabled
-            } else if button_state.interaction.pressed {
-                self.row.styles.pressed
-            } else if button_state.interaction.hovered {
-                self.row.styles.hovered
-            } else if button_state.interaction.focused {
-                self.row.styles.focused
-            } else {
-                self.row.styles.normal
-            };
+            let style = self.row.style_for(button_state);
             cx.write_line(
                 LocalRect::new(i32::from(action_area.x), 0, action_area.width, 1),
                 &Line::from_spans([Span::styled(format!("[ {} ]", action.label), style)]),
@@ -564,12 +554,29 @@ impl<'a> ActionRow<'a> {
                 return;
             };
             let button_state = self.button_state(state, index);
-            let button = Button::new(action.label.as_str()).styles(self.styles);
+            let line = Line::from_spans([Span::styled(
+                format!("[ {} ]", action.label),
+                self.style_for(button_state),
+            )]);
             if let Some(fallback) = fallback {
-                button.render_with_fallback_style(action_area, &button_state, frame, fallback);
+                frame.write_line_with_fallback_style(action_area, &line, fallback);
             } else {
-                button.render_visual(action_area, button_state, frame);
+                frame.write_line(action_area, &line);
             }
+        }
+    }
+
+    const fn style_for(&self, state: ButtonState) -> Style {
+        if state.interaction.disabled {
+            self.styles.disabled
+        } else if state.interaction.pressed {
+            self.styles.pressed
+        } else if state.interaction.hovered {
+            self.styles.hovered
+        } else if state.interaction.focused {
+            self.styles.focused
+        } else {
+            self.styles.normal
         }
     }
 

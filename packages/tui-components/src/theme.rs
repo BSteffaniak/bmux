@@ -402,11 +402,15 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn component_state_matrix_uses_only_supplied_theme_styles() {
+        use std::cell::Cell;
+
         use bmux_tui::buffer::Buffer;
+        use bmux_tui::component::{Component, Constraints, LayoutCx};
         use bmux_tui::frame::Frame;
         use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui::paint::PaintCx;
 
-        use crate::button::{Button, ButtonState};
+        use crate::button::{ButtonComponent, ButtonState};
         use crate::common::InteractionState;
 
         let theme = ComponentTheme {
@@ -478,11 +482,11 @@ mod tests {
         for (label, interaction, expected) in states {
             let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
             let mut frame = Frame::new(&mut buffer);
-            Button::new("Action").styles(theme.button_styles()).render(
-                Rect::new(0, 0, 12, 1),
-                &ButtonState { interaction },
-                &mut frame,
-            );
+            let state = Cell::new(ButtonState { interaction });
+            let button = ButtonComponent::new("theme.action", "Action", &state)
+                .styles(theme.button_styles());
+            let layout = button.layout(Constraints::for_width(12), &mut LayoutCx::new());
+            button.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(
                 frame
                     .buffer()
