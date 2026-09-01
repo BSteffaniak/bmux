@@ -8,9 +8,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::hit::{HitId, HitRegion, HitRole};
+use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
@@ -321,7 +320,7 @@ impl Component for ToastStackComponent<'_, '_> {
             if self.stack.policy.close_button && self.stack.policy.mouse {
                 cx.push_hit(
                     HitRegion::new(
-                        format!("{}:{}.close", self.id.as_str(), toast.id),
+                        format!("{}.{}.close", self.id.as_str(), toast.id),
                         Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
                     )
                     .role(HitRole::Action)
@@ -444,43 +443,6 @@ impl<'a> ToastStack<'a> {
         self.toasts.len().min(self.policy.max_visible)
     }
 
-    /// Render toast stack.
-    pub fn render(&self, area: Rect, state: &ToastStackState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("toast-stack");
-        self.render_with_id_prefix(area, state, frame, id.as_str());
-    }
-
-    /// Render toast stack with stable semantic close-control identifiers.
-    pub fn render_with_id_prefix(
-        &self,
-        area: Rect,
-        _state: &ToastStackState,
-        frame: &mut Frame<'_>,
-        id_prefix: &str,
-    ) {
-        if area.is_empty() {
-            return;
-        }
-        for (visible, toast) in self.toasts.iter().take(self.visible_count()).enumerate() {
-            let Some(rect) = self.toast_area(area, visible, toast) else {
-                continue;
-            };
-            if self.policy.close_button && self.policy.mouse {
-                let close_area = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
-                frame.push_hit(
-                    HitRegion::new(
-                        HitId::new(format!("{id_prefix}.{}.close", toast.id)),
-                        close_area,
-                    )
-                    .role(HitRole::Action)
-                    .hoverable(true)
-                    .focusable(true),
-                );
-            }
-            self.render_toast(rect, toast, frame);
-        }
-    }
-
     /// Handle activation routed from committed semantic interaction metadata.
     pub fn handle_event_for_target(
         &self,
@@ -581,29 +543,6 @@ impl<'a> ToastStack<'a> {
         }
     }
 
-    fn render_toast(&self, area: Rect, toast: &ToastItem<'_>, frame: &mut Frame<'_>) {
-        let width = usize::from(area.width);
-        let close = if self.policy.close_button { " ×" } else { "" };
-        let title_width = width.saturating_sub(close.len());
-        let title = truncate_to_display_width(toast.title, title_width);
-        let title_line = Line::from_spans([
-            Span::styled(title, self.title_style(toast.severity)),
-            Span::styled(close, self.styles.close),
-        ]);
-        frame.write_line(area, &title_line);
-        if let Some(body) = toast.body
-            && area.height > 1
-        {
-            frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-                &Line::from_spans([Span::styled(
-                    truncate_to_display_width(body, width),
-                    self.styles.body,
-                )]),
-            );
-        }
-    }
-
     fn close_at(&self, area: Rect, position: Point) -> Option<usize> {
         self.toasts
             .iter()
@@ -676,12 +615,51 @@ mod tests {
     use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect, Size};
-    use bmux_tui::paint::PaintCx;
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
     use super::{
         ToastItem, ToastSeverity, ToastStack, ToastStackComponent, ToastStackOutcome,
         ToastStackPolicy, ToastStackState,
     };
+
+    trait ToastStackTestRender {
+        fn render(&self, area: Rect, state: &ToastStackState, frame: &mut Frame<'_>);
+        fn render_with_id_prefix(
+            &self,
+            area: Rect,
+            state: &ToastStackState,
+            frame: &mut Frame<'_>,
+            id_prefix: &'static str,
+        );
+    }
+
+    impl ToastStackTestRender for ToastStack<'_> {
+        fn render(&self, area: Rect, state: &ToastStackState, frame: &mut Frame<'_>) {
+            self.render_with_id_prefix(area, state, frame, "test.toasts");
+        }
+
+        fn render_with_id_prefix(
+            &self,
+            area: Rect,
+            state: &ToastStackState,
+            frame: &mut Frame<'_>,
+            id_prefix: &'static str,
+        ) {
+            let state = std::cell::Cell::new(*state);
+            let component = ToastStackComponent {
+                id: id_prefix.into(),
+                stack: *self,
+                state: &state,
+            };
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn component_measures_paints_and_registers_close_controls() {
