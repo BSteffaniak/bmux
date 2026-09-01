@@ -8,11 +8,11 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::badge::BadgeComponent;
-use bmux_tui_components::breadcrumbs::{BreadcrumbItem, Breadcrumbs, BreadcrumbsState};
+use bmux_tui_components::breadcrumbs::{BreadcrumbItem, BreadcrumbsComponent, BreadcrumbsState};
 use bmux_tui_components::chart::{
     Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
 };
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent};
 use bmux_tui_components::menu::{Menu, MenuItem, MenuPolicy};
 use bmux_tui_components::scroll_area::{
     ScrollArea, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
@@ -49,14 +49,26 @@ fn golden_styled_truncation_components() {
         BreadcrumbItem::new("home", "Home"),
         BreadcrumbItem::new("docs", "Documentation"),
     ];
-    Breadcrumbs::new(&breadcrumbs_items).render(
-        Rect::new(0, 1, 8, 1),
-        &BreadcrumbsState::new(Some(1)),
-        &mut frame,
+    let breadcrumbs_state = std::cell::Cell::new(BreadcrumbsState::new(Some(1)));
+    let breadcrumbs =
+        BreadcrumbsComponent::new("golden.breadcrumbs", &breadcrumbs_items, &breadcrumbs_state);
+    let breadcrumbs_layout = breadcrumbs.layout(
+        Constraints::tight(Rect::new(0, 1, 8, 1).size()),
+        &mut LayoutCx::new(),
     );
+    PaintCx::new(&mut frame).with_child(0, 1, LocalRect::new(0, 0, 8, 1), |cx| {
+        breadcrumbs.paint(&breadcrumbs_layout, cx);
+    });
 
     let hints = [KeyHint::new("Ctrl+O", "Open")];
-    KeyHintBar::new(&hints).render(Rect::new(0, 2, 8, 1), &mut frame);
+    let hints_component = KeyHintBarComponent::new("golden.hints", &hints);
+    let hints_layout = hints_component.layout(
+        Constraints::tight(Rect::new(0, 2, 8, 1).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut frame).with_child(0, 2, LocalRect::new(0, 0, 8, 1), |cx| {
+        hints_component.paint(&hints_layout, cx);
+    });
 
     let status_segments = [
         StatusSegment::new("ready"),
@@ -215,9 +227,16 @@ fn golden_recent_list_menu_and_chart_polish() {
     ];
     let mut chart_buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
     let mut chart_frame = Frame::new(&mut chart_buffer);
-    Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
-        .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight))
-        .render(Rect::new(0, 0, 8, 2), &mut chart_frame);
+    let chart = Chart::new(&datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0))
+        .policy(ChartPolicy::compact().legend(ChartLegendPlacement::TopRight));
+    let chart_layout = chart.layout(
+        Constraints::tight(chart_frame.buffer().area().size()),
+        &mut LayoutCx::new(),
+    );
+    let chart_clip = LocalRect::new(0, 0, 8, 2);
+    PaintCx::new(&mut chart_frame).with_child(0, 0, chart_clip, |cx| {
+        chart.paint(&chart_layout, cx);
+    });
     assert_eq!(
         buffer_rows(chart_frame.buffer()),
         vec!["alpha b…", "•       "]

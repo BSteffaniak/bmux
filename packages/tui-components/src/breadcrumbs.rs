@@ -9,9 +9,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
@@ -349,40 +348,6 @@ impl<'a> Breadcrumbs<'a> {
         self
     }
 
-    /// Render breadcrumbs and register the composite interaction area.
-    pub fn render(&self, area: Rect, state: &BreadcrumbsState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("breadcrumbs");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render breadcrumbs with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &BreadcrumbsState,
-        frame: &mut Frame<'_>,
-    ) {
-        if area.is_empty() {
-            return;
-        }
-        let interactive = self.policy.keyboard || self.policy.mouse.enabled;
-        if interactive && self.items.iter().any(|item| !item.disabled) {
-            frame.push_hit(
-                SceneRegion::new(id, area)
-                    .role(HitRole::ListItem)
-                    .pointer_events(self.policy.mouse.enabled)
-                    .hoverable(self.policy.mouse.hover)
-                    .focusable(self.policy.keyboard),
-            );
-        }
-        let mut line = self.line(state);
-        if self.policy.truncate {
-            line = line.truncate(usize::from(area.width));
-        }
-        frame.write_line(area, &line);
-    }
-
     /// Handle one event.
     pub fn handle_event(
         &self,
@@ -576,12 +541,51 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::hit::HitRole;
-    use bmux_tui::paint::PaintCx;
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
     use super::{
         BreadcrumbItem, Breadcrumbs, BreadcrumbsComponent, BreadcrumbsOutcome, BreadcrumbsPolicy,
         BreadcrumbsState,
     };
+
+    trait BreadcrumbsTestRender {
+        fn render(&self, area: Rect, state: &BreadcrumbsState, frame: &mut Frame<'_>);
+        fn render_with_id(
+            &self,
+            id: &'static str,
+            area: Rect,
+            state: &BreadcrumbsState,
+            frame: &mut Frame<'_>,
+        );
+    }
+
+    impl BreadcrumbsTestRender for Breadcrumbs<'_> {
+        fn render(&self, area: Rect, state: &BreadcrumbsState, frame: &mut Frame<'_>) {
+            self.render_with_id("test.breadcrumbs", area, state, frame);
+        }
+
+        fn render_with_id(
+            &self,
+            id: &'static str,
+            area: Rect,
+            state: &BreadcrumbsState,
+            frame: &mut Frame<'_>,
+        ) {
+            let state = Cell::new(*state);
+            let component = BreadcrumbsComponent {
+                id: id.into(),
+                breadcrumbs: *self,
+                state: &state,
+            };
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn renders_breadcrumbs() {

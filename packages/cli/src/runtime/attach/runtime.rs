@@ -54,10 +54,12 @@ use bmux_plugin_sdk::{
 use bmux_recording_plugin_api::recording_state;
 use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::frame::Frame as TuiFrame;
 use bmux_tui::geometry::{Insets as TuiInsets, Rect as TuiRect, Size as TuiSize};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line as TuiLine;
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
@@ -7600,23 +7602,28 @@ fn help_overlay_render_ops(
             KeyHint::new("PgUp/PgDn", "page"),
             KeyHint::new("Esc", "close"),
         ];
-        KeyHintBar::new(&hints)
-            .styles(KeyHintBarStyles {
+        let hints_area = TuiRect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        );
+        let hints =
+            KeyHintBarComponent::new("attach.help.hints", &hints).styles(KeyHintBarStyles {
                 key: component_theme.focused,
                 label: component_theme.muted,
                 separator: component_theme.muted,
                 disabled: component_theme.disabled,
                 background: component_theme.surfaces.overlay,
-            })
-            .render(
-                TuiRect::new(
-                    content.x,
-                    content.bottom().saturating_sub(1),
-                    content.width,
-                    1,
-                ),
-                &mut frame,
-            );
+            });
+        let hints_layout =
+            hints.layout(Constraints::tight(hints_area.size()), &mut LayoutCx::new());
+        PaintCx::new(&mut frame).with_child(
+            i32::from(hints_area.x),
+            i64::from(hints_area.y),
+            LocalRect::new(0, 0, hints_area.width, hints_area.height),
+            |cx| hints.paint(&hints_layout, cx),
+        );
     }
     buffer_render_ops(&buffer)
 }

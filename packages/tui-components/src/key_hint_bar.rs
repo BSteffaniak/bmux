@@ -6,7 +6,6 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
@@ -267,28 +266,6 @@ impl<'a> KeyHintBar<'a> {
         hint_text(self.hints, self.policy.separator)
     }
 
-    /// Render hints into one row.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() || self.hints.is_empty() {
-            return;
-        }
-        let text = self.text();
-        if matches!(self.policy.overflow, KeyHintOverflow::Hide)
-            && display_width(&text) > usize::from(area.width)
-        {
-            return;
-        }
-        if self.policy.background {
-            frame.fill(area, " ", self.styles.background);
-        }
-        let line = if display_width(&text) > usize::from(area.width) {
-            self.styled_line().truncate(usize::from(area.width))
-        } else {
-            self.styled_line()
-        };
-        frame.write_line_with_fallback_style(area, &line, self.styles.background);
-    }
-
     fn styled_line(&self) -> Line {
         let mut spans = Vec::new();
         for (index, hint) in self.hints.iter().copied().enumerate() {
@@ -350,9 +327,29 @@ mod tests {
     use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Rect, Size};
-    use bmux_tui::paint::PaintCx;
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
     use super::{KeyHint, KeyHintBar, KeyHintBarComponent, KeyHintBarPolicy, KeyHintOverflow};
+
+    trait KeyHintBarTestRender {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>);
+    }
+
+    impl KeyHintBarTestRender for KeyHintBar<'_> {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+            let component = KeyHintBarComponent {
+                id: "test.hints".into(),
+                bar: *self,
+            };
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn builds_compact_hint_text() {

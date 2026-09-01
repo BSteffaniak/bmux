@@ -1,7 +1,6 @@
 //! Lightweight generic chart component.
 
 use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, display_width};
@@ -414,17 +413,6 @@ impl<'a> Chart<'a> {
         map_point(area, self.bounds, point, clipping)
     }
 
-    /// Render chart datasets through authoritative layout and scoped painting.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(area.x),
-            i64::from(area.y),
-            LocalRect::new(0, 0, area.width, area.height),
-            |cx| self.paint(&layout, cx),
-        );
-    }
-
     fn paint_area(&self, area: Rect, cx: &mut PaintCx<'_, '_>) {
         if area.is_empty() {
             return;
@@ -831,6 +819,22 @@ mod tests {
         ChartInterpolation, ChartLegendPlacement, ChartPoint, ChartPolicy, render_even_labels,
         render_vertical_labels,
     };
+
+    trait ChartTestRender {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>);
+    }
+
+    impl ChartTestRender for Chart<'_> {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+            let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| self.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn component_paint_clips_chart_output_to_the_scoped_viewport() {

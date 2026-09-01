@@ -6,7 +6,6 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
@@ -43,7 +42,7 @@ impl<'a> BarChartItem<'a> {
     }
 }
 
-/// Value label placement for [`BarChart`].
+/// Value label placement for [`BarChartComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BarChartValuePlacement {
     /// Do not render value labels.
@@ -174,7 +173,10 @@ impl Default for BarChartStyles {
 /// Canonical component-lifecycle bar chart.
 pub struct BarChartComponent<'a> {
     id: LayoutId,
-    chart: BarChart<'a>,
+    items: &'a [BarChartItem<'a>],
+    policy: BarChartPolicy,
+    styles: BarChartStyles,
+    empty: &'a str,
 }
 
 impl<'a> BarChartComponent<'a> {
@@ -183,28 +185,37 @@ impl<'a> BarChartComponent<'a> {
     pub fn new(id: impl Into<LayoutId>, items: &'a [BarChartItem<'a>]) -> Self {
         Self {
             id: id.into(),
-            chart: BarChart::new(items),
+            items,
+            policy: BarChartPolicy::compact(),
+            styles: BarChartStyles {
+                label: Style::new(),
+                bar: Style::new(),
+                empty: Style::new(),
+                value: Style::new(),
+                empty_message: Style::new(),
+            },
+            empty: "No data",
         }
     }
 
     /// Set rendering policy.
     #[must_use]
     pub const fn policy(mut self, policy: BarChartPolicy) -> Self {
-        self.chart.policy = policy;
+        self.policy = policy;
         self
     }
 
     /// Set visual styles.
     #[must_use]
     pub const fn styles(mut self, styles: BarChartStyles) -> Self {
-        self.chart.styles = styles;
+        self.styles = styles;
         self
     }
 
     /// Set empty message.
     #[must_use]
     pub const fn empty(mut self, empty: &'a str) -> Self {
-        self.chart.empty = empty;
+        self.empty = empty;
         self
     }
 }
@@ -213,32 +224,32 @@ impl Component for BarChartComponent<'_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        self.chart.empty.hash(&mut layout);
-        self.chart.policy.label_width.hash(&mut layout);
-        self.chart.policy.bar_width.hash(&mut layout);
-        self.chart.policy.bar_gap.hash(&mut layout);
-        self.chart.policy.bar.hash(&mut layout);
-        self.chart.policy.empty.hash(&mut layout);
-        self.chart.policy.separator.hash(&mut layout);
-        self.chart.policy.value_placement.hash(&mut layout);
-        self.chart.policy.values.hash(&mut layout);
-        self.chart.policy.truncate_labels.hash(&mut layout);
-        for item in self.chart.items {
+        self.empty.hash(&mut layout);
+        self.policy.label_width.hash(&mut layout);
+        self.policy.bar_width.hash(&mut layout);
+        self.policy.bar_gap.hash(&mut layout);
+        self.policy.bar.hash(&mut layout);
+        self.policy.empty.hash(&mut layout);
+        self.policy.separator.hash(&mut layout);
+        self.policy.value_placement.hash(&mut layout);
+        self.policy.values.hash(&mut layout);
+        self.policy.truncate_labels.hash(&mut layout);
+        for item in self.items {
             item.label.hash(&mut layout);
             item.group.len().hash(&mut layout);
         }
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
-        self.chart.policy.max.hash(&mut paint);
-        for item in self.chart.items {
+        self.policy.max.hash(&mut paint);
+        for item in self.items {
             item.value.hash(&mut paint);
             item.group.hash(&mut paint);
         }
-        self.chart.styles.label.hash(&mut paint);
-        self.chart.styles.bar.hash(&mut paint);
-        self.chart.styles.empty.hash(&mut paint);
-        self.chart.styles.value.hash(&mut paint);
-        self.chart.styles.empty_message.hash(&mut paint);
+        self.styles.label.hash(&mut paint);
+        self.styles.bar.hash(&mut paint);
+        self.styles.empty.hash(&mut paint);
+        self.styles.value.hash(&mut paint);
+        self.styles.empty_message.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -246,22 +257,20 @@ impl Component for BarChartComponent<'_> {
         cx.record_measurement();
         let width = if constraints.min_width() == constraints.max_width() {
             constraints.max_width()
-        } else if self.chart.items.is_empty() {
-            u16::try_from(display_width(self.chart.empty))
+        } else if self.items.is_empty() {
+            u16::try_from(display_width(self.empty))
                 .unwrap_or(u16::MAX)
                 .clamp(constraints.min_width(), constraints.max_width())
         } else {
             let label_width = self
-                .chart
                 .items
                 .iter()
                 .map(|item| display_width(item.label))
                 .max()
                 .unwrap_or_default()
-                .min(usize::from(self.chart.policy.label_width));
-            let value_width = usize::from(self.chart.policy.values)
+                .min(usize::from(self.policy.label_width));
+            let value_width = usize::from(self.policy.values)
                 * self
-                    .chart
                     .items
                     .iter()
                     .map(|item| item.value.to_string().len().saturating_add(1))
@@ -269,19 +278,19 @@ impl Component for BarChartComponent<'_> {
                     .unwrap_or_default();
             u16::try_from(
                 label_width
-                    .saturating_add(display_width(self.chart.policy.separator))
+                    .saturating_add(display_width(self.policy.separator))
                     .saturating_add(value_width)
                     .saturating_add(1),
             )
             .unwrap_or(u16::MAX)
             .clamp(constraints.min_width(), constraints.max_width())
         };
-        let visible = self.chart.items.len();
+        let visible = self.items.len();
         let height = if visible == 0 {
             usize::from(width > 0)
         } else {
             visible.saturating_add(
-                usize::from(self.chart.policy.bar_gap).saturating_mul(visible.saturating_sub(1)),
+                usize::from(self.policy.bar_gap).saturating_mul(visible.saturating_sub(1)),
             )
         };
         LayoutNode::leaf(
@@ -295,23 +304,22 @@ impl Component for BarChartComponent<'_> {
         if layout.size.width == 0 || layout.size.height == 0 {
             return;
         }
-        if self.chart.items.is_empty() {
+        if self.items.is_empty() {
             cx.write_line_with_fallback_style(
                 LocalRect::new(0, 0, layout.size.width, 1),
-                &Line::from(self.chart.empty),
-                self.chart.styles.empty_message,
+                &Line::from(self.empty),
+                self.styles.empty_message,
             );
         } else {
-            let max = self.chart.policy.max.unwrap_or_else(|| {
-                self.chart
-                    .items
+            let max = self.policy.max.unwrap_or_else(|| {
+                self.items
                     .iter()
                     .flat_map(|item| std::iter::once(item.value).chain(item.group.iter().copied()))
                     .max()
                     .unwrap_or(0)
             });
-            let row_step = usize::from(self.chart.policy.bar_gap).saturating_add(1);
-            for (index, item) in self.chart.items.iter().enumerate() {
+            let row_step = usize::from(self.policy.bar_gap).saturating_add(1);
+            for (index, item) in self.items.iter().enumerate() {
                 let row = index.saturating_mul(row_step);
                 if row >= layout.size.height {
                     break;
@@ -323,7 +331,7 @@ impl Component for BarChartComponent<'_> {
                         layout.size.width,
                         1,
                     ),
-                    &self.chart.item_line(item, max, layout.size.width),
+                    &self.item_line(item, max, layout.size.width),
                 );
             }
         }
@@ -338,103 +346,11 @@ impl Component for BarChartComponent<'_> {
     }
 }
 
-/// Small horizontal bar chart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BarChart<'a> {
-    items: &'a [BarChartItem<'a>],
-    policy: BarChartPolicy,
-    styles: BarChartStyles,
-    empty: &'a str,
-}
-
-impl<'a> BarChart<'a> {
-    /// Create a bar chart over caller-owned items.
-    #[must_use]
-    pub const fn new(items: &'a [BarChartItem<'a>]) -> Self {
-        Self {
-            items,
-            policy: BarChartPolicy {
-                max: None,
-                label_width: 6,
-                bar_width: None,
-                bar_gap: 0,
-                bar: "█",
-                empty: "░",
-                separator: " ",
-                value_placement: BarChartValuePlacement::Hidden,
-                values: false,
-                truncate_labels: true,
-            },
-            styles: BarChartStyles {
-                label: Style::new(),
-                bar: Style::new(),
-                empty: Style::new(),
-                value: Style::new(),
-                empty_message: Style::new(),
-            },
-            empty: "No data",
-        }
-    }
-
-    /// Set policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: BarChartPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    /// Set styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: BarChartStyles) -> Self {
-        self.styles = styles;
-        self
-    }
-
-    /// Set empty message.
-    #[must_use]
-    pub const fn empty(mut self, empty: &'a str) -> Self {
-        self.empty = empty;
-        self
-    }
-
+impl BarChartComponent<'_> {
     /// Compute filled bar width.
     #[must_use]
     pub fn filled_width(&self, value: u64, max: u64, width: u16) -> u16 {
         filled_width(value, max, width)
-    }
-
-    /// Render bar chart.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
-        if self.items.is_empty() {
-            frame.write_line_with_fallback_style(
-                area,
-                &Line::from(self.empty),
-                self.styles.empty_message,
-            );
-            return;
-        }
-        let max = self.policy.max.unwrap_or_else(|| {
-            self.items
-                .iter()
-                .flat_map(|item| std::iter::once(item.value).chain(item.group.iter().copied()))
-                .max()
-                .unwrap_or(0)
-        });
-        let row_step = usize::from(self.policy.bar_gap).saturating_add(1);
-        for (index, item) in self.items.iter().enumerate() {
-            let y_offset = index.saturating_mul(row_step);
-            if y_offset >= usize::from(area.height) {
-                return;
-            }
-            let Ok(y_offset) = u16::try_from(y_offset) else {
-                return;
-            };
-            let row = Rect::new(area.x, area.y.saturating_add(y_offset), area.width, 1);
-            frame.write_line(row, &self.item_line(item, max, area.width));
-        }
     }
 
     fn item_line(&self, item: &BarChartItem<'_>, max: u64, width: u16) -> Line {
@@ -589,12 +505,21 @@ mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
+    use bmux_tui::geometry::{Rect, Size};
     use bmux_tui::paint::PaintCx;
 
-    use super::{
-        BarChart, BarChartComponent, BarChartItem, BarChartPolicy, BarChartValuePlacement,
-    };
+    use super::{BarChartComponent, BarChartItem, BarChartPolicy};
+
+    fn paint(component: &BarChartComponent<'_>, width: u16, height: u16) -> Buffer {
+        let layout = component.layout(
+            Constraints::tight(Size::new(width, height)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        buffer
+    }
 
     #[test]
     fn component_measures_paints_and_registers_chart() {
@@ -628,140 +553,51 @@ mod tests {
     }
 
     #[test]
-    fn scales_bars_against_derived_max() {
+    fn scales_bars_and_supports_max_override() {
         let items = [BarChartItem::new("a", 5), BarChartItem::new("b", 10)];
-        let chart = BarChart::new(&items);
-
-        assert_eq!(chart.filled_width(5, 10, 10), 5);
-        assert_eq!(chart.filled_width(10, 10, 10), 10);
-    }
-
-    #[test]
-    fn renders_labels_and_bars() {
-        let items = [BarChartItem::new("alpha", 5), BarChartItem::new("beta", 10)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 2));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items).render(Rect::new(0, 0, 16, 2), &mut frame);
-
+        let buffer = paint(&BarChartComponent::new("chart", &items), 16, 2);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("a      ████░░░░░"));
+        assert_eq!(buffer.row_symbols(1).as_deref(), Some("b      █████████"));
         assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
-            Some("alpha  ████░░░░░")
-        );
-        assert_eq!(
-            frame.buffer().row_symbols(1).as_deref(),
-            Some("beta   █████████")
+            BarChartComponent::new("chart", &items).filled_width(20, 10, 4),
+            4
         );
     }
 
     #[test]
-    fn bar_width_and_gap_are_configurable() {
-        let items = [BarChartItem::new("a", 5), BarChartItem::new("b", 10)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items)
-            .policy(
-                BarChartPolicy::compact()
-                    .max(Some(10))
-                    .bar_width(Some(4))
-                    .bar_gap(1),
-            )
-            .render(Rect::new(0, 0, 12, 3), &mut frame);
-
-        assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
-            Some("a      ██░░ ")
+    fn renders_values_and_grouped_segments() {
+        let groups = [5, 10];
+        let grouped = [BarChartItem::new("a", 0).group(&groups)];
+        let grouped_buffer = paint(
+            &BarChartComponent::new("chart", &grouped)
+                .policy(BarChartPolicy::compact().max(Some(10)).bar_width(Some(8))),
+            16,
+            1,
         );
         assert_eq!(
-            frame.buffer().row_symbols(1).as_deref(),
-            Some("            ")
-        );
-        assert_eq!(
-            frame.buffer().row_symbols(2).as_deref(),
-            Some("b      ████ ")
-        );
-    }
-
-    #[test]
-    fn renders_inside_value_label() {
-        let items = [BarChartItem::new("a", 5)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 17, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items)
-            .policy(
-                BarChartPolicy::compact()
-                    .max(Some(10))
-                    .bar_width(Some(5))
-                    .value_placement(BarChartValuePlacement::Inside),
-            )
-            .render(Rect::new(0, 0, 17, 1), &mut frame);
-
-        assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
-            Some("a      ██░░░    5")
-        );
-    }
-
-    #[test]
-    fn renders_grouped_bars() {
-        let group = [5, 10];
-        let items = [BarChartItem::new("a", 0).group(&group)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items)
-            .policy(BarChartPolicy::compact().max(Some(10)).bar_width(Some(8)))
-            .render(Rect::new(0, 0, 16, 1), &mut frame);
-
-        assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
+            grouped_buffer.row_symbols(0).as_deref(),
             Some("a      ░░ █░ ██ ")
         );
-    }
 
-    #[test]
-    fn renders_empty_message() {
-        let items = [];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items).render(Rect::new(0, 0, 8, 1), &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("No data "));
-    }
-
-    #[test]
-    fn max_override_clips_values() {
-        let items = [BarChartItem::new("a", 20)];
-        let chart = BarChart::new(&items).policy(BarChartPolicy::compact().max(Some(10)));
-
-        assert_eq!(chart.filled_width(20, 10, 4), 4);
-    }
-
-    #[test]
-    fn renders_values_when_enabled() {
-        let items = [BarChartItem::new("a", 5)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items)
-            .policy(BarChartPolicy::with_values().max(Some(10)))
-            .render(Rect::new(0, 0, 14, 1), &mut frame);
-
+        let values = [BarChartItem::new("a", 5)];
+        let value_buffer = paint(
+            &BarChartComponent::new("chart", &values)
+                .policy(BarChartPolicy::with_values().max(Some(10))),
+            14,
+            1,
+        );
         assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
+            value_buffer.row_symbols(0).as_deref(),
             Some("a      ██░░░ 5")
         );
     }
 
     #[test]
-    fn tiny_area_does_not_panic() {
+    fn empty_and_zero_sized_charts_are_safe() {
+        let empty = [];
+        let buffer = paint(&BarChartComponent::new("chart", &empty), 8, 1);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("No data "));
         let items = [BarChartItem::new("a", 1)];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
-        let mut frame = Frame::new(&mut buffer);
-
-        BarChart::new(&items).render(Rect::new(0, 0, 0, 0), &mut frame);
+        let _ = paint(&BarChartComponent::new("chart", &items), 0, 0);
     }
 }

@@ -294,18 +294,21 @@ fn render_chart(frame: &mut Frame<'_>) {
     ];
     let x_labels = ["0", "3"];
     let y_labels = ["3", "0"];
-    Chart::new(&datasets, ChartBounds::new(0.0, 3.0, 0.0, 3.0))
-        .axes(
-            ChartAxes::empty()
-                .x(ChartAxis::empty().title("x").labels(&x_labels))
-                .y(ChartAxis::empty().title("y").labels(&y_labels)),
-        )
-        .policy(
-            ChartPolicy::compact()
-                .axes(ChartAxisVisibility::Visible)
-                .legend(ChartLegendPlacement::TopRight),
-        )
-        .render(Rect::new(35, 17, 32, 5), frame);
+    render_component(
+        &Chart::new(&datasets, ChartBounds::new(0.0, 3.0, 0.0, 3.0))
+            .axes(
+                ChartAxes::empty()
+                    .x(ChartAxis::empty().title("x").labels(&x_labels))
+                    .y(ChartAxis::empty().title("y").labels(&y_labels)),
+            )
+            .policy(
+                ChartPolicy::compact()
+                    .axes(ChartAxisVisibility::Visible)
+                    .legend(ChartLegendPlacement::TopRight),
+            ),
+        Rect::new(35, 17, 32, 5),
+        frame,
+    );
 }
 
 fn render_canvas(frame: &mut Frame<'_>) {
@@ -317,11 +320,14 @@ fn render_canvas(frame: &mut Frame<'_>) {
     ];
     let circles = [CanvasCircle::new(2.0, 1.0, 0.8, "○")];
 
-    Canvas::new(&points, CanvasBounds::new(0.0, 3.0, 0.0, 2.0))
-        .lines(&lines)
-        .rects(&rects)
-        .circles(&circles)
-        .render(Rect::new(35, 22, 18, 2), frame);
+    render_component(
+        &Canvas::new(&points, CanvasBounds::new(0.0, 3.0, 0.0, 2.0))
+            .lines(&lines)
+            .rects(&rects)
+            .circles(&circles),
+        Rect::new(35, 22, 18, 2),
+        frame,
+    );
 }
 
 fn render_recent_text_polish(frame: &mut Frame<'_>) {

@@ -10,7 +10,6 @@
 //! for that cell.
 
 use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::Style;
@@ -359,17 +358,6 @@ impl<'a> Canvas<'a> {
     #[must_use]
     pub fn map_point(&self, area: Rect, x: f64, y: f64) -> Option<(u16, u16)> {
         map_point(area, self.bounds, x, y)
-    }
-
-    /// Render the canvas through one mixed-glyph raster/composition pipeline.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(area.x),
-            i64::from(area.y),
-            LocalRect::new(0, 0, area.width, area.height),
-            |cx| self.paint(&layout, cx),
-        );
     }
 
     fn raster(&self, area: Rect) -> Option<CanvasRaster<'a>> {
@@ -775,6 +763,22 @@ mod tests {
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::style::{Color, Style};
+
+    trait CanvasTestRender {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>);
+    }
+
+    impl CanvasTestRender for Canvas<'_> {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+            let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| self.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn component_paint_clips_raster_output_to_the_scoped_viewport() {
