@@ -204,7 +204,7 @@ impl<'items> CommandPalette<'items> {
             .style(self.list_style)
             .selected_style(self.selected_style)
             .highlight_symbol("> ")
-            .paint_in(areas.list, frame, &mut state.list);
+            .paint(areas.list, frame, &mut state.list);
     }
 
     /// Handle a key for query/list palette interaction.
@@ -344,9 +344,9 @@ impl<'items> CommandPalette<'items> {
     }
 }
 
+#[cfg(test)]
 impl CommandPalette<'_> {
-    /// Paint this palette into an explicitly assigned area using caller-owned state.
-    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut CommandPaletteState) {
+    fn paint(&self, area: Rect, frame: &mut Frame<'_>, state: &mut CommandPaletteState) {
         let filtered = self.filtered_indices(state.query.text());
         self.render_projected(area, frame, state, &filtered);
     }
@@ -395,7 +395,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        palette.paint_in(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
+        palette.paint(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -420,7 +420,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        palette.paint_in(Rect::new(0, 0, 16, 5), &mut frame, &mut state);
+        palette.paint(Rect::new(0, 0, 16, 5), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(3).as_deref(),

@@ -287,8 +287,7 @@ impl<'items> List<'items> {
 }
 
 impl List<'_> {
-    /// Paint this list into an explicitly assigned area using caller-owned state.
-    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut ListState) {
+    pub(crate) fn paint(&self, area: Rect, frame: &mut Frame<'_>, state: &mut ListState) {
         if area.is_empty() {
             return;
         }
@@ -365,7 +364,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         let selected_style = Style::new().add_modifier(Modifier::REVERSED);
 
-        List::new(&items).selected_style(selected_style).paint_in(
+        List::new(&items).selected_style(selected_style).paint(
             Rect::new(0, 0, 7, 2),
             &mut frame,
             &mut state,
@@ -396,7 +395,7 @@ mod tests {
 
         List::new(&items)
             .style(style)
-            .paint_in(Rect::new(0, 0, 5, 2), &mut frame, &mut state);
+            .paint(Rect::new(0, 0, 5, 2), &mut frame, &mut state);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("one  "));
         assert_eq!(
@@ -434,7 +433,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        List::new(&items).highlight_symbol("> ").paint_in(
+        List::new(&items).highlight_symbol("> ").paint(
             Rect::new(0, 0, 6, 1),
             &mut frame,
             &mut state,
