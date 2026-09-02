@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
@@ -19,7 +19,8 @@ use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
 use bmux_tui_components::pane::{
-    Pane, PaneBoundsPolicy, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState, ResizeHandles,
+    Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
+    ResizeHandles,
 };
 use bmux_tui_components::panel_group::{
     PanelGroup, PanelGroupAxis, PanelGroupComponent, PanelGroupOutcome, PanelGroupPolicy,
@@ -184,10 +185,17 @@ fn render_playground(
     message: &str,
 ) {
     let pane = interactive_pane(terminal_area);
-    pane.render(pane_state, frame);
-    frame.write_line(
-        pane.inner_area(pane_state),
-        &Line::from("Drag title or resize border"),
+    let pane_area = pane_state.area;
+    let pane_state = Cell::new(*pane_state);
+    render_component(
+        &PaneComponent::new(
+            "playground.pane",
+            pane,
+            &pane_state,
+            TextContent::new("Drag title or resize border").id("playground.pane.content"),
+        ),
+        pane_area,
+        frame,
     );
 
     let modal_area = Rect::new(36, 1, 32, 14);

@@ -9,9 +9,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::semantic::SemanticRegion;
@@ -264,7 +263,6 @@ impl ActionRowOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionRow<'a> {
     actions: &'a [ActionButton],
-    focused: usize,
     spacing: u16,
     policy: ActionRowPolicy,
     styles: ActionRowStyles,
@@ -356,7 +354,7 @@ impl Component for ActionRowComponent<'_, '_> {
             let Some(action) = self.row.actions.get(index) else {
                 break;
             };
-            let button_state = self.row.button_state(Some(&state), index);
+            let button_state = ActionRow::button_state(&state, index);
             let style = self.row.style_for(button_state);
             cx.write_line(
                 LocalRect::new(i32::from(action_area.x), 0, action_area.width, 1),
@@ -398,18 +396,10 @@ impl<'a> ActionRow<'a> {
     pub fn new(actions: &'a [ActionButton]) -> Self {
         Self {
             actions,
-            focused: 0,
             spacing: 1,
             policy: ActionRowPolicy::default(),
             styles: ActionRowStyles::default(),
         }
-    }
-
-    /// Set focused action index for stateless rendering.
-    #[must_use]
-    pub const fn focused(mut self, focused: usize) -> Self {
-        self.focused = focused;
-        self
     }
 
     /// Set horizontal spacing between buttons.
@@ -449,75 +439,6 @@ impl<'a> ActionRow<'a> {
         areas
     }
 
-    /// Render the action row using stateless focused-index configuration.
-    pub fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("action-row");
-        self.register_actions(area, None, frame, id.as_str());
-        self.render_actions(area, None, frame, None);
-    }
-
-    /// Render the action row with runtime state.
-    pub fn render_state(&self, area: Rect, state: &ActionRowState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("action-row");
-        self.render_state_with_id_prefix(area, state, frame, id.as_str());
-    }
-
-    /// Render state and register each visible button as an individual tab stop.
-    pub fn render_state_with_id_prefix(
-        &self,
-        area: Rect,
-        state: &ActionRowState,
-        frame: &mut Frame<'_>,
-        id_prefix: &str,
-    ) {
-        self.register_actions(area, Some(state), frame, id_prefix);
-        self.render_actions(area, Some(state), frame, None);
-    }
-
-    fn register_actions(
-        &self,
-        area: Rect,
-        state: Option<&ActionRowState>,
-        frame: &mut Frame<'_>,
-        id_prefix: &str,
-    ) {
-        for (index, action_area) in self.action_areas(area).into_iter().enumerate() {
-            let Some(action) = self.actions.get(index) else {
-                break;
-            };
-            frame.push_hit(
-                SceneRegion::new(
-                    HitId::new(format!("{id_prefix}.{}", action.id)),
-                    action_area,
-                )
-                .role(HitRole::Action)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(state.is_none_or(|state| !state.interaction.disabled)),
-            );
-        }
-    }
-
-    /// Render the action row with a fallback style filling each button area.
-    pub fn render_with_fallback_style(&self, area: Rect, frame: &mut Frame<'_>, style: Style) {
-        let id = frame.next_interaction_id("action-row");
-        self.register_actions(area, None, frame, id.as_str());
-        self.render_actions(area, None, frame, Some(style));
-    }
-
-    /// Render the action row with runtime state and a fallback style filling each button area.
-    pub fn render_state_with_fallback_style(
-        &self,
-        area: Rect,
-        state: &ActionRowState,
-        frame: &mut Frame<'_>,
-        style: Style,
-    ) {
-        let id = frame.next_interaction_id("action-row");
-        self.register_actions(area, Some(state), frame, id.as_str());
-        self.render_actions(area, Some(state), frame, Some(style));
-    }
-
     /// Handle one input event.
     pub fn handle_event(
         &self,
@@ -542,30 +463,6 @@ impl<'a> ActionRow<'a> {
         }
     }
 
-    fn render_actions(
-        &self,
-        area: Rect,
-        state: Option<&ActionRowState>,
-        frame: &mut Frame<'_>,
-        fallback: Option<Style>,
-    ) {
-        for (index, action_area) in self.action_areas(area).into_iter().enumerate() {
-            let Some(action) = self.actions.get(index) else {
-                return;
-            };
-            let button_state = self.button_state(state, index);
-            let line = Line::from_spans([Span::styled(
-                format!("[ {} ]", action.label),
-                self.style_for(button_state),
-            )]);
-            if let Some(fallback) = fallback {
-                frame.write_line_with_fallback_style(action_area, &line, fallback);
-            } else {
-                frame.write_line(action_area, &line);
-            }
-        }
-    }
-
     const fn style_for(&self, state: ButtonState) -> Style {
         if state.interaction.disabled {
             self.styles.disabled
@@ -580,16 +477,12 @@ impl<'a> ActionRow<'a> {
         }
     }
 
-    fn button_state(&self, state: Option<&ActionRowState>, index: usize) -> ButtonState {
+    fn button_state(state: &ActionRowState, index: usize) -> ButtonState {
         let mut button_state = ButtonState::new();
-        if let Some(state) = state {
-            button_state.set_focused(state.focused == Some(index));
-            button_state.interaction.hovered = state.hovered == Some(index);
-            button_state.interaction.pressed = state.pressed == Some(index);
-            button_state.interaction.disabled = state.interaction.disabled;
-        } else {
-            button_state.set_focused(index == self.focused);
-        }
+        button_state.set_focused(state.focused == Some(index));
+        button_state.interaction.hovered = state.hovered == Some(index);
+        button_state.interaction.pressed = state.pressed == Some(index);
+        button_state.interaction.disabled = state.interaction.disabled;
         button_state
     }
 
@@ -783,20 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_buttons() {
-        let actions = [ActionButton::new("approve", "Approve")];
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
-        let mut frame = Frame::new(&mut buffer);
-
-        ActionRow::new(&actions).render(Rect::new(0, 0, 12, 1), &mut frame);
-
-        assert_eq!(
-            frame.buffer().row_symbols(0).as_deref(),
-            Some("[ Approve ] ")
-        );
-    }
-
-    #[test]
     fn default_global_row_yields_arrow_navigation_to_global_routing() {
         let actions = [
             ActionButton::new("approve", "Approve"),
@@ -885,39 +764,6 @@ mod tests {
                 id: "deny".to_owned()
             }
         );
-    }
-
-    #[test]
-    fn every_render_path_registers_individual_global_tab_stops() {
-        let actions = [
-            ActionButton::new("approve", "Approve"),
-            ActionButton::new("deny", "Deny"),
-        ];
-        let row = ActionRow::new(&actions).spacing(2);
-        let area = Rect::new(3, 4, 30, 1);
-
-        for render in 0..4 {
-            let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 8));
-            let mut frame = Frame::new(&mut buffer);
-            let state = ActionRowState::new();
-            match render {
-                0 => row.render(area, &mut frame),
-                1 => row.render_state(area, &state, &mut frame),
-                2 => {
-                    row.render_with_fallback_style(area, &mut frame, bmux_tui::style::Style::new());
-                }
-                _ => row.render_state_with_fallback_style(
-                    area,
-                    &state,
-                    &mut frame,
-                    bmux_tui::style::Style::new(),
-                ),
-            }
-
-            assert_eq!(frame.hits().focus_targets(None).len(), 2);
-            assert_eq!(frame.hits().regions()[0].area, Rect::new(3, 4, 11, 1));
-            assert_eq!(frame.hits().regions()[1].area, Rect::new(16, 4, 8, 1));
-        }
     }
 
     #[test]

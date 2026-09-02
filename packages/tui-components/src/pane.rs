@@ -11,18 +11,16 @@ use bmux_tui::component::{
 };
 use bmux_tui::composition::Surface;
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Style};
 use bmux_tui::style::Modifier;
-use bmux_tui::widget::Widget;
 
 use crate::common::{DragState, InteractionState};
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
-    register_component_scope,
+    paint_component_scope,
 };
 
 /// Visual styles for a pane.
@@ -363,48 +361,9 @@ impl Pane<'_> {
         state: &PaneState,
         selection: &ComponentSelectionState,
         policy: &ComponentSelectionPolicy,
-        frame: &mut Frame<'_>,
+        paint: &mut PaintCx<'_, '_>,
     ) -> ComponentSelectionOutcome {
-        register_component_scope(frame, selection, policy, state.area, self.inner_area(state))
-    }
-
-    /// Render pane chrome/background and register enabled pane interaction.
-    pub fn render(&self, state: &PaneState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("pane");
-        self.render_with_id(id, state, frame);
-    }
-
-    /// Render pane chrome/background with a stable interaction identifier.
-    pub fn render_with_id(&self, id: impl Into<HitId>, state: &PaneState, frame: &mut Frame<'_>) {
-        let id = id.into();
-        if self.policy.mouse.enabled && !state.area.is_empty() {
-            frame.push_hit(
-                SceneRegion::new(id.clone(), state.area)
-                    .role(HitRole::Background)
-                    .hoverable(true)
-                    .focusable(false)
-                    .enabled(!state.interaction.disabled),
-            );
-            if self.policy.mouse.title_bar_drag {
-                frame.push_hit(
-                    SceneRegion::new(format!("{}.title", id.as_str()), title_bar_area(state.area))
-                        .role(HitRole::DragHandle)
-                        .hoverable(true)
-                        .focusable(false)
-                        .enabled(!state.interaction.disabled),
-                );
-            }
-            for (suffix, area) in self.resize_regions(state.area) {
-                frame.push_hit(
-                    SceneRegion::new(format!("{}.resize.{suffix}", id.as_str()), area)
-                        .role(HitRole::ResizeHandle)
-                        .hoverable(true)
-                        .focusable(false)
-                        .enabled(!state.interaction.disabled),
-                );
-            }
-        }
-        self.panel(state).render(state.area, frame);
+        paint_component_scope(paint, selection, policy, state.area, self.inner_area(state))
     }
 
     /// Handle one input event.
@@ -956,15 +915,12 @@ mod tests {
     use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
-    use bmux_tui::hit::HitRole;
     use bmux_tui::paint::PaintCx;
-    use bmux_tui::selection::SelectionCapture;
 
     use super::{
         Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
         ResizeHandles,
     };
-    use crate::selection::{ComponentSelectionPolicy, ComponentSelectionState};
 
     #[test]
     fn inner_area_accounts_for_border_and_padding() {
@@ -972,68 +928,6 @@ mod tests {
         let state = PaneState::new(Rect::new(0, 0, 20, 8));
 
         assert_eq!(pane.inner_area(&state), Rect::new(3, 2, 14, 4));
-    }
-
-    #[test]
-    fn renders_bordered_pane() {
-        let pane = Pane::new().title("Pane");
-        let state = PaneState::new(Rect::new(0, 0, 10, 3));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
-        let mut frame = Frame::new(&mut buffer);
-
-        pane.render(&state, &mut frame);
-
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("┌Pane────┐"));
-    }
-
-    #[test]
-    fn interactive_render_registers_pane_drag_and_resize_geometry() {
-        let pane = Pane::new().policy(PanePolicy {
-            mouse: PaneMousePolicy {
-                resize_handles: ResizeHandles::ALL,
-                ..PaneMousePolicy::draggable()
-            },
-            bounds: PaneBoundsPolicy::default(),
-        });
-        let state = PaneState::new(Rect::new(5, 3, 10, 5));
-        let mut buffer = Buffer::empty(Rect::new(3, 2, 14, 8));
-        let mut frame = Frame::new(&mut buffer);
-
-        pane.render_with_id("editor", &state, &mut frame);
-
-        let regions = frame.hits().regions();
-        assert_eq!(regions[0].id.as_str(), "editor");
-        assert_eq!(regions[0].area, Rect::new(5, 3, 10, 5));
-        assert_eq!(regions[0].role, HitRole::Background);
-        assert_eq!(regions[1].id.as_str(), "editor.title");
-        assert_eq!(regions[1].area, Rect::new(5, 3, 10, 1));
-        assert_eq!(regions[1].role, HitRole::DragHandle);
-        assert!(regions.iter().any(|region| {
-            region.id.as_str() == "editor.resize.bottom-right"
-                && region.area == Rect::new(14, 7, 1, 1)
-                && region.role == HitRole::ResizeHandle
-        }));
-        assert!(frame.hits().focus_targets(None).is_empty());
-    }
-
-    #[test]
-    fn static_and_empty_panes_register_nothing() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
-        let mut frame = Frame::new(&mut buffer);
-
-        Pane::new().render_with_id(
-            "static",
-            &PaneState::new(Rect::new(0, 0, 10, 3)),
-            &mut frame,
-        );
-        Pane::new()
-            .policy(PanePolicy {
-                mouse: PaneMousePolicy::draggable(),
-                bounds: PaneBoundsPolicy::default(),
-            })
-            .render_with_id("empty", &PaneState::new(Rect::new(0, 0, 0, 0)), &mut frame);
-
-        assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
@@ -1198,47 +1092,6 @@ mod tests {
         let outcome = pane.handle_event(&mut state, &mouse(MouseEventKind::ScrollDown, 0, 0));
 
         assert_eq!(outcome, PaneOutcome::Ignored);
-    }
-
-    #[test]
-    fn resize_handles_keep_precedence_over_nested_selection_scope() {
-        let pane = Pane::new().padding(Insets::all(1)).policy(PanePolicy {
-            mouse: PaneMousePolicy {
-                enabled: true,
-                click_to_focus: true,
-                title_bar_drag: false,
-                scroll_wheel: false,
-                resize_handles: ResizeHandles::ALL,
-            },
-            bounds: PaneBoundsPolicy::default(),
-        });
-        let mut state = PaneState::new(Rect::new(0, 0, 10, 5));
-        let mut buffer = Buffer::empty(state.area);
-        let mut frame = Frame::new(&mut buffer);
-        let selection = ComponentSelectionState::new("pane").parent("workspace");
-
-        pane.register_selection(
-            &state,
-            &selection,
-            &ComponentSelectionPolicy::content(),
-            &mut frame,
-        );
-        pane.render_with_id("pane", &state, &mut frame);
-
-        let scope = &frame.selection().scopes()[0];
-        assert_eq!(scope.initiation_area, pane.inner_area(&state));
-        assert_eq!(scope.capture, SelectionCapture::Capture);
-        assert!(frame.hits().regions().iter().any(|region| {
-            region.role == HitRole::ResizeHandle && region.area.contains(Point::new(9, 4))
-        }));
-        assert_eq!(
-            pane.handle_event(
-                &mut state,
-                &mouse(MouseEventKind::Down(MouseButton::Left), 9, 4),
-            ),
-            PaneOutcome::FocusRequested
-        );
-        assert!(state.is_dragging());
     }
 
     #[test]

@@ -22,7 +22,8 @@ use bmux_tui::hit::HitMap;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::palette::{CommandPalette, CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span};
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowState};
+use bmux_tui_components::action_row::{ActionButton, ActionRowComponent, ActionRowState};
+use bmux_tui_components::button::ButtonStyles;
 use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState, CheckboxStyles};
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
@@ -42,6 +43,7 @@ use bmux_tui_components::text_input_box::{
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -1582,18 +1584,31 @@ fn render_form(
             ActionButton::new("submit", active.envelope.request.submit_label.clone()),
             ActionButton::new("cancel", active.envelope.request.cancel_label.clone()),
         ];
-        let mut state = ActionRowState::new();
-        state.set_focused(Some(0));
-        ActionRow::new(&actions).render_state_with_fallback_style(
-            Rect::new(
-                content.x,
-                content.bottom().saturating_sub(1),
-                content.width,
-                1,
-            ),
-            &state,
-            frame,
-            theme.background,
+        let state = Cell::new({
+            let mut state = ActionRowState::new();
+            state.set_focused(Some(0));
+            state
+        });
+        let area = Rect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        );
+        let component =
+            ActionRowComponent::new("prompt.form.actions", &actions, &state).styles(ButtonStyles {
+                normal: theme.background,
+                focused: theme.background.patch(theme.focused),
+                hovered: theme.background,
+                pressed: theme.background,
+                disabled: theme.background,
+            });
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
         );
     }
     true

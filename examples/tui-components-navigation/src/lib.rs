@@ -3,11 +3,12 @@ use std::cell::{Cell, RefCell};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextContent;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Line, Span};
+use bmux_tui::prelude::{Line, Span, Text};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::breadcrumbs::{
     BreadcrumbItem, Breadcrumbs, BreadcrumbsComponent, BreadcrumbsOutcome, BreadcrumbsState,
@@ -16,10 +17,13 @@ use bmux_tui_components::key_hint_bar::{
     KeyHint, KeyHintBarComponent, KeyHintBarPolicy, KeyHintBarStyles,
 };
 use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
-use bmux_tui_components::pane::{Pane, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState};
+use bmux_tui_components::pane::{
+    Pane, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
+};
 use bmux_tui_components::scroll_area::{
     ScrollArea, ScrollAreaOutcome, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
 };
+use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
@@ -308,13 +312,30 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     let table_rows = table_rows();
     Table::new(&table_columns, &table_rows).render(Rect::new(1, 9, 32, 4), &demo.table, frame);
 
-    let pane = scroll_delegate_pane();
-    let pane_state = PaneState::new(scroll_delegate_pane_area());
-    pane.render(&pane_state, frame);
+    let pane_area = scroll_delegate_pane_area();
+    let pane_state = Cell::new(PaneState::new(pane_area));
     let pane_lines = pane_scroll_lines();
-    ScrollArea::new(&pane_lines)
-        .policy(ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Overlay))
-        .render(pane.inner_area(&pane_state), &demo.pane_scroll, frame);
+    let mut scroll_state = ScrollViewState::new();
+    scroll_state.set_vertical_offset(usize::from(demo.pane_scroll.vertical_offset()));
+    let content_area = scroll_delegate_pane().inner_area(&pane_state.get());
+    render_component(
+        &PaneComponent::new(
+            "navigation.scroll-pane",
+            scroll_delegate_pane(),
+            &pane_state,
+            ScrollViewComponent::new(
+                "navigation.scroll-pane.viewport",
+                bmux_tui::component::LogicalSize::new(
+                    content_area.width,
+                    usize::from(content_area.height),
+                ),
+                scroll_state,
+                TextContent::new(Text::from_lines(pane_lines)).id("navigation.scroll-pane.content"),
+            ),
+        ),
+        pane_area,
+        frame,
+    );
 
     let text_lines = text_view_lines();
     let text_highlights = text_view_highlights();

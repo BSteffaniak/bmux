@@ -12,10 +12,8 @@ use bmux_tui::component::{
 };
 use bmux_tui::composition::{SizeBox, Stack, Surface};
 use bmux_tui::event::{Event, EventOutcome};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::PaintCx;
-use bmux_tui::prelude::Widget;
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::Line;
 
@@ -230,29 +228,6 @@ impl ModalFrame {
     #[must_use]
     pub fn content_area(&self, parent: Rect) -> Rect {
         self.panel().inner_area(self.panel_area(parent))
-    }
-
-    /// Render the modal scrim and opaque panel frame.
-    pub fn render(&self, parent: Rect, frame: &mut Frame<'_>) {
-        if let Some(scrim) = self.theme.scrim {
-            frame.fill(parent, " ", scrim);
-        }
-        self.panel().render(self.panel_area(parent), frame);
-    }
-
-    /// Render this frame without outer chrome while preserving the same
-    /// border-reserved content geometry for extension-owned decoration.
-    pub fn render_without_chrome(&self, parent: Rect, frame: &mut Frame<'_>) {
-        if let Some(scrim) = self.theme.scrim {
-            frame.fill(parent, " ", scrim);
-        }
-        frame.fill(self.panel_area(parent), " ", self.theme.background);
-    }
-
-    /// Render one line inside this modal using the theme text style as an
-    /// opaque fallback.
-    pub fn render_line(&self, area: Rect, line: &Line, frame: &mut Frame<'_>) {
-        frame.write_line_with_fallback_style(area, line, self.theme.text);
     }
 
     /// Return this modal's visual theme.
@@ -620,7 +595,12 @@ mod tests {
             theme,
         );
 
-        modal.render(frame.area(), &mut frame);
+        let component = ModalFrameComponent::new("modal", modal.clone(), TextContent::new(""));
+        let layout = component.layout(
+            Constraints::tight(frame.area().size()),
+            &mut LayoutCx::new(),
+        );
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
 
         let panel = modal.panel_area(frame.area());
         for y in panel.y..panel.bottom() {
@@ -713,7 +693,12 @@ mod tests {
             theme,
         );
 
-        modal.render(frame.area(), &mut frame);
+        let component = ModalFrameComponent::new("modal", modal, TextContent::new(""));
+        let layout = component.layout(
+            Constraints::tight(frame.area().size()),
+            &mut LayoutCx::new(),
+        );
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(
             frame.buffer().get(Point::new(0, 0)).expect("cell").style.bg,

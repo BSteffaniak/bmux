@@ -29,7 +29,7 @@ use bmux_tui_components::labeled_details::{DetailItem, LabeledDetailsComponent};
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
-use bmux_tui_components::pane::{Pane, PaneState};
+use bmux_tui_components::pane::{Pane, PaneComponent, PaneState};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFrameComponent, PickerFramePolicy};
 use bmux_tui_components::progress_bar::{
     ProgressBarComponent, ProgressBarPolicy, ProgressBarValue, ProgressLabelPlacement,
@@ -182,10 +182,18 @@ fn render_field(frame: &mut Frame<'_>) {
 }
 
 fn render_pane(frame: &mut Frame<'_>) {
-    let pane = Pane::new().title("Pane").padding(Insets::all(1));
-    let state = PaneState::new(Rect::new(1, 11, 28, 8));
-    pane.render(&state, frame);
-    frame.write_line(pane.inner_area(&state), &Line::from("Pane content area"));
+    let area = Rect::new(1, 11, 28, 8);
+    let state = Cell::new(PaneState::new(area));
+    render_component(
+        &PaneComponent::new(
+            "gallery.pane",
+            Pane::new().title("Pane").padding(Insets::all(1)),
+            &state,
+            TextContent::new("Pane content area").id("gallery.pane.content"),
+        ),
+        area,
+        frame,
+    );
 }
 
 fn render_progress(frame: &mut Frame<'_>) {

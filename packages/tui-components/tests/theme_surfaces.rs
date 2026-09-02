@@ -9,7 +9,7 @@ use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Style};
 use bmux_tui_components::button::{ButtonComponent, ButtonState};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalSizing};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
 use bmux_tui_components::picker_frame::{PickerFrame, PickerFrameComponent, PickerFramePolicy};
 use bmux_tui_components::theme::ComponentTheme;
 
@@ -46,12 +46,23 @@ fn rendered(theme: ComponentTheme) -> Buffer {
         |cx| picker.paint(&layout, cx),
     );
 
-    ModalFrame::new(
-        ModalSizing::fixed(Size::new(14, 5), Insets::all(0)),
-        theme.modal_theme(),
-    )
-    .title("Modal")
-    .render(Rect::new(24, 3, 15, 6), &mut frame);
+    let modal_area = Rect::new(24, 3, 15, 6);
+    let modal = ModalFrameComponent::new(
+        "theme.modal",
+        ModalFrame::new(
+            ModalSizing::fixed(Size::new(14, 5), Insets::all(0)),
+            theme.modal_theme(),
+        )
+        .title("Modal"),
+        TextContent::new(""),
+    );
+    let layout = modal.layout(Constraints::tight(modal_area.size()), &mut LayoutCx::new());
+    PaintCx::new(&mut frame).with_child(
+        i32::from(modal_area.x),
+        i64::from(modal_area.y),
+        LocalRect::new(0, 0, modal_area.width, modal_area.height),
+        |cx| modal.paint(&layout, cx),
+    );
     buffer
 }
 

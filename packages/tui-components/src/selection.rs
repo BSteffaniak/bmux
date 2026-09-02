@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::selection::{
     SelectionAutoScrollPolicy, SelectionCapture, SelectionContentId, SelectionFragment,
     SelectionScope, SelectionScopeId,
@@ -172,16 +173,14 @@ pub enum ComponentSelectionOutcome {
     ContentRegistered { fragments: usize },
 }
 
-/// Register one component scope with separate content and outer chrome areas.
-pub fn register_component_scope(
-    frame: &mut Frame<'_>,
+fn component_scope(
     state: &ComponentSelectionState,
     policy: &ComponentSelectionPolicy,
     outer_area: Rect,
     content_area: Rect,
-) -> ComponentSelectionOutcome {
+) -> Option<SelectionScope> {
     if !policy.enabled || outer_area.is_empty() {
-        return ComponentSelectionOutcome::Disabled;
+        return None;
     }
     let capture = if content_area.is_empty() {
         policy.chrome_capture
@@ -202,6 +201,35 @@ pub fn register_component_scope(
     if let Some(parent) = state.parent_scope.as_ref() {
         scope = scope.parent(parent.clone());
     }
+    Some(scope)
+}
+
+/// Register one component scope in local component coordinates.
+pub fn paint_component_scope(
+    paint: &mut PaintCx<'_, '_>,
+    state: &ComponentSelectionState,
+    policy: &ComponentSelectionPolicy,
+    outer_area: Rect,
+    content_area: Rect,
+) -> ComponentSelectionOutcome {
+    let Some(scope) = component_scope(state, policy, outer_area, content_area) else {
+        return ComponentSelectionOutcome::Disabled;
+    };
+    paint.push_selection_scope(scope);
+    ComponentSelectionOutcome::ScopeRegistered
+}
+
+/// Register one component scope with separate content and outer chrome areas.
+pub fn register_component_scope(
+    frame: &mut Frame<'_>,
+    state: &ComponentSelectionState,
+    policy: &ComponentSelectionPolicy,
+    outer_area: Rect,
+    content_area: Rect,
+) -> ComponentSelectionOutcome {
+    let Some(scope) = component_scope(state, policy, outer_area, content_area) else {
+        return ComponentSelectionOutcome::Disabled;
+    };
     frame.push_selection_scope(scope);
     ComponentSelectionOutcome::ScopeRegistered
 }
