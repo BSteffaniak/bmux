@@ -286,10 +286,9 @@ impl<'items> List<'items> {
     }
 }
 
-impl crate::widget::StatefulWidget for List<'_> {
-    type State = ListState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl List<'_> {
+    /// Paint this list into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut ListState) {
         if area.is_empty() {
             return;
         }
@@ -348,7 +347,6 @@ mod tests {
     use crate::frame::Frame;
     use crate::geometry::Rect;
     use crate::style::{Color, Modifier, Style};
-    use crate::widget::StatefulWidget;
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 
     #[test]
@@ -367,7 +365,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         let selected_style = Style::new().add_modifier(Modifier::REVERSED);
 
-        List::new(&items).selected_style(selected_style).render(
+        List::new(&items).selected_style(selected_style).paint_in(
             Rect::new(0, 0, 7, 2),
             &mut frame,
             &mut state,
@@ -398,7 +396,7 @@ mod tests {
 
         List::new(&items)
             .style(style)
-            .render(Rect::new(0, 0, 5, 2), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 5, 2), &mut frame, &mut state);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("one  "));
         assert_eq!(
@@ -436,7 +434,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        List::new(&items).highlight_symbol("> ").render(
+        List::new(&items).highlight_symbol("> ").paint_in(
             Rect::new(0, 0, 6, 1),
             &mut frame,
             &mut state,

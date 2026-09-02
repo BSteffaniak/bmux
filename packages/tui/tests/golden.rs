@@ -19,7 +19,7 @@ fn golden_panel_text_and_dialog_rendering() {
 
     Dialog::new("Run this command?", &actions)
         .panel(Panel::new().border(Border::ascii()).title("Confirm"))
-        .render(Rect::new(0, 0, 24, 6), &mut frame, &mut state);
+        .paint_in(Rect::new(0, 0, 24, 6), &mut frame, &mut state);
 
     assert_eq!(
         buffer_rows(frame.buffer()),
@@ -52,7 +52,7 @@ fn golden_list_picker_rendering() {
     ListPicker::new(&input, &items)
         .panel(Panel::new().border(Border::rounded()).title("Command"))
         .list(List::new(&items).highlight_symbol("> "))
-        .render(Rect::new(0, 0, 20, 6), &mut frame, &mut state);
+        .paint_in(Rect::new(0, 0, 20, 6), &mut frame, &mut state);
 
     assert_eq!(
         buffer_rows(frame.buffer()),
@@ -69,7 +69,7 @@ fn golden_list_picker_rendering() {
 
 #[test]
 fn golden_dropdown_overlay_rendering() {
-    let base = TextBlock::new("base surface");
+    let base = TextBlock::new("base surface").id("base");
     let items = vec![ListItem::new("alpha"), ListItem::new("beta")];
     let dropdown = Dropdown::new(&items)
         .panel(Panel::new().border(Border::ascii()))
@@ -81,8 +81,12 @@ fn golden_dropdown_overlay_rendering() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 4));
     let mut frame = Frame::new(&mut buffer);
 
-    base.render(Rect::new(0, 0, 16, 1), &mut frame);
-    dropdown.render(Rect::new(4, 1, 8, 3), &mut frame, &mut list_state);
+    let layout = base.layout(
+        Constraints::tight(Rect::new(0, 0, 16, 1).size()),
+        &mut LayoutCx::new(),
+    );
+    base.paint(&layout, &mut PaintCx::new(&mut frame));
+    dropdown.paint_in(Rect::new(4, 1, 8, 3), &mut frame, &mut list_state);
 
     assert_eq!(
         buffer_rows(frame.buffer()),

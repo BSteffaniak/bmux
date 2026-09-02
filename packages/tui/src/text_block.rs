@@ -1,15 +1,19 @@
 //! Styled text block widget and wrapping helpers.
 
-use crate::frame::Frame;
-use crate::geometry::Rect;
+use std::hash::{Hash, Hasher};
+
+use crate::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
+use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::{Line, Text, wrap_line_character, wrap_line_word};
-use crate::widget::Widget;
 
 pub use crate::text::TextWrap;
 
 /// Horizontal text alignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Alignment {
     /// Align to the left edge.
     #[default]
@@ -23,6 +27,7 @@ pub enum Alignment {
 /// A simple styled text block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextBlock {
+    id: LayoutId,
     text: Text,
     style: Style,
     alignment: Alignment,
@@ -36,6 +41,7 @@ impl TextBlock {
     #[must_use]
     pub fn new(text: impl Into<Text>) -> Self {
         Self {
+            id: LayoutId::new("text-block"),
             text: text.into(),
             style: Style::new(),
             alignment: Alignment::Left,
@@ -43,6 +49,13 @@ impl TextBlock {
             trim: false,
             vertical_scroll: 0,
         }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Set base style used to fill rendered rows and as a fallback behind text
@@ -88,30 +101,66 @@ impl TextBlock {
     }
 }
 
-impl Widget for TextBlock {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
+impl Component for TextBlock {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut layout);
+        self.text.width().hash(&mut layout);
+        self.text.lines.len().hash(&mut layout);
+        format!("{:?}", self.wrap).hash(&mut layout);
+        self.trim.hash(&mut layout);
+        self.vertical_scroll.hash(&mut layout);
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.text).hash(&mut paint);
+        self.style.hash(&mut paint);
+        self.alignment.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
 
-        let lines = render_lines_for_text_block(&self.text, area.width, self.wrap, self.trim);
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = if constraints.min_width() == constraints.max_width() {
+            constraints.max_width()
+        } else {
+            u16::try_from(self.text.width())
+                .unwrap_or(u16::MAX)
+                .clamp(constraints.min_width(), constraints.max_width())
+        };
+        let rows = render_lines_for_text_block(&self.text, width, self.wrap, self.trim)
+            .len()
+            .saturating_sub(self.vertical_scroll);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, rows)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("text-block"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let lines =
+            render_lines_for_text_block(&self.text, layout.size.width, self.wrap, self.trim);
         for (line_index, line) in lines
             .iter()
             .skip(self.vertical_scroll)
-            .take(usize::from(area.height))
+            .take(usize::from(height))
             .enumerate()
         {
-            let Ok(line_offset) = u16::try_from(line_index) else {
-                return;
+            let row = u16::try_from(line_index).unwrap_or(u16::MAX);
+            let row_area = LocalRect::new(0, i64::from(row), layout.size.width, 1);
+            cx.fill(row_area, " ", self.style);
+            let width = line_width(line).min(layout.size.width);
+            let remaining = layout.size.width.saturating_sub(width);
+            let x = match self.alignment {
+                Alignment::Left => 0,
+                Alignment::Center => remaining / 2,
+                Alignment::Right => remaining,
             };
-            let line_y = area.y.saturating_add(line_offset);
-            let line_area = aligned_line_area(area, line, self.alignment)
-                .unwrap_or_else(|| Rect::new(area.x, line_y, 0, 1));
-            frame.fill(Rect::new(area.x, line_y, area.width, 1), " ", self.style);
-            frame.write_line(
-                Rect::new(line_area.x, line_y, line_area.width, 1),
+            cx.write_line(
+                LocalRect::new(i32::from(x), i64::from(row), width, 1),
                 &line.with_fallback_style(self.style),
             );
+            cx.push_damage(row_area);
         }
     }
 }
@@ -163,20 +212,6 @@ fn trim_line_end(line: &Line) -> Line {
     Line::from_spans(spans)
 }
 
-fn aligned_line_area(area: Rect, line: &Line, alignment: Alignment) -> Option<Rect> {
-    let width = line_width(line).min(area.width);
-    if width == 0 {
-        return None;
-    }
-    let remaining = area.width.saturating_sub(width);
-    let x_offset = match alignment {
-        Alignment::Left => 0,
-        Alignment::Center => remaining / 2,
-        Alignment::Right => remaining,
-    };
-    Some(Rect::new(area.x.saturating_add(x_offset), area.y, width, 1))
-}
-
 fn line_width(line: &Line) -> u16 {
     let width: usize = line
         .spans
@@ -190,11 +225,27 @@ fn line_width(line: &Line) -> u16 {
 mod tests {
     use super::{Alignment, TextBlock, TextWrap};
     use crate::buffer::Buffer;
+    use crate::component::{Component, Constraints, LayoutCx};
     use crate::frame::Frame;
     use crate::geometry::Rect;
+    use crate::paint::{LocalRect, PaintCx};
     use crate::style::{Color, Style};
     use crate::text::{Line, Text};
-    use crate::widget::Widget;
+    trait TextBlockTestRender {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>);
+    }
+
+    impl TextBlockTestRender for TextBlock {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+            let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| self.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn text_block_wraps_at_grapheme_boundaries() {

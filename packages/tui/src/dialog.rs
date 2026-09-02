@@ -1,18 +1,25 @@
 //! Button and dialog widgets.
 
-use crate::chrome::{Border, Panel};
+use std::hash::{Hash, Hasher};
+
+use crate::chrome::{Border, Panel, PanelComponent};
+use crate::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::layout::{Direction, split_trailing};
+use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::{Line, Text};
 use crate::text_block::{TextBlock, TextWrap};
-use crate::widget::Widget;
 
-/// A simple button widget.
+/// A simple button component.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Button {
+    id: LayoutId,
     label: Line,
     style: Style,
     focused_style: Style,
@@ -22,8 +29,9 @@ pub struct Button {
 impl Button {
     /// Create a button with a label.
     #[must_use]
-    pub fn new(label: impl Into<Line>) -> Self {
+    pub fn new(id: impl Into<LayoutId>, label: impl Into<Line>) -> Self {
         Self {
+            id: id.into(),
             label: label.into(),
             style: Style::new(),
             focused_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
@@ -51,19 +59,13 @@ impl Button {
         self.focused = focused;
         self
     }
-}
-
-impl Widget for Button {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
+    fn line(&self) -> Line {
         let style = if self.focused {
             self.style.patch(self.focused_style)
         } else {
             self.style
         };
-        let line = Line::from_spans(vec![
+        Line::from_spans(vec![
             crate::text::Span::styled("[ ", style),
             self.label
                 .with_fallback_style(style)
@@ -72,8 +74,35 @@ impl Widget for Button {
                 .next()
                 .unwrap_or_else(|| crate::text::Span::styled(String::new(), style)),
             crate::text::Span::styled(" ]", style),
-        ]);
-        frame.write_line(area, &line);
+        ])
+    }
+}
+
+impl Component for Button {
+    fn revision(&self) -> ComponentRevision {
+        let line = self.line();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut layout);
+        line.width().hash(&mut layout);
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{line:?}").hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let width = u16::try_from(self.line().width()).unwrap_or(u16::MAX);
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, 1)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("button"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        cx.write_line(area, &self.line());
+        cx.push_damage(area);
     }
 }
 
@@ -177,18 +206,32 @@ impl<'a> Dialog<'a> {
     }
 }
 
-impl crate::widget::StatefulWidget for Dialog<'_> {
-    type State = DialogState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl Dialog<'_> {
+    /// Paint this dialog into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut DialogState) {
         if area.is_empty() {
             return;
         }
-        self.panel.render(area, frame);
+        let panel = PanelComponent::new("dialog.panel", &self.panel);
+        let panel_layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| panel.paint(&panel_layout, cx),
+        );
         let inner = self.content_area(area);
         let action_height = u16::from(!self.actions.is_empty());
         let split = split_trailing(inner, Direction::Vertical, action_height);
-        self.body.render(split.first, frame);
+        let layout = self
+            .body
+            .layout(Constraints::tight(split.first.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(split.first.x),
+            i64::from(split.first.y),
+            LocalRect::new(0, 0, split.first.width, split.first.height),
+            |cx| self.body.paint(&layout, cx),
+        );
         render_dialog_actions(
             self.actions,
             state,
@@ -223,11 +266,18 @@ fn render_dialog_actions(
         .unwrap_or(u16::MAX)
         .saturating_add(4)
         .min(area.right().saturating_sub(x));
-        let button = Button::new(action.label.clone())
+        let button = Button::new(format!("dialog-action:{}", action.id), action.label.clone())
             .style(button_style)
             .focused_style(focused_button_style)
             .focused(index == state.focused_action);
-        button.render(Rect::new(x, area.y, width, 1), frame);
+        let area = Rect::new(x, area.y, width, 1);
+        let layout = button.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| button.paint(&layout, cx),
+        );
         x = x.saturating_add(width).saturating_add(1);
     }
 }
@@ -237,10 +287,11 @@ mod tests {
     use super::{Button, Dialog, DialogAction, DialogState};
     use crate::buffer::Buffer;
     use crate::chrome::{Border, Panel};
+    use crate::component::{Component, Constraints, LayoutCx};
     use crate::frame::Frame;
     use crate::geometry::Rect;
+    use crate::paint::PaintCx;
     use crate::style::{Color, Style};
-    use crate::widget::{StatefulWidget, Widget};
 
     #[test]
     fn button_renders_focus_style() {
@@ -248,10 +299,12 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         let focus = Style::new().bg(Color::Blue);
 
-        Button::new("Run")
-            .focused_style(focus)
-            .focused(true)
-            .render(Rect::new(0, 0, 8, 1), &mut frame);
+        let button = Button::new("run", "Run").focused_style(focus).focused(true);
+        let layout = button.layout(
+            Constraints::tight(Rect::new(0, 0, 8, 1).size()),
+            &mut LayoutCx::new(),
+        );
+        button.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ Run ] "));
         assert_eq!(
@@ -275,7 +328,7 @@ mod tests {
 
         Dialog::new("Permit action?", &actions)
             .panel(Panel::new().border(Border::ascii()).title("Permission"))
-            .render(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),

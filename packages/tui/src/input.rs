@@ -10,12 +10,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize,
 };
-use crate::frame::Frame;
 use crate::geometry::{Point, Rect};
 use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::Line;
-use crate::widget::Widget;
 
 /// Enter-key behavior for text input key handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,6 +87,7 @@ pub struct TextInputProjection {
 /// A multiline text input widget backed by [`TextEditBuffer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextInput<'buffer> {
+    id: LayoutId,
     buffer: &'buffer TextEditBuffer,
     style: Style,
     selection_style: Style,
@@ -101,8 +100,9 @@ pub struct TextInput<'buffer> {
 impl<'buffer> TextInput<'buffer> {
     /// Create a text input from an edit buffer.
     #[must_use]
-    pub const fn new(buffer: &'buffer TextEditBuffer) -> Self {
+    pub fn new(buffer: &'buffer TextEditBuffer) -> Self {
         Self {
+            id: LayoutId::new("text-input"),
             buffer,
             style: Style::new(),
             selection_style: Style::new().add_modifier(crate::style::Modifier::REVERSED),
@@ -111,6 +111,13 @@ impl<'buffer> TextInput<'buffer> {
             cursor_visible: true,
             vertical_scroll: 0,
         }
+    }
+
+    /// Set stable layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Set rendered text style.
@@ -286,7 +293,7 @@ impl Component for TextInput<'_> {
                 .max(1)
         };
         LayoutNode::leaf(
-            LayoutId::new("text-input"),
+            self.id.clone(),
             constraints.constrain(LogicalSize::new(width, rows)),
         )
     }
@@ -300,18 +307,6 @@ impl Component for TextInput<'_> {
                 u16::try_from(layout.size.height).unwrap_or(u16::MAX),
             ),
             cx,
-        );
-    }
-}
-
-impl Widget for TextInput<'_> {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(area.x),
-            i64::from(area.y),
-            LocalRect::new(0, 0, area.width, area.height),
-            |cx| self.paint(&layout, cx),
         );
     }
 }
@@ -371,7 +366,21 @@ mod tests {
     use crate::geometry::{Rect, Size};
     use crate::paint::{LocalRect, PaintCx};
     use crate::style::{Modifier, Style};
-    use crate::widget::Widget;
+    trait TextInputTestRender {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>);
+    }
+
+    impl TextInputTestRender for TextInput<'_> {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+            let layout = self.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| self.paint(&layout, cx),
+            );
+        }
+    }
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
     use bmux_text_edit::TextEditBuffer;
 

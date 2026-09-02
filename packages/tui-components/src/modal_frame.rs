@@ -1,11 +1,11 @@
 //! Opaque modal frame components.
 //!
 //! [`ModalFrame`] is the preferred foundation for overlay dialogs. It keeps the
-//! low-level [`bmux_tui::chrome::Panel`] primitive flexible while making modal
+//! low-level [`bmux_tui::composition::Surface`] primitive flexible while making modal
 //! surfaces opaque by default so underlying content cannot bleed through blank
 //! rows or short text lines.
 
-use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::chrome::Border;
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode, LogicalSize,
@@ -227,24 +227,15 @@ impl ModalFrame {
     /// Return the resolved modal content area for a parent area.
     #[must_use]
     pub fn content_area(&self, parent: Rect) -> Rect {
-        self.panel().inner_area(self.panel_area(parent))
+        self.panel_area(parent)
+            .inset(self.border.sides.insets())
+            .inset(self.padding)
     }
 
     /// Return this modal's visual theme.
     #[must_use]
     pub const fn theme(&self) -> ModalTheme {
         self.theme
-    }
-
-    fn panel(&self) -> Panel {
-        let mut panel = Panel::new()
-            .border(self.border.clone())
-            .padding(self.padding)
-            .background(self.theme.background);
-        if let Some(title) = &self.title {
-            panel = panel.title(title.clone());
-        }
-        panel
     }
 }
 

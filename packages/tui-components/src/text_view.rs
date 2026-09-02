@@ -1,14 +1,15 @@
 //! Read-only text/paragraph viewer component.
 
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::{line_viewport, wrap_line_character, wrap_line_word};
-use bmux_tui::widget::Widget;
 
 use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
@@ -641,12 +642,22 @@ impl<'a> TextView<'a> {
             layout.lines
         };
         let text = Text::from_lines(lines);
-        TextBlock::new(text)
+        let text = TextBlock::new(text)
+            .id(format!("{}.content", id.as_str()))
             .style(self.styles.text)
             .alignment(self.policy.alignment)
             .wrap(TextWrap::None)
-            .vertical_scroll(layout.vertical_scroll)
-            .render(content_area, frame);
+            .vertical_scroll(layout.vertical_scroll);
+        let text_layout = text.layout(
+            Constraints::tight(content_area.size()),
+            &mut LayoutCx::new(),
+        );
+        PaintCx::new(frame).with_child(
+            i32::from(content_area.x),
+            i64::from(content_area.y),
+            LocalRect::new(0, 0, content_area.width, content_area.height),
+            |cx| text.paint(&text_layout, cx),
+        );
         self.render_scrollbars(
             id.as_str(),
             area,

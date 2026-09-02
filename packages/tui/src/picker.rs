@@ -2,13 +2,14 @@
 
 use bmux_text_edit::TextEditBuffer;
 
-use crate::chrome::{Border, Panel};
+use crate::chrome::{Border, Panel, PanelComponent};
+use crate::component::{Component, Constraints, LayoutCx};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::input::TextInput;
 use crate::layout::{Direction, split_leading};
 use crate::list::{List, ListItem, ListState};
-use crate::widget::Widget;
+use crate::paint::{LocalRect, PaintCx};
 
 /// A lightweight dropdown/list popup widget.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,10 +63,9 @@ impl<'items> Dropdown<'items> {
     }
 }
 
-impl crate::widget::StatefulWidget for Dropdown<'_> {
-    type State = ListState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl Dropdown<'_> {
+    /// Paint this dropdown into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut ListState) {
         if area.is_empty() {
             return;
         }
@@ -73,9 +73,16 @@ impl crate::widget::StatefulWidget for Dropdown<'_> {
             Rect::new(area.x, area.y, area.width, min_u16(area.height, max_height))
         });
         if let Some(panel) = &self.panel {
-            panel.render(area, frame);
+            let panel = PanelComponent::new("dropdown.panel", panel);
+            let panel_layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| panel.paint(&panel_layout, cx),
+            );
         }
-        self.list.render(self.content_area(area), frame, state);
+        self.list.paint_in(self.content_area(area), frame, state);
     }
 }
 
@@ -97,7 +104,7 @@ pub struct ListPicker<'a> {
 impl<'a> ListPicker<'a> {
     /// Create a list picker from an input buffer and list items.
     #[must_use]
-    pub const fn new(input: &'a TextEditBuffer, items: &'a [ListItem]) -> Self {
+    pub fn new(input: &'a TextEditBuffer, items: &'a [ListItem]) -> Self {
         Self {
             input: TextInput::new(input),
             items,
@@ -156,17 +163,30 @@ impl<'a> ListPicker<'a> {
     }
 }
 
-impl crate::widget::StatefulWidget for ListPicker<'_> {
-    type State = ListState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl ListPicker<'_> {
+    /// Paint this picker into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut ListState) {
         if area.is_empty() {
             return;
         }
-        self.panel.render(area, frame);
+        let panel = PanelComponent::new("list-picker.panel", &self.panel);
+        let panel_layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| panel.paint(&panel_layout, cx),
+        );
         let areas = self.content_areas(area);
-        self.input.render(areas.input, frame);
-        self.list.render(areas.list, frame, state);
+        let input = self.input.clone().id("list-picker.input");
+        let layout = input.layout(Constraints::tight(areas.input.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(areas.input.x),
+            i64::from(areas.input.y),
+            LocalRect::new(0, 0, areas.input.width, areas.input.height),
+            |cx| input.paint(&layout, cx),
+        );
+        self.list.paint_in(areas.list, frame, state);
     }
 }
 
@@ -195,7 +215,6 @@ mod tests {
     use crate::frame::Frame;
     use crate::geometry::Rect;
     use crate::list::{ListItem, ListState};
-    use crate::widget::StatefulWidget;
     use bmux_text_edit::TextEditBuffer;
 
     #[test]
@@ -215,7 +234,7 @@ mod tests {
         Dropdown::new(&items)
             .panel(Panel::new().border(Border::ascii()))
             .max_height(3)
-            .render(Rect::new(0, 0, 8, 4), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 8, 4), &mut frame, &mut state);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("+------+"));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("|two   |"));
@@ -266,7 +285,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        ListPicker::new(&input, &items).render(Rect::new(0, 0, 8, 5), &mut frame, &mut state);
+        ListPicker::new(&input, &items).paint_in(Rect::new(0, 0, 8, 5), &mut frame, &mut state);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("┌──────┐"));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("│f     │"));

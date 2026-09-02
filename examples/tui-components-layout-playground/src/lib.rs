@@ -8,10 +8,9 @@ use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Border, Line, Panel, PanelTitle};
+use bmux_tui::prelude::{Border, Line, Panel, PanelComponent, PanelTitle};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text_block::Alignment;
-use bmux_tui::widget::Widget;
 use bmux_tui_components::common::{
     ComponentHitRegion, DragState, HitRegionId, ResizeBounds, hit_region_at,
 };
@@ -216,13 +215,17 @@ fn render_playground(
     );
 
     let block_area = Rect::new(2, 10, 30, 1);
-    Panel::new()
+    let panel = Panel::new()
         .border(Border::rounded())
         .title(PanelTitle::new("Padded Block").alignment(Alignment::Center))
         .padding(Insets::new(0, 1, 0, 1))
         .background(Style::new().bg(Color::Black))
-        .content_style(Style::new().bg(Color::Black))
-        .render(block_area, frame);
+        .content_style(Style::new().bg(Color::Black));
+    render_component(
+        &PanelComponent::new("playground.padded-block", &panel),
+        block_area,
+        frame,
+    );
 
     let group_area = panel_group_area();
     let group = PanelGroupComponent::new(

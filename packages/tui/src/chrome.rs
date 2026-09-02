@@ -1,13 +1,19 @@
 //! Panel, border, and modal chrome primitives.
 
+use std::hash::{Hash, Hasher};
+
+use crate::component::{
+    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
+    LogicalSize,
+};
 use crate::frame::Frame;
 use crate::geometry::{Insets, Rect, Size};
 use crate::layout::centered;
+use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::Line;
 use crate::text_block::Alignment;
 use crate::text_width::display_width;
-use crate::widget::Widget;
 
 /// Border glyph set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,24 +365,187 @@ impl Panel {
     }
 }
 
-impl Widget for Panel {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+impl Component for PanelComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut layout);
+        self.panel.padding.top.hash(&mut layout);
+        self.panel.padding.right.hash(&mut layout);
+        self.panel.padding.bottom.hash(&mut layout);
+        self.panel.padding.left.hash(&mut layout);
+        format!(
+            "{:?}",
+            self.panel.border.as_ref().map(|border| border.sides)
+        )
+        .hash(&mut layout);
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.panel).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(
+                constraints.max_width(),
+                constraints
+                    .max_height()
+                    .unwrap_or_else(|| constraints.min_height()),
+            )),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("panel"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
         if area.is_empty() {
             return;
         }
-        if let Some(style) = self.background {
-            frame.fill(area, " ", style);
+        if let Some(style) = self.panel.background {
+            cx.fill(LocalRect::new(0, 0, area.width, area.height), " ", style);
         }
-        if let Some(style) = self.content_style {
-            frame.fill(self.inner_area(area), " ", style);
+        if let Some(style) = self.panel.content_style {
+            let inner = self.panel.inner_area(area);
+            cx.fill(
+                LocalRect::new(
+                    i32::from(inner.x),
+                    i64::from(inner.y),
+                    inner.width,
+                    inner.height,
+                ),
+                " ",
+                style,
+            );
         }
-        if let Some(border) = &self.border {
-            render_border(area, border, frame);
-            if let Some(title) = &self.title {
-                render_title(area, title, self.title_style.unwrap_or(border.style), frame);
+        if let Some(border) = &self.panel.border {
+            paint_panel_border(area, border, cx);
+            if let Some(title) = &self.panel.title {
+                paint_panel_title(
+                    area,
+                    title,
+                    self.panel.title_style.unwrap_or(border.style),
+                    cx,
+                );
+            }
+        }
+        cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
+    }
+}
+
+/// Canonical scoped-paint adapter for legacy child-owning containers.
+pub struct PanelComponent<'a> {
+    id: LayoutId,
+    panel: &'a Panel,
+}
+
+impl<'a> PanelComponent<'a> {
+    /// Borrow panel chrome under stable component identity.
+    pub fn new(id: impl Into<LayoutId>, panel: &'a Panel) -> Self {
+        Self {
+            id: id.into(),
+            panel,
+        }
+    }
+}
+
+fn paint_panel_border(area: Rect, border: &Border, cx: &mut PaintCx<'_, '_>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let right = area.right().saturating_sub(1);
+    let bottom = area.bottom().saturating_sub(1);
+    let sides = border.sides;
+    for (enabled, horizontal, coordinate) in [
+        (sides.top, true, area.y),
+        (sides.bottom && bottom != area.y, true, bottom),
+        (sides.left, false, area.x),
+        (sides.right && right != area.x, false, right),
+    ] {
+        if !enabled {
+            continue;
+        }
+        if horizontal {
+            for x in area.x..area.right() {
+                cx.set_cell(
+                    i32::from(x),
+                    i64::from(coordinate),
+                    &border.set.horizontal.to_string(),
+                    border.style,
+                );
+            }
+        } else {
+            for y in area.y..area.bottom() {
+                cx.set_cell(
+                    i32::from(coordinate),
+                    i64::from(y),
+                    &border.set.vertical.to_string(),
+                    border.style,
+                );
             }
         }
     }
+    if area.width > 1 && area.height > 1 {
+        for (enabled, x, y, symbol) in [
+            (sides.top && sides.left, area.x, area.y, border.set.top_left),
+            (
+                sides.top && sides.right,
+                right,
+                area.y,
+                border.set.top_right,
+            ),
+            (
+                sides.bottom && sides.left,
+                area.x,
+                bottom,
+                border.set.bottom_left,
+            ),
+            (
+                sides.bottom && sides.right,
+                right,
+                bottom,
+                border.set.bottom_right,
+            ),
+        ] {
+            if enabled {
+                cx.set_cell(
+                    i32::from(x),
+                    i64::from(y),
+                    &symbol.to_string(),
+                    border.style,
+                );
+            }
+        }
+    }
+}
+
+fn paint_panel_title(area: Rect, title: &PanelTitle, style: Style, cx: &mut PaintCx<'_, '_>) {
+    if area.width <= 2 || area.height == 0 {
+        return;
+    }
+    let y = match title.position {
+        TitlePosition::Top => area.y,
+        TitlePosition::Bottom => area.bottom().saturating_sub(1),
+    };
+    let width = area.width.saturating_sub(2);
+    let title_width = u16::try_from(display_width(&title.line.plain_text()))
+        .unwrap_or(u16::MAX)
+        .min(width);
+    let offset = match title.alignment {
+        Alignment::Left => 0,
+        Alignment::Center => width.saturating_sub(title_width) / 2,
+        Alignment::Right => width.saturating_sub(title_width),
+    };
+    cx.write_line(
+        LocalRect::new(
+            i32::from(area.x.saturating_add(1).saturating_add(offset)),
+            i64::from(y),
+            title_width,
+            1,
+        ),
+        &title.line.with_fallback_style(style),
+    );
 }
 
 /// A centered modal surface with optional scrim and child content.
@@ -434,8 +603,9 @@ impl<'widget, W> Modal<'widget, W> {
     }
 }
 
-impl<W: Widget> Widget for Modal<'_, W> {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+impl<W: Component> Modal<'_, W> {
+    /// Paint this modal into an explicitly assigned terminal area.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>) {
         if area.is_empty() {
             return;
         }
@@ -443,127 +613,54 @@ impl<W: Widget> Widget for Modal<'_, W> {
             frame.fill(area, " ", style);
         }
         let panel_area = self.panel_area(area);
-        self.panel.render(panel_area, frame);
+        let panel = PanelComponent::new("modal.panel", &self.panel);
+        let layout = panel.layout(Constraints::tight(panel_area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(panel_area.x),
+            i64::from(panel_area.y),
+            LocalRect::new(0, 0, panel_area.width, panel_area.height),
+            |cx| panel.paint(&layout, cx),
+        );
         if let Some(child) = self.child {
-            child.render(self.panel.inner_area(panel_area), frame);
-        }
-    }
-}
-
-fn render_border(area: Rect, border: &Border, frame: &mut Frame<'_>) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let right = area.right().saturating_sub(1);
-    let bottom = area.bottom().saturating_sub(1);
-    let sides = border.sides;
-
-    if sides.top {
-        for x in area.x..area.right() {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(x, area.y),
-                border.set.horizontal.to_string(),
-                border.style,
+            let inner = self.panel.inner_area(panel_area);
+            let layout = child.layout(Constraints::tight(inner.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(inner.x),
+                i64::from(inner.y),
+                LocalRect::new(0, 0, inner.width, inner.height),
+                |cx| child.paint(&layout, cx),
             );
         }
     }
-    if sides.bottom && bottom != area.y {
-        for x in area.x..area.right() {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(x, bottom),
-                border.set.horizontal.to_string(),
-                border.style,
-            );
-        }
-    }
-    if sides.left {
-        for y in area.y..area.bottom() {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(area.x, y),
-                border.set.vertical.to_string(),
-                border.style,
-            );
-        }
-    }
-    if sides.right && right != area.x {
-        for y in area.y..area.bottom() {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(right, y),
-                border.set.vertical.to_string(),
-                border.style,
-            );
-        }
-    }
-
-    if area.width > 1 && area.height > 1 {
-        if sides.top && sides.left {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(area.x, area.y),
-                border.set.top_left.to_string(),
-                border.style,
-            );
-        }
-        if sides.top && sides.right {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(right, area.y),
-                border.set.top_right.to_string(),
-                border.style,
-            );
-        }
-        if sides.bottom && sides.left {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(area.x, bottom),
-                border.set.bottom_left.to_string(),
-                border.style,
-            );
-        }
-        if sides.bottom && sides.right {
-            frame.buffer_mut().set_cell(
-                crate::geometry::Point::new(right, bottom),
-                border.set.bottom_right.to_string(),
-                border.style,
-            );
-        }
-    }
-}
-
-fn render_title(area: Rect, title: &PanelTitle, style: Style, frame: &mut Frame<'_>) {
-    if area.width <= 2 || area.height == 0 {
-        return;
-    }
-    let y = match title.position {
-        TitlePosition::Top => area.y,
-        TitlePosition::Bottom => area.bottom().saturating_sub(1),
-    };
-    let width = area.width.saturating_sub(2);
-    let title_width = u16::try_from(display_width(&title.line.plain_text()))
-        .unwrap_or(u16::MAX)
-        .min(width);
-    let x_offset = match title.alignment {
-        Alignment::Left => 0,
-        Alignment::Center => width.saturating_sub(title_width) / 2,
-        Alignment::Right => width.saturating_sub(title_width),
-    };
-    let title_area = Rect::new(
-        area.x.saturating_add(1).saturating_add(x_offset),
-        y,
-        width.saturating_sub(x_offset),
-        1,
-    );
-    let styled_title = title.line.with_fallback_style(style);
-    frame.write_line(title_area, &styled_title);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Border, BorderSides, Modal, Panel, PanelTitle, TitlePosition};
     use crate::buffer::Buffer;
+    use crate::component::{Component, Constraints, LayoutCx};
     use crate::frame::Frame;
     use crate::geometry::{Insets, Rect, Size};
+    use crate::paint::{LocalRect, PaintCx};
     use crate::style::{Color, Style};
     use crate::text_block::TextBlock;
-    use crate::widget::Widget;
+
+    trait PanelTestRender {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>);
+    }
+
+    impl PanelTestRender for Panel {
+        fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+            let component = super::PanelComponent::new("panel-test", self);
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
+        }
+    }
 
     #[test]
     fn modal_centers_panel_and_renders_child_in_inner_area() {
@@ -572,7 +669,7 @@ mod tests {
         let child = TextBlock::new("Hi");
         let modal = Modal::new(Size::new(6, 3)).child(&child);
 
-        modal.render(Rect::new(0, 0, 10, 5), &mut frame);
+        modal.paint_in(Rect::new(0, 0, 10, 5), &mut frame);
 
         assert_eq!(
             modal.panel_area(Rect::new(0, 0, 10, 5)),
@@ -591,7 +688,7 @@ mod tests {
         let panel = Panel::new().border(Border::ascii());
         let modal: Modal<'_, TextBlock> = Modal::new(Size::new(3, 3)).panel(panel).scrim(scrim);
 
-        modal.render(Rect::new(0, 0, 5, 3), &mut frame);
+        modal.paint_in(Rect::new(0, 0, 5, 3), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" +-+ "));
         assert_eq!(

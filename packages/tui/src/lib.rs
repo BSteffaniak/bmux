@@ -49,7 +49,6 @@ pub mod text;
 pub mod text_block;
 pub mod text_width;
 pub mod viewport;
-pub mod widget;
 
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
@@ -60,7 +59,7 @@ pub mod prelude {
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::capabilities::{TerminalBackground, TerminalCapabilities, TerminalColorDepth};
     pub use crate::chrome::{
-        Border, BorderSet, BorderSides, Modal, Panel, PanelTitle, TitlePosition,
+        Border, BorderSet, BorderSides, Modal, Panel, PanelComponent, PanelTitle, TitlePosition,
     };
     pub use crate::clear::Clear;
     pub use crate::component::{
@@ -137,5 +136,4 @@ pub mod prelude {
         wrap_text_with_continuation_character,
     };
     pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
-    pub use crate::widget::{StatefulWidget, Widget};
 }

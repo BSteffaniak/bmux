@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 
-use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::chrome::Border;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId, LayoutNode,
 };
@@ -348,8 +348,13 @@ impl Pane<'_> {
 
     /// Return the content area for the current pane state.
     #[must_use]
-    pub fn inner_area(&self, state: &PaneState) -> Rect {
-        self.panel(state).inner_area(state.area)
+    pub const fn inner_area(&self, state: &PaneState) -> Rect {
+        let border = if self.border {
+            Insets::all(1)
+        } else {
+            Insets::all(0)
+        };
+        state.area.inset(border).inset(self.padding)
     }
 
     /// Register pane selection geometry using the exact rendered outer and inner areas.
@@ -375,25 +380,6 @@ impl Pane<'_> {
             return PaneOutcome::Ignored;
         };
         self.handle_mouse(state, *mouse)
-    }
-
-    fn panel(&self, state: &PaneState) -> Panel {
-        let border_style = if state.interaction.focused {
-            self.styles.focused_border
-        } else {
-            self.styles.border
-        };
-        let mut panel = Panel::new().padding(self.padding);
-        if self.border {
-            panel = panel.border(Border::single().style(border_style));
-        }
-        if let Some(title) = self.title.clone() {
-            panel = panel.title(title);
-        }
-        if let Some(background) = self.styles.background {
-            panel = panel.background(background);
-        }
-        panel
     }
 
     fn handle_mouse(&self, state: &mut PaneState, mouse: MouseEvent) -> PaneOutcome {
@@ -439,7 +425,7 @@ impl Pane<'_> {
         }
     }
 
-    fn handle_scroll(
+    const fn handle_scroll(
         &self,
         state: &PaneState,
         position: Point,

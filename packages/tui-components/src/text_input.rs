@@ -227,6 +227,7 @@ impl Component for TextInputComponent<'_, '_> {
         let mut state = self.state.borrow_mut();
         state.set_content_area(area, self.policy);
         let mut input = TextInput::new(state.buffer())
+            .id(self.id.clone())
             .style(self.style)
             .selection_style(self.selection_style)
             .placeholder_style(self.placeholder_style)

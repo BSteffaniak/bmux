@@ -3,16 +3,17 @@
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 
-use crate::chrome::{Border, Panel};
+use crate::chrome::{Border, Panel, PanelComponent};
+use crate::component::{Component, Constraints, LayoutCx};
 use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::input::{TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use crate::layout::{Direction, split_leading};
 use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
+use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::Line;
-use crate::widget::{StatefulWidget, Widget};
 
 /// One command palette item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,11 +165,25 @@ impl<'items> CommandPalette<'items> {
         if area.is_empty() {
             return;
         }
-        self.panel.render(area, frame);
+        let panel = PanelComponent::new("command-palette.panel", &self.panel);
+        let panel_layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| panel.paint(&panel_layout, cx),
+        );
         let areas = self.areas(area);
-        TextInput::new(&state.query)
-            .placeholder(self.placeholder.clone())
-            .render(areas.input, frame);
+        let input = TextInput::new(&state.query)
+            .id("command-palette.query")
+            .placeholder(self.placeholder.clone());
+        let layout = input.layout(Constraints::tight(areas.input.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(areas.input.x),
+            i64::from(areas.input.y),
+            LocalRect::new(0, 0, areas.input.width, areas.input.height),
+            |cx| input.paint(&layout, cx),
+        );
 
         let valid = filtered
             .iter()
@@ -189,7 +204,7 @@ impl<'items> CommandPalette<'items> {
             .style(self.list_style)
             .selected_style(self.selected_style)
             .highlight_symbol("> ")
-            .render(areas.list, frame, &mut state.list);
+            .paint_in(areas.list, frame, &mut state.list);
     }
 
     /// Handle a key for query/list palette interaction.
@@ -329,10 +344,9 @@ impl<'items> CommandPalette<'items> {
     }
 }
 
-impl StatefulWidget for CommandPalette<'_> {
-    type State = CommandPaletteState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl CommandPalette<'_> {
+    /// Paint this palette into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut CommandPaletteState) {
         let filtered = self.filtered_indices(state.query.text());
         self.render_projected(area, frame, state, &filtered);
     }
@@ -353,7 +367,6 @@ mod tests {
     use crate::chrome::{Border, Panel};
     use crate::frame::Frame;
     use crate::geometry::Rect;
-    use crate::widget::StatefulWidget;
 
     fn items() -> Vec<PaletteItem> {
         vec![
@@ -382,7 +395,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        palette.render(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
+        palette.paint_in(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -407,7 +420,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        palette.render(Rect::new(0, 0, 16, 5), &mut frame, &mut state);
+        palette.paint_in(Rect::new(0, 0, 16, 5), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(3).as_deref(),

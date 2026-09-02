@@ -8,7 +8,6 @@ use crate::hit::{HitId, HitMap, HitRegion, HitRole};
 use crate::style::{Color, Modifier, Style};
 use crate::text::{Line, Span};
 use crate::text_width::{display_width, truncate_to_display_width};
-use crate::widget::StatefulWidget;
 
 /// Summary for one changed file in a diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,10 +321,9 @@ impl<'files> DiffFileList<'files> {
     }
 }
 
-impl StatefulWidget for DiffFileList<'_> {
-    type State = DiffFileListState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl DiffFileList<'_> {
+    /// Paint this file list into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut DiffFileListState) {
         if area.is_empty() {
             return;
         }
@@ -701,10 +699,9 @@ impl<'lines> DiffView<'lines> {
     }
 }
 
-impl StatefulWidget for DiffView<'_> {
-    type State = DiffViewState;
-
-    fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
+impl DiffView<'_> {
+    /// Paint this diff into an explicitly assigned area using caller-owned state.
+    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut DiffViewState) {
         if area.is_empty() {
             return;
         }
@@ -1054,7 +1051,6 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::hit::HitMap;
     use crate::style::{Color, Modifier, Style};
-    use crate::widget::StatefulWidget;
     use bmux_keyboard::{KeyCode, KeyStroke};
 
     #[test]
@@ -1083,7 +1079,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 2));
         let mut frame = Frame::new(&mut buffer);
 
-        DiffFileList::new(&files).render(Rect::new(0, 0, 16, 2), &mut frame, &mut state);
+        DiffFileList::new(&files).paint_in(Rect::new(0, 0, 16, 2), &mut frame, &mut state);
 
         assert_eq!(state.offset, 1);
         assert_eq!(
@@ -1151,7 +1147,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 2));
         let mut frame = Frame::new(&mut buffer);
 
-        DiffView::new(&lines).render(Rect::new(0, 0, 16, 2), &mut frame, &mut state);
+        DiffView::new(&lines).paint_in(Rect::new(0, 0, 16, 2), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -1173,11 +1169,9 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
         let mut frame = Frame::new(&mut buffer);
 
-        DiffView::new(&lines).mode(DiffViewMode::SideBySide).render(
-            Rect::new(0, 0, 20, 2),
-            &mut frame,
-            &mut state,
-        );
+        DiffView::new(&lines)
+            .mode(DiffViewMode::SideBySide)
+            .paint_in(Rect::new(0, 0, 20, 2), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -1199,7 +1193,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        DiffView::new(&lines).render(Rect::new(0, 0, 16, 1), &mut frame, &mut state);
+        DiffView::new(&lines).paint_in(Rect::new(0, 0, 16, 1), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -1216,7 +1210,7 @@ mod tests {
 
         DiffView::new(&lines)
             .styles(super::DiffViewStyles::default())
-            .render(Rect::new(0, 0, 20, 1), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 20, 1), &mut frame, &mut state);
 
         assert_eq!(
             frame
@@ -1251,7 +1245,7 @@ mod tests {
 
         DiffView::new(&lines)
             .styles(super::DiffViewStyles::default())
-            .render(Rect::new(0, 0, 24, 1), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 24, 1), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().get(Point::new(11, 0)).map(|cell| cell.style),
@@ -1278,7 +1272,7 @@ mod tests {
 
         DiffView::new(&lines)
             .styles(super::DiffViewStyles::default())
-            .render(Rect::new(0, 0, 20, 1), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 20, 1), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().get(Point::new(15, 0)).map(|cell| cell.style),
@@ -1307,7 +1301,7 @@ mod tests {
         DiffView::new(&lines)
             .styles(super::DiffViewStyles::default())
             .mode(DiffViewMode::SideBySide)
-            .render(Rect::new(0, 0, 24, 1), &mut frame, &mut state);
+            .paint_in(Rect::new(0, 0, 24, 1), &mut frame, &mut state);
 
         assert_eq!(
             frame.buffer().get(Point::new(10, 0)).map(|cell| cell.style),
@@ -1335,7 +1329,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        DiffView::new(&lines).fold_context(3, 1).render(
+        DiffView::new(&lines).fold_context(3, 1).paint_in(
             Rect::new(0, 0, 40, 5),
             &mut frame,
             &mut state,
