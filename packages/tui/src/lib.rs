@@ -39,8 +39,6 @@ pub mod overlay;
 pub mod paint;
 pub mod palette;
 pub mod picker;
-pub mod retained_list;
-pub mod retained_sectioned_list;
 pub mod selection;
 pub mod semantic;
 pub mod style;
@@ -115,10 +113,6 @@ pub mod prelude {
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
     };
     pub use crate::picker::{Dropdown, ListPicker, ListPickerAreas};
-    pub use crate::retained_list::{RetainedListLayout, RetainedListLine, RetainedListSignature};
-    pub use crate::retained_sectioned_list::{
-        RetainedSectionedListLayout, RetainedSectionedListLine,
-    };
     pub use crate::selection::{
         SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,
         SelectionContentId, SelectionController, SelectionEndpoint, SelectionFragment,
