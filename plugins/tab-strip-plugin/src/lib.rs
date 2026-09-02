@@ -27,8 +27,6 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole,
     global_presentation_fact_host_service,
 };
-#[cfg(test)]
-use bmux_tui_components::tab_bar::TabItem;
 use bmux_windows_plugin_api::{windows_commands, windows_list};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -539,11 +537,6 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
 }
 
 #[cfg(test)]
-fn component_label(id: &str, label: &str) -> String {
-    TabItem::new(id, label).label()
-}
-
-#[cfg(test)]
 fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index: usize) -> String {
     const INDEX_TOKEN: &str = concat!("{", "index}");
     const INDEX0_TOKEN: &str = concat!("{", "index0}");
@@ -575,10 +568,7 @@ fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index:
         )
         .replace('\u{0}', "{")
         .replace('\u{1}', "}");
-    truncate_to_width(
-        &component_label(&window.id.to_string(), &label),
-        usize::from(settings.maximum_label_width),
-    )
+    truncate_to_width(&label, usize::from(settings.maximum_label_width))
 }
 
 #[derive(Clone, Copy)]

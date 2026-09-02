@@ -2438,7 +2438,6 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_text_edit",
- "bmux_tui_components",
  "bmux_windows_plugin_api",
  "serde",
  "tokio",

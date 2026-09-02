@@ -18,7 +18,6 @@ bmux_plugin               = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 bmux_presentation_state   = { workspace = true }
 bmux_text_edit            = { workspace = true }
-bmux_tui_components       = { workspace = true, features = ["tab-bar"] }
 bmux_windows_plugin_api   = { workspace = true }
 serde                     = { workspace = true }
 tokio                     = { workspace = true, features = ["rt", "sync"] }
@@ -34,7 +33,6 @@ fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_presentation_state/fail-on-warnings",
-    "bmux_tui_components/fail-on-warnings",
     "bmux_windows_plugin_api/fail-on-warnings",
 ]
 static-bundled = []
