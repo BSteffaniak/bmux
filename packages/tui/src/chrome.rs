@@ -3,10 +3,9 @@
 use std::hash::{Hash, Hasher};
 
 use crate::component::{
-    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
-    LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
 };
-use crate::frame::Frame;
 use crate::geometry::{Insets, Rect, Size};
 use crate::layout::centered;
 use crate::paint::{LocalRect, PaintCx};
@@ -603,34 +602,85 @@ impl<'widget, W> Modal<'widget, W> {
     }
 }
 
-impl<W: Component> Modal<'_, W> {
-    /// Paint this modal into an explicitly assigned terminal area.
-    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>) {
-        if area.is_empty() {
-            return;
-        }
-        if let Some(style) = self.scrim {
-            frame.fill(area, " ", style);
-        }
-        let panel_area = self.panel_area(area);
+impl<W: Component> Component for Modal<'_, W> {
+    fn revision(&self) -> ComponentRevision {
+        let panel = PanelComponent::new("modal.panel", &self.panel).revision();
+        self.child
+            .map_or(panel, |child| panel.combine(child.revision()))
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let size = constraints.constrain(LogicalSize::new(
+            constraints.max_width(),
+            constraints
+                .max_height()
+                .unwrap_or_else(|| constraints.min_height()),
+        ));
+        let height = u16::try_from(size.height).unwrap_or(u16::MAX);
+        let panel_area = self.panel_area(Rect::new(0, 0, size.width, height));
         let panel = PanelComponent::new("modal.panel", &self.panel);
-        let layout = panel.layout(Constraints::tight(panel_area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(panel_area.x),
-            i64::from(panel_area.y),
-            LocalRect::new(0, 0, panel_area.width, panel_area.height),
-            |cx| panel.paint(&layout, cx),
-        );
+        let mut panel_layout = panel.layout(Constraints::tight(panel_area.size()), cx);
         if let Some(child) = self.child {
-            let inner = self.panel.inner_area(panel_area);
-            let layout = child.layout(Constraints::tight(inner.size()), &mut LayoutCx::new());
-            PaintCx::new(frame).with_child(
-                i32::from(inner.x),
-                i64::from(inner.y),
-                LocalRect::new(0, 0, inner.width, inner.height),
-                |cx| child.paint(&layout, cx),
-            );
+            let inner = self
+                .panel
+                .inner_area(Rect::new(0, 0, panel_area.width, panel_area.height));
+            panel_layout.children.push(ChildLayout::new(
+                inner.x,
+                usize::from(inner.y),
+                child.layout(Constraints::tight(inner.size()), cx),
+            ));
         }
+        LayoutNode::with_children(
+            LayoutId::new("modal"),
+            size,
+            vec![ChildLayout::new(
+                panel_area.x,
+                usize::from(panel_area.y),
+                panel_layout,
+            )],
+        )
+        .with_metadata(LayoutMetadata::new().semantic("modal"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        if let Some(style) = self.scrim {
+            cx.fill(LocalRect::new(0, 0, layout.size.width, height), " ", style);
+        }
+        let Some(panel_layout) = layout.children.first() else {
+            return;
+        };
+        let panel = PanelComponent::new("modal.panel", &self.panel);
+        cx.with_child(
+            i32::from(panel_layout.x),
+            i64::try_from(panel_layout.y).unwrap_or(i64::MAX),
+            LocalRect::new(
+                0,
+                0,
+                panel_layout.node.size.width,
+                u16::try_from(panel_layout.node.size.height).unwrap_or(u16::MAX),
+            ),
+            |cx| {
+                panel.paint(&panel_layout.node, cx);
+                if let (Some(child), Some(child_layout)) =
+                    (self.child, panel_layout.node.children.first())
+                {
+                    cx.with_child(
+                        i32::from(child_layout.x),
+                        i64::try_from(child_layout.y).unwrap_or(i64::MAX),
+                        LocalRect::new(
+                            0,
+                            0,
+                            child_layout.node.size.width,
+                            u16::try_from(child_layout.node.size.height).unwrap_or(u16::MAX),
+                        ),
+                        |cx| child.paint(&child_layout.node, cx),
+                    );
+                }
+            },
+        );
+        cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
     }
 }
 
@@ -644,6 +694,16 @@ mod tests {
     use crate::paint::{LocalRect, PaintCx};
     use crate::style::{Color, Style};
     use crate::text_block::TextBlock;
+
+    fn paint_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    }
 
     trait PanelTestRender {
         fn render(&self, area: Rect, frame: &mut Frame<'_>);
@@ -669,7 +729,7 @@ mod tests {
         let child = TextBlock::new("Hi");
         let modal = Modal::new(Size::new(6, 3)).child(&child);
 
-        modal.paint_in(Rect::new(0, 0, 10, 5), &mut frame);
+        paint_component(&modal, Rect::new(0, 0, 10, 5), &mut frame);
 
         assert_eq!(
             modal.panel_area(Rect::new(0, 0, 10, 5)),
@@ -688,7 +748,7 @@ mod tests {
         let panel = Panel::new().border(Border::ascii());
         let modal: Modal<'_, TextBlock> = Modal::new(Size::new(3, 3)).panel(panel).scrim(scrim);
 
-        modal.paint_in(Rect::new(0, 0, 5, 3), &mut frame);
+        paint_component(&modal, Rect::new(0, 0, 5, 3), &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" +-+ "));
         assert_eq!(

@@ -95,8 +95,10 @@ impl<'buffer> Frame<'buffer> {
         self.buffer
     }
 
-    /// Return a mutable view of the backing buffer.
-    pub const fn buffer_mut(&mut self) -> &mut Buffer {
+    /// Return mutable access to the backing buffer for the canonical scoped
+    /// paint implementation. Components and downstream consumers must use
+    /// [`crate::paint::PaintCx`] instead.
+    pub(crate) const fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
     }
 

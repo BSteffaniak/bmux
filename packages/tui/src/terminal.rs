@@ -531,9 +531,7 @@ mod tests {
 
         let stats = terminal
             .draw(|frame| {
-                frame
-                    .buffer_mut()
-                    .set_cell(Point::new(0, 0), "A", Style::new());
+                frame.write_line(Rect::new(0, 0, 1, 1), &crate::text::Line::raw("A"));
             })
             .unwrap();
 
@@ -551,17 +549,13 @@ mod tests {
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
         terminal
             .draw(|frame| {
-                frame
-                    .buffer_mut()
-                    .set_cell(Point::new(0, 0), "A", Style::new());
+                frame.write_line(Rect::new(0, 0, 1, 1), &crate::text::Line::raw("A"));
             })
             .unwrap();
 
         let stats = terminal
             .draw(|frame| {
-                frame
-                    .buffer_mut()
-                    .set_cell(Point::new(1, 0), "B", Style::new());
+                frame.write_line(Rect::new(1, 0, 1, 1), &crate::text::Line::raw("B"));
             })
             .unwrap();
 

@@ -1,13 +1,13 @@
 //! Button and dialog widgets.
 
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 
 use crate::chrome::{Border, Panel, PanelComponent};
 use crate::component::{
-    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
-    LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
 };
-use crate::frame::Frame;
 use crate::geometry::Rect;
 use crate::layout::{Direction, split_trailing};
 use crate::paint::{LocalRect, PaintCx};
@@ -206,85 +206,157 @@ impl<'a> Dialog<'a> {
     }
 }
 
-impl Dialog<'_> {
-    /// Paint this dialog into an explicitly assigned area using caller-owned state.
-    pub fn paint_in(&self, area: Rect, frame: &mut Frame<'_>, state: &mut DialogState) {
-        if area.is_empty() {
-            return;
-        }
-        let panel = PanelComponent::new("dialog.panel", &self.panel);
-        let panel_layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(area.x),
-            i64::from(area.y),
-            LocalRect::new(0, 0, area.width, area.height),
-            |cx| panel.paint(&panel_layout, cx),
-        );
-        let inner = self.content_area(area);
-        let action_height = u16::from(!self.actions.is_empty());
-        let split = split_trailing(inner, Direction::Vertical, action_height);
-        let layout = self
-            .body
-            .layout(Constraints::tight(split.first.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(split.first.x),
-            i64::from(split.first.y),
-            LocalRect::new(0, 0, split.first.width, split.first.height),
-            |cx| self.body.paint(&layout, cx),
-        );
-        render_dialog_actions(
-            self.actions,
+/// Canonical component-lifecycle dialog with caller-owned action focus.
+pub struct DialogComponent<'a, 'state> {
+    id: LayoutId,
+    dialog: Dialog<'a>,
+    state: &'state Cell<DialogState>,
+}
+
+impl<'a, 'state> DialogComponent<'a, 'state> {
+    /// Wrap a dialog under stable identity with caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        dialog: Dialog<'a>,
+        state: &'state Cell<DialogState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            dialog,
             state,
-            split.second,
-            frame,
-            self.button_style,
-            self.focused_button_style,
-        );
+        }
     }
 }
 
-fn render_dialog_actions(
-    actions: &[DialogAction],
-    state: &mut DialogState,
-    area: Rect,
-    frame: &mut Frame<'_>,
-    button_style: Style,
-    focused_button_style: Style,
-) {
-    if actions.is_empty() || area.is_empty() {
-        return;
+impl Component for DialogComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut layout);
+        format!("{:?}", self.dialog.body).hash(&mut layout);
+        format!("{:?}", self.dialog.actions).hash(&mut layout);
+        format!("{:?}", self.dialog.panel).hash(&mut layout);
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.dialog.button_style.hash(&mut paint);
+        self.dialog.focused_button_style.hash(&mut paint);
+        self.state.get().focused_action.hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
     }
-    state.focused_action = state.focused_action.min(actions.len().saturating_sub(1));
-    let mut x = area.x;
-    for (index, action) in actions.iter().enumerate() {
-        if x >= area.right() {
-            return;
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let size = constraints.constrain(LogicalSize::new(
+            constraints.max_width(),
+            constraints
+                .max_height()
+                .unwrap_or_else(|| constraints.min_height()),
+        ));
+        let height = u16::try_from(size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, size.width, height);
+        let inner = self.dialog.content_area(area);
+        let action_height = u16::from(!self.dialog.actions.is_empty());
+        let split = split_trailing(inner, Direction::Vertical, action_height);
+        let panel = PanelComponent::new(format!("{}.panel", self.id.as_str()), &self.dialog.panel);
+        let mut panel_layout = panel.layout(Constraints::tight(area.size()), cx);
+        panel_layout.children.push(ChildLayout::new(
+            split.first.x,
+            usize::from(split.first.y),
+            self.dialog
+                .body
+                .layout(Constraints::tight(split.first.size()), cx),
+        ));
+        let mut x = split.second.x;
+        let focused = self
+            .state
+            .get()
+            .focused_action
+            .min(self.dialog.actions.len().saturating_sub(1));
+        self.state.set(DialogState {
+            focused_action: focused,
+        });
+        for (index, action) in self.dialog.actions.iter().enumerate() {
+            if x >= split.second.right() {
+                break;
+            }
+            let width = u16::try_from(unicode_width::UnicodeWidthStr::width(
+                action.label.plain_text().as_str(),
+            ))
+            .unwrap_or(u16::MAX)
+            .saturating_add(4)
+            .min(split.second.right().saturating_sub(x));
+            let button = Button::new(format!("dialog-action:{}", action.id), action.label.clone())
+                .style(self.dialog.button_style)
+                .focused_style(self.dialog.focused_button_style)
+                .focused(index == focused);
+            panel_layout.children.push(ChildLayout::new(
+                x,
+                usize::from(split.second.y),
+                button.layout(Constraints::tight(Rect::new(0, 0, width, 1).size()), cx),
+            ));
+            x = x.saturating_add(width).saturating_add(1);
         }
-        let width = u16::try_from(unicode_width::UnicodeWidthStr::width(
-            action.label.plain_text().as_str(),
-        ))
-        .unwrap_or(u16::MAX)
-        .saturating_add(4)
-        .min(area.right().saturating_sub(x));
-        let button = Button::new(format!("dialog-action:{}", action.id), action.label.clone())
-            .style(button_style)
-            .focused_style(focused_button_style)
-            .focused(index == state.focused_action);
-        let area = Rect::new(x, area.y, width, 1);
-        let layout = button.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
-            i32::from(area.x),
-            i64::from(area.y),
-            LocalRect::new(0, 0, area.width, area.height),
-            |cx| button.paint(&layout, cx),
-        );
-        x = x.saturating_add(width).saturating_add(1);
+        LayoutNode::with_children(
+            self.id.clone(),
+            size,
+            vec![ChildLayout::new(0, 0, panel_layout)],
+        )
+        .with_metadata(LayoutMetadata::new().semantic("dialog"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let Some(panel_layout) = layout.children.first() else {
+            return;
+        };
+        let panel = PanelComponent::new(format!("{}.panel", self.id.as_str()), &self.dialog.panel);
+        panel.paint(&panel_layout.node, cx);
+        if let Some(body_layout) = panel_layout.node.children.first() {
+            cx.with_child(
+                i32::from(body_layout.x),
+                i64::try_from(body_layout.y).unwrap_or(i64::MAX),
+                LocalRect::new(
+                    0,
+                    0,
+                    body_layout.node.size.width,
+                    u16::try_from(body_layout.node.size.height).unwrap_or(u16::MAX),
+                ),
+                |cx| self.dialog.body.paint(&body_layout.node, cx),
+            );
+        }
+        let focused = self
+            .state
+            .get()
+            .focused_action
+            .min(self.dialog.actions.len().saturating_sub(1));
+        for (index, (action, child)) in self
+            .dialog
+            .actions
+            .iter()
+            .zip(panel_layout.node.children.iter().skip(1))
+            .enumerate()
+        {
+            let button = Button::new(format!("dialog-action:{}", action.id), action.label.clone())
+                .style(self.dialog.button_style)
+                .focused_style(self.dialog.focused_button_style)
+                .focused(index == focused);
+            cx.with_child(
+                i32::from(child.x),
+                i64::try_from(child.y).unwrap_or(i64::MAX),
+                LocalRect::new(0, 0, child.node.size.width, 1),
+                |cx| button.paint(&child.node, cx),
+            );
+        }
+        cx.push_damage(LocalRect::new(
+            0,
+            0,
+            layout.size.width,
+            u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+        ));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Button, Dialog, DialogAction, DialogState};
+    use super::{Button, Dialog, DialogAction, DialogComponent, DialogState};
     use crate::buffer::Buffer;
     use crate::chrome::{Border, Panel};
     use crate::component::{Component, Constraints, LayoutCx};
@@ -292,6 +364,7 @@ mod tests {
     use crate::geometry::Rect;
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+    use std::cell::Cell;
 
     #[test]
     fn button_renders_focus_style() {
@@ -322,13 +395,20 @@ mod tests {
             DialogAction::new("allow", "Allow"),
             DialogAction::new("deny", "Deny"),
         ];
-        let mut state = DialogState { focused_action: 1 };
+        let state = Cell::new(DialogState { focused_action: 1 });
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 5));
         let mut frame = Frame::new(&mut buffer);
-
-        Dialog::new("Permit action?", &actions)
-            .panel(Panel::new().border(Border::ascii()).title("Permission"))
-            .paint_in(Rect::new(0, 0, 20, 5), &mut frame, &mut state);
+        let component = DialogComponent::new(
+            "permission-dialog",
+            Dialog::new("Permit action?", &actions)
+                .panel(Panel::new().border(Border::ascii()).title("Permission")),
+            &state,
+        );
+        let layout = component.layout(
+            Constraints::tight(frame.area().size()),
+            &mut LayoutCx::new(),
+        );
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -342,7 +422,7 @@ mod tests {
             frame.buffer().row_symbols(3).as_deref(),
             Some("|[ Allow ] [ Deny ]|")
         );
-        assert_eq!(state.focused_action, 1);
+        assert_eq!(state.get().focused_action, 1);
     }
 
     #[test]

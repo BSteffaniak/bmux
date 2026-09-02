@@ -1,5 +1,6 @@
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::prelude::*;
+use std::cell::Cell;
 
 fn buffer_rows(buffer: &Buffer) -> Vec<String> {
     (buffer.area().y..buffer.area().bottom())
@@ -13,13 +14,20 @@ fn golden_panel_text_and_dialog_rendering() {
         DialogAction::new("yes", "Yes"),
         DialogAction::new("no", "No"),
     ];
-    let mut state = DialogState { focused_action: 0 };
+    let state = Cell::new(DialogState { focused_action: 0 });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 6));
     let mut frame = Frame::new(&mut buffer);
-
-    Dialog::new("Run this command?", &actions)
-        .panel(Panel::new().border(Border::ascii()).title("Confirm"))
-        .paint_in(Rect::new(0, 0, 24, 6), &mut frame, &mut state);
+    let dialog = DialogComponent::new(
+        "confirm-dialog",
+        Dialog::new("Run this command?", &actions)
+            .panel(Panel::new().border(Border::ascii()).title("Confirm")),
+        &state,
+    );
+    let layout = dialog.layout(
+        Constraints::tight(frame.area().size()),
+        &mut LayoutCx::new(),
+    );
+    dialog.paint(&layout, &mut PaintCx::new(&mut frame));
 
     assert_eq!(
         buffer_rows(frame.buffer()),

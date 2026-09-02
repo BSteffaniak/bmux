@@ -78,7 +78,7 @@ pub mod prelude {
         poll_event, read_event, terminal_size,
     };
     pub use crate::damage::{Damage, DamagePolicy};
-    pub use crate::dialog::{Button, Dialog, DialogAction, DialogState};
+    pub use crate::dialog::{Button, Dialog, DialogAction, DialogComponent, DialogState};
     #[cfg(feature = "diff")]
     pub use crate::diff::{
         DiffChangedRange, DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome,

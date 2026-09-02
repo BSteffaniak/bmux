@@ -86,7 +86,13 @@ fn command_palette_like_surface_renders_and_flushes_to_ansi() {
         .panel(Panel::new().background(Style::new().bg(Color::BrightBlack)));
     let root = frame.area();
 
-    modal.paint_in(root, &mut frame);
+    let modal_layout = modal.layout(Constraints::tight(root.size()), &mut LayoutCx::new());
+    PaintCx::new(&mut frame).with_child(
+        i32::from(root.x),
+        i64::from(root.y),
+        LocalRect::new(0, 0, root.width, root.height),
+        |cx| modal.paint(&modal_layout, cx),
+    );
     picker.paint_in(modal.content_area(root), &mut frame, &mut state);
 
     assert_eq!(
