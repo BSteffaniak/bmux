@@ -1,9 +1,13 @@
 # bmux_tui_components
 
-Reusable, opt-in terminal UI components built from BMUX low-level primitives.
+Reusable, opt-in terminal UI components built on BMUX's measurable component,
+scoped-paint, and interaction primitives.
 
-The crate keeps state separate from policy. Low-level `bmux_tui` widgets remain
-available for applications that want raw rendering and event handling.
+The crate keeps caller-owned state separate from reusable policy. Components
+resolve an authoritative `LayoutNode` through `Component::layout`, paint that
+exact layout through `PaintCx`, and route events through `EventCx`. Applications
+should not assign raw frame areas to reusable controls or reconstruct component
+geometry after painting.
 
 ## Cargo features
 
@@ -36,6 +40,25 @@ role styles are deterministically patched over the selected surface: an explicit
 background, or modifier wins, while omitted values inherit from that surface. Overlay themes may
 also carry a scrim. `terminal_default()` preserves `Color::Default` at every depth; `opaque_dark()`
 and `opaque_light()` provide neutral gallery/reference palettes rather than product theme policy.
+
+## Canonical composition
+
+Use `bmux_tui::composition` for child ownership, measurement, placement, and
+rectangular styling. A `Surface` owns its background, border, padding, and child;
+`Row` and `Column` own linear placement; wrappers such as `Padding`, `SizeBox`,
+`Align`, `Flex`, `Clip`, `StyleScope`, `Visibility`, `Stack`, and `Keyed` each
+modify one concern. A component that measures a rectangle is responsible for
+painting that complete rectangle. Application-side background extension,
+wrapped-row caches, and parallel hit geometry are not supported integration
+patterns.
+
+For arbitrary scrolling, use the `scroll-view` feature and caller-owned
+`ScrollViewState`. It provides logical offsets, nested wheel routing,
+keyboard/page/home/end navigation, scrollbars and dragging, ensure-visible,
+selection autoscroll, and bottom follow. For large variable-height collections,
+use `virtual-list`: item keys and revisions retain exact current-width layouts,
+only viewport-intersecting items paint/register metadata, and keyed top or
+bottom anchors survive insertion, removal, reorder, append, and reflow.
 
 ## Logical content selection
 
@@ -81,9 +104,11 @@ belongs in applications or plugins.
 Applications should compose these controls at their renderer boundary and request exact production
 features. Product-specific recipes and workflow semantics remain application/plugin-owned; do not
 move them into this crate to eliminate a thin adapter. Direct `bmux_tui` primitives remain
-appropriate for full-canvas underpaint, clipping/scratch-frame adaptation, terminal media placement,
-domain-specific drawing, and component implementation internals. Reusable controls, chrome, and
-interaction policy belong here rather than in application-local raw rendering.
+appropriate for full-canvas underpaint, terminal media placement, domain-specific drawing, and
+component implementation internals. Reusable controls, chrome, composition, scrolling, and
+interaction policy belong here rather than in application-local raw rendering. Ordinary reusable
+components paint through `PaintCx`; scratch-frame adaptation and unrestricted `Frame`/buffer access
+are backend/runtime concerns, not an application integration model.
 
 `bmux_tui` intentionally carries keyboard and text-editing in its baseline primitive API. Public
 event, focus, list, viewport, picker, palette, history, and text-input modules directly expose those

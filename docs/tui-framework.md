@@ -1,344 +1,232 @@
 # BMUX TUI framework
 
-BMUX will provide a native terminal UI framework for building responsive, high-performance terminal interfaces in BMUX, Bcode, and future plugin/application surfaces.
-
-The framework is not a product-specific UI layer. It owns terminal UI primitives: geometry, layout, styled text, render buffers, widgets, events, focus, overlays, virtualization, and terminal backends. Product behavior such as sessions, windows, panes, clients, contexts, permissions, model turns, tools, and chat state remains outside the framework.
-
-## Goals
-
-- Provide a BMUX-native replacement for the terminal UI library currently used by Bcode.
-- Make terminal UI construction more ergonomic than direct cell painting or ad hoc crossterm rendering.
-- Support deterministic responsive layout across terminal sizes and resize events.
-- Support reusable widgets for text input, lists, overlays, modals, command palettes, and transcripts.
-- Support opt-in developer-tool widgets such as diff/file views without making them part of the default TUI core.
-- Preserve BMUX's existing strengths in terminal protocol correctness, rendering performance, and plugin-oriented architecture.
-- Make rendering testable without a real terminal.
-
-## Non-goals
-
-- Do not put BMUX domain behavior into the framework. Sessions, windows, panes, clients, contexts, and permissions remain plugin/application concerns.
-- Do not mechanically clone ratatui. Ratatui is a practical migration checklist, not the design ceiling.
-- Do not rewrite the attach pipeline wholesale as an early step.
-- Do not create speculative helper crates before implementation pressure proves they are needed.
-
-## Image presentation boundary
-
-`bmux_tui` frames may contribute protocol-neutral image payloads, stable keys,
-cell destinations, clips, and frame or persistent lifecycles. The terminal
-retains and reconciles this image scene alongside its cell buffer and
-interaction metadata. `draw_with_overlay` and `draw_damage_with_overlay` let a
-backend emit protocol overlays before the shared flush, so failed image output
-does not commit speculative frame state.
-
-Terminal protocol selection and encoding are intentionally outside
-`bmux_tui`. The feature-gated `bmux_tui_runtime::ImageTerminalPresenter` uses
-`bmux_image` for Kitty, Sixel, and iTerm2 output and owns the normal runtime
-integration. Applications retain semantic image identity, content, sizing, and
-text fallback policy.
-
-
-
-BMUX's TUI framework has three domain-neutral layers:
-
-- `packages/tui` (`bmux_tui`) owns low-level terminal primitives, frames, events, and backends.
-- `packages/tui-components` (`bmux_tui_components`) owns reusable controls and component-local interaction state.
-- `packages/tui-runtime` (`bmux_tui_runtime`) owns bounded event admission, fair scheduling, commands, timers, redraw coalescing, render cadence, terminal-input lifecycle, shutdown, and neutral runtime statistics.
-
-The runtime depends on `bmux_tui` but not `bmux_tui_components`. Applications may use all three while retaining product state and behavior. See [`tui-runtime.md`](tui-runtime.md) for the runtime contract.
-
-## Canonical component and composition model
-
-The long-term rendering entry point is the domain-neutral `Component` lifecycle. A component:
-
-1. resolves a `LayoutNode` from explicit `Constraints` in `Component::layout`;
-2. paints only from that resolved node through `PaintCx` in `Component::paint`; and
-3. routes input against the same resolved node through `EventCx` in `Component::event`.
-
-Measurement and painting are separate operations. Painting and event routing must not recalculate wrapping, child placement, or viewport geometry. Application and control state remains caller-owned; framework caches retain only derived layout and collection indexes.
-
-### Constraints and logical geometry
-
-`Constraints` carries a bounded terminal width and a logical `usize` height range. `LayoutNode` and `LogicalRect` retain document dimensions and vertical positions without terminal `u16` saturation. Conversion to terminal `Rect` happens only when geometry reaches a visible terminal boundary. Parents assign child placement through `ChildLayout`; children lay themselves out in local coordinates and do not know their eventual terminal origin.
-
-Rows, columns, surfaces, wrappers, scroll viewports, and virtualized items all produce the same authoritative tree shape. `Surface` owns complete rectangular background, border, padding, inherited content style, and one measured child. `Row`, `Column`, and `Stack` own child ordering and placement. Wrapper components add one orthogonal behavior such as size bounds, alignment, clipping, style, visibility, or stable identity rather than introducing application-specific layout rules.
-
-### Scoped painting and interaction geometry
-
-`PaintCx` is the ordinary raster and metadata boundary. A child scope combines signed translation, clip intersection, and inherited style. Cell writes, fills, text, cursor placement, hit regions, focus targets, selection scopes/fragments, semantic regions, images, and damage all pass through that scope. Components that genuinely need cell-level rasterization use the bounded clip-aware raster API; ordinary components must not bypass scope correctness through direct buffer mutation.
-
-`EventCx` projects the same resolved child placement and viewport clipping into event geometry. Containers route against resolved descendants rather than maintaining another hit-layout map. Overlay-like containers traverse topmost-first. Scroll and virtual-list routing applies the same content translation and visible clipping as painting, and offscreen virtualized children do not receive pointer events.
-
-### Stable identity, revisions, and retention
-
-`LayoutId` is stable semantic layout identity. A keyed child keeps identity across insertion, removal, and reorder. `ComponentRevision` separates geometry-affecting `layout` revisions from `paint` revisions. Layout-affecting inputs include content, wrapping, border/padding, constraints, and geometry capability changes. Theme or other paint-only changes must repaint without invalidating geometry.
-
-`LayoutCache` keys derived layouts by stable identity, layout revision, exact constraints, and layout environment. Parent revisions include ordered descendant revisions so invalidation propagates upward. Consumers explicitly retain active identities so removed entries are released. The cache never owns application state or decides product behavior.
-
-### Scrolling and variable-height virtualization
-
-`ScrollViewState` is caller-owned logical scroll state shared by arbitrary measured content and keyed collections. Scrolling is projection: content remains in logical coordinates while painting and event routing apply a signed offset and viewport clip. Anchors use stable layout/item identity and relative position rather than a raw framebuffer row. Focus visibility and selection edge autoscroll use the same minimum-distance viewport projection.
-
-`VirtualList` uses `MeasuredListIndex` for exact keyed variable-height geometry. Current-width item measurements and retained item layouts are authoritative; visible-range lookup is sublinear. Only viewport-intersecting items are painted and registered for interaction, including correctly clipped boundary items. Item components remain ordinary components, and collection state contains only derived measurement/index data plus caller-owned scroll state. Prefer `VirtualList::component(key, component)` so the item measurement cache consumes the child's declared layout revision automatically. Use `VirtualList::item(key, layout_revision, component)` only when revision ownership is intentionally external to the component.
-
-This model replaces, rather than adapts indefinitely to, the area-assigned `Widget`/`StatefulWidget`, independent line-scroller, and retained-rendered-row architectures. Those APIs may coexist only while in-repository and downstream consumers are actively migrated; they are not part of the architectural endpoint.
-
-### Testable architectural invariants
-
-The replacement is accepted only while these invariants remain mechanically testable:
-
-- **Constraint satisfaction:** every resolved node size is inside its normalized constraints; inverted ranges normalize deterministically, zero dimensions remain valid, unbounded logical height remains `usize`, and terminal conversion saturates only at a visible boundary.
-- **Deterministic authoritative layout:** identical component input, layout revision, constraints, and layout environment resolve the same tree. Paint and event passes consume that tree without invoking measurement or independently deriving placement or wrapping.
-- **Local transforms and clipping:** a child contribution is translated exactly once from local to terminal coordinates and intersected with every ancestor clip. Cells, cursor, hits, focus, selection, semantics, images, damage, and event-visible geometry use the same effective transform and clip. Empty/offscreen intersections emit no contribution.
-- **Stable keyed retention:** insertion, removal, and reorder preserve the retained measurements and semantic identity of unchanged keys. Duplicate keys are rejected. Removed identities release cache entries and cannot continue contributing interaction metadata.
-- **Revision invalidation:** a matching identity/layout revision/constraints/environment is a cache hit; content, geometry style, width, or geometry capability changes miss exactly the affected entries. Paint-only revisions repaint without measuring. Viewport-height-only projection does not invalidate width-dependent item measurement.
-- **Scroll anchoring:** top-item and bottom-follow anchors restore stable semantic position through append, insertion above, removal, reorder, and exact width reflow. `ensure_visible` performs the minimum logical movement and all offsets clamp to exact content extent.
-- **Visible-only virtualization:** visible-range lookup is sublinear in collection size. Paint and event work, interaction/selection registration, damage, and output are bounded by viewport-intersecting items plus required boundary items, not total collection length. Partially visible first and last items use exact clipping.
-- **Committed metadata:** terminal cells and every metadata scene advance atomically only after successful presentation. Failed output publishes none of the attempted frame and invalidates uncertain retained output so the next successful presentation is complete. Regional damage restores committed cells and metadata outside damaged regions.
-
-Unit, property, integration, and structural benchmark tests may divide coverage across crates, but no invariant may be replaced by an application-owned correction or manual-only assertion. Performance tests assert structural work counts alongside observational timings; machine-dependent latency alone is not a correctness gate.
-
-## Initial primitive crate boundary
-
-The primitive crate is `packages/tui`, published in the workspace as `bmux_tui`.
-
-The first crate owns neutral primitives:
-
-- geometry: `Point`, `Size`, `Rect`, `Insets`
-- style: `Color`, `Modifier`, `Style`
-- text: `Span`, `Line`, `Text`
-- buffer: `Cell`, `Buffer`
-- layout: constraints and deterministic split helpers
-
-Bespoke product-adjacent functionality should be opt-in. Diff/file views are useful for coding-agent and developer-tool surfaces, but they are not required by general terminal UI consumers, so they live behind the `diff` crate feature and must not be required by the core primitives.
-
-Later modules should be added only when needed:
-
-- widgets
-- events
-- focus
-- terminal backends
-- virtualization
-- diff/file views
-- test support
-
-If the crate becomes too broad, split only by real capability pressure, for example `tui-render` or `tui-testing`. Avoid vague shared/common crates.
-
-## Feature boundaries and dependency direction
-
-`bmux_tui` has a small default feature set. The default build is the general-purpose terminal UI toolkit and must stay useful for applications that have no developer-tool or coding-agent needs.
-
-Default `bmux_tui` may contain:
-
-- geometry, layout, style, text, buffer, frame, and backend primitives
-- general widgets such as text blocks, panels, modals, text inputs, lists, and pickers
-- generic event/focus/viewport primitives when they are added
-- adapters to neutral BMUX primitives when those adapters do not pull in product behavior
-
-Default `bmux_tui` must not contain hard dependencies on:
-
-- BMUX sessions, windows, panes, clients, contexts, permissions, or plugin runtime behavior
-- Bcode chat/model/tool concepts
-- coding-agent-only visualizations
-- file-edit or VCS-specific models
-
-Feature-gated modules may provide more specialized UI surfaces. These features must depend inward on the neutral TUI primitives; neutral primitives must never depend outward on feature-gated modules.
-
-Current specialized features:
-
-| Feature | Purpose                                                   | Boundary rule                                                     |
-| ------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
-| `diff`  | Developer-tool/coding-agent diff and file view primitives | Opt-in only; no default exports; no core dependency on diff types |
-
-If a feature begins to need substantial domain models or behavior, prefer a separate domain crate or plugin-owned UI module instead of expanding default `bmux_tui`.
-
-## Relationship to existing BMUX crates
-
-### `bmux_terminal_grid`
-
-`bmux_terminal_grid` models terminal-emulator state and PTY output. `bmux_tui` models application UI output. The two may share concepts, but the TUI render buffer should remain an application rendering target rather than becoming PTY state.
-
-### `bmux_attach_pipeline`
-
-The attach pipeline already contains rendering, cursor, compositor, mouse, and scene integration code. Generic helpers can be extracted or reused, but attach-specific pane/session behavior should stay in attach/plugin layers.
-
-### `bmux_attach_layout_protocol`
-
-Attach layout protocol DTOs describe attached surfaces and content rectangles. `bmux_tui` should use its own neutral geometry and may provide explicit adapter functions later.
-
-### `bmux_scene_protocol` and `bmux_scene_protocol_render`
-
-Scene protocol is useful for plugin paint/decorations and may become an adapter target. `bmux_tui` should first define a neutral render buffer. Scene-protocol integration should be adapter-oriented unless a stronger dependency is justified.
-
-### `bmux_text_edit`
-
-Text input widgets should build on `bmux_text_edit` for Unicode-aware text storage, grapheme movement, deletion, word navigation, wrapping, and cursor projection.
-
-### `bmux_keyboard`
-
-TUI event handling should use `bmux_keyboard` key types instead of backend-specific key events. Crossterm conversion belongs in backend/adapters.
-
-## Bcode replacement milestone
-
-A major milestone is that Bcode's TUI can remove its current ratatui dependency and render with BMUX TUI primitives.
-
-The replacement surface should cover the practical roles Bcode currently gets from ratatui:
-
-| Current role                 | BMUX TUI target                    |
-| ---------------------------- | ---------------------------------- |
-| terminal runtime             | terminal/backend abstraction       |
-| frame render pass            | frame/render context               |
-| cell buffer                  | `Buffer` and `Cell`                |
-| rectangle and position types | `Rect`, `Point`, `Size`, `Insets`  |
-| constraints and splits       | `layout` primitives                |
-| colors and style modifiers   | `Color`, `Modifier`, `Style`       |
-| styled text                  | `Span`, `Line`, `Text`             |
-| widgets                      | BMUX-native widget model           |
-| block/borders                | panel/block widget                 |
-| paragraph/wrapping           | text block widget                  |
-| lists and list state         | virtualized list widget            |
-| overlays/clear               | overlay stack and modal primitives |
-| cursor placement             | frame cursor API                   |
-| crossterm backend            | backend adapter                    |
-
-This document deliberately does not perform Bcode migration work. Bcode should migrate only after BMUX primitives are implemented and tested.
-
-## Responsive layout
-
-The layout system should be deterministic and testable. Widgets should not read terminal size directly; the frame/layout context provides bounds.
-
-Initial requirements:
-
-- fixed, percentage, ratio/fill, minimum, and maximum constraints
-- horizontal and vertical splitting
-- safe behavior for zero-size and tiny terminal regions
-- nested layout determinism
-- breakpoint helpers for compact, medium, and wide views
-
-Future responsive widgets should be able to switch presentation by available width, for example:
-
-- wide diff view: side-by-side
-- medium diff view: unified
-- narrow diff view: compact stacked
-
-## Rendering model
-
-The framework renders into a neutral cell buffer first. Backends then flush the buffer to crossterm/ANSI or other targets.
-
-Important properties:
-
-- clipping is explicit and reliable
-- wide/unicode text behavior is deliberate
-- style patching is cheap and predictable
-- render output is easy to assert in tests
-- complete frames use retained-buffer incremental ANSI diffing
-- `Damage::Regions` supports process-local partial presentation: regions are clipped, deterministically coalesced, bounded by count and area, and promoted to `Damage::Full` when excessive
-- partial renders begin with an empty staging buffer; only declared damaged cells survive, while cells and hit/image metadata outside damage are restored from the last committed presentation
-- resize, reset, first presentation, and unknown damage use a complete presentation
-- terminal output and metadata commit atomically after a successful flush; output failure preserves committed metadata, discards the uncertain retained buffer, and forces the next successful draw to repaint fully
-
-This retained state is process-local terminal presentation state. It does not define transport retention, acknowledgment, replay, conflict handling, reconnect safety, or durable resume.
-
-## Logical content selection
-
-`bmux_tui::selection` models selection as logical document interaction rather than framebuffer text
-extraction. Renderers register hierarchical scopes and visible fragments that map terminal geometry
-to caller-owned UTF-8 source boundaries. A caller-owned controller locks the deepest eligible scope
-at pointer-down, supports parent delegation and cross-descendant ordering, and exposes snapshots of
-logical source slices plus current visible highlights.
-
-Selection metadata follows the same transactional frame boundary as hits and images. Applications
-paint a current snapshot with `Frame::paint_selection` after ordinary content rendering, then retain
-the controller independently of frame geometry. Applications and components own viewport mutation
-for generic autoscroll requests; product consumers own canonical source resolution, copy formatting,
-and clipboard effects. Core selection types remain domain-neutral and do not interpret panes,
-transcripts, Markdown, tools, sessions, or plugins.
-
-## Performance direction
-
-The framework should be designed for high-churn terminal applications, large transcripts, and large diffs.
-
-Required performance direction:
-
-- virtualized lists/transcripts/diffs
-- wrapping caches keyed by content revision and width
-- bounded dirty-region damage with safe full-frame fallback
-- incremental retained-buffer diffing before backend flush
-- avoid full transcript/diff re-render work every frame
-- performance tests for resize churn, large transcripts, and large diffs
-
-## Diff and file views
-
-Diff/file views are important for developer-tool and coding-agent consumers, especially for file edit tools, but they are not part of the general-purpose TUI core. They live behind the `diff` feature and should remain optional.
-
-Boundary requirements for diff/file view work:
-
-- The default `bmux_tui` build must not export diff types.
-- Core modules such as geometry, layout, style, text, buffer, frame, widgets, and ANSI backends must not depend on diff modules.
-- Diff modules may depend on neutral TUI primitives.
-- Diff modules must avoid Bcode-specific model/tool/session types.
-- If diff support grows into a substantial developer-tool UI domain, consider extracting it into a dedicated crate such as `packages/tui-diff` instead of expanding default `bmux_tui`.
-
-The optional diff feature can eventually provide reusable primitives for:
-
-- unified diffs
-- side-by-side diffs
-- responsive mode switching
-- line-number gutters
-- added/deleted/changed-line styling
-- inline changed-region highlighting
-- folded unchanged ranges
-- file list navigation
-- hunk navigation
-- virtualization for large files
-
-## Phased implementation plan
-
-### Phase 1: foundation
-
-- Create `bmux_tui` crate.
-- Add geometry, style, text, buffer, and basic layout primitives.
-- Add focused unit tests.
-
-### Phase 2: render and layout depth
-
-- Add richer constraints and responsive helpers.
-- Add clipping and styled text rendering helpers.
-- Add backend-neutral frame/render context.
-
-### Phase 3: text input widgets
-
-- Build single-line and multiline inputs on `bmux_text_edit`.
-- Support selection, cursor projection, wrapping, paste, and viewport scrolling.
-
-### Phase 4: widgets and overlays
-
-- Add text block, panel/block, list, virtualized viewport, overlay stack, modal, completion, and command palette primitives.
-
-### Phase 5: terminal backend
-
-- Add crossterm/ANSI backend adapter.
-- Add cursor positioning and incremental flush support.
-
-### Phase 6: optional developer-tool views
-
-- Keep diff/file view primitives behind the `diff` feature.
-- Add transcript/list virtualization depth to the default core only when the primitives remain general.
-- Add optional diff/file view primitives without introducing default dependencies on coding-agent or VCS concepts.
-
-### Phase 7: adoption
-
-- Integrate into bounded BMUX UI surfaces first.
-- Later migrate Bcode component-by-component until ratatui can be removed.
-
-## Validation expectations
-
-For implementation changes, run focused validation first:
-
-```sh
-cargo fmt --check
-cargo check -p bmux_tui
-cargo clippy -p bmux_tui --all-targets -- -D warnings
-cargo test -p bmux_tui
+`bmux_tui` is BMUX's domain-neutral foundation for measurable terminal user
+interfaces. It owns logical geometry, constraint-based layout, scoped painting,
+styled text, terminal buffers, interaction metadata, selection, images, damage,
+and ANSI presentation primitives. Reusable controls live in
+`bmux_tui_components`; scheduling and terminal presentation live in
+`bmux_tui_runtime`.
+
+Product behavior such as windows, sessions, panes, clients, contexts,
+permissions, model turns, tools, and chat state remains in plugins and
+applications.
+
+## Crate boundaries
+
+```text
+applications and plugins
+        |
+        +-- bmux_tui_components  reusable controls and control state
+        +-- bmux_tui_runtime     scheduling, events, commands, presentation
+                    |
+                 bmux_tui        geometry, layout, paint, scenes, terminal I/O
 ```
 
-Before broader integration, run workspace checks according to repository policy.
+- `bmux_tui` does not depend on either higher layer.
+- `bmux_tui_runtime` depends on `bmux_tui`, not on `bmux_tui_components`.
+- Application and control state is caller-owned.
+- The framework may retain only derived data that can be reconstructed from
+  caller state, stable identities, revisions, constraints, and environment.
+- Core layers must not interpret a plugin or application domain.
+
+## Canonical component lifecycle
+
+A terminal component implements `Component`:
+
+```rust,ignore
+pub trait Component {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode;
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>);
+    fn event(
+        &self,
+        event: &Event,
+        layout: &LayoutNode,
+        cx: &mut EventCx<'_>,
+    ) -> EventOutcome;
+    fn revision(&self) -> ComponentRevision;
+}
+```
+
+Layout resolves explicit constraints into an authoritative `LayoutNode` tree.
+Painting and event routing consume that exact tree; they do not independently
+recompute placement. A parent assigns each child's local placement, and scoped
+contexts translate it to terminal coordinates.
+
+`ComponentRevision` has independent layout and paint channels. Callers advance
+the layout revision when measurement or child placement can change and the
+paint revision when visual output changes without changing geometry. Stable
+`LayoutId` values identify retained dynamic children. Vector positions and
+whole-tree hashes are not substitutes for stable identity.
+
+`LayoutCache` keys derived geometry by stable identity, layout revision,
+constraints, and layout environment. Cache entries are disposable and never
+become application state.
+
+## Logical geometry
+
+Terminal width is represented in cells (`u16`), while vertical document
+positions and extents use logical rows (`usize`). This lets a scrollable or
+virtualized document exceed terminal coordinate limits. Conversion to terminal
+rectangles happens only where content intersects a visible boundary.
+
+Nested components use local coordinates. `PaintCx` and `EventCx` carry the
+current translation and effective clip. Every projected channel follows the
+same transform and clip:
+
+- cells and wide glyph continuations;
+- cursor ownership and visibility;
+- pointer hit regions and focus geometry;
+- semantic regions;
+- UTF-8 selection fragments and scopes;
+- image placements;
+- damage regions.
+
+Offscreen descendants contribute no visible or interactive metadata.
+
+## Composition primitives
+
+`composition` contains orthogonal containers and wrappers rather than
+product-specific controls:
+
+- `Surface` owns a child plus background, border, padding, and style scope;
+- `Column` and `Row` own linear placement, gaps, intrinsic/fixed/flex sizing,
+  cross-axis alignment, and deterministic constrained overflow;
+- `Padding`, `SizeBox`, `Fill`, `Align`, `Flex`, `Clip`, `StyleScope`,
+  `Visibility`, `Stack`, and `Keyed` modify one composition concern;
+- `TextContent` provides measurable rich text and source projection;
+- `ScrollViewport` applies caller-owned logical offsets through scoped
+  translation and clipping.
+
+A rectangular style belongs to the component that measures that rectangle.
+Consumers must not extend backgrounds, reconstruct wrapped rows, or mutate the
+buffer after rendering to compensate for missing geometry.
+
+`chrome::Panel` remains the shared border/title/padding vocabulary for current
+consumers. New child-owning surfaces should prefer `Surface`; duplicate panel,
+modal, clear, overlay, or content-layout engines must not be introduced.
+
+## Text and selection
+
+Rich text preserves span styles, Unicode display width, wrapping, alignment,
+and logical source projection. Selection uses stable content and scope
+identities plus logical UTF-8 byte offsets. Rendering projects those endpoints
+to visible cells; resize, wrapping, clipping, and scrolling do not rewrite the
+logical selection.
+
+`SelectionController` is caller-owned. Components register scopes and fragments
+during scene construction. `Frame::paint_selection` is the deterministic visual
+overlay stage after ordinary content painting. Copying reads the logical
+selection snapshot rather than scraping the terminal buffer.
+
+## Interaction and committed scenes
+
+Components register hit regions, focus geometry, semantics, cursors, selection
+fragments, images, and damage from their authoritative layouts. Stable IDs,
+not coordinates, preserve focus and interaction identity across reflow.
+
+Presentation is transactional. Runtime presentation stages a complete scene,
+flushes terminal output, and publishes interaction metadata only after a
+successful presentation. Failed presentation does not expose geometry that the
+user cannot see. Regional updates replace only the affected metadata while
+preserving valid state outside the damaged region.
+
+## Scrolling
+
+Reusable arbitrary-content scrolling belongs to
+`bmux_tui_components::ScrollView`. Its caller-owned `ScrollViewState` stores
+logical horizontal and vertical offsets, bottom-follow state, and interaction
+state. Reconciliation clamps offsets against authoritative content and viewport
+layout.
+
+The shared scroll path owns:
+
+- keyboard, page, home/end, and wheel navigation;
+- viewport-routed nested scrolling and edge propagation;
+- horizontal and vertical logical offsets;
+- scrollbar painting, hit regions, and drag mapping;
+- ensure-visible and focus visibility;
+- selection edge autoscroll;
+- bottom-follow restoration.
+
+Controls must not add independent line-oriented scroll engines when their
+content can use this model.
+
+## Variable-height virtualization
+
+`bmux_tui_components::VirtualList` composes arbitrary keyed item components.
+`MeasuredListIndex` retains exact current-width heights and prefix geometry
+behind an implementation-independent API.
+
+The virtual-list contract is:
+
+- item keys are stable across insertion, removal, reorder, and reflow;
+- cache validity includes key, layout revision, width, and relevant environment;
+- total height, prefix offsets, and offset-to-item lookup remain exact;
+- only viewport-intersecting boundary and visible items paint or register
+  interaction metadata;
+- top-item and bottom-follow anchors survive mutation and width reflow;
+- scroll-to-key and ensure-visible use keyed geometry;
+- a retained layout is reused for painting instead of being remeasured there.
+
+Exact measurement is the correctness model. Estimated heights are not part of
+the public contract unless measured evidence establishes that exact retained
+measurement cannot satisfy the supported scale.
+
+## Images and damage
+
+Images are scene contributions with stable keys, logical placement, payload,
+and lifecycle. They use the same transforms and clips as cells. Presentation
+diffs committed image scenes so moved, replaced, hidden, and removed images are
+handled consistently with terminal output.
+
+Damage is registered through scoped paint contexts. Full and regional damage
+must agree with visual output and all metadata channels. Wide glyphs and image
+placements are clipped atomically at visible boundaries.
+
+## Reusable controls
+
+Reusable interactive behavior belongs in `bmux_tui_components`, including
+buttons, inputs, panes, dialogs, menus, selectable collections, scrollbars,
+scroll views, virtual lists, viewers, and image-adjacent controls. Controls own
+no application domain and receive caller-owned state and policy.
+
+Feature-gated controls must preserve dependency isolation. Developer-tool
+source and diff views belong in the component crate rather than introducing
+VCS or coding-agent concepts into `bmux_tui`.
+
+## Terminal presentation
+
+`Buffer` and `Frame` are backend-facing staging types. Ordinary components
+paint through `PaintCx`; unrestricted buffer mutation is not a component API.
+ANSI output performs retained cell diffing, cursor projection, and terminal
+writes. Runtime code owns terminal setup/restoration and presentation timing,
+not component layout.
+
+## Performance contract
+
+Performance is demonstrated structurally as well as with elapsed time:
+
+- retained layout cache hits and misses;
+- measured nodes and items;
+- painted nodes and items;
+- interaction registrations;
+- damaged cells or regions;
+- allocations and emitted frame bytes.
+
+Steady repaint reuses valid measurement. Virtual-list visible-range lookup is
+sublinear, and steady scrolling paints/registers only visible content. Width or
+layout revision changes invalidate exactly the geometry they affect; a
+paint-only revision must not force measurement.
+
+## Validation
+
+Focused framework work should run the affected crate tests first. Repository
+completion follows `AGENTS.md`, including formatting, warning-free clippy,
+nextest, dependency hygiene, CLI checks/tests, and relevant PTY/runtime smoke
+commands. Changes to terminal protocol, query/reply, TERM, or profile behavior
+also require the compatibility matrix. Plugin source changes require rebuilding
+workspace plugins.
+
+Architecture checks must continue to prove that core TUI and runtime layers are
+domain-neutral and that deleted area-assigned rendering APIs, rendered-row
+caches, and unrestricted component buffer access are not reintroduced.
