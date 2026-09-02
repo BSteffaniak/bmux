@@ -17,7 +17,6 @@ pub mod composition;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
 pub mod damage;
-pub mod dialog;
 pub mod event;
 pub mod focus;
 pub mod frame;
@@ -48,7 +47,7 @@ pub mod prelude {
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::capabilities::{TerminalBackground, TerminalCapabilities, TerminalColorDepth};
     pub use crate::chrome::{
-        Border, BorderSet, BorderSides, Modal, Panel, PanelComponent, PanelTitle, TitlePosition,
+        Border, BorderSet, BorderSides, Panel, PanelComponent, PanelTitle, TitlePosition,
     };
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
@@ -66,7 +65,6 @@ pub mod prelude {
         poll_event, read_event, terminal_size,
     };
     pub use crate::damage::{Damage, DamagePolicy};
-    pub use crate::dialog::{Button, Dialog, DialogAction, DialogComponent, DialogState};
     pub use crate::event::{
         Event, EventHandler, EventOutcome, FocusEvent, MouseButton, MouseEvent, MouseEventKind,
         MouseModifiers,
