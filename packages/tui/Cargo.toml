@@ -27,5 +27,4 @@ crossterm = [
     "crossterm/events",
 ]
 default = []
-diff = []
 fail-on-warnings = []

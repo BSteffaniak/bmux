@@ -9,24 +9,19 @@
 //! helpers. Product behavior belongs in application crates and plugins.
 
 pub mod ansi;
-pub mod blocks;
 pub mod buffer;
 pub mod capabilities;
 pub mod chrome;
-pub mod clear;
 pub mod component;
 pub mod composition;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
 pub mod damage;
 pub mod dialog;
-#[cfg(feature = "diff")]
-pub mod diff;
 pub mod event;
 pub mod focus;
 pub mod frame;
 pub mod geometry;
-pub mod history;
 pub mod hit;
 pub mod image;
 pub mod image_scene;
@@ -35,7 +30,6 @@ pub mod interaction;
 pub mod layout;
 pub mod list;
 pub mod measured_list;
-pub mod overlay;
 pub mod paint;
 pub mod palette;
 pub mod selection;
@@ -51,13 +45,11 @@ pub mod prelude {
     pub use crate::ansi::{
         AnsiFrameDiffStats, ansi_to_lines, write_ansi_frame, write_ansi_frame_diff,
     };
-    pub use crate::blocks::{ProgressBlock, StatusBlock, StatusLevel, ToolBlock};
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::capabilities::{TerminalBackground, TerminalCapabilities, TerminalColorDepth};
     pub use crate::chrome::{
         Border, BorderSet, BorderSides, Modal, Panel, PanelComponent, PanelTitle, TitlePosition,
     };
-    pub use crate::clear::Clear;
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
         LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
@@ -75,12 +67,6 @@ pub mod prelude {
     };
     pub use crate::damage::{Damage, DamagePolicy};
     pub use crate::dialog::{Button, Dialog, DialogAction, DialogComponent, DialogState};
-    #[cfg(feature = "diff")]
-    pub use crate::diff::{
-        DiffChangedRange, DiffFileList, DiffFileListKeyHandler, DiffFileListKeyOutcome,
-        DiffFileListState, DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind, DiffView,
-        DiffViewMode, DiffViewState, DiffViewStyles,
-    };
     pub use crate::event::{
         Event, EventHandler, EventOutcome, FocusEvent, MouseButton, MouseEvent, MouseEventKind,
         MouseModifiers,
@@ -88,7 +74,6 @@ pub mod prelude {
     pub use crate::focus::{FocusId, FocusKeyOutcome, FocusTrap};
     pub use crate::frame::{Cursor, Frame};
     pub use crate::geometry::{Insets, Point, Rect, Size};
-    pub use crate::history::{TextInputHistory, TextInputHistoryDirection, TextInputHistoryState};
     pub use crate::hit::{Hit, HitId, HitMap, HitRegion, HitRole};
     pub use crate::image::{
         ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
@@ -105,7 +90,6 @@ pub mod prelude {
     };
     pub use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
     pub use crate::measured_list::{MeasuredListIndex, MeasuredListItem, VisibleItemRange};
-    pub use crate::overlay::{OverlayLayer, OverlayStack};
     pub use crate::paint::{LocalRect, PaintCx};
     pub use crate::palette::{
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
