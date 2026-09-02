@@ -38,7 +38,6 @@ pub mod measured_list;
 pub mod overlay;
 pub mod paint;
 pub mod palette;
-pub mod picker;
 pub mod selection;
 pub mod semantic;
 pub mod style;
@@ -46,7 +45,6 @@ pub mod terminal;
 pub mod text;
 pub mod text_block;
 pub mod text_width;
-pub mod viewport;
 
 /// Common imports for building BMUX TUI surfaces.
 pub mod prelude {
@@ -112,7 +110,6 @@ pub mod prelude {
     pub use crate::palette::{
         CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
     };
-    pub use crate::picker::{Dropdown, ListPicker, ListPickerAreas};
     pub use crate::selection::{
         SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,
         SelectionContentId, SelectionController, SelectionEndpoint, SelectionFragment,
@@ -129,5 +126,4 @@ pub mod prelude {
         display_width, truncate_to_display_width, wrap_text_with_continuation,
         wrap_text_with_continuation_character,
     };
-    pub use crate::viewport::{Viewport, ViewportKeyHandler, ViewportKeyOutcome, ViewportState};
 }
