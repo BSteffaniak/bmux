@@ -138,11 +138,11 @@ impl NavigationDemo {
             event,
         ) {
             SelectableListOutcome::Selected(index) => {
-                self.message = format!("List selected: {}", list_items[index].label());
+                self.message = format!("List selected: {}", list_item_text(&list_items[index]));
                 return false;
             }
             SelectableListOutcome::Focused(index) => {
-                self.message = format!("List focus: {}", list_items[index].label());
+                self.message = format!("List focus: {}", list_item_text(&list_items[index]));
                 return false;
             }
             SelectableListOutcome::Ignored | SelectableListOutcome::Redraw => {}
@@ -531,6 +531,14 @@ fn tree_items() -> [TreeViewItem; 4] {
         TreeViewItem::new("main", "main.rs", 1),
         TreeViewItem::new("readme", "README.md", 0),
     ]
+}
+
+fn list_item_text(item: &SelectableListItem) -> String {
+    item.lines
+        .iter()
+        .map(Line::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn list_items() -> [SelectableListItem; 3] {

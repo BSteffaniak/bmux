@@ -131,12 +131,6 @@ impl ActionRowKeyboardPolicy {
         }
     }
 
-    /// Legacy alias for deliberate local roving behavior.
-    #[must_use]
-    pub const fn interactive() -> Self {
-        Self::roving()
-    }
-
     /// Return true when Left/Right move focus.
     #[must_use]
     pub const fn arrow_navigation(self) -> bool {
@@ -200,12 +194,6 @@ impl ActionRowPolicy {
             mouse: ComponentMousePolicy::button(),
             keyboard: ActionRowKeyboardPolicy::roving(),
         }
-    }
-
-    /// Legacy alias for deliberate local roving behavior.
-    #[must_use]
-    pub const fn interactive() -> Self {
-        Self::roving()
     }
 }
 

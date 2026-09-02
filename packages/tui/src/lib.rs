@@ -86,12 +86,8 @@ pub mod prelude {
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
         Split, split,
     };
-    pub use crate::list::{List, ListItem, ListKeyHandler, ListKeyOutcome, ListState};
     pub use crate::measured_list::{MeasuredListIndex, MeasuredListItem, VisibleItemRange};
     pub use crate::paint::{LocalRect, PaintCx};
-    pub use crate::palette::{
-        CommandPalette, CommandPaletteKeyOutcome, CommandPaletteState, PaletteItem,
-    };
     pub use crate::selection::{
         SelectionAffinity, SelectionAutoScrollPolicy, SelectionAutoScrollRequest, SelectionCapture,
         SelectionContentId, SelectionController, SelectionEndpoint, SelectionFragment,

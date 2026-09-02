@@ -151,7 +151,7 @@ impl<'a> CanvasPoint<'a> {
 
 /// One canvas line shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CanvasLine<'a> {
+pub struct CanvasLine {
     /// Start x coordinate.
     pub x0: f64,
     /// Start y coordinate.
@@ -160,22 +160,19 @@ pub struct CanvasLine<'a> {
     pub x1: f64,
     /// End y coordinate.
     pub y1: f64,
-    /// Marker symbol retained for API compatibility; geometry is rasterized.
-    pub marker: &'a str,
     /// Line style.
     pub style: Style,
 }
 
-impl<'a> CanvasLine<'a> {
+impl CanvasLine {
     /// Create a canvas line.
     #[must_use]
-    pub const fn new(x0: f64, y0: f64, x1: f64, y1: f64, marker: &'a str) -> Self {
+    pub const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
         Self {
             x0,
             y0,
             x1,
             y1,
-            marker,
             style: Style::new(),
         }
     }
@@ -199,7 +196,7 @@ pub enum CanvasRectMode {
 
 /// One canvas rectangle shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CanvasRect<'a> {
+pub struct CanvasRect {
     /// Minimum x coordinate.
     pub x0: f64,
     /// Minimum y coordinate.
@@ -208,24 +205,21 @@ pub struct CanvasRect<'a> {
     pub x1: f64,
     /// Maximum y coordinate.
     pub y1: f64,
-    /// Marker symbol retained for API compatibility; geometry is rasterized.
-    pub marker: &'a str,
     /// Rectangle style.
     pub style: Style,
     /// Rectangle rendering mode.
     pub mode: CanvasRectMode,
 }
 
-impl<'a> CanvasRect<'a> {
+impl CanvasRect {
     /// Create a canvas rectangle outline.
     #[must_use]
-    pub const fn new(x0: f64, y0: f64, x1: f64, y1: f64, marker: &'a str) -> Self {
+    pub const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
         Self {
             x0,
             y0,
             x1,
             y1,
-            marker,
             style: Style::new(),
             mode: CanvasRectMode::Outline,
         }
@@ -248,30 +242,27 @@ impl<'a> CanvasRect<'a> {
 
 /// One canvas circle shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CanvasCircle<'a> {
+pub struct CanvasCircle {
     /// Center x coordinate.
     pub x: f64,
     /// Center y coordinate.
     pub y: f64,
     /// Radius in canvas coordinates.
     pub radius: f64,
-    /// Marker symbol retained for API compatibility; geometry is rasterized.
-    pub marker: &'a str,
     /// Circle style.
     pub style: Style,
     /// Whether to fill the circle.
     pub filled: bool,
 }
 
-impl<'a> CanvasCircle<'a> {
+impl CanvasCircle {
     /// Create a canvas circle outline.
     #[must_use]
-    pub const fn new(x: f64, y: f64, radius: f64, marker: &'a str) -> Self {
+    pub const fn new(x: f64, y: f64, radius: f64) -> Self {
         Self {
             x,
             y,
             radius,
-            marker,
             style: Style::new(),
             filled: false,
         }
@@ -296,9 +287,9 @@ impl<'a> CanvasCircle<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Canvas<'a> {
     points: &'a [CanvasPoint<'a>],
-    lines: &'a [CanvasLine<'a>],
-    rects: &'a [CanvasRect<'a>],
-    circles: &'a [CanvasCircle<'a>],
+    lines: &'a [CanvasLine],
+    rects: &'a [CanvasRect],
+    circles: &'a [CanvasCircle],
     bounds: CanvasBounds,
     style: Style,
     policy: CanvasPolicy,
@@ -335,21 +326,21 @@ impl<'a> Canvas<'a> {
 
     /// Return this canvas with line shapes.
     #[must_use]
-    pub const fn lines(mut self, lines: &'a [CanvasLine<'a>]) -> Self {
+    pub const fn lines(mut self, lines: &'a [CanvasLine]) -> Self {
         self.lines = lines;
         self
     }
 
     /// Return this canvas with rectangle shapes.
     #[must_use]
-    pub const fn rects(mut self, rects: &'a [CanvasRect<'a>]) -> Self {
+    pub const fn rects(mut self, rects: &'a [CanvasRect]) -> Self {
         self.rects = rects;
         self
     }
 
     /// Return this canvas with circle shapes.
     #[must_use]
-    pub const fn circles(mut self, circles: &'a [CanvasCircle<'a>]) -> Self {
+    pub const fn circles(mut self, circles: &'a [CanvasCircle]) -> Self {
         self.circles = circles;
         self
     }
@@ -563,7 +554,7 @@ impl<'a> CanvasRaster<'a> {
         }
     }
 
-    fn draw_rect(&mut self, rect: CanvasRect<'_>, style: Style) {
+    fn draw_rect(&mut self, rect: CanvasRect, style: Style) {
         let (Some(a), Some(b)) = (
             self.map_point(rect.x0, rect.y0),
             self.map_point(rect.x1, rect.y1),
@@ -588,7 +579,7 @@ impl<'a> CanvasRaster<'a> {
         }
     }
 
-    fn draw_circle(&mut self, circle: CanvasCircle<'_>, style: Style) {
+    fn draw_circle(&mut self, circle: CanvasCircle, style: Style) {
         if circle.radius <= 0.0 {
             return;
         }
@@ -831,8 +822,8 @@ mod tests {
         let red = Style::new().fg(Color::Red);
         let blue = Style::new().fg(Color::Blue);
         let lines = [
-            CanvasLine::new(0.0, 1.0, 0.0, 1.0, "ignored").style(red),
-            CanvasLine::new(1.0, 1.0, 1.0, 1.0, "ignored").style(blue),
+            CanvasLine::new(0.0, 1.0, 0.0, 1.0).style(red),
+            CanvasLine::new(1.0, 1.0, 1.0, 1.0).style(blue),
         ];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut frame = Frame::new(&mut buffer);
@@ -854,7 +845,7 @@ mod tests {
         let red = Style::new().fg(Color::Red);
         let blue = Style::new().fg(Color::Blue);
         let points = [CanvasPoint::new(0.0, 1.0, "p").style(blue)];
-        let rects = [CanvasRect::new(0.0, 1.0, 0.0, 1.0, "ignored").style(red)];
+        let rects = [CanvasRect::new(0.0, 1.0, 0.0, 1.0).style(red)];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut frame = Frame::new(&mut buffer);
 
@@ -886,7 +877,7 @@ mod tests {
 
     #[test]
     fn auto_composes_full_half_quadrant_and_braille_cells() {
-        let full = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "ignored").fill()];
+        let full = [CanvasRect::new(0.0, 0.0, 1.0, 1.0).fill()];
         let mut full_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut full_frame = Frame::new(&mut full_buffer);
         Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
@@ -895,7 +886,7 @@ mod tests {
             .render(Rect::new(0, 0, 1, 1), &mut full_frame);
         assert_eq!(full_frame.buffer().row_symbols(0).as_deref(), Some("█"));
 
-        let top = [CanvasRect::new(0.0, 0.5, 1.0, 1.0, "ignored").fill()];
+        let top = [CanvasRect::new(0.0, 0.5, 1.0, 1.0).fill()];
         let mut top_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut top_frame = Frame::new(&mut top_buffer);
         Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
@@ -903,7 +894,7 @@ mod tests {
             .render(Rect::new(0, 0, 1, 1), &mut top_frame);
         assert_eq!(top_frame.buffer().row_symbols(0).as_deref(), Some("▀"));
 
-        let left = [CanvasRect::new(0.0, 0.0, 0.0, 1.0, "ignored")];
+        let left = [CanvasRect::new(0.0, 0.0, 0.0, 1.0)];
         let mut left_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut left_frame = Frame::new(&mut left_buffer);
         Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
@@ -911,7 +902,7 @@ mod tests {
             .render(Rect::new(0, 0, 1, 1), &mut left_frame);
         assert_eq!(left_frame.buffer().row_symbols(0).as_deref(), Some("▌"));
 
-        let diagonal = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
+        let diagonal = [CanvasLine::new(0.0, 0.0, 1.0, 1.0)];
         let mut diagonal_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut diagonal_frame = Frame::new(&mut diagonal_buffer);
         Canvas::new(&[], CanvasBounds::new(0.0, 1.0, 0.0, 1.0))
@@ -922,7 +913,7 @@ mod tests {
 
     #[test]
     fn preferences_use_same_raster_pipeline() {
-        let diagonal = [CanvasLine::new(0.0, 0.0, 1.0, 1.0, "ignored")];
+        let diagonal = [CanvasLine::new(0.0, 0.0, 1.0, 1.0)];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
         let mut frame = Frame::new(&mut buffer);
 
@@ -958,8 +949,8 @@ mod tests {
     #[test]
     fn renders_filled_rectangles_and_circles_before_points() {
         let points = [CanvasPoint::new(2.0, 2.0, "p")];
-        let rects = [CanvasRect::new(0.0, 0.0, 1.0, 1.0, "r").fill()];
-        let circles = [CanvasCircle::new(2.0, 2.0, 1.0, "c").fill()];
+        let rects = [CanvasRect::new(0.0, 0.0, 1.0, 1.0).fill()];
+        let circles = [CanvasCircle::new(2.0, 2.0, 1.0).fill()];
         let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 5));
         let mut frame = Frame::new(&mut buffer);
 

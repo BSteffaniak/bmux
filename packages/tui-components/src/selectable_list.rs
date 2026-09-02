@@ -59,16 +59,6 @@ impl SelectableListItem {
         }
     }
 
-    /// Return the plain-text label for compatibility with string-oriented callers.
-    #[must_use]
-    pub fn label(&self) -> String {
-        self.lines
-            .iter()
-            .map(Line::plain_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Return rendered item height in rows.
     #[must_use]
     pub fn height(&self) -> usize {

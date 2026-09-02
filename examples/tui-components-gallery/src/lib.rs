@@ -321,12 +321,12 @@ fn render_chart(frame: &mut Frame<'_>) {
 
 fn render_canvas(frame: &mut Frame<'_>) {
     let points = [CanvasPoint::new(1.0, 1.0, "●")];
-    let lines = [CanvasLine::new(0.0, 0.0, 3.0, 2.0, "·")];
+    let lines = [CanvasLine::new(0.0, 0.0, 3.0, 2.0)];
     let rects = [
-        CanvasRect::new(0.0, 0.0, 3.0, 2.0, "□"),
-        CanvasRect::new(0.2, 0.2, 0.8, 0.8, "▒").fill(),
+        CanvasRect::new(0.0, 0.0, 3.0, 2.0),
+        CanvasRect::new(0.2, 0.2, 0.8, 0.8).fill(),
     ];
-    let circles = [CanvasCircle::new(2.0, 1.0, 0.8, "○")];
+    let circles = [CanvasCircle::new(2.0, 1.0, 0.8)];
 
     render_component(
         &Canvas::new(&points, CanvasBounds::new(0.0, 3.0, 0.0, 2.0))
