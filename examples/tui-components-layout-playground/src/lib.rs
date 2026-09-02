@@ -3,14 +3,13 @@ use std::cell::{Cell, RefCell};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::{Column, Row, Surface, TextContent};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Border, Line, Panel, PanelComponent, PanelTitle};
+use bmux_tui::prelude::Line;
 use bmux_tui::style::{Color, Style};
-use bmux_tui::text_block::Alignment;
 use bmux_tui_components::common::{
     ComponentHitRegion, DragState, HitRegionId, ResizeBounds, hit_region_at,
 };
@@ -215,17 +214,21 @@ fn render_playground(
     );
 
     let block_area = Rect::new(2, 10, 30, 1);
-    let panel = Panel::new()
-        .border(Border::rounded())
-        .title(PanelTitle::new("Padded Block").alignment(Alignment::Center))
-        .padding(Insets::new(0, 1, 0, 1))
-        .background(Style::new().bg(Color::Black))
-        .content_style(Style::new().bg(Color::Black));
-    render_component(
-        &PanelComponent::new("playground.padded-block", &panel),
-        block_area,
-        frame,
-    );
+    let composed_card = Surface::new(
+        Column::new().id("playground.composed-card.column").child(
+            Row::new()
+                .id("playground.composed-card.header")
+                .child(TextContent::new("Composed").id("playground.composed-card.title"))
+                .flex_child(
+                    1,
+                    TextContent::new("local layout").id("playground.composed-card.detail"),
+                ),
+        ),
+    )
+    .id("playground.composed-card")
+    .background(Style::new().bg(Color::Black))
+    .padding(Insets::new(0, 1, 0, 1));
+    render_component(&composed_card, block_area, frame);
 
     let group_area = panel_group_area();
     let group = PanelGroupComponent::new(
@@ -416,7 +419,8 @@ mod tests {
 
         assert!(rendered.contains("Drag/resize me"));
         assert!(rendered.contains("Modal placement"));
-        assert!(rendered.contains("Padded Block"));
+        assert!(rendered.contains("Composed"));
+        assert!(rendered.contains("local layout"));
         assert!(rendered.contains("Panel 0"));
         assert!(rendered.contains("Drag pane title/border or panel-group divider"));
     }
