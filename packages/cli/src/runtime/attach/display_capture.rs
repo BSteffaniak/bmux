@@ -176,6 +176,11 @@ enum DisplayCaptureCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordOutcome {
     Written,
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     Skipped,
 }
 

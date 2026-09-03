@@ -11,7 +11,6 @@ use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::{line_viewport, wrap_line_character, wrap_line_word};
 
-use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 use crate::selection::{
@@ -173,9 +172,9 @@ pub struct TextViewPolicy {
     /// Fill background before rendering.
     pub background: bool,
     /// Integrated vertical scrollbar layout mode.
-    pub vertical_scrollbar: ScrollAreaScrollbarMode,
+    pub vertical_scrollbar: ScrollbarAxisLayoutMode,
     /// Integrated horizontal scrollbar layout mode.
-    pub horizontal_scrollbar: ScrollAreaScrollbarMode,
+    pub horizontal_scrollbar: ScrollbarAxisLayoutMode,
 }
 
 impl TextViewPolicy {
@@ -189,8 +188,8 @@ impl TextViewPolicy {
             keyboard: false,
             mouse_wheel: false,
             background: false,
-            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
-            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            vertical_scrollbar: ScrollbarAxisLayoutMode::Hidden,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
         }
     }
 
@@ -204,13 +203,13 @@ impl TextViewPolicy {
             keyboard: true,
             mouse_wheel: true,
             background: false,
-            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
-            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            vertical_scrollbar: ScrollbarAxisLayoutMode::Hidden,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
         }
     }
     /// Return this policy with integrated vertical scrollbar mode changed.
     #[must_use]
-    pub const fn vertical_scrollbar(mut self, vertical_scrollbar: ScrollAreaScrollbarMode) -> Self {
+    pub const fn vertical_scrollbar(mut self, vertical_scrollbar: ScrollbarAxisLayoutMode) -> Self {
         self.vertical_scrollbar = vertical_scrollbar;
         self
     }
@@ -219,7 +218,7 @@ impl TextViewPolicy {
     #[must_use]
     pub const fn horizontal_scrollbar(
         mut self,
-        horizontal_scrollbar: ScrollAreaScrollbarMode,
+        horizontal_scrollbar: ScrollbarAxisLayoutMode,
     ) -> Self {
         self.horizontal_scrollbar = horizontal_scrollbar;
         self
@@ -378,8 +377,8 @@ impl<'a> TextView<'a> {
         scrollbar_layout(
             area,
             ScrollbarLayoutPolicy::new(
-                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
-                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+                self.policy.vertical_scrollbar,
+                self.policy.horizontal_scrollbar,
             ),
         )
         .content
@@ -391,8 +390,8 @@ impl<'a> TextView<'a> {
         scrollbar_layout(
             area,
             ScrollbarLayoutPolicy::new(
-                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
-                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+                self.policy.vertical_scrollbar,
+                self.policy.horizontal_scrollbar,
             ),
         )
         .vertical_scrollbar
@@ -404,8 +403,8 @@ impl<'a> TextView<'a> {
         scrollbar_layout(
             area,
             ScrollbarLayoutPolicy::new(
-                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
-                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+                self.policy.vertical_scrollbar,
+                self.policy.horizontal_scrollbar,
             ),
         )
         .horizontal_scrollbar
@@ -711,8 +710,8 @@ impl<'a> TextView<'a> {
         if let Some(corner) = scrollbar_layout(
             area,
             ScrollbarLayoutPolicy::new(
-                text_view_axis_layout_mode(self.policy.vertical_scrollbar),
-                text_view_axis_layout_mode(self.policy.horizontal_scrollbar),
+                self.policy.vertical_scrollbar,
+                self.policy.horizontal_scrollbar,
             ),
         )
         .corner
@@ -895,14 +894,6 @@ impl<'a> TextView<'a> {
     }
 }
 
-const fn text_view_axis_layout_mode(mode: ScrollAreaScrollbarMode) -> ScrollbarAxisLayoutMode {
-    match mode {
-        ScrollAreaScrollbarMode::Hidden => ScrollbarAxisLayoutMode::Hidden,
-        ScrollAreaScrollbarMode::Overlay => ScrollbarAxisLayoutMode::Overlay,
-        ScrollAreaScrollbarMode::Gutter => ScrollbarAxisLayoutMode::Gutter,
-    }
-}
-
 fn apply_ranges(
     lines: &[Line],
     highlights: &[TextViewHighlight],
@@ -1061,7 +1052,7 @@ mod tests {
         TextView, TextViewCursor, TextViewHighlight, TextViewOutcome, TextViewPolicy,
         TextViewSelection, TextViewState,
     };
-    use crate::scroll_area::ScrollAreaScrollbarMode;
+    use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
     #[test]
     fn wraps_content_to_area_width() {
@@ -1081,7 +1072,7 @@ mod tests {
             Line::from("three"),
         ];
         let view = TextView::new(&lines).policy(
-            TextViewPolicy::scrollable().vertical_scrollbar(ScrollAreaScrollbarMode::Gutter),
+            TextViewPolicy::scrollable().vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter),
         );
         let mut buffer = Buffer::empty(Rect::new(3, 2, 14, 5));
         let mut frame = Frame::new(&mut buffer);
@@ -1297,8 +1288,8 @@ mod tests {
         TextView::new(&lines)
             .policy(
                 TextViewPolicy::bare()
-                    .vertical_scrollbar(ScrollAreaScrollbarMode::Gutter)
-                    .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+                    .vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter)
+                    .horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
             )
             .render(Rect::new(0, 0, 4, 3), &state, &mut frame);
 

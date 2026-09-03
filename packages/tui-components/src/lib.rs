@@ -38,8 +38,6 @@ pub mod dialog;
 pub mod diff_viewer;
 #[cfg(feature = "empty-state")]
 pub mod empty_state;
-#[cfg(feature = "filtered-list")]
-pub mod filtered_list;
 #[cfg(feature = "form")]
 pub mod form;
 #[cfg(feature = "form-field")]

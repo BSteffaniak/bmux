@@ -64,6 +64,7 @@ bmux_tui_components = { workspace = true, features = [
     "selectable-list",
     "text-input-box",
     "text-view",
+    "virtual-list",
 ] }
 bmux_windows_plugin_api = { workspace = true }
 sshenv_vault = { workspace = true }

@@ -11,10 +11,10 @@ use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::hit_test::{HitRegion, hit_region_at};
-use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{
     Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
 };
+use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
 /// One selectable list item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +181,7 @@ pub struct SelectableListPolicy {
     /// Highlight symbol behavior.
     pub highlight: SelectableListHighlightPolicy,
     /// Optional integrated vertical scrollbar mode.
-    pub scrollbar: ScrollAreaScrollbarMode,
+    pub scrollbar: ScrollbarAxisLayoutMode,
     /// Integrated scrollbar rendering/interaction policy.
     pub scrollbar_policy: ScrollbarPolicy,
 }
@@ -194,13 +194,13 @@ impl SelectableListPolicy {
             mouse: ComponentMousePolicy::button(),
             keyboard: SelectableListKeyboardPolicy::interactive(),
             highlight: SelectableListHighlightPolicy::new(">", true),
-            scrollbar: ScrollAreaScrollbarMode::Hidden,
+            scrollbar: ScrollbarAxisLayoutMode::Hidden,
             scrollbar_policy: ScrollbarPolicy::vertical(),
         }
     }
     /// Return policy with integrated vertical scrollbar mode set.
     #[must_use]
-    pub const fn scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
+    pub const fn scrollbar(mut self, mode: ScrollbarAxisLayoutMode) -> Self {
         self.scrollbar = mode;
         self
     }
@@ -367,7 +367,7 @@ impl<'a> SelectableList<'a> {
 
     fn content_area(&self, area: Rect) -> Rect {
         let reserve_scrollbar =
-            matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Gutter) && area.width > 0;
+            matches!(self.policy.scrollbar, ScrollbarAxisLayoutMode::Gutter) && area.width > 0;
         Rect::new(
             area.x,
             area.y,
@@ -377,7 +377,7 @@ impl<'a> SelectableList<'a> {
     }
 
     const fn scrollbar_area(&self, area: Rect) -> Option<Rect> {
-        if matches!(self.policy.scrollbar, ScrollAreaScrollbarMode::Hidden) || area.width == 0 {
+        if matches!(self.policy.scrollbar, ScrollbarAxisLayoutMode::Hidden) || area.width == 0 {
             return None;
         }
         Some(Rect::new(
@@ -982,7 +982,7 @@ mod tests {
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::prelude::{Line, Span, Style};
 
-    use crate::scroll_area::ScrollAreaScrollbarMode;
+    use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
     use super::{
         SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListOutcome,
@@ -994,7 +994,7 @@ mod tests {
         let items = [SelectableListItem::new("one", "One")];
         let theme = crate::theme::ComponentTheme::opaque_dark();
         let list = SelectableList::new(&items)
-            .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter))
             .styles(theme.selectable_list_styles());
         let area = Rect::new(0, 0, 12, 4);
         let mut buffer = Buffer::empty(area);
@@ -1135,7 +1135,7 @@ mod tests {
             SelectableListItem::new("three", "Three"),
         ];
         let list = SelectableList::new(&items)
-            .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter));
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter));
         let mut state = SelectableListState::new(Some(0));
         state.set_vertical_scroll(1);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
@@ -1154,7 +1154,7 @@ mod tests {
             SelectableListItem::new("three", "Three"),
         ];
         let list = SelectableList::new(&items)
-            .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter));
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter));
         let mut state = SelectableListState::new(Some(0));
 
         let outcome = list.handle_event(

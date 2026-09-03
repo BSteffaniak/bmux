@@ -137,6 +137,11 @@ macro_rules! declare_bundled_plugins {
 }
 
 /// Register an optional client-side adapter owned by one bundled plugin.
+#[cfg(any(
+    feature = "bundled-plugin-cluster",
+    feature = "bundled-plugin-tab-strip",
+    feature = "bundled-plugin-sidebar"
+))]
 #[allow(unused_variables, clippy::missing_const_for_fn)]
 fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value>) {
     #[cfg(feature = "bundled-plugin-cluster")]

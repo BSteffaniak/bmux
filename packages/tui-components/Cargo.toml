@@ -39,7 +39,6 @@ compact = ["dep:unicode-segmentation", "dep:unicode-width"]
 dialog = ["action-row", "modal-frame"]
 diff-viewer = ["source-viewer", "dep:unicode-segmentation", "dep:unicode-width"]
 empty-state = []
-filtered-list = []
 form = ["keyboard-input"]
 form-field = []
 key-hint-bar = []
@@ -55,13 +54,13 @@ scroll-area = ["keyboard-input", "scrollbar"]
 scroll-view = ["keyboard-input", "scrollbar"]
 scrollbar = []
 select-dropdown = ["selectable-list"]
-selectable-list = ["keyboard-input", "scroll-area"]
+selectable-list = ["keyboard-input", "scrollbar"]
 source-viewer = ["dep:unicode-segmentation", "dep:unicode-width"]
 sparkline = []
 status-bar = []
 stepper = []
 tab-bar = ["keyboard-input"]
-table = ["keyboard-input", "scroll-area"]
+table = ["keyboard-input", "scrollbar"]
 terminal-viewer = ["dep:bmux_terminal_grid"]
 text-input = [
     "keyboard-input",
@@ -69,7 +68,7 @@ text-input = [
     "dep:unicode-segmentation",
 ]
 text-input-box = ["text-input", "form-field"]
-text-view = ["keyboard-input", "scroll-area"]
+text-view = ["keyboard-input", "scrollbar"]
 toast-stack = ["keyboard-input"]
 tree-view = ["keyboard-input"]
 virtual-list = ["scroll-view"]
@@ -91,7 +90,6 @@ all = [
     "dialog",
     "diff-viewer",
     "empty-state",
-    "filtered-list",
     "form",
     "form-field",
     "key-hint-bar",
@@ -146,13 +144,6 @@ forms = [
     "select-dropdown",
     "text-input-box",
 ]
-navigation = [
-    "breadcrumbs",
-    "filtered-list",
-    "menu",
-    "selectable-list",
-    "tab-bar",
-    "tree-view",
-]
+navigation = ["breadcrumbs", "menu", "selectable-list", "tab-bar", "tree-view"]
 overlays = ["dialog", "modal-frame", "picker-frame", "toast-stack"]
 text-editing = ["text-input", "text-input-box", "text-view"]

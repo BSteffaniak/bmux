@@ -12,7 +12,6 @@ use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::hit_test::{HitRegion, hit_region_at};
-use crate::scroll_area::ScrollAreaScrollbarMode;
 use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
@@ -306,11 +305,11 @@ pub struct TablePolicy {
     /// Descending sort indicator symbol.
     pub sort_descending_symbol: &'static str,
     /// Integrated vertical scrollbar mode.
-    pub vertical_scrollbar: ScrollAreaScrollbarMode,
+    pub vertical_scrollbar: ScrollbarAxisLayoutMode,
     /// Integrated vertical scrollbar policy.
     pub vertical_scrollbar_policy: ScrollbarPolicy,
     /// Integrated horizontal scrollbar mode.
-    pub horizontal_scrollbar: ScrollAreaScrollbarMode,
+    pub horizontal_scrollbar: ScrollbarAxisLayoutMode,
     /// Integrated horizontal scrollbar policy.
     pub horizontal_scrollbar_policy: ScrollbarPolicy,
 }
@@ -329,9 +328,9 @@ impl TablePolicy {
             sticky_left_columns: 0,
             sort_ascending_symbol: "↑",
             sort_descending_symbol: "↓",
-            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            vertical_scrollbar: ScrollbarAxisLayoutMode::Hidden,
             vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
-            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
             horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
     }
@@ -349,9 +348,9 @@ impl TablePolicy {
             sticky_left_columns: 0,
             sort_ascending_symbol: "↑",
             sort_descending_symbol: "↓",
-            vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            vertical_scrollbar: ScrollbarAxisLayoutMode::Hidden,
             vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
-            horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
             horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
     }
@@ -372,7 +371,7 @@ impl TablePolicy {
 
     /// Return policy with vertical scrollbar mode set.
     #[must_use]
-    pub const fn vertical_scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
+    pub const fn vertical_scrollbar(mut self, mode: ScrollbarAxisLayoutMode) -> Self {
         self.vertical_scrollbar = mode;
         self
     }
@@ -386,7 +385,7 @@ impl TablePolicy {
 
     /// Return policy with horizontal scrollbar mode set.
     #[must_use]
-    pub const fn horizontal_scrollbar(mut self, mode: ScrollAreaScrollbarMode) -> Self {
+    pub const fn horizontal_scrollbar(mut self, mode: ScrollbarAxisLayoutMode) -> Self {
         self.horizontal_scrollbar = mode;
         self
     }
@@ -518,9 +517,9 @@ impl<'a> Table<'a> {
                 sticky_left_columns: 0,
                 sort_ascending_symbol: "↑",
                 sort_descending_symbol: "↓",
-                vertical_scrollbar: ScrollAreaScrollbarMode::Hidden,
+                vertical_scrollbar: ScrollbarAxisLayoutMode::Hidden,
                 vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
-                horizontal_scrollbar: ScrollAreaScrollbarMode::Hidden,
+                horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
                 horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
             },
             styles: TableStyles {
@@ -587,8 +586,8 @@ impl<'a> Table<'a> {
                     .saturating_sub(separator_rows),
             ),
             ScrollbarLayoutPolicy::new(
-                scrollbar_axis_mode(self.policy.vertical_scrollbar),
-                scrollbar_axis_mode(self.policy.horizontal_scrollbar),
+                self.policy.vertical_scrollbar,
+                self.policy.horizontal_scrollbar,
             ),
         );
         TableLayout {
@@ -1133,14 +1132,6 @@ impl<'a> Table<'a> {
     }
 }
 
-const fn scrollbar_axis_mode(mode: ScrollAreaScrollbarMode) -> ScrollbarAxisLayoutMode {
-    match mode {
-        ScrollAreaScrollbarMode::Hidden => ScrollbarAxisLayoutMode::Hidden,
-        ScrollAreaScrollbarMode::Overlay => ScrollbarAxisLayoutMode::Overlay,
-        ScrollAreaScrollbarMode::Gutter => ScrollbarAxisLayoutMode::Gutter,
-    }
-}
-
 fn format_cell_line(line: &Line, width: u16, align: TableAlign, truncate: bool) -> Line {
     let width = usize::from(width);
     let line_width = line.width();
@@ -1289,7 +1280,7 @@ mod tests {
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
-    use crate::scroll_area::ScrollAreaScrollbarMode;
+    use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
     use super::{
         Table, TableAlign, TableColumn, TableHit, TableOutcome, TablePolicy, TableRow,
@@ -1471,8 +1462,8 @@ mod tests {
         Table::new(&columns, &rows)
             .policy(
                 TablePolicy::bare()
-                    .vertical_scrollbar(ScrollAreaScrollbarMode::Gutter)
-                    .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+                    .vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter)
+                    .horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
             )
             .render(Rect::new(0, 0, 6, 4), &state, &mut frame);
 
@@ -1494,7 +1485,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
 
         Table::new(&columns, &rows)
-            .policy(TablePolicy::bare().vertical_scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .policy(TablePolicy::bare().vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter))
             .render(Rect::new(0, 0, 6, 3), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("two  │"));
@@ -1512,7 +1503,7 @@ mod tests {
         let mut state = TableState::new(None);
 
         let outcome = Table::new(&columns, &rows)
-            .policy(TablePolicy::interactive().vertical_scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .policy(TablePolicy::interactive().vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter))
             .handle_event(
                 Rect::new(0, 0, 6, 3),
                 &mut state,
@@ -1535,7 +1526,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
 
         Table::new(&columns, &rows)
-            .policy(TablePolicy::bare().horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter))
+            .policy(TablePolicy::bare().horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter))
             .render(Rect::new(0, 0, 5, 2), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("██───"));
@@ -1549,7 +1540,7 @@ mod tests {
 
         let outcome = Table::new(&columns, &rows)
             .policy(
-                TablePolicy::interactive().horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+                TablePolicy::interactive().horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
             )
             .handle_event(
                 Rect::new(0, 0, 5, 2),

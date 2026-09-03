@@ -17,6 +17,7 @@ use bmux_tui_components::menu::{Menu, MenuItem, MenuPolicy};
 use bmux_tui_components::scroll_area::{
     ScrollArea, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
 };
+use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListPolicy, SelectableListState,
 };
@@ -148,8 +149,8 @@ fn golden_scroll_area_and_text_view_both_axis_scrollbars() {
     TextView::new(&lines)
         .policy(
             TextViewPolicy::bare()
-                .vertical_scrollbar(ScrollAreaScrollbarMode::Gutter)
-                .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
+                .vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter)
+                .horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
         )
         .render(Rect::new(0, 0, 4, 3), &text_state, &mut text_frame);
 
@@ -206,7 +207,7 @@ fn golden_recent_list_menu_and_chart_polish() {
     let mut list_buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
     let mut list_frame = Frame::new(&mut list_buffer);
     SelectableList::new(&list_items)
-        .policy(SelectableListPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter))
+        .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter))
         .render(Rect::new(0, 0, 6, 2), &list_state, &mut list_frame);
     assert_eq!(buffer_rows(list_frame.buffer()), vec!["  Two│", "  Thr█"]);
 
