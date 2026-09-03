@@ -1,11 +1,19 @@
 //! Generic hierarchical tree-view component.
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::KeyCode;
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 
 use crate::common::{ComponentMousePolicy, InteractionState};
@@ -322,48 +330,49 @@ impl<'a> TreeView<'a> {
         visible_indices(self.items, state)
     }
 
-    /// Render visible tree rows and register one composite tab stop.
-    pub fn render(&self, area: Rect, state: &TreeViewState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("tree-view");
-        self.render_with_id(id, area, state, frame);
+    /// Return the natural size: the widest visible row and one row per
+    /// visible item under the current expansion state.
+    #[must_use]
+    pub fn size(&self, state: &TreeViewState) -> (u16, u16) {
+        let visible = self.visible_indices(state);
+        let width = visible
+            .iter()
+            .enumerate()
+            .map(|(row, source)| self.row_line(&self.items[*source], state, row).width())
+            .max()
+            .unwrap_or(0);
+        (u16_saturating(width), u16_saturating(visible.len()))
     }
 
-    /// Render visible tree rows with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &TreeViewState,
-        frame: &mut Frame<'_>,
-    ) {
+    /// Whether this tree currently exposes any interactive row.
+    fn is_interactive(&self, state: &TreeViewState) -> bool {
+        let usable = self
+            .visible_indices(state)
+            .into_iter()
+            .any(|source| !self.items[source].disabled);
+        usable && (self.policy.keyboard.enabled || self.policy.mouse.enabled)
+    }
+
+    /// Paint visible tree rows through a scoped local-coordinate context whose
+    /// origin is this tree's top-left corner.
+    pub fn paint(&self, area: Rect, state: &TreeViewState, cx: &mut PaintCx<'_, '_>) {
         if area.is_empty() {
             return;
         }
-        let visible = self.visible_indices(state);
-        let usable = visible.iter().any(|source| !self.items[*source].disabled);
-        if usable && (self.policy.keyboard.enabled || self.policy.mouse.enabled) {
-            frame.push_hit(
-                SceneRegion::new(id, area)
-                    .role(HitRole::ListItem)
-                    .pointer_events(self.policy.mouse.enabled)
-                    .hoverable(self.policy.mouse.hover)
-                    .focusable(self.policy.keyboard.enabled)
-                    .enabled(!state.interaction.disabled),
-            );
-        }
-        for (visible, source) in visible
+        for (visible, source) in self
+            .visible_indices(state)
             .into_iter()
             .take(usize::from(area.height))
             .enumerate()
         {
             let item = &self.items[source];
-            let row = Rect::new(
-                area.x,
-                area.y.saturating_add(u16_saturating(visible)),
+            let row = LocalRect::new(
+                i32::from(area.x),
+                i64::from(area.y.saturating_add(u16_saturating(visible))),
                 area.width,
                 1,
             );
-            frame.write_line_with_fallback_style(
+            cx.write_line_with_fallback_style(
                 row,
                 &self.row_line(item, state, visible),
                 self.row_style(item, state, visible),
@@ -621,6 +630,140 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+/// Canonical component-lifecycle hierarchical tree view.
+///
+/// The component measures one row per visible item under the caller-owned
+/// expansion state, paints rows through the scoped paint context, registers
+/// one composite roving-focus region plus one visible row region per stable
+/// item id, and routes events through the same resolved layout. Tree state
+/// remains caller-owned through an interior-mutable `RefCell`.
+pub struct TreeViewComponent<'a, 'state> {
+    id: LayoutId,
+    tree: TreeView<'a>,
+    state: &'state RefCell<TreeViewState>,
+}
+
+impl<'a, 'state> TreeViewComponent<'a, 'state> {
+    /// Create a tree view with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        items: &'a [TreeViewItem],
+        state: &'state RefCell<TreeViewState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            tree: TreeView::new(items),
+            state,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: TreeViewPolicy) -> Self {
+        self.tree.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: TreeViewStyles) -> Self {
+        self.tree.styles = styles;
+        self
+    }
+}
+
+impl Component for TreeViewComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let state = self.state.borrow();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for item in self.tree.items {
+            item.id.hash(&mut layout);
+            item.label.hash(&mut layout);
+            item.depth.hash(&mut layout);
+            item.expandable.hash(&mut layout);
+        }
+        self.tree.policy.indent_width.hash(&mut layout);
+        state.expanded_ids().hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for item in self.tree.items {
+            item.disabled.hash(&mut paint);
+        }
+        format!("{:?}", self.tree.styles).hash(&mut paint);
+        format!("{:?}", *state).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let (width, height) = self.tree.size(&self.state.borrow());
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, usize::from(height))),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("tree"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        if area.is_empty() {
+            return;
+        }
+        let state = self.state.borrow();
+        if self.tree.is_interactive(&state) {
+            cx.push_hit(
+                SceneRegion::new(self.id.as_str(), area)
+                    .role(HitRole::ListItem)
+                    .pointer_events(self.tree.policy.mouse.enabled)
+                    .hoverable(self.tree.policy.mouse.hover)
+                    .focusable(self.tree.policy.keyboard.enabled)
+                    .enabled(!state.interaction.disabled),
+            );
+            for (visible, source) in self
+                .tree
+                .visible_indices(&state)
+                .into_iter()
+                .take(usize::from(area.height))
+                .enumerate()
+            {
+                let item = &self.tree.items[source];
+                let row = Rect::new(0, u16_saturating(visible), area.width, 1);
+                let item_id = format!("{}.{}", self.id.as_str(), item.id);
+                cx.push_hit(
+                    SceneRegion::new(item_id.clone(), row)
+                        .role(HitRole::ListItem)
+                        .pointer_events(self.tree.policy.mouse.enabled)
+                        .hoverable(self.tree.policy.mouse.hover)
+                        .enabled(!state.interaction.disabled && !item.disabled),
+                );
+                cx.push_semantic(SemanticRegion::new(item_id, row, "tree-item"));
+            }
+        }
+        self.tree.paint(area, &state, cx);
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "tree"));
+        cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let outcome = self
+            .tree
+            .handle_event(area, &mut self.state.borrow_mut(), event);
+        match outcome {
+            TreeViewOutcome::Ignored => EventOutcome::Ignored,
+            TreeViewOutcome::Redraw
+            | TreeViewOutcome::Focused { .. }
+            | TreeViewOutcome::Selected { .. }
+            | TreeViewOutcome::Toggled { .. } => EventOutcome::Redraw,
+        }
+    }
+}
+
 impl crate::theme::ComponentTheme {
     /// Convert this semantic component theme into [`TreeViewStyles`].
     #[must_use]
@@ -645,14 +788,30 @@ impl From<crate::theme::ComponentTheme> for TreeViewStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
-    use super::{TreeView, TreeViewItem, TreeViewOutcome, TreeViewPolicy, TreeViewState};
+    use super::{
+        TreeView, TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewPolicy, TreeViewState,
+    };
+
+    fn render_component(component: &TreeViewComponent<'_, '_>, area: Rect, frame: &mut Frame<'_>) {
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    }
 
     #[test]
     fn visible_indices_respect_expansion_state() {
@@ -669,13 +828,14 @@ mod tests {
     #[test]
     fn render_shows_disclosure_markers_and_indentation() {
         let items = sample_items();
-        let view = TreeView::new(&items);
         let mut state = TreeViewState::new(Some(0));
         state.set_expanded("src", true);
+        let state = RefCell::new(state);
+        let component = TreeViewComponent::new("files", &items, &state);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 4));
         let mut frame = Frame::new(&mut buffer);
 
-        view.render(Rect::new(0, 0, 20, 4), &state, &mut frame);
+        render_component(&component, Rect::new(0, 0, 20, 4), &mut frame);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -688,35 +848,108 @@ mod tests {
     }
 
     #[test]
+    fn component_measures_visible_rows_and_relayouts_on_expansion() {
+        let items = sample_items();
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let component = TreeViewComponent::new("files", &items, &state);
+        let mut cx = LayoutCx::new();
+
+        let collapsed = component.layout(Constraints::for_width(20), &mut cx);
+        assert_eq!(collapsed.size.height, 2);
+        let collapsed_revision = component.revision();
+
+        state.borrow_mut().set_expanded("src", true);
+        let expanded = component.layout(Constraints::for_width(20), &mut cx);
+        assert_eq!(expanded.size.height, 4);
+        assert_eq!(cx.measured_nodes(), 2);
+        assert_ne!(collapsed_revision.layout, component.revision().layout);
+
+        state.borrow_mut().set_selected_visible(Some(1));
+        let paint_only = component.revision();
+        assert_eq!(
+            component
+                .layout(Constraints::for_width(20), &mut cx)
+                .size
+                .height,
+            4
+        );
+        assert_ne!(paint_only.paint, collapsed_revision.paint);
+    }
+
+    #[test]
     fn render_registers_exact_composite_geometry_and_disabled_state() {
         let items = sample_items();
-        let view = TreeView::new(&items);
         let mut enabled = TreeViewState::new(Some(0));
         enabled.set_expanded("src", true);
         let mut disabled = enabled.clone();
         disabled.set_disabled(true);
+        let enabled = RefCell::new(enabled);
+        let disabled = RefCell::new(disabled);
         let mut buffer = Buffer::empty(Rect::new(3, 2, 24, 10));
         let mut frame = Frame::new(&mut buffer);
 
-        view.render_with_id("files", Rect::new(6, 3, 18, 4), &enabled, &mut frame);
-        view.render_with_id(
-            "disabled-files",
+        render_component(
+            &TreeViewComponent::new("files", &items, &enabled),
+            Rect::new(6, 3, 18, 4),
+            &mut frame,
+        );
+        render_component(
+            &TreeViewComponent::new("disabled-files", &items, &disabled),
             Rect::new(6, 7, 18, 4),
-            &disabled,
             &mut frame,
         );
 
         let regions = frame.hits().regions();
-        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.len(), 10);
         assert_eq!(regions[0].id.as_str(), "files");
         assert_eq!(regions[0].area, Rect::new(6, 3, 18, 4));
         assert_eq!(regions[0].role, HitRole::ListItem);
         assert!(regions[0].focusable);
         assert!(regions[0].enabled);
-        assert_eq!(regions[1].id.as_str(), "disabled-files");
-        assert_eq!(regions[1].area, Rect::new(6, 7, 18, 4));
-        assert!(!regions[1].enabled);
+        assert_eq!(regions[1].id.as_str(), "files.src");
+        assert_eq!(regions[1].area, Rect::new(6, 3, 18, 1));
+        assert!(!regions[1].focusable);
+        assert_eq!(regions[4].id.as_str(), "files.readme");
+        assert_eq!(regions[4].area, Rect::new(6, 6, 18, 1));
+        assert_eq!(regions[5].id.as_str(), "disabled-files");
+        assert_eq!(regions[5].area, Rect::new(6, 7, 18, 4));
+        assert!(!regions[5].enabled);
+        assert!(regions[6..].iter().all(|region| !region.enabled));
         assert_eq!(frame.hits().focus_targets(None).len(), 1);
+        assert!(
+            frame
+                .semantics()
+                .regions()
+                .iter()
+                .any(|region| region.id == "files.lib" && region.role == "tree-item")
+        );
+    }
+
+    #[test]
+    fn component_routes_events_through_resolved_layout_and_updates_caller_state() {
+        let items = sample_items();
+        let mut initial = TreeViewState::new(Some(0));
+        initial.set_focused(true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("files", &items, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 20, 4).size()),
+            &mut LayoutCx::new(),
+        );
+
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Right)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert!(state.borrow().is_expanded("src"));
+        assert_eq!(
+            component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
+            EventOutcome::Ignored
+        );
     }
 
     #[test]
@@ -726,27 +959,25 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 3));
         let mut frame = Frame::new(&mut buffer);
 
-        TreeView::new(&disabled).render_with_id(
-            "disabled",
+        let disabled_state = RefCell::new(TreeViewState::new(Some(0)));
+        render_component(
+            &TreeViewComponent::new("disabled", &disabled, &disabled_state),
             Rect::new(0, 0, 20, 1),
-            &TreeViewState::new(Some(0)),
             &mut frame,
         );
-        TreeView::new(&empty).render_with_id(
-            "empty",
+        let empty_state = RefCell::new(TreeViewState::new(None));
+        render_component(
+            &TreeViewComponent::new("empty", &empty, &empty_state),
             Rect::new(0, 1, 20, 1),
-            &TreeViewState::new(None),
             &mut frame,
         );
         let items = sample_items();
-        TreeView::new(&items)
-            .policy(TreeViewPolicy::bare())
-            .render_with_id(
-                "bare",
-                Rect::new(0, 2, 20, 1),
-                &TreeViewState::new(Some(0)),
-                &mut frame,
-            );
+        let bare_state = RefCell::new(TreeViewState::new(Some(0)));
+        render_component(
+            &TreeViewComponent::new("bare", &items, &bare_state).policy(TreeViewPolicy::bare()),
+            Rect::new(0, 2, 20, 1),
+            &mut frame,
+        );
 
         assert!(frame.hits().regions().is_empty());
     }

@@ -37,7 +37,7 @@ use bmux_tui_components::progress_bar::{
 use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::sparkline::{SparklineComponent, SparklinePolicy};
 use bmux_tui_components::stepper::{StepItem, StepStatus, StepperComponent, StepperPolicy};
-use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
+use bmux_tui_components::table::{TableColumn, TableComponent, TableRow, TableState};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 use bmux_tui_components::toast_stack::{
@@ -377,7 +377,12 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
         Span::styled("red", Style::new().fg(Color::Red)),
         Span::styled("blue", Style::new().fg(Color::Blue)),
     ])])];
-    Table::new(&columns, &rows).render(Rect::new(41, 24, 10, 3), &TableState::new(Some(0)), frame);
+    let table_state = std::cell::RefCell::new(TableState::new(Some(0)));
+    render_component(
+        &TableComponent::new("gallery.table", &columns, &rows, &table_state),
+        Rect::new(41, 24, 10, 3),
+        frame,
+    );
 
     render_badge_component(
         BadgeComponent::new("gallery.badge.truncated", "truncated-style")

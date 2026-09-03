@@ -1,11 +1,19 @@
 //! Configurable selectable-menu component.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::Event;
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 
 use crate::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListPolicy,
@@ -205,59 +213,14 @@ impl<'a> Menu<'a> {
         SelectableList::new(&items).size()
     }
 
-    /// Render the menu and register it as one composite tab stop.
-    ///
-    /// Use [`Self::render_with_id`] when focus must survive responsive reflow
-    /// or callers route events by semantic identity.
-    pub fn render(&self, area: Rect, state: &MenuState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("menu");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render the menu with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &MenuState,
-        frame: &mut Frame<'_>,
-    ) {
-        self.render_with_id_and_fallback_style(id, area, state, frame, Style::new());
-    }
-
-    /// Render the menu with fallback style filling each item row.
-    pub fn render_with_fallback_style(
-        &self,
-        area: Rect,
-        state: &MenuState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        let id = frame.next_interaction_id("menu");
-        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
-    }
-
-    /// Render with a stable interaction identifier and fallback style.
-    pub fn render_with_id_and_fallback_style(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &MenuState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::ListItem)
-                .hoverable(self.policy.list.mouse.hover)
-                .focusable(true)
-                .enabled(!state.list.interaction.disabled),
-        );
+    /// Paint visible menu rows through a scoped local-coordinate context whose
+    /// origin is this menu's top-left corner.
+    pub fn paint(&self, area: Rect, state: &MenuState, fallback: Style, cx: &mut PaintCx<'_, '_>) {
         let items = self.list_items();
         SelectableList::new(&items)
             .policy(self.policy.list)
             .styles(self.styles)
-            .render_with_fallback_style(area, &state.list, frame, fallback);
+            .paint(area, &state.list, fallback, cx);
     }
 
     /// Return the menu item index at a terminal point using the same
@@ -358,18 +321,210 @@ impl<'a> Menu<'a> {
     }
 }
 
+/// Canonical component-lifecycle selectable menu.
+///
+/// The menu measures its exact stacked item height, paints complete rows
+/// through the scoped paint context, registers one composite roving-focus
+/// region plus one visible region per stable item id, and routes events
+/// through the same resolved layout. Menu state remains caller-owned through
+/// an interior-mutable `Cell`; semantic outcomes such as activation and
+/// cancellation are read by callers from [`Menu::handle_event`] or by
+/// comparing caller state before and after the event.
+pub struct MenuComponent<'a, 'state> {
+    id: LayoutId,
+    menu: Menu<'a>,
+    state: &'state Cell<MenuState>,
+    fallback: Style,
+}
+
+impl<'a, 'state> MenuComponent<'a, 'state> {
+    /// Create a menu with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        items: &'a [MenuItem],
+        state: &'state Cell<MenuState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            menu: Menu::new(items),
+            state,
+            fallback: Style::new(),
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: MenuPolicy) -> Self {
+        self.menu.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: MenuStyles) -> Self {
+        self.menu.styles = styles;
+        self
+    }
+
+    /// Set the row fill style applied beneath every item row.
+    #[must_use]
+    pub const fn fallback_style(mut self, fallback: Style) -> Self {
+        self.fallback = fallback;
+        self
+    }
+}
+
+impl Component for MenuComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for item in self.menu.items {
+            item.id.hash(&mut layout);
+            item.submenu.hash(&mut layout);
+            item.lines.len().hash(&mut layout);
+            for line in &item.lines {
+                format!("{line:?}").hash(&mut layout);
+            }
+        }
+        self.menu.policy.submenu_indicator.hash(&mut layout);
+        self.menu.policy.list.highlight.symbol.hash(&mut layout);
+        self.menu
+            .policy
+            .list
+            .highlight
+            .repeat_spacing
+            .hash(&mut layout);
+        format!("{:?}", self.menu.policy.list.scrollbar).hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for item in self.menu.items {
+            item.disabled.hash(&mut paint);
+            item.section.hash(&mut paint);
+        }
+        format!("{:?}", self.menu.styles).hash(&mut paint);
+        format!("{:?}", self.fallback).hash(&mut paint);
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let (width, _) = self.menu.size();
+        let height = self
+            .menu
+            .items
+            .iter()
+            .map(|item| item.lines.len().max(1))
+            .sum::<usize>();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, height)),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("menu"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        if area.is_empty() {
+            return;
+        }
+        let state = self.state.get();
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), area)
+                .role(HitRole::ListItem)
+                .hoverable(self.menu.policy.list.mouse.hover)
+                .focusable(true)
+                .enabled(!state.list.interaction.disabled),
+        );
+        let items = self.menu.list_items();
+        let list = SelectableList::new(&items)
+            .policy(self.menu.policy.list)
+            .styles(self.menu.styles);
+        for region in list.visible_semantic_regions(area, &state.list) {
+            let item_id = format!("{}.{}", self.id.as_str(), region.key);
+            let disabled = self
+                .menu
+                .items
+                .iter()
+                .find(|item| item.id == region.key)
+                .is_none_or(|item| !Menu::is_activatable_item(item));
+            cx.push_hit(
+                SceneRegion::new(item_id.clone(), region.rect)
+                    .role(HitRole::ListItem)
+                    .hoverable(self.menu.policy.list.mouse.hover)
+                    .enabled(!state.list.interaction.disabled && !disabled),
+            );
+            cx.push_semantic(SemanticRegion::new(item_id, region.rect, "menu-item"));
+        }
+        list.paint(area, &state.list, self.fallback, cx);
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "menu"));
+        cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.menu.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            MenuOutcome::Ignored => EventOutcome::Ignored,
+            MenuOutcome::Typeahead(_) | MenuOutcome::Cancelled => EventOutcome::Handled,
+            MenuOutcome::Redraw | MenuOutcome::Focused(_) | MenuOutcome::Activated { .. } => {
+                EventOutcome::Redraw
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
-    use super::{Menu, MenuItem, MenuOutcome, MenuPolicy, MenuState, SelectableListStyles};
+    use super::{
+        Menu, MenuComponent, MenuItem, MenuOutcome, MenuPolicy, MenuState, SelectableListStyles,
+    };
+
+    fn render_component(component: &MenuComponent<'_, '_>, area: Rect, frame: &mut Frame<'_>) {
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    }
+
+    trait MenuTestRender {
+        fn render(&self, area: Rect, state: &MenuState, frame: &mut Frame<'_>);
+    }
+
+    impl MenuTestRender for Menu<'_> {
+        fn render(&self, area: Rect, state: &MenuState, frame: &mut Frame<'_>) {
+            let state = Cell::new(*state);
+            let component = MenuComponent {
+                id: "test.menu".into(),
+                menu: self.clone(),
+                state: &state,
+                fallback: Style::new(),
+            };
+            render_component(&component, area, frame);
+        }
+    }
 
     #[test]
     fn renders_menu_items() {
@@ -391,35 +546,114 @@ mod tests {
     }
 
     #[test]
-    fn render_registers_exact_composite_geometry_and_disabled_state() {
-        let items = items();
-        let menu = Menu::new(&items);
-        let enabled = MenuState::new(Some(0));
-        let mut disabled = MenuState::new(Some(0));
-        disabled.set_disabled(true);
-        let mut buffer = Buffer::empty(Rect::new(3, 2, 20, 5));
+    fn component_measures_exact_height_and_registers_composite_and_item_geometry() {
+        let items = [
+            MenuItem::new("open", "Open"),
+            MenuItem::new("recent", "Recent").section(true),
+            MenuItem::new("close", "Close"),
+        ];
+        let enabled = Cell::new(MenuState::new(Some(0)));
+        let mut disabled_state = MenuState::new(Some(0));
+        disabled_state.set_disabled(true);
+        let disabled = Cell::new(disabled_state);
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 20, 8));
         let mut frame = Frame::new(&mut buffer);
 
-        menu.render_with_id("file-menu", Rect::new(6, 3, 12, 2), &enabled, &mut frame);
-        menu.render_with_id_and_fallback_style(
-            "disabled-menu",
-            Rect::new(6, 5, 12, 2),
-            &disabled,
+        let component = MenuComponent::new("file-menu", &items, &enabled);
+        let mut cx = LayoutCx::new();
+        let layout = component.layout(Constraints::for_width(12), &mut cx);
+        assert_eq!(layout.size.height, 3);
+        assert_eq!(cx.measured_nodes(), 1);
+        render_component(&component, Rect::new(6, 3, 12, 3), &mut frame);
+        render_component(
+            &MenuComponent::new("disabled-menu", &items, &disabled),
+            Rect::new(6, 6, 12, 3),
             &mut frame,
-            Style::new(),
         );
 
         let regions = frame.hits().regions();
-        assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].id.as_str(), "file-menu");
-        assert_eq!(regions[0].area, Rect::new(6, 3, 12, 2));
+        assert_eq!(regions[0].area, Rect::new(6, 3, 12, 3));
         assert_eq!(regions[0].role, HitRole::ListItem);
         assert!(regions[0].focusable);
         assert!(regions[0].enabled);
-        assert_eq!(regions[1].id.as_str(), "disabled-menu");
-        assert_eq!(regions[1].area, Rect::new(6, 5, 12, 2));
-        assert!(!regions[1].enabled);
+        assert_eq!(regions[1].id.as_str(), "file-menu.open");
+        assert_eq!(regions[1].area, Rect::new(6, 3, 12, 1));
+        assert!(regions[1].enabled);
+        assert!(!regions[1].focusable);
+        assert_eq!(regions[2].id.as_str(), "file-menu.recent");
+        assert!(!regions[2].enabled, "section rows are not activatable");
+        assert_eq!(regions[3].id.as_str(), "file-menu.close");
+        assert_eq!(regions[4].id.as_str(), "disabled-menu");
+        assert_eq!(regions[4].area, Rect::new(6, 6, 12, 3));
+        assert!(!regions[4].enabled);
+        assert!(regions[5..].iter().all(|region| !region.enabled));
         assert_eq!(frame.hits().focus_targets(None).len(), 1);
+        let semantics = frame.semantics().regions();
+        assert!(
+            semantics
+                .iter()
+                .any(|region| region.id == "file-menu.close" && region.role == "menu-item")
+        );
+        assert!(
+            semantics
+                .iter()
+                .any(|region| region.id == "file-menu" && region.role == "menu")
+        );
+    }
+
+    #[test]
+    fn component_routes_events_through_resolved_layout_and_updates_caller_state() {
+        let items = items();
+        let state = Cell::new(MenuState::new(Some(0)));
+        let component = MenuComponent::new("file-menu", &items, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 12, 2).size()),
+            &mut LayoutCx::new(),
+        );
+
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Down)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.get().focused(), Some(1));
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Escape)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Handled
+        );
+        assert_eq!(
+            component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
+            EventOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn component_revision_separates_layout_and_paint_changes() {
+        let items = items();
+        let state = Cell::new(MenuState::new(None));
+        let component = MenuComponent::new("file-menu", &items, &state);
+        let before = component.revision();
+
+        state.set(MenuState::new(Some(1)));
+        let paint_only = component.revision();
+        assert_eq!(before.layout, paint_only.layout);
+        assert_ne!(before.paint, paint_only.paint);
+
+        let more = [
+            MenuItem::new("open", "Open"),
+            MenuItem::new("close", "Close"),
+            MenuItem::new("quit", "Quit"),
+        ];
+        let relayout = MenuComponent::new("file-menu", &more, &state).revision();
+        assert_ne!(before.layout, relayout.layout);
     }
 
     #[test]

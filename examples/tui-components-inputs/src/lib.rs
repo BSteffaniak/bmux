@@ -13,7 +13,8 @@ use bmux_tui_components::radio_group::{
     RadioGroup, RadioGroupComponent, RadioGroupOutcome, RadioGroupState, RadioOption,
 };
 use bmux_tui_components::select_dropdown::{
-    SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption,
+    SelectDropdown, SelectDropdownComponent, SelectDropdownOutcome, SelectDropdownState,
+    SelectOption,
 };
 use bmux_tui_components::text_input::{
     TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
@@ -221,7 +222,15 @@ fn render_inputs_with_state(
     );
 
     let options = select_options();
-    SelectDropdown::new(&options).render(SELECT_AREA, select, frame);
+    let select_state = std::cell::Cell::new(*select);
+    let component = SelectDropdownComponent::new("inputs.select", &options, &select_state);
+    let layout = component.layout(Constraints::tight(SELECT_AREA.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(SELECT_AREA.x),
+        i64::from(SELECT_AREA.y),
+        LocalRect::new(0, 0, SELECT_AREA.width, SELECT_AREA.height),
+        |cx| component.paint(&layout, cx),
+    );
 
     frame.write_line(Rect::new(38, 6, 32, 1), &Line::from(message));
 }

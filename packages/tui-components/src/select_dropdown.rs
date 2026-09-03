@@ -1,12 +1,21 @@
 //! Configurable select/dropdown field control.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
+use bmux_tui::text_width::display_width;
 
 use crate::common::{ComponentMousePolicy, InteractionState};
 use crate::selectable_list::{SelectableList, SelectableListItem, SelectableListState};
@@ -241,72 +250,56 @@ impl<'a> SelectDropdown<'a> {
         )
     }
 
-    /// Render the select/dropdown and register it as one composite tab stop.
-    ///
-    /// Use [`Self::render_with_id`] when focus must survive responsive reflow
-    /// or callers route events by semantic identity.
-    pub fn render(&self, area: Rect, state: &SelectDropdownState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("select-dropdown");
-        self.render_with_id(id, area, state, frame);
+    /// Return the natural size: a width that fits every closed label and the
+    /// option list, and one closed row plus every option row when open.
+    #[must_use]
+    pub fn size(&self, state: SelectDropdownState) -> (u16, u16) {
+        let items = self.list_items();
+        let (list_width, _) = SelectableList::new(&items).size();
+        let marker_width = 2;
+        let closed_width = self
+            .options
+            .iter()
+            .map(|option| display_width(&option.label))
+            .chain(std::iter::once(display_width(self.placeholder)))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(marker_width);
+        let width = closed_width.max(usize::from(list_width));
+        let height = if state.open {
+            self.list_height().saturating_add(1)
+        } else {
+            1
+        };
+        (u16::try_from(width).unwrap_or(u16::MAX), height)
     }
 
-    /// Render the select/dropdown with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &SelectDropdownState,
-        frame: &mut Frame<'_>,
-    ) {
-        self.render_with_id_and_fallback_style(id, area, state, frame, Style::new());
-    }
-
-    /// Render the select/dropdown control with fallback style.
-    pub fn render_with_fallback_style(
+    /// Paint the closed control row and, when open, the option list through a
+    /// scoped local-coordinate context whose origin is this control's
+    /// top-left corner.
+    pub fn paint(
         &self,
         area: Rect,
         state: &SelectDropdownState,
-        frame: &mut Frame<'_>,
         fallback: Style,
+        cx: &mut PaintCx<'_, '_>,
     ) {
-        let id = frame.next_interaction_id("select-dropdown");
-        self.render_with_id_and_fallback_style(id, area, state, frame, fallback);
-    }
-
-    /// Render with a stable interaction identifier and fallback style.
-    pub fn render_with_id_and_fallback_style(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &SelectDropdownState,
-        frame: &mut Frame<'_>,
-        fallback: Style,
-    ) {
-        let id = id.into();
+        if area.is_empty() {
+            return;
+        }
         let closed_area = Rect::new(area.x, area.y, area.width, 1);
-        frame.push_hit(
-            SceneRegion::new(id.clone(), closed_area)
-                .role(HitRole::ListItem)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
+        cx.write_line_with_fallback_style(
+            LocalRect::terminal(closed_area),
+            &self.closed_line(*state),
+            fallback,
         );
-        frame.write_line_with_fallback_style(closed_area, &self.closed_line(*state), fallback);
         if state.open {
-            let list_area = self.list_area(area);
-            frame.push_hit(
-                SceneRegion::new(format!("{}.options", id.as_str()), list_area)
-                    .role(HitRole::ListItem)
-                    .hoverable(self.policy.mouse.hover)
-                    .focusable(false)
-                    .enabled(!state.interaction.disabled),
-            );
             let items = self.list_items();
-            SelectableList::new(&items).render_with_fallback_style(
-                list_area,
+            SelectableList::new(&items).paint(
+                self.list_area(area).intersection(area),
                 &state.list,
-                frame,
                 fallback,
+                cx,
             );
         }
     }
@@ -573,6 +566,165 @@ impl<'a> SelectDropdown<'a> {
     }
 }
 
+/// Canonical component-lifecycle select/dropdown control.
+///
+/// The component measures one closed row plus the option list while open,
+/// paints through the scoped paint context, registers the closed row as the
+/// focusable composite region and each visible option as an item region, and
+/// routes events through the same resolved layout. Control state remains
+/// caller-owned through an interior-mutable `Cell`.
+pub struct SelectDropdownComponent<'a, 'state> {
+    id: LayoutId,
+    select: SelectDropdown<'a>,
+    state: &'state Cell<SelectDropdownState>,
+    fallback: Style,
+}
+
+impl<'a, 'state> SelectDropdownComponent<'a, 'state> {
+    /// Create a select/dropdown with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        options: &'a [SelectOption],
+        state: &'state Cell<SelectDropdownState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            select: SelectDropdown::new(options),
+            state,
+            fallback: Style::new(),
+        }
+    }
+
+    /// Set placeholder text used when no option is selected.
+    #[must_use]
+    pub const fn placeholder(mut self, placeholder: &'a str) -> Self {
+        self.select.placeholder = placeholder;
+        self
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: SelectDropdownPolicy) -> Self {
+        self.select.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: SelectDropdownStyles) -> Self {
+        self.select.styles = styles;
+        self
+    }
+
+    /// Set the row fill style applied beneath the control and option rows.
+    #[must_use]
+    pub const fn fallback_style(mut self, fallback: Style) -> Self {
+        self.fallback = fallback;
+        self
+    }
+}
+
+impl Component for SelectDropdownComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let state = self.state.get();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        self.select.placeholder.hash(&mut layout);
+        for option in self.select.options {
+            option.id.hash(&mut layout);
+            option.label.hash(&mut layout);
+        }
+        state.open.hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for option in self.select.options {
+            option.disabled.hash(&mut paint);
+        }
+        format!("{:?}", self.select.styles).hash(&mut paint);
+        format!("{:?}", self.fallback).hash(&mut paint);
+        format!("{state:?}").hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let (width, height) = self.select.size(self.state.get());
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, usize::from(height))),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("select"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        if area.is_empty() {
+            return;
+        }
+        let state = self.state.get();
+        let closed_area = Rect::new(0, 0, area.width, 1);
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), closed_area)
+                .role(HitRole::ListItem)
+                .hoverable(self.select.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        if state.open {
+            let list_area = self.select.list_area(area).intersection(area);
+            if !list_area.is_empty() {
+                cx.push_hit(
+                    SceneRegion::new(format!("{}.options", self.id.as_str()), list_area)
+                        .role(HitRole::ListItem)
+                        .hoverable(self.select.policy.mouse.hover)
+                        .focusable(false)
+                        .enabled(!state.interaction.disabled),
+                );
+                let items = self.select.list_items();
+                let list = SelectableList::new(&items);
+                for region in list.visible_semantic_regions(list_area, &state.list) {
+                    let option_id = format!("{}.{}", self.id.as_str(), region.key);
+                    let disabled = self
+                        .select
+                        .options
+                        .iter()
+                        .find(|option| option.id == region.key)
+                        .is_none_or(|option| option.disabled);
+                    cx.push_hit(
+                        SceneRegion::new(option_id.clone(), region.rect)
+                            .role(HitRole::ListItem)
+                            .hoverable(self.select.policy.mouse.hover)
+                            .enabled(!state.interaction.disabled && !disabled),
+                    );
+                    cx.push_semantic(SemanticRegion::new(option_id, region.rect, "option"));
+                }
+            }
+        }
+        self.select.paint(area, &state, self.fallback, cx);
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "select"));
+        cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.select.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            SelectDropdownOutcome::Ignored => EventOutcome::Ignored,
+            SelectDropdownOutcome::Redraw
+            | SelectDropdownOutcome::Opened
+            | SelectDropdownOutcome::Closed
+            | SelectDropdownOutcome::Focused(_)
+            | SelectDropdownOutcome::Selected(_) => EventOutcome::Redraw,
+        }
+    }
+}
+
 impl crate::theme::ComponentTheme {
     /// Convert this semantic component theme into [`SelectDropdownStyles`].
     #[must_use]
@@ -596,27 +748,45 @@ impl From<crate::theme::ComponentTheme> for SelectDropdownStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
     use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::{LocalRect, PaintCx};
 
-    use super::{SelectDropdown, SelectDropdownOutcome, SelectDropdownState, SelectOption};
+    use super::{
+        SelectDropdown, SelectDropdownComponent, SelectDropdownOutcome, SelectDropdownState,
+        SelectOption,
+    };
+
+    fn render_component(
+        component: &SelectDropdownComponent<'_, '_>,
+        area: Rect,
+        frame: &mut Frame<'_>,
+    ) {
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    }
 
     #[test]
     fn renders_closed_selected_option() {
         let options = options();
-        let select = SelectDropdown::new(&options);
+        let state = Cell::new(SelectDropdownState::new(Some(1)));
+        let component = SelectDropdownComponent::new("status", &options, &state);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        select.render(
-            Rect::new(0, 0, 14, 1),
-            &SelectDropdownState::new(Some(1)),
-            &mut frame,
-        );
+        render_component(&component, Rect::new(0, 0, 14, 1), &mut frame);
 
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
@@ -625,25 +795,45 @@ mod tests {
     }
 
     #[test]
+    fn component_measures_closed_and_open_heights() {
+        let options = options();
+        let state = Cell::new(SelectDropdownState::new(Some(0)));
+        let component = SelectDropdownComponent::new("status", &options, &state);
+        let mut cx = LayoutCx::new();
+
+        let closed = component.layout(Constraints::for_width(14), &mut cx);
+        assert_eq!(closed.size.height, 1);
+        assert_eq!(closed.size.width, 14);
+        let closed_revision = component.revision();
+
+        let mut opened = state.get();
+        opened.set_open(true);
+        state.set(opened);
+        let open = component.layout(Constraints::for_width(14), &mut cx);
+        assert_eq!(open.size.height, 3);
+        assert_eq!(cx.measured_nodes(), 2);
+        assert_ne!(
+            closed_revision.layout,
+            component.revision().layout,
+            "opening the list changes measured height and must relayout"
+        );
+    }
+
+    #[test]
     fn render_registers_closed_and_open_composite_geometry() {
         let options = options();
-        let select = SelectDropdown::new(&options);
-        let mut state = SelectDropdownState::new(Some(0));
-        state.interaction.focused = true;
-        state.set_open(true);
+        let mut initial = SelectDropdownState::new(Some(0));
+        initial.interaction.focused = true;
+        initial.set_open(true);
+        let state = Cell::new(initial);
+        let component = SelectDropdownComponent::new("status", &options, &state);
         let mut buffer = Buffer::empty(Rect::new(4, 3, 20, 6));
         let mut frame = Frame::new(&mut buffer);
 
-        select.render_with_id_and_fallback_style(
-            "status",
-            Rect::new(7, 4, 14, 3),
-            &state,
-            &mut frame,
-            bmux_tui::style::Style::new(),
-        );
+        render_component(&component, Rect::new(7, 4, 14, 3), &mut frame);
 
         let regions = frame.hits().regions();
-        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.len(), 4);
         assert_eq!(regions[0].id.as_str(), "status");
         assert_eq!(regions[0].area, Rect::new(7, 4, 14, 1));
         assert_eq!(regions[0].role, HitRole::ListItem);
@@ -651,23 +841,120 @@ mod tests {
         assert_eq!(regions[1].id.as_str(), "status.options");
         assert_eq!(regions[1].area, Rect::new(7, 5, 14, 2));
         assert!(!regions[1].focusable);
+        assert_eq!(regions[2].id.as_str(), "status.draft");
+        assert_eq!(regions[2].area, Rect::new(7, 5, 14, 1));
+        assert_eq!(regions[3].id.as_str(), "status.published");
+        assert_eq!(regions[3].area, Rect::new(7, 6, 14, 1));
         assert_eq!(frame.hits().focus_targets(None).len(), 1);
+        assert_eq!(
+            frame.buffer().row_symbols(5).as_deref(),
+            Some("   > Draft          ")
+        );
+        assert!(
+            frame
+                .semantics()
+                .regions()
+                .iter()
+                .any(|region| region.id == "status.published" && region.role == "option")
+        );
+    }
+
+    #[test]
+    fn open_list_is_clipped_to_the_assigned_area() {
+        let options = options();
+        let mut initial = SelectDropdownState::new(Some(0));
+        initial.set_open(true);
+        let state = Cell::new(initial);
+        let component = SelectDropdownComponent::new("status", &options, &state);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        render_component(&component, Rect::new(0, 0, 14, 2), &mut frame);
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions[1].area, Rect::new(0, 1, 14, 1));
+        assert!(
+            regions
+                .iter()
+                .all(|region| region.id.as_str() != "status.published")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("> Draft       ")
+        );
     }
 
     #[test]
     fn disabled_dropdown_is_excluded_from_traversal() {
         let options = options();
-        let select = SelectDropdown::new(&options);
-        let mut state = SelectDropdownState::new(Some(0));
-        state.set_disabled(true);
+        let mut initial = SelectDropdownState::new(Some(0));
+        initial.set_disabled(true);
+        let state = Cell::new(initial);
+        let component = SelectDropdownComponent::new("status", &options, &state);
         let mut buffer = Buffer::empty(Rect::new(2, 2, 16, 2));
         let mut frame = Frame::new(&mut buffer);
 
-        select.render_with_id("status", Rect::new(3, 2, 14, 1), &state, &mut frame);
+        render_component(&component, Rect::new(3, 2, 14, 1), &mut frame);
 
         assert_eq!(frame.hits().regions().len(), 1);
         assert!(!frame.hits().regions()[0].enabled);
         assert!(frame.hits().focus_targets(None).is_empty());
+    }
+
+    #[test]
+    fn component_routes_events_through_resolved_layout_and_updates_caller_state() {
+        let options = options();
+        let mut initial = SelectDropdownState::new(Some(0));
+        initial.interaction.focused = true;
+        let state = Cell::new(initial);
+        let component = SelectDropdownComponent::new("status", &options, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 14, 3).size()),
+            &mut LayoutCx::new(),
+        );
+
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert!(state.get().is_open());
+
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 14, 3).size()),
+            &mut LayoutCx::new(),
+        );
+        assert_eq!(
+            component.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(2, 2),
+                )),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(
+            component.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(2, 2),
+                )),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.get().selected(), Some(1));
+        assert!(!state.get().is_open());
+        assert_eq!(
+            component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
+            EventOutcome::Ignored
+        );
     }
 
     #[test]

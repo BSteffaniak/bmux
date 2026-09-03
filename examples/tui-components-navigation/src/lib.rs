@@ -16,13 +16,14 @@ use bmux_tui_components::breadcrumbs::{
 use bmux_tui_components::key_hint_bar::{
     KeyHint, KeyHintBarComponent, KeyHintBarPolicy, KeyHintBarStyles,
 };
-use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
+use bmux_tui_components::menu::{Menu, MenuComponent, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{
     Pane, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
 };
 use bmux_tui_components::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
+    SelectableList, SelectableListComponent, SelectableListItem, SelectableListOutcome,
+    SelectableListState,
 };
 use bmux_tui_components::status_bar::{
     MessageBarComponent, StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment,
@@ -31,12 +32,14 @@ use bmux_tui_components::status_bar::{
 use bmux_tui_components::tab_bar::{
     TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
 };
-use bmux_tui_components::table::{Table, TableColumn, TableOutcome, TableRow, TableState};
+use bmux_tui_components::table::{
+    Table, TableColumn, TableComponent, TableOutcome, TableRow, TableState,
+};
 use bmux_tui_components::text_view::{
     TextView, TextViewCursor, TextViewHighlight, TextViewSelection, TextViewState,
 };
 use bmux_tui_components::tree_view::{
-    TreeView, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
+    TreeView, TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
 };
 
 pub const WIDTH: u16 = 72;
@@ -305,25 +308,40 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     );
 
     let list_items = list_items();
-    SelectableList::new(&list_items).render(Rect::new(1, 1, 24, 4), &demo.list, frame);
+    let list_state = Cell::new(demo.list);
+    render_component(
+        &SelectableListComponent::new("navigation.list", &list_items, &list_state),
+        Rect::new(1, 1, 24, 4),
+        frame,
+    );
 
     let menu_items = menu_items();
-    Menu::new(&menu_items).render(Rect::new(30, 1, 18, 2), &demo.menu, frame);
+    let menu_state = Cell::new(demo.menu);
+    render_component(
+        &MenuComponent::new("navigation.menu", &menu_items, &menu_state),
+        Rect::new(30, 1, 18, 2),
+        frame,
+    );
 
     let tree_items = tree_items();
-    TreeView::new(&tree_items)
-        .styles(TreeViewStyles {
-            normal: Style::new().fg(Color::BrightWhite),
-            selected: Style::new()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            hovered: Style::new().fg(Color::White),
-            pressed: Style::new().fg(Color::Black).bg(Color::BrightGreen),
-            disabled: Style::new().fg(Color::BrightBlack),
-            marker: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        })
-        .render(Rect::new(48, 1, 22, 6), &demo.tree, frame);
+    let tree_state = RefCell::new(demo.tree.clone());
+    render_component(
+        &TreeViewComponent::new("navigation.tree", &tree_items, &tree_state).styles(
+            TreeViewStyles {
+                normal: Style::new().fg(Color::BrightWhite),
+                selected: Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                hovered: Style::new().fg(Color::White),
+                pressed: Style::new().fg(Color::Black).bg(Color::BrightGreen),
+                disabled: Style::new().fg(Color::BrightBlack),
+                marker: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            },
+        ),
+        Rect::new(48, 1, 22, 6),
+        frame,
+    );
 
     let lines = scroll_lines();
     let area = Rect::new(1, 6, 24, 2);
@@ -355,7 +373,17 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
 
     let table_columns = table_columns();
     let table_rows = table_rows();
-    Table::new(&table_columns, &table_rows).render(Rect::new(1, 9, 32, 4), &demo.table, frame);
+    let table_state = RefCell::new(demo.table.clone());
+    render_component(
+        &TableComponent::new(
+            "navigation.table",
+            &table_columns,
+            &table_rows,
+            &table_state,
+        ),
+        Rect::new(1, 9, 32, 4),
+        frame,
+    );
 
     let pane_area = scroll_delegate_pane_area();
     let pane_state = Cell::new(PaneState::new(pane_area));

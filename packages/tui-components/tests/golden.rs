@@ -13,14 +13,14 @@ use bmux_tui_components::chart::{
     Chart, ChartBounds, ChartDataset, ChartLegendPlacement, ChartPoint, ChartPolicy,
 };
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent};
-use bmux_tui_components::menu::{Menu, MenuItem, MenuPolicy};
+use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuPolicy};
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListItem, SelectableListPolicy, SelectableListState,
+    SelectableListComponent, SelectableListItem, SelectableListPolicy, SelectableListState,
 };
 use bmux_tui_components::status_bar::{StatusBarComponent, StatusSegment, StatusSeverity};
 use bmux_tui_components::tab_bar::{TabBarComponent, TabBarPolicy, TabBarState};
-use bmux_tui_components::table::{Table, TableColumn, TableRow, TableState};
+use bmux_tui_components::table::{TableColumn, TableComponent, TableRow, TableState};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState};
 
 fn buffer_rows(buffer: &Buffer) -> Vec<String> {
@@ -148,11 +148,15 @@ fn golden_table_rich_truncation_and_text_view_wrapping() {
     ])])];
     let mut table_buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
     let mut table_frame = Frame::new(&mut table_buffer);
-    Table::new(&columns, &rows).render(
-        Rect::new(0, 0, 5, 2),
-        &TableState::new(Some(0)),
-        &mut table_frame,
+    let table_state = std::cell::RefCell::new(TableState::new(Some(0)));
+    let table = TableComponent::new("golden.table", &columns, &rows, &table_state);
+    let table_layout = table.layout(
+        Constraints::tight(Rect::new(0, 0, 5, 2).size()),
+        &mut LayoutCx::new(),
     );
+    PaintCx::new(&mut table_frame).with_child(0, 0, LocalRect::new(0, 0, 5, 2), |cx| {
+        table.paint(&table_layout, cx);
+    });
     assert_eq!(buffer_rows(table_frame.buffer()), vec!["Name ", "abcd…"]);
 
     let text_lines = [Line::from_spans([
@@ -183,11 +187,18 @@ fn golden_recent_list_menu_and_chart_polish() {
     ];
     let mut list_state = SelectableListState::new(Some(0));
     list_state.set_vertical_scroll(1);
+    let list_state = std::cell::Cell::new(list_state);
     let mut list_buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
     let mut list_frame = Frame::new(&mut list_buffer);
-    SelectableList::new(&list_items)
-        .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter))
-        .render(Rect::new(0, 0, 6, 2), &list_state, &mut list_frame);
+    let list = SelectableListComponent::new("golden.list", &list_items, &list_state)
+        .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter));
+    let list_layout = list.layout(
+        Constraints::tight(Rect::new(0, 0, 6, 2).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut list_frame).with_child(0, 0, LocalRect::new(0, 0, 6, 2), |cx| {
+        list.paint(&list_layout, cx);
+    });
     assert_eq!(buffer_rows(list_frame.buffer()), vec!["  Two│", "  Thr█"]);
 
     let menu_items = [MenuItem::rich(
@@ -195,18 +206,20 @@ fn golden_recent_list_menu_and_chart_polish() {
         Line::from_spans([Span::styled("New", Style::new().fg(Color::Yellow))]),
     )
     .submenu(true)];
+    let menu_state = std::cell::Cell::new(bmux_tui_components::menu::MenuState::new(Some(0)));
     let mut menu_buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
     let mut menu_frame = Frame::new(&mut menu_buffer);
-    Menu::new(&menu_items)
-        .policy(MenuPolicy {
-            submenu_indicator: ">",
-            ..MenuPolicy::default()
-        })
-        .render(
-            Rect::new(0, 0, 10, 1),
-            &bmux_tui_components::menu::MenuState::new(Some(0)),
-            &mut menu_frame,
-        );
+    let menu = MenuComponent::new("golden.menu", &menu_items, &menu_state).policy(MenuPolicy {
+        submenu_indicator: ">",
+        ..MenuPolicy::default()
+    });
+    let menu_layout = menu.layout(
+        Constraints::tight(Rect::new(0, 0, 10, 1).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut menu_frame).with_child(0, 0, LocalRect::new(0, 0, 10, 1), |cx| {
+        menu.paint(&menu_layout, cx);
+    });
     assert_eq!(buffer_rows(menu_frame.buffer()), vec!["> New >   "]);
 
     let points_a = [ChartPoint::new(0.0, 0.0)];

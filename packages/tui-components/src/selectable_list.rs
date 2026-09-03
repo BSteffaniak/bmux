@@ -1,11 +1,19 @@
 //! Configurable selectable-list component.
 
+use std::cell::Cell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
 
@@ -400,65 +408,53 @@ impl<'a> SelectableList<'a> {
         state.vertical_scroll = state.vertical_scroll.min(self.max_vertical_scroll(area));
     }
 
-    /// Render the selectable list.
-    pub fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("selectable-list");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render and register this composite control as one roving-focus tab stop.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &SelectableListState,
-        frame: &mut Frame<'_>,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::ListItem)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
-        self.render_with_fallback_style(area, state, frame, self.styles.background);
-    }
-
-    /// Render the selectable list with a fallback style filling each item row.
-    pub fn render_with_fallback_style(
+    /// Paint visible item rows and the integrated scrollbar through a scoped
+    /// local-coordinate context whose origin is this list's top-left corner.
+    ///
+    /// Item rows fill their complete width with `fallback` patched by the
+    /// item style; content that lies outside the paint clip is dropped by the
+    /// context rather than by this primitive.
+    pub fn paint(
         &self,
         area: Rect,
         state: &SelectableListState,
-        frame: &mut Frame<'_>,
         fallback: Style,
+        cx: &mut PaintCx<'_, '_>,
     ) {
-        frame.fill(area, " ", fallback);
+        if area.is_empty() {
+            return;
+        }
+        cx.fill(LocalRect::terminal(area), " ", fallback);
         let content_area = self.content_area(area);
         let mut skipped_rows = state.vertical_scroll;
         let mut rendered_row = 0u16;
-        for (index, item) in self.items.iter().enumerate() {
+        'items: for (index, item) in self.items.iter().enumerate() {
             for line_index in 0..item.height() {
                 if skipped_rows > 0 {
                     skipped_rows = skipped_rows.saturating_sub(1);
                     continue;
                 }
                 if rendered_row >= content_area.height {
-                    self.render_scrollbar(area, state, frame);
-                    return;
+                    break 'items;
                 }
                 let row = content_area.y.saturating_add(rendered_row);
-                frame.write_line_with_fallback_style(
-                    Rect::new(content_area.x, row, content_area.width, 1),
+                cx.write_line_with_fallback_style(
+                    LocalRect::new(
+                        i32::from(content_area.x),
+                        i64::from(row),
+                        content_area.width,
+                        1,
+                    ),
                     &self.line(index, item, line_index, *state),
                     fallback,
                 );
                 rendered_row = rendered_row.saturating_add(1);
             }
         }
-        self.render_scrollbar(area, state, frame);
+        self.paint_scrollbar(area, state, cx);
     }
 
-    fn render_scrollbar(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
+    fn paint_scrollbar(&self, area: Rect, state: &SelectableListState, cx: &mut PaintCx<'_, '_>) {
         let Some(area) = self.scrollbar_area(area) else {
             return;
         };
@@ -467,7 +463,7 @@ impl<'a> SelectableList<'a> {
         Scrollbar::new()
             .policy(self.policy.scrollbar_policy)
             .styles(self.styles.scrollbar)
-            .render(area, &scrollbar_state, frame);
+            .paint(area, &scrollbar_state, cx);
     }
 
     /// Return visible hit regions keyed by stable item id for tests/semantics.
@@ -939,6 +935,152 @@ impl<'a> SelectableList<'a> {
     }
 }
 
+/// Canonical component-lifecycle selectable list.
+///
+/// The component measures the exact stacked item height at the constrained
+/// width, paints complete item rows and the integrated scrollbar through the
+/// scoped paint context, and registers one composite roving-focus region plus
+/// one visible item region per stable item id. Interaction state remains
+/// caller-owned through an interior-mutable `Cell`.
+pub struct SelectableListComponent<'a, 'state> {
+    id: LayoutId,
+    list: SelectableList<'a>,
+    state: &'state Cell<SelectableListState>,
+    fallback: Option<Style>,
+}
+
+impl<'a, 'state> SelectableListComponent<'a, 'state> {
+    /// Create a selectable list with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        items: &'a [SelectableListItem],
+        state: &'state Cell<SelectableListState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            list: SelectableList::new(items),
+            state,
+            fallback: None,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: SelectableListPolicy) -> Self {
+        self.list.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: SelectableListStyles) -> Self {
+        self.list.styles = styles;
+        self
+    }
+
+    /// Override the row fill style; defaults to the configured background style.
+    #[must_use]
+    pub const fn fallback_style(mut self, fallback: Style) -> Self {
+        self.fallback = Some(fallback);
+        self
+    }
+
+    /// Stable semantic identifier for one contained item.
+    fn item_id(&self, item: &SelectableListItem) -> String {
+        format!("{}.{}", self.id.as_str(), item.id)
+    }
+}
+
+impl Component for SelectableListComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for item in self.list.items {
+            item.id.hash(&mut layout);
+            item.lines.len().hash(&mut layout);
+            for line in &item.lines {
+                format!("{line:?}").hash(&mut layout);
+            }
+        }
+        self.list.policy.highlight.symbol.hash(&mut layout);
+        self.list.policy.highlight.repeat_spacing.hash(&mut layout);
+        format!("{:?}", self.list.policy.scrollbar).hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for item in self.list.items {
+            item.disabled.hash(&mut paint);
+        }
+        format!("{:?}", self.list.styles).hash(&mut paint);
+        format!("{:?}", self.fallback).hash(&mut paint);
+        format!("{:?}", self.state.get()).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let (width, _) = self.list.size();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, self.list.total_height())),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("list"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        if area.is_empty() {
+            return;
+        }
+        let state = self.state.get();
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), area)
+                .role(HitRole::ListItem)
+                .hoverable(self.list.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        let content_area = self.list.content_area(area);
+        for region in self.list.visible_hit_regions(content_area, &state) {
+            let Some(item) = self.list.items.get(region.key) else {
+                continue;
+            };
+            let item_id = self.item_id(item);
+            cx.push_hit(
+                SceneRegion::new(item_id.clone(), region.rect)
+                    .role(HitRole::ListItem)
+                    .hoverable(self.list.policy.mouse.hover)
+                    .enabled(!state.interaction.disabled && !item.disabled),
+            );
+            cx.push_semantic(SemanticRegion::new(item_id, region.rect, "list-item"));
+        }
+        self.list.paint(
+            area,
+            &state,
+            self.fallback.unwrap_or(self.list.styles.background),
+            cx,
+        );
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "list"));
+        cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.list.handle_event(area, &mut state, event);
+        self.state.set(state);
+        match outcome {
+            SelectableListOutcome::Ignored => EventOutcome::Ignored,
+            SelectableListOutcome::Redraw
+            | SelectableListOutcome::Focused(_)
+            | SelectableListOutcome::Selected(_) => EventOutcome::Redraw,
+        }
+    }
+}
+
 fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
@@ -975,19 +1117,183 @@ impl From<crate::theme::ComponentTheme> for SelectableListStyles {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::prelude::{Line, Span, Style};
 
     use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
     use super::{
-        SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListOutcome,
-        SelectableListPolicy, SelectableListState, SelectableListStyles,
+        SelectableList, SelectableListComponent, SelectableListHighlightPolicy, SelectableListItem,
+        SelectableListOutcome, SelectableListPolicy, SelectableListState, SelectableListStyles,
     };
+
+    trait SelectableListTestRender {
+        fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>);
+    }
+
+    impl SelectableListTestRender for SelectableList<'_> {
+        fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>) {
+            let state = Cell::new(*state);
+            let component = SelectableListComponent {
+                id: "test.list".into(),
+                list: *self,
+                state: &state,
+                fallback: None,
+            };
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            PaintCx::new(frame).with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
+        }
+    }
+
+    #[test]
+    fn component_measures_exact_stacked_height_and_registers_geometry() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::multiline("two", [Line::from("Two A"), Line::from("Two B")]),
+            SelectableListItem::new("three", "Three").disabled(true),
+        ];
+        let state = Cell::new(SelectableListState::new(Some(0)));
+        let component = SelectableListComponent::new("nav.list", &items, &state);
+
+        let mut cx = LayoutCx::new();
+        let layout = component.layout(Constraints::for_width(12), &mut cx);
+        assert_eq!(layout.size.width, 12);
+        assert_eq!(layout.size.height, 4);
+        assert_eq!(cx.measured_nodes(), 1);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 6));
+        let mut frame = Frame::new(&mut buffer);
+        let layout = component.layout(Constraints::tight(Rect::new(0, 0, 12, 3).size()), &mut cx);
+        PaintCx::new(&mut frame).with_child(3, 1, LocalRect::new(0, 0, 12, 3), |cx| {
+            component.paint(&layout, cx);
+        });
+
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("   > One            ")
+        );
+        let regions = frame.hits().regions();
+        assert_eq!(regions[0].id.as_str(), "nav.list");
+        assert_eq!(regions[0].area, Rect::new(3, 1, 12, 3));
+        assert_eq!(regions[0].role, HitRole::ListItem);
+        assert!(regions[0].focusable);
+        assert_eq!(regions[1].id.as_str(), "nav.list.one");
+        assert_eq!(regions[1].area, Rect::new(3, 1, 12, 1));
+        assert!(!regions[1].focusable);
+        assert_eq!(regions[2].id.as_str(), "nav.list.two");
+        assert_eq!(regions[2].area, Rect::new(3, 2, 12, 2));
+        assert_eq!(regions.len(), 3, "the clipped third item must not register");
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+        let semantics = frame.semantics().regions();
+        assert!(
+            semantics
+                .iter()
+                .any(|region| region.id == "nav.list.two" && region.role == "list-item")
+        );
+        assert!(
+            semantics
+                .iter()
+                .any(|region| region.id == "nav.list" && region.role == "list")
+        );
+    }
+
+    #[test]
+    fn component_routes_events_through_resolved_layout_and_updates_caller_state() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+        ];
+        let state = Cell::new(SelectableListState::new(Some(0)));
+        let component = SelectableListComponent::new("nav.list", &items, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 12, 2).size()),
+            &mut LayoutCx::new(),
+        );
+
+        let outcome = component.event(
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 1),
+            )),
+            &layout,
+            &mut EventCx::new(&layout),
+        );
+        assert_eq!(outcome, EventOutcome::Redraw);
+        let outcome = component.event(
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(MouseButton::Left),
+                Point::new(1, 1),
+            )),
+            &layout,
+            &mut EventCx::new(&layout),
+        );
+        assert_eq!(outcome, EventOutcome::Redraw);
+        assert_eq!(state.get().selected(), Some(1));
+
+        let ignored = component.event(&Event::Tick, &layout, &mut EventCx::new(&layout));
+        assert_eq!(ignored, EventOutcome::Ignored);
+    }
+
+    #[test]
+    fn component_revision_separates_layout_and_paint_changes() {
+        let items = [SelectableListItem::new("one", "One")];
+        let state = Cell::new(SelectableListState::new(None));
+        let component = SelectableListComponent::new("nav.list", &items, &state);
+        let before = component.revision();
+
+        state.set(SelectableListState::new(Some(0)));
+        let paint_only = component.revision();
+        assert_eq!(before.layout, paint_only.layout);
+        assert_ne!(before.paint, paint_only.paint);
+
+        let taller = [SelectableListItem::multiline(
+            "one",
+            [Line::from("One"), Line::from("More")],
+        )];
+        let relayout = SelectableListComponent::new("nav.list", &taller, &state).revision();
+        assert_ne!(before.layout, relayout.layout);
+    }
+
+    #[test]
+    fn component_paint_is_clipped_by_parent_scope() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+            SelectableListItem::new("three", "Three"),
+        ];
+        let state = Cell::new(SelectableListState::new(None));
+        let component = SelectableListComponent::new("nav.list", &items, &state);
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(0, -1, LocalRect::new(0, 1, 8, 2), |cx| {
+            component.paint(&layout, cx);
+        });
+
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  Two   "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  Three "));
+        let regions = frame.hits().regions();
+        assert!(regions.iter().all(|region| region.area.y < 2));
+        assert!(
+            regions
+                .iter()
+                .all(|region| region.id.as_str() != "nav.list.one")
+        );
+    }
 
     #[test]
     fn opaque_theme_fills_complete_list_surface_and_scrollbar_gutter() {

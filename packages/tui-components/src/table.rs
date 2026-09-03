@@ -1,11 +1,19 @@
 //! Generic table display and selectable table component.
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+
 use bmux_keyboard::KeyCode;
-use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
+};
+use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
+use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{line_viewport, truncate_line_to_display_width};
 use bmux_tui::text_width::display_width;
@@ -605,31 +613,40 @@ impl<'a> Table<'a> {
         }
     }
 
-    /// Render table.
-    pub fn render(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("table");
-        self.render_with_id(id, area, state, frame);
+    /// Natural content size: the preferred column width plus the header and
+    /// every row at their exact heights, before viewport constraints apply.
+    #[must_use]
+    pub fn size(&self) -> (u16, u16) {
+        let header_rows = usize::from(self.policy.header);
+        let separator_rows = usize::from(self.policy.header && self.policy.header_separator);
+        let body_rows = if self.rows.is_empty() {
+            1
+        } else {
+            self.rows.iter().map(TableRow::height).sum::<usize>()
+        };
+        let gutter = u16::from(matches!(
+            self.policy.vertical_scrollbar,
+            ScrollbarAxisLayoutMode::Gutter
+        ));
+        let horizontal_gutter = usize::from(matches!(
+            self.policy.horizontal_scrollbar,
+            ScrollbarAxisLayoutMode::Gutter
+        ));
+        (
+            u16_saturating(self.preferred_content_width()).saturating_add(gutter),
+            u16_saturating(
+                header_rows
+                    .saturating_add(separator_rows)
+                    .saturating_add(body_rows)
+                    .saturating_add(horizontal_gutter),
+            ),
+        )
     }
 
-    /// Render and register this table as one roving-focus tab stop.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &TableState,
-        frame: &mut Frame<'_>,
-    ) {
-        frame.push_hit(
-            SceneRegion::new(id, area)
-                .role(HitRole::ListItem)
-                .hoverable(self.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
-        );
-        self.render_body(area, state, frame);
-    }
-
-    fn render_body(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>) {
+    /// Paint the header, visible rows, integrated scrollbars, and corner
+    /// through a scoped local-coordinate context whose origin is this
+    /// table's top-left corner.
+    pub fn paint(&self, area: Rect, state: &TableState, cx: &mut PaintCx<'_, '_>) {
         if area.is_empty() {
             return;
         }
@@ -644,23 +661,23 @@ impl<'a> Table<'a> {
                 None,
                 state,
             );
-            frame.write_line_with_fallback_style(
-                header,
+            cx.write_line_with_fallback_style(
+                LocalRect::terminal(header),
                 &self.visible_line(&line, &layout.column_widths, state, header.width),
                 self.styles.header,
             );
         }
         if let Some(separator) = layout.header_separator {
             let line = self.separator_line(&layout.column_widths);
-            frame.write_line_with_fallback_style(
-                separator,
+            cx.write_line_with_fallback_style(
+                LocalRect::terminal(separator),
                 &self.visible_line(&line, &layout.column_widths, state, separator.width),
                 self.styles.separator,
             );
         }
         if self.rows.is_empty() {
-            frame.write_line_with_fallback_style(
-                layout.body,
+            cx.write_line_with_fallback_style(
+                LocalRect::terminal(layout.body),
                 &Line::from(self.empty),
                 self.styles.empty,
             );
@@ -687,26 +704,26 @@ impl<'a> Table<'a> {
                     Some(source),
                     state,
                 );
-                frame.write_line_with_fallback_style(
-                    rect,
+                cx.write_line_with_fallback_style(
+                    LocalRect::terminal(rect),
                     &self.visible_line(&line, &layout.column_widths, state, rect.width),
                     self.row_style(source, row, state),
                 );
                 rendered = rendered.saturating_add(1);
             }
         }
-        self.render_vertical_scrollbar(&layout, state, frame);
-        self.render_horizontal_scrollbar(&layout, state, frame);
+        self.paint_vertical_scrollbar(&layout, state, cx);
+        self.paint_horizontal_scrollbar(&layout, state, cx);
         if let Some(corner) = layout.scrollbar_corner {
-            frame.write_line(corner, &Line::from(" "));
+            cx.write_line(LocalRect::terminal(corner), &Line::from(" "));
         }
     }
 
-    fn render_vertical_scrollbar(
+    fn paint_vertical_scrollbar(
         &self,
         layout: &TableLayout,
         state: &TableState,
-        frame: &mut Frame<'_>,
+        cx: &mut PaintCx<'_, '_>,
     ) {
         let Some(area) = layout.vertical_scrollbar else {
             return;
@@ -715,14 +732,14 @@ impl<'a> Table<'a> {
             .offset(u16_saturating(state.scroll));
         Scrollbar::new()
             .policy(self.policy.vertical_scrollbar_policy)
-            .render(area, &scrollbar_state, frame);
+            .paint(area, &scrollbar_state, cx);
     }
 
-    fn render_horizontal_scrollbar(
+    fn paint_horizontal_scrollbar(
         &self,
         layout: &TableLayout,
         state: &TableState,
-        frame: &mut Frame<'_>,
+        cx: &mut PaintCx<'_, '_>,
     ) {
         let Some(area) = layout.horizontal_scrollbar else {
             return;
@@ -732,7 +749,7 @@ impl<'a> Table<'a> {
                 .offset(u16_saturating(state.horizontal_scroll));
         Scrollbar::new()
             .policy(self.policy.horizontal_scrollbar_policy)
-            .render(area, &scrollbar_state, frame);
+            .paint(area, &scrollbar_state, cx);
     }
 
     /// Hit-test a point against visible table regions.
@@ -1270,22 +1287,302 @@ fn u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+/// Canonical component-lifecycle table.
+///
+/// The component measures the table's natural content size, paints header,
+/// visible rows, and integrated scrollbars through the scoped paint context,
+/// registers one composite roving-focus region plus one visible region per
+/// row, and routes events through the same resolved layout. Table state
+/// remains caller-owned through an interior-mutable `RefCell`.
+pub struct TableComponent<'a, 'state> {
+    id: LayoutId,
+    table: Table<'a>,
+    state: &'state RefCell<TableState>,
+}
+
+impl<'a, 'state> TableComponent<'a, 'state> {
+    /// Create a table with stable identity and caller-owned state.
+    #[must_use]
+    pub fn new(
+        id: impl Into<LayoutId>,
+        columns: &'a [TableColumn<'a>],
+        rows: &'a [TableRow],
+        state: &'state RefCell<TableState>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            table: Table::new(columns, rows),
+            state,
+        }
+    }
+
+    /// Set behavior policy.
+    #[must_use]
+    pub const fn policy(mut self, policy: TablePolicy) -> Self {
+        self.table.policy = policy;
+        self
+    }
+
+    /// Set visual styles.
+    #[must_use]
+    pub const fn styles(mut self, styles: TableStyles) -> Self {
+        self.table.styles = styles;
+        self
+    }
+
+    /// Set the text shown when the table has no rows.
+    #[must_use]
+    pub const fn empty(mut self, empty: &'a str) -> Self {
+        self.table.empty = empty;
+        self
+    }
+}
+
+impl Component for TableComponent<'_, '_> {
+    fn revision(&self) -> ComponentRevision {
+        let state = self.state.borrow();
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        for column in self.table.columns {
+            column.title.hash(&mut layout);
+            format!("{:?}", column.width).hash(&mut layout);
+        }
+        for row in self.table.rows {
+            row.height().hash(&mut layout);
+            for cell in &row.cells {
+                for line in cell {
+                    format!("{line:?}").hash(&mut layout);
+                }
+            }
+        }
+        self.table.empty.hash(&mut layout);
+        self.table.policy.header.hash(&mut layout);
+        self.table.policy.header_separator.hash(&mut layout);
+        self.table.policy.cell_separator.hash(&mut layout);
+        format!("{:?}", self.table.policy.vertical_scrollbar).hash(&mut layout);
+        format!("{:?}", self.table.policy.horizontal_scrollbar).hash(&mut layout);
+
+        let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for row in self.table.rows {
+            row.disabled.hash(&mut paint);
+        }
+        for column in self.table.columns {
+            format!("{:?}", column.sort).hash(&mut paint);
+            format!("{:?}", column.align).hash(&mut paint);
+        }
+        format!("{:?}", self.table.styles).hash(&mut paint);
+        format!("{:?}", *state).hash(&mut paint);
+        ComponentRevision::new(layout.finish(), paint.finish())
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let (width, height) = self.table.size();
+        LayoutNode::leaf(
+            self.id.clone(),
+            constraints.constrain(LogicalSize::new(width, usize::from(height))),
+        )
+        .with_metadata(LayoutMetadata::new().semantic("table"))
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, layout.size.width, height);
+        if area.is_empty() {
+            return;
+        }
+        let state = self.state.borrow();
+        cx.push_hit(
+            SceneRegion::new(self.id.as_str(), area)
+                .role(HitRole::ListItem)
+                .hoverable(self.table.policy.mouse.hover)
+                .focusable(true)
+                .enabled(!state.interaction.disabled),
+        );
+        for region in self.table.row_hit_regions(area, &state) {
+            let disabled = self
+                .table
+                .rows
+                .get(region.key)
+                .is_none_or(|row| row.disabled);
+            let row_id = format!("{}.row.{}", self.id.as_str(), region.key);
+            cx.push_hit(
+                SceneRegion::new(row_id.clone(), region.rect)
+                    .role(HitRole::ListItem)
+                    .hoverable(self.table.policy.mouse.hover)
+                    .enabled(!state.interaction.disabled && !disabled),
+            );
+            cx.push_semantic(SemanticRegion::new(row_id, region.rect, "row"));
+        }
+        self.table.paint(area, &state, cx);
+        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "table"));
+        cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return EventOutcome::Ignored;
+        };
+        let outcome = self
+            .table
+            .handle_event(area, &mut self.state.borrow_mut(), event);
+        match outcome {
+            TableOutcome::Ignored => EventOutcome::Ignored,
+            TableOutcome::Redraw | TableOutcome::Focused(_) | TableOutcome::Selected(_) => {
+                EventOutcome::Redraw
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
+    use bmux_tui::hit::HitRole;
+    use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
     use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
     use super::{
-        Table, TableAlign, TableColumn, TableHit, TableOutcome, TablePolicy, TableRow,
-        TableSortDirection, TableState, TableStyles, format_cell,
+        Table, TableAlign, TableColumn, TableComponent, TableHit, TableOutcome, TablePolicy,
+        TableRow, TableSortDirection, TableState, TableStyles, format_cell,
     };
+
+    fn render_component(component: &TableComponent<'_, '_>, area: Rect, frame: &mut Frame<'_>) {
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    }
+
+    trait TableTestRender {
+        fn render(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>);
+    }
+
+    impl TableTestRender for Table<'_> {
+        fn render(&self, area: Rect, state: &TableState, frame: &mut Frame<'_>) {
+            let state = RefCell::new(state.clone());
+            let component = TableComponent {
+                id: "test.table".into(),
+                table: self.clone(),
+                state: &state,
+            };
+            render_component(&component, area, frame);
+        }
+    }
+
+    #[test]
+    fn component_measures_natural_size_and_registers_composite_and_row_geometry() {
+        let columns = [
+            TableColumn::new("Name").fixed(6),
+            TableColumn::new("Size").fixed(4),
+        ];
+        let rows = [
+            TableRow::new(vec!["one", "1"]),
+            TableRow::multiline(vec![
+                vec![Line::from("two"), Line::from("more")],
+                vec![Line::from("2")],
+            ]),
+            TableRow::new(vec!["three", "3"]).disabled(true),
+        ];
+        let state = RefCell::new(TableState::new(Some(0)));
+        let component = TableComponent::new("grid", &columns, &rows, &state);
+        let mut cx = LayoutCx::new();
+        let layout = component.layout(Constraints::for_width(11), &mut cx);
+        assert_eq!(layout.size.height, 5, "header plus exact row heights");
+        assert_eq!(cx.measured_nodes(), 1);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 8));
+        let mut frame = Frame::new(&mut buffer);
+        render_component(&component, Rect::new(2, 1, 11, 4), &mut frame);
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions[0].id.as_str(), "grid");
+        assert_eq!(regions[0].area, Rect::new(2, 1, 11, 4));
+        assert_eq!(regions[0].role, HitRole::ListItem);
+        assert!(regions[0].focusable);
+        assert_eq!(regions[1].id.as_str(), "grid.row.0");
+        assert_eq!(regions[1].area, Rect::new(2, 2, 11, 1));
+        assert!(regions[1].enabled);
+        assert!(!regions[1].focusable);
+        assert_eq!(regions[2].id.as_str(), "grid.row.1");
+        assert_eq!(regions[2].area, Rect::new(2, 3, 11, 2));
+        assert_eq!(
+            regions.len(),
+            3,
+            "the clipped disabled row does not register"
+        );
+        assert_eq!(frame.hits().focus_targets(None).len(), 1);
+        assert!(
+            frame
+                .semantics()
+                .regions()
+                .iter()
+                .any(|region| region.id == "grid.row.1" && region.role == "row")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("  Name   Size ")
+        );
+    }
+
+    #[test]
+    fn component_routes_events_through_resolved_layout_and_updates_caller_state() {
+        let columns = [TableColumn::new("Name").fixed(6)];
+        let rows = [TableRow::new(vec!["one"]), TableRow::new(vec!["two"])];
+        let mut initial = TableState::new(Some(0));
+        initial.set_focused(true);
+        let state = RefCell::new(initial);
+        let component = TableComponent::new("grid", &columns, &rows, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 6, 3).size()),
+            &mut LayoutCx::new(),
+        );
+
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Down)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().selected(), Some(1));
+        assert_eq!(
+            component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
+            EventOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn component_revision_separates_layout_and_paint_changes() {
+        let columns = [TableColumn::new("Name").fixed(6)];
+        let rows = [TableRow::new(vec!["one"])];
+        let state = RefCell::new(TableState::new(None));
+        let component = TableComponent::new("grid", &columns, &rows, &state);
+        let before = component.revision();
+
+        state.borrow_mut().set_selected(Some(0));
+        let paint_only = component.revision();
+        assert_eq!(before.layout, paint_only.layout);
+        assert_ne!(before.paint, paint_only.paint);
+
+        let more = [TableRow::new(vec!["one"]), TableRow::new(vec!["two"])];
+        let relayout = TableComponent::new("grid", &columns, &more, &state).revision();
+        assert_ne!(before.layout, relayout.layout);
+    }
 
     #[test]
     fn resolves_fixed_and_flex_columns() {
