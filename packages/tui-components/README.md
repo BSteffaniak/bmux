@@ -66,7 +66,9 @@ bottom anchors survive insertion, removal, reorder, append, and reflow.
 and bounded autoscroll cadence. Components register caller-owned logical identities and source
 boundaries; they never derive copied text from terminal cells. Pane content captures locally while
 chrome delegates by default, PanelGroup supplies deterministic sibling ordering without consuming
-divider handles, and TextView maps wrapped/scrolled visible graphemes to original UTF-8 offsets.
+divider handles, and TextViewComponent maps wrapped/scrolled visible graphemes to original UTF-8 offsets
+through the scoped paint context. SourceViewer, DiffViewer, and TerminalViewer selection registrars
+accept the same `PaintCx` so their fragments translate and clip with the surrounding component tree.
 SourceViewer and unified DiffViewer map visible rows to canonical source bytes; DiffViewer declines
 ambiguous side-by-side projections. TerminalViewer deliberately selects its decoded terminal-grid
 text document rather than claiming ANSI/control bytes as source provenance. Editable TextInput

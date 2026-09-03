@@ -67,7 +67,7 @@ text-input = [
     "dep:unicode-segmentation",
 ]
 text-input-box = ["text-input", "form-field"]
-text-view = ["keyboard-input", "scrollbar"]
+text-view = ["scroll-view"]
 toast-stack = ["keyboard-input"]
 tree-view = ["keyboard-input"]
 virtual-list = ["scroll-view"]

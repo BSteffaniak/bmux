@@ -4,7 +4,7 @@ use bmux_tui::geometry::Point;
 use bmux_tui::style::Style;
 
 /// Runtime interaction flags common to interactive controls.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct InteractionState {
     /// Control currently has keyboard focus.

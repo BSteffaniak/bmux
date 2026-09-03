@@ -3,7 +3,7 @@
 use bmux_tui::geometry::Rect;
 
 /// Axis scrollbar layout mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScrollbarAxisLayoutMode {
     /// Axis scrollbar is hidden.
     Hidden,

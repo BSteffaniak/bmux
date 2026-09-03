@@ -147,13 +147,17 @@ The shared scroll path owns:
 - keyboard, page, home/end, and wheel navigation;
 - viewport-routed nested scrolling and edge propagation;
 - horizontal and vertical logical offsets;
-- scrollbar painting, hit regions, and drag mapping;
+- integrated vertical and horizontal gutter scrollbars, their hit regions, and
+  drag mapping through `ScrollbarAxisLayoutMode`;
 - ensure-visible and focus visibility;
 - selection edge autoscroll;
 - bottom-follow restoration.
 
 Controls must not add independent line-oriented scroll engines when their
-content can use this model.
+content can use this model. `TextViewComponent` is the reference consumer: it
+composes a measured `TextBlock` inside the shared viewport, so wrapping, exact
+height, clipping, scrollbars, selection geometry, and events all derive from one
+layout and one caller-owned `ScrollViewState`.
 
 ## Variable-height virtualization
 

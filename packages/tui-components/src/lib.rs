@@ -65,7 +65,7 @@ pub mod radio_group;
 pub mod scroll_view;
 #[cfg(feature = "scrollbar")]
 pub mod scrollbar;
-#[cfg(any(feature = "selectable-list", feature = "table", feature = "text-view"))]
+#[cfg(feature = "scrollbar")]
 pub mod scrollbar_layout;
 #[cfg(feature = "select-dropdown")]
 pub mod select_dropdown;

@@ -2,11 +2,11 @@
 
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
-    register_component_scope,
+    paint_component_scope,
 };
 use crate::source_viewer::pad_card_spans;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -97,9 +97,9 @@ pub fn register_diff_viewer_selection(
     area: Rect,
     selection: &ComponentSelectionState,
     policy: &ComponentSelectionPolicy,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
 ) -> ComponentSelectionOutcome {
-    let scope_outcome = register_component_scope(frame, selection, policy, area, area);
+    let scope_outcome = paint_component_scope(cx, selection, policy, area, area);
     if !policy.enabled || area.is_empty() {
         return scope_outcome;
     }
@@ -176,7 +176,7 @@ pub fn register_diff_viewer_selection(
                 source_base.saturating_add(offset),
                 selection.revision,
             ) {
-                frame.push_selection_fragment(fragment);
+                cx.push_selection_fragment(fragment);
                 fragments = fragments.saturating_add(1);
             }
             screen_y = screen_y.saturating_add(1);
@@ -1733,6 +1733,7 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 mod tests {
     use super::*;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
 
     fn test_diff_viewer_rows_with_layout(
         label: &str,
@@ -2214,7 +2215,7 @@ mod tests {
             Rect::new(0, 0, 24, 14),
             &state,
             &ComponentSelectionPolicy::content(),
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
         );
 
         assert!(matches!(
@@ -2263,7 +2264,7 @@ mod tests {
             Rect::new(0, 0, 120, 12),
             &ComponentSelectionState::new("diff"),
             &ComponentSelectionPolicy::content(),
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
         );
 
         assert_eq!(outcome, ComponentSelectionOutcome::ScopeRegistered);

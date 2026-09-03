@@ -19,8 +19,10 @@ use bmux_tui::style::{Color, Style};
 
 use crate::common::InteractionState;
 use crate::scrollbar::{
-    Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
+    Scrollbar, ScrollbarOrientation, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState,
+    ScrollbarStyles,
 };
+use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
 /// Stable layout identity and viewport-relative row used across relayout.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,13 +46,14 @@ impl ScrollAnchor {
 }
 
 /// Caller-owned logical scroll state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScrollViewState {
     /// Common enabled and focus state.
     pub interaction: InteractionState,
     vertical_offset: usize,
     horizontal_offset: usize,
     follow_bottom: bool,
+    dragging: Option<ScrollbarOrientation>,
 }
 
 impl ScrollViewState {
@@ -62,6 +65,7 @@ impl ScrollViewState {
             vertical_offset: 0,
             horizontal_offset: 0,
             follow_bottom: false,
+            dragging: None,
         }
     }
 
@@ -98,6 +102,12 @@ impl ScrollViewState {
     pub const fn follows_bottom(self) -> bool {
         self.follow_bottom
     }
+
+    /// Whether an integrated scrollbar thumb is currently being dragged.
+    #[must_use]
+    pub const fn dragging_scrollbar(self) -> bool {
+        self.dragging.is_some()
+    }
 }
 
 impl Default for ScrollViewState {
@@ -106,29 +116,62 @@ impl Default for ScrollViewState {
     }
 }
 
-/// Generic vertical scroll behavior.
+/// Generic scroll behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollViewPolicy {
     /// Keyboard navigation enabled.
     pub keyboard: bool,
     /// Mouse-wheel navigation enabled.
     pub mouse_wheel: bool,
-    /// Render and route an integrated vertical scrollbar gutter.
-    pub scrollbar: bool,
+    /// Integrated vertical scrollbar layout mode.
+    pub vertical_scrollbar: ScrollbarAxisLayoutMode,
+    /// Integrated horizontal scrollbar layout mode.
+    pub horizontal_scrollbar: ScrollbarAxisLayoutMode,
     /// Logical rows per wheel event.
     pub wheel_rows: usize,
 }
 
 impl ScrollViewPolicy {
-    /// Common keyboard and mouse behavior.
+    /// Common keyboard and mouse behavior with a vertical gutter scrollbar.
     #[must_use]
     pub const fn interactive() -> Self {
         Self {
             keyboard: true,
             mouse_wheel: true,
-            scrollbar: true,
+            vertical_scrollbar: ScrollbarAxisLayoutMode::Gutter,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
             wheel_rows: 3,
         }
+    }
+
+    /// Non-interactive viewport with no integrated scrollbars.
+    #[must_use]
+    pub const fn bare() -> Self {
+        Self {
+            keyboard: false,
+            mouse_wheel: false,
+            vertical_scrollbar: ScrollbarAxisLayoutMode::Hidden,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
+            wheel_rows: 3,
+        }
+    }
+
+    /// Return this policy with the integrated vertical scrollbar mode changed.
+    #[must_use]
+    pub const fn vertical_scrollbar(mut self, mode: ScrollbarAxisLayoutMode) -> Self {
+        self.vertical_scrollbar = mode;
+        self
+    }
+
+    /// Return this policy with the integrated horizontal scrollbar mode changed.
+    #[must_use]
+    pub const fn horizontal_scrollbar(mut self, mode: ScrollbarAxisLayoutMode) -> Self {
+        self.horizontal_scrollbar = mode;
+        self
+    }
+
+    const fn scrollbar_layout(self) -> ScrollbarLayoutPolicy {
+        ScrollbarLayoutPolicy::new(self.vertical_scrollbar, self.horizontal_scrollbar)
     }
 }
 
@@ -194,6 +237,16 @@ impl<'a> ScrollViewComponent<'a> {
         self.content_width = width;
         self
     }
+
+    /// Build the authoritative viewport node over an already measured child.
+    ///
+    /// This is the single owner of the viewport layout shape consumed by
+    /// [`ScrollView`] and by composite components that must measure their
+    /// content once before deciding the viewport size.
+    #[must_use]
+    pub fn viewport_layout(id: LayoutId, viewport: LogicalSize, child: LayoutNode) -> LayoutNode {
+        LayoutNode::with_children(id, viewport, vec![ChildLayout::new(0, 0, child)])
+    }
 }
 
 impl Component for ScrollViewComponent<'_> {
@@ -220,8 +273,7 @@ impl Component for ScrollViewComponent<'_> {
         let child = self
             .child
             .layout(Constraints::for_width(self.content_width), cx);
-        let size = constraints.constrain(self.viewport);
-        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(0, 0, child)])
+        Self::viewport_layout(self.id.clone(), constraints.constrain(self.viewport), child)
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -302,32 +354,29 @@ impl ScrollView {
         self
     }
 
-    /// Content viewport after reserving an integrated scrollbar gutter.
+    /// Content viewport after reserving integrated scrollbar gutters.
     #[must_use]
     pub const fn content_area(&self, area: Rect) -> Rect {
-        if self.policy.scrollbar && area.width > 0 {
-            Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
-        } else {
-            area
-        }
+        scrollbar_layout(area, self.policy.scrollbar_layout()).content
     }
 
-    /// Integrated vertical scrollbar area.
+    /// Integrated vertical scrollbar area when enabled.
     #[must_use]
     pub const fn scrollbar_area(&self, area: Rect) -> Option<Rect> {
-        if self.policy.scrollbar && area.width > 0 {
-            Some(Rect::new(
-                area.right().saturating_sub(1),
-                area.y,
-                1,
-                area.height,
-            ))
-        } else {
-            None
-        }
+        scrollbar_layout(area, self.policy.scrollbar_layout()).vertical_scrollbar
     }
 
-    /// Register the scroll viewport and paint an integrated scrollbar.
+    /// Integrated horizontal scrollbar area when enabled.
+    #[must_use]
+    pub const fn horizontal_scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        scrollbar_layout(area, self.policy.scrollbar_layout()).horizontal_scrollbar
+    }
+
+    /// Register the scroll viewport and paint integrated scrollbars.
+    ///
+    /// `area` is the complete local viewport rectangle (content plus gutters)
+    /// and `layout` is the authoritative [`ScrollViewComponent`] layout for its
+    /// content area.
     pub fn paint_chrome(
         &self,
         id: impl Into<String>,
@@ -338,37 +387,62 @@ impl ScrollView {
     ) {
         let content = self.content_area(area);
         let id = id.into();
+        let content_local = Rect::new(
+            content.x.saturating_sub(area.x),
+            content.y.saturating_sub(area.y),
+            content.width,
+            content.height,
+        );
         cx.push_hit(
-            HitRegion::new(id.clone(), Rect::new(0, 0, content.width, content.height))
+            HitRegion::new(id.clone(), content_local)
                 .role(HitRole::Scroll)
                 .pointer_events(self.policy.mouse_wheel)
                 .focusable(self.policy.keyboard)
                 .enabled(!state.interaction.disabled),
         );
-        cx.push_semantic(SemanticRegion::new(
-            id,
-            Rect::new(0, 0, content.width, content.height),
-            "scroll",
-        ));
-        let Some(scrollbar_area) = self.scrollbar_area(area) else {
-            return;
-        };
-        let total = layout
-            .children
-            .first()
-            .map_or(0, |child| child.node.size.height);
-        let scrollbar = scrollbar_state(total, layout.size.height, state.vertical_offset);
-        Scrollbar::new()
-            .policy(ScrollbarPolicy::vertical())
-            .styles(self.scrollbar_styles)
-            .paint(
-                Rect::new(scrollbar_area.x.saturating_sub(area.x), 0, 1, area.height),
-                &scrollbar,
-                cx,
+        cx.push_semantic(SemanticRegion::new(id, content_local, "scroll"));
+        let resolved = scrollbar_layout(area, self.policy.scrollbar_layout());
+        if let Some(scrollbar_area) = resolved.vertical_scrollbar {
+            let scrollbar = scrollbar_state(
+                content_height(layout),
+                layout.size.height,
+                state.vertical_offset,
             );
+            Scrollbar::new()
+                .policy(ScrollbarPolicy::vertical())
+                .styles(self.scrollbar_styles)
+                .paint(local_rect(area, scrollbar_area), &scrollbar, cx);
+        }
+        if let Some(scrollbar_area) = resolved.horizontal_scrollbar {
+            let scrollbar = scrollbar_state(
+                usize::from(content_width(layout)),
+                usize::from(layout.size.width),
+                state.horizontal_offset,
+            );
+            Scrollbar::new()
+                .policy(ScrollbarPolicy::horizontal())
+                .styles(self.scrollbar_styles)
+                .paint(local_rect(area, scrollbar_area), &scrollbar, cx);
+        }
+        if let Some(corner) = resolved.corner {
+            let corner = local_rect(area, corner);
+            cx.fill(
+                LocalRect::new(
+                    i32::from(corner.x),
+                    i64::from(corner.y),
+                    corner.width,
+                    corner.height,
+                ),
+                " ",
+                Style::new(),
+            );
+        }
     }
 
     /// Route integrated scrollbar dragging into logical scroll state.
+    ///
+    /// `area` is the complete terminal-space viewport rectangle the chrome was
+    /// painted into.
     pub fn handle_scrollbar_event(
         &self,
         area: Rect,
@@ -376,30 +450,61 @@ impl ScrollView {
         state: &mut ScrollViewState,
         event: &Event,
     ) -> ScrollViewOutcome {
-        let Some(area) = self.scrollbar_area(area) else {
-            return ScrollViewOutcome::Ignored;
-        };
-        let total = layout
-            .children
-            .first()
-            .map_or(0, |child| child.node.size.height);
-        let mut scrollbar = scrollbar_state(total, layout.size.height, state.vertical_offset);
-        let result = Scrollbar::new()
-            .policy(ScrollbarPolicy::vertical())
-            .handle_event(area, &mut scrollbar, event);
-        match result {
-            ScrollbarOutcome::Changed { offset } => {
-                let old = state.vertical_offset;
-                state.vertical_offset = logical_offset_from_scrollbar(
-                    usize::from(offset),
-                    usize::from(scrollbar.max_offset()),
-                    Self::max_vertical_offset(layout),
-                );
-                state.follow_bottom = state.vertical_offset == Self::max_vertical_offset(layout);
-                outcome(old, state.vertical_offset)
+        let resolved = scrollbar_layout(area, self.policy.scrollbar_layout());
+        if let Some(scrollbar_area) = resolved.vertical_scrollbar {
+            let mut scrollbar = scrollbar_state(
+                content_height(layout),
+                layout.size.height,
+                state.vertical_offset,
+            );
+            scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Vertical);
+            let result = Scrollbar::new()
+                .policy(ScrollbarPolicy::vertical())
+                .handle_event(scrollbar_area, &mut scrollbar, event);
+            state.dragging = scrollbar.dragging.then_some(ScrollbarOrientation::Vertical);
+            match result {
+                ScrollbarOutcome::Changed { offset } => {
+                    let old = state.vertical_offset;
+                    let maximum = Self::max_vertical_offset(layout);
+                    state.vertical_offset = logical_offset_from_scrollbar(
+                        usize::from(offset),
+                        usize::from(scrollbar.max_offset()),
+                        maximum,
+                    );
+                    state.follow_bottom = state.vertical_offset == maximum;
+                    return outcome(old, state.vertical_offset);
+                }
+                ScrollbarOutcome::Redraw => return ScrollViewOutcome::Ignored,
+                ScrollbarOutcome::Ignored => {}
             }
-            ScrollbarOutcome::Ignored | ScrollbarOutcome::Redraw => ScrollViewOutcome::Ignored,
         }
+        if let Some(scrollbar_area) = resolved.horizontal_scrollbar {
+            let mut scrollbar = scrollbar_state(
+                usize::from(content_width(layout)),
+                usize::from(layout.size.width),
+                state.horizontal_offset,
+            );
+            scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Horizontal);
+            let result = Scrollbar::new()
+                .policy(ScrollbarPolicy::horizontal())
+                .handle_event(scrollbar_area, &mut scrollbar, event);
+            state.dragging = scrollbar
+                .dragging
+                .then_some(ScrollbarOrientation::Horizontal);
+            match result {
+                ScrollbarOutcome::Changed { offset } => {
+                    let old = state.horizontal_offset;
+                    state.horizontal_offset = logical_offset_from_scrollbar(
+                        usize::from(offset),
+                        usize::from(scrollbar.max_offset()),
+                        Self::max_horizontal_offset(layout),
+                    );
+                    return horizontal_outcome(old, state.horizontal_offset);
+                }
+                ScrollbarOutcome::Redraw | ScrollbarOutcome::Ignored => {}
+            }
+        }
+        ScrollViewOutcome::Ignored
     }
 
     /// Return the maximum logical offset from an authoritative viewport layout.
@@ -672,6 +777,15 @@ impl ScrollView {
                             .min(maximum);
                         state.follow_bottom = state.vertical_offset == maximum;
                     }
+                    MouseEventKind::ScrollLeft => {
+                        state.horizontal_offset = state.horizontal_offset.saturating_sub(1);
+                    }
+                    MouseEventKind::ScrollRight => {
+                        state.horizontal_offset = state
+                            .horizontal_offset
+                            .saturating_add(1)
+                            .min(Self::max_horizontal_offset(layout));
+                    }
                     _ => return ScrollViewOutcome::Ignored,
                 }
             }
@@ -762,6 +876,31 @@ pub(crate) fn scrollbar_state(total: usize, viewport: usize, offset: usize) -> S
     ScrollbarState::new(scaled_total, scaled_viewport).offset(scaled_offset)
 }
 
+fn content_height(layout: &LayoutNode) -> usize {
+    layout
+        .children
+        .first()
+        .map_or(0, |child| child.node.size.height)
+}
+
+fn content_width(layout: &LayoutNode) -> u16 {
+    layout
+        .children
+        .first()
+        .map_or(0, |child| child.node.size.width)
+}
+
+/// Translate a terminal-space rectangle nested inside `area` into
+/// `area`-relative local coordinates.
+const fn local_rect(area: Rect, inner: Rect) -> Rect {
+    Rect::new(
+        inner.x.saturating_sub(area.x),
+        inner.y.saturating_sub(area.y),
+        inner.width,
+        inner.height,
+    )
+}
+
 fn logical_offset_from_scrollbar(
     offset: usize,
     scrollbar_maximum: usize,
@@ -818,9 +957,10 @@ const fn horizontal_outcome(old: usize, current: usize) -> ScrollViewOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        NestedScrollOutcome, ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewState,
-        logical_offset_from_scrollbar, scrollbar_state,
+        NestedScrollOutcome, ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewPolicy,
+        ScrollViewState, logical_offset_from_scrollbar, scrollbar_state,
     };
+    use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{
@@ -1491,6 +1631,97 @@ mod tests {
                 .get(Point::new(9, 0))
                 .map(|cell| cell.symbol.as_str()),
             Some(" ")
+        );
+    }
+
+    #[test]
+    fn horizontal_gutter_reserves_row_paints_scrollbar_and_routes_drag() {
+        let view = ScrollView::new().policy(
+            ScrollViewPolicy::interactive()
+                .vertical_scrollbar(ScrollbarAxisLayoutMode::Hidden)
+                .horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+        );
+        let area = Rect::new(0, 0, 10, 5);
+        assert_eq!(view.content_area(area), Rect::new(0, 0, 10, 4));
+        assert_eq!(view.scrollbar_area(area), None);
+        assert_eq!(
+            view.horizontal_scrollbar_area(area),
+            Some(Rect::new(0, 4, 10, 1))
+        );
+
+        let child = LayoutNode::leaf("content".into(), LogicalSize::new(40, 4));
+        let layout = LayoutNode::with_children(
+            "viewport".into(),
+            LogicalSize::new(10, 4),
+            vec![ChildLayout::new(0, 0, child)],
+        );
+        let mut state = ScrollViewState::new();
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        view.paint_chrome("view", area, &layout, &state, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, 10, 4));
+        assert_eq!(frame.buffer().row_symbols(4).as_deref(), Some("██────────"));
+
+        let press = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            Point::new(9, 4),
+        ));
+        assert!(matches!(
+            view.handle_scrollbar_event(area, &layout, &mut state, &press),
+            ScrollViewOutcome::HorizontalScrolled { .. }
+        ));
+        assert_eq!(state.horizontal_offset(), 30);
+        assert!(state.dragging_scrollbar());
+        let release = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+            Point::new(9, 4),
+        ));
+        assert_eq!(
+            view.handle_scrollbar_event(area, &layout, &mut state, &release),
+            ScrollViewOutcome::Ignored
+        );
+        assert!(!state.dragging_scrollbar());
+    }
+
+    #[test]
+    fn both_gutters_reserve_corner_and_wheel_scrolls_horizontally() {
+        let view = ScrollView::new().policy(
+            ScrollViewPolicy::interactive().horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+        );
+        let area = Rect::new(0, 0, 10, 5);
+        assert_eq!(view.content_area(area), Rect::new(0, 0, 9, 4));
+        assert_eq!(view.scrollbar_area(area), Some(Rect::new(9, 0, 1, 4)));
+        assert_eq!(
+            view.horizontal_scrollbar_area(area),
+            Some(Rect::new(0, 4, 9, 1))
+        );
+
+        let child = LayoutNode::leaf("content".into(), LogicalSize::new(20, 4));
+        let layout = LayoutNode::with_children(
+            "viewport".into(),
+            LogicalSize::new(9, 4),
+            vec![ChildLayout::new(0, 0, child)],
+        );
+        let mut state = ScrollViewState::new();
+        let right = Event::Mouse(MouseEvent::new(
+            MouseEventKind::ScrollRight,
+            Point::new(1, 1),
+        ));
+        assert_eq!(
+            view.handle_event(view.content_area(area), &layout, &mut state, &right),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 1
+            }
+        );
+        let left = Event::Mouse(MouseEvent::new(
+            MouseEventKind::ScrollLeft,
+            Point::new(1, 1),
+        ));
+        assert_eq!(
+            view.handle_event(view.content_area(area), &layout, &mut state, &left),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 0
+            }
         );
     }
 

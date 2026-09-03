@@ -14,6 +14,7 @@ use bmux_tui_components::chart::{
 };
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent};
 use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuPolicy};
+use bmux_tui_components::scroll_view::ScrollViewState;
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
     SelectableListComponent, SelectableListItem, SelectableListPolicy, SelectableListState,
@@ -21,7 +22,7 @@ use bmux_tui_components::selectable_list::{
 use bmux_tui_components::status_bar::{StatusBarComponent, StatusSegment, StatusSeverity};
 use bmux_tui_components::tab_bar::{TabBarComponent, TabBarPolicy, TabBarState};
 use bmux_tui_components::table::{TableColumn, TableComponent, TableRow, TableState};
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState};
+use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
 
 fn buffer_rows(buffer: &Buffer) -> Vec<String> {
     (buffer.area().y..buffer.area().bottom())
@@ -122,16 +123,22 @@ fn golden_text_view_both_axis_scrollbars() {
 
     let mut text_buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
     let mut text_frame = Frame::new(&mut text_buffer);
-    let mut text_state = TextViewState::new();
-    text_state.set_vertical_scroll(1);
-    text_state.set_horizontal_scroll(1);
-    TextView::new(&lines)
-        .policy(
-            TextViewPolicy::bare()
-                .vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter)
-                .horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
-        )
-        .render(Rect::new(0, 0, 4, 3), &text_state, &mut text_frame);
+    let mut text_state = ScrollViewState::new();
+    text_state.set_vertical_offset(1);
+    text_state.set_horizontal_offset(1);
+    let text_state = std::cell::Cell::new(text_state);
+    let view = TextViewComponent::new("golden.text-view", &lines, &text_state).policy(
+        TextViewPolicy::bare()
+            .vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter)
+            .horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+    );
+    let layout = view.layout(
+        Constraints::tight(Rect::new(0, 0, 4, 3).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut text_frame).with_child(0, 0, LocalRect::new(0, 0, 4, 3), |cx| {
+        view.paint(&layout, cx);
+    });
 
     assert_eq!(
         buffer_rows(text_frame.buffer()),
@@ -165,16 +172,19 @@ fn golden_table_rich_truncation_and_text_view_wrapping() {
     ])];
     let mut text_buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
     let mut text_frame = Frame::new(&mut text_buffer);
-    TextView::new(&text_lines)
-        .policy(TextViewPolicy {
+    let text_state = std::cell::Cell::new(ScrollViewState::new());
+    let view =
+        TextViewComponent::new("golden.wrapped", &text_lines, &text_state).policy(TextViewPolicy {
             wrap: TextWrap::Word,
             ..TextViewPolicy::bare()
-        })
-        .render(
-            Rect::new(0, 0, 4, 2),
-            &TextViewState::new(),
-            &mut text_frame,
-        );
+        });
+    let layout = view.layout(
+        Constraints::tight(Rect::new(0, 0, 4, 2).size()),
+        &mut LayoutCx::new(),
+    );
+    PaintCx::new(&mut text_frame).with_child(0, 0, LocalRect::new(0, 0, 4, 2), |cx| {
+        view.paint(&layout, cx);
+    });
     assert_eq!(buffer_rows(text_frame.buffer()), vec!["one ", "two "]);
 }
 

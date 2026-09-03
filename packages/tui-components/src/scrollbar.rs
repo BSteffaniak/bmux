@@ -8,9 +8,8 @@ use bmux_tui::component::{
     LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
+use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Style};
@@ -368,77 +367,6 @@ impl Scrollbar {
         }
     }
 
-    /// Render the scrollbar and register pointer interaction when enabled.
-    pub fn render(&self, area: Rect, state: &ScrollbarState, frame: &mut Frame<'_>) {
-        let id = frame.next_interaction_id("scrollbar");
-        self.render_with_id(id, area, state, frame);
-    }
-
-    /// Render the scrollbar with a stable interaction identifier.
-    pub fn render_with_id(
-        &self,
-        id: impl Into<HitId>,
-        area: Rect,
-        state: &ScrollbarState,
-        frame: &mut Frame<'_>,
-    ) {
-        if area.is_empty() {
-            return;
-        }
-        if self.policy.mouse_drag && state.max_offset() > 0 {
-            frame.push_hit(
-                SceneRegion::new(id, area)
-                    .role(HitRole::Scroll)
-                    .hoverable(false)
-                    .focusable(false),
-            );
-        }
-        self.render_visual(area, *state, frame);
-    }
-
-    fn render_visual(&self, area: Rect, state: ScrollbarState, frame: &mut Frame<'_>) {
-        let layout = self.layout(area, &state);
-        match self.policy.orientation {
-            ScrollbarOrientation::Vertical => {
-                for y in 0..area.height {
-                    let (symbol, style) = if y >= layout.thumb_start
-                        && y < layout.thumb_start.saturating_add(layout.thumb_len)
-                    {
-                        (self.policy.thumb, self.styles.thumb)
-                    } else if y == 0 {
-                        (self.policy.begin, self.styles.begin)
-                    } else if y == area.height.saturating_sub(1) {
-                        (self.policy.end, self.styles.end)
-                    } else {
-                        (self.policy.track, self.styles.track)
-                    };
-                    frame.write_line(
-                        Rect::new(area.x, area.y.saturating_add(y), area.width, 1),
-                        &Line::from_spans([Span::styled(symbol, style)]),
-                    );
-                }
-            }
-            ScrollbarOrientation::Horizontal => {
-                let mut spans = Vec::new();
-                for x in 0..area.width {
-                    let (symbol, style) = if x >= layout.thumb_start
-                        && x < layout.thumb_start.saturating_add(layout.thumb_len)
-                    {
-                        (self.policy.thumb, self.styles.thumb)
-                    } else if x == 0 {
-                        (self.policy.begin, self.styles.begin)
-                    } else if x == area.width.saturating_sub(1) {
-                        (self.policy.end, self.styles.end)
-                    } else {
-                        (self.policy.track, self.styles.track)
-                    };
-                    spans.push(Span::styled(symbol, style));
-                }
-                frame.write_line(area, &Line::from_spans(spans));
-            }
-        }
-    }
-
     /// Paint scrollbar visuals through a scoped local-coordinate context.
     pub fn paint(&self, area: Rect, state: &ScrollbarState, cx: &mut PaintCx<'_, '_>) {
         if area.is_empty() {
@@ -604,6 +532,16 @@ mod tests {
         ScrollbarStyles,
     };
 
+    fn paint_component(component: &ScrollbarComponent<'_>, area: Rect, frame: &mut Frame<'_>) {
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        PaintCx::new(frame).with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            bmux_tui::paint::LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    }
+
     #[test]
     fn component_uses_authoritative_layout_for_paint_and_drag() {
         let state = Cell::new(ScrollbarState::new(100, 20).offset(20));
@@ -642,25 +580,28 @@ mod tests {
 
     #[test]
     fn renders_vertical_scrollbar() {
-        let state = ScrollbarState::new(100, 20).offset(40);
+        let state = Cell::new(ScrollbarState::new(100, 20).offset(40));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 5));
         let mut frame = Frame::new(&mut buffer);
 
-        Scrollbar::new().render(Rect::new(0, 0, 1, 5), &state, &mut frame);
+        paint_component(
+            &ScrollbarComponent::new("vertical", &state),
+            Rect::new(0, 0, 1, 5),
+            &mut frame,
+        );
 
         assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("█"));
     }
 
     #[test]
     fn draggable_render_registers_exact_pointer_region_without_tab_stop() {
-        let state = ScrollbarState::new(100, 20).offset(40);
+        let state = Cell::new(ScrollbarState::new(100, 20).offset(40));
         let mut buffer = Buffer::empty(Rect::new(3, 2, 8, 8));
         let mut frame = Frame::new(&mut buffer);
 
-        Scrollbar::new().render_with_id(
-            "results.scroll",
+        paint_component(
+            &ScrollbarComponent::new("results.scroll", &state),
             Rect::new(9, 3, 1, 6),
-            &state,
             &mut frame,
         );
 
@@ -675,24 +616,30 @@ mod tests {
 
     #[test]
     fn noninteractive_or_empty_scrollbar_registers_no_pointer_region() {
-        let state = ScrollbarState::new(100, 20);
+        let state = Cell::new(ScrollbarState::new(100, 20));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 4));
         let mut frame = Frame::new(&mut buffer);
 
-        Scrollbar::new()
-            .policy(ScrollbarPolicy {
+        paint_component(
+            &ScrollbarComponent::new("static", &state).policy(ScrollbarPolicy {
                 mouse_drag: false,
                 ..ScrollbarPolicy::vertical()
-            })
-            .render_with_id("static", Rect::new(0, 0, 1, 4), &state, &mut frame);
-        Scrollbar::new().render_with_id("empty", Rect::new(0, 0, 0, 0), &state, &mut frame);
+            }),
+            Rect::new(0, 0, 1, 4),
+            &mut frame,
+        );
+        paint_component(
+            &ScrollbarComponent::new("empty", &state),
+            Rect::new(0, 0, 0, 0),
+            &mut frame,
+        );
 
         assert!(frame.hits().regions().is_empty());
     }
 
     #[test]
     fn customizes_begin_end_track_thumb_symbols_and_styles() {
-        let state = ScrollbarState::new(100, 20).offset(50);
+        let state = Cell::new(ScrollbarState::new(100, 20).offset(50));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 5));
         let mut frame = Frame::new(&mut buffer);
         let styles = ScrollbarStyles {
@@ -702,10 +649,13 @@ mod tests {
             end: Style::new().fg(Color::Yellow),
         };
 
-        Scrollbar::new()
-            .policy(ScrollbarPolicy::vertical().symbols("^", "|", "#", "v"))
-            .styles(styles)
-            .render(Rect::new(0, 0, 1, 5), &state, &mut frame);
+        paint_component(
+            &ScrollbarComponent::new("custom", &state)
+                .policy(ScrollbarPolicy::vertical().symbols("^", "|", "#", "v"))
+                .styles(styles),
+            Rect::new(0, 0, 1, 5),
+            &mut frame,
+        );
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("^"));
         assert_eq!(frame.buffer().row_symbols(4).as_deref(), Some("v"));
@@ -720,13 +670,15 @@ mod tests {
 
     #[test]
     fn renders_horizontal_scrollbar() {
-        let state = ScrollbarState::new(100, 20).offset(0);
+        let state = Cell::new(ScrollbarState::new(100, 20).offset(0));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
         let mut frame = Frame::new(&mut buffer);
 
-        Scrollbar::new()
-            .policy(ScrollbarPolicy::horizontal())
-            .render(Rect::new(0, 0, 5, 1), &state, &mut frame);
+        paint_component(
+            &ScrollbarComponent::new("horizontal", &state).policy(ScrollbarPolicy::horizontal()),
+            Rect::new(0, 0, 5, 1),
+            &mut frame,
+        );
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█────"));
     }
@@ -769,10 +721,14 @@ mod tests {
 
     #[test]
     fn tiny_area_does_not_panic() {
-        let state = ScrollbarState::new(100, 20);
+        let state = Cell::new(ScrollbarState::new(100, 20));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
         let mut frame = Frame::new(&mut buffer);
 
-        Scrollbar::new().render(Rect::new(0, 0, 0, 0), &state, &mut frame);
+        paint_component(
+            &ScrollbarComponent::new("tiny", &state),
+            Rect::new(0, 0, 0, 0),
+            &mut frame,
+        );
     }
 }

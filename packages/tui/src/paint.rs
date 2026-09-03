@@ -75,6 +75,12 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         self.inherited_style
     }
 
+    /// Read-only view of the selection metadata registered so far in this frame.
+    #[must_use]
+    pub const fn selection(&self) -> &crate::selection::SelectionScene {
+        self.frame.selection()
+    }
+
     /// Paint in a translated child coordinate system with an additional local clip.
     pub fn with_child(
         &mut self,

@@ -5,15 +5,15 @@ use bmux_terminal_grid::{
     TerminalGridStream,
 };
 use bmux_tui::ansi::ansi_to_lines;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use bmux_tui::selection::SelectionCapture;
 use bmux_tui::style::Modifier;
 
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
-    register_component_scope,
+    paint_component_scope,
 };
 
 /// Default maximum number of terminal rows rendered inline.
@@ -65,7 +65,7 @@ pub fn register_terminal_viewer_selection(
     area: Rect,
     selection: &ComponentSelectionState,
     policy: &ComponentSelectionPolicy,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
 ) -> ComponentSelectionOutcome {
     let isolated_policy = ComponentSelectionPolicy {
         enabled: policy.enabled,
@@ -80,8 +80,7 @@ pub fn register_terminal_viewer_selection(
         area.width,
         area.height.saturating_sub(content_start),
     );
-    let scope_outcome =
-        register_component_scope(frame, selection, &isolated_policy, area, content_area);
+    let scope_outcome = paint_component_scope(cx, selection, &isolated_policy, area, content_area);
     if !policy.enabled || content_area.is_empty() {
         return scope_outcome;
     }
@@ -110,7 +109,7 @@ pub fn register_terminal_viewer_selection(
             source_offset,
             selection.revision,
         ) {
-            frame.push_selection_fragment(fragment);
+            cx.push_selection_fragment(fragment);
             fragments = fragments.saturating_add(1);
         }
         source_offset = source_offset.saturating_add(text.len().saturating_add(1));
@@ -464,6 +463,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
 
     fn rendered_text(rows: &[Line]) -> String {
         rows.iter()
@@ -652,7 +652,7 @@ mod tests {
             Rect::new(0, 0, 40, 4),
             &state,
             &policy,
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
         );
 
         let scope = &frame.selection().scopes()[0];
@@ -690,7 +690,7 @@ mod tests {
             Rect::new(0, 0, 40, 8),
             &state,
             &ComponentSelectionPolicy::content(),
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
         );
 
         assert!(matches!(

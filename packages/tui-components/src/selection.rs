@@ -2,12 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::selection::{
-    SelectionAutoScrollPolicy, SelectionCapture, SelectionContentId, SelectionFragment,
-    SelectionScope, SelectionScopeId,
+    SelectionAutoScrollPolicy, SelectionCapture, SelectionScope, SelectionScopeId,
 };
 use bmux_tui::style::Style;
 
@@ -219,50 +217,11 @@ pub fn paint_component_scope(
     ComponentSelectionOutcome::ScopeRegistered
 }
 
-/// Register one component scope with separate content and outer chrome areas.
-pub fn register_component_scope(
-    frame: &mut Frame<'_>,
-    state: &ComponentSelectionState,
-    policy: &ComponentSelectionPolicy,
-    outer_area: Rect,
-    content_area: Rect,
-) -> ComponentSelectionOutcome {
-    let Some(scope) = component_scope(state, policy, outer_area, content_area) else {
-        return ComponentSelectionOutcome::Disabled;
-    };
-    frame.push_selection_scope(scope);
-    ComponentSelectionOutcome::ScopeRegistered
-}
-
-/// Register one already-resolved visible content fragment.
-pub fn register_component_fragment(
-    frame: &mut Frame<'_>,
-    state: &ComponentSelectionState,
-    content_id: impl Into<SelectionContentId>,
-    area: Rect,
-    order: u64,
-    source_range: std::ops::Range<usize>,
-) -> ComponentSelectionOutcome {
-    if area.is_empty() {
-        return ComponentSelectionOutcome::ScopeRegistered;
-    }
-    frame.push_selection_fragment(
-        SelectionFragment::new(
-            state.scope_id.clone(),
-            content_id,
-            area,
-            order,
-            source_range,
-        )
-        .revision(state.revision),
-    );
-    ComponentSelectionOutcome::ContentRegistered { fragments: 1 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
 
     #[test]
     fn content_policy_defaults_to_local_content_and_delegating_chrome() {
@@ -293,8 +252,8 @@ mod tests {
             ..ComponentSelectionPolicy::content()
         };
 
-        register_component_scope(
-            &mut frame,
+        paint_component_scope(
+            &mut PaintCx::new(&mut frame),
             &ComponentSelectionState::new("child").parent("root"),
             &policy,
             Rect::new(0, 0, 10, 4),
@@ -320,8 +279,8 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
         let mut frame = Frame::new(&mut buffer);
         let state = ComponentSelectionState::new("child").parent("root");
-        register_component_scope(
-            &mut frame,
+        paint_component_scope(
+            &mut PaintCx::new(&mut frame),
             &state,
             &ComponentSelectionPolicy::content(),
             Rect::new(0, 0, 10, 4),

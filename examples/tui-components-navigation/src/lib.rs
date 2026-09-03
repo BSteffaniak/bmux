@@ -36,7 +36,7 @@ use bmux_tui_components::table::{
     Table, TableColumn, TableComponent, TableOutcome, TableRow, TableState,
 };
 use bmux_tui_components::text_view::{
-    TextView, TextViewCursor, TextViewHighlight, TextViewSelection, TextViewState,
+    TextViewComponent, TextViewCursor, TextViewHighlight, TextViewSelection,
 };
 use bmux_tui_components::tree_view::{
     TreeView, TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
@@ -53,7 +53,7 @@ pub struct NavigationDemo {
     menu: MenuState,
     table: TableState,
     scroll: ScrollViewState,
-    text: TextViewState,
+    text: ScrollViewState,
     pane_scroll: ScrollViewState,
     message: String,
 }
@@ -77,7 +77,7 @@ impl NavigationDemo {
                 state.set_vertical_offset(1);
                 state
             },
-            text: TextViewState::new(),
+            text: ScrollViewState::new(),
             pane_scroll: ScrollViewState::new(),
             message: "Use arrows/Enter, wheel over scroll pane, q quits".to_string(),
         }
@@ -186,10 +186,18 @@ impl NavigationDemo {
         }
 
         let text_lines = text_view_lines();
-        if let bmux_tui_components::text_view::TextViewOutcome::Scrolled { vertical_scroll } =
-            TextView::new(&text_lines).handle_event(Rect::new(1, 13, 68, 2), &mut self.text, event)
+        let text_highlights = text_view_highlights();
+        let text_state = Cell::new(self.text);
+        let text_area = Rect::new(1, 13, 68, 2);
+        let text_view = text_view_component(&text_lines, &text_highlights, &text_state);
+        let text_layout =
+            text_view.layout(Constraints::tight(text_area.size()), &mut LayoutCx::new());
+        let text_outcome = text_view.handle_event(text_area, &text_layout, event);
+        self.text = text_state.get();
+        if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled { vertical_offset } =
+            text_outcome
         {
-            self.message = format!("Text scrolled: {vertical_scroll}");
+            self.message = format!("Text scrolled: {vertical_offset}");
             return false;
         }
 
@@ -410,20 +418,12 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
 
     let text_lines = text_view_lines();
     let text_highlights = text_view_highlights();
-    TextView::new(&text_lines)
-        .highlights(&text_highlights)
-        .selection(Some(TextViewSelection::new(
-            1,
-            0,
-            11,
-            Style::new().bg(Color::Blue),
-        )))
-        .cursor(Some(TextViewCursor::new(
-            0,
-            8,
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )))
-        .render(Rect::new(1, 13, 68, 2), &demo.text, frame);
+    let text_state = Cell::new(demo.text);
+    render_component(
+        &text_view_component(&text_lines, &text_highlights, &text_state),
+        Rect::new(1, 13, 68, 2),
+        frame,
+    );
     render_component(
         &MessageBarComponent::new("navigation.message", &demo.message)
             .severity(StatusSeverity::Info)
@@ -546,7 +546,7 @@ pub fn demonstrate_text_view_scroll() -> usize {
         bmux_tui::event::MouseEventKind::ScrollDown,
         bmux_tui::geometry::Point::new(2, 13),
     )));
-    demo.text.vertical_scroll()
+    demo.text.vertical_offset()
 }
 
 pub fn demonstrate_table_selection() -> String {
@@ -673,6 +673,26 @@ fn scroll_lines() -> [Line; 4] {
         Line::from("Scroll two"),
         Line::from("Scroll three"),
     ]
+}
+
+fn text_view_component<'a>(
+    lines: &'a [Line],
+    highlights: &'a [TextViewHighlight],
+    state: &'a Cell<ScrollViewState>,
+) -> TextViewComponent<'a, 'a> {
+    TextViewComponent::new("navigation.text", lines, state)
+        .highlights(highlights)
+        .selection(Some(TextViewSelection::new(
+            1,
+            0,
+            11,
+            Style::new().bg(Color::Blue),
+        )))
+        .cursor(Some(TextViewCursor::new(
+            0,
+            8,
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )))
 }
 
 fn text_view_lines() -> [Line; 3] {

@@ -1,12 +1,12 @@
 //! Generic source-code card and gutter rendering.
 
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
-    register_component_scope,
+    paint_component_scope,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -79,9 +79,9 @@ pub fn register_source_viewer_selection(
     area: Rect,
     selection: &ComponentSelectionState,
     policy: &ComponentSelectionPolicy,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
 ) -> ComponentSelectionOutcome {
-    let scope_outcome = register_component_scope(frame, selection, policy, area, area);
+    let scope_outcome = paint_component_scope(cx, selection, policy, area, area);
     if !policy.enabled || area.is_empty() {
         return scope_outcome;
     }
@@ -132,7 +132,7 @@ pub fn register_source_viewer_selection(
                     chunk_offset,
                     selection.revision,
                 ) {
-                    frame.push_selection_fragment(fragment);
+                    cx.push_selection_fragment(fragment);
                     fragments = fragments.saturating_add(1);
                 }
                 chunk_offset = chunk_offset.saturating_add(chunk.len());
@@ -164,7 +164,7 @@ pub fn register_source_viewer_selection(
                 source_offset,
                 selection.revision,
             ) {
-                frame.push_selection_fragment(fragment);
+                cx.push_selection_fragment(fragment);
                 fragments = fragments.saturating_add(1);
             }
             screen_y = screen_y.saturating_add(1);
@@ -366,6 +366,7 @@ fn spans_width(spans: &[Span]) -> usize {
 mod tests {
     use super::*;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
     use bmux_tui::style::Modifier;
 
     fn rendered(rows: &[Line]) -> String {
@@ -626,7 +627,7 @@ mod tests {
             Rect::new(0, 0, 10, 6),
             &state,
             &ComponentSelectionPolicy::content(),
-            &mut frame,
+            &mut PaintCx::new(&mut frame),
         );
 
         let fragments = frame.selection().fragments();
