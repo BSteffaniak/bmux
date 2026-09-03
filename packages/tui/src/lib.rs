@@ -44,9 +44,7 @@ pub mod prelude {
     };
     pub use crate::buffer::{Buffer, Cell};
     pub use crate::capabilities::{TerminalBackground, TerminalCapabilities, TerminalColorDepth};
-    pub use crate::chrome::{
-        Border, BorderSet, BorderSides, Panel, PanelComponent, PanelTitle, TitlePosition,
-    };
+    pub use crate::chrome::{Border, BorderSet, BorderSides};
     pub use crate::component::{
         ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCache,
         LayoutCacheStats, LayoutCx, LayoutEnvironment, LayoutId, LayoutMetadata, LayoutNode,
