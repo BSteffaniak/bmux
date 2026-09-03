@@ -14,9 +14,6 @@ use bmux_tui_components::chart::{
 };
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent};
 use bmux_tui_components::menu::{Menu, MenuItem, MenuPolicy};
-use bmux_tui_components::scroll_area::{
-    ScrollArea, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
-};
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListPolicy, SelectableListState,
@@ -116,30 +113,12 @@ fn golden_styled_truncation_components() {
 }
 
 #[test]
-fn golden_scroll_area_and_text_view_both_axis_scrollbars() {
+fn golden_text_view_both_axis_scrollbars() {
     let lines = [
         Line::from("abcdef"),
         Line::from("ghijkl"),
         Line::from("mnopqr"),
     ];
-
-    let mut scroll_buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
-    let mut scroll_frame = Frame::new(&mut scroll_buffer);
-    let mut scroll_state = ScrollAreaState::new();
-    scroll_state.set_vertical_offset(1);
-    scroll_state.set_horizontal_offset(1);
-    ScrollArea::new(&lines)
-        .policy(
-            ScrollAreaPolicy::interactive()
-                .scrollbar(ScrollAreaScrollbarMode::Gutter)
-                .horizontal_scrollbar(ScrollAreaScrollbarMode::Gutter),
-        )
-        .render(Rect::new(0, 0, 4, 3), &scroll_state, &mut scroll_frame);
-
-    assert_eq!(
-        buffer_rows(scroll_frame.buffer()),
-        vec!["hij│", "nop█", "█── "]
-    );
 
     let mut text_buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
     let mut text_frame = Frame::new(&mut text_buffer);

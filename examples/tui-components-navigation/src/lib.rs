@@ -20,10 +20,7 @@ use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{
     Pane, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
 };
-use bmux_tui_components::scroll_area::{
-    ScrollArea, ScrollAreaOutcome, ScrollAreaPolicy, ScrollAreaScrollbarMode, ScrollAreaState,
-};
-use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
+use bmux_tui_components::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
@@ -52,9 +49,9 @@ pub struct NavigationDemo {
     list: SelectableListState,
     menu: MenuState,
     table: TableState,
-    scroll: ScrollAreaState,
+    scroll: ScrollViewState,
     text: TextViewState,
-    pane_scroll: ScrollAreaState,
+    pane_scroll: ScrollViewState,
     message: String,
 }
 
@@ -73,12 +70,12 @@ impl NavigationDemo {
             menu: MenuState::new(Some(0)),
             table: TableState::new(Some(0)),
             scroll: {
-                let mut state = ScrollAreaState::new();
+                let mut state = ScrollViewState::new();
                 state.set_vertical_offset(1);
                 state
             },
             text: TextViewState::new(),
-            pane_scroll: ScrollAreaState::new(),
+            pane_scroll: ScrollViewState::new(),
             message: "Use arrows/Enter, wheel over scroll pane, q quits".to_string(),
         }
     }
@@ -159,8 +156,10 @@ impl NavigationDemo {
         }
 
         let lines = scroll_lines();
-        if let ScrollAreaOutcome::Scrolled { vertical_offset } =
-            ScrollArea::new(&lines).handle_event(Rect::new(1, 6, 24, 2), &mut self.scroll, event)
+        let area = Rect::new(1, 6, 24, 2);
+        let layout = scroll_layout("navigation.scroll", area, &lines, self.scroll);
+        if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled { vertical_offset } =
+            ScrollView::new().handle_event(area, &layout, &mut self.scroll, event)
         {
             self.message = format!("Scroll offset: {vertical_offset}");
         }
@@ -207,19 +206,24 @@ impl NavigationDemo {
                 | bmux_tui_components::pane::ScrollDirection::Right => return false,
             };
             let pane_lines = pane_scroll_lines();
-            if let ScrollAreaOutcome::Scrolled { vertical_offset } = ScrollArea::new(&pane_lines)
-                .handle_event(
-                    pane.inner_area(&pane_state),
-                    &mut self.pane_scroll,
-                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
-                        delegated,
-                        bmux_tui::geometry::Point::new(
-                            pane.inner_area(&pane_state).x,
-                            pane.inner_area(&pane_state).y,
-                        ),
-                    )),
-                )
-            {
+            let area = pane.inner_area(&pane_state);
+            let layout = scroll_layout(
+                "navigation.scroll-pane.viewport",
+                area,
+                &pane_lines,
+                self.pane_scroll,
+            );
+            if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled {
+                vertical_offset,
+            } = ScrollView::new().handle_event(
+                area,
+                &layout,
+                &mut self.pane_scroll,
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    delegated,
+                    bmux_tui::geometry::Point::new(area.x, area.y),
+                )),
+            ) {
                 self.message = format!("Delegated pane scroll offset: {vertical_offset}");
             }
         }
@@ -238,6 +242,24 @@ pub fn render_navigation() -> Buffer {
     let mut frame = Frame::new(&mut buffer);
     NavigationDemo::new().render(&mut frame);
     buffer
+}
+
+fn scroll_layout(
+    id: &str,
+    area: Rect,
+    lines: &[Line],
+    state: ScrollViewState,
+) -> bmux_tui::component::LayoutNode {
+    ScrollViewComponent::new(
+        id.to_owned(),
+        bmux_tui::component::LogicalSize::new(
+            area.width.saturating_sub(1),
+            usize::from(area.height),
+        ),
+        state,
+        TextContent::new(Text::from_lines(lines.to_vec())).id(format!("{id}.content")),
+    )
+    .layout(Constraints::tight(area.size()), &mut LayoutCx::new())
 }
 
 fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
@@ -304,9 +326,32 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
         .render(Rect::new(48, 1, 22, 6), &demo.tree, frame);
 
     let lines = scroll_lines();
-    ScrollArea::new(&lines)
-        .policy(ScrollAreaPolicy::interactive().scrollbar(ScrollAreaScrollbarMode::Gutter))
-        .render(Rect::new(1, 6, 24, 2), &demo.scroll, frame);
+    let area = Rect::new(1, 6, 24, 2);
+    let component = ScrollViewComponent::new(
+        "navigation.scroll",
+        bmux_tui::component::LogicalSize::new(
+            area.width.saturating_sub(1),
+            usize::from(area.height),
+        ),
+        demo.scroll,
+        TextContent::new(Text::from_lines(lines)).id("navigation.scroll.content"),
+    );
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    PaintCx::new(frame).with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| {
+            component.paint(&layout, cx);
+            ScrollView::new().paint_chrome(
+                "navigation.scroll",
+                Rect::new(0, 0, area.width, area.height),
+                &layout,
+                &demo.scroll,
+                cx,
+            );
+        },
+    );
 
     let table_columns = table_columns();
     let table_rows = table_rows();
@@ -315,8 +360,6 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     let pane_area = scroll_delegate_pane_area();
     let pane_state = Cell::new(PaneState::new(pane_area));
     let pane_lines = pane_scroll_lines();
-    let mut scroll_state = ScrollViewState::new();
-    scroll_state.set_vertical_offset(usize::from(demo.pane_scroll.vertical_offset()));
     let content_area = scroll_delegate_pane().inner_area(&pane_state.get());
     render_component(
         &PaneComponent::new(
@@ -329,7 +372,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
                     content_area.width,
                     usize::from(content_area.height),
                 ),
-                scroll_state,
+                demo.pane_scroll,
                 TextContent::new(Text::from_lines(pane_lines)).id("navigation.scroll-pane.content"),
             ),
         ),
@@ -441,7 +484,7 @@ pub fn demonstrate_pane_scroll_delegation() -> PaneOutcome {
     )
 }
 
-pub fn demonstrate_delegated_pane_scroll_offset() -> u16 {
+pub fn demonstrate_delegated_pane_scroll_offset() -> usize {
     let mut demo = NavigationDemo::new();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::ScrollDown,
@@ -704,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_pane_scroll_updates_nested_scroll_area() {
+    fn delegated_pane_scroll_updates_nested_scroll_view() {
         assert_eq!(demonstrate_delegated_pane_scroll_offset(), 3);
     }
 

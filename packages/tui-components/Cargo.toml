@@ -50,7 +50,6 @@ panel-group = []
 picker-frame = []
 progress-bar = []
 radio-group = ["keyboard-input"]
-scroll-area = ["keyboard-input", "scrollbar"]
 scroll-view = ["keyboard-input", "scrollbar"]
 scrollbar = []
 select-dropdown = ["selectable-list"]
@@ -101,7 +100,6 @@ all = [
     "picker-frame",
     "progress-bar",
     "radio-group",
-    "scroll-area",
     "scroll-view",
     "scrollbar",
     "select-dropdown",

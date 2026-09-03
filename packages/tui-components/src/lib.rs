@@ -61,13 +61,11 @@ pub mod picker_frame;
 pub mod progress_bar;
 #[cfg(feature = "radio-group")]
 pub mod radio_group;
-#[cfg(feature = "scroll-area")]
-pub mod scroll_area;
 #[cfg(feature = "scroll-view")]
 pub mod scroll_view;
 #[cfg(feature = "scrollbar")]
 pub mod scrollbar;
-#[cfg(any(feature = "scroll-area", feature = "table", feature = "text-view"))]
+#[cfg(any(feature = "table", feature = "text-view"))]
 pub mod scrollbar_layout;
 #[cfg(feature = "select-dropdown")]
 pub mod select_dropdown;
