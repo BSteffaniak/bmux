@@ -15,7 +15,7 @@ use bmux_tui::style::{Color, Modifier, Style};
 use crate::form_field::FormFieldComponent;
 use crate::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
 
-/// Behavior policy for [`TextInputBox`].
+/// Behavior policy for [`TextInputBoxComponent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct TextInputBoxPolicy {
@@ -112,7 +112,7 @@ impl Default for TextInputBoxPolicy {
     }
 }
 
-/// Visual styles for [`TextInputBox`].
+/// Visual styles for [`TextInputBoxComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextInputBoxStyles {
     /// Text style when enabled and unfocused.
@@ -154,9 +154,9 @@ impl Default for TextInputBoxStyles {
     }
 }
 
-/// Configurable visible text-input wrapper.
+/// Private configuration assembled by [`TextInputBoxComponent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TextInputBox<'a> {
+struct TextInputBoxConfig<'a> {
     label: Option<&'a str>,
     required: bool,
     help: Option<&'a str>,
@@ -170,7 +170,7 @@ pub struct TextInputBox<'a> {
 /// Canonical component-lifecycle text input box.
 pub struct TextInputBoxComponent<'a, 'state> {
     id: LayoutId,
-    box_control: TextInputBox<'a>,
+    box_control: TextInputBoxConfig<'a>,
     state: &'state RefCell<TextInputState>,
 }
 
@@ -184,7 +184,7 @@ impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
     ) -> Self {
         Self {
             id: id.into(),
-            box_control: TextInputBox::new(text_policy),
+            box_control: TextInputBoxConfig::new(text_policy),
             state,
         }
     }
@@ -313,7 +313,7 @@ impl Component for TextInputBoxComponent<'_, '_> {
     }
 }
 
-impl<'a> TextInputBox<'a> {
+impl TextInputBoxConfig<'_> {
     /// Create a text input box using the supplied text-edit policy.
     #[must_use]
     pub fn new(text_policy: TextInputPolicy) -> Self {
@@ -327,55 +327,6 @@ impl<'a> TextInputBox<'a> {
             text_policy,
             styles: TextInputBoxStyles::default(),
         }
-    }
-
-    /// Set optional label.
-    #[must_use]
-    pub const fn label(mut self, label: &'a str) -> Self {
-        self.label = Some(label);
-        self
-    }
-
-    /// Set required marker visibility for labeled fields.
-    #[must_use]
-    pub const fn required(mut self, required: bool) -> Self {
-        self.required = required;
-        self
-    }
-
-    /// Set optional help text.
-    #[must_use]
-    pub const fn help(mut self, help: &'a str) -> Self {
-        self.help = Some(help);
-        self
-    }
-
-    /// Set optional error text.
-    #[must_use]
-    pub const fn error(mut self, error: &'a str) -> Self {
-        self.error = Some(error);
-        self
-    }
-
-    /// Set placeholder text.
-    #[must_use]
-    pub const fn placeholder(mut self, placeholder: &'a str) -> Self {
-        self.placeholder = Some(placeholder);
-        self
-    }
-
-    /// Set behavior policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: TextInputBoxPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    /// Set visual styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: TextInputBoxStyles) -> Self {
-        self.styles = styles;
-        self
     }
 
     const fn background_style(&self) -> Style {
@@ -429,7 +380,7 @@ impl From<crate::theme::ComponentTheme> for TextInputBoxStyles {
 mod tests {
     use std::cell::RefCell;
 
-    use bmux_text_edit::TextEditBuffer;
+    use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
     use bmux_tui::event::{Event, EventOutcome};
@@ -437,21 +388,32 @@ mod tests {
     use bmux_tui::geometry::Rect;
     use bmux_tui::paint::PaintCx;
 
-    use super::{TextInputBoxComponent, TextInputBoxPolicy};
+    use super::{TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles};
     use crate::text_input::{TextInputPolicy, TextInputState};
 
     fn paint(
         component: &impl Component,
         width: u16,
         height: u16,
-    ) -> (Buffer, bmux_tui::component::LayoutNode) {
+    ) -> (
+        Buffer,
+        bmux_tui::component::LayoutNode,
+        Option<bmux_tui::frame::Cursor>,
+        Vec<bmux_tui::hit::HitRegion>,
+        Vec<bmux_tui::semantic::SemanticRegion>,
+    ) {
         let layout = component.layout(
             Constraints::tight(bmux_tui::geometry::Size::new(width, height)),
             &mut LayoutCx::new(),
         );
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-        component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
-        (buffer, layout)
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let cursor = frame.cursor();
+        let hits = frame.hits().regions().to_vec();
+        let semantics = frame.semantics().regions().to_vec();
+        drop(frame);
+        (buffer, layout, cursor, hits, semantics)
     }
 
     #[test]
@@ -461,7 +423,7 @@ mod tests {
             TextInputBoxComponent::new("name", TextInputPolicy::chat_composer(), &state)
                 .policy(TextInputBoxPolicy::bare().focused(true));
 
-        let (buffer, _) = paint(&component, 8, 1);
+        let (buffer, _, _, _, _) = paint(&component, 8, 1);
 
         assert_eq!(buffer.row_symbols(0).as_deref(), Some("Ada     "));
         assert_eq!(state.borrow().content_area(), Rect::new(0, 0, 8, 1));
@@ -474,7 +436,7 @@ mod tests {
             TextInputBoxComponent::new("name", TextInputPolicy::chat_composer(), &state)
                 .policy(TextInputBoxPolicy::field().focused(true));
 
-        let (buffer, _) = paint(&component, 12, 3);
+        let (buffer, _, _, _, _) = paint(&component, 12, 3);
 
         assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌──────────┐"));
         assert_eq!(buffer.row_symbols(1).as_deref(), Some("│ Ada      │"));
@@ -495,7 +457,7 @@ mod tests {
                     .focused(true)
                     .rows(2, Some(2)),
             );
-        let (_, layout) = paint(&component, 24, 8);
+        let (_, layout, _, _, _) = paint(&component, 24, 8);
         assert!(layout.find(&"composer".into()).is_some());
         assert!(layout.find(&"composer.surface".into()).is_some());
         assert!(layout.find(&"composer.input".into()).is_some());
@@ -511,12 +473,82 @@ mod tests {
     }
 
     #[test]
+    fn focused_box_projects_cursor_hit_and_semantics_from_the_input_layout() {
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("Ada")));
+        let component =
+            TextInputBoxComponent::new("name", TextInputPolicy::chat_composer(), &state)
+                .policy(TextInputBoxPolicy::field().focused(true));
+
+        let (_, layout, cursor, hits, semantics) = paint(&component, 12, 3);
+        let input = layout.find(&"name.input".into()).expect("input layout");
+
+        assert_eq!(input.size.height, 1);
+        assert_eq!(
+            cursor,
+            Some(bmux_tui::frame::Cursor::visible(
+                bmux_tui::geometry::Point::new(5, 1)
+            ))
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), "name.input");
+        assert_eq!(hits[0].area, Rect::new(2, 1, 8, 1));
+        assert_eq!(semantics.len(), 1);
+        assert_eq!(semantics[0].id, "name.input");
+        assert_eq!(semantics[0].role, "text-input");
+        assert_eq!(semantics[0].area, hits[0].area);
+    }
+
+    #[test]
+    fn box_projects_selection_style_through_nested_wrapped_geometry() {
+        let selection_style = bmux_tui::style::Style::new()
+            .fg(bmux_tui::style::Color::Black)
+            .bg(bmux_tui::style::Color::Yellow);
+        let mut buffer = TextEditBuffer::from_text("ab🙂cd");
+        buffer.move_cursor(TextMotion::Start);
+        buffer.move_cursor_with_selection(TextMotion::Right, SelectionMode::Extend);
+        buffer.move_cursor_with_selection(TextMotion::Right, SelectionMode::Extend);
+        let state = RefCell::new(TextInputState::new(buffer));
+        let component =
+            TextInputBoxComponent::new("message", TextInputPolicy::chat_composer(), &state)
+                .policy(TextInputBoxPolicy::field().focused(true).rows(2, Some(2)))
+                .styles(TextInputBoxStyles {
+                    selection: selection_style,
+                    ..TextInputBoxStyles::default()
+                });
+
+        let (buffer, layout, cursor, _, _) = paint(&component, 8, 4);
+        let input = layout.find(&"message.input".into()).expect("input layout");
+
+        assert_eq!(input.size.height, 2);
+        assert_eq!(buffer.row_symbols(1).as_deref(), Some("│ ab🙂 │"));
+        assert_eq!(buffer.row_symbols(2).as_deref(), Some("│ cd   │"));
+        let selected_a = buffer
+            .get(bmux_tui::geometry::Point::new(2, 1))
+            .map(|cell| cell.style)
+            .expect("selected a cell");
+        let selected_b = buffer
+            .get(bmux_tui::geometry::Point::new(3, 1))
+            .map(|cell| cell.style)
+            .expect("selected b cell");
+        assert_eq!(selected_a.fg, selection_style.fg);
+        assert_eq!(selected_a.bg, selection_style.bg);
+        assert_eq!(selected_b.fg, selection_style.fg);
+        assert_eq!(selected_b.bg, selection_style.bg);
+        assert_eq!(
+            cursor,
+            Some(bmux_tui::frame::Cursor::visible(
+                bmux_tui::geometry::Point::new(4, 1)
+            ))
+        );
+    }
+
+    #[test]
     fn disabled_component_ignores_events() {
         let state = RefCell::new(TextInputState::default());
         let component =
             TextInputBoxComponent::new("disabled", TextInputPolicy::chat_composer(), &state)
                 .policy(TextInputBoxPolicy::field().disabled(true));
-        let (_, layout) = paint(&component, 12, 3);
+        let (_, layout, _, _, _) = paint(&component, 12, 3);
 
         assert_eq!(
             component.event(
@@ -538,7 +570,7 @@ mod tests {
             TextInputBoxComponent::new("bounded", TextInputPolicy::chat_composer(), &state)
                 .policy(TextInputBoxPolicy::field().rows(1, Some(2)));
 
-        let (_, layout) = paint(&component, 16, 8);
+        let (_, layout, _, _, _) = paint(&component, 16, 8);
         let input = layout.find(&"bounded.input".into()).expect("input layout");
 
         assert_eq!(input.size.height, 2);

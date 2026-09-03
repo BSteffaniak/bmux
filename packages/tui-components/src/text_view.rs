@@ -2,12 +2,13 @@
 
 use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::hit::{HitId, HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Alignment, Line, Span, Text, TextBlock, TextWrap};
+use bmux_tui::prelude::{Alignment, Line, Span, Text, TextWrap};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::{line_viewport, wrap_line_character, wrap_line_word};
 

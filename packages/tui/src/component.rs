@@ -1000,11 +1000,11 @@ mod tests {
     #[test]
     fn keyed_child_identity_survives_reorder_in_authoritative_tree() {
         let first = crate::composition::Column::new()
-            .child(crate::composition::TextContent::new("a").id("a"))
-            .child(crate::composition::TextContent::new("b").id("b"));
+            .child(crate::composition::TextBlock::new("a").id("a"))
+            .child(crate::composition::TextBlock::new("b").id("b"));
         let reordered = crate::composition::Column::new()
-            .child(crate::composition::TextContent::new("b").id("b"))
-            .child(crate::composition::TextContent::new("a").id("a"));
+            .child(crate::composition::TextBlock::new("b").id("b"))
+            .child(crate::composition::TextBlock::new("a").id("a"));
         let constraints = Constraints::for_width(4);
         let first = first.layout(constraints, &mut LayoutCx::new());
         let reordered = reordered.layout(constraints, &mut LayoutCx::new());

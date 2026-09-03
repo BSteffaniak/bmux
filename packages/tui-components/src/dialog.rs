@@ -6,7 +6,7 @@ use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode, LogicalSize,
 };
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -49,7 +49,7 @@ struct DialogContent<'a, 'state> {
 
 impl<'a, 'state: 'a> DialogContent<'a, 'state> {
     fn new(id: &LayoutId, dialog: &Dialog<'a>, state: &'state Cell<ActionRowState>) -> Self {
-        let body = TextContent::new(Text::from_lines(dialog.body.to_vec()))
+        let body = TextBlock::new(Text::from_lines(dialog.body.to_vec()))
             .id(format!("{}.body", id.as_str()));
         let actions = (!dialog.actions.is_empty()).then(|| {
             Element::new(

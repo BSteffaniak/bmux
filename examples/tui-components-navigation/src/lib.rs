@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -257,7 +257,7 @@ fn scroll_layout(
             usize::from(area.height),
         ),
         state,
-        TextContent::new(Text::from_lines(lines.to_vec())).id(format!("{id}.content")),
+        TextBlock::new(Text::from_lines(lines.to_vec())).id(format!("{id}.content")),
     )
     .layout(Constraints::tight(area.size()), &mut LayoutCx::new())
 }
@@ -334,7 +334,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             usize::from(area.height),
         ),
         demo.scroll,
-        TextContent::new(Text::from_lines(lines)).id("navigation.scroll.content"),
+        TextBlock::new(Text::from_lines(lines)).id("navigation.scroll.content"),
     );
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     PaintCx::new(frame).with_child(
@@ -373,7 +373,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
                     usize::from(content_area.height),
                 ),
                 demo.pane_scroll,
-                TextContent::new(Text::from_lines(pane_lines)).id("navigation.scroll-pane.content"),
+                TextBlock::new(Text::from_lines(pane_lines)).id("navigation.scroll-pane.content"),
             ),
         ),
         pane_area,

@@ -135,16 +135,17 @@ pub struct TextProjectionRow {
 
 /// A measurable rich-text component.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TextContent {
+pub struct TextBlock {
     id: LayoutId,
     text: Text,
     style: Style,
     alignment: Alignment,
     wrap: TextWrap,
     trim: bool,
+    vertical_scroll: usize,
 }
 
-impl TextContent {
+impl TextBlock {
     /// Create rich text content.
     #[must_use]
     pub fn new(text: impl Into<Text>) -> Self {
@@ -155,6 +156,7 @@ impl TextContent {
             alignment: Alignment::Left,
             wrap: TextWrap::Word,
             trim: false,
+            vertical_scroll: 0,
         }
     }
 
@@ -190,6 +192,13 @@ impl TextContent {
     #[must_use]
     pub const fn trim(mut self, trim: bool) -> Self {
         self.trim = trim;
+        self
+    }
+
+    /// Skip logical projected rows before painting.
+    #[must_use]
+    pub const fn vertical_scroll(mut self, vertical_scroll: usize) -> Self {
+        self.vertical_scroll = vertical_scroll;
         self
     }
 
@@ -229,6 +238,7 @@ impl TextContent {
                 Alignment::Right => 2,
             })
             .hash(state);
+            self.vertical_scroll.hash(state);
         });
         ComponentRevision::new(layout, paint)
     }
@@ -345,7 +355,7 @@ fn trim_line_end(line: &Line) -> Line {
     Line::from_spans(spans)
 }
 
-impl Component for TextContent {
+impl Component for TextBlock {
     fn revision(&self) -> ComponentRevision {
         self.own_revision()
     }
@@ -369,6 +379,7 @@ impl Component for TextContent {
         for (index, line) in self
             .rows(layout.size.width)
             .iter()
+            .skip(self.vertical_scroll)
             .take(usize::from(height))
             .enumerate()
         {
@@ -1808,7 +1819,7 @@ impl Component for Column<'_> {
 mod tests {
     use super::{
         Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, ScrollViewport,
-        SizeBox, Stack, StyleScope, Surface, TextContent, VerticalAlignment, Visibility,
+        SizeBox, Stack, StyleScope, Surface, TextBlock, VerticalAlignment, Visibility,
     };
     use crate::buffer::Buffer;
     use crate::chrome::Border;
@@ -1857,10 +1868,10 @@ mod tests {
                 .child(
                     Row::new()
                         .gap(1)
-                        .child(TextContent::new("Alice"))
-                        .flex_child(1, TextContent::new("10:42")),
+                        .child(TextBlock::new("Alice"))
+                        .flex_child(1, TextBlock::new("10:42")),
                 )
-                .child(TextContent::new(
+                .child(TextBlock::new(
                     "A long message wraps naturally from constraints without a caller-owned height.",
                 )),
         )
@@ -1968,7 +1979,7 @@ mod tests {
 
     #[test]
     fn text_selection_uses_authoritative_projection_and_alignment() {
-        let component = TextContent::new("one two").alignment(crate::text_block::Alignment::Right);
+        let component = TextBlock::new("one two").alignment(crate::text_block::Alignment::Right);
         let layout = component.layout(Constraints::for_width(6), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
         let mut frame = Frame::new(&mut buffer);
@@ -1991,7 +2002,7 @@ mod tests {
 
     #[test]
     fn wrapped_utf8_selection_survives_nested_scroll_clipping() {
-        let component = TextContent::new("aé🙂b");
+        let component = TextBlock::new("aé🙂b");
         let layout = component.layout(Constraints::for_width(2), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(4, 7, 2, 1));
         let mut frame = Frame::new(&mut buffer);
@@ -2011,7 +2022,7 @@ mod tests {
 
     #[test]
     fn text_trim_preserves_styles_and_projects_trimmed_source_ranges() {
-        let component = TextContent::new(crate::text::Text::from_lines(vec![
+        let component = TextBlock::new(crate::text::Text::from_lines(vec![
             crate::text::Line::from_spans(vec![
                 crate::text::Span::styled("ab", Style::new().fg(Color::Green)),
                 crate::text::Span::styled("  ", Style::new().fg(Color::Blue)),
@@ -2043,7 +2054,7 @@ mod tests {
 
     #[test]
     fn text_projection_preserves_utf8_source_ranges_across_wraps_and_lines() {
-        let component = TextContent::new(crate::text::Text::from_lines(vec![
+        let component = TextBlock::new(crate::text::Text::from_lines(vec![
             crate::text::Line::raw("one  two"),
             crate::text::Line::raw("éx"),
         ]));
@@ -2079,25 +2090,25 @@ mod tests {
     #[test]
     fn flex_descriptor_allocates_remaining_width_without_extra_layout_node() {
         let component = Row::new()
-            .child(TextContent::new("ab"))
-            .flex(Flex::new(2, TextContent::new("flexible").id("body")));
+            .child(TextBlock::new("ab"))
+            .flex(Flex::new(2, TextBlock::new("flexible").id("body")));
         let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
         assert_eq!(layout.children.len(), 2);
         assert_eq!(layout.children[1].node.id.as_str(), "body");
         assert_eq!(layout.children[1].node.size.width, 8);
-        assert_eq!(Flex::new(0, TextContent::new("x")).weight(), 1);
+        assert_eq!(Flex::new(0, TextBlock::new("x")).weight(), 1);
     }
 
     #[test]
     fn keyed_wrapper_replaces_only_parent_identity() {
-        let component = Keyed::new("message:42", TextContent::new("hello").id("body"));
+        let component = Keyed::new("message:42", TextBlock::new("hello").id("body"));
         let layout = component.layout(Constraints::new(0, 20, 0, None), &mut LayoutCx::new());
         assert_eq!(layout.id.as_str(), "message:42");
         assert_eq!(layout.children[0].node.id.as_str(), "body");
         assert_eq!(layout.size, layout.children[0].node.size);
         assert_ne!(
             component.revision().layout,
-            Keyed::new("message:43", TextContent::new("hello").id("body"))
+            Keyed::new("message:43", TextBlock::new("hello").id("body"))
                 .revision()
                 .layout
         );
@@ -2105,7 +2116,7 @@ mod tests {
 
     #[test]
     fn padding_wrapper_measures_without_visual_chrome() {
-        let component = Padding::new(Insets::new(1, 2, 1, 2), TextContent::new("hello"));
+        let component = Padding::new(Insets::new(1, 2, 1, 2), TextBlock::new("hello"));
         let layout = component.layout(Constraints::new(0, 20, 0, None), &mut LayoutCx::new());
         assert_eq!(layout.size.width, 9);
         assert_eq!(layout.size.height, 3);
@@ -2117,7 +2128,7 @@ mod tests {
     fn fill_wrapper_paints_complete_measured_rectangle() {
         let component = Fill::new(
             Style::new().bg(Color::Blue),
-            SizeBox::new(TextContent::new("x")).width(6).height(2),
+            SizeBox::new(TextBlock::new("x")).width(6).height(2),
         );
         let layout = component.layout(Constraints::new(0, 10, 0, None), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
@@ -2134,7 +2145,7 @@ mod tests {
 
     #[test]
     fn surface_measures_padding_and_paints_complete_rectangle() {
-        let component = Surface::new(TextContent::new("hello"))
+        let component = Surface::new(TextBlock::new("hello"))
             .background(Style::new().bg(Color::Blue))
             .padding(Insets::new(1, 1, 1, 1));
         let mut layout_cx = LayoutCx::new();
@@ -2159,9 +2170,9 @@ mod tests {
     fn scroll_viewport_translates_and_clips_arbitrary_composed_content() {
         let component = ScrollViewport::new(
             Column::new()
-                .child(TextContent::new("first"))
-                .child(TextContent::new("second"))
-                .child(TextContent::new("third")),
+                .child(TextBlock::new("first"))
+                .child(TextBlock::new("second"))
+                .child(TextBlock::new("third")),
         )
         .vertical_offset(1);
         let constraints = Constraints::new(8, 8, 2, Some(2));
@@ -2181,8 +2192,8 @@ mod tests {
     fn row_assigns_remaining_width_to_flexible_child() {
         let component = Row::new()
             .gap(1)
-            .child(TextContent::new("tag"))
-            .flex_child(1, TextContent::new("flexible"));
+            .child(TextBlock::new("tag"))
+            .flex_child(1, TextBlock::new("flexible"));
         let mut cx = LayoutCx::new();
         let layout = component.layout(Constraints::for_width(12), &mut cx);
 
@@ -2194,7 +2205,7 @@ mod tests {
 
     #[test]
     fn wrappers_constrain_align_style_clip_and_hide_children() {
-        let component = Align::new(SizeBox::new(TextContent::new("x")).width(1).height(1))
+        let component = Align::new(SizeBox::new(TextBlock::new("x")).width(1).height(1))
             .horizontal(HorizontalAlignment::End)
             .vertical(VerticalAlignment::End);
         let layout = component.layout(Constraints::new(5, 5, 3, Some(3)), &mut LayoutCx::new());
@@ -2202,7 +2213,7 @@ mod tests {
         assert_eq!((layout.children[0].x, layout.children[0].y), (4, 2));
 
         let styled = Clip::new(StyleScope::new(
-            TextContent::new("x"),
+            TextBlock::new("x"),
             Style::new().bg(Color::Blue),
         ));
         let styled_layout = styled.layout(Constraints::for_width(3), &mut LayoutCx::new());
@@ -2214,7 +2225,7 @@ mod tests {
             Some(Color::Blue)
         );
 
-        let hidden = Visibility::new(TextContent::new("hidden"), false);
+        let hidden = Visibility::new(TextBlock::new("hidden"), false);
         let hidden_layout = hidden.layout(Constraints::new(0, 8, 0, None), &mut LayoutCx::new());
         assert_eq!(hidden_layout.size.height, 0);
         assert!(hidden_layout.children.is_empty());
@@ -2223,8 +2234,8 @@ mod tests {
     #[test]
     fn stack_paints_children_in_insertion_order() {
         let component = Stack::new()
-            .child(Surface::new(TextContent::new(" ")).background(Style::new().bg(Color::Blue)))
-            .child(TextContent::new("top").style(Style::new().fg(Color::White).bg(Color::Red)));
+            .child(Surface::new(TextBlock::new(" ")).background(Style::new().bg(Color::Blue)))
+            .child(TextBlock::new("top").style(Style::new().fg(Color::White).bg(Color::Red)));
         let layout = component.layout(Constraints::for_width(4), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
         let mut frame = Frame::new(&mut buffer);
@@ -2239,30 +2250,30 @@ mod tests {
 
     #[test]
     fn border_visuals_are_paint_only_while_border_sides_change_layout() {
-        let plain = Surface::new(TextContent::new("x"));
-        let single = Surface::new(TextContent::new("x")).border(crate::chrome::Border::single());
+        let plain = Surface::new(TextBlock::new("x"));
+        let single = Surface::new(TextBlock::new("x")).border(crate::chrome::Border::single());
         assert_ne!(plain.revision().layout, single.revision().layout);
 
-        let blue = Surface::new(TextContent::new("x"))
+        let blue = Surface::new(TextBlock::new("x"))
             .border(crate::chrome::Border::single().style(Style::new().fg(Color::Blue)));
-        let red = Surface::new(TextContent::new("x"))
+        let red = Surface::new(TextBlock::new("x"))
             .border(crate::chrome::Border::single().style(Style::new().fg(Color::Red)));
         assert_eq!(blue.revision().layout, red.revision().layout);
         assert_ne!(blue.revision().paint, red.revision().paint);
 
-        let top_only = Surface::new(TextContent::new("x"))
+        let top_only = Surface::new(TextBlock::new("x"))
             .border(crate::chrome::Border::single().sides(crate::chrome::BorderSides::TOP));
         assert_ne!(single.revision().layout, top_only.revision().layout);
     }
 
     #[test]
     fn text_and_surface_configuration_revisions_separate_layout_from_paint() {
-        let text_a = TextContent::new("a");
-        let text_b = TextContent::new("b");
+        let text_a = TextBlock::new("a");
+        let text_b = TextBlock::new("b");
         assert_ne!(text_a.revision().layout, text_b.revision().layout);
 
-        let text_plain = TextContent::new("same");
-        let text_painted = TextContent::new(crate::text::Text::from_lines(vec![
+        let text_plain = TextBlock::new("same");
+        let text_painted = TextBlock::new(crate::text::Text::from_lines(vec![
             crate::text::Line::from_spans(vec![crate::text::Span::styled(
                 "same",
                 Style::new().fg(Color::Blue),
@@ -2273,12 +2284,12 @@ mod tests {
         assert_eq!(text_plain.revision().layout, text_painted.revision().layout);
         assert_ne!(text_plain.revision().paint, text_painted.revision().paint);
 
-        let plain = Surface::new(TextContent::new("x"));
-        let painted = Surface::new(TextContent::new("x")).background(Style::new().bg(Color::Blue));
+        let plain = Surface::new(TextBlock::new("x"));
+        let painted = Surface::new(TextBlock::new("x")).background(Style::new().bg(Color::Blue));
         assert_eq!(plain.revision().layout, painted.revision().layout);
         assert_ne!(plain.revision().paint, painted.revision().paint);
 
-        let padded = Surface::new(TextContent::new("x")).padding(Insets::all(1));
+        let padded = Surface::new(TextBlock::new("x")).padding(Insets::all(1));
         assert_ne!(plain.revision().layout, padded.revision().layout);
     }
 
@@ -2323,15 +2334,15 @@ mod tests {
     fn row_and_column_apply_cross_axis_alignment() {
         let row = Row::new()
             .alignment(VerticalAlignment::End)
-            .child(SizeBox::new(TextContent::new("one")).height(1))
-            .child(SizeBox::new(TextContent::new("two")).height(2));
+            .child(SizeBox::new(TextBlock::new("one")).height(1))
+            .child(SizeBox::new(TextBlock::new("two")).height(2));
         let row_layout = row.layout(Constraints::new(0, 8, 3, Some(3)), &mut LayoutCx::new());
         assert_eq!(row_layout.children[0].y, 2);
         assert_eq!(row_layout.children[1].y, 1);
 
         let column = Column::new()
             .alignment(HorizontalAlignment::End)
-            .child(TextContent::new("x"));
+            .child(TextBlock::new("x"));
         let column_layout = column.layout(Constraints::for_width(5), &mut LayoutCx::new());
         assert_eq!(column_layout.children[0].x, 4);
         assert_eq!(column_layout.children[0].node.size.width, 1);
@@ -2339,7 +2350,7 @@ mod tests {
 
     #[test]
     fn wrapper_options_use_the_correct_revision_channel() {
-        let child = || TextContent::new("x");
+        let child = || TextBlock::new("x");
 
         assert_ne!(
             SizeBox::new(child()).width(2).revision().layout,
@@ -2384,40 +2395,37 @@ mod tests {
         let row_revision = Row::new()
             .gap(1)
             .alignment(VerticalAlignment::Center)
-            .flex_child(2, TextContent::new("x"))
+            .flex_child(2, TextBlock::new("x"))
             .revision();
         assert_ne!(
             row_revision,
-            Row::new().child(TextContent::new("x")).revision()
+            Row::new().child(TextBlock::new("x")).revision()
         );
         assert_ne!(
-            Row::new()
-                .id("first")
-                .child(TextContent::new("x"))
-                .revision(),
+            Row::new().id("first").child(TextBlock::new("x")).revision(),
             Row::new()
                 .id("second")
-                .child(TextContent::new("x"))
+                .child(TextBlock::new("x"))
                 .revision()
         );
 
         let column_revision = Column::new()
             .gap(2)
             .alignment(HorizontalAlignment::Center)
-            .child(TextContent::new("x"))
+            .child(TextBlock::new("x"))
             .revision();
         assert_ne!(
             column_revision,
-            Column::new().child(TextContent::new("x")).revision()
+            Column::new().child(TextBlock::new("x")).revision()
         );
         assert_ne!(
             Column::new()
                 .id("first")
-                .child(TextContent::new("x"))
+                .child(TextBlock::new("x"))
                 .revision(),
             Column::new()
                 .id("second")
-                .child(TextContent::new("x"))
+                .child(TextBlock::new("x"))
                 .revision()
         );
     }
@@ -2426,8 +2434,8 @@ mod tests {
     fn column_places_variable_height_children_with_gap() {
         let component = Column::new()
             .gap(1)
-            .child(TextContent::new("one"))
-            .child(TextContent::new("two words wrapping"));
+            .child(TextBlock::new("one"))
+            .child(TextBlock::new("two words wrapping"));
         let mut cx = LayoutCx::new();
         let layout = component.layout(Constraints::for_width(8), &mut cx);
 

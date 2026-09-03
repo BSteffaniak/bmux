@@ -826,7 +826,7 @@ mod tests {
     use bmux_tui::component::{
         ChildLayout, Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
     };
-    use bmux_tui::composition::TextContent;
+    use bmux_tui::composition::TextBlock;
     use bmux_tui::event::{Event, EventOutcome, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect, Size};
@@ -904,7 +904,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             ScrollViewState::new(),
-            TextContent::new("abcdef"),
+            TextBlock::new("abcdef"),
         )
         .content_width(6)
         .revision();
@@ -912,7 +912,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             ScrollViewState::new(),
-            TextContent::new("abcdef")
+            TextBlock::new("abcdef")
                 .style(bmux_tui::style::Style::new().add_modifier(bmux_tui::style::Modifier::BOLD)),
         )
         .content_width(6)
@@ -924,7 +924,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             ScrollViewState::new(),
-            TextContent::new("abcdefgh"),
+            TextBlock::new("abcdefgh"),
         )
         .content_width(6)
         .revision();
@@ -937,7 +937,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             ScrollViewState::new(),
-            TextContent::new("abcdef"),
+            TextBlock::new("abcdef"),
         )
         .content_width(6)
         .revision();
@@ -948,7 +948,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             scrolled,
-            TextContent::new("abcdef"),
+            TextBlock::new("abcdef"),
         )
         .content_width(6)
         .revision();
@@ -959,7 +959,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             ScrollViewState::new(),
-            TextContent::new("abcdef"),
+            TextBlock::new("abcdef"),
         )
         .content_width(8)
         .revision();
@@ -974,7 +974,7 @@ mod tests {
             "scroll",
             LogicalSize::new(4, 1),
             state,
-            TextContent::new("abcdef"),
+            TextBlock::new("abcdef"),
         )
         .content_width(6);
         let mut layout_cx = LayoutCx::new();
@@ -1036,7 +1036,7 @@ mod tests {
             "scroll",
             LogicalSize::new(6, 2),
             state,
-            TextContent::new("first\nsecond\nthird"),
+            TextBlock::new("first\nsecond\nthird"),
         );
         let mut layout_cx = LayoutCx::new();
         let layout = component.layout(Constraints::tight(Size::new(6, 2)), &mut layout_cx);

@@ -511,7 +511,7 @@ mod tests {
     use super::{ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
-    use bmux_tui::composition::TextContent;
+    use bmux_tui::composition::TextBlock;
     use bmux_tui::event::Event;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
@@ -527,7 +527,7 @@ mod tests {
         let component = ModalFrameComponent::new(
             "confirm",
             frame,
-            TextContent::new("Proceed?").id("confirm.body"),
+            TextBlock::new("Proceed?").id("confirm.body"),
         );
         let layout = component.layout(Constraints::new(30, 30, 10, Some(10)), &mut LayoutCx::new());
         assert_eq!(layout.size.width, 30);
@@ -567,7 +567,7 @@ mod tests {
             ModalTheme::dark(Color::Green),
         )
         .placement(ModalPlacement::Anchored(Point::new(7, 3)));
-        let component = ModalFrameComponent::new("anchored", frame, TextContent::new("body"));
+        let component = ModalFrameComponent::new("anchored", frame, TextBlock::new("body"));
         let layout = component.layout(Constraints::new(30, 30, 10, Some(10)), &mut LayoutCx::new());
         let surface = layout
             .find_logical_rect(&"anchored.surface".into())
@@ -586,7 +586,7 @@ mod tests {
             theme,
         );
 
-        let component = ModalFrameComponent::new("modal", modal.clone(), TextContent::new(""));
+        let component = ModalFrameComponent::new("modal", modal.clone(), TextBlock::new(""));
         let layout = component.layout(
             Constraints::tight(frame.area().size()),
             &mut LayoutCx::new(),
@@ -684,7 +684,7 @@ mod tests {
             theme,
         );
 
-        let component = ModalFrameComponent::new("modal", modal, TextContent::new(""));
+        let component = ModalFrameComponent::new("modal", modal, TextBlock::new(""));
         let layout = component.layout(
             Constraints::tight(frame.area().size()),
             &mut LayoutCx::new(),

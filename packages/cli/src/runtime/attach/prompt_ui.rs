@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use super::input::{TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent};
 use super::render::opaque_row_text;
 use super::state::AttachCursorState;
@@ -14,11 +16,10 @@ use bmux_attach_layout_protocol::{
 use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::TextBlock;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::hit::HitMap;
-use bmux_tui::input::TextInput;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Text};
 use bmux_tui_components::action_row::{ActionButton, ActionRowComponent, ActionRowState};
@@ -35,7 +36,7 @@ use bmux_tui_components::select_dropdown::{
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
 };
-use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
     TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
 };
@@ -1216,7 +1217,7 @@ impl AttachPromptState {
         let mut buffer = surface_buffer(area);
         let mut frame = Frame::new(&mut buffer);
         let modal_component =
-            ModalFrameComponent::new("prompt.overlay", modal.clone(), TextContent::new(""))
+            ModalFrameComponent::new("prompt.overlay", modal.clone(), TextBlock::new(""))
                 .chrome(!extension_chrome);
         paint_component(&modal_component, area, &mut frame);
         let content = modal.content_area(area);
@@ -1946,9 +1947,11 @@ fn render_command_palette(
             "Search options".to_owned()
         }
     });
-    let input = TextInput::new(query)
-        .id("command-palette.query")
-        .placeholder(placeholder);
+    let input_state = RefCell::new(TextInputState::new(query.clone()));
+    let input_policy = TextInputPolicy::raw();
+    let input = TextInputComponent::new("command-palette.query", &input_state, &input_policy)
+        .placeholder(&placeholder, theme.muted)
+        .focused(true);
     paint_component(&input, input_area, frame);
 
     let list_area = Rect::new(
@@ -1969,7 +1972,7 @@ fn render_command_palette(
                 };
                 list.component(
                     source_index,
-                    TextContent::new(Text::from_lines([items[source_index].clone()]))
+                    TextBlock::new(Text::from_lines([items[source_index].clone()]))
                         .id(format!("command-list.label.{source_index}"))
                         .style(style),
                 )
@@ -2997,6 +3000,38 @@ mod tests {
             .expect("small layout");
         assert_eq!((small.surface.rect.x, small.surface.rect.y), (0, 0));
         assert_eq!((small.surface.rect.w, small.surface.rect.h), (20, 6));
+    }
+
+    #[test]
+    fn command_palette_query_cursor_tracks_caller_owned_edits() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Command Palette",
+                vec![PromptOption::new("commit", "Commit")],
+            )
+            .modal_id("command-palette"),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+
+        let empty = state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .expect("empty palette should render");
+        let empty_cursor = empty.cursor_state.expect("empty query cursor");
+
+        for ch in "co".chars() {
+            let _ = state.handle_key_event(&key_event(KeyCode::Char(ch)));
+        }
+        let edited = state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .expect("edited palette should render");
+        let edited_cursor = edited.cursor_state.expect("edited query cursor");
+
+        assert!(empty_cursor.visible);
+        assert!(edited_cursor.visible);
+        assert_eq!(edited_cursor.y, empty_cursor.y);
+        assert_eq!(edited_cursor.x, empty_cursor.x.saturating_add(2));
     }
 
     #[test]

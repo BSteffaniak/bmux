@@ -1083,7 +1083,7 @@ mod tests {
 
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
-    use bmux_tui::composition::TextContent;
+    use bmux_tui::composition::TextBlock;
     use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
@@ -1358,8 +1358,8 @@ mod tests {
             PanelGroup::new(PanelGroupAxis::Horizontal).policy(PanelGroupPolicy::interactive()),
             &state,
         )
-        .child(TextContent::new("left").id("left"))
-        .child(TextContent::new("right").id("right"));
+        .child(TextBlock::new("left").id("left"))
+        .child(TextBlock::new("right").id("right"));
         let layout = component.layout(Constraints::new(10, 10, 2, Some(2)), &mut LayoutCx::new());
 
         assert_eq!(layout.children.len(), 2);
@@ -1405,8 +1405,8 @@ mod tests {
             PanelGroup::new(PanelGroupAxis::Vertical),
             &state,
         )
-        .child(TextContent::new("top"))
-        .child(TextContent::new("bottom"));
+        .child(TextBlock::new("top"))
+        .child(TextBlock::new("bottom"));
         let layout = component.layout(Constraints::new(6, 6, 6, Some(6)), &mut LayoutCx::new());
 
         assert_eq!(layout.children[0].y, 0);

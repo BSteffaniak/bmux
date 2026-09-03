@@ -483,7 +483,7 @@ mod tests {
         Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutEnvironment, LayoutId,
         LayoutNode, LogicalSize,
     };
-    use bmux_tui::composition::TextContent;
+    use bmux_tui::composition::TextBlock;
     use bmux_tui::damage::{Damage, DamagePolicy};
     use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
@@ -893,9 +893,9 @@ mod tests {
     #[test]
     fn stable_key_scroll_and_ensure_visible_use_exact_item_geometry() {
         let list = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b line that wraps"))
-            .item("c", 0, TextContent::new("c"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b line that wraps"))
+            .item("c", 0, TextBlock::new("c"));
         let mut state = VirtualListState::new(1);
         list.sync(6, &mut state, &mut LayoutCx::new());
 
@@ -912,10 +912,10 @@ mod tests {
     #[test]
     fn focused_key_is_ensured_visible_and_restored_after_modal_scope() {
         let list = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b"))
-            .item("c", 0, TextContent::new("c"))
-            .item("d", 0, TextContent::new("d"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"))
+            .item("d", 0, TextBlock::new("d"));
         let mut state = VirtualListState::new(0);
         list.sync(8, &mut state, &mut LayoutCx::new());
 
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn capability_revision_invalidates_item_measurements_and_layouts() {
         let list =
-            VirtualList::new("messages").item("a", 0, TextContent::new("a message that wraps"));
+            VirtualList::new("messages").item("a", 0, TextBlock::new("a message that wraps"));
         let mut state = VirtualListState::new(0);
         let mut cx = LayoutCx::new();
 
@@ -961,8 +961,8 @@ mod tests {
     #[test]
     fn state_geometry_queries_hide_index_implementation() {
         let list = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b wraps here"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b wraps here"));
         let mut state = VirtualListState::new(1);
         list.sync(6, &mut state, &mut LayoutCx::new());
 
@@ -979,8 +979,8 @@ mod tests {
     #[test]
     fn viewport_height_does_not_remeasure_but_width_and_removed_keys_do() {
         let list = VirtualList::new("messages")
-            .item("a", 1, TextContent::new("a message that wraps"))
-            .item("b", 1, TextContent::new("b"));
+            .item("a", 1, TextBlock::new("a message that wraps"))
+            .item("b", 1, TextBlock::new("b"));
         let mut state = VirtualListState::new(1);
         let mut cx = LayoutCx::new();
         list.sync(8, &mut state, &mut cx);
@@ -994,8 +994,8 @@ mod tests {
         assert_eq!(cx.measured_nodes(), initial_measurements);
 
         let reordered = VirtualList::new("messages")
-            .item("b", 1, TextContent::new("b"))
-            .item("a", 1, TextContent::new("a message that wraps"));
+            .item("b", 1, TextBlock::new("b"))
+            .item("a", 1, TextBlock::new("a message that wraps"));
         reordered.sync(8, &mut state, &mut cx);
         assert_eq!(cx.measured_nodes(), initial_measurements);
 
@@ -1004,7 +1004,7 @@ mod tests {
         let retained_before_removal = state.layout_cache().len();
 
         VirtualList::new("messages")
-            .item("a", 1, TextContent::new("a message that wraps"))
+            .item("a", 1, TextBlock::new("a message that wraps"))
             .sync(6, &mut state, &mut cx);
         assert!(state.layout_cache().len() < retained_before_removal);
         assert!(state.layout_cache().stats().released > 0);
@@ -1017,14 +1017,14 @@ mod tests {
         let mut cx = LayoutCx::new();
         let initial = VirtualList::new("messages").component(
             "a",
-            TextContent::new("message").style(Style::new().fg(bmux_tui::style::Color::Red)),
+            TextBlock::new("message").style(Style::new().fg(bmux_tui::style::Color::Red)),
         );
         initial.sync(area.width, &mut state, &mut cx);
         let measured = cx.measured_nodes();
 
         let changed = VirtualList::new("messages").component(
             "a",
-            TextContent::new("message").style(Style::new().fg(bmux_tui::style::Color::Blue)),
+            TextBlock::new("message").style(Style::new().fg(bmux_tui::style::Color::Blue)),
         );
         changed.sync(area.width, &mut state, &mut cx);
         assert_eq!(cx.measured_nodes(), measured);
@@ -1083,10 +1083,10 @@ mod tests {
     #[test]
     fn paints_and_registers_only_intersecting_variable_height_items() {
         let list = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b line that wraps"))
-            .item("c", 0, TextContent::new("c"))
-            .item("d", 0, TextContent::new("d"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b line that wraps"))
+            .item("c", 0, TextBlock::new("c"))
+            .item("d", 0, TextBlock::new("d"));
         let mut state = VirtualListState::new(1);
         list.sync(6, &mut state, &mut LayoutCx::new());
         state.scroll.set_vertical_offset(2);
@@ -1229,7 +1229,7 @@ mod tests {
     fn large_collection_paint_work_is_bounded_by_viewport() {
         let mut list = VirtualList::new("messages");
         for key in 0..10_000usize {
-            list = list.item(key, 0, TextContent::new("x"));
+            list = list.item(key, 0, TextBlock::new("x"));
         }
         let mut state = VirtualListState::new(0);
         list.sync(8, &mut state, &mut LayoutCx::new());
@@ -1257,9 +1257,9 @@ mod tests {
     #[test]
     fn removed_anchor_falls_forward_then_back_and_empty_resets() {
         let initial = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b"))
-            .item("c", 0, TextContent::new("c"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"));
         let mut state = VirtualListState::new(1);
         initial.sync(8, &mut state, &mut LayoutCx::new());
         state
@@ -1268,8 +1268,8 @@ mod tests {
         state.capture_anchor();
 
         let removed = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("c", 0, TextContent::new("c"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("c", 0, TextBlock::new("c"));
         removed.sync(8, &mut state, &mut LayoutCx::new());
         state.restore_anchor(1);
         assert_eq!(state.scroll.vertical_offset(), 2);
@@ -1283,9 +1283,9 @@ mod tests {
     #[test]
     fn stable_top_anchor_survives_insertion_and_width_reflow() {
         let first = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("short"))
-            .item("b", 0, TextContent::new("b message wraps here"))
-            .item("c", 0, TextContent::new("c"));
+            .item("a", 0, TextBlock::new("short"))
+            .item("b", 0, TextBlock::new("b message wraps here"))
+            .item("c", 0, TextBlock::new("c"));
         let mut state = VirtualListState::new(1);
         first.sync(8, &mut state, &mut LayoutCx::new());
         let b_start = first.item_offset(&state, &"b").unwrap();
@@ -1293,10 +1293,10 @@ mod tests {
         state.capture_anchor();
 
         let changed = VirtualList::new("messages")
-            .item("new", 0, TextContent::new("inserted"))
-            .item("a", 0, TextContent::new("short"))
-            .item("b", 0, TextContent::new("b message wraps here"))
-            .item("c", 0, TextContent::new("c"));
+            .item("new", 0, TextBlock::new("inserted"))
+            .item("a", 0, TextBlock::new("short"))
+            .item("b", 0, TextBlock::new("b message wraps here"))
+            .item("c", 0, TextBlock::new("c"));
         changed.sync(6, &mut state, &mut LayoutCx::new());
         state.restore_anchor(3);
 
@@ -1309,10 +1309,10 @@ mod tests {
     #[test]
     fn stable_viewport_survives_complete_keyed_mutation_sequence() {
         let initial = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b wraps across rows"))
-            .item("c", 0, TextContent::new("c wraps across rows"))
-            .item("d", 0, TextContent::new("d"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b wraps across rows"))
+            .item("c", 0, TextBlock::new("c wraps across rows"))
+            .item("d", 0, TextBlock::new("d"));
         let mut state = VirtualListState::new(1);
         initial.sync(8, &mut state, &mut LayoutCx::new());
         state
@@ -1321,38 +1321,38 @@ mod tests {
         state.capture_anchor();
 
         let appended = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b wraps across rows"))
-            .item("c", 0, TextContent::new("c wraps across rows"))
-            .item("d", 0, TextContent::new("d"))
-            .item("e", 0, TextContent::new("e"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b wraps across rows"))
+            .item("c", 0, TextBlock::new("c wraps across rows"))
+            .item("d", 0, TextBlock::new("d"))
+            .item("e", 0, TextBlock::new("e"));
         assert_anchor_after_sync(&appended, 8, &mut state, "c", 1);
 
         let inserted = VirtualList::new("messages")
-            .item("new", 0, TextContent::new("inserted above"))
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b wraps across rows"))
-            .item("c", 0, TextContent::new("c wraps across rows"))
-            .item("d", 0, TextContent::new("d"))
-            .item("e", 0, TextContent::new("e"));
+            .item("new", 0, TextBlock::new("inserted above"))
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b wraps across rows"))
+            .item("c", 0, TextBlock::new("c wraps across rows"))
+            .item("d", 0, TextBlock::new("d"))
+            .item("e", 0, TextBlock::new("e"));
         assert_anchor_after_sync(&inserted, 8, &mut state, "c", 1);
 
         let reordered = VirtualList::new("messages")
-            .item("e", 0, TextContent::new("e"))
-            .item("d", 0, TextContent::new("d"))
-            .item("c", 0, TextContent::new("c wraps across rows"))
-            .item("b", 0, TextContent::new("b wraps across rows"))
-            .item("a", 0, TextContent::new("a"))
-            .item("new", 0, TextContent::new("inserted above"));
+            .item("e", 0, TextBlock::new("e"))
+            .item("d", 0, TextBlock::new("d"))
+            .item("c", 0, TextBlock::new("c wraps across rows"))
+            .item("b", 0, TextBlock::new("b wraps across rows"))
+            .item("a", 0, TextBlock::new("a"))
+            .item("new", 0, TextBlock::new("inserted above"));
         assert_anchor_after_sync(&reordered, 8, &mut state, "c", 1);
         assert_anchor_after_sync(&reordered, 6, &mut state, "c", 1);
 
         let removed_above = VirtualList::new("messages")
-            .item("e", 0, TextContent::new("e"))
-            .item("c", 0, TextContent::new("c wraps across rows"))
-            .item("b", 0, TextContent::new("b wraps across rows"))
-            .item("a", 0, TextContent::new("a"))
-            .item("new", 0, TextContent::new("inserted above"));
+            .item("e", 0, TextBlock::new("e"))
+            .item("c", 0, TextBlock::new("c wraps across rows"))
+            .item("b", 0, TextBlock::new("b wraps across rows"))
+            .item("a", 0, TextBlock::new("a"))
+            .item("new", 0, TextBlock::new("inserted above"));
         assert_anchor_after_sync(&removed_above, 6, &mut state, "c", 1);
     }
 
@@ -1374,9 +1374,9 @@ mod tests {
     #[test]
     fn bottom_follow_and_ensure_visible_use_keyed_collection_geometry() {
         let list = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b"))
-            .item("c", 0, TextContent::new("c"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"));
         let mut state = VirtualListState::new(1);
         list.sync(8, &mut state, &mut LayoutCx::new());
         state.scroll.set_follow_bottom(true);
@@ -1395,9 +1395,9 @@ mod tests {
     #[test]
     fn bottom_follow_survives_append_without_jump() {
         let initial = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b"))
-            .item("c", 0, TextContent::new("c"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"));
         let mut state = VirtualListState::new(1);
         initial.sync(8, &mut state, &mut LayoutCx::new());
         state.scroll.set_follow_bottom(true);
@@ -1405,10 +1405,10 @@ mod tests {
         assert_eq!(state.scroll.vertical_offset(), 3);
 
         let appended = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b"))
-            .item("c", 0, TextContent::new("c"))
-            .item("d", 0, TextContent::new("d message wraps"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"))
+            .item("d", 0, TextBlock::new("d message wraps"));
         appended.sync(8, &mut state, &mut LayoutCx::new());
         state.restore_anchor(2);
 
@@ -1477,16 +1477,16 @@ mod tests {
     #[test]
     fn sync_retains_measurements_across_reorder_and_exposes_key_offsets() {
         let first = VirtualList::new("messages")
-            .item("a", 0, TextContent::new("a"))
-            .item("b", 0, TextContent::new("b"));
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"));
         let mut state = VirtualListState::new(1);
         let mut cx = LayoutCx::new();
         first.sync(8, &mut state, &mut cx);
         let measured = cx.measured_nodes();
 
         let reordered = VirtualList::new("messages")
-            .item("b", 0, TextContent::new("b"))
-            .item("a", 0, TextContent::new("a"));
+            .item("b", 0, TextBlock::new("b"))
+            .item("a", 0, TextBlock::new("a"));
         reordered.sync(8, &mut state, &mut cx);
 
         assert_eq!(cx.measured_nodes(), measured);

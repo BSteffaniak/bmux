@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::{Column, Row, Surface, TextContent};
+use bmux_tui::composition::{Column, Row, Surface, TextBlock};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
@@ -190,7 +190,7 @@ fn render_playground(
             "playground.pane",
             pane,
             &pane_state,
-            TextContent::new("Drag title or resize border").id("playground.pane.content"),
+            TextBlock::new("Drag title or resize border").id("playground.pane.content"),
         ),
         pane_area,
         frame,
@@ -207,7 +207,7 @@ fn render_playground(
         &ModalFrameComponent::new(
             "playground.modal",
             modal,
-            TextContent::new("Modal placement").id("playground.modal.body"),
+            TextBlock::new("Modal placement").id("playground.modal.body"),
         ),
         modal_area,
         frame,
@@ -218,10 +218,10 @@ fn render_playground(
         Column::new().id("playground.composed-card.column").child(
             Row::new()
                 .id("playground.composed-card.header")
-                .child(TextContent::new("Composed").id("playground.composed-card.title"))
+                .child(TextBlock::new("Composed").id("playground.composed-card.title"))
                 .flex_child(
                     1,
-                    TextContent::new("local layout").id("playground.composed-card.detail"),
+                    TextBlock::new("local layout").id("playground.composed-card.detail"),
                 ),
         ),
     )
@@ -236,9 +236,9 @@ fn render_playground(
         interactive_panel_group(),
         panel_group_state,
     )
-    .child(TextContent::new(" Panel 0").id("playground.panel.0"))
-    .child(TextContent::new(" Panel 1").id("playground.panel.1"))
-    .child(TextContent::new(" Panel 2").id("playground.panel.2"));
+    .child(TextBlock::new(" Panel 0").id("playground.panel.0"))
+    .child(TextBlock::new(" Panel 1").id("playground.panel.1"))
+    .child(TextBlock::new(" Panel 2").id("playground.panel.2"));
     render_component(&group, group_area, frame);
 
     frame.write_line(Rect::new(1, 16, 68, 1), &Line::from(message));

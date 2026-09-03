@@ -45,7 +45,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, LayoutCx};
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::TextBlock;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::measured_list::MeasuredListIndex;
@@ -463,7 +463,7 @@ fn benchmark_item(index: usize, paint_revision: u64) -> impl Component {
             "long item {index} with several words that exercise variable-height exact measurement across a constrained terminal width"
         ),
     };
-    TextContent::new(text).style(if paint_revision == 0 {
+    TextBlock::new(text).style(if paint_revision == 0 {
         bmux_tui::style::Style::new()
     } else {
         bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Blue)

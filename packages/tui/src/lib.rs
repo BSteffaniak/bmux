@@ -52,7 +52,7 @@ pub mod prelude {
     };
     pub use crate::composition::{
         Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, ScrollViewport,
-        SizeBox, Stack, StyleScope, Surface, TextContent, TextProjectionRow, VerticalAlignment,
+        SizeBox, Stack, StyleScope, Surface, TextBlock, TextProjectionRow, VerticalAlignment,
         Visibility,
     };
     #[cfg(feature = "crossterm")]
@@ -73,10 +73,6 @@ pub mod prelude {
         ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
     };
     pub use crate::image_scene::{ImageScene, ImageSceneDelta};
-    pub use crate::input::{
-        TextInput, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
-        TextInputProjection,
-    };
     pub use crate::interaction::{InteractionRoute, InteractionRouter};
     pub use crate::layout::{
         Breakpoint, Breakpoints, Constraint, Direction, DockAreas, DockLayout, Layout, Responsive,
@@ -95,7 +91,7 @@ pub mod prelude {
     pub use crate::style::{Color, Modifier, Style};
     pub use crate::terminal::{DrawStats, Terminal};
     pub use crate::text::{Line, Span, Text, TextWrap, TextWrapGeometry, wrap_text};
-    pub use crate::text_block::{Alignment, TextBlock};
+    pub use crate::text_block::Alignment;
     pub use crate::text_width::{
         display_width, truncate_to_display_width, wrap_text_with_continuation,
         wrap_text_with_continuation_character,

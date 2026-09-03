@@ -302,13 +302,13 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
     use bmux_tui::paint::PaintCx;
-    use bmux_tui::prelude::TextContent;
+    use bmux_tui::prelude::TextBlock;
 
     use super::{FormFieldComponent, FormFieldStyles};
 
     #[test]
     fn component_measures_and_paints_child_with_chrome() {
-        let component = FormFieldComponent::new("name", "Name", TextContent::new("input"))
+        let component = FormFieldComponent::new("name", "Name", TextBlock::new("input"))
             .required(true)
             .help("Enter name")
             .error("Missing")
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn component_constraints_limit_child_before_adding_chrome() {
         let component =
-            FormFieldComponent::new("name", "Name", TextContent::new("one two three four five"))
+            FormFieldComponent::new("name", "Name", TextBlock::new("one two three four five"))
                 .help("Help");
         let layout = component.layout(Constraints::new(8, 8, 0, Some(4)), &mut LayoutCx::new());
         assert_eq!(layout.size.height, 4);

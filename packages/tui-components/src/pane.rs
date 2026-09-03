@@ -897,7 +897,7 @@ mod tests {
 
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
-    use bmux_tui::composition::TextContent;
+    use bmux_tui::composition::TextBlock;
     use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
@@ -1099,7 +1099,7 @@ mod tests {
                     bounds: PaneBoundsPolicy::default(),
                 }),
             &state,
-            TextContent::new("body").id("pane.body"),
+            TextBlock::new("body").id("pane.body"),
         );
         let layout = component.layout(Constraints::new(12, 12, 5, Some(5)), &mut LayoutCx::new());
         assert_eq!(layout.size.width, 12);
@@ -1144,7 +1144,7 @@ mod tests {
                 bounds: PaneBoundsPolicy::default(),
             }),
             &state,
-            TextContent::new("inside").id("pane.body"),
+            TextBlock::new("inside").id("pane.body"),
         );
         let layout = component.layout(Constraints::new(8, 8, 4, Some(4)), &mut LayoutCx::new());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 4));

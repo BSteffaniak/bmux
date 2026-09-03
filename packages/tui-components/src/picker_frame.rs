@@ -633,7 +633,7 @@ impl From<crate::theme::ComponentTheme> for PickerFrameStyles {
 mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::{Component, Constraints, LayoutCx};
-    use bmux_tui::composition::TextContent;
+    use bmux_tui::composition::TextBlock;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
     use bmux_tui::paint::PaintCx;
@@ -739,9 +739,9 @@ mod tests {
         let component = PickerFrameComponent::new(
             "picker",
             picker,
-            TextContent::new("first\nsecond").id("picker.list"),
+            TextBlock::new("first\nsecond").id("picker.list"),
         )
-        .input(TextContent::new("query").id("picker.input"));
+        .input(TextBlock::new("query").id("picker.input"));
 
         let layout = component.layout(Constraints::new(40, 40, 12, Some(12)), &mut LayoutCx::new());
         let panel = &layout.children[0];
@@ -785,7 +785,7 @@ mod tests {
                 max_size: Size::new(12, 5),
                 ..PickerFramePolicy::palette()
             }),
-            TextContent::new("item").id("picker.list"),
+            TextBlock::new("item").id("picker.list"),
         );
         let layout = component.layout(Constraints::new(12, 12, 5, Some(5)), &mut LayoutCx::new());
 

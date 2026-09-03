@@ -1,8 +1,10 @@
+#![cfg(all(feature = "button", feature = "modal-frame", feature = "picker-frame"))]
+
 use std::cell::Cell;
 
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::TextBlock;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Size};
 use bmux_tui::geometry::{Point, Rect};
@@ -35,7 +37,7 @@ fn rendered(theme: ComponentTheme) -> Buffer {
             .title("Picker")
             .policy(PickerFramePolicy::palette().max_size(Size::new(18, 6)))
             .styles(theme.picker_frame_styles()),
-        TextContent::new("").id("theme.picker.list"),
+        TextBlock::new("").id("theme.picker.list"),
     );
     let picker_area = Rect::new(1, 3, 20, 7);
     let layout = picker.layout(Constraints::tight(picker_area.size()), &mut LayoutCx::new());
@@ -54,7 +56,7 @@ fn rendered(theme: ComponentTheme) -> Buffer {
             theme.modal_theme(),
         )
         .title("Modal"),
-        TextContent::new(""),
+        TextBlock::new(""),
     );
     let layout = modal.layout(Constraints::tight(modal_area.size()), &mut LayoutCx::new());
     PaintCx::new(&mut frame).with_child(

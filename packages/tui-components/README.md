@@ -110,7 +110,10 @@ interaction policy belong here rather than in application-local raw rendering. O
 components paint through `PaintCx`; scratch-frame adaptation and unrestricted `Frame`/buffer access
 are backend/runtime concerns, not an application integration model.
 
-`bmux_tui` intentionally carries keyboard and text-editing in its baseline primitive API. Public
-event, focus, list, viewport, picker, palette, history, and text-input modules directly expose those
-types. Component-owned optional dependencies—including terminal-grid and Unicode helpers—remain
-isolated behind component features and the repository feature-matrix guard.
+`bmux_tui` intentionally carries keyboard events and foundational text-edit painting in its
+baseline primitive API. Applications should use `TextInputComponent` or `TextInputBoxComponent`
+from this crate; the foundational `bmux_tui::input::TextInput` leaf is an implementation detail for
+component authors and is not prelude-exported. `TextInputState` owns the edit buffer, cursor,
+selection, pointer gesture, and viewport offset; `TextInputPolicy` owns keyboard, mouse, edge, and
+outer-selection behavior. Component-owned optional dependencies—including terminal-grid and Unicode
+helpers—remain isolated behind component features and the repository feature-matrix guard.

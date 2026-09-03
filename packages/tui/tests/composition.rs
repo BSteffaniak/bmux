@@ -9,13 +9,13 @@ fn message_card_sketch_uses_only_canonical_composition() {
             .child(
                 Row::new()
                     .gap(1)
-                    .child(TextContent::new("Ada").style(Style::new().add_modifier(Modifier::BOLD)))
+                    .child(TextBlock::new("Ada").style(Style::new().add_modifier(Modifier::BOLD)))
                     .flex(Flex::new(
                         1,
-                        TextContent::new("10:42").alignment(Alignment::Right),
+                        TextBlock::new("10:42").alignment(Alignment::Right),
                     )),
             )
-            .child(TextContent::new(
+            .child(TextBlock::new(
                 "A variable-height message wraps without precomputing its child height.",
             )),
     )

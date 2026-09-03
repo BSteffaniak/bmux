@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx, LogicalSize};
-use bmux_tui::composition::TextContent;
+use bmux_tui::composition::TextBlock;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -171,7 +171,7 @@ fn render_field(frame: &mut Frame<'_>) {
         &FormFieldComponent::new(
             "gallery.form-field",
             "Project",
-            TextContent::new("bmux").id("gallery.form-field.control"),
+            TextBlock::new("bmux").id("gallery.form-field.control"),
         )
         .required(true)
         .help("Shown with a required marker")
@@ -189,7 +189,7 @@ fn render_pane(frame: &mut Frame<'_>) {
             "gallery.pane",
             Pane::new().title("Pane").padding(Insets::all(1)),
             &state,
-            TextContent::new("Pane content area").id("gallery.pane.content"),
+            TextBlock::new("Pane content area").id("gallery.pane.content"),
         ),
         area,
         frame,
@@ -352,7 +352,7 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
             "gallery.scroll",
             LogicalSize::new(21, 3),
             scroll_state,
-            TextContent::new(Text::from_lines(scroll_lines)).wrap(TextWrap::None),
+            TextBlock::new(Text::from_lines(scroll_lines)).wrap(TextWrap::None),
         )
         .content_width(24),
         Rect::new(1, 24, 22, 3),
@@ -365,7 +365,7 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
         Span::styled("demo", Style::new().fg(Color::Magenta)),
     ])];
     render_component(
-        &TextContent::new(Text::from_lines(text_lines))
+        &TextBlock::new(Text::from_lines(text_lines))
             .id("gallery.styled-text")
             .wrap(TextWrap::Word),
         Rect::new(25, 24, 14, 3),
@@ -415,7 +415,7 @@ fn render_picker(frame: &mut Frame<'_>) {
         &input_state,
     )
     .policy(TextInputBoxPolicy::bare().focused(true));
-    let list = TextContent::new("Open file\nClose window").id("gallery.picker.list");
+    let list = TextBlock::new("Open file\nClose window").id("gallery.picker.list");
     render_component(
         &PickerFrameComponent::new("gallery.picker", picker, list).input(input),
         Rect::new(34, 6, 34, 12),
@@ -436,7 +436,7 @@ fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
         &ModalFrameComponent::new(
             "gallery.modal",
             modal,
-            TextContent::new("Opaque modal frame").id("gallery.modal.body"),
+            TextBlock::new("Opaque modal frame").id("gallery.modal.body"),
         ),
         Rect::new(34, 18, 34, 6),
         frame,

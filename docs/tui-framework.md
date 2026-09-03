@@ -93,7 +93,7 @@ product-specific controls:
   cross-axis alignment, and deterministic constrained overflow;
 - `Padding`, `SizeBox`, `Fill`, `Align`, `Flex`, `Clip`, `StyleScope`,
   `Visibility`, `Stack`, and `Keyed` modify one composition concern;
-- `TextContent` provides measurable rich text and source projection;
+- `TextBlock` provides measurable rich text and source projection;
 - `ScrollViewport` applies caller-owned logical offsets through scoped
   translation and clipping.
 
@@ -101,9 +101,13 @@ A rectangular style belongs to the component that measures that rectangle.
 Consumers must not extend backgrounds, reconstruct wrapped rows, or mutate the
 buffer after rendering to compensate for missing geometry.
 
-`chrome::Panel` remains the shared border/title/padding vocabulary for current
-consumers. New child-owning surfaces should prefer `Surface`; duplicate panel,
-modal, clear, overlay, or content-layout engines must not be introduced.
+Editable controls belong to `bmux_tui_components`: use `TextInputComponent` or
+`TextInputBoxComponent` with caller-owned `TextInputState`. The core
+`bmux_tui::input::TextInput` leaf exists for component implementation and is not
+an application-facing/prelude API.
+
+New child-owning surfaces should prefer `Surface`; duplicate panel, modal,
+clear, overlay, or content-layout engines must not be introduced.
 
 ## Text and selection
 
