@@ -62,7 +62,6 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -7592,20 +7591,23 @@ fn help_overlay_render_ops(
         content.width,
         content.height.saturating_sub(hints_height),
     );
-    let rich_lines = lines
-        .iter()
-        .map(|line| TuiLine::raw(line.clone()))
-        .collect::<Vec<_>>();
-    let mut state = TextViewState::new();
-    state.set_vertical_scroll(scroll);
-    TextView::new(&rich_lines)
-        .policy(TextViewPolicy::scrollable())
-        .styles(TextViewStyles {
-            text: component_theme.text,
-            empty: component_theme.muted,
-            background: component_theme.surfaces.overlay,
-        })
-        .render(body_area, &state, &mut frame);
+    let text = bmux_tui::prelude::Text::from_lines(
+        lines
+            .iter()
+            .map(|line| TuiLine::raw(line.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let body = TextBlock::new(text)
+        .id("attach.help.body")
+        .style(component_theme.text)
+        .vertical_scroll(scroll);
+    let body_layout = body.layout(Constraints::tight(body_area.size()), &mut LayoutCx::new());
+    PaintCx::new(&mut frame).with_child(
+        i32::from(body_area.x),
+        i64::from(body_area.y),
+        LocalRect::new(0, 0, body_area.width, body_area.height),
+        |cx| body.paint(&body_layout, cx),
+    );
     if hints_height > 0 {
         let hints = [
             KeyHint::new("↑↓", "scroll"),

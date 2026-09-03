@@ -170,6 +170,8 @@ The virtual-list contract is:
   interaction metadata;
 - top-item and bottom-follow anchors survive mutation and width reflow;
 - scroll-to-key and ensure-visible use keyed geometry;
+- caller actions use `scroll_by`, `scroll_to_top`, and `scroll_to_bottom` rather
+  than mutating or recomputing row offsets outside the collection state;
 - a retained layout is reused for painting instead of being remeasured there.
 
 Exact measurement is the correctness model. Estimated heights are not part of

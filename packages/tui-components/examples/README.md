@@ -10,7 +10,9 @@ canonical lifecycle:
 2. Call `sync` at the current width so `VirtualListState` retains authoritative
    exact layouts by key, layout revision, width, and environment.
 3. Keep logical scrolling and anchor state in the caller-owned
-   `VirtualListState`.
+   `VirtualListState`. Use `scroll_by` for row/page movement, `scroll_to_top`
+   and `scroll_to_bottom` for Home/End behavior, and capture/sync/restore around
+   keyed mutations so top or bottom anchoring reconciles against exact geometry.
 4. Paint through a clipped `PaintCx`; only viewport-intersecting items may paint
    or register hits, focus, semantics, selection, images, and damage.
 

@@ -135,6 +135,27 @@ where
         )
     }
 
+    /// Scroll to the first logical collection row and stop following appends.
+    pub const fn scroll_to_top(&mut self) {
+        self.scroll.set_vertical_offset(0);
+    }
+
+    /// Move by a signed logical row delta and clamp to the collection extent.
+    pub fn scroll_by(&mut self, rows: isize, viewport_height: usize) -> bool {
+        let old = self.scroll.vertical_offset();
+        let next = old.saturating_add_signed(rows);
+        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        self.scroll.set_vertical_offset(next.min(maximum));
+        self.scroll.vertical_offset() != old
+    }
+
+    /// Scroll to the final logical collection row and follow subsequent appends.
+    pub fn scroll_to_bottom(&mut self, viewport_height: usize) {
+        let maximum = self.index.total_height().saturating_sub(viewport_height);
+        self.scroll.set_vertical_offset(maximum);
+        self.scroll.set_follow_bottom(true);
+    }
+
     /// Clamp logical scrolling to the current collection extent.
     pub fn clamp_scroll(&mut self, viewport_height: usize) {
         let maximum = self.index.total_height().saturating_sub(viewport_height);
@@ -496,6 +517,7 @@ mod tests {
     use bmux_tui::paint::{LocalRect, PaintCx};
     use bmux_tui::selection::{SelectionFragment, SelectionScope};
     use bmux_tui::style::Style;
+    use bmux_tui::text::{Line, Text};
 
     struct ExternallyRevisedItem;
 
@@ -956,6 +978,66 @@ mod tests {
         assert_eq!(cx.measured_nodes(), 2);
         assert_eq!(state.key_at_offset(0), Some(&"a"));
         assert_eq!(state.item_offset(&"a"), Some(0));
+    }
+
+    #[test]
+    fn logical_navigation_clamps_and_disables_bottom_follow() {
+        fn rows(lines: &[&str]) -> TextBlock {
+            TextBlock::new(Text::from_lines(
+                lines
+                    .iter()
+                    .map(|line| Line::raw(*line))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        let mut state = VirtualListState::new(0);
+        VirtualList::new("messages")
+            .item("a", 0, rows(&["one", "two", "three", "four", "five"]))
+            .sync(8, &mut state, &mut LayoutCx::new());
+
+        state.scroll_to_bottom(2);
+        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert!(state.scroll.follows_bottom());
+        assert!(state.scroll_by(-2, 2));
+        assert_eq!(state.scroll.vertical_offset(), 1);
+        assert!(!state.scroll.follows_bottom());
+        assert!(state.scroll_by(isize::MAX, 2));
+        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert!(!state.scroll_by(1, 2));
+        state.scroll_to_top();
+        assert_eq!(state.scroll.vertical_offset(), 0);
+        assert!(!state.scroll.follows_bottom());
+    }
+
+    #[test]
+    fn scroll_to_bottom_sets_exact_offset_and_follows_appends() {
+        fn rows(lines: &[&str]) -> TextBlock {
+            TextBlock::new(Text::from_lines(
+                lines
+                    .iter()
+                    .map(|line| Line::raw(*line))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        let mut state = VirtualListState::new(0);
+        VirtualList::new("messages")
+            .item("a", 0, rows(&["one", "two", "three"]))
+            .sync(8, &mut state, &mut LayoutCx::new());
+
+        state.scroll_to_bottom(2);
+        assert_eq!(state.scroll.vertical_offset(), 1);
+        assert!(state.scroll.follows_bottom());
+
+        state.capture_anchor();
+        VirtualList::new("messages")
+            .item("a", 0, rows(&["one", "two", "three"]))
+            .item("b", 0, rows(&["four", "five"]))
+            .sync(8, &mut state, &mut LayoutCx::new());
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert!(state.scroll.follows_bottom());
     }
 
     #[test]

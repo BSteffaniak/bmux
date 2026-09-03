@@ -30,12 +30,6 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSiz
 use bmux_tui_components::scrollbar::{
     ScrollbarComponent, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
 };
-use bmux_tui_components::select_dropdown::{
-    SelectDropdown, SelectDropdownState, SelectDropdownStyles, SelectOption,
-};
-use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
-};
 use bmux_tui_components::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
     TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
@@ -1427,23 +1421,24 @@ fn render_form_control(
             PromptFormFieldKind::SingleSelect { options, .. },
             Some(PromptFormValue::Single(value)),
         ) => {
-            let component_options = options
+            let label = options
                 .iter()
-                .map(|option| SelectOption::new(option.value.clone(), option.label.clone()))
-                .collect::<Vec<_>>();
-            let selected = options.iter().position(|option| option.value == *value);
-            let mut state = SelectDropdownState::new(selected);
-            state.interaction.focused = focused;
-            state.set_disabled(field.disabled);
-            SelectDropdown::new(&component_options)
-                .styles(SelectDropdownStyles {
-                    normal: theme.text,
-                    focused: theme.focused,
-                    hovered: theme.focused,
-                    pressed: theme.focused,
-                    disabled: theme.muted,
-                })
-                .render_with_fallback_style(area, &state, frame, theme.background);
+                .find(|option| option.value == *value)
+                .map_or("Select an option", |option| option.label.as_str());
+            let style = if field.disabled {
+                theme.muted
+            } else if focused {
+                theme.focused
+            } else {
+                theme.text
+            };
+            let component = TextBlock::new(Text::from_lines([Line::from_spans([
+                Span::styled(label, style),
+                Span::styled(" ▾", style),
+            ])]))
+            .id(format!("prompt.form.{}.select", field.id))
+            .style(theme.background);
+            paint_component(&component, area, frame);
             true
         }
         (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
@@ -1815,44 +1810,44 @@ fn render_single_select(
     let PromptWidgetState::SingleSelect { selected, scroll } = &mut active.state else {
         return false;
     };
-    let items = options
-        .iter()
-        .map(|option| {
-            SelectableListItem::rich(
-                option.value.clone(),
-                Line::from_spans(vec![
-                    Span::styled(option.label.clone(), theme.text),
-                    Span::styled(
-                        option
-                            .detail
-                            .as_ref()
-                            .map_or_else(String::new, |detail| format!("  —  {detail}")),
-                        theme.muted,
-                    ),
-                ]),
+    let items = options.iter().enumerate().fold(
+        VirtualList::new("single-select-list"),
+        |list, (index, option)| {
+            let style = if index == *selected {
+                theme.focused
+            } else {
+                theme.text
+            };
+            let detail = option
+                .detail
+                .as_ref()
+                .map_or_else(String::new, |detail| format!("  —  {detail}"));
+            list.component(
+                index,
+                TextBlock::new(Text::from_lines([Line::from_spans(vec![
+                    Span::styled(option.label.clone(), style),
+                    Span::styled(detail, theme.muted),
+                ])]))
+                .id(format!("single-select-list.label.{index}"))
+                .style(theme.background),
             )
-        })
-        .collect::<Vec<_>>();
-    let mut state = SelectableListState::new((!items.is_empty()).then_some(*selected));
-    state.set_focused((!items.is_empty()).then_some(*selected));
-    state.set_vertical_scroll(*scroll);
-    SelectableList::new(&items)
-        .styles(SelectableListStyles {
-            background: theme.background,
-            scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles {
-                begin: theme.muted,
-                track: theme.muted,
-                thumb: theme.focused,
-                end: theme.muted,
-            },
-            normal: theme.text,
-            focused: theme.focused,
-            selected: theme.focused,
-            hovered: theme.focused,
-            pressed: theme.focused,
-            disabled: theme.muted,
-        })
-        .render_with_fallback_style(content, &state, frame, theme.background);
+        },
+    );
+    let mut state = VirtualListState::new(0);
+    state.scroll.set_vertical_offset(*scroll);
+    items.sync(content.width, &mut state, &mut LayoutCx::new());
+    if !options.is_empty() {
+        items.ensure_item_visible(&mut state, selected, usize::from(content.height));
+    }
+    *scroll = state.scroll.vertical_offset();
+    PaintCx::new(frame).with_child(
+        i32::from(content.x),
+        i64::from(content.y),
+        LocalRect::new(0, 0, content.width, content.height),
+        |cx| {
+            items.paint(Rect::new(0, 0, content.width, content.height), &state, cx);
+        },
+    );
     true
 }
 
