@@ -19,7 +19,7 @@ fn rendered(theme: ComponentTheme) -> Buffer {
     let area = Rect::new(0, 0, 40, 12);
     let mut buffer = Buffer::empty(area);
     let mut frame = Frame::new(&mut buffer);
-    frame.fill(area, " ", theme.canvas);
+    PaintCx::new(&mut frame).fill(LocalRect::terminal(area), " ", theme.canvas);
 
     let mut focused = ButtonState::new();
     focused.set_focused(true);

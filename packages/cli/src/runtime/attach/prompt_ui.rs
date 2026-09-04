@@ -1210,63 +1210,65 @@ impl AttachPromptState {
         });
         let mut buffer = surface_buffer(area);
         let mut frame = Frame::new(&mut buffer);
-        let modal_component =
-            ModalFrameComponent::new("prompt.overlay", modal.clone(), TextBlock::new(""))
-                .chrome(!extension_chrome);
-        paint_component(&modal_component, area, &mut frame);
-        let content = modal.content_area(area);
-        let mut component_cursor = None;
-        let rendered_palette = render_command_palette(active, content, &mut frame, theme);
+        let (rendered_palette, cursor_state) = {
+            let mut cx = PaintCx::new(&mut frame);
+            let modal_component =
+                ModalFrameComponent::new("prompt.overlay", modal.clone(), TextBlock::new(""))
+                    .chrome(!extension_chrome);
+            paint_component(&modal_component, area, &mut cx);
+            let content = modal.content_area(area);
+            let rendered_palette = render_command_palette(active, content, &mut cx, theme);
+            let rendered_single_select =
+                !rendered_palette && render_single_select(active, content, &mut cx, theme);
+            let rendered_text_input = !rendered_palette
+                && !rendered_single_select
+                && render_text_input(active, content, &mut cx, theme);
+            let rendered_confirm = !rendered_palette
+                && !rendered_single_select
+                && !rendered_text_input
+                && render_confirm(active, area, &mut cx, theme);
+            let rendered_multi_toggle = !rendered_palette
+                && !rendered_single_select
+                && !rendered_text_input
+                && !rendered_confirm
+                && render_multi_toggle(active, content, &mut cx, theme);
+            let rendered_form = !rendered_palette
+                && !rendered_single_select
+                && !rendered_text_input
+                && !rendered_confirm
+                && !rendered_multi_toggle
+                && render_form(active, content, &mut cx, theme);
+            debug_assert!(
+                rendered_palette
+                    || rendered_single_select
+                    || rendered_text_input
+                    || rendered_confirm
+                    || rendered_multi_toggle
+                    || rendered_form,
+                "every prompt field must have a component renderer"
+            );
+            if !rendered_palette && !rendered_confirm && content.height > 1 {
+                let footer_y = content.bottom().saturating_sub(1);
+                cx.write_line_with_fallback_style(
+                    LocalRect::terminal(Rect::new(content.x, footer_y, content.width, 1)),
+                    &Line::raw(opaque_row_text(&footer, usize::from(content.width))),
+                    theme.muted,
+                );
+            }
+            let cursor_state = (rendered_palette || rendered_text_input)
+                .then(|| cx.cursor())
+                .flatten()
+                .map(|cursor| AttachCursorState {
+                    x: cursor.position.x,
+                    y: cursor.position.y,
+                    visible: cursor.visible,
+                });
+            (rendered_palette, cursor_state)
+        };
         if rendered_palette {
             active.hits = frame.hits().clone();
         }
-        let rendered_single_select =
-            !rendered_palette && render_single_select(active, content, &mut frame, theme);
-        let rendered_text_input = !rendered_palette
-            && !rendered_single_select
-            && render_text_input(active, content, &mut frame, theme);
-        let rendered_confirm = !rendered_palette
-            && !rendered_single_select
-            && !rendered_text_input
-            && render_confirm(active, area, &mut frame, theme);
-        let rendered_multi_toggle = !rendered_palette
-            && !rendered_single_select
-            && !rendered_text_input
-            && !rendered_confirm
-            && render_multi_toggle(active, content, &mut frame, theme);
-        let rendered_form = !rendered_palette
-            && !rendered_single_select
-            && !rendered_text_input
-            && !rendered_confirm
-            && !rendered_multi_toggle
-            && render_form(active, content, &mut frame, theme);
-        if rendered_palette || rendered_text_input {
-            component_cursor = frame.cursor().map(|cursor| AttachCursorState {
-                x: cursor.position.x,
-                y: cursor.position.y,
-                visible: cursor.visible,
-            });
-        }
-        debug_assert!(
-            rendered_palette
-                || rendered_single_select
-                || rendered_text_input
-                || rendered_confirm
-                || rendered_multi_toggle
-                || rendered_form,
-            "every prompt field must have a component renderer"
-        );
-        if !rendered_palette && !rendered_confirm && content.height > 1 {
-            let footer_y = content.bottom().saturating_sub(1);
-            frame.write_line_with_fallback_style(
-                Rect::new(content.x, footer_y, content.width, 1),
-                &Line::raw(opaque_row_text(&footer, usize::from(content.width))),
-                theme.muted,
-            );
-        }
         let ops = buffer_render_ops(&buffer);
-
-        let cursor_state = component_cursor;
 
         Some(AttachPromptOverlayRender {
             surface: layout.surface,
@@ -1320,9 +1322,9 @@ impl AttachPromptState {
     }
 }
 
-fn paint_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+fn paint_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),
@@ -1337,13 +1339,13 @@ fn paint_checkbox(
     styles: CheckboxStyles,
     fallback: bmux_tui::style::Style,
     area: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
 ) {
     let state = std::cell::Cell::new(state);
     let component = CheckboxComponent::new(id, label, &state)
         .styles(styles)
         .fallback_style(fallback);
-    paint_component(&component, area, frame);
+    paint_component(&component, area, cx);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Rendering one field keeps all concrete control projections together over canonical form state.
@@ -1354,7 +1356,7 @@ fn render_form_control(
     errors: &BTreeMap<String, String>,
     focused: bool,
     area: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     match (&field.kind, values.get(&field.id)) {
@@ -1375,7 +1377,7 @@ fn render_form_control(
                 },
                 theme.background,
                 area,
-                frame,
+                cx,
             );
             true
         }
@@ -1414,7 +1416,7 @@ fn render_form_control(
             if let Some(error) = errors.get(&field.id) {
                 component = component.error(error);
             }
-            paint_component(&component, area, frame);
+            paint_component(&component, area, cx);
             true
         }
         (
@@ -1438,7 +1440,7 @@ fn render_form_control(
             ])]))
             .id(format!("prompt.form.{}.select", field.id))
             .style(theme.background);
-            paint_component(&component, area, frame);
+            paint_component(&component, area, cx);
             true
         }
         (PromptFormFieldKind::Integer { .. }, Some(PromptFormValue::Integer(value))) => {
@@ -1465,7 +1467,7 @@ fn render_form_control(
             if let Some(error) = errors.get(&field.id) {
                 component = component.error(error);
             }
-            paint_component(&component, area, frame);
+            paint_component(&component, area, cx);
             true
         }
         (
@@ -1499,7 +1501,7 @@ fn render_form_control(
                 },
                 theme.background,
                 area,
-                frame,
+                cx,
             );
             true
         }
@@ -1528,7 +1530,7 @@ const fn form_text_input_styles(
 fn render_form(
     active: &ActivePrompt,
     content: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     let PromptField::Form {
@@ -1600,7 +1602,7 @@ fn render_form(
                 errors,
                 index.saturating_add(page_offset) == *cursor,
                 control_area,
-                frame,
+                cx,
                 theme,
             )
         {
@@ -1613,8 +1615,8 @@ fn render_form(
         } else {
             theme.text
         };
-        frame.write_line_with_fallback_style(
-            control_area,
+        cx.write_line_with_fallback_style(
+            LocalRect::terminal(control_area),
             &Line::raw(row.text.clone()),
             theme.background.patch(style),
         );
@@ -1644,7 +1646,7 @@ fn render_form(
                 disabled: theme.background,
             });
         let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        PaintCx::new(frame).with_child(
+        cx.with_child(
             i32::from(area.x),
             i64::from(area.y),
             LocalRect::new(0, 0, area.width, area.height),
@@ -1657,7 +1659,7 @@ fn render_form(
 fn render_multi_toggle(
     active: &ActivePrompt,
     content: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     let PromptField::MultiToggle { options, .. } = &active.envelope.request.field else {
@@ -1695,7 +1697,7 @@ fn render_multi_toggle(
             },
             theme.background,
             Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
-            frame,
+            cx,
         );
     }
     true
@@ -1704,7 +1706,7 @@ fn render_multi_toggle(
 fn render_confirm(
     active: &ActivePrompt,
     area: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     let PromptField::Confirm {
@@ -1741,8 +1743,7 @@ fn render_confirm(
         .padding(Insets::new(0, 1, 0, 1));
     let component = DialogComponent::new("prompt.confirm", dialog, &actions_state);
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    let mut paint = PaintCx::new(frame);
-    paint.with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),
@@ -1754,7 +1755,7 @@ fn render_confirm(
 fn render_text_input(
     active: &ActivePrompt,
     content: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     let PromptField::TextInput {
@@ -1794,14 +1795,14 @@ fn render_text_input(
     if let Some(error) = error {
         component = component.error(error);
     }
-    paint_component(&component, content, frame);
+    paint_component(&component, content, cx);
     true
 }
 
 fn render_single_select(
     active: &mut ActivePrompt,
     content: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     let PromptField::SingleSelect { options, .. } = &active.envelope.request.field else {
@@ -1840,7 +1841,7 @@ fn render_single_select(
         items.ensure_item_visible(&mut state, selected, usize::from(content.height));
     }
     *scroll = state.scroll.vertical_offset();
-    PaintCx::new(frame).with_child(
+    cx.with_child(
         i32::from(content.x),
         i64::from(content.y),
         LocalRect::new(0, 0, content.width, content.height),
@@ -1855,7 +1856,7 @@ fn render_single_select(
 fn render_command_palette(
     active: &mut ActivePrompt,
     content: Rect,
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
 ) -> bool {
     let PromptField::SearchSelect {
@@ -1917,8 +1918,13 @@ fn render_command_palette(
             let Ok(row) = u16::try_from(row) else {
                 break;
             };
-            frame.write_line_with_fallback_style(
-                Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
+            cx.write_line_with_fallback_style(
+                LocalRect::terminal(Rect::new(
+                    content.x,
+                    content.y.saturating_add(row),
+                    content.width,
+                    1,
+                )),
                 &Line::raw(line),
                 theme.muted,
             );
@@ -1947,7 +1953,7 @@ fn render_command_palette(
     let input = TextInputComponent::new("command-palette.query", &input_state, &input_policy)
         .placeholder(&placeholder, theme.muted)
         .focused(true);
-    paint_component(&input, input_area, frame);
+    paint_component(&input, input_area, cx);
 
     let list_area = Rect::new(
         component_area.x,
@@ -1977,9 +1983,13 @@ fn render_command_palette(
         list.ensure_item_visible(list_state, source_index, usize::from(list_area.height));
     }
     if filtered.is_empty() {
-        frame.write_line_with_fallback_style(list_area, &Line::raw("No matches"), theme.muted);
+        cx.write_line_with_fallback_style(
+            LocalRect::terminal(list_area),
+            &Line::raw("No matches"),
+            theme.muted,
+        );
     } else {
-        PaintCx::new(frame).with_child(
+        cx.with_child(
             i32::from(list_area.x),
             i64::from(list_area.y),
             LocalRect::new(0, 0, list_area.width, list_area.height),
@@ -2014,7 +2024,7 @@ fn render_command_palette(
                 thumb: theme.focused,
                 end: theme.muted,
             });
-        paint_component(&scrollbar, scrollbar_area, frame);
+        paint_component(&scrollbar, scrollbar_area, cx);
     }
     if footer_rows > 0 {
         let selected = if filtered.is_empty() {
@@ -2033,13 +2043,13 @@ fn render_command_palette(
                 filtered.len()
             )
         };
-        frame.write_line_with_fallback_style(
-            Rect::new(
+        cx.write_line_with_fallback_style(
+            LocalRect::terminal(Rect::new(
                 content.x,
                 content.bottom().saturating_sub(1),
                 content.width,
                 1,
-            ),
+            )),
             &Line::raw(footer),
             theme.muted,
         );

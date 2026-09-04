@@ -55,9 +55,9 @@ impl LayoutPlaygroundDemo {
         self.message = "Terminal resized; pane bounds updated".to_string();
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&self, cx: &mut PaintCx<'_, '_>) {
         render_playground(
-            frame,
+            cx,
             self.terminal_area,
             &self.pane_state,
             &RefCell::new(self.panel_group_state.clone()),
@@ -167,16 +167,12 @@ impl Default for LayoutPlaygroundDemo {
 pub fn render_layout_playground() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
-    LayoutPlaygroundDemo::default().render(&mut frame);
+    LayoutPlaygroundDemo::default().render(&mut PaintCx::new(&mut frame));
     buffer
 }
 
-pub fn render_layout_playground_into(frame: &mut Frame<'_>) {
-    LayoutPlaygroundDemo::default().render(frame);
-}
-
 fn render_playground(
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     terminal_area: Rect,
     pane_state: &PaneState,
     panel_group_state: &RefCell<PanelGroupState>,
@@ -193,7 +189,7 @@ fn render_playground(
             TextBlock::new("Drag title or resize border").id("playground.pane.content"),
         ),
         pane_area,
-        frame,
+        cx,
     );
 
     let modal_area = Rect::new(36, 1, 32, 14);
@@ -210,7 +206,7 @@ fn render_playground(
             TextBlock::new("Modal placement").id("playground.modal.body"),
         ),
         modal_area,
-        frame,
+        cx,
     );
 
     let block_area = Rect::new(2, 10, 30, 1);
@@ -228,7 +224,7 @@ fn render_playground(
     .id("playground.composed-card")
     .background(Style::new().bg(Color::Black))
     .padding(Insets::new(0, 1, 0, 1));
-    render_component(&composed_card, block_area, frame);
+    render_component(&composed_card, block_area, cx);
 
     let group_area = panel_group_area();
     let group = PanelGroupComponent::new(
@@ -239,14 +235,14 @@ fn render_playground(
     .child(TextBlock::new(" Panel 0").id("playground.panel.0"))
     .child(TextBlock::new(" Panel 1").id("playground.panel.1"))
     .child(TextBlock::new(" Panel 2").id("playground.panel.2"));
-    render_component(&group, group_area, frame);
+    render_component(&group, group_area, cx);
 
-    frame.write_line(Rect::new(1, 16, 68, 1), &Line::from(message));
+    cx.write_line(LocalRect::new(1, 16, 68, 1), &Line::from(message));
 }
 
-fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+fn render_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),

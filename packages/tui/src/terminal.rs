@@ -11,6 +11,7 @@ use crate::geometry::Rect;
 use crate::hit::HitMap;
 use crate::image::ImageContribution;
 use crate::image_scene::{ImageScene, ImageSceneDelta};
+use crate::paint::PaintCx;
 use crate::selection::SelectionScene;
 
 /// Statistics from one terminal draw.
@@ -173,7 +174,7 @@ impl<W: Write> Terminal<W> {
     /// # Errors
     ///
     /// Returns any I/O error reported by the backend writer.
-    pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawStats> {
+    pub fn draw(&mut self, render: impl FnOnce(&mut PaintCx<'_, '_>)) -> io::Result<DrawStats> {
         self.draw_damage(Damage::Full, render)
     }
 
@@ -190,7 +191,7 @@ impl<W: Write> Terminal<W> {
     /// Returns any I/O error reported by the backend writer or overlay callback.
     pub fn draw_with_overlay(
         &mut self,
-        render: impl FnOnce(&mut Frame<'_>),
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
         self.draw_damage_with_overlay(Damage::Full, render, overlay)
@@ -211,7 +212,7 @@ impl<W: Write> Terminal<W> {
     pub fn draw_damage(
         &mut self,
         damage: Damage,
-        render: impl FnOnce(&mut Frame<'_>),
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> io::Result<DrawStats> {
         self.draw_damage_with_overlay(damage, render, |_, _, _| Ok(()))
     }
@@ -229,7 +230,7 @@ impl<W: Write> Terminal<W> {
     pub fn draw_damage_with_overlay(
         &mut self,
         damage: Damage,
-        render: impl FnOnce(&mut Frame<'_>),
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
         let damage = if self.previous.is_none() {
@@ -247,7 +248,7 @@ impl<W: Write> Terminal<W> {
         let mut buffer = Buffer::empty(self.area);
         let (cursor, hits, focus_scope, images, selection, semantics) = {
             let mut frame = Frame::new(&mut buffer);
-            render(&mut frame);
+            render(&mut PaintCx::new(&mut frame));
             let mut hits = if matches!(damage, Damage::Regions(_)) {
                 let mut retained = self.hits.clone();
                 for region in requested_regions {
@@ -374,6 +375,7 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::hit::HitRegion;
     use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
+    use crate::paint::{LocalRect, PaintCx};
     use crate::selection::{SelectionFragment, SelectionScope};
     use crate::semantic::SemanticRegion;
     use crate::style::Style;
@@ -414,7 +416,7 @@ mod tests {
         );
         terminal
             .draw(|frame| {
-                frame.push_hit(HitRegion::new("committed", frame.area()));
+                frame.push_hit(HitRegion::new("committed", frame.clip()));
                 frame.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("committed"),
                     payload: ImagePayload::Pixels {
@@ -423,8 +425,8 @@ mod tests {
                         height: 1,
                         format: crate::image::ImagePixelFormat::Rgba8,
                     },
-                    destination: frame.area(),
-                    clip: frame.area(),
+                    destination: frame.clip(),
+                    clip: frame.clip(),
                     lifecycle: ImageLifecycle::Frame,
                 }));
             })
@@ -432,7 +434,7 @@ mod tests {
 
         let error = terminal.draw_with_overlay(
             |frame| {
-                frame.push_hit(HitRegion::new("speculative", frame.area()));
+                frame.push_hit(HitRegion::new("speculative", frame.clip()));
                 frame.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("speculative"),
                     payload: ImagePayload::Pixels {
@@ -441,8 +443,8 @@ mod tests {
                         height: 1,
                         format: crate::image::ImagePixelFormat::Rgba8,
                     },
-                    destination: frame.area(),
-                    clip: frame.area(),
+                    destination: frame.clip(),
+                    clip: frame.clip(),
                     lifecycle: ImageLifecycle::Frame,
                 }));
             },
@@ -479,7 +481,7 @@ mod tests {
         );
         terminal
             .draw(|frame| {
-                frame.push_selection_scope(SelectionScope::new("committed", frame.area()));
+                frame.push_selection_scope(SelectionScope::new("committed", frame.clip()));
                 frame.push_selection_fragment(SelectionFragment::new(
                     "committed",
                     "content",
@@ -494,7 +496,7 @@ mod tests {
         assert!(
             terminal
                 .draw(|frame| {
-                    frame.push_selection_scope(SelectionScope::new("speculative", frame.area()));
+                    frame.push_selection_scope(SelectionScope::new("speculative", frame.clip()));
                 })
                 .is_err()
         );
@@ -507,16 +509,22 @@ mod tests {
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 8, 2));
         terminal
             .draw(|frame| {
-                frame.write_line(Rect::new(0, 0, 8, 1), &crate::text::Line::raw("A👩🏽‍💻│"));
-                frame.write_line(Rect::new(0, 1, 8, 1), &crate::text::Line::raw("bottom│"));
+                frame.write_line(LocalRect::new(0, 0, 8, 1), &crate::text::Line::raw("A👩🏽‍💻│"));
+                frame.write_line(
+                    LocalRect::new(0, 1, 8, 1),
+                    &crate::text::Line::raw("bottom│"),
+                );
             })
             .unwrap();
         let first_len = terminal.writer().len();
 
         terminal
             .draw(|frame| {
-                frame.write_line(Rect::new(0, 0, 8, 1), &crate::text::Line::raw("bottom│"));
-                frame.write_line(Rect::new(0, 1, 8, 1), &crate::text::Line::raw("B👩🏽‍💻│"));
+                frame.write_line(
+                    LocalRect::new(0, 0, 8, 1),
+                    &crate::text::Line::raw("bottom│"),
+                );
+                frame.write_line(LocalRect::new(0, 1, 8, 1), &crate::text::Line::raw("B👩🏽‍💻│"));
             })
             .unwrap();
         let output = String::from_utf8(terminal.writer()[first_len..].to_vec()).unwrap();
@@ -531,7 +539,7 @@ mod tests {
 
         let stats = terminal
             .draw(|frame| {
-                frame.write_line(Rect::new(0, 0, 1, 1), &crate::text::Line::raw("A"));
+                frame.write_line(LocalRect::new(0, 0, 1, 1), &crate::text::Line::raw("A"));
             })
             .unwrap();
 
@@ -549,13 +557,13 @@ mod tests {
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 2, 1));
         terminal
             .draw(|frame| {
-                frame.write_line(Rect::new(0, 0, 1, 1), &crate::text::Line::raw("A"));
+                frame.write_line(LocalRect::new(0, 0, 1, 1), &crate::text::Line::raw("A"));
             })
             .unwrap();
 
         let stats = terminal
             .draw(|frame| {
-                frame.write_line(Rect::new(1, 0, 1, 1), &crate::text::Line::raw("B"));
+                frame.write_line(LocalRect::new(1, 0, 1, 1), &crate::text::Line::raw("B"));
             })
             .unwrap();
 
@@ -581,17 +589,17 @@ mod tests {
         let scope = crate::hit::HitId::new("modal");
         terminal
             .draw(|frame| {
-                frame.fill(Rect::new(0, 0, 4, 2), "A", Style::new());
+                frame.fill(LocalRect::new(0, 0, 4, 2), "A", Style::new());
                 frame.push_hit(HitRegion::new("left", Rect::new(0, 0, 2, 2)));
                 frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 2)));
                 frame.set_focus_scope(Some(scope.clone()));
-                frame.set_cursor(Cursor::visible(Point::new(3, 1)));
+                frame.set_cursor(Point::new(3, 1), true);
             })
             .unwrap();
 
         let stats = terminal
             .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 2, 2)]), |frame| {
-                frame.fill(Rect::new(0, 0, 2, 2), "B", Style::new());
+                frame.fill(LocalRect::new(0, 0, 2, 2), "B", Style::new());
                 frame.push_hit(HitRegion::new("new-left", Rect::new(0, 0, 2, 2)));
             })
             .unwrap();
@@ -658,34 +666,34 @@ mod tests {
         terminal
             .draw(|frame| {
                 frame.fill(frame.area(), "A", Style::new());
-                frame.push_hit(HitRegion::new("committed", frame.area()));
-                frame.push_selection_scope(SelectionScope::new("committed", frame.area()));
+                frame.push_hit(HitRegion::new("committed", frame.clip()));
+                frame.push_selection_scope(SelectionScope::new("committed", frame.clip()));
                 frame.push_selection_fragment(SelectionFragment::new(
                     "committed",
                     "committed-content",
-                    frame.area(),
+                    frame.clip(),
                     0,
                     0..1,
                 ));
-                frame.push_semantic(SemanticRegion::new("committed", frame.area(), "content"));
-                frame.set_cursor(Cursor::visible(Point::new(1, 0)));
+                frame.push_semantic(SemanticRegion::new("committed", frame.clip(), "content"));
+                frame.set_cursor(Point::new(1, 0), true);
             })
             .unwrap();
         terminal.writer_mut().fail = true;
 
         let result = terminal.draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |frame| {
             frame.fill(frame.area(), "B", Style::new());
-            frame.push_hit(HitRegion::new("uncommitted", frame.area()));
-            frame.push_selection_scope(SelectionScope::new("uncommitted", frame.area()));
+            frame.push_hit(HitRegion::new("uncommitted", frame.clip()));
+            frame.push_selection_scope(SelectionScope::new("uncommitted", frame.clip()));
             frame.push_selection_fragment(SelectionFragment::new(
                 "uncommitted",
                 "uncommitted-content",
-                frame.area(),
+                frame.clip(),
                 0,
                 0..1,
             ));
-            frame.push_semantic(SemanticRegion::new("uncommitted", frame.area(), "content"));
-            frame.set_cursor(Cursor::hidden(Point::new(0, 0)));
+            frame.push_semantic(SemanticRegion::new("uncommitted", frame.clip(), "content"));
+            frame.set_cursor(Point::new(0, 0), false);
         });
 
         assert!(result.is_err());
@@ -704,7 +712,7 @@ mod tests {
 
     #[test]
     fn region_draw_matches_complete_frame_for_declared_change() {
-        fn first(frame: &mut crate::frame::Frame<'_>) {
+        fn first(frame: &mut PaintCx<'_, '_>) {
             frame.fill(frame.area(), "A", Style::new());
             frame.push_hit(HitRegion::new("left", Rect::new(0, 0, 2, 1)));
             frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 1)));
@@ -720,11 +728,11 @@ mod tests {
                 Rect::new(2, 0, 2, 1),
                 "content",
             ));
-            frame.set_cursor(Cursor::visible(Point::new(3, 0)));
+            frame.set_cursor(Point::new(3, 0), true);
         }
-        fn second(frame: &mut crate::frame::Frame<'_>) {
-            frame.fill(Rect::new(0, 0, 2, 1), "B", Style::new());
-            frame.fill(Rect::new(2, 0, 2, 1), "A", Style::new());
+        fn second(frame: &mut PaintCx<'_, '_>) {
+            frame.fill(LocalRect::new(0, 0, 2, 1), "B", Style::new());
+            frame.fill(LocalRect::new(2, 0, 2, 1), "A", Style::new());
             frame.push_hit(HitRegion::new("new-left", Rect::new(0, 0, 2, 1)));
             frame.push_hit(HitRegion::new("right", Rect::new(2, 0, 2, 1)));
             frame.push_selection_scope(
@@ -741,7 +749,7 @@ mod tests {
                 Rect::new(2, 0, 2, 1),
                 "content",
             ));
-            frame.set_cursor(Cursor::visible(Point::new(3, 0)));
+            frame.set_cursor(Point::new(3, 0), true);
         }
 
         let area = Rect::new(0, 0, 4, 1);
@@ -792,7 +800,7 @@ mod tests {
 
         let stats = terminal
             .draw_damage(Damage::Regions(vec![Rect::new(0, 0, 1, 1)]), |frame| {
-                frame.fill(Rect::new(0, 0, 1, 1), "X", Style::new());
+                frame.fill(LocalRect::new(0, 0, 1, 1), "X", Style::new());
             })
             .unwrap();
 

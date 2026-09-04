@@ -58,9 +58,9 @@ impl InputsDemo {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&self, cx: &mut PaintCx<'_, '_>) {
         render_inputs_with_state(
-            frame,
+            cx,
             &self.text,
             &self.checkbox,
             &self.radio,
@@ -167,12 +167,22 @@ impl Default for InputsDemo {
 pub fn render_inputs() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
-    InputsDemo::new().render(&mut frame);
+    InputsDemo::new().render(&mut PaintCx::new(&mut frame));
     buffer
 }
 
+fn paint_component(cx: &mut PaintCx<'_, '_>, area: Rect, component: &impl Component) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 fn render_inputs_with_state(
-    frame: &mut Frame<'_>,
+    cx: &mut PaintCx<'_, '_>,
     text: &TextInputState,
     checkbox: &CheckboxState,
     radio: &RadioGroupState,
@@ -187,52 +197,24 @@ fn render_inputs_with_state(
             .required(true)
             .help("Click the field, then type")
             .policy(TextInputBoxPolicy::labeled_field().focused(focused == 0));
-    let text_area = Rect::new(1, 1, 34, 5);
-    let layout = component.layout(Constraints::tight(text_area.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
-        i32::from(text_area.x),
-        i64::from(text_area.y),
-        LocalRect::new(0, 0, text_area.width, text_area.height),
-        |cx| component.paint(&layout, cx),
-    );
+    paint_component(cx, Rect::new(1, 1, 34, 5), &component);
 
     let checkbox_state = std::cell::Cell::new(*checkbox);
     let component =
         CheckboxComponent::new("inputs.subscribe", "Subscribe to updates", &checkbox_state);
-    let layout = component.layout(
-        Constraints::tight(CHECKBOX_AREA.size()),
-        &mut LayoutCx::new(),
-    );
-    PaintCx::new(frame).with_child(
-        i32::from(CHECKBOX_AREA.x),
-        i64::from(CHECKBOX_AREA.y),
-        LocalRect::new(0, 0, CHECKBOX_AREA.width, CHECKBOX_AREA.height),
-        |cx| component.paint(&layout, cx),
-    );
+    paint_component(cx, CHECKBOX_AREA, &component);
 
     let radios = radio_options();
     let radio_state = std::cell::Cell::new(*radio);
     let component = RadioGroupComponent::new("inputs.frequency", &radios, &radio_state);
-    let layout = component.layout(Constraints::tight(RADIO_AREA.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
-        i32::from(RADIO_AREA.x),
-        i64::from(RADIO_AREA.y),
-        LocalRect::new(0, 0, RADIO_AREA.width, RADIO_AREA.height),
-        |cx| component.paint(&layout, cx),
-    );
+    paint_component(cx, RADIO_AREA, &component);
 
     let options = select_options();
     let select_state = std::cell::Cell::new(*select);
     let component = SelectDropdownComponent::new("inputs.select", &options, &select_state);
-    let layout = component.layout(Constraints::tight(SELECT_AREA.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
-        i32::from(SELECT_AREA.x),
-        i64::from(SELECT_AREA.y),
-        LocalRect::new(0, 0, SELECT_AREA.width, SELECT_AREA.height),
-        |cx| component.paint(&layout, cx),
-    );
+    paint_component(cx, SELECT_AREA, &component);
 
-    frame.write_line(Rect::new(38, 6, 32, 1), &Line::from(message));
+    cx.write_line(LocalRect::new(38, 6, 32, 1), &Line::from(message));
 }
 
 pub fn demonstrate_text_input_edit() -> String {

@@ -17,7 +17,7 @@ fn main() -> Result<()> {
         let mut terminal = Terminal::new(writer, Rect::new(0, 0, 72, 18));
 
         loop {
-            terminal.draw(|frame| demo.render(frame))?;
+            terminal.draw(|cx| demo.render(cx))?;
             if let Some(event) = poll_event(Duration::from_millis(100))? {
                 match event {
                     Event::Key(stroke) if should_quit(stroke) => break,

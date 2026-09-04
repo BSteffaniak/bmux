@@ -43,12 +43,19 @@ impl Cursor {
     }
 }
 
-/// Mutable render context for a single frame.
+/// Staging container for one frame's cells and interaction metadata.
+///
+/// A frame owns the buffer being painted plus the cursor, hit, focus-scope,
+/// image, selection, semantic, and damage contributions registered while
+/// painting. It never accepts writes directly: every contribution flows
+/// through the scoped [`crate::paint::PaintCx`] created over it, which
+/// applies translation and clipping uniformly. Presenters and offscreen
+/// staging code create a frame, paint through a root `PaintCx`, and then read
+/// the committed metadata through this type's accessors.
 pub struct Frame<'buffer> {
     buffer: &'buffer mut Buffer,
     cursor: Option<Cursor>,
     hits: HitMap,
-    automatic_hit_index: usize,
     focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
     selection: SelectionScene,
@@ -57,13 +64,12 @@ pub struct Frame<'buffer> {
 }
 
 impl<'buffer> Frame<'buffer> {
-    /// Create a frame that renders into `buffer`.
+    /// Create a frame that stages painting into `buffer`.
     pub const fn new(buffer: &'buffer mut Buffer) -> Self {
         Self {
             buffer,
             cursor: None,
             hits: HitMap::new(),
-            automatic_hit_index: 0,
             focus_scope: None,
             images: Vec::new(),
             selection: SelectionScene::new(),
@@ -84,21 +90,9 @@ impl<'buffer> Frame<'buffer> {
         self.cursor
     }
 
-    /// Request a cursor state for this frame.
-    pub const fn set_cursor(&mut self, cursor: Cursor) {
-        self.cursor = Some(cursor);
-    }
-
     /// Return an immutable view of the backing buffer.
     #[must_use]
     pub const fn buffer(&self) -> &Buffer {
-        self.buffer
-    }
-
-    /// Return mutable access to the backing buffer for the canonical scoped
-    /// paint implementation. Components and downstream consumers must use
-    /// [`crate::paint::PaintCx`] instead.
-    pub(crate) const fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
     }
 
@@ -108,44 +102,16 @@ impl<'buffer> Frame<'buffer> {
         &self.hits
     }
 
-    /// Add a hit-test region for this frame.
-    pub fn push_hit(&mut self, mut region: HitRegion) {
-        if let Some(scope) = self.focus_scope.as_ref()
-            && region.focusable
-            && region.focus_scope.is_none()
-        {
-            region.focus_scope = Some(scope.clone());
-        }
-        self.hits.push(region);
-    }
-
-    /// Create a deterministic render-order identifier for an automatic control.
-    pub fn next_interaction_id(&mut self, kind: &str) -> crate::hit::HitId {
-        let index = self.automatic_hit_index;
-        self.automatic_hit_index = self.automatic_hit_index.saturating_add(1);
-        crate::hit::HitId::new(format!("auto.{kind}.{index}"))
-    }
-
     /// Return the active focus scope requested by this frame.
     #[must_use]
     pub const fn focus_scope(&self) -> Option<&FocusScopeId> {
         self.focus_scope.as_ref()
     }
 
-    /// Select the focus scope active after this frame commits.
-    pub fn set_focus_scope(&mut self, scope: Option<FocusScopeId>) {
-        self.focus_scope = scope;
-    }
-
     /// Return image lifecycle contributions registered for this frame.
     #[must_use]
     pub fn images(&self) -> &[ImageContribution] {
         &self.images
-    }
-
-    /// Add an image lifecycle contribution to this frame.
-    pub fn push_image(&mut self, contribution: ImageContribution) {
-        self.images.push(contribution);
     }
 
     /// Return selection metadata registered for this frame.
@@ -160,56 +126,68 @@ impl<'buffer> Frame<'buffer> {
         &self.semantics
     }
 
-    /// Add one semantic region.
-    pub fn push_semantic(&mut self, region: SemanticRegion) {
-        self.semantics.push(region);
-    }
-
-    /// Add one terminal-space damage region.
-    pub fn push_damage(&mut self, area: Rect) {
-        if !area.is_empty() {
-            self.damage.push(area);
-        }
-    }
-
     /// Return bounded damage requested by rendered components.
     #[must_use]
     pub fn damage(&self, policy: DamagePolicy) -> Damage {
         Damage::regions(self.damage.iter().copied(), self.area(), policy)
     }
 
-    /// Add or replace one hierarchical selection scope.
-    pub fn push_selection_scope(&mut self, scope: SelectionScope) {
+    // Every mutator below is reachable only through `crate::paint::PaintCx`,
+    // which translates and clips each contribution before staging it here.
+
+    pub(crate) const fn buffer_mut(&mut self) -> &mut Buffer {
+        self.buffer
+    }
+
+    pub(crate) const fn set_cursor(&mut self, cursor: Cursor) {
+        self.cursor = Some(cursor);
+    }
+
+    pub(crate) fn push_hit(&mut self, mut region: HitRegion) {
+        if let Some(scope) = self.focus_scope.as_ref()
+            && region.focusable
+            && region.focus_scope.is_none()
+        {
+            region.focus_scope = Some(scope.clone());
+        }
+        self.hits.push(region);
+    }
+
+    pub(crate) fn set_focus_scope(&mut self, scope: Option<FocusScopeId>) {
+        self.focus_scope = scope;
+    }
+
+    pub(crate) fn push_image(&mut self, contribution: ImageContribution) {
+        self.images.push(contribution);
+    }
+
+    pub(crate) fn push_semantic(&mut self, region: SemanticRegion) {
+        self.semantics.push(region);
+    }
+
+    pub(crate) fn push_damage(&mut self, area: Rect) {
+        if !area.is_empty() {
+            self.damage.push(area);
+        }
+    }
+
+    pub(crate) fn push_selection_scope(&mut self, scope: SelectionScope) {
         self.selection.push_scope(scope);
     }
 
-    /// Add one visible logical selection fragment.
-    pub fn push_selection_fragment(&mut self, fragment: SelectionFragment) {
+    pub(crate) fn push_selection_fragment(&mut self, fragment: SelectionFragment) {
         self.selection.push_fragment(fragment);
     }
 
-    /// Paint one logical selection snapshot over content already rendered.
-    ///
-    /// Calling this after component rendering gives selection a deterministic
-    /// overlay stage while preserving every underlying cell symbol and
-    /// semantic style field not replaced by `style`.
-    pub fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
+    pub(crate) fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
         paint_selection_highlights(self.buffer, &snapshot.visible_highlights, style);
     }
 
-    /// Fill a rectangular area with a symbol and style.
-    pub fn fill(&mut self, area: Rect, symbol: &str, style: Style) {
+    pub(crate) fn fill(&mut self, area: Rect, symbol: &str, style: Style) {
         self.buffer.fill(area, symbol, style);
     }
 
-    /// Write a styled line into a rectangular area.
-    pub fn write_line(&mut self, area: Rect, line: &Line) {
-        self.buffer.write_line(area, line);
-    }
-
-    /// Fill a rectangular area with `style`, then write a line whose spans
-    /// inherit that fallback style.
-    pub fn write_line_with_fallback_style(&mut self, area: Rect, line: &Line, style: Style) {
+    pub(crate) fn write_line_with_fallback_style(&mut self, area: Rect, line: &Line, style: Style) {
         self.buffer
             .write_line_with_fallback_style(area, line, style);
     }

@@ -273,7 +273,7 @@ where
     };
     let mut staged_compositor = compositor.clone();
     let stats = terminal.draw_with_overlay(
-        |frame| render(program, &mut PaintCx::new(frame)),
+        |cx| render(program, cx),
         |writer, scene, delta| {
             staged_compositor.apply_delta(delta);
             staged_compositor

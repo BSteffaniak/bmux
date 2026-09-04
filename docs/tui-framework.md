@@ -120,7 +120,7 @@ to visible cells; resize, wrapping, clipping, and scrolling do not rewrite the
 logical selection.
 
 `SelectionController` is caller-owned. Components register scopes and fragments
-during scene construction. `Frame::paint_selection` is the deterministic visual
+during scene construction. `PaintCx::paint_selection` is the deterministic visual
 overlay stage after ordinary content painting. Copying reads the logical
 selection snapshot rather than scraping the terminal buffer.
 
@@ -219,8 +219,11 @@ VCS or coding-agent concepts into `bmux_tui`.
 
 ## Terminal presentation
 
-`Buffer` and `Frame` are backend-facing staging types. Ordinary components
-paint through `PaintCx`; unrestricted buffer mutation is not a component API.
+`Buffer` and `Frame` are backend-facing staging types. `Frame` exposes only
+read accessors publicly; every cell, cursor, hit, focus-scope, image,
+semantic, selection, and damage contribution is written through `PaintCx`,
+including from the root `Terminal::draw` and presenter callbacks, so
+translation and clipping are never bypassed.
 ANSI output performs retained cell diffing, cursor projection, and terminal
 writes. Runtime code owns terminal setup/restoration and presentation timing,
 not component layout.

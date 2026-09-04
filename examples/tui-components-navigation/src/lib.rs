@@ -83,8 +83,8 @@ impl NavigationDemo {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>) {
-        render_navigation_with_state(frame, self);
+    pub fn render(&self, cx: &mut PaintCx<'_, '_>) {
+        render_navigation_with_state(cx, self);
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
@@ -251,7 +251,7 @@ impl Default for NavigationDemo {
 pub fn render_navigation() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
-    NavigationDemo::new().render(&mut frame);
+    NavigationDemo::new().render(&mut PaintCx::new(&mut frame));
     buffer
 }
 
@@ -273,9 +273,9 @@ fn scroll_layout(
     .layout(Constraints::tight(area.size()), &mut LayoutCx::new())
 }
 
-fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+fn render_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),
@@ -283,7 +283,7 @@ fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_
     );
 }
 
-fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
+fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo) {
     let tab_items = tab_items();
     let tab_state = RefCell::new(demo.tabs.clone());
     render_component(
@@ -300,7 +300,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             separator: Style::new().fg(Color::BrightBlack),
         }),
         Rect::new(1, 0, 26, 1),
-        frame,
+        cx,
     );
 
     let breadcrumb_items = breadcrumb_items();
@@ -312,7 +312,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             &breadcrumb_state,
         ),
         Rect::new(30, 0, 38, 1),
-        frame,
+        cx,
     );
 
     let list_items = list_items();
@@ -320,7 +320,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     render_component(
         &SelectableListComponent::new("navigation.list", &list_items, &list_state),
         Rect::new(1, 1, 24, 4),
-        frame,
+        cx,
     );
 
     let menu_items = menu_items();
@@ -328,7 +328,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     render_component(
         &MenuComponent::new("navigation.menu", &menu_items, &menu_state),
         Rect::new(30, 1, 18, 2),
-        frame,
+        cx,
     );
 
     let tree_items = tree_items();
@@ -348,7 +348,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             },
         ),
         Rect::new(48, 1, 22, 6),
-        frame,
+        cx,
     );
 
     let lines = scroll_lines();
@@ -363,7 +363,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
         TextBlock::new(Text::from_lines(lines)).id("navigation.scroll.content"),
     );
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    PaintCx::new(frame).with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),
@@ -390,7 +390,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             &table_state,
         ),
         Rect::new(1, 9, 32, 4),
-        frame,
+        cx,
     );
 
     let pane_area = scroll_delegate_pane_area();
@@ -413,7 +413,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             ),
         ),
         pane_area,
-        frame,
+        cx,
     );
 
     let text_lines = text_view_lines();
@@ -422,7 +422,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
     render_component(
         &text_view_component(&text_lines, &text_highlights, &text_state),
         Rect::new(1, 13, 68, 2),
-        frame,
+        cx,
     );
     render_component(
         &MessageBarComponent::new("navigation.message", &demo.message)
@@ -441,7 +441,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             })
             .policy(StatusBarPolicy::compact().background(true)),
         Rect::new(1, 15, 60, 1),
-        frame,
+        cx,
     );
 
     let status_left = [StatusSegment::new("nav").severity(StatusSeverity::Info)];
@@ -462,7 +462,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             })
             .policy(StatusBarPolicy::compact().background(true)),
         Rect::new(1, 16, 68, 1),
-        frame,
+        cx,
     );
 
     let hints = [
@@ -485,7 +485,7 @@ fn render_navigation_with_state(frame: &mut Frame<'_>, demo: &NavigationDemo) {
             })
             .policy(KeyHintBarPolicy::compact().background(true)),
         Rect::new(1, 17, 68, 1),
-        frame,
+        cx,
     );
 }
 

@@ -1,5 +1,6 @@
 //! Scoped local-coordinate painting for composable components.
 
+use crate::focus::FocusScopeId;
 use crate::frame::{Cursor, Frame};
 use crate::geometry::{Point, Rect};
 use crate::hit::HitRegion;
@@ -262,6 +263,20 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         });
     }
 
+    /// Select the focus scope active after this frame commits.
+    ///
+    /// Focusable hit regions registered afterwards without an explicit scope
+    /// inherit it, so a modal paints its scope before painting its controls.
+    pub fn set_focus_scope(&mut self, scope: Option<FocusScopeId>) {
+        self.frame.set_focus_scope(scope);
+    }
+
+    /// Return the focus scope requested so far in this frame.
+    #[must_use]
+    pub const fn focus_scope(&self) -> Option<&FocusScopeId> {
+        self.frame.focus_scope()
+    }
+
     /// Register local damage after translation and clipping.
     pub fn push_damage(&mut self, area: LocalRect) {
         if let Some(area) = self.project_rect(area) {
@@ -455,6 +470,41 @@ mod tests {
     use crate::semantic::SemanticRegion;
     use crate::style::{Color, Style};
     use crate::text::Line;
+
+    #[test]
+    fn focus_scope_set_through_context_is_inherited_by_later_hits() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 3));
+        let mut frame = Frame::new(&mut buffer);
+        {
+            let mut paint = PaintCx::new(&mut frame);
+            paint.push_hit(HitRegion::new("background", Rect::new(0, 0, 8, 1)).focusable(true));
+            assert!(paint.focus_scope().is_none());
+            paint.set_focus_scope(Some(crate::hit::HitId::new("modal")));
+            paint.with_child(2, 1, LocalRect::new(0, 0, 4, 1), |paint| {
+                paint.push_hit(HitRegion::new("modal.ok", Rect::new(0, 0, 4, 1)).focusable(true));
+            });
+            assert_eq!(
+                paint.focus_scope().map(crate::hit::HitId::as_str),
+                Some("modal")
+            );
+        }
+
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].focus_scope.is_none());
+        assert_eq!(
+            regions[1]
+                .focus_scope
+                .as_ref()
+                .map(crate::hit::HitId::as_str),
+            Some("modal")
+        );
+        assert_eq!(regions[1].area, Rect::new(2, 1, 4, 1));
+        assert_eq!(
+            frame.focus_scope().map(crate::hit::HitId::as_str),
+            Some("modal")
+        );
+    }
 
     #[test]
     fn nested_translation_and_clipping_bound_cells() {

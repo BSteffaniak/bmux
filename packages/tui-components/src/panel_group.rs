@@ -1279,7 +1279,7 @@ mod tests {
         );
         for (index, panel) in group.layout(area, &state).panels.into_iter().enumerate() {
             let scope = format!("workspace.panel.{index}");
-            frame.push_selection_fragment(SelectionFragment::new(
+            PaintCx::new(&mut frame).push_selection_fragment(SelectionFragment::new(
                 scope,
                 format!("panel-{index}"),
                 panel,

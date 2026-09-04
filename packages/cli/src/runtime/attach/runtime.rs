@@ -62,6 +62,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line as TuiLine;
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
+use bmux_tui_components::theme::ComponentTheme;
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -7573,11 +7574,30 @@ fn help_overlay_render_ops(
     .padding(TuiInsets::new(0, 1, 0, 1));
     let mut buffer = surface_buffer(area);
     let mut frame = TuiFrame::new(&mut buffer);
+    paint_help_overlay(
+        &mut PaintCx::new(&mut frame),
+        area,
+        &modal,
+        lines,
+        scroll,
+        component_theme,
+    );
+    buffer_render_ops(&buffer)
+}
+
+fn paint_help_overlay(
+    cx: &mut PaintCx<'_, '_>,
+    area: TuiRect,
+    modal: &ModalFrame,
+    lines: &[String],
+    scroll: usize,
+    component_theme: ComponentTheme,
+) {
     let modal_component =
         ModalFrameComponent::new("attach.help", modal.clone(), TextBlock::new(""));
     let modal_layout =
         modal_component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    PaintCx::new(&mut frame).with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),
@@ -7602,7 +7622,7 @@ fn help_overlay_render_ops(
         .style(component_theme.text)
         .vertical_scroll(scroll);
     let body_layout = body.layout(Constraints::tight(body_area.size()), &mut LayoutCx::new());
-    PaintCx::new(&mut frame).with_child(
+    cx.with_child(
         i32::from(body_area.x),
         i64::from(body_area.y),
         LocalRect::new(0, 0, body_area.width, body_area.height),
@@ -7630,14 +7650,13 @@ fn help_overlay_render_ops(
             });
         let hints_layout =
             hints.layout(Constraints::tight(hints_area.size()), &mut LayoutCx::new());
-        PaintCx::new(&mut frame).with_child(
+        cx.with_child(
             i32::from(hints_area.x),
             i64::from(hints_area.y),
             LocalRect::new(0, 0, hints_area.width, hints_area.height),
             |cx| hints.paint(&hints_layout, cx),
         );
     }
-    buffer_render_ops(&buffer)
 }
 
 const fn attach_surface_damage_rect(surface: &AttachSurface) -> DamageRect {

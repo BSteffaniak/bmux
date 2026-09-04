@@ -396,24 +396,28 @@ impl bmux_tui_runtime::Presenter<TuiBenchProgram> for TuiBenchPresenter {
     ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
         let area = bmux_tui::geometry::Rect::new(0, 0, 100, 30);
         let localized = bmux_tui::geometry::Rect::new(2, 28, 60, 1);
-        let render = |frame: &mut bmux_tui::frame::Frame<'_>| {
+        let render = |cx: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             let style = bmux_tui::style::Style::new()
                 .fg(bmux_tui::style::Color::Cyan)
                 .add_modifier(bmux_tui::style::Modifier::BOLD);
-            frame.fill(area, " ", bmux_tui::style::Style::new());
-            frame.write_line(
-                bmux_tui::geometry::Rect::new(1, 1, 98, 1),
+            cx.fill(
+                bmux_tui::paint::LocalRect::terminal(area),
+                " ",
+                bmux_tui::style::Style::new(),
+            );
+            cx.write_line(
+                bmux_tui::paint::LocalRect::new(1, 1, 98, 1),
                 &bmux_tui::text::Line::from_spans([
                     bmux_tui::text::Span::styled("BMUX TUI ", style),
                     bmux_tui::text::Span::raw("Unicode: 界 👨‍👩‍👧‍👦 e\u{301}"),
                 ]),
             );
-            frame.write_line(
-                localized,
+            cx.write_line(
+                bmux_tui::paint::LocalRect::terminal(localized),
                 &bmux_tui::text::Line::raw(format!("revision {}", program.revision)),
             );
-            frame.push_hit(bmux_tui::hit::HitRegion::new("benchmark.action", localized));
-            frame.push_image(bmux_tui::image::ImageContribution::Present(
+            cx.push_hit(bmux_tui::hit::HitRegion::new("benchmark.action", localized));
+            cx.push_image(bmux_tui::image::ImageContribution::Present(
                 bmux_tui::image::ImagePlacement {
                     key: bmux_tui::image::ImageKey::new("benchmark.image"),
                     payload: bmux_tui::image::ImagePayload::Pixels {
@@ -427,9 +431,7 @@ impl bmux_tui_runtime::Presenter<TuiBenchProgram> for TuiBenchPresenter {
                     lifecycle: bmux_tui::image::ImageLifecycle::Frame,
                 },
             ));
-            frame.set_cursor(bmux_tui::frame::Cursor::visible(
-                bmux_tui::geometry::Point::new(2, 28),
-            ));
+            cx.set_cursor(bmux_tui::geometry::Point::new(2, 28), true);
         };
         let damage = if program.force_full {
             program.force_full = false;

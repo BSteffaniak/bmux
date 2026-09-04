@@ -113,9 +113,7 @@ where
     }
 
     fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
-        let stats = self
-            .terminal
-            .draw(|frame| (self.render)(program, &mut PaintCx::new(frame)))?;
+        let stats = self.terminal.draw(|cx| (self.render)(program, cx))?;
         Ok(PresentReport {
             changed_cells: stats.changed_cells,
             full_repaint: stats.full_repaint,
@@ -141,9 +139,7 @@ where
     }
 
     fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
-        let stats = self
-            .terminal
-            .draw(|frame| (self.render)(program, &mut PaintCx::new(frame)))?;
+        let stats = self.terminal.draw(|cx| (self.render)(program, cx))?;
         let interactions = self.terminal.hits().clone();
         let focus = self.terminal.focus().clone();
         (self.commit)(program, &interactions, &focus);
