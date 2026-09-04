@@ -93,9 +93,11 @@ product-specific controls:
   cross-axis alignment, and deterministic constrained overflow;
 - `Padding`, `SizeBox`, `Fill`, `Align`, `Flex`, `Clip`, `StyleScope`,
   `Visibility`, `Stack`, and `Keyed` modify one composition concern;
-- `TextBlock` provides measurable rich text and source projection;
-- `ScrollViewport` applies caller-owned logical offsets through scoped
-  translation and clipping.
+- `TextBlock` provides measurable rich text and source projection.
+
+Translated/clipped scrolling over arbitrary content is owned by
+`bmux_tui_components::ScrollViewComponent` and its `ScrollView` controller; the
+core crate provides only the coordinate/clip primitives it builds on.
 
 A rectangular style belongs to the component that measures that rectangle.
 Consumers must not extend backgrounds, reconstruct wrapped rows, or mutate the
@@ -157,7 +159,18 @@ Controls must not add independent line-oriented scroll engines when their
 content can use this model. `TextViewComponent` is the reference consumer: it
 composes a measured `TextBlock` inside the shared viewport, so wrapping, exact
 height, clipping, scrollbars, selection geometry, and events all derive from one
-layout and one caller-owned `ScrollViewState`.
+layout and one caller-owned `ScrollViewState`. `SelectableListComponent` and
+`TableComponent` (and the menu/dropdown controls built on the list) embed a
+`ScrollViewState` in their caller-owned state and resolve a
+`ScrollViewComponent::viewport_layout` node inside their own layout, so paging,
+wheel, gutter scrollbars, clamping, and selected-item auto-scroll route through
+the same controller rather than a per-control offset. Sticky table columns are
+a per-line horizontal projection over that viewport, not a second engine.
+
+`TextInputState` keeps its wrapped-row offset because that offset is derived
+from the caller-owned edit buffer's cursor and wrap layout, which the shared
+viewport does not own; it is cursor-following text-edit state, not content
+scrolling.
 
 ## Variable-height virtualization
 

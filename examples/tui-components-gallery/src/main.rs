@@ -4,9 +4,9 @@ use anyhow::Result;
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::event::Event;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::interaction::InteractionRouter;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::terminal::Terminal;
 use bmux_tui_components_gallery::render_gallery_interactive;
 use bmux_tui_runtime::{
@@ -92,9 +92,9 @@ async fn main() -> Result<()> {
     result.map_err(Into::into)
 }
 
-fn render_gallery_program(program: &mut GalleryProgram, frame: &mut Frame<'_>) {
+fn render_gallery_program(program: &mut GalleryProgram, cx: &mut PaintCx<'_, '_>) {
     render_gallery_interactive(
-        frame,
+        cx,
         program
             .interactions
             .focused()

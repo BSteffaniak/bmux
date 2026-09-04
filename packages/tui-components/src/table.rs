@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 
 use bmux_keyboard::KeyCode;
 use bmux_tui::component::{
-    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
-    LayoutNode, LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId,
+    LayoutMetadata, LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::{Point, Rect};
@@ -18,10 +18,13 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{line_viewport, truncate_line_to_display_width};
 use bmux_tui::text_width::display_width;
 
-use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::common::{ComponentMousePolicy, InteractionState, local_rect, u16_saturating};
 use crate::hit_test::{HitRegion, hit_region_at};
-use crate::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState};
-use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
+use crate::scroll_view::{
+    ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewPolicy, ScrollViewState,
+};
+use crate::scrollbar::{ScrollbarPolicy, ScrollbarStyles};
+use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
 /// Horizontal cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -215,13 +218,18 @@ impl TableRow {
 }
 
 /// Runtime selectable table state.
+///
+/// Scroll offsets are owned by the shared [`ScrollViewState`] so the table
+/// scrolls through the same controller as every other viewport. Vertical
+/// offsets are logical body rows; horizontal offsets are content cells past
+/// the sticky columns.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableState {
     selected: Option<usize>,
     selected_column: Option<usize>,
     hovered: Option<usize>,
-    scroll: usize,
-    horizontal_scroll: usize,
+    /// Shared body viewport scroll state.
+    pub scroll: ScrollViewState,
     /// Generic interaction flags.
     pub interaction: InteractionState,
 }
@@ -234,8 +242,7 @@ impl TableState {
             selected,
             selected_column: None,
             hovered: None,
-            scroll: 0,
-            horizontal_scroll: 0,
+            scroll: ScrollViewState::new(),
             interaction: InteractionState::new(),
         }
     }
@@ -267,26 +274,26 @@ impl TableState {
         self.selected_column = selected_column;
     }
 
-    /// Return horizontal scroll offset in rendered columns.
+    /// Return horizontal scroll offset in content cells.
     #[must_use]
     pub const fn horizontal_scroll(&self) -> usize {
-        self.horizontal_scroll
+        self.scroll.horizontal_offset()
     }
 
-    /// Set horizontal scroll offset in rendered columns.
+    /// Set horizontal scroll offset in content cells.
     pub const fn set_horizontal_scroll(&mut self, horizontal_scroll: usize) {
-        self.horizontal_scroll = horizontal_scroll;
+        self.scroll.set_horizontal_offset(horizontal_scroll);
     }
 
-    /// Return row scroll offset.
+    /// Return the logical body-row scroll offset.
     #[must_use]
     pub const fn scroll(&self) -> usize {
-        self.scroll
+        self.scroll.vertical_offset()
     }
 
-    /// Set row scroll offset.
+    /// Set the logical body-row scroll offset.
     pub const fn set_scroll(&mut self, scroll: usize) {
-        self.scroll = scroll;
+        self.scroll.set_vertical_offset(scroll);
     }
 }
 
@@ -404,6 +411,21 @@ impl TablePolicy {
         self.horizontal_scrollbar_policy = policy;
         self
     }
+
+    /// Shared scroll-view policy derived from this table policy.
+    ///
+    /// Row and column navigation keys are owned by the table, so the shared
+    /// controller handles wheel and scrollbar input only.
+    #[must_use]
+    pub const fn scroll_view_policy(self) -> ScrollViewPolicy {
+        ScrollViewPolicy {
+            keyboard: false,
+            mouse_wheel: self.mouse.enabled,
+            vertical_scrollbar: self.vertical_scrollbar,
+            horizontal_scrollbar: self.horizontal_scrollbar,
+            wheel_rows: 1,
+        }
+    }
 }
 
 impl Default for TablePolicy {
@@ -433,6 +455,8 @@ pub struct TableStyles {
     pub separator: Style,
     /// Empty table style.
     pub empty: Style,
+    /// Integrated scrollbar styles.
+    pub scrollbar: ScrollbarStyles,
 }
 
 impl Default for TableStyles {
@@ -447,6 +471,7 @@ impl Default for TableStyles {
             disabled: Style::new().fg(Color::BrightBlack),
             separator: Style::new().fg(Color::BrightBlack),
             empty: Style::new().fg(Color::BrightBlack),
+            scrollbar: ScrollbarStyles::default(),
         }
     }
 }
@@ -476,6 +501,10 @@ pub enum TableOutcome {
 }
 
 /// Table layout details.
+///
+/// All rectangles are expressed in the coordinate space of the area the table
+/// was laid out for. The body is the shared scroll viewport after reserving
+/// header rows and integrated scrollbar gutters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableLayout {
     /// Resolved column widths.
@@ -492,6 +521,12 @@ pub struct TableLayout {
     pub horizontal_scrollbar: Option<Rect>,
     /// Corner cell reserved when both gutter scrollbars are enabled.
     pub scrollbar_corner: Option<Rect>,
+    /// Authoritative shared scroll viewport over the stacked body rows.
+    ///
+    /// The viewport's single child is the measured body content whose height
+    /// is the exact sum of row heights and whose width is the scrollable
+    /// content width past the sticky columns.
+    pub viewport: LayoutNode,
 }
 
 /// Generic table component.
@@ -540,6 +575,7 @@ impl<'a> Table<'a> {
                 disabled: Style::new(),
                 separator: Style::new(),
                 empty: Style::new(),
+                scrollbar: ScrollbarStyles::new(),
             },
             empty: "No rows",
         }
@@ -566,9 +602,27 @@ impl<'a> Table<'a> {
         self
     }
 
-    /// Compute table layout.
+    /// Shared scroll controller configured from this table's policy and styles.
+    #[must_use]
+    pub const fn scroll_view(&self) -> ScrollView {
+        ScrollView::new()
+            .policy(self.policy.scroll_view_policy())
+            .scrollbar_styles(self.styles.scrollbar)
+            .scrollbar_policies(
+                self.policy.vertical_scrollbar_policy,
+                self.policy.horizontal_scrollbar_policy,
+            )
+    }
+
+    /// Compute table layout for one area.
     #[must_use]
     pub fn layout(&self, area: Rect) -> TableLayout {
+        self.layout_with_id(&LayoutId::new("table"), area)
+    }
+
+    /// Compute table layout for one area with a stable viewport identity.
+    #[must_use]
+    pub fn layout_with_id(&self, id: &LayoutId, area: Rect) -> TableLayout {
         let header_rows = u16::from(self.policy.header && area.height > 0);
         let separator_rows = u16::from(
             self.policy.header && self.policy.header_separator && area.height > header_rows,
@@ -584,32 +638,38 @@ impl<'a> Table<'a> {
             .y
             .saturating_add(header_rows)
             .saturating_add(separator_rows);
-        let viewport = scrollbar_layout(
-            Rect::new(
-                area.x,
-                body_y,
-                area.width,
-                area.height
-                    .saturating_sub(header_rows)
-                    .saturating_sub(separator_rows),
-            ),
-            ScrollbarLayoutPolicy::new(
-                self.policy.vertical_scrollbar,
-                self.policy.horizontal_scrollbar,
+        let scroll_area = Rect::new(
+            area.x,
+            body_y,
+            area.width,
+            area.height
+                .saturating_sub(header_rows)
+                .saturating_sub(separator_rows),
+        );
+        let scroll_view = self.scroll_view();
+        let body = scroll_view.content_area(scroll_area);
+        let column_widths =
+            resolve_column_widths(self.columns, body.width, self.policy.cell_separator);
+        let viewport = ScrollViewComponent::viewport_layout(
+            viewport_id(id),
+            LogicalSize::new(body.width, usize::from(body.height)),
+            LayoutNode::leaf(
+                content_id(id),
+                LogicalSize::new(
+                    self.horizontal_content_width(&column_widths, body.width),
+                    self.body_height(),
+                ),
             ),
         );
         TableLayout {
-            column_widths: resolve_column_widths(
-                self.columns,
-                viewport.content.width,
-                self.policy.cell_separator,
-            ),
+            column_widths,
             header,
             header_separator,
-            body: viewport.content,
-            vertical_scrollbar: viewport.vertical_scrollbar,
-            horizontal_scrollbar: viewport.horizontal_scrollbar,
-            scrollbar_corner: viewport.corner,
+            body,
+            vertical_scrollbar: scroll_view.scrollbar_area(scroll_area),
+            horizontal_scrollbar: scroll_view.horizontal_scrollbar_area(scroll_area),
+            scrollbar_corner: scroll_view.scrollbar_corner(scroll_area),
+            viewport,
         }
     }
 
@@ -619,11 +679,6 @@ impl<'a> Table<'a> {
     pub fn size(&self) -> (u16, u16) {
         let header_rows = usize::from(self.policy.header);
         let separator_rows = usize::from(self.policy.header && self.policy.header_separator);
-        let body_rows = if self.rows.is_empty() {
-            1
-        } else {
-            self.rows.iter().map(TableRow::height).sum::<usize>()
-        };
         let gutter = u16::from(matches!(
             self.policy.vertical_scrollbar,
             ScrollbarAxisLayoutMode::Gutter
@@ -637,10 +692,29 @@ impl<'a> Table<'a> {
             u16_saturating(
                 header_rows
                     .saturating_add(separator_rows)
-                    .saturating_add(body_rows)
+                    .saturating_add(self.body_height())
                     .saturating_add(horizontal_gutter),
             ),
         )
+    }
+
+    /// Clamp caller-owned scroll state to valid bounds for this area, applying
+    /// selected-row auto-scroll when the policy requests it.
+    pub fn reconcile(&self, area: Rect, state: &mut TableState) {
+        let layout = self.layout(area);
+        self.reconcile_layout(&layout, state);
+    }
+
+    fn reconcile_layout(&self, layout: &TableLayout, state: &mut TableState) {
+        let scroll_view = self.scroll_view();
+        if self.policy.auto_scroll_selected
+            && let Some(selected) = state.selected
+            && let Some(start) = self.row_start(selected)
+        {
+            let height = self.rows.get(selected).map_or(0, TableRow::height);
+            let _ = scroll_view.ensure_visible(&layout.viewport, &mut state.scroll, start, height);
+        }
+        scroll_view.reconcile(&layout.viewport, &mut state.scroll);
     }
 
     /// Paint the header, visible rows, integrated scrollbars, and corner
@@ -651,6 +725,21 @@ impl<'a> Table<'a> {
             return;
         }
         let layout = self.layout(area);
+        self.paint_layout(&layout, area, &self.reconciled(&layout, state), cx);
+    }
+
+    /// Paint against an already resolved layout.
+    ///
+    /// The supplied `state` must already be reconciled against `layout`; the
+    /// component lifecycle does this before painting so the painted offset and
+    /// the offset used for interaction registration agree exactly.
+    fn paint_layout(
+        &self,
+        layout: &TableLayout,
+        area: Rect,
+        state: &TableState,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
         if let Some(header) = layout.header {
             let line = self.row_line(
                 &layout.column_widths,
@@ -681,90 +770,60 @@ impl<'a> Table<'a> {
                 &Line::from(self.empty),
                 self.styles.empty,
             );
-            return;
+        } else {
+            let body = layout.body;
+            cx.with_child(
+                i32::from(body.x),
+                i64::from(body.y),
+                LocalRect::new(0, 0, body.width, body.height),
+                |cx| {
+                    ScrollViewComponent::new(
+                        layout.viewport.id.clone(),
+                        layout.viewport.size,
+                        // Horizontal projection is applied per line by
+                        // `visible_line` so sticky columns stay pinned; the
+                        // viewport translates rows only.
+                        vertical_only(state.scroll),
+                        BodyRows {
+                            table: self,
+                            layout,
+                            state,
+                        },
+                    )
+                    .paint(&layout.viewport, cx);
+                },
+            );
         }
-        let scroll = self.effective_scroll(state, layout.body.height);
-        let mut rendered = 0usize;
-        for source in scroll..self.rows.len() {
-            let row = &self.rows[source];
-            for line_index in 0..row.height() {
-                if rendered >= usize::from(layout.body.height) {
-                    break;
-                }
-                let y = layout.body.y.saturating_add(u16_saturating(rendered));
-                let rect = Rect::new(layout.body.x, y, layout.body.width, 1);
-                let line = self.row_line(
-                    &layout.column_widths,
-                    row.cells.iter().map(|cell| {
-                        cell.get(line_index)
-                            .cloned()
-                            .unwrap_or_else(|| Line::from(""))
-                    }),
-                    false,
-                    Some(source),
-                    state,
+        let scroll_area = local_rect(area, scroll_area_of(layout, area));
+        cx.with_child(
+            i32::from(scroll_area.x),
+            i64::from(scroll_area.y),
+            LocalRect::new(0, 0, scroll_area.width, scroll_area.height),
+            |cx| {
+                self.scroll_view().paint_scrollbars(
+                    Rect::new(0, 0, scroll_area.width, scroll_area.height),
+                    &layout.viewport,
+                    &state.scroll,
+                    cx,
                 );
-                cx.write_line_with_fallback_style(
-                    LocalRect::terminal(rect),
-                    &self.visible_line(&line, &layout.column_widths, state, rect.width),
-                    self.row_style(source, row, state),
-                );
-                rendered = rendered.saturating_add(1);
-            }
-        }
-        self.paint_vertical_scrollbar(&layout, state, cx);
-        self.paint_horizontal_scrollbar(&layout, state, cx);
-        if let Some(corner) = layout.scrollbar_corner {
-            cx.write_line(LocalRect::terminal(corner), &Line::from(" "));
-        }
-    }
-
-    fn paint_vertical_scrollbar(
-        &self,
-        layout: &TableLayout,
-        state: &TableState,
-        cx: &mut PaintCx<'_, '_>,
-    ) {
-        let Some(area) = layout.vertical_scrollbar else {
-            return;
-        };
-        let scrollbar_state = ScrollbarState::new(u16_saturating(self.rows.len()), area.height)
-            .offset(u16_saturating(state.scroll));
-        Scrollbar::new()
-            .policy(self.policy.vertical_scrollbar_policy)
-            .paint(area, &scrollbar_state, cx);
-    }
-
-    fn paint_horizontal_scrollbar(
-        &self,
-        layout: &TableLayout,
-        state: &TableState,
-        cx: &mut PaintCx<'_, '_>,
-    ) {
-        let Some(area) = layout.horizontal_scrollbar else {
-            return;
-        };
-        let scrollbar_state =
-            ScrollbarState::new(u16_saturating(self.preferred_content_width()), area.width)
-                .offset(u16_saturating(state.horizontal_scroll));
-        Scrollbar::new()
-            .policy(self.policy.horizontal_scrollbar_policy)
-            .paint(area, &scrollbar_state, cx);
+            },
+        );
     }
 
     /// Hit-test a point against visible table regions.
     #[must_use]
     pub fn hit_test(&self, area: Rect, state: &TableState, position: Point) -> Option<TableHit> {
         let layout = self.layout(area);
+        let state = self.reconciled(&layout, state);
         if let Some(header) = layout.header
             && header.contains(position)
         {
             return self
-                .column_at(&layout, header, state, position)
+                .column_at(&layout, header, &state, position)
                 .map(|column| TableHit::Header { column });
         }
-        let row = self.row_at(area, state, position)?;
-        self.column_at(&layout, layout.body, state, position)
+        let row = self.row_at_layout(&layout, &state, position)?;
+        self.column_at(&layout, layout.body, &state, position)
             .map_or(Some(TableHit::Row { row }), |column| {
                 Some(TableHit::Cell { row, column })
             })
@@ -772,18 +831,32 @@ impl<'a> Table<'a> {
 
     /// Handle one event.
     pub fn handle_event(&self, area: Rect, state: &mut TableState, event: &Event) -> TableOutcome {
+        let layout = self.layout(area);
+        self.handle_event_with_layout(&layout, area, state, event)
+    }
+
+    fn handle_event_with_layout(
+        &self,
+        layout: &TableLayout,
+        area: Rect,
+        state: &mut TableState,
+        event: &Event,
+    ) -> TableOutcome {
         if state.interaction.disabled {
             return TableOutcome::Ignored;
         }
+        self.reconcile_layout(layout, state);
         match event {
             Event::Key(stroke) if self.policy.keyboard && stroke.modifiers.is_empty() => {
                 match stroke.key {
-                    KeyCode::Up => self.move_selection(state, -1),
-                    KeyCode::Down => self.move_selection(state, 1),
-                    KeyCode::Home => self.select_index(state, 0),
-                    KeyCode::End => self.select_index(state, self.rows.len().saturating_sub(1)),
-                    KeyCode::Left => self.scroll_horizontal(state, -1),
-                    KeyCode::Right => self.scroll_horizontal(state, 1),
+                    KeyCode::Up => self.move_selection(layout, state, -1),
+                    KeyCode::Down => self.move_selection(layout, state, 1),
+                    KeyCode::Home => self.select_index(layout, state, 0),
+                    KeyCode::End => {
+                        self.select_index(layout, state, self.rows.len().saturating_sub(1))
+                    }
+                    KeyCode::Left => self.scroll_horizontal(layout, state, -1),
+                    KeyCode::Right => self.scroll_horizontal(layout, state, 1),
                     KeyCode::Enter => state
                         .selected
                         .map_or(TableOutcome::Ignored, TableOutcome::Selected),
@@ -791,7 +864,7 @@ impl<'a> Table<'a> {
                 }
             }
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
-                self.handle_mouse(area, state, *mouse)
+                self.handle_mouse(layout, area, state, *mouse)
             }
             Event::Key(_)
             | Event::Mouse(_)
@@ -803,37 +876,42 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn handle_mouse(&self, area: Rect, state: &mut TableState, mouse: MouseEvent) -> TableOutcome {
-        let layout = self.layout(area);
-        if let Some(scrollbar_area) = layout.vertical_scrollbar {
-            let mut scrollbar_state =
-                ScrollbarState::new(u16_saturating(self.rows.len()), scrollbar_area.height)
-                    .offset(u16_saturating(state.scroll));
-            let outcome = Scrollbar::new()
-                .policy(self.policy.vertical_scrollbar_policy)
-                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse));
-            if let ScrollbarOutcome::Changed { offset } = outcome {
-                state.scroll = usize::from(offset).min(self.rows.len().saturating_sub(1));
-                return TableOutcome::Redraw;
-            }
+    fn handle_mouse(
+        &self,
+        layout: &TableLayout,
+        area: Rect,
+        state: &mut TableState,
+        mouse: MouseEvent,
+    ) -> TableOutcome {
+        let scroll_view = self.scroll_view();
+        let event = Event::Mouse(mouse);
+        let scroll_area = scroll_area_of(layout, area);
+        let scrollbar = scroll_view.handle_scrollbar_event(
+            scroll_area,
+            &layout.viewport,
+            &mut state.scroll,
+            &event,
+        );
+        if scrollbar != ScrollViewOutcome::Ignored || state.scroll.dragging_scrollbar() {
+            return TableOutcome::Redraw;
         }
-        if let Some(scrollbar_area) = layout.horizontal_scrollbar {
-            let mut scrollbar_state = ScrollbarState::new(
-                u16_saturating(self.preferred_content_width()),
-                scrollbar_area.width,
-            )
-            .offset(u16_saturating(state.horizontal_scroll));
-            let outcome = Scrollbar::new()
-                .policy(self.policy.horizontal_scrollbar_policy)
-                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse));
-            if let ScrollbarOutcome::Changed { offset } = outcome {
-                state.horizontal_scroll = usize::from(offset);
-                return TableOutcome::Redraw;
-            }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ) {
+            return scroll_outcome(scroll_view.handle_event(
+                area,
+                &layout.viewport,
+                &mut state.scroll,
+                &event,
+            ));
         }
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => {
-                let hovered = self.row_at(area, state, mouse.position);
+                let hovered = self.row_at_layout(layout, state, mouse.position);
                 if hovered == state.hovered {
                     TableOutcome::Ignored
                 } else {
@@ -842,22 +920,15 @@ impl<'a> Table<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => self
-                .row_at(area, state, mouse.position)
-                .map_or(TableOutcome::Ignored, |row| self.select_index(state, row)),
-            MouseEventKind::ScrollDown => {
-                state.scroll = state
-                    .scroll
-                    .saturating_add(1)
-                    .min(self.rows.len().saturating_sub(1));
-                TableOutcome::Redraw
-            }
-            MouseEventKind::ScrollUp => {
-                state.scroll = state.scroll.saturating_sub(1);
-                TableOutcome::Redraw
-            }
-            MouseEventKind::ScrollLeft => self.scroll_horizontal(state, -1),
-            MouseEventKind::ScrollRight => self.scroll_horizontal(state, 1),
-            MouseEventKind::Down(_)
+                .row_at_layout(layout, state, mouse.position)
+                .map_or(TableOutcome::Ignored, |row| {
+                    self.select_index(layout, state, row)
+                }),
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+            | MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
             | MouseEventKind::Move => TableOutcome::Ignored,
@@ -887,15 +958,16 @@ impl<'a> Table<'a> {
             .sum::<usize>()
             .saturating_add(separator_width.saturating_mul(sticky.saturating_sub(1)));
         let local_x = usize::from(position.x.saturating_sub(area.x));
+        let horizontal = state.horizontal_scroll();
         let content_x = if sticky > 0 && local_x < sticky_width {
             local_x
         } else if sticky > 0 {
             local_x
-                .saturating_add(state.horizontal_scroll)
+                .saturating_add(horizontal)
                 .saturating_add(sticky_width)
                 .saturating_add(separator_width)
         } else {
-            local_x.saturating_add(state.horizontal_scroll)
+            local_x.saturating_add(horizontal)
         };
         let mut start = 0usize;
         for (index, width) in layout.column_widths.iter().copied().enumerate() {
@@ -909,29 +981,52 @@ impl<'a> Table<'a> {
     }
 
     /// Return visible body-row hit regions for tests and semantic inspection.
+    ///
+    /// Regions are derived from the reconciled logical scroll offset: rows
+    /// above the offset are skipped exactly and the final visible row is
+    /// clipped to the viewport bottom.
     #[must_use]
     pub fn row_hit_regions(&self, area: Rect, state: &TableState) -> Vec<HitRegion<usize>> {
         let layout = self.layout(area);
-        let mut rendered = 0u16;
+        self.row_hit_regions_layout(&layout, &self.reconciled(&layout, state))
+    }
+
+    /// Visible row regions for an already reconciled `state`.
+    fn row_hit_regions_layout(
+        &self,
+        layout: &TableLayout,
+        state: &TableState,
+    ) -> Vec<HitRegion<usize>> {
+        let body = layout.body;
+        let offset = state.scroll.vertical_offset();
+        let viewport_end = offset.saturating_add(usize::from(body.height));
+        let mut start = 0usize;
         let mut regions = Vec::new();
-        for source in self.effective_scroll(state, layout.body.height)..self.rows.len() {
-            if rendered >= layout.body.height {
+        for (index, row) in self.rows.iter().enumerate() {
+            let end = start.saturating_add(row.height());
+            if end <= offset {
+                start = end;
+                continue;
+            }
+            if start >= viewport_end {
                 break;
             }
-            let height = u16_saturating(self.rows[source].height())
-                .min(layout.body.height.saturating_sub(rendered));
+            let visible_start = start.max(offset);
+            let visible_end = end.min(viewport_end);
+            let height = visible_end.saturating_sub(visible_start);
             if height > 0 {
                 regions.push(HitRegion::new(
-                    source,
+                    index,
                     Rect::new(
-                        layout.body.x,
-                        layout.body.y.saturating_add(rendered),
-                        layout.body.width,
-                        height,
+                        body.x,
+                        body.y
+                            .saturating_add(u16_saturating(visible_start.saturating_sub(offset))),
+                        body.width,
+                        u16_saturating(height),
                     ),
                 ));
-                rendered = rendered.saturating_add(height);
             }
+            start = end;
         }
         regions
     }
@@ -939,7 +1034,32 @@ impl<'a> Table<'a> {
     /// Return visible body-row index at a point, if any.
     #[must_use]
     pub fn row_at(&self, area: Rect, state: &TableState, position: Point) -> Option<usize> {
-        hit_region_at(&self.row_hit_regions(area, state), position).map(|region| region.key)
+        let layout = self.layout(area);
+        self.row_at_layout(&layout, &self.reconciled(&layout, state), position)
+    }
+
+    /// Visible row at a point for an already reconciled `state`.
+    fn row_at_layout(
+        &self,
+        layout: &TableLayout,
+        state: &TableState,
+        position: Point,
+    ) -> Option<usize> {
+        hit_region_at(&self.row_hit_regions_layout(layout, state), position)
+            .map(|region| region.key)
+    }
+
+    /// Exact stacked body height in logical rows.
+    fn body_height(&self) -> usize {
+        self.rows.iter().map(TableRow::height).sum()
+    }
+
+    /// Logical start row of one source row.
+    fn row_start(&self, index: usize) -> Option<usize> {
+        if index >= self.rows.len() {
+            return None;
+        }
+        Some(self.rows.iter().take(index).map(TableRow::height).sum())
     }
 
     fn preferred_content_width(&self) -> usize {
@@ -964,7 +1084,30 @@ impl<'a> Table<'a> {
         )
     }
 
-    fn move_selection(&self, state: &mut TableState, delta: i32) -> TableOutcome {
+    /// Logical content width of the body viewport.
+    ///
+    /// The viewport is the full body width so sticky columns stay inside the
+    /// clip; the content extends past it by exactly the cells that horizontal
+    /// scrolling can reveal. With sticky columns the scrolled region directly
+    /// follows the pinned cells, so the separator after the last sticky
+    /// column never renders and is excluded from the scrollable extent.
+    fn horizontal_content_width(&self, widths: &[u16], body_width: u16) -> u16 {
+        let sticky = self.policy.sticky_left_columns.min(widths.len());
+        let total = self.preferred_content_width();
+        let scrollable = if sticky == 0 {
+            total
+        } else {
+            total.saturating_sub(display_width(self.policy.cell_separator))
+        };
+        u16_saturating(scrollable).max(body_width)
+    }
+
+    fn move_selection(
+        &self,
+        layout: &TableLayout,
+        state: &mut TableState,
+        delta: i32,
+    ) -> TableOutcome {
         if self.rows.is_empty() {
             return TableOutcome::Ignored;
         }
@@ -982,17 +1125,23 @@ impl<'a> Table<'a> {
         if next == current {
             return TableOutcome::Ignored;
         }
-        self.select_index(state, next)
+        self.select_index(layout, state, next)
     }
 
-    fn scroll_horizontal(&self, state: &mut TableState, delta: i32) -> TableOutcome {
-        let before_scroll = state.horizontal_scroll;
+    fn scroll_horizontal(
+        &self,
+        layout: &TableLayout,
+        state: &mut TableState,
+        delta: i32,
+    ) -> TableOutcome {
         let before_column = state.selected_column;
-        let current = i32::try_from(state.horizontal_scroll).unwrap_or(i32::MAX);
-        state.horizontal_scroll =
-            usize::try_from(current.saturating_add(delta).max(0)).unwrap_or(usize::MAX);
+        let scrolled = ScrollView::scroll_horizontal_by(
+            &layout.viewport,
+            &mut state.scroll,
+            isize::try_from(delta).unwrap_or(isize::MAX),
+        );
         let _ = self.move_column(state, delta);
-        if state.horizontal_scroll == before_scroll && state.selected_column == before_column {
+        if scrolled == ScrollViewOutcome::Ignored && state.selected_column == before_column {
             TableOutcome::Ignored
         } else {
             TableOutcome::Redraw
@@ -1021,35 +1170,32 @@ impl<'a> Table<'a> {
         TableOutcome::Redraw
     }
 
-    fn select_index(&self, state: &mut TableState, index: usize) -> TableOutcome {
+    fn select_index(
+        &self,
+        layout: &TableLayout,
+        state: &mut TableState,
+        index: usize,
+    ) -> TableOutcome {
         if self.rows.get(index).is_none_or(|row| row.disabled) {
             return TableOutcome::Ignored;
         }
         state.selected = Some(index);
+        self.reconcile_layout(layout, state);
         TableOutcome::Focused(index)
     }
 
-    fn effective_scroll(&self, state: &TableState, body_height: u16) -> usize {
-        if !self.policy.auto_scroll_selected || body_height == 0 {
-            return state.scroll.min(self.rows.len().saturating_sub(1));
-        }
-        let Some(selected) = state.selected else {
-            return state.scroll.min(self.rows.len().saturating_sub(1));
-        };
-        let height = usize::from(body_height);
-        if selected < state.scroll {
-            selected
-        } else if selected >= state.scroll.saturating_add(height) {
-            selected.saturating_sub(height.saturating_sub(1))
-        } else {
-            state.scroll
-        }
+    /// Copy of `state` reconciled against `layout` without mutating the caller.
+    fn reconciled(&self, layout: &TableLayout, state: &TableState) -> TableState {
+        let mut reconciled = state.clone();
+        self.reconcile_layout(layout, &mut reconciled);
+        reconciled
     }
 
     fn visible_line(&self, line: &Line, widths: &[u16], state: &TableState, width: u16) -> Line {
+        let horizontal = state.horizontal_scroll();
         let sticky = self.policy.sticky_left_columns.min(widths.len());
         if sticky == 0 {
-            return line_viewport(line, state.horizontal_scroll, usize::from(width));
+            return line_viewport(line, horizontal, usize::from(width));
         }
         let separator_width = display_width(self.policy.cell_separator);
         let sticky_width = widths
@@ -1066,7 +1212,7 @@ impl<'a> Table<'a> {
                 line,
                 sticky_width
                     .saturating_add(separator_width)
-                    .saturating_add(state.horizontal_scroll),
+                    .saturating_add(horizontal),
                 remaining,
             );
             left.spans.append(&mut right.spans);
@@ -1146,6 +1292,100 @@ impl<'a> Table<'a> {
             );
         }
         Line::from_spans(spans)
+    }
+}
+
+/// Stacked body rows painted as the single child of the shared viewport.
+///
+/// The viewport translation and clip decide which rows reach the buffer, so
+/// painting is bounded to rows intersecting the viewport. Horizontal
+/// projection stays per line so sticky columns remain pinned.
+struct BodyRows<'a, 'table> {
+    table: &'table Table<'a>,
+    layout: &'table TableLayout,
+    state: &'table TableState,
+}
+
+impl Component for BodyRows<'_, '_> {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        LayoutNode::leaf(
+            self.layout.viewport.children.first().map_or_else(
+                || LayoutId::new("table.content"),
+                |child| child.node.id.clone(),
+            ),
+            LogicalSize::new(constraints.max_width(), self.table.body_height()),
+        )
+    }
+
+    fn paint(&self, _layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let body = self.layout.body;
+        let offset = self.state.scroll.vertical_offset();
+        let end = offset.saturating_add(usize::from(body.height));
+        let mut row = 0usize;
+        for (source, table_row) in self.table.rows.iter().enumerate() {
+            if row >= end {
+                break;
+            }
+            for line_index in 0..table_row.height() {
+                if row >= offset && row < end {
+                    let line = self.table.row_line(
+                        &self.layout.column_widths,
+                        table_row.cells.iter().map(|cell| {
+                            cell.get(line_index)
+                                .cloned()
+                                .unwrap_or_else(|| Line::from(""))
+                        }),
+                        false,
+                        Some(source),
+                        self.state,
+                    );
+                    cx.write_line_with_fallback_style(
+                        LocalRect::new(0, i64::try_from(row).unwrap_or(i64::MAX), body.width, 1),
+                        &self.table.visible_line(
+                            &line,
+                            &self.layout.column_widths,
+                            self.state,
+                            body.width,
+                        ),
+                        self.table.row_style(source, table_row, self.state),
+                    );
+                }
+                row = row.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// The complete scroll area (body plus gutters) for one laid-out table.
+const fn scroll_area_of(layout: &TableLayout, area: Rect) -> Rect {
+    let top = layout.body.y;
+    Rect::new(area.x, top, area.width, area.bottom().saturating_sub(top))
+}
+
+/// Scroll state with the horizontal offset cleared.
+///
+/// The body viewport translates rows only; horizontal projection is applied
+/// per line so sticky columns stay pinned.
+const fn vertical_only(mut state: ScrollViewState) -> ScrollViewState {
+    state.set_horizontal_offset(0);
+    state
+}
+
+fn viewport_id(id: &LayoutId) -> LayoutId {
+    LayoutId::new(format!("{}.viewport", id.as_str()))
+}
+
+fn content_id(id: &LayoutId) -> LayoutId {
+    LayoutId::new(format!("{}.content", id.as_str()))
+}
+
+const fn scroll_outcome(outcome: ScrollViewOutcome) -> TableOutcome {
+    match outcome {
+        ScrollViewOutcome::Ignored => TableOutcome::Ignored,
+        ScrollViewOutcome::Scrolled { .. } | ScrollViewOutcome::HorizontalScrolled { .. } => {
+            TableOutcome::Redraw
+        }
     }
 }
 
@@ -1273,6 +1513,7 @@ impl From<crate::theme::ComponentTheme> for TableStyles {
             disabled: theme.disabled,
             separator: theme.border,
             empty: theme.muted,
+            scrollbar: theme.scrollbar_styles(),
         }
     }
 }
@@ -1281,10 +1522,6 @@ impl From<crate::theme::ComponentTheme> for TableStyles {
 fn format_cell(text: &str, width: u16, align: TableAlign, truncate: bool) -> String {
     let line = Line::from(text);
     format_cell_line(&line, width, align, truncate).plain_text()
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 /// Canonical component-lifecycle table.
@@ -1378,19 +1615,32 @@ impl Component for TableComponent<'_, '_> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let (width, height) = self.table.size();
-        LayoutNode::leaf(
+        let size = constraints.constrain(LogicalSize::new(width, usize::from(height)));
+        let area = Rect::new(0, 0, size.width, u16_saturating(size.height));
+        let table_layout = self.table.layout_with_id(&self.id, area);
+        LayoutNode::with_children(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, usize::from(height))),
+            size,
+            vec![ChildLayout::new(
+                table_layout.body.x,
+                usize::from(table_layout.body.y),
+                table_layout.viewport,
+            )],
         )
         .with_metadata(LayoutMetadata::new().semantic("table"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = Rect::new(0, 0, layout.size.width, height);
+        let area = Rect::new(0, 0, layout.size.width, u16_saturating(layout.size.height));
         if area.is_empty() {
             return;
         }
+        let table_layout = self.table.layout_with_id(&self.id, area);
+        // Reconcile caller-owned scroll state against the authoritative
+        // viewport before painting so the painted offset, hit regions, and
+        // subsequent input routing agree exactly.
+        self.table
+            .reconcile_layout(&table_layout, &mut self.state.borrow_mut());
         let state = self.state.borrow();
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
@@ -1399,7 +1649,7 @@ impl Component for TableComponent<'_, '_> {
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
-        for region in self.table.row_hit_regions(area, &state) {
+        for region in self.table.row_hit_regions_layout(&table_layout, &state) {
             let disabled = self
                 .table
                 .rows
@@ -1414,7 +1664,7 @@ impl Component for TableComponent<'_, '_> {
             );
             cx.push_semantic(SemanticRegion::new(row_id, region.rect, "row"));
         }
-        self.table.paint(area, &state, cx);
+        self.table.paint_layout(&table_layout, area, &state, cx);
         cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "table"));
         cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
     }
@@ -1423,9 +1673,13 @@ impl Component for TableComponent<'_, '_> {
         let Some(area) = cx.find_rect(&layout.id) else {
             return EventOutcome::Ignored;
         };
-        let outcome = self
-            .table
-            .handle_event(area, &mut self.state.borrow_mut(), event);
+        let table_layout = self.table.layout_with_id(&self.id, area);
+        let outcome = self.table.handle_event_with_layout(
+            &table_layout,
+            area,
+            &mut self.state.borrow_mut(),
+            event,
+        );
         match outcome {
             TableOutcome::Ignored => EventOutcome::Ignored,
             TableOutcome::Redraw | TableOutcome::Focused(_) | TableOutcome::Selected(_) => {
@@ -1441,7 +1695,7 @@ mod tests {
 
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx, LayoutId, LogicalSize};
     use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect};
@@ -1450,6 +1704,7 @@ mod tests {
     use bmux_tui::prelude::{Line, Span};
     use bmux_tui::style::{Color, Style};
 
+    use crate::scroll_view::ScrollView;
     use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
     use super::{
@@ -2258,5 +2513,157 @@ mod tests {
             .render(Rect::new(0, 0, 8, 2), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("two     "));
+    }
+
+    #[test]
+    fn component_layout_exposes_shared_scroll_viewport_over_exact_body_content() {
+        let columns = [TableColumn::new("Name").fixed(6)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::multiline(vec![vec![Line::from("two"), Line::from("more")]]),
+            TableRow::new(vec!["three"]),
+        ];
+        let state = RefCell::new(TableState::new(None));
+        let component = TableComponent::new("grid", &columns, &rows, &state)
+            .policy(TablePolicy::interactive().vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter));
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 7, 3).size()),
+            &mut LayoutCx::new(),
+        );
+
+        let viewport = layout
+            .find(&LayoutId::new("grid.viewport"))
+            .expect("shared viewport node");
+        assert_eq!(
+            viewport.size,
+            LogicalSize::new(6, 2),
+            "body minus header and gutter"
+        );
+        let content = layout
+            .find(&LayoutId::new("grid.content"))
+            .expect("measured body content");
+        assert_eq!(content.size.height, 4, "exact sum of row heights");
+        assert_eq!(
+            layout
+                .find_logical_rect(&LayoutId::new("grid.viewport"))
+                .map(|rect| rect.y),
+            Some(1),
+            "viewport starts below the header"
+        );
+        assert_eq!(ScrollView::max_vertical_offset(viewport), 2);
+    }
+
+    #[test]
+    fn wheel_and_page_scrolling_route_through_shared_scroll_view_and_clamp() {
+        let columns = [TableColumn::new("Name").fixed(6)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::new(vec!["two"]),
+            TableRow::new(vec!["three"]),
+            TableRow::new(vec!["four"]),
+        ];
+        let table = Table::new(&columns, &rows).policy(TablePolicy {
+            auto_scroll_selected: false,
+            ..TablePolicy::interactive()
+        });
+        let area = Rect::new(0, 0, 6, 3);
+        let mut state = TableState::new(None);
+
+        let wheel = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 1)));
+        assert_eq!(
+            table.handle_event(area, &mut state, &wheel(MouseEventKind::ScrollDown)),
+            TableOutcome::Redraw
+        );
+        assert_eq!(state.scroll(), 1);
+        assert_eq!(
+            table.handle_event(area, &mut state, &wheel(MouseEventKind::ScrollDown)),
+            TableOutcome::Redraw
+        );
+        assert_eq!(state.scroll(), 2, "clamped to the final visible page");
+        assert_eq!(
+            table.handle_event(area, &mut state, &wheel(MouseEventKind::ScrollDown)),
+            TableOutcome::Ignored,
+            "scrolling past the end is a no-op"
+        );
+        assert_eq!(
+            table.handle_event(area, &mut state, &wheel(MouseEventKind::ScrollUp)),
+            TableOutcome::Redraw
+        );
+        assert_eq!(state.scroll(), 1);
+
+        let mut oversized = TableState::new(None);
+        oversized.set_scroll(99);
+        table.reconcile(area, &mut oversized);
+        assert_eq!(oversized.scroll(), 2, "stale offsets clamp to the layout");
+
+        let mut horizontal = TableState::new(None);
+        horizontal.set_horizontal_scroll(99);
+        table.reconcile(area, &mut horizontal);
+        assert_eq!(
+            horizontal.horizontal_scroll(),
+            0,
+            "no horizontal overflow means no horizontal offset"
+        );
+    }
+
+    #[test]
+    fn horizontal_wheel_scrolls_columns_and_clamps_to_content_width() {
+        let columns = [
+            TableColumn::new("A").fixed(4),
+            TableColumn::new("B").fixed(4),
+        ];
+        let rows = [TableRow::new(vec!["abcd", "efgh"])];
+        let table = Table::new(&columns, &rows).policy(TablePolicy {
+            header: false,
+            ..TablePolicy::interactive()
+        });
+        let area = Rect::new(0, 0, 5, 1);
+        let mut state = TableState::new(None);
+
+        for _ in 0..6 {
+            let _ = table.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::ScrollRight,
+                    Point::new(1, 0),
+                )),
+            );
+        }
+        assert_eq!(
+            state.horizontal_scroll(),
+            4,
+            "content width 9 minus viewport 5"
+        );
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        table.render(area, &state, &mut frame);
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" efgh"));
+    }
+
+    #[test]
+    fn auto_scroll_reconciles_selected_row_without_mutating_caller_offset_on_paint() {
+        let columns = [TableColumn::new("Name").fixed(6)];
+        let rows = [
+            TableRow::new(vec!["one"]),
+            TableRow::new(vec!["two"]),
+            TableRow::new(vec!["three"]),
+        ];
+        let table = Table::new(&columns, &rows);
+        let area = Rect::new(0, 0, 6, 2);
+        let state = TableState::new(Some(2));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let mut frame = Frame::new(&mut buffer);
+
+        table.render(area, &state, &mut frame);
+
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("three "));
+        assert_eq!(state.scroll(), 0, "painting never mutates caller state");
+        assert_eq!(
+            table.row_hit_regions(area, &state)[0].key,
+            2,
+            "hit regions agree with the painted offset"
+        );
     }
 }

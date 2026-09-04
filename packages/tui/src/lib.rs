@@ -51,9 +51,8 @@ pub mod prelude {
         LogicalRect, LogicalSize, combine_child_revisions,
     };
     pub use crate::composition::{
-        Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, ScrollViewport,
-        SizeBox, Stack, StyleScope, Surface, TextBlock, TextProjectionRow, VerticalAlignment,
-        Visibility,
+        Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, SizeBox, Stack,
+        StyleScope, Surface, TextBlock, TextProjectionRow, VerticalAlignment, Visibility,
     };
     #[cfg(feature = "crossterm")]
     pub use crate::crossterm::{

@@ -13,6 +13,8 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
+use crate::common::u16_saturating;
+
 /// Status severity for message/status segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusSeverity {
@@ -541,10 +543,6 @@ fn segments_text(segments: &[StatusSegment<'_>], separator: &str) -> String {
         .map(|segment| segment.text)
         .collect::<Vec<_>>()
         .join(separator)
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 impl crate::theme::ComponentTheme {

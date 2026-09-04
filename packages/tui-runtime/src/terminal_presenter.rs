@@ -1,5 +1,10 @@
 //! [`bmux_tui::terminal::Terminal`] presenter adapter.
 //!
+//! The render callback receives the application and a root
+//! [`bmux_tui::paint::PaintCx`] covering the terminal area. Applications resolve
+//! their component tree under the terminal constraints and paint it through
+//! that scoped context; the raw frame and buffer are never exposed.
+//!
 //! [`TerminalPresenter::with_commit`] publishes the exact interaction metadata
 //! from the last successfully flushed frame. Applications should update their
 //! [`bmux_tui::interaction::InteractionRouter`] from this callback and route
@@ -10,9 +15,9 @@
 use std::io::{self, Write};
 
 use bmux_tui::focus::FocusTrap;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::hit::HitMap;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::selection::SelectionScene;
 use bmux_tui::terminal::Terminal;
 
@@ -94,7 +99,7 @@ impl<W: Write, R, C> TerminalPresenter<W, R, C> {
 impl<P, W, R> Presenter<P> for TerminalPresenter<W, R, NoopPresentationCommit>
 where
     W: Write,
-    R: FnMut(&mut P, &mut Frame<'_>),
+    R: FnMut(&mut P, &mut PaintCx<'_, '_>),
 {
     type Error = io::Error;
 
@@ -108,7 +113,9 @@ where
     }
 
     fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
-        let stats = self.terminal.draw(|frame| (self.render)(program, frame))?;
+        let stats = self
+            .terminal
+            .draw(|frame| (self.render)(program, &mut PaintCx::new(frame)))?;
         Ok(PresentReport {
             changed_cells: stats.changed_cells,
             full_repaint: stats.full_repaint,
@@ -119,7 +126,7 @@ where
 impl<P, W, R, C> Presenter<P> for TerminalPresenter<W, R, C>
 where
     W: Write,
-    R: FnMut(&mut P, &mut Frame<'_>),
+    R: FnMut(&mut P, &mut PaintCx<'_, '_>),
     C: FnMut(&mut P, &HitMap, &FocusTrap),
 {
     type Error = io::Error;
@@ -134,7 +141,9 @@ where
     }
 
     fn present(&mut self, program: &mut P) -> Result<PresentReport, Self::Error> {
-        let stats = self.terminal.draw(|frame| (self.render)(program, frame))?;
+        let stats = self
+            .terminal
+            .draw(|frame| (self.render)(program, &mut PaintCx::new(frame)))?;
         let interactions = self.terminal.hits().clone();
         let focus = self.terminal.focus().clone();
         (self.commit)(program, &interactions, &focus);
@@ -193,8 +202,12 @@ mod tests {
         let committed_router = Rc::clone(&router);
         let mut presenter = TerminalPresenter::with_commit(
             terminal,
-            |program: &mut &'static str, frame: &mut bmux_tui::frame::Frame<'_>| {
-                frame.push_hit(HitRegion::new(*program, frame.area()).focusable(true));
+            |program: &mut &'static str, cx: &mut bmux_tui::paint::PaintCx<'_, '_>| {
+                let area = cx.area();
+                cx.push_hit(
+                    HitRegion::new(*program, Rect::new(0, 0, area.width, area.height))
+                        .focusable(true),
+                );
             },
             move |_: &mut &'static str,
                   hits: &bmux_tui::hit::HitMap,

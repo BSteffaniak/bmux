@@ -640,116 +640,6 @@ fn paint_border(
     }
 }
 
-/// A measured viewport over one arbitrary component subtree.
-pub struct ScrollViewport<'a> {
-    id: LayoutId,
-    child: Element<'a>,
-    vertical_offset: usize,
-}
-
-impl<'a> ScrollViewport<'a> {
-    /// Create a vertical viewport over arbitrary content.
-    #[must_use]
-    pub fn new(child: impl Component + 'a) -> Self {
-        Self {
-            id: LayoutId::new("scroll-viewport"),
-            child: Element::new(child),
-            vertical_offset: 0,
-        }
-    }
-
-    /// Set stable layout identity.
-    #[must_use]
-    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
-        self.id = id.into();
-        self
-    }
-
-    /// Set caller-owned logical vertical offset.
-    #[must_use]
-    pub const fn vertical_offset(mut self, vertical_offset: usize) -> Self {
-        self.vertical_offset = vertical_offset;
-        self
-    }
-
-    /// Return maximum logical vertical offset for a resolved viewport.
-    #[must_use]
-    pub fn max_vertical_offset(layout: &LayoutNode) -> usize {
-        layout.children.first().map_or(0, |child| {
-            child.node.size.height.saturating_sub(layout.size.height)
-        })
-    }
-}
-
-impl Component for ScrollViewport<'_> {
-    fn revision(&self) -> ComponentRevision {
-        ComponentRevision::new(
-            stable_revision(|state| self.id.as_str().hash(state)),
-            stable_revision(|state| self.vertical_offset.hash(state)),
-        )
-        .combine(self.child.revision())
-    }
-
-    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        cx.record_measurement();
-        let width = constraints.max_width();
-        let child = self
-            .child
-            .layout(Constraints::new(width, width, 0, None), cx);
-        let natural_height = child.size.height;
-        let viewport_height = constraints.max_height().map_or(natural_height, |maximum| {
-            natural_height.clamp(constraints.min_height(), maximum)
-        });
-        let size = constraints.constrain(LogicalSize::new(width, viewport_height));
-        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(0, 0, child)])
-    }
-
-    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let Some(child) = layout.children.first() else {
-            return;
-        };
-        let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let offset = self.vertical_offset.min(Self::max_vertical_offset(layout));
-        cx.with_child(
-            0,
-            -i64::try_from(offset).unwrap_or(i64::MAX),
-            LocalRect::new(
-                0,
-                i64::try_from(offset).unwrap_or(i64::MAX),
-                layout.size.width,
-                viewport_height,
-            ),
-            |cx| self.child.paint(&child.node, cx),
-        );
-    }
-
-    fn event(
-        &self,
-        event: &crate::event::Event,
-        layout: &LayoutNode,
-        cx: &mut crate::component::EventCx<'_>,
-    ) -> crate::event::EventOutcome {
-        let Some(child) = layout.children.first() else {
-            return crate::event::EventOutcome::Ignored;
-        };
-        let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let offset = self.vertical_offset.min(Self::max_vertical_offset(layout));
-        cx.with_transform(
-            0,
-            0,
-            0,
-            -i64::try_from(offset).unwrap_or(i64::MAX),
-            Rect::new(
-                0,
-                u16::try_from(offset).unwrap_or(u16::MAX),
-                layout.size.width,
-                viewport_height,
-            ),
-            |cx| self.child.event(event, &child.node, cx),
-        )
-    }
-}
-
 /// Assign stable keyed identity to one child without changing its geometry.
 pub struct Keyed<'a> {
     id: LayoutId,
@@ -1818,8 +1708,8 @@ impl Component for Column<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, ScrollViewport,
-        SizeBox, Stack, StyleScope, Surface, TextBlock, VerticalAlignment, Visibility,
+        Align, Clip, Column, Fill, Flex, HorizontalAlignment, Keyed, Padding, Row, SizeBox, Stack,
+        StyleScope, Surface, TextBlock, VerticalAlignment, Visibility,
     };
     use crate::buffer::Buffer;
     use crate::chrome::Border;
@@ -2167,28 +2057,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_viewport_translates_and_clips_arbitrary_composed_content() {
-        let component = ScrollViewport::new(
-            Column::new()
-                .child(TextBlock::new("first"))
-                .child(TextBlock::new("second"))
-                .child(TextBlock::new("third")),
-        )
-        .vertical_offset(1);
-        let constraints = Constraints::new(8, 8, 2, Some(2));
-        let mut layout_cx = LayoutCx::new();
-        let layout = component.layout(constraints, &mut layout_cx);
-        assert_eq!(layout.size.height, 2);
-        assert_eq!(ScrollViewport::max_vertical_offset(&layout), 1);
-
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
-        let mut frame = Frame::new(&mut buffer);
-        component.paint(&layout, &mut PaintCx::new(&mut frame));
-        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("second  "));
-        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("third   "));
-    }
-
-    #[test]
     fn row_assigns_remaining_width_to_flexible_child() {
         let component = Row::new()
             .gap(1)
@@ -2378,11 +2246,6 @@ mod tests {
             Stack::new().id("first").child(child()).revision().layout,
             Stack::new().id("second").child(child()).revision().layout
         );
-
-        let top = ScrollViewport::new(child()).vertical_offset(0).revision();
-        let scrolled = ScrollViewport::new(child()).vertical_offset(1).revision();
-        assert_eq!(top.layout, scrolled.layout);
-        assert_ne!(top.paint, scrolled.paint);
 
         let plain = StyleScope::new(child(), Style::new()).revision();
         let styled = StyleScope::new(child(), Style::new().fg(Color::Red)).revision();

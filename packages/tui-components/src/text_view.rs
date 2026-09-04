@@ -20,6 +20,8 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Alignment, Line, Span, Text, TextWrap};
 use bmux_tui::style::{Color, Style};
 
+use crate::common::local_area_of;
+
 use crate::scroll_view::{
     ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewPolicy, ScrollViewState,
 };
@@ -359,7 +361,7 @@ impl<'a, 'state> TextViewComponent<'a, 'state> {
         content_id: impl Into<bmux_tui::selection::SelectionContentId>,
         cx: &mut PaintCx<'_, '_>,
     ) -> ComponentSelectionOutcome {
-        let outer = local_area(layout);
+        let outer = local_area_of(layout.size);
         let content_area = self.scroll_view().content_area(outer);
         let scope_outcome = paint_component_scope(cx, selection, policy, outer, content_area);
         if !policy.enabled || content_area.is_empty() || self.lines.is_empty() {
@@ -519,7 +521,7 @@ impl Component for TextViewComponent<'_, '_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let outer = local_area(layout);
+        let outer = local_area_of(layout.size);
         if outer.is_empty() {
             return;
         }
@@ -579,19 +581,6 @@ fn resolved_viewport(layout: &LayoutNode) -> Option<(&LayoutNode, &ChildLayout)>
     let viewport = layout.children.first()?;
     let content = viewport.node.children.first()?;
     Some((&viewport.node, content))
-}
-
-fn local_area(layout: &LayoutNode) -> Rect {
-    local_area_of(layout.size)
-}
-
-fn local_area_of(size: LogicalSize) -> Rect {
-    Rect::new(
-        0,
-        0,
-        size.width,
-        u16::try_from(size.height).unwrap_or(u16::MAX),
-    )
 }
 
 fn apply_ranges(

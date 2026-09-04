@@ -1,6 +1,7 @@
 //! Shared neutral primitives for higher-level TUI components.
 
-use bmux_tui::geometry::Point;
+use bmux_tui::component::LogicalSize;
+use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::style::Style;
 
 /// Runtime interaction flags common to interactive controls.
@@ -246,6 +247,33 @@ impl ResizeBounds {
         }
         bmux_tui::geometry::Size::new(width, height)
     }
+}
+
+/// Saturate a logical row/cell count into terminal-space `u16`.
+///
+/// Logical geometry is unbounded; this is the single conversion used where a
+/// component projects a logical size onto a terminal rectangle.
+#[must_use]
+pub fn u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+/// The local-coordinate rectangle covering a resolved logical size.
+#[must_use]
+pub fn local_area_of(size: LogicalSize) -> Rect {
+    Rect::new(0, 0, size.width, u16_saturating(size.height))
+}
+
+/// Translate a terminal-space rectangle nested inside `area` into
+/// `area`-relative local coordinates.
+#[must_use]
+pub const fn local_rect(area: Rect, inner: Rect) -> Rect {
+    Rect::new(
+        inner.x.saturating_sub(area.x),
+        inner.y.saturating_sub(area.y),
+        inner.width,
+        inner.height,
+    )
 }
 
 #[cfg(test)]

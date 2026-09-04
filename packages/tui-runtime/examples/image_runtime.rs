@@ -37,12 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let terminal = bmux_tui::terminal::Terminal::new(io::stdout(), area);
     let presenter = ImageTerminalPresenter::detect(
         terminal,
-        |_: &mut ExampleProgram, frame: &mut bmux_tui::frame::Frame<'_>| {
-            frame.write_line(
-                Rect::new(0, 0, 24, 1),
+        |_: &mut ExampleProgram, cx: &mut bmux_tui::paint::PaintCx<'_, '_>| {
+            cx.write_line(
+                bmux_tui::paint::LocalRect::new(0, 0, 24, 1),
                 &bmux_tui::text::Line::raw("BMUX protocol-neutral image"),
             );
-            frame.push_image(ImageContribution::Present(ImagePlacement {
+            cx.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("example.checkerboard"),
                 payload: ImagePayload::Pixels {
                     bytes: vec![
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format: ImagePixelFormat::Rgba8,
                 },
                 destination: Rect::new(0, 2, 4, 2),
-                clip: frame.area(),
+                clip: cx.clip(),
                 lifecycle: ImageLifecycle::Frame,
             }));
         },

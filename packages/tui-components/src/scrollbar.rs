@@ -166,14 +166,22 @@ pub struct ScrollbarStyles {
     pub end: Style,
 }
 
-impl Default for ScrollbarStyles {
-    fn default() -> Self {
+impl ScrollbarStyles {
+    /// Default muted track with a bright thumb.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             begin: Style::new().fg(Color::BrightBlack),
             track: Style::new().fg(Color::BrightBlack),
             thumb: Style::new().fg(Color::BrightCyan),
             end: Style::new().fg(Color::BrightBlack),
         }
+    }
+}
+
+impl Default for ScrollbarStyles {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

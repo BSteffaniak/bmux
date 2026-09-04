@@ -13,6 +13,8 @@ use bmux_tui::hit::{HitRegion as SceneRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 
+use crate::common::u16_saturating;
+
 use crate::common::DragState;
 use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
@@ -1052,10 +1054,6 @@ fn add_signed(value: u16, delta: i32) -> u16 {
     } else {
         value.saturating_add(magnitude)
     }
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 impl crate::theme::ComponentTheme {

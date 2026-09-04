@@ -15,7 +15,9 @@ use bmux_tui::selection::{
     SelectionAutoScrollRequest, SelectionScrollAxis, SelectionScrollDirection,
 };
 use bmux_tui::semantic::SemanticRegion;
-use bmux_tui::style::{Color, Style};
+use bmux_tui::style::Style;
+
+use crate::common::local_rect;
 
 use crate::common::InteractionState;
 use crate::scrollbar::{
@@ -323,6 +325,8 @@ impl Component for ScrollViewComponent<'_> {
 pub struct ScrollView {
     policy: ScrollViewPolicy,
     scrollbar_styles: ScrollbarStyles,
+    vertical_scrollbar_policy: ScrollbarPolicy,
+    horizontal_scrollbar_policy: ScrollbarPolicy,
 }
 
 impl ScrollView {
@@ -331,13 +335,28 @@ impl ScrollView {
     pub const fn new() -> Self {
         Self {
             policy: ScrollViewPolicy::interactive(),
-            scrollbar_styles: ScrollbarStyles {
-                begin: Style::new().fg(Color::BrightBlack),
-                track: Style::new().fg(Color::BrightBlack),
-                thumb: Style::new().fg(Color::BrightCyan),
-                end: Style::new().fg(Color::BrightBlack),
-            },
+            scrollbar_styles: ScrollbarStyles::new(),
+            vertical_scrollbar_policy: ScrollbarPolicy::vertical(),
+            horizontal_scrollbar_policy: ScrollbarPolicy::horizontal(),
         }
+    }
+
+    /// Set the glyph, minimum-thumb, and drag policies used for the integrated
+    /// scrollbars.
+    ///
+    /// Orientation is owned by the axis each policy paints, so it is forced to
+    /// match regardless of the supplied value.
+    #[must_use]
+    pub const fn scrollbar_policies(
+        mut self,
+        mut vertical: ScrollbarPolicy,
+        mut horizontal: ScrollbarPolicy,
+    ) -> Self {
+        vertical.orientation = ScrollbarOrientation::Vertical;
+        horizontal.orientation = ScrollbarOrientation::Horizontal;
+        self.vertical_scrollbar_policy = vertical;
+        self.horizontal_scrollbar_policy = horizontal;
+        self
     }
 
     /// Set scroll behavior.
@@ -372,6 +391,12 @@ impl ScrollView {
         scrollbar_layout(area, self.policy.scrollbar_layout()).horizontal_scrollbar
     }
 
+    /// Corner cell reserved when both gutter scrollbars are enabled.
+    #[must_use]
+    pub const fn scrollbar_corner(&self, area: Rect) -> Option<Rect> {
+        scrollbar_layout(area, self.policy.scrollbar_layout()).corner
+    }
+
     /// Register the scroll viewport and paint integrated scrollbars.
     ///
     /// `area` is the complete local viewport rectangle (content plus gutters)
@@ -401,6 +426,23 @@ impl ScrollView {
                 .enabled(!state.interaction.disabled),
         );
         cx.push_semantic(SemanticRegion::new(id, content_local, "scroll"));
+        self.paint_scrollbars(area, layout, state, cx);
+    }
+
+    /// Paint integrated scrollbars and the gutter corner without registering
+    /// the viewport as a scroll region.
+    ///
+    /// Composite controls whose interaction region carries its own role (for
+    /// example a focusable list) use this so the shared gutter geometry is
+    /// painted from the authoritative viewport layout while hit ownership
+    /// stays with the control.
+    pub fn paint_scrollbars(
+        &self,
+        area: Rect,
+        layout: &LayoutNode,
+        state: &ScrollViewState,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
         let resolved = scrollbar_layout(area, self.policy.scrollbar_layout());
         if let Some(scrollbar_area) = resolved.vertical_scrollbar {
             let scrollbar = scrollbar_state(
@@ -409,7 +451,7 @@ impl ScrollView {
                 state.vertical_offset,
             );
             Scrollbar::new()
-                .policy(ScrollbarPolicy::vertical())
+                .policy(self.vertical_scrollbar_policy)
                 .styles(self.scrollbar_styles)
                 .paint(local_rect(area, scrollbar_area), &scrollbar, cx);
         }
@@ -420,7 +462,7 @@ impl ScrollView {
                 state.horizontal_offset,
             );
             Scrollbar::new()
-                .policy(ScrollbarPolicy::horizontal())
+                .policy(self.horizontal_scrollbar_policy)
                 .styles(self.scrollbar_styles)
                 .paint(local_rect(area, scrollbar_area), &scrollbar, cx);
         }
@@ -459,7 +501,7 @@ impl ScrollView {
             );
             scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Vertical);
             let result = Scrollbar::new()
-                .policy(ScrollbarPolicy::vertical())
+                .policy(self.vertical_scrollbar_policy)
                 .handle_event(scrollbar_area, &mut scrollbar, event);
             state.dragging = scrollbar.dragging.then_some(ScrollbarOrientation::Vertical);
             match result {
@@ -486,7 +528,7 @@ impl ScrollView {
             );
             scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Horizontal);
             let result = Scrollbar::new()
-                .policy(ScrollbarPolicy::horizontal())
+                .policy(self.horizontal_scrollbar_policy)
                 .handle_event(scrollbar_area, &mut scrollbar, event);
             state.dragging = scrollbar
                 .dragging
@@ -521,6 +563,27 @@ impl ScrollView {
         layout.children.first().map_or(0, |child| {
             usize::from(child.node.size.width.saturating_sub(layout.size.width))
         })
+    }
+
+    /// Move vertically by a signed logical-row delta and clamp to layout.
+    ///
+    /// Scrolling to the final row starts following appends; any other
+    /// movement stops following.
+    pub fn scroll_vertical_by(
+        layout: &LayoutNode,
+        state: &mut ScrollViewState,
+        delta: isize,
+    ) -> ScrollViewOutcome {
+        let maximum = Self::max_vertical_offset(layout);
+        let old = state.vertical_offset;
+        state.vertical_offset = if delta < 0 {
+            old.saturating_sub(delta.unsigned_abs())
+        } else {
+            old.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
+                .min(maximum)
+        };
+        state.follow_bottom = state.vertical_offset == maximum && delta > 0;
+        outcome(old, state.vertical_offset)
     }
 
     /// Move horizontally by a signed logical-cell delta and clamp to layout.
@@ -888,17 +951,6 @@ fn content_width(layout: &LayoutNode) -> u16 {
         .children
         .first()
         .map_or(0, |child| child.node.size.width)
-}
-
-/// Translate a terminal-space rectangle nested inside `area` into
-/// `area`-relative local coordinates.
-const fn local_rect(area: Rect, inner: Rect) -> Rect {
-    Rect::new(
-        inner.x.saturating_sub(area.x),
-        inner.y.saturating_sub(area.y),
-        inner.width,
-        inner.height,
-    )
 }
 
 fn logical_offset_from_scrollbar(

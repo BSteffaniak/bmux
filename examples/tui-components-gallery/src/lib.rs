@@ -50,44 +50,48 @@ pub const HEIGHT: u16 = 30;
 pub fn render_gallery() -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
     let mut frame = Frame::new(&mut buffer);
-    render_gallery_into(&mut frame);
+    render_gallery_into(&mut PaintCx::new(&mut frame));
     buffer
 }
 
-pub fn render_gallery_into(frame: &mut Frame<'_>) {
-    render_gallery_interactive(frame, None);
+pub fn render_gallery_into(cx: &mut PaintCx<'_, '_>) {
+    render_gallery_interactive(cx, None);
 }
 
 /// Render the gallery with focus styling driven by a committed semantic target.
-pub fn render_gallery_interactive(frame: &mut Frame<'_>, focused: Option<&str>) {
+///
+/// `cx` is the root scoped paint context supplied by the presenter; every
+/// section resolves its own component layout and paints into a translated
+/// child of that context.
+pub fn render_gallery_interactive(cx: &mut PaintCx<'_, '_>, focused: Option<&str>) {
     let theme = ModalTheme::dark(Color::Cyan);
 
-    render_buttons(frame, focused);
-    render_badges(frame);
-    render_details(frame);
-    render_field(frame);
-    render_pane(frame);
-    render_progress(frame);
-    render_empty_state(frame);
-    render_picker(frame);
-    render_stepper(frame);
-    render_bar_chart(frame);
-    render_modal(frame, theme);
-    render_dialog(frame, theme);
-    render_toasts(frame);
-    render_chart(frame);
-    render_canvas(frame);
-    render_recent_text_polish(frame);
+    render_buttons(cx, focused);
+    render_badges(cx);
+    render_details(cx);
+    render_field(cx);
+    render_pane(cx);
+    render_progress(cx);
+    render_empty_state(cx);
+    render_picker(cx);
+    render_stepper(cx);
+    render_bar_chart(cx);
+    render_modal(cx, theme);
+    render_dialog(cx, theme);
+    render_toasts(cx);
+    render_chart(cx);
+    render_canvas(cx);
+    render_recent_text_polish(cx);
 }
 
-fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
+fn render_buttons(cx: &mut PaintCx<'_, '_>, focused_id: Option<&str>) {
     let mut focused = ButtonState::new();
     focused.interaction.focused = focused_id == Some("gallery.save");
     let focused = Cell::new(focused);
     render_component(
         &ButtonComponent::new("gallery.save", "Save", &focused),
         Rect::new(1, 1, 10, 1),
-        frame,
+        cx,
     );
 
     let mut disabled = ButtonState::new();
@@ -96,7 +100,7 @@ fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
     render_component(
         &ButtonComponent::new("gallery.disabled", "Disabled", &disabled),
         Rect::new(13, 1, 14, 1),
-        frame,
+        cx,
     );
 
     let actions = [
@@ -114,15 +118,14 @@ fn render_buttons(frame: &mut Frame<'_>, focused_id: Option<&str>) {
     render_component(
         &ActionRowComponent::new("gallery.actions", &actions, &state),
         Rect::new(1, 3, 30, 1),
-        frame,
+        cx,
     );
 }
 
-fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_>) {
+fn render_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
     let mut layout_cx = LayoutCx::new();
     let layout = component.layout(Constraints::tight(area.size()), &mut layout_cx);
-    let mut paint_cx = PaintCx::new(frame);
-    paint_cx.with_child(
+    cx.with_child(
         i32::from(area.x),
         i64::from(area.y),
         LocalRect::new(0, 0, area.width, area.height),
@@ -130,31 +133,31 @@ fn render_component(component: &impl Component, area: Rect, frame: &mut Frame<'_
     );
 }
 
-fn render_badges(frame: &mut Frame<'_>) {
+fn render_badges(cx: &mut PaintCx<'_, '_>) {
     render_badge_component(
         BadgeComponent::new("gallery.badge.info", "info")
             .severity(BadgeSeverity::Info)
             .policy(BadgePolicy::pill().uppercase(true)),
         Rect::new(1, 3, 10, 1),
-        frame,
+        cx,
     );
     render_badge_component(
         BadgeComponent::new("gallery.badge.ok", "ok").severity(BadgeSeverity::Success),
         Rect::new(12, 3, 8, 1),
-        frame,
+        cx,
     );
     render_badge_component(
         BadgeComponent::new("gallery.badge.warn", "warn").severity(BadgeSeverity::Warning),
         Rect::new(21, 3, 10, 1),
-        frame,
+        cx,
     );
 }
 
-fn render_badge_component(component: BadgeComponent<'_>, area: Rect, frame: &mut Frame<'_>) {
-    render_component(&component, area, frame);
+fn render_badge_component(component: BadgeComponent<'_>, area: Rect, cx: &mut PaintCx<'_, '_>) {
+    render_component(&component, area, cx);
 }
 
-fn render_details(frame: &mut Frame<'_>) {
+fn render_details(cx: &mut PaintCx<'_, '_>) {
     let items = [
         DetailItem::new("Component", "LabeledDetails"),
         DetailItem::new("Purpose", "Wrapped labels and values"),
@@ -162,11 +165,11 @@ fn render_details(frame: &mut Frame<'_>) {
     render_component(
         &LabeledDetailsComponent::new("gallery.details", &items),
         Rect::new(1, 5, 34, 5),
-        frame,
+        cx,
     );
 }
 
-fn render_field(frame: &mut Frame<'_>) {
+fn render_field(cx: &mut PaintCx<'_, '_>) {
     render_component(
         &FormFieldComponent::new(
             "gallery.form-field",
@@ -177,11 +180,11 @@ fn render_field(frame: &mut Frame<'_>) {
         .help("Shown with a required marker")
         .error("Example error text"),
         Rect::new(38, 1, 30, 5),
-        frame,
+        cx,
     );
 }
 
-fn render_pane(frame: &mut Frame<'_>) {
+fn render_pane(cx: &mut PaintCx<'_, '_>) {
     let area = Rect::new(1, 11, 28, 8);
     let state = Cell::new(PaneState::new(area));
     render_component(
@@ -192,11 +195,11 @@ fn render_pane(frame: &mut Frame<'_>) {
             TextBlock::new("Pane content area").id("gallery.pane.content"),
         ),
         area,
-        frame,
+        cx,
     );
 }
 
-fn render_progress(frame: &mut Frame<'_>) {
+fn render_progress(cx: &mut PaintCx<'_, '_>) {
     render_component(
         &ProgressBarComponent::new(
             "gallery.progress.indexed",
@@ -209,7 +212,7 @@ fn render_progress(frame: &mut Frame<'_>) {
                 .label(ProgressLabelPlacement::Right),
         ),
         Rect::new(1, 20, 28, 1),
-        frame,
+        cx,
     );
     render_component(
         &ProgressBarComponent::new(
@@ -222,7 +225,7 @@ fn render_progress(frame: &mut Frame<'_>) {
                 .symbols("━", "─", "╸"),
         ),
         Rect::new(1, 21, 28, 1),
-        frame,
+        cx,
     );
     render_component(
         &ProgressBarComponent::new(
@@ -231,18 +234,18 @@ fn render_progress(frame: &mut Frame<'_>) {
         )
         .policy(ProgressBarPolicy::bare()),
         Rect::new(1, 22, 28, 1),
-        frame,
+        cx,
     );
     let samples = [1, 2, 3, 5, 8, 13, 8, 5, 3, 2, 1];
     render_component(
         &SparklineComponent::new("gallery.sparkline", &samples)
             .policy(SparklinePolicy::bare().max(Some(13))),
         Rect::new(1, 23, 28, 1),
-        frame,
+        cx,
     );
 }
 
-fn render_empty_state(frame: &mut Frame<'_>) {
+fn render_empty_state(cx: &mut PaintCx<'_, '_>) {
     let body = [Line::from("No matching components yet")];
     let actions = [Line::from("Press / to filter")];
     render_component(
@@ -252,11 +255,11 @@ fn render_empty_state(frame: &mut Frame<'_>) {
             .actions(&actions)
             .policy(EmptyStatePolicy::centered()),
         Rect::new(2, 14, 26, 4),
-        frame,
+        cx,
     );
 }
 
-fn render_stepper(frame: &mut Frame<'_>) {
+fn render_stepper(cx: &mut PaintCx<'_, '_>) {
     let steps = [
         StepItem::new("plan", "Plan").status(StepStatus::Complete),
         StepItem::new("build", "Build").status(StepStatus::Current),
@@ -265,11 +268,11 @@ fn render_stepper(frame: &mut Frame<'_>) {
     render_component(
         &StepperComponent::new("gallery.stepper", &steps).policy(StepperPolicy::horizontal()),
         Rect::new(35, 12, 33, 1),
-        frame,
+        cx,
     );
 }
 
-fn render_bar_chart(frame: &mut Frame<'_>) {
+fn render_bar_chart(cx: &mut PaintCx<'_, '_>) {
     let mem_group = [4, 6];
     let items = [
         BarChartItem::new("CPU", 7),
@@ -284,11 +287,11 @@ fn render_bar_chart(frame: &mut Frame<'_>) {
                 .value_placement(BarChartValuePlacement::Right),
         ),
         Rect::new(35, 13, 32, 3),
-        frame,
+        cx,
     );
 }
 
-fn render_chart(frame: &mut Frame<'_>) {
+fn render_chart(cx: &mut PaintCx<'_, '_>) {
     let trend = [
         ChartPoint::new(0.0, 1.0),
         ChartPoint::new(1.0, 2.0),
@@ -315,11 +318,11 @@ fn render_chart(frame: &mut Frame<'_>) {
                     .legend(ChartLegendPlacement::TopRight),
             ),
         Rect::new(35, 17, 32, 5),
-        frame,
+        cx,
     );
 }
 
-fn render_canvas(frame: &mut Frame<'_>) {
+fn render_canvas(cx: &mut PaintCx<'_, '_>) {
     let points = [CanvasPoint::new(1.0, 1.0, "●")];
     let lines = [CanvasLine::new(0.0, 0.0, 3.0, 2.0)];
     let rects = [
@@ -334,11 +337,11 @@ fn render_canvas(frame: &mut Frame<'_>) {
             .rects(&rects)
             .circles(&circles),
         Rect::new(35, 22, 18, 2),
-        frame,
+        cx,
     );
 }
 
-fn render_recent_text_polish(frame: &mut Frame<'_>) {
+fn render_recent_text_polish(cx: &mut PaintCx<'_, '_>) {
     let scroll_lines = [
         Line::from("horizontal scroll area"),
         Line::from("wide content with gutter"),
@@ -356,7 +359,7 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
         )
         .content_width(24),
         Rect::new(1, 24, 22, 3),
-        frame,
+        cx,
     );
 
     let text_lines = [Line::from_spans([
@@ -369,7 +372,7 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
             .id("gallery.styled-text")
             .wrap(TextWrap::Word),
         Rect::new(25, 24, 14, 3),
-        frame,
+        cx,
     );
 
     let columns = [TableColumn::new("Rich").fixed(8)];
@@ -381,18 +384,18 @@ fn render_recent_text_polish(frame: &mut Frame<'_>) {
     render_component(
         &TableComponent::new("gallery.table", &columns, &rows, &table_state),
         Rect::new(41, 24, 10, 3),
-        frame,
+        cx,
     );
 
     render_badge_component(
         BadgeComponent::new("gallery.badge.truncated", "truncated-style")
             .severity(BadgeSeverity::Info),
         Rect::new(53, 24, 12, 1),
-        frame,
+        cx,
     );
 }
 
-fn render_toasts(frame: &mut Frame<'_>) {
+fn render_toasts(cx: &mut PaintCx<'_, '_>) {
     let toasts = [
         ToastItem::new("saved", "Saved")
             .body("Changes persisted")
@@ -403,11 +406,11 @@ fn render_toasts(frame: &mut Frame<'_>) {
     render_component(
         &ToastStackComponent::new("gallery.toasts", &toasts, &state),
         Rect::new(1, 20, 30, 4),
-        frame,
+        cx,
     );
 }
 
-fn render_picker(frame: &mut Frame<'_>) {
+fn render_picker(cx: &mut PaintCx<'_, '_>) {
     let picker = PickerFrame::new()
         .title("Command Palette")
         .header("Commands")
@@ -424,11 +427,11 @@ fn render_picker(frame: &mut Frame<'_>) {
     render_component(
         &PickerFrameComponent::new("gallery.picker", picker, list).input(input),
         Rect::new(34, 6, 34, 12),
-        frame,
+        cx,
     );
 }
 
-fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
+fn render_modal(cx: &mut PaintCx<'_, '_>, theme: ModalTheme) {
     let modal = ModalFrame::new(
         ModalSizing::new(Size::new(24, 7), Size::new(24, 7), Insets::all(0)),
         theme,
@@ -444,11 +447,11 @@ fn render_modal(frame: &mut Frame<'_>, theme: ModalTheme) {
             TextBlock::new("Opaque modal frame").id("gallery.modal.body"),
         ),
         Rect::new(34, 18, 34, 6),
-        frame,
+        cx,
     );
 }
 
-fn render_dialog(frame: &mut Frame<'_>, theme: ModalTheme) {
+fn render_dialog(cx: &mut PaintCx<'_, '_>, theme: ModalTheme) {
     let body = [Line::from("Dialog body with actions")];
     let actions = [ActionButton::new("ok", "OK")];
     let mut action_state = ActionRowState::new();
@@ -464,7 +467,7 @@ fn render_dialog(frame: &mut Frame<'_>, theme: ModalTheme) {
     render_component(
         &DialogComponent::new("gallery.dialog", dialog, &state),
         Rect::new(35, 13, 34, 9),
-        frame,
+        cx,
     );
 }
 
@@ -480,6 +483,7 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
     use bmux_tui::interaction::InteractionRouter;
+    use bmux_tui::paint::PaintCx;
 
     use super::{HEIGHT, WIDTH, render_gallery, render_gallery_interactive, rows};
 
@@ -488,7 +492,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
         let scene = {
             let mut frame = Frame::new(&mut buffer);
-            render_gallery_interactive(&mut frame, None);
+            render_gallery_interactive(&mut PaintCx::new(&mut frame), None);
             frame.hits().clone()
         };
         let mut router = InteractionRouter::new();
@@ -524,7 +528,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
         let scene = {
             let mut frame = Frame::new(&mut buffer);
-            render_gallery_interactive(&mut frame, None);
+            render_gallery_interactive(&mut PaintCx::new(&mut frame), None);
             frame.hits().clone()
         };
         let targets = scene.focus_targets(None);
@@ -573,7 +577,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
         let semantics = {
             let mut frame = Frame::new(&mut buffer);
-            render_gallery_interactive(&mut frame, None);
+            render_gallery_interactive(&mut PaintCx::new(&mut frame), None);
             frame.semantics().regions().to_vec()
         };
 

@@ -1,12 +1,17 @@
 //! Configurable selectable-list component.
+//!
+//! Item rows are stacked into one measured content node and scrolled through
+//! the shared [`ScrollView`] controller: the viewport layout, offset clamping,
+//! wheel/page/scrollbar interaction, and gutter geometry are owned by
+//! `scroll_view`, so this module contains no independent row-skip engine.
 
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::{
-    Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
-    LayoutNode, LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId,
+    LayoutMetadata, LayoutNode, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -17,11 +22,12 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
 
-use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::common::{ComponentMousePolicy, InteractionState, local_area_of, u16_saturating};
 use crate::hit_test::{HitRegion, hit_region_at};
-use crate::scrollbar::{
-    Scrollbar, ScrollbarOutcome, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
+use crate::scroll_view::{
+    ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewPolicy, ScrollViewState,
 };
+use crate::scrollbar::ScrollbarStyles;
 use crate::scrollbar_layout::ScrollbarAxisLayoutMode;
 
 /// One selectable list item.
@@ -190,8 +196,6 @@ pub struct SelectableListPolicy {
     pub highlight: SelectableListHighlightPolicy,
     /// Optional integrated vertical scrollbar mode.
     pub scrollbar: ScrollbarAxisLayoutMode,
-    /// Integrated scrollbar rendering/interaction policy.
-    pub scrollbar_policy: ScrollbarPolicy,
 }
 
 impl SelectableListPolicy {
@@ -203,7 +207,6 @@ impl SelectableListPolicy {
             keyboard: SelectableListKeyboardPolicy::interactive(),
             highlight: SelectableListHighlightPolicy::new(">", true),
             scrollbar: ScrollbarAxisLayoutMode::Hidden,
-            scrollbar_policy: ScrollbarPolicy::vertical(),
         }
     }
     /// Return policy with integrated vertical scrollbar mode set.
@@ -213,11 +216,19 @@ impl SelectableListPolicy {
         self
     }
 
-    /// Return policy with integrated vertical scrollbar policy set.
+    /// Shared scroll-view policy derived from this list policy.
+    ///
+    /// Keyboard scrolling is owned by the list's focus navigation and paging
+    /// keys, so the shared controller handles wheel and scrollbar input only.
     #[must_use]
-    pub const fn scrollbar_policy(mut self, policy: ScrollbarPolicy) -> Self {
-        self.scrollbar_policy = policy;
-        self
+    pub const fn scroll_view_policy(self) -> ScrollViewPolicy {
+        ScrollViewPolicy {
+            keyboard: false,
+            mouse_wheel: self.mouse.enabled,
+            vertical_scrollbar: self.scrollbar,
+            horizontal_scrollbar: ScrollbarAxisLayoutMode::Hidden,
+            wheel_rows: 1,
+        }
     }
 }
 
@@ -232,11 +243,12 @@ impl Default for SelectableListPolicy {
 pub struct SelectableListState {
     /// Common list interaction flags.
     pub interaction: InteractionState,
+    /// Shared logical scroll state.
+    pub scroll: ScrollViewState,
     selected: Option<usize>,
     focused: Option<usize>,
     hovered: Option<usize>,
     pressed: Option<usize>,
-    vertical_scroll: usize,
 }
 
 impl SelectableListState {
@@ -245,11 +257,11 @@ impl SelectableListState {
     pub const fn new(selected: Option<usize>) -> Self {
         Self {
             interaction: InteractionState::new(),
+            scroll: ScrollViewState::new(),
             selected,
             focused: selected,
             hovered: None,
             pressed: None,
-            vertical_scroll: 0,
         }
     }
 
@@ -276,15 +288,15 @@ impl SelectableListState {
         self.interaction.focused = focused.is_some();
     }
 
-    /// Return vertical scroll offset in rendered rows.
+    /// Return vertical scroll offset in logical item rows.
     #[must_use]
     pub const fn vertical_scroll(self) -> usize {
-        self.vertical_scroll
+        self.scroll.vertical_offset()
     }
 
-    /// Set vertical scroll offset in rendered rows.
+    /// Set vertical scroll offset in logical item rows before clamping.
     pub const fn set_vertical_scroll(&mut self, vertical_scroll: usize) {
-        self.vertical_scroll = vertical_scroll;
+        self.scroll.set_vertical_offset(vertical_scroll);
     }
 
     /// Set disabled state for the whole list.
@@ -311,6 +323,11 @@ pub enum SelectableListOutcome {
 }
 
 /// Configurable vertical selectable-list control.
+///
+/// The controller measures item rows into one stacked content node, resolves
+/// the viewport through [`ScrollViewComponent::viewport_layout`], and routes
+/// wheel, paging, scrollbar, and ensure-visible behavior through the shared
+/// [`ScrollView`] controller against that authoritative layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectableList<'a> {
     items: &'a [SelectableListItem],
@@ -344,6 +361,9 @@ impl<'a> SelectableList<'a> {
     }
 
     /// Return required render size.
+    ///
+    /// The width covers the widest item plus the highlight prefix and a
+    /// two-cell margin; the height is the exact stacked item height.
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
         let prefix_width = self.prefix_width();
@@ -363,57 +383,56 @@ impl<'a> SelectableList<'a> {
 
         (
             u16::try_from(width).unwrap_or(u16::MAX).saturating_add(2),
-            u16::try_from(
-                self.items
-                    .iter()
-                    .map(SelectableListItem::height)
-                    .sum::<usize>(),
-            )
-            .unwrap_or(u16::MAX),
+            u16_saturating(self.total_height()),
         )
     }
 
-    fn content_area(&self, area: Rect) -> Rect {
-        let reserve_scrollbar =
-            matches!(self.policy.scrollbar, ScrollbarAxisLayoutMode::Gutter) && area.width > 0;
-        Rect::new(
-            area.x,
-            area.y,
-            area.width.saturating_sub(u16::from(reserve_scrollbar)),
-            area.height,
-        )
+    /// Shared scroll controller configured from this list's policy and styles.
+    #[must_use]
+    pub const fn scroll_view(&self) -> ScrollView {
+        ScrollView::new()
+            .policy(self.policy.scroll_view_policy())
+            .scrollbar_styles(self.styles.scrollbar)
     }
 
-    const fn scrollbar_area(&self, area: Rect) -> Option<Rect> {
-        if matches!(self.policy.scrollbar, ScrollbarAxisLayoutMode::Hidden) || area.width == 0 {
-            return None;
-        }
-        Some(Rect::new(
-            area.right().saturating_sub(1),
-            area.y,
-            1,
-            area.height,
-        ))
+    /// Content viewport after reserving the integrated scrollbar gutter.
+    #[must_use]
+    pub const fn content_area(&self, area: Rect) -> Rect {
+        self.scroll_view().content_area(area)
+    }
+
+    /// Resolve the authoritative list layout for one terminal area.
+    ///
+    /// The result has the shape produced by [`Component::layout`] for
+    /// [`SelectableListComponent`]: the list node contains one scroll viewport
+    /// child whose single child is the stacked item content.
+    #[must_use]
+    pub fn layout(&self, id: &LayoutId, area: Rect) -> LayoutNode {
+        self.layout_with(id, Constraints::tight(area.size()))
     }
 
     /// Return maximum vertical scroll offset for this area.
     #[must_use]
     pub fn max_vertical_scroll(&self, area: Rect) -> usize {
-        self.total_height()
-            .saturating_sub(usize::from(self.content_area(area).height))
+        resolved_viewport(&self.layout(&LayoutId::new("list"), area))
+            .map_or(0, ScrollView::max_vertical_offset)
     }
 
     /// Clamp caller-owned state to valid scroll bounds for this area.
     pub fn clamp_state(&self, area: Rect, state: &mut SelectableListState) {
-        state.vertical_scroll = state.vertical_scroll.min(self.max_vertical_scroll(area));
+        let layout = self.layout(&LayoutId::new("list"), area);
+        if let Some(viewport) = resolved_viewport(&layout) {
+            self.scroll_view().reconcile(viewport, &mut state.scroll);
+        }
     }
 
     /// Paint visible item rows and the integrated scrollbar through a scoped
-    /// local-coordinate context whose origin is this list's top-left corner.
+    /// local-coordinate context; `area` is expressed in that context's
+    /// coordinates.
     ///
     /// Item rows fill their complete width with `fallback` patched by the
-    /// item style; content that lies outside the paint clip is dropped by the
-    /// context rather than by this primitive.
+    /// item style; content that lies outside the viewport clip is dropped by
+    /// the context rather than by this primitive.
     pub fn paint(
         &self,
         area: Rect,
@@ -424,49 +443,61 @@ impl<'a> SelectableList<'a> {
         if area.is_empty() {
             return;
         }
-        cx.fill(LocalRect::terminal(area), " ", fallback);
-        let content_area = self.content_area(area);
-        let mut skipped_rows = state.vertical_scroll;
-        let mut rendered_row = 0u16;
-        'items: for (index, item) in self.items.iter().enumerate() {
-            for line_index in 0..item.height() {
-                if skipped_rows > 0 {
-                    skipped_rows = skipped_rows.saturating_sub(1);
-                    continue;
-                }
-                if rendered_row >= content_area.height {
-                    break 'items;
-                }
-                let row = content_area.y.saturating_add(rendered_row);
-                cx.write_line_with_fallback_style(
-                    LocalRect::new(
-                        i32::from(content_area.x),
-                        i64::from(row),
-                        content_area.width,
-                        1,
-                    ),
-                    &self.line(index, item, line_index, *state),
-                    fallback,
-                );
-                rendered_row = rendered_row.saturating_add(1);
-            }
-        }
-        self.paint_scrollbar(area, state, cx);
+        let layout = self.layout(&LayoutId::new("list"), area);
+        self.paint_layout(&layout, area, state, fallback, cx);
     }
 
-    fn paint_scrollbar(&self, area: Rect, state: &SelectableListState, cx: &mut PaintCx<'_, '_>) {
-        let Some(area) = self.scrollbar_area(area) else {
+    pub(crate) fn paint_layout(
+        &self,
+        layout: &LayoutNode,
+        area: Rect,
+        state: &SelectableListState,
+        fallback: Style,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        let Some(viewport) = resolved_viewport(layout) else {
             return;
         };
-        let scrollbar_state = ScrollbarState::new(u16_saturating(self.total_height()), area.height)
-            .offset(u16_saturating(state.vertical_scroll));
-        Scrollbar::new()
-            .policy(self.policy.scrollbar_policy)
-            .styles(self.styles.scrollbar)
-            .paint(area, &scrollbar_state, cx);
+        let local = Rect::new(0, 0, area.width, area.height);
+        let content_area = self.content_area(local);
+        cx.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::terminal(local),
+            |cx| {
+                cx.fill(LocalRect::terminal(local), " ", fallback);
+                cx.with_child(
+                    i32::from(content_area.x),
+                    i64::from(content_area.y),
+                    LocalRect::new(0, 0, content_area.width, content_area.height),
+                    |cx| {
+                        ScrollViewComponent::new(
+                            viewport.id.clone(),
+                            viewport.size,
+                            state.scroll,
+                            ItemRows {
+                                list: self,
+                                id: content_id_of(viewport),
+                                state: *state,
+                                fallback,
+                                offset: state.scroll.vertical_offset(),
+                                viewport_height: viewport.size.height,
+                            },
+                        )
+                        .paint(viewport, cx);
+                    },
+                );
+                self.scroll_view()
+                    .paint_scrollbars(local, viewport, &state.scroll, cx);
+            },
+        );
     }
 
     /// Return visible hit regions keyed by stable item id for tests/semantics.
+    ///
+    /// `area` is the complete list rectangle; regions are reported inside its
+    /// content viewport after the current scroll offset and are clipped to
+    /// the viewport bottom.
     #[must_use]
     pub fn visible_semantic_regions(
         &self,
@@ -495,9 +526,21 @@ impl<'a> SelectableList<'a> {
         hit_region_at(&regions, point).map(|region| region.key)
     }
 
-    /// Handle one input event.
+    /// Handle one input event against the terminal rectangle the list was
+    /// painted into.
     pub fn handle_event(
         &self,
+        area: Rect,
+        state: &mut SelectableListState,
+        event: &Event,
+    ) -> SelectableListOutcome {
+        let layout = self.layout(&LayoutId::new("list"), area);
+        self.handle_event_with_layout(&layout, area, state, event)
+    }
+
+    fn handle_event_with_layout(
+        &self,
+        layout: &LayoutNode,
         area: Rect,
         state: &mut SelectableListState,
         event: &Event,
@@ -506,13 +549,50 @@ impl<'a> SelectableList<'a> {
         if state.interaction.disabled {
             return SelectableListOutcome::Ignored;
         }
+        let Some(viewport) = resolved_viewport(layout) else {
+            return SelectableListOutcome::Ignored;
+        };
         match event {
-            Event::Key(stroke) => self.handle_key(area, state, *stroke),
-            Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
+            Event::Key(stroke) => self.handle_key(viewport, state, *stroke),
+            Event::Mouse(mouse) => self.handle_mouse(viewport, area, state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 SelectableListOutcome::Ignored
             }
         }
+    }
+
+    pub(crate) fn layout_with(&self, id: &LayoutId, constraints: Constraints) -> LayoutNode {
+        let scroll_view = self.scroll_view();
+        let (natural_width, _) = self.size();
+        let width = constraints
+            .constrain(LogicalSize::new(natural_width, 0))
+            .width;
+        // Gutter reservation depends only on policy and outer width, so resolve
+        // it against a tall probe rectangle before the height is known.
+        let probe = scroll_view.content_area(Rect::new(0, 0, width, u16::MAX));
+        let content = self.content_layout(content_id(id), probe.width);
+        let size = constraints.constrain(LogicalSize::new(width, content.size.height));
+        let content_area = scroll_view.content_area(local_area_of(size));
+        let viewport = ScrollViewComponent::viewport_layout(
+            viewport_id(id),
+            LogicalSize::new(content_area.width, usize::from(content_area.height)),
+            content,
+        );
+        LayoutNode::with_children(
+            id.clone(),
+            size,
+            vec![ChildLayout::new(
+                content_area.x,
+                usize::from(content_area.y),
+                viewport,
+            )],
+        )
+        .with_metadata(LayoutMetadata::new().semantic("list"))
+    }
+
+    /// Exact stacked item content at one content width.
+    fn content_layout(&self, id: LayoutId, width: u16) -> LayoutNode {
+        LayoutNode::leaf(id, LogicalSize::new(width, self.total_height()))
     }
 
     fn line(
@@ -575,34 +655,35 @@ impl<'a> SelectableList<'a> {
 
     fn handle_key(
         &self,
-        area: Rect,
+        viewport: &LayoutNode,
         state: &mut SelectableListState,
         stroke: KeyStroke,
     ) -> SelectableListOutcome {
         if !stroke.modifiers.is_empty() {
             return SelectableListOutcome::Ignored;
         }
+        let page = isize::try_from(viewport.size.height.max(1)).unwrap_or(isize::MAX);
         match stroke.key {
             KeyCode::Up if self.policy.keyboard.arrows_move_focus => {
-                self.move_focus(area, state, Direction::Previous)
+                self.move_focus(viewport, state, Direction::Previous)
             }
             KeyCode::Down if self.policy.keyboard.arrows_move_focus => {
-                self.move_focus(area, state, Direction::Next)
+                self.move_focus(viewport, state, Direction::Next)
             }
             KeyCode::Home if self.policy.keyboard.home_end_move_focus => {
-                self.focus_edge(area, state, true)
+                self.focus_edge(viewport, state, true)
             }
             KeyCode::End if self.policy.keyboard.home_end_move_focus => {
-                self.focus_edge(area, state, false)
+                self.focus_edge(viewport, state, false)
             }
             KeyCode::Enter if self.policy.keyboard.enter_selects => {
-                self.select_focused(area, state)
+                self.select_focused(viewport, state)
             }
             KeyCode::Space | KeyCode::Char(' ') if self.policy.keyboard.space_selects => {
-                self.select_focused(area, state)
+                self.select_focused(viewport, state)
             }
-            KeyCode::PageUp => self.scroll_by(area, state, -i32::from(area.height.max(1))),
-            KeyCode::PageDown => self.scroll_by(area, state, i32::from(area.height.max(1))),
+            KeyCode::PageUp => Self::scroll_by(viewport, state, page.saturating_neg()),
+            KeyCode::PageDown => Self::scroll_by(viewport, state, page),
             KeyCode::Char(_)
             | KeyCode::Enter
             | KeyCode::Tab
@@ -623,6 +704,7 @@ impl<'a> SelectableList<'a> {
 
     fn handle_mouse(
         &self,
+        viewport: &LayoutNode,
         area: Rect,
         state: &mut SelectableListState,
         mouse: MouseEvent,
@@ -630,19 +712,25 @@ impl<'a> SelectableList<'a> {
         if !self.policy.mouse.enabled {
             return SelectableListOutcome::Ignored;
         }
-        if let Some(scrollbar_area) = self.scrollbar_area(area) {
-            let mut scrollbar_state =
-                ScrollbarState::new(u16_saturating(self.total_height()), scrollbar_area.height)
-                    .offset(u16_saturating(state.vertical_scroll));
-            let outcome = Scrollbar::new()
-                .policy(self.policy.scrollbar_policy)
-                .handle_event(scrollbar_area, &mut scrollbar_state, &Event::Mouse(mouse));
-            if let ScrollbarOutcome::Changed { offset } = outcome {
-                state.vertical_scroll = usize::from(offset).min(self.max_vertical_scroll(area));
-                return SelectableListOutcome::Redraw;
-            }
+        let scroll_view = self.scroll_view();
+        let event = Event::Mouse(mouse);
+        let scrollbar =
+            scroll_view.handle_scrollbar_event(area, viewport, &mut state.scroll, &event);
+        if scrollbar != ScrollViewOutcome::Ignored || state.scroll.dragging_scrollbar() {
+            return SelectableListOutcome::Redraw;
         }
         let content_area = self.content_area(area);
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            return scroll_outcome(scroll_view.handle_event(
+                content_area,
+                viewport,
+                &mut state.scroll,
+                &event,
+            ));
+        }
         let hit = self.hit_index(content_area, state, mouse);
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => Self::hover(state, hit),
@@ -650,16 +738,16 @@ impl<'a> SelectableList<'a> {
                 Self::press(state, hit)
             }
             MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                self.release(area, state, hit)
+                self.release(viewport, state, hit)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.policy.mouse.click => {
                 Self::drag(state, hit)
             }
-            MouseEventKind::ScrollUp => self.scroll_by(area, state, -1),
-            MouseEventKind::ScrollDown => self.scroll_by(area, state, 1),
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight
             | MouseEventKind::Move => SelectableListOutcome::Ignored,
@@ -687,14 +775,14 @@ impl<'a> SelectableList<'a> {
 
     fn release(
         &self,
-        area: Rect,
+        viewport: &LayoutNode,
         state: &mut SelectableListState,
         hit: Option<usize>,
     ) -> SelectableListOutcome {
         let was_pressed = state.pressed;
         state.pressed = None;
         if let Some(index) = hit.filter(|hit_index| was_pressed == Some(*hit_index)) {
-            return self.select_index(area, state, index);
+            return self.select_index(viewport, state, index);
         }
         if was_pressed.is_some() {
             SelectableListOutcome::Redraw
@@ -715,34 +803,20 @@ impl<'a> SelectableList<'a> {
     }
 
     fn scroll_by(
-        &self,
-        area: Rect,
+        viewport: &LayoutNode,
         state: &mut SelectableListState,
-        delta: i32,
+        delta: isize,
     ) -> SelectableListOutcome {
-        let current = i32::try_from(state.vertical_scroll).unwrap_or(i32::MAX);
-        let next = usize::try_from(current.saturating_add(delta).max(0)).unwrap_or(usize::MAX);
-        self.set_scroll(area, state, next)
-    }
-
-    fn set_scroll(
-        &self,
-        area: Rect,
-        state: &mut SelectableListState,
-        scroll: usize,
-    ) -> SelectableListOutcome {
-        let next = scroll.min(SelectableList::max_vertical_scroll(self, area));
-        if next == state.vertical_scroll {
-            SelectableListOutcome::Ignored
-        } else {
-            state.vertical_scroll = next;
-            SelectableListOutcome::Redraw
-        }
+        scroll_outcome(ScrollView::scroll_vertical_by(
+            viewport,
+            &mut state.scroll,
+            delta,
+        ))
     }
 
     fn move_focus(
         &self,
-        area: Rect,
+        viewport: &LayoutNode,
         state: &mut SelectableListState,
         direction: Direction,
     ) -> SelectableListOutcome {
@@ -760,13 +834,13 @@ impl<'a> SelectableList<'a> {
             return SelectableListOutcome::Ignored;
         }
         state.set_focused(Some(next));
-        self.ensure_visible(area, state, next);
+        self.ensure_visible(viewport, state, next);
         SelectableListOutcome::Focused(next)
     }
 
     fn focus_edge(
         &self,
-        area: Rect,
+        viewport: &LayoutNode,
         state: &mut SelectableListState,
         first: bool,
     ) -> SelectableListOutcome {
@@ -782,12 +856,16 @@ impl<'a> SelectableList<'a> {
             SelectableListOutcome::Ignored
         } else {
             state.set_focused(Some(index));
-            self.ensure_visible(area, state, index);
+            self.ensure_visible(viewport, state, index);
             SelectableListOutcome::Focused(index)
         }
     }
 
-    fn select_focused(&self, area: Rect, state: &mut SelectableListState) -> SelectableListOutcome {
+    fn select_focused(
+        &self,
+        viewport: &LayoutNode,
+        state: &mut SelectableListState,
+    ) -> SelectableListOutcome {
         let index = state
             .focused
             .or(state.selected)
@@ -795,12 +873,12 @@ impl<'a> SelectableList<'a> {
         let Some(index) = index else {
             return SelectableListOutcome::Ignored;
         };
-        self.select_index(area, state, index)
+        self.select_index(viewport, state, index)
     }
 
     fn select_index(
         &self,
-        area: Rect,
+        viewport: &LayoutNode,
         state: &mut SelectableListState,
         index: usize,
     ) -> SelectableListOutcome {
@@ -809,27 +887,26 @@ impl<'a> SelectableList<'a> {
         }
         state.selected = Some(index);
         state.set_focused(Some(index));
-        self.ensure_visible(area, state, index);
+        self.ensure_visible(viewport, state, index);
         SelectableListOutcome::Selected(index)
     }
 
-    fn ensure_visible(&self, area: Rect, state: &mut SelectableListState, index: usize) {
-        if area.height == 0 {
+    fn ensure_visible(&self, viewport: &LayoutNode, state: &mut SelectableListState, index: usize) {
+        if viewport.size.height == 0 {
             return;
         }
-        let before = self.items[..index]
+        let start = self.item_start(index);
+        let height = self.items.get(index).map_or(0, SelectableListItem::height);
+        self.scroll_view()
+            .ensure_visible(viewport, &mut state.scroll, start, height);
+    }
+
+    fn item_start(&self, index: usize) -> usize {
+        self.items
             .iter()
+            .take(index)
             .map(SelectableListItem::height)
-            .sum::<usize>();
-        let item_height = self.items[index].height();
-        let after = before.saturating_add(item_height);
-        let viewport_height = usize::from(area.height);
-        if before < state.vertical_scroll {
-            state.vertical_scroll = before;
-        } else if after > state.vertical_scroll.saturating_add(viewport_height) {
-            state.vertical_scroll = after.saturating_sub(viewport_height);
-        }
-        state.vertical_scroll = state.vertical_scroll.min(self.max_vertical_scroll(area));
+            .sum()
     }
 
     fn next_enabled(&self, current: usize, direction: Direction) -> Option<usize> {
@@ -844,9 +921,14 @@ impl<'a> SelectableList<'a> {
                 }
                 Direction::Previous if index == 0 => return Some(current),
                 Direction::Previous => index.saturating_sub(1),
-                Direction::Next if index + 1 >= self.items.len() && self.policy.keyboard.wrap => 0,
-                Direction::Next if index + 1 >= self.items.len() => return Some(current),
-                Direction::Next => index + 1,
+                Direction::Next if index.saturating_add(1) >= self.items.len() => {
+                    if self.policy.keyboard.wrap {
+                        0
+                    } else {
+                        return Some(current);
+                    }
+                }
+                Direction::Next => index.saturating_add(1),
             };
             if self.is_enabled_item(index) {
                 return Some(index);
@@ -870,40 +952,43 @@ impl<'a> SelectableList<'a> {
         }
     }
 
+    /// Visible item rectangles inside the content viewport `area` after
+    /// applying the logical scroll offset. Rows above the offset are skipped
+    /// exactly and the final visible item is clipped to the viewport bottom.
     fn visible_hit_regions(
         &self,
         area: Rect,
         state: &SelectableListState,
     ) -> Vec<HitRegion<usize>> {
-        let mut skipped_rows = state.vertical_scroll;
-        let mut rendered_row = 0u16;
+        let offset = state.scroll.vertical_offset();
+        let viewport_end = offset.saturating_add(usize::from(area.height));
+        let mut start = 0usize;
         let mut regions = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
-            let item_height = item.height();
-            if skipped_rows >= item_height {
-                skipped_rows = skipped_rows.saturating_sub(item_height);
+            let end = start.saturating_add(item.height());
+            if end <= offset {
+                start = end;
                 continue;
             }
-            let visible_height = item_height.saturating_sub(skipped_rows);
-            skipped_rows = 0;
-            if rendered_row >= area.height {
+            if start >= viewport_end {
                 break;
             }
-            let region_height = u16::try_from(visible_height)
-                .unwrap_or(u16::MAX)
-                .min(area.height.saturating_sub(rendered_row));
-            if region_height > 0 {
+            let visible_start = start.max(offset);
+            let visible_end = end.min(viewport_end);
+            let height = visible_end.saturating_sub(visible_start);
+            if height > 0 {
                 regions.push(HitRegion::new(
                     index,
                     Rect::new(
                         area.x,
-                        area.y.saturating_add(rendered_row),
+                        area.y
+                            .saturating_add(u16_saturating(visible_start.saturating_sub(offset))),
                         area.width,
-                        region_height,
+                        u16_saturating(height),
                     ),
                 ));
-                rendered_row = rendered_row.saturating_add(region_height);
             }
+            start = end;
         }
         regions
     }
@@ -932,6 +1017,49 @@ impl<'a> SelectableList<'a> {
 
     fn is_enabled_item(&self, index: usize) -> bool {
         self.items.get(index).is_some_and(|item| !item.disabled)
+    }
+}
+
+/// Measured stacked item rows painted in content-local coordinates.
+///
+/// The rows are the single child of the shared scroll viewport, so the
+/// viewport translation and clip decide which rows reach the buffer. Painting
+/// is bounded to the rows that intersect the viewport.
+struct ItemRows<'a, 'list> {
+    list: &'list SelectableList<'a>,
+    id: LayoutId,
+    state: SelectableListState,
+    fallback: Style,
+    offset: usize,
+    viewport_height: usize,
+}
+
+impl Component for ItemRows<'_, '_> {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        self.list
+            .content_layout(self.id.clone(), constraints.max_width())
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let width = layout.size.width;
+        let end = self.offset.saturating_add(self.viewport_height);
+        let mut row = 0usize;
+        for (index, item) in self.list.items.iter().enumerate() {
+            if row >= end {
+                break;
+            }
+            for line_index in 0..item.height() {
+                if row >= self.offset && row < end {
+                    cx.write_line_with_fallback_style(
+                        LocalRect::new(0, i64::try_from(row).unwrap_or(i64::MAX), width, 1),
+                        &self.list.line(index, item, line_index, self.state),
+                        self.fallback,
+                    );
+                }
+                row = row.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -986,6 +1114,18 @@ impl<'a, 'state> SelectableListComponent<'a, 'state> {
         self
     }
 
+    /// Stable identity of the shared scroll viewport.
+    #[must_use]
+    pub fn viewport_id(&self) -> LayoutId {
+        viewport_id(&self.id)
+    }
+
+    /// Stable identity of the measured item content.
+    #[must_use]
+    pub fn content_id(&self) -> LayoutId {
+        content_id(&self.id)
+    }
+
     /// Stable semantic identifier for one contained item.
     fn item_id(&self, item: &SelectableListItem) -> String {
         format!("{}.{}", self.id.as_str(), item.id)
@@ -1005,7 +1145,7 @@ impl Component for SelectableListComponent<'_, '_> {
         }
         self.list.policy.highlight.symbol.hash(&mut layout);
         self.list.policy.highlight.repeat_spacing.hash(&mut layout);
-        format!("{:?}", self.list.policy.scrollbar).hash(&mut layout);
+        self.list.policy.scrollbar.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         for item in self.list.items {
@@ -1019,17 +1159,11 @@ impl Component for SelectableListComponent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let (width, _) = self.list.size();
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, self.list.total_height())),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("list"))
+        self.list.layout_with(&self.id, constraints)
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = Rect::new(0, 0, layout.size.width, height);
+        let area = local_area_of(layout.size);
         if area.is_empty() {
             return;
         }
@@ -1055,7 +1189,8 @@ impl Component for SelectableListComponent<'_, '_> {
             );
             cx.push_semantic(SemanticRegion::new(item_id, region.rect, "list-item"));
         }
-        self.list.paint(
+        self.list.paint_layout(
+            layout,
             area,
             &state,
             self.fallback.unwrap_or(self.list.styles.background),
@@ -1070,7 +1205,9 @@ impl Component for SelectableListComponent<'_, '_> {
             return EventOutcome::Ignored;
         };
         let mut state = self.state.get();
-        let outcome = self.list.handle_event(area, &mut state, event);
+        let outcome = self
+            .list
+            .handle_event_with_layout(layout, area, &mut state, event);
         self.state.set(state);
         match outcome {
             SelectableListOutcome::Ignored => EventOutcome::Ignored,
@@ -1081,8 +1218,34 @@ impl Component for SelectableListComponent<'_, '_> {
     }
 }
 
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
+/// Resolve the shared scroll viewport node inside a list layout.
+fn resolved_viewport(layout: &LayoutNode) -> Option<&LayoutNode> {
+    layout.children.first().map(|child| &child.node)
+}
+
+/// Identity of the measured content already resolved inside a viewport node.
+fn content_id_of(viewport: &LayoutNode) -> LayoutId {
+    viewport.children.first().map_or_else(
+        || LayoutId::new("list.content"),
+        |child| child.node.id.clone(),
+    )
+}
+
+fn viewport_id(id: &LayoutId) -> LayoutId {
+    LayoutId::new(format!("{}.viewport", id.as_str()))
+}
+
+fn content_id(id: &LayoutId) -> LayoutId {
+    LayoutId::new(format!("{}.content", id.as_str()))
+}
+
+const fn scroll_outcome(outcome: ScrollViewOutcome) -> SelectableListOutcome {
+    match outcome {
+        ScrollViewOutcome::Ignored => SelectableListOutcome::Ignored,
+        ScrollViewOutcome::Scrolled { .. } | ScrollViewOutcome::HorizontalScrolled { .. } => {
+            SelectableListOutcome::Redraw
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

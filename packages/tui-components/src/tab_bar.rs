@@ -17,7 +17,7 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
-use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::common::{ComponentMousePolicy, InteractionState, u16_saturating};
 use crate::hit_test::{HitRegion, hit_region_at};
 
 /// One tab-bar item.
@@ -686,10 +686,6 @@ fn tab_label_width_with_policy(item: &TabItem<'_>, policy: TabBarPolicy) -> usiz
     display_width(policy.padding_left)
         .saturating_add(display_width(&item.label.plain_text()))
         .saturating_add(display_width(policy.padding_right))
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 impl crate::theme::ComponentTheme {

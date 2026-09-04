@@ -4,7 +4,7 @@ use crate::frame::{Cursor, Frame};
 use crate::geometry::{Point, Rect};
 use crate::hit::HitRegion;
 use crate::image::ImageContribution;
-use crate::selection::{SelectionFragment, SelectionScope};
+use crate::selection::{SelectionFragment, SelectionScope, SelectionSnapshot};
 use crate::semantic::SemanticRegion;
 use crate::style::Style;
 use crate::text::Line;
@@ -67,6 +67,53 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     #[must_use]
     pub const fn clip(&self) -> Rect {
         self.clip
+    }
+
+    /// The local rectangle covering this context's effective clip.
+    ///
+    /// For a root context this is the complete frame area; nested contexts
+    /// see the region their parent assigned to them, expressed in their own
+    /// local coordinates.
+    #[must_use]
+    pub fn area(&self) -> LocalRect {
+        let x = i64::from(self.clip.x)
+            .saturating_sub(i64::from(self.origin_x))
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        let y = i64::from(self.clip.y).saturating_sub(self.origin_y);
+        LocalRect::new(
+            i32::try_from(x).unwrap_or(i32::MAX),
+            y,
+            self.clip.width,
+            self.clip.height,
+        )
+    }
+
+    /// The cursor requested so far in this frame, in terminal coordinates.
+    #[must_use]
+    pub const fn cursor(&self) -> Option<Cursor> {
+        self.frame.cursor()
+    }
+
+    /// Paint one logical selection snapshot over content already rendered.
+    ///
+    /// This is the deterministic overlay stage a root presenter callback runs
+    /// after composing its tree; highlights are already terminal-space
+    /// rectangles produced from committed selection geometry, so they are
+    /// intersected with the effective clip rather than translated.
+    pub fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
+        let clipped = snapshot
+            .visible_highlights
+            .iter()
+            .map(|highlight| highlight.intersection(self.clip))
+            .filter(|highlight| !highlight.is_empty())
+            .collect::<Vec<_>>();
+        self.frame.paint_selection(
+            &SelectionSnapshot {
+                visible_highlights: clipped,
+                ..snapshot.clone()
+            },
+            style,
+        );
     }
 
     /// Current inherited style.

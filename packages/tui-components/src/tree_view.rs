@@ -16,7 +16,7 @@ use bmux_tui::prelude::{Line, Span};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 
-use crate::common::{ComponentMousePolicy, InteractionState};
+use crate::common::{ComponentMousePolicy, InteractionState, u16_saturating};
 use crate::hit_test::{HitRegion, hit_region_at, vertical_hit_regions};
 
 /// One tree item in caller-provided preorder.
@@ -624,10 +624,6 @@ fn visible_indices(items: &[TreeViewItem], state: &TreeViewState) -> Vec<usize> 
         }
     }
     visible
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 /// Canonical component-lifecycle hierarchical tree view.

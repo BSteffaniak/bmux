@@ -17,6 +17,8 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
+use crate::common::u16_saturating;
+
 use crate::common::ComponentMousePolicy;
 use crate::hit_test::{HitRegion, hit_region_at};
 
@@ -502,10 +504,6 @@ impl<'a> Breadcrumbs<'a> {
             self.styles.normal
         }
     }
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 impl crate::theme::ComponentTheme {

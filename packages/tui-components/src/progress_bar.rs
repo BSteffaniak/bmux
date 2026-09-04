@@ -13,6 +13,8 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
+use crate::common::u16_saturating;
+
 /// Progress value model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressBarValue {
@@ -535,10 +537,6 @@ fn overlay_label(mut line: Line, label: Option<&str>, style: Style, width: usize
     let text = format!("{}{}", " ".repeat(left), label);
     line.spans.push(Span::styled(text, style));
     line
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 impl crate::theme::ComponentTheme {

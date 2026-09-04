@@ -2,10 +2,12 @@
 
 use std::hash::{Hash, Hasher};
 
+use bmux_tui::chrome::Border;
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode, LogicalSize, combine_child_revisions,
 };
+use bmux_tui::composition::Surface;
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -351,35 +353,55 @@ impl<'a> PickerFrameComponent<'a> {
         ))
     }
 
+    /// The panel chrome as the core child-owning [`Surface`] container.
+    ///
+    /// Background, border, and padding belong to the surface that measures
+    /// the panel rectangle; header, input, list, and footer rows are placed
+    /// inside its content insets by [`PickerFrame::resolved_layout`].
+    fn panel_surface(&self) -> Surface<'static> {
+        let mut surface = Surface::new(EmptyContent)
+            .id(format!("{}.surface", self.id.as_str()))
+            .padding(self.frame.policy.padding);
+        if self.frame.policy.background {
+            surface = surface.background(self.frame.styles.background);
+        }
+        if self.frame.policy.chrome {
+            surface = surface.border(Border::single().style(self.frame.styles.border));
+        }
+        surface
+    }
+
     fn paint_chrome(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let Some(panel) = layout.children.first() else {
             return;
         };
         let local = self.local_layout(panel.node.size);
+        let panel_height = u16::try_from(panel.node.size.height).unwrap_or(u16::MAX);
         cx.with_child(
             i32::from(panel.x),
             i64::try_from(panel.y).unwrap_or(i64::MAX),
-            LocalRect::new(
-                0,
-                0,
-                panel.node.size.width,
-                u16::try_from(panel.node.size.height).unwrap_or(u16::MAX),
-            ),
+            LocalRect::new(0, 0, panel.node.size.width, panel_height),
             |cx| {
-                if self.frame.policy.background {
-                    cx.fill(
-                        LocalRect::terminal(local.panel),
-                        " ",
-                        self.frame.styles.background,
-                    );
-                }
-                if self.frame.policy.chrome {
-                    paint_picker_border(
-                        local.panel,
-                        self.frame.styles.border,
-                        self.frame.title,
-                        cx,
-                    );
+                let surface = self.panel_surface();
+                let surface_layout =
+                    surface.layout(Constraints::tight(local.panel.size()), &mut LayoutCx::new());
+                surface.paint(&surface_layout, cx);
+                if self.frame.policy.chrome
+                    && let Some(title) = self.frame.title
+                {
+                    let width = local.panel.width.saturating_sub(2);
+                    if width > 0 {
+                        cx.write_line_with_fallback_style(
+                            LocalRect::new(
+                                i32::from(local.panel.x.saturating_add(1)),
+                                i64::from(local.panel.y),
+                                width,
+                                1,
+                            ),
+                            &Line::from(title),
+                            self.frame.styles.border,
+                        );
+                    }
                 }
                 if let (Some(area), Some(header)) = (local.header, &self.frame.header) {
                     cx.write_line_with_fallback_style(
@@ -388,12 +410,8 @@ impl<'a> PickerFrameComponent<'a> {
                         self.frame.styles.header,
                     );
                 }
-                if local.input.is_some() {
-                    cx.fill(
-                        LocalRect::terminal(local.input.unwrap_or_default()),
-                        " ",
-                        self.frame.styles.input,
-                    );
+                if let Some(area) = local.input {
+                    cx.fill(LocalRect::terminal(area), " ", self.frame.styles.input);
                 }
                 cx.fill(LocalRect::terminal(local.list), " ", self.frame.styles.list);
                 if let (Some(area), Some(footer)) = (local.footer, &self.frame.footer) {
@@ -406,6 +424,21 @@ impl<'a> PickerFrameComponent<'a> {
             },
         );
     }
+}
+
+/// Zero-size placeholder so the panel [`Surface`] measures only its own
+/// chrome; the picker places its real children from its resolved layout.
+struct EmptyContent;
+
+impl Component for EmptyContent {
+    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+        LayoutNode::leaf(
+            LayoutId::new("picker.surface.content"),
+            constraints.constrain(LogicalSize::new(0, 0)),
+        )
+    }
+
+    fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
 }
 
 impl Component for PickerFrameComponent<'_> {
@@ -526,38 +559,6 @@ impl Component for PickerFrameComponent<'_> {
             }
         }
         EventOutcome::Ignored
-    }
-}
-
-fn paint_picker_border(area: Rect, style: Style, title: Option<&str>, cx: &mut PaintCx<'_, '_>) {
-    if area.is_empty() {
-        return;
-    }
-    let right = area.right().saturating_sub(1);
-    let bottom = area.bottom().saturating_sub(1);
-    for x in area.x..area.right() {
-        cx.set_cell(i32::from(x), i64::from(area.y), "─", style);
-        cx.set_cell(i32::from(x), i64::from(bottom), "─", style);
-    }
-    for y in area.y..area.bottom() {
-        cx.set_cell(i32::from(area.x), i64::from(y), "│", style);
-        cx.set_cell(i32::from(right), i64::from(y), "│", style);
-    }
-    cx.set_cell(i32::from(area.x), i64::from(area.y), "┌", style);
-    cx.set_cell(i32::from(right), i64::from(area.y), "┐", style);
-    cx.set_cell(i32::from(area.x), i64::from(bottom), "└", style);
-    cx.set_cell(i32::from(right), i64::from(bottom), "┘", style);
-    if let Some(title) = title {
-        cx.write_line_with_fallback_style(
-            LocalRect::new(
-                i32::from(area.x.saturating_add(1)),
-                i64::from(area.y),
-                area.width.saturating_sub(2),
-                1,
-            ),
-            &Line::from(title),
-            style,
-        );
     }
 }
 

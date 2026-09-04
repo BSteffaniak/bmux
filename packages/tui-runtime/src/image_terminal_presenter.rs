@@ -7,9 +7,9 @@ use bmux_image::compositor::PaneRect;
 use bmux_image::host_caps::HostImageCapabilities;
 use bmux_image::tui::{TuiImageCompositor, TuiImageError};
 use bmux_tui::focus::FocusTrap;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::hit::HitMap;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::selection::SelectionScene;
 use bmux_tui::terminal::Terminal;
 
@@ -194,7 +194,7 @@ impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
 impl<P, W, R> Presenter<P> for ImageTerminalPresenter<W, R, NoopPresentationCommit>
 where
     W: Write,
-    R: FnMut(&mut P, &mut Frame<'_>),
+    R: FnMut(&mut P, &mut PaintCx<'_, '_>),
 {
     type Error = ImagePresentationError;
 
@@ -223,7 +223,7 @@ where
 impl<P, W, R, C> Presenter<P> for ImageTerminalPresenter<W, R, C>
 where
     W: Write,
-    R: FnMut(&mut P, &mut Frame<'_>),
+    R: FnMut(&mut P, &mut PaintCx<'_, '_>),
     C: FnMut(&mut P, &HitMap, &FocusTrap),
 {
     type Error = ImagePresentationError;
@@ -262,7 +262,7 @@ fn present_image_frame<P, W, R>(
 ) -> Result<PresentReport, ImagePresentationError>
 where
     W: Write,
-    R: FnMut(&mut P, &mut Frame<'_>),
+    R: FnMut(&mut P, &mut PaintCx<'_, '_>),
 {
     let terminal_area = terminal.area();
     let pane = PaneRect {
@@ -273,7 +273,7 @@ where
     };
     let mut staged_compositor = compositor.clone();
     let stats = terminal.draw_with_overlay(
-        |frame| render(program, frame),
+        |frame| render(program, &mut PaintCx::new(frame)),
         |writer, scene, delta| {
             staged_compositor.apply_delta(delta);
             staged_compositor
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn reset_resize_and_cleanup_cover_image_lifecycle_handoffs() {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
-        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+        let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
@@ -323,7 +323,7 @@ mod tests {
                     format: ImagePixelFormat::Rgba8,
                 },
                 destination: Rect::new(0, 0, 1, 1),
-                clip: frame.area(),
+                clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
             }));
         };
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn consuming_presenter_cleans_images_before_returning_terminal() {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
-        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+        let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
@@ -360,7 +360,7 @@ mod tests {
                     format: ImagePixelFormat::Rgba8,
                 },
                 destination: Rect::new(0, 0, 1, 1),
-                clip: frame.area(),
+                clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
             }));
         };
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn cleanup_removes_host_images_before_terminal_handoff() {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
-        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+        let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
@@ -390,7 +390,7 @@ mod tests {
                     format: ImagePixelFormat::Rgba8,
                 },
                 destination: Rect::new(0, 0, 1, 1),
-                clip: frame.area(),
+                clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
             }));
         };
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn reset_removes_old_host_image_before_retransmission() {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
-        let render = |(): &mut (), frame: &mut bmux_tui::frame::Frame<'_>| {
+        let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
@@ -423,7 +423,7 @@ mod tests {
                     format: ImagePixelFormat::Rgba8,
                 },
                 destination: Rect::new(0, 0, 1, 1),
-                clip: frame.area(),
+                clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
             }));
         };

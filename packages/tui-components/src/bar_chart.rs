@@ -13,6 +13,8 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
+use crate::common::u16_saturating;
+
 /// One bar chart item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BarChartItem<'a> {
@@ -473,10 +475,6 @@ fn format_label(label: &str, width: u16, truncate: bool) -> String {
     };
     let padding = width.saturating_sub(display_width(&label));
     format!("{label}{}", " ".repeat(padding))
-}
-
-fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 impl crate::theme::ComponentTheme {
