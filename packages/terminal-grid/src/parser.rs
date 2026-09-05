@@ -321,7 +321,9 @@ struct GridPerformer<'a> {
 
 impl Perform for GridPerformer<'_> {
     fn print(&mut self, c: char) {
-        self.grid.print_char(c);
+        let ch = self.grid.characters.translate(c);
+        self.grid.characters.last = Some(ch);
+        self.grid.print_char(ch);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -329,6 +331,10 @@ impl Perform for GridPerformer<'_> {
             b'\n' | 0x0b | 0x0c => self.grid.linefeed(),
             b'\r' => self.grid.carriage_return(),
             0x08 => self.grid.backspace(),
+            0x0e | 0x0f => {
+                self.grid.characters.active = usize::from(byte == 0x0e);
+                self.grid.bump_revision();
+            }
             b'\t' => self.grid.tab(),
             _ => {}
         }
@@ -364,7 +370,18 @@ impl Perform for GridPerformer<'_> {
             'D' => self
                 .grid
                 .move_cursor_relative(0, -one_based(values.first()).cast_signed()),
-            'G' => self.grid.move_cursor_to(
+            'd' => self.grid.move_cursor_to(
+                one_based(values.first()).saturating_sub(1),
+                self.grid.cursor().col,
+            ),
+            'b' => {
+                if let Some(ch) = self.grid.characters.last {
+                    for _ in 0..one_based(values.first()) {
+                        self.grid.print_char(ch);
+                    }
+                }
+            }
+            'G' | '`' => self.grid.move_cursor_to(
                 self.grid.cursor().row,
                 one_based(values.first()).saturating_sub(1),
             ),
@@ -468,7 +485,20 @@ impl Perform for GridPerformer<'_> {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
-        if ignore || !intermediates.is_empty() {
+        if ignore {
+            return;
+        }
+        if let [slot @ (b'(' | b')')] = intermediates {
+            match byte {
+                b'0' | b'B' => {
+                    self.grid.characters.graphics[usize::from(*slot == b')')] = byte == b'0';
+                    self.grid.bump_revision();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if !intermediates.is_empty() {
             return;
         }
         match byte {
@@ -605,6 +635,51 @@ mod tests {
         );
         assert!(!protocol.application_keypad);
         assert!(!protocol.bracketed_paste);
+    }
+
+    #[test]
+    fn curses_borders_use_graphics_repeat_and_vertical_positioning() {
+        let mut grid = TerminalGrid::new(8, 4, GridLimits::default()).unwrap();
+        grid.process(
+            b"\x1b(0lq\x1b[5bk\x1b[2d\rxx\x1b[8Gx\x1b[3d\rx\x1b[8Gx\x1b[4d\rmq\x1b[5bj\x1b(B",
+        );
+        let lines = crate::visible_text_lines(&grid, 0, 4);
+        assert_eq!(lines[0], "┌──────┐");
+        assert_eq!(lines[1], "││     │");
+        assert_eq!(lines[2], "│      │");
+        assert_eq!(lines[3], "└──────┘");
+    }
+
+    #[test]
+    fn character_state_survives_chunks_snapshots_and_deltas() {
+        let limits = GridLimits::default();
+        let mut source = TerminalGridStream::new(16, 2, limits).unwrap();
+        source.process(b"\x1b)");
+        let mut restored =
+            TerminalGridStream::from_snapshot(&source.snapshot(0, 2), limits).unwrap();
+        for stream in [&mut source, &mut restored] {
+            stream.process(b"0\x0eq\x1b7\x0fx\x1b8\x1b[2b\x0fq");
+        }
+        assert_eq!(source.snapshot(0, 2), restored.snapshot(0, 2));
+        assert_eq!(
+            crate::visible_text_lines(source.grid(), 0, 2)[0].trim_end(),
+            "───q"
+        );
+        let delta = source.process_delta(b"\x0e").unwrap();
+        restored.apply_delta(&delta, limits).unwrap();
+        source.process(b"x");
+        restored.process(b"x");
+        assert_eq!(source.snapshot(0, 2), restored.snapshot(0, 2));
+    }
+
+    #[test]
+    fn vertical_position_defaults_and_clamps_without_changing_column() {
+        let mut grid = TerminalGrid::new(8, 4, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[3;4H\x1b[dA\x1b[0dB\x1b[999dC");
+        let rows = grid.viewport_rows();
+        assert_eq!(rows[0].cells()[3].text(), "A");
+        assert_eq!(rows[0].cells()[4].text(), "B");
+        assert_eq!(rows[3].cells()[5].text(), "C");
     }
 
     #[test]

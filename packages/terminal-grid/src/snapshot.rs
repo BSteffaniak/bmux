@@ -43,6 +43,10 @@ pub struct GridSnapshot {
     #[serde(default)]
     pub saved_pending_wrap: bool,
     #[serde(default)]
+    pub characters: crate::CharacterState,
+    #[serde(default)]
+    pub saved_characters: crate::CharacterState,
+    #[serde(default)]
     pub current_style: Style,
     #[serde(default = "default_autowrap")]
     pub autowrap: bool,
@@ -86,6 +90,8 @@ impl GridSnapshot {
             cursor,
             saved_cursor: cursor_snapshot(grid.saved_cursor()),
             saved_pending_wrap: grid.saved_pending_wrap(),
+            characters: grid.characters,
+            saved_characters: grid.saved_characters,
             current_style: grid.current_style(),
             autowrap: grid.autowrap(),
             pending_wrap: grid.pending_wrap(),

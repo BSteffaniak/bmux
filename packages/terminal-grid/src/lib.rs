@@ -9,7 +9,9 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod charset;
 mod delta;
+pub use charset::CharacterState;
 mod model;
 mod parser;
 mod reflow;

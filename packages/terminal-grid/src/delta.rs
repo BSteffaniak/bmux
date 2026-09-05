@@ -35,6 +35,10 @@ pub struct GridDeltaBatch {
     #[serde(default)]
     pub saved_pending_wrap: bool,
     #[serde(default)]
+    pub characters: crate::CharacterState,
+    #[serde(default)]
+    pub saved_characters: crate::CharacterState,
+    #[serde(default)]
     pub current_style: Style,
     #[serde(default = "default_autowrap")]
     pub autowrap: bool,
@@ -99,6 +103,8 @@ impl GridDeltaBatch {
             cursor: after.cursor,
             saved_cursor: after.saved_cursor,
             saved_pending_wrap: after.saved_pending_wrap,
+            characters: after.characters,
+            saved_characters: after.saved_characters,
             current_style: after.current_style,
             autowrap: after.autowrap,
             pending_wrap: after.pending_wrap,
@@ -151,6 +157,8 @@ impl GridDeltaBatch {
         snapshot.cursor = self.cursor;
         snapshot.saved_cursor = self.saved_cursor;
         snapshot.saved_pending_wrap = self.saved_pending_wrap;
+        snapshot.characters = self.characters;
+        snapshot.saved_characters = self.saved_characters;
         snapshot.current_style = self.current_style;
         snapshot.autowrap = self.autowrap;
         snapshot.pending_wrap = self.pending_wrap;

@@ -10018,6 +10018,8 @@ mod tests {
             cursor: bmux_terminal_grid::CursorSnapshot::default(),
             saved_cursor: bmux_terminal_grid::CursorSnapshot::default(),
             saved_pending_wrap: false,
+            characters: bmux_terminal_grid::CharacterState::default(),
+            saved_characters: bmux_terminal_grid::CharacterState::default(),
             current_style: bmux_terminal_grid::Style::default(),
             autowrap: true,
             pending_wrap: false,
