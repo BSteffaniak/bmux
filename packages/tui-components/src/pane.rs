@@ -675,7 +675,14 @@ impl Component for PaneComponent<'_, '_> {
         }
         if let Some(title) = &self.pane.title {
             cx.write_line(
-                LocalRect::new(1, 0, layout.size.width.saturating_sub(2), 1),
+                LocalRect::new(
+                    1,
+                    0,
+                    u16::try_from(title.width())
+                        .unwrap_or(u16::MAX)
+                        .min(layout.size.width.saturating_sub(2)),
+                    1,
+                ),
                 title,
             );
         }
@@ -909,6 +916,34 @@ mod tests {
     };
 
     #[test]
+    fn title_preserves_remaining_top_border() {
+        for (title, expected) in [
+            ("Hi", "┌Hi──────┐"),
+            ("界", "┌界──────┐"),
+            ("", "┌────────┐"),
+            ("1234567890", "┌12345678┐"),
+        ] {
+            let state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 3)));
+            let component = PaneComponent::new(
+                "pane",
+                Pane::new().border(true).title(title),
+                &state,
+                TextBlock::new(""),
+            );
+            let layout =
+                component.layout(Constraints::tight(Size::new(10, 3)), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+            component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            let top = buffer.cells()[..10]
+                .iter()
+                .filter(|cell| !cell.is_wide_continuation())
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            assert_eq!(top, expected, "title: {title:?}");
+        }
+    }
+
+    #[test]
     fn inner_area_accounts_for_border_and_padding() {
         let pane = Pane::new().padding(Insets::new(1, 2, 1, 2));
         let state = PaneState::new(Rect::new(0, 0, 20, 8));
@@ -1110,7 +1145,7 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 5));
         let mut frame = Frame::new(&mut buffer);
         component.paint(&layout, &mut PaintCx::new(&mut frame));
-        assert_eq!(frame.buffer().row_symbols(0).unwrap(), "┌Pane      ┐");
+        assert_eq!(frame.buffer().row_symbols(0).unwrap(), "┌Pane──────┐");
         assert!(frame.buffer().row_symbols(2).unwrap().contains("body"));
         assert!(frame.hits().regions().iter().any(|region| {
             region.id.as_str() == "pane" && region.area == Rect::new(0, 0, 12, 5)
