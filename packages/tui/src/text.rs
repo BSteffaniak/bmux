@@ -614,12 +614,26 @@ impl Text {
         Self { lines: Vec::new() }
     }
 
-    /// Create text from one unstyled line.
+    /// Create unstyled text, splitting LF and CRLF into logical lines.
+    ///
+    /// Empty input creates one empty line. Blank lines, including a trailing
+    /// empty line after a newline, are preserved. Bare carriage returns are not
+    /// line separators.
     #[must_use]
     pub fn raw(content: impl Into<String>) -> Self {
-        Self {
-            lines: vec![Line::raw(content)],
+        let content = content.into();
+        let mut lines = content.split('\n').peekable();
+        let mut result = Vec::new();
+        while let Some(line) = lines.next() {
+            // Strip CR only when it belongs to a CRLF separator.
+            let line = if lines.peek().is_some() {
+                line.strip_suffix('\r').unwrap_or(line)
+            } else {
+                line
+            };
+            result.push(Line::raw(line));
         }
+        Self { lines: result }
     }
 
     /// Create text from lines.
