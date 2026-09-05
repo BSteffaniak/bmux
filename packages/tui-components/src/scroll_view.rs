@@ -214,6 +214,7 @@ pub struct ScrollViewComponent<'a> {
     offset_y: usize,
     child: Element<'a>,
     reveal: Option<LayoutId>,
+    retained_state: Option<&'a std::cell::Cell<ScrollViewState>>,
 }
 
 impl<'a> ScrollViewComponent<'a> {
@@ -233,6 +234,7 @@ impl<'a> ScrollViewComponent<'a> {
             offset_y: state.vertical_offset(),
             child: Element::new(child),
             reveal: None,
+            retained_state: None,
         }
     }
 
@@ -240,6 +242,18 @@ impl<'a> ScrollViewComponent<'a> {
     #[must_use]
     pub fn reveal(mut self, id: impl Into<LayoutId>) -> Self {
         self.reveal = Some(id.into());
+        self
+    }
+
+    /// Retain the revealed viewport offset in caller-owned state after painting.
+    ///
+    /// Reuse this state when constructing subsequent frames so focus moves
+    /// within the existing viewport before scrolling at its edges.
+    #[must_use]
+    pub const fn retain_state(mut self, state: &'a std::cell::Cell<ScrollViewState>) -> Self {
+        self.offset_x = state.get().horizontal_offset();
+        self.offset_y = state.get().vertical_offset();
+        self.retained_state = Some(state);
         self
     }
 
@@ -320,6 +334,11 @@ impl Component for ScrollViewComponent<'_> {
         };
         let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
         let offset = self.effective_offset(layout);
+        if let Some(state) = self.retained_state {
+            let mut value = state.get();
+            value.set_vertical_offset(offset);
+            state.set(value);
+        }
         cx.with_child(
             -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
             -i64::try_from(offset).unwrap_or(i64::MAX),
