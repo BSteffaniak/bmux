@@ -1581,6 +1581,7 @@ impl Component for Row<'_> {
 pub struct Column<'a> {
     id: LayoutId,
     children: Vec<Element<'a>>,
+    weights: Vec<u16>,
     gap: usize,
     alignment: HorizontalAlignment,
 }
@@ -1592,6 +1593,7 @@ impl<'a> Column<'a> {
         Self {
             id: LayoutId::new("column"),
             children: Vec::new(),
+            weights: Vec::new(),
             gap: 0,
             alignment: HorizontalAlignment::Stretch,
         }
@@ -1622,6 +1624,16 @@ impl<'a> Column<'a> {
     #[must_use]
     pub fn child(mut self, child: impl Component + 'a) -> Self {
         self.children.push(Element::new(child));
+        self.weights.push(0);
+        self
+    }
+
+    /// Append a child receiving a weighted share of remaining bounded height.
+    /// With unbounded height, flexible children retain their intrinsic height.
+    #[must_use]
+    pub fn flex(mut self, child: Flex<'a>) -> Self {
+        self.children.push(child.component);
+        self.weights.push(child.weight);
         self
     }
 }
@@ -1638,6 +1650,7 @@ impl Component for Column<'_> {
             stable_revision(|state| {
                 self.id.as_str().hash(state);
                 self.gap.hash(state);
+                self.weights.hash(state);
                 (match self.alignment {
                     HorizontalAlignment::Start => 0u8,
                     HorizontalAlignment::Center => 1,
@@ -1656,16 +1669,51 @@ impl Component for Column<'_> {
         let mut y = 0usize;
         let width = constraints.max_width();
         let mut children = Vec::with_capacity(self.children.len());
-        for child in &self.children {
+        let total_weight = self
+            .weights
+            .iter()
+            .map(|weight| usize::from(*weight))
+            .sum::<usize>();
+        let flex_height = constraints
+            .max_height()
+            .filter(|_| total_weight > 0)
+            .map(|height| {
+                let fixed = self
+                    .children
+                    .iter()
+                    .zip(&self.weights)
+                    .filter(|(_, weight)| **weight == 0)
+                    .map(|(child, _)| {
+                        child
+                            .layout(Constraints::new(width, width, 0, None), cx)
+                            .size
+                            .height
+                    })
+                    .sum::<usize>();
+                height.saturating_sub(fixed).saturating_sub(
+                    self.gap
+                        .saturating_mul(self.children.len().saturating_sub(1)),
+                )
+            });
+        let mut allocated = 0usize;
+        let mut consumed_weight = 0usize;
+        for (child, weight) in self.children.iter().zip(&self.weights) {
             let child_min_width = if self.alignment == HorizontalAlignment::Stretch {
                 width
             } else {
                 0
             };
-            let node = child.layout(
-                Constraints::new(child_min_width, width, 0, constraints.max_height()),
-                cx,
+            let child_constraints = flex_height.filter(|_| *weight > 0).map_or_else(
+                || Constraints::new(child_min_width, width, 0, constraints.max_height()),
+                |height| {
+                    consumed_weight += usize::from(*weight);
+                    let end = height.saturating_mul(consumed_weight) / total_weight;
+                    let share = end.saturating_sub(allocated);
+                    allocated = end;
+                    Constraints::new(child_min_width, width, share, Some(share))
+                },
             );
+            let node = child.layout(child_constraints, cx);
             let x = match self.alignment {
                 HorizontalAlignment::Start | HorizontalAlignment::Stretch => 0,
                 HorizontalAlignment::Center => width.saturating_sub(node.size.width) / 2,

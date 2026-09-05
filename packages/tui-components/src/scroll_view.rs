@@ -213,6 +213,7 @@ pub struct ScrollViewComponent<'a> {
     offset_x: usize,
     offset_y: usize,
     child: Element<'a>,
+    reveal: Option<LayoutId>,
 }
 
 impl<'a> ScrollViewComponent<'a> {
@@ -231,6 +232,40 @@ impl<'a> ScrollViewComponent<'a> {
             offset_x: state.horizontal_offset(),
             offset_y: state.vertical_offset(),
             child: Element::new(child),
+            reveal: None,
+        }
+    }
+
+    /// Keep a measured descendant visible in the allocated viewport.
+    #[must_use]
+    pub fn reveal(mut self, id: impl Into<LayoutId>) -> Self {
+        self.reveal = Some(id.into());
+        self
+    }
+
+    fn effective_offset(&self, layout: &LayoutNode) -> usize {
+        let Some(child) = layout.children.first() else {
+            return 0;
+        };
+        let height = layout.size.height;
+        let offset = self
+            .offset_y
+            .min(child.node.size.height.saturating_sub(height));
+        let Some(rect) = self
+            .reveal
+            .as_ref()
+            .and_then(|id| child.node.find_logical_rect(id))
+        else {
+            return offset;
+        };
+        if rect.y < offset {
+            rect.y
+        } else if rect.y.saturating_add(rect.height.min(height)) > offset.saturating_add(height) {
+            rect.y
+                .saturating_add(rect.height.min(height))
+                .saturating_sub(height)
+        } else {
+            offset
         }
     }
     /// Set the logical content width used to measure the child subtree.
@@ -263,6 +298,7 @@ impl Component for ScrollViewComponent<'_> {
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         self.offset_x.hash(&mut paint);
         self.offset_y.hash(&mut paint);
+        self.reveal.hash(&mut paint);
         child.paint.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
@@ -283,12 +319,13 @@ impl Component for ScrollViewComponent<'_> {
             return;
         };
         let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let offset = self.effective_offset(layout);
         cx.with_child(
             -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
-            -i64::try_from(self.offset_y).unwrap_or(i64::MAX),
+            -i64::try_from(offset).unwrap_or(i64::MAX),
             LocalRect::new(
                 i32::try_from(self.offset_x).unwrap_or(i32::MAX),
-                i64::try_from(self.offset_y).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX),
                 layout.size.width,
                 viewport_height,
             ),
@@ -311,9 +348,9 @@ impl Component for ScrollViewComponent<'_> {
             .map_or(viewport, |parent| parent.intersection(viewport));
         cx.with_transform(
             u16::try_from(self.offset_x).unwrap_or(u16::MAX),
-            self.offset_y,
+            self.effective_offset(layout),
             -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
-            -i64::try_from(self.offset_y).unwrap_or(i64::MAX),
+            -i64::try_from(self.effective_offset(layout)).unwrap_or(i64::MAX),
             clip,
             |cx| self.child.event(event, &child.node, cx),
         )
