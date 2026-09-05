@@ -40,6 +40,26 @@ pub fn write_ansi_frame(
     Ok(())
 }
 
+/// Paint a buffer at the current cursor row without absolute positioning.
+///
+/// Each row is cleared before painting and ends at column zero of the next row.
+/// The caller owns row reservation and must leave a spare terminal column to
+/// avoid automatic wrapping. Uses the same style and wide-cell encoder as frames.
+///
+/// # Errors
+/// Returns any writer error.
+pub fn write_ansi_inline_frame(writer: &mut impl Write, buffer: &Buffer) -> io::Result<()> {
+    let area = buffer.area();
+    let mut style = Style::new();
+    write_ansi_style(writer, style)?;
+    for y in area.y..area.bottom() {
+        writer.write_all(b"\r\x1b[2K")?;
+        emit_row_cells(writer, buffer, y, area.x, area.right(), &mut style)?;
+        writer.write_all(b"\r\n")?;
+    }
+    write_ansi_style(writer, Style::new())
+}
+
 /// Statistics from a damage-aware ANSI frame write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AnsiFrameDiffStats {
@@ -145,6 +165,17 @@ fn emit_row_span(
         return Ok(());
     }
     write_ansi_move_to(writer, Point::new(start, y))?;
+    emit_row_cells(writer, buffer, y, start, end, active_style)
+}
+
+fn emit_row_cells(
+    writer: &mut impl Write,
+    buffer: &Buffer,
+    y: u16,
+    start: u16,
+    end: u16,
+    active_style: &mut Style,
+) -> io::Result<()> {
     let mut x = start;
     while x < end {
         let Some(cell) = buffer.get(Point::new(x, y)) else {
