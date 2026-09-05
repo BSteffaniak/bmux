@@ -214,6 +214,7 @@ pub struct ScrollViewComponent<'a> {
     offset_y: usize,
     child: Element<'a>,
     reveal: Option<LayoutId>,
+    reveal_end: bool,
     retained_state: Option<&'a std::cell::Cell<ScrollViewState>>,
 }
 
@@ -234,6 +235,7 @@ impl<'a> ScrollViewComponent<'a> {
             offset_y: state.vertical_offset(),
             child: Element::new(child),
             reveal: None,
+            reveal_end: false,
             retained_state: None,
         }
     }
@@ -242,6 +244,16 @@ impl<'a> ScrollViewComponent<'a> {
     #[must_use]
     pub fn reveal(mut self, id: impl Into<LayoutId>) -> Self {
         self.reveal = Some(id.into());
+        self.reveal_end = false;
+        self
+    }
+
+    /// Reveal the trailing edge of a descendant, including when it is taller
+    /// than the viewport. Useful for reaching the end of scrollable content.
+    #[must_use]
+    pub fn reveal_end(mut self, id: impl Into<LayoutId>) -> Self {
+        self.reveal = Some(id.into());
+        self.reveal_end = true;
         self
     }
 
@@ -272,6 +284,14 @@ impl<'a> ScrollViewComponent<'a> {
         else {
             return offset;
         };
+        if self.reveal_end {
+            let bottom = rect.y.saturating_add(rect.height);
+            return if bottom > offset.saturating_add(height) || bottom <= offset {
+                bottom.saturating_sub(height)
+            } else {
+                offset
+            };
+        }
         if rect.y < offset {
             rect.y
         } else if rect.y.saturating_add(rect.height.min(height)) > offset.saturating_add(height) {
@@ -313,6 +333,7 @@ impl Component for ScrollViewComponent<'_> {
         self.offset_x.hash(&mut paint);
         self.offset_y.hash(&mut paint);
         self.reveal.hash(&mut paint);
+        self.reveal_end.hash(&mut paint);
         child.paint.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
