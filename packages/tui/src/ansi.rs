@@ -60,6 +60,49 @@ pub fn write_ansi_inline_frame(writer: &mut impl Write, buffer: &Buffer) -> io::
     write_ansi_style(writer, Style::new())
 }
 
+/// Update a same-sized inline buffer from the cursor row immediately below it.
+///
+/// Only changed cell spans are emitted; unchanged frames emit no bytes. The
+/// cursor returns below the buffer without newlines or clearing visible rows.
+///
+/// # Errors
+/// Returns a writer error or invalid input for differently sized buffers.
+pub fn write_ansi_inline_frame_diff(
+    writer: &mut impl Write,
+    previous: &Buffer,
+    current: &Buffer,
+) -> io::Result<()> {
+    if previous.area() != current.area() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inline diff requires matching frame areas",
+        ));
+    }
+    let area = current.area();
+    let mut style = Style::new();
+    let mut started = false;
+    for y in area.y..area.bottom() {
+        if let Some((start, end)) = changed_row_suffix(previous, current, y) {
+            if !started {
+                write_ansi_style(writer, style)?;
+                started = true;
+            }
+            let distance = area.bottom() - y;
+            write!(writer, "\r\x1b[{distance}A")?;
+            let column = start - area.x;
+            if column > 0 {
+                write!(writer, "\x1b[{column}C")?;
+            }
+            emit_row_cells(writer, current, y, start, end, &mut style)?;
+            write!(writer, "\r\x1b[{distance}B")?;
+        }
+    }
+    if started {
+        write_ansi_style(writer, Style::new())?;
+    }
+    Ok(())
+}
+
 /// Statistics from a damage-aware ANSI frame write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AnsiFrameDiffStats {

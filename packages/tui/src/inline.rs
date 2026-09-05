@@ -1,6 +1,9 @@
 //! Inline terminal ownership without an alternate screen.
 
-use crate::{ansi::write_ansi_inline_frame, buffer::Buffer};
+use crate::{
+    ansi::{write_ansi_inline_frame, write_ansi_inline_frame_diff},
+    buffer::Buffer,
+};
 use std::io::{self, Write};
 
 /// Owns raw mode and the rows of one inline interaction.
@@ -14,6 +17,7 @@ pub struct InlineTerminal<W: Write> {
     writer: W,
     rows: u16,
     restore_raw: bool,
+    previous: Option<Buffer>,
 }
 
 impl<W: Write> InlineTerminal<W> {
@@ -36,6 +40,7 @@ impl<W: Write> InlineTerminal<W> {
             writer,
             rows: 0,
             restore_raw,
+            previous: None,
         })
     }
 
@@ -51,11 +56,46 @@ impl<W: Write> InlineTerminal<W> {
                 "inline frame must leave a spare terminal row and column",
             ));
         }
-        self.clear()?;
-        // Record before writing so cleanup is attempted even after partial output.
+        let mut update = Vec::new();
+        if let Some(previous) = &self.previous
+            && previous.area() == buffer.area()
+        {
+            write_ansi_inline_frame_diff(&mut update, previous, buffer)?;
+        } else {
+            // Resize/first paint: clear and repaint in the same buffered update,
+            // never flush a blank intermediate frame.
+            let rows = self.rows.min(height.saturating_sub(1));
+            if rows > 0 {
+                write!(update, "\r\x1b[{rows}A")?;
+                for _ in 0..rows {
+                    update.write_all(b"\x1b[2K\r\n")?;
+                }
+                write!(update, "\x1b[{rows}A\r")?;
+            }
+            write_ansi_inline_frame(&mut update, buffer)?;
+        }
+        if update.is_empty() {
+            return Ok(());
+        }
+        // Synchronized output is ignored by terminals which do not support it;
+        // those terminals still benefit from changed-span writes with no clear.
+        let mut transaction = Vec::with_capacity(update.len() + 16);
+        transaction.extend_from_slice(b"\x1b[?2026h");
+        transaction.extend_from_slice(&update);
+        transaction.extend_from_slice(b"\x1b[?2026l");
+        if let Err(error) = self
+            .writer
+            .write_all(&transaction)
+            .and_then(|()| self.writer.flush())
+        {
+            self.previous = None;
+            let _ = self.writer.write_all(b"\x1b[?2026l");
+            let _ = self.writer.flush();
+            return Err(error);
+        }
         self.rows = buffer.area().height;
-        write_ansi_inline_frame(&mut self.writer, buffer)?;
-        self.writer.flush()
+        self.previous = Some(buffer.clone());
+        Ok(())
     }
 
     /// Clear owned visible rows and leave the cursor at their beginning.
@@ -76,6 +116,7 @@ impl<W: Write> InlineTerminal<W> {
             write!(self.writer, "\x1b[{rows}A\r")?;
         }
         self.rows = 0;
+        self.previous = None;
         self.writer.flush()
     }
 }
