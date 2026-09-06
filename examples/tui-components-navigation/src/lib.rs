@@ -11,7 +11,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Text};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::breadcrumbs::{
-    BreadcrumbItem, Breadcrumbs, BreadcrumbsComponent, BreadcrumbsOutcome, BreadcrumbsState,
+    BreadcrumbItem, BreadcrumbsComponent, BreadcrumbsOutcome, BreadcrumbsState,
 };
 use bmux_tui_components::key_hint_bar::{
     KeyHint, KeyHintBarComponent, KeyHintBarPolicy, KeyHintBarStyles,
@@ -92,9 +92,24 @@ impl NavigationDemo {
             return true;
         }
         let breadcrumb_items = breadcrumb_items();
-        if let BreadcrumbsOutcome::Activated { id, .. } = Breadcrumbs::new(&breadcrumb_items)
-            .handle_event(Rect::new(30, 0, 38, 1), &mut self.breadcrumbs, event)
-        {
+        let breadcrumb_state = Cell::new(self.breadcrumbs);
+        let component = BreadcrumbsComponent::new(
+            "navigation.breadcrumbs",
+            &breadcrumb_items,
+            &breadcrumb_state,
+        );
+        let area = Rect::new(30, 0, 38, 1);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let outcome = EventCx::new(&layout).with_transform(
+            0,
+            0,
+            i32::from(area.x),
+            i64::from(area.y),
+            area,
+            |cx| component.handle_event(event, &layout, cx),
+        );
+        self.breadcrumbs = breadcrumb_state.get();
+        if let BreadcrumbsOutcome::Activated { id, .. } = outcome {
             self.message = format!("Breadcrumb activated: {id}");
             return false;
         }

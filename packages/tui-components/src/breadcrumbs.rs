@@ -212,6 +212,22 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
         }
     }
 
+    /// Handle input using resolved component geometry, preserving activation details.
+    pub fn handle_event(
+        &self,
+        event: &Event,
+        layout: &LayoutNode,
+        cx: &mut EventCx<'_>,
+    ) -> BreadcrumbsOutcome<'a> {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return BreadcrumbsOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.breadcrumbs.handle_event(area, &mut state, event);
+        self.state.set(state);
+        outcome
+    }
+
     /// Set behavior policy.
     #[must_use]
     pub const fn policy(mut self, policy: BreadcrumbsPolicy) -> Self {
@@ -294,13 +310,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
-            return EventOutcome::Ignored;
-        };
-        let mut state = self.state.get();
-        let outcome = self.breadcrumbs.handle_event(area, &mut state, event);
-        self.state.set(state);
-        match outcome {
+        match self.handle_event(event, layout, cx) {
             BreadcrumbsOutcome::Ignored => EventOutcome::Ignored,
             BreadcrumbsOutcome::Redraw | BreadcrumbsOutcome::Activated { .. } => {
                 EventOutcome::Redraw
@@ -475,7 +485,9 @@ impl<'a> Breadcrumbs<'a> {
         if !area.contains(position) || position.y != area.y {
             return None;
         }
-        hit_region_at(&self.item_hit_regions(area), position).map(|region| region.key)
+        hit_region_at(&self.item_hit_regions(area), position)
+            .map(|region| region.key)
+            .filter(|&index| !self.items[index].disabled)
     }
 
     fn line(&self, state: &BreadcrumbsState) -> Line {
@@ -693,6 +705,33 @@ mod tests {
             ),
             BreadcrumbsOutcome::Redraw
         );
+    }
+
+    #[test]
+    fn disabled_items_do_not_acquire_pointer_state() {
+        let items = [BreadcrumbItem::new("disabled", "Disabled").disabled(true)];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        let area = Rect::new(0, 0, 10, 1);
+        let mut state = BreadcrumbsState::new(None);
+        for kind in [
+            MouseEventKind::Move,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let outcome = breadcrumbs.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent {
+                    kind,
+                    position: Point::new(0, 0),
+                    modifiers: bmux_tui::event::MouseModifiers::default(),
+                }),
+            );
+            assert!(!matches!(outcome, BreadcrumbsOutcome::Activated { .. }));
+            assert_eq!(state.hovered(), None);
+            assert_eq!(state.pressed, None);
+            assert_eq!(state.current(), None);
+        }
     }
 
     #[test]
