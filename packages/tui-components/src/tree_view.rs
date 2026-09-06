@@ -364,10 +364,22 @@ impl<'a> TreeView<'a> {
         }
     }
 
-    fn row_line(&self, item: &TreeViewItem, state: &TreeViewState, visible: usize) -> Line {
-        let indent = " ".repeat(usize::from(
-            item.depth.saturating_mul(self.policy.indent_width),
-        ));
+    fn row_line(
+        &self,
+        item: &TreeViewItem,
+        state: &TreeViewState,
+        visible: usize,
+        width: u16,
+    ) -> Line {
+        let indent_width = item
+            .depth
+            .saturating_mul(self.policy.indent_width)
+            .min(width);
+        let style = self.row_style(item, state, visible);
+        let indent = " ".repeat(usize::from(indent_width));
+        if indent_width == width {
+            return Line::from_spans([Span::styled(indent, style)]);
+        }
         let marker = if item.expandable {
             if state.is_expanded(&item.id) {
                 "▾"
@@ -377,7 +389,6 @@ impl<'a> TreeView<'a> {
         } else {
             " "
         };
-        let style = self.row_style(item, state, visible);
         let marker_style = if item.disabled || state.interaction.disabled {
             self.styles.disabled
         } else {
@@ -757,7 +768,7 @@ impl Component for TreeViewComponent<'_, '_> {
                     cx.push_semantic(SemanticRegion::new(item_id, row, "tree-item"));
                     cx.write_line_with_fallback_style(
                         LocalRect::new(0, i64::from(row.y), row.width, 1),
-                        &self.tree.row_line(item, &state, visible),
+                        &self.tree.row_line(item, &state, visible, row.width),
                         self.tree.row_style(item, &state, visible),
                     );
                 }
@@ -982,6 +993,48 @@ mod tests {
                         constraints.constrain(bmux_tui::component::LogicalSize::new(expected, 1))
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_indentation_paints_only_the_allocated_row_width() {
+        let items = [TreeViewItem::new("deep", "Hidden label", u16::MAX).expandable(true)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let line = component.tree.row_line(&items[0], &state.borrow(), 0, 3);
+        assert_eq!(line.width(), 3);
+        assert_eq!(line.spans.len(), 1);
+        let area = Rect::new(0, 0, 3, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render_component(&component, area, &mut frame);
+        assert_eq!(frame.hits().regions().len(), 2);
+    }
+
+    #[test]
+    fn indentation_boundary_preserves_marker_and_label_columns() {
+        let items = [TreeViewItem::new("branch", "X", 2).expandable(true)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        for expanded in [false, true] {
+            state.borrow_mut().set_expanded("branch", expanded);
+            for (width, collapsed, opened) in [
+                (3, "   ", "   "),
+                (4, "    ", "    "),
+                (5, "    ▸", "    ▾"),
+                (6, "    ▸ ", "    ▾ "),
+                (7, "    ▸ X", "    ▾ X"),
+            ] {
+                let area = Rect::new(0, 0, width, 1);
+                let mut buffer = Buffer::empty(area);
+                let mut frame = Frame::new(&mut buffer);
+                render_component(&component, area, &mut frame);
+                assert_eq!(
+                    frame.buffer().row_symbols(0).as_deref(),
+                    Some(if expanded { opened } else { collapsed })
+                );
+                assert_eq!(frame.hits().regions().len(), 2);
             }
         }
     }
