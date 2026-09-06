@@ -925,7 +925,12 @@ mod tests {
                 let mut initial = TreeViewState::new(None);
                 initial.set_disabled(disabled_tree);
                 let state = RefCell::new(initial);
-                let component = TreeViewComponent::new("tree", &items, &state);
+                let component =
+                    TreeViewComponent::new("tree", &items, &state).styles(super::TreeViewStyles {
+                        disabled: bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Red),
+                        marker: bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Green),
+                        ..super::TreeViewStyles::default()
+                    });
                 for expanded in [false, true] {
                     state.borrow_mut().set_expanded("branch", expanded);
                     let expected = if disabled_item || disabled_tree {
@@ -1033,6 +1038,25 @@ mod tests {
     }
 
     #[test]
+    fn horizontally_clipped_indentation_preserves_logical_columns() {
+        let items = [TreeViewItem::new("branch", "X", 2).expandable(true)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(7), &mut LayoutCx::new());
+        for (offset, expected) in [(2, "  ▸"), (3, " ▸ "), (4, "▸ X")] {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+            let mut frame = Frame::new(&mut buffer);
+            PaintCx::new(&mut frame).with_child(
+                -offset,
+                0,
+                LocalRect::new(offset, 0, 3, 1),
+                |cx| component.paint(&layout, cx),
+            );
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn indentation_boundary_preserves_marker_and_label_columns() {
         let items = [TreeViewItem::new("branch", "X", 2).expandable(true)];
         let state = RefCell::new(TreeViewState::new(None));
@@ -1127,25 +1151,25 @@ mod tests {
     fn whole_tree_disabled_style_overrides_row_interaction() {
         let items = [TreeViewItem::new("row", "Row", 0)];
         let state = RefCell::new(TreeViewState::new(None));
-        let component = TreeViewComponent::new("tree", &items, &state);
-        for (disabled, selected, pointer) in [
-            (true, false, false),
-            (true, true, false),
-            (true, true, true),
-            (false, true, true),
+        let component =
+            TreeViewComponent::new("tree", &items, &state).styles(super::TreeViewStyles::default());
+        let styles = component.tree.styles;
+        for (disabled, selected, hovered, pressed, expected) in [
+            (false, false, false, false, styles.normal),
+            (false, false, true, false, styles.hovered),
+            (false, true, true, false, styles.selected),
+            (false, true, true, true, styles.pressed),
+            (true, false, false, false, styles.disabled),
+            (true, true, false, false, styles.disabled),
+            (true, true, true, true, styles.disabled),
         ] {
             {
                 let mut state = state.borrow_mut();
                 state.interaction.disabled = disabled;
                 state.selected_visible = selected.then_some(0);
-                state.hovered_visible = pointer.then_some(0);
-                state.pressed_visible = pointer.then_some(0);
+                state.hovered_visible = hovered.then_some(0);
+                state.pressed_visible = pressed.then_some(0);
             }
-            let expected = if disabled {
-                component.tree.styles.disabled
-            } else {
-                component.tree.styles.pressed
-            };
             let area = Rect::new(0, 0, 20, 1);
             let mut buffer = Buffer::empty(area);
             let mut frame = Frame::new(&mut buffer);
