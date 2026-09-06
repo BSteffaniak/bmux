@@ -394,11 +394,17 @@ impl<'a> TreeView<'a> {
         } else {
             self.styles.marker
         };
+        let label = if width - indent_width > 2 {
+            item.label.clone()
+        } else {
+            String::new()
+        };
+        let separator = if width - indent_width > 1 { " " } else { "" };
         Line::from_spans([
             Span::styled(indent, style),
             Span::styled(marker, marker_style),
-            Span::styled(" ", style),
-            Span::styled(item.label.clone(), style),
+            Span::styled(separator, style),
+            Span::styled(label, style),
         ])
     }
 
@@ -1010,6 +1016,20 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         render_component(&component, area, &mut frame);
         assert_eq!(frame.hits().regions().len(), 2);
+    }
+
+    #[test]
+    fn hidden_label_is_not_materialized_when_only_the_prefix_fits() {
+        let items = [TreeViewItem::new("branch", "X".repeat(100_000), 2).expandable(true)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        for width in [5, 6] {
+            let line = component
+                .tree
+                .row_line(&items[0], &state.borrow(), 0, width);
+            assert_eq!(line.width(), usize::from(width));
+            assert!(line.spans.last().unwrap().content.is_empty());
+        }
     }
 
     #[test]
