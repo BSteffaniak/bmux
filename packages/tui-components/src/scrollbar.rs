@@ -82,7 +82,7 @@ pub struct ScrollbarPolicy {
     pub thumb: &'static str,
     /// End cap symbol.
     pub end: &'static str,
-    /// Minimum thumb size.
+    /// Minimum thumb size, clamped to at least one cell on nonempty tracks.
     pub min_thumb: u16,
     /// Mouse dragging enabled.
     pub mouse_drag: bool,
@@ -268,7 +268,8 @@ impl Component for ScrollbarComponent<'_> {
         let area = Rect::new(0, 0, layout.size.width, height);
         let state = self.state.get();
         self.scrollbar.paint(area, &state, cx);
-        if self.scrollbar.policy.mouse_drag && state.max_offset() > 0 {
+        let geometry = self.scrollbar.layout(area, &state);
+        if self.scrollbar.policy.mouse_drag && geometry.thumb_len < geometry.track_len {
             cx.push_hit(
                 SceneRegion::new(self.id.as_str(), area)
                     .role(HitRole::Scroll)
@@ -355,7 +356,7 @@ impl Scrollbar {
             (u32::from(state.viewport_len) * u32::from(track_len)) / u32::from(state.content_len),
         )
         .unwrap_or(track_len)
-        .max(self.policy.min_thumb)
+        .max(self.policy.min_thumb.max(1))
         .min(track_len);
         let travel = track_len.saturating_sub(thumb_len);
         let max_offset = state.max_offset();
@@ -434,7 +435,13 @@ impl Scrollbar {
         state: &mut ScrollbarState,
         event: &Event,
     ) -> ScrollbarOutcome {
-        if !self.policy.mouse_drag || area.is_empty() {
+        if !self.policy.mouse_drag || area.is_empty() || state.max_offset() == 0 {
+            state.dragging = false;
+            return ScrollbarOutcome::Ignored;
+        }
+        let layout = self.layout(area, state);
+        if layout.thumb_len == layout.track_len {
+            state.dragging = false;
             return ScrollbarOutcome::Ignored;
         }
         let Event::Mouse(mouse) = event else {
@@ -575,6 +582,124 @@ mod tests {
             bmux_tui::event::EventOutcome::Redraw
         );
         assert_eq!(state.get().offset, state.get().max_offset());
+    }
+
+    #[test]
+    fn unavailable_scrollbar_never_captures_or_resumes_a_drag() {
+        for policy in [ScrollbarPolicy::vertical(), ScrollbarPolicy::horizontal()] {
+            let scrollbar = Scrollbar::new().policy(policy);
+            let area = Rect::new(2, 3, 8, 8);
+            let press = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(2, 3),
+            ));
+            let drag = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(MouseButton::Left),
+                Point::new(9, 10),
+            ));
+            let mut disabled = policy;
+            disabled.mouse_drag = false;
+            for (unavailable, bounds, content, viewport) in [
+                (scrollbar, area, 5, 5),
+                (scrollbar, area, 0, 5),
+                (scrollbar, Rect::new(2, 3, 0, 0), 100, 5),
+                (Scrollbar::new().policy(disabled), area, 100, 5),
+            ] {
+                let mut state = ScrollbarState::new(content, viewport);
+                assert_eq!(
+                    unavailable.handle_event(bounds, &mut state, &press),
+                    ScrollbarOutcome::Ignored
+                );
+                assert!(!state.dragging);
+                state.dragging = true;
+                assert_eq!(
+                    unavailable.handle_event(bounds, &mut state, &drag),
+                    ScrollbarOutcome::Ignored
+                );
+                assert!(!state.dragging);
+                assert_eq!(state.offset, 0);
+                state.content_len = 100;
+                state.viewport_len = 5;
+                assert_eq!(
+                    scrollbar.handle_event(area, &mut state, &drag),
+                    ScrollbarOutcome::Ignored
+                );
+                assert_eq!(state.offset, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn full_track_thumb_preserves_offset_and_releases_drag() {
+        for mut policy in [ScrollbarPolicy::vertical(), ScrollbarPolicy::horizontal()] {
+            for (size, minimum) in [(1, 1), (4, 4), (4, 10)] {
+                policy.min_thumb = minimum;
+                let scrollbar = Scrollbar::new().policy(policy);
+                let area = Rect::new(2, 3, size, size);
+                let mut state = ScrollbarState::new(100, 20).offset(40);
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Drag(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    state.dragging = true;
+                    let event = Event::Mouse(MouseEvent::new(kind, Point::new(2, 3)));
+                    assert_eq!(
+                        scrollbar.handle_event(area, &mut state, &event),
+                        ScrollbarOutcome::Ignored
+                    );
+                    assert_eq!(state.offset, 40);
+                    assert!(!state.dragging);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_track_thumb_has_no_interactive_region() {
+        let state = Cell::new(ScrollbarState::new(100, 20).offset(40));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+        paint_component(
+            &ScrollbarComponent::new("tiny", &state),
+            Rect::new(0, 0, 1, 1),
+            &mut frame,
+        );
+        assert!(frame.hits().regions().is_empty());
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("█"));
+        assert_eq!(state.get().offset, 40);
+    }
+
+    #[test]
+    fn zero_minimum_keeps_a_visible_thumb_at_both_scroll_endpoints() {
+        for mut policy in [ScrollbarPolicy::vertical(), ScrollbarPolicy::horizontal()] {
+            policy.min_thumb = 0;
+            let scrollbar = Scrollbar::new().policy(policy);
+            let area = match policy.orientation {
+                super::ScrollbarOrientation::Vertical => Rect::new(0, 0, 1, 4),
+                super::ScrollbarOrientation::Horizontal => Rect::new(0, 0, 4, 1),
+            };
+            for viewport in [0, 1] {
+                let mut state = ScrollbarState::new(100, viewport);
+                for offset in [0, state.max_offset()] {
+                    state.offset = offset;
+                    let geometry = scrollbar.layout(area, &state);
+                    assert_eq!(geometry.thumb_len, 1);
+                    assert_eq!(geometry.thumb_start, if offset == 0 { 0 } else { 3 });
+                    let mut buffer = Buffer::empty(area);
+                    let mut frame = Frame::new(&mut buffer);
+                    scrollbar.paint(area, &state, &mut PaintCx::new(&mut frame));
+                    assert_eq!(
+                        buffer
+                            .cells()
+                            .iter()
+                            .filter(|cell| cell.symbol == "█")
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
     }
 
     #[test]

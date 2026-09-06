@@ -567,6 +567,9 @@ impl Component for TextViewComponent<'_, '_> {
         let Some(area) = cx.find_rect(&layout.id) else {
             return EventOutcome::Ignored;
         };
+        if area.is_empty() {
+            return EventOutcome::Ignored;
+        }
         match self.handle_event(area, layout, event) {
             ScrollViewOutcome::Ignored => EventOutcome::Ignored,
             ScrollViewOutcome::Scrolled { .. } | ScrollViewOutcome::HorizontalScrolled { .. } => {
@@ -990,6 +993,28 @@ mod tests {
             ),
             ScrollViewOutcome::Ignored
         );
+    }
+
+    #[test]
+    fn parent_clipped_text_view_ignores_keyboard_without_changing_scroll_state() {
+        let lines = [Line::from("one"), Line::from("two"), Line::from("three")];
+        let mut initial = ScrollViewState::new();
+        initial.interaction.focused = true;
+        let state = Cell::new(initial);
+        let view = TextViewComponent::new("text", &lines, &state);
+        let layout = layout_at(&view, Rect::new(0, 0, 8, 1));
+        let event = Event::Key(KeyStroke::simple(KeyCode::Down));
+        let mut cx = EventCx::with_clip(&layout, Rect::new(0, 0, 30, 30));
+        for clip in [Rect::new(0, 0, 8, 1), Rect::new(12, 11, 0, 1)] {
+            cx.with_transform(0, 0, 12, 11, clip, |cx| {
+                assert_eq!(view.event(&event, &layout, cx), EventOutcome::Ignored);
+            });
+            assert_eq!(state.get(), initial);
+        }
+        cx.with_transform(0, 0, 12, 11, Rect::new(12, 11, 8, 1), |cx| {
+            assert_eq!(view.event(&event, &layout, cx), EventOutcome::Redraw);
+        });
+        assert_eq!(state.get().vertical_offset(), 1);
     }
 
     #[test]

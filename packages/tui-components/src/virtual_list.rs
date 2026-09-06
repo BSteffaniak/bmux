@@ -153,11 +153,14 @@ where
         self.scroll.set_follow_bottom(true);
     }
 
-    /// Clamp logical scrolling to the current collection extent.
+    /// Clamp logical scrolling to the current collection extent without changing
+    /// whether subsequent appends are followed.
     pub fn clamp_scroll(&mut self, viewport_height: usize) {
         let maximum = self.index.total_height().saturating_sub(viewport_height);
+        let follow_bottom = self.scroll.follows_bottom();
         self.scroll
             .set_vertical_offset(self.scroll.vertical_offset().min(maximum));
+        self.scroll.set_follow_bottom(follow_bottom);
     }
 
     /// Logical start row for a stable key.
@@ -926,6 +929,76 @@ mod tests {
         assert_eq!(
             list.event(area, &state, &event, &mut cx),
             EventOutcome::Redraw
+        );
+    }
+
+    #[test]
+    fn intrinsic_narrow_item_uses_full_width_list_constraints() {
+        struct NarrowItem;
+        impl Component for NarrowItem {
+            fn layout(&self, constraints: Constraints, _: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf(
+                    "narrow".into(),
+                    constraints.constrain(LogicalSize::new(3, 2)),
+                )
+            }
+
+            fn paint(&self, _: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+                cx.fill(cx.area(), "x", Style::new());
+            }
+
+            fn event(&self, _: &Event, _: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+                assert_eq!(cx.clip(), Some(Rect::new(12, 11, 8, 2)));
+                EventOutcome::Handled
+            }
+        }
+
+        let list = VirtualList::new("list").item("narrow", 0, NarrowItem);
+        let mut state = VirtualListState::new(0);
+        list.sync(8, &mut state, &mut LayoutCx::new());
+        let root = LayoutNode::leaf("root".into(), LogicalSize::new(30, 30));
+        let area = Rect::new(2, 1, 8, 4);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 30));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(12, 11, LocalRect::new(0, 0, 8, 4), |cx| {
+            list.paint(Rect::new(0, 0, 8, 4), &state, cx);
+        });
+        for y in 10..14 {
+            for x in 11..21 {
+                let expected = if (12..20).contains(&x) && (11..13).contains(&y) {
+                    "x"
+                } else {
+                    " "
+                };
+                assert_eq!(buffer.get(Point::new(x, y)).unwrap().symbol, expected);
+            }
+        }
+        let mut cx = EventCx::new(&root);
+        cx.with_transform(0, 0, 10, 10, Rect::new(0, 0, 30, 30), |cx| {
+            for (x, expected) in [
+                (12, EventOutcome::Handled),
+                (14, EventOutcome::Handled),
+                (15, EventOutcome::Handled),
+                (19, EventOutcome::Handled),
+                (20, EventOutcome::Ignored),
+            ] {
+                let event = Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(x, 11),
+                ));
+                assert_eq!(list.event(area, &state, &event, cx), expected);
+            }
+            assert_eq!(
+                list.event(area, &state, &Event::Paste("input".into()), cx),
+                EventOutcome::Handled
+            );
+        });
+        // A parent exposing only rows below the measured child hides it entirely,
+        // including from non-positional handlers that unconditionally accept input.
+        let mut cx = EventCx::with_clip(&root, Rect::new(2, 3, 8, 2));
+        assert_eq!(
+            list.event(area, &state, &Event::Paste("input".into()), &mut cx),
+            EventOutcome::Ignored
         );
     }
 
@@ -1789,6 +1862,33 @@ mod tests {
         initial.sync(8, &mut state, &mut cx);
         state.restore_anchor(2);
         assert_eq!(state.scroll.vertical_offset(), 1);
+    }
+
+    #[test]
+    fn clamping_preserves_follow_policy_across_append_and_viewport_changes() {
+        let initial = VirtualList::new("list")
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"));
+        let appended = VirtualList::new("list")
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"));
+        for follow in [false, true] {
+            let mut state = VirtualListState::new(0);
+            initial.sync(8, &mut state, &mut LayoutCx::new());
+            state.scroll.set_vertical_offset(100);
+            state.scroll.set_follow_bottom(follow);
+            state.clamp_scroll(1);
+            assert_eq!(state.scroll.vertical_offset(), 1);
+            assert_eq!(state.scroll.follows_bottom(), follow);
+            state.clamp_scroll(3);
+            assert_eq!(state.scroll.vertical_offset(), 0);
+            assert_eq!(state.scroll.follows_bottom(), follow);
+            appended.sync(8, &mut state, &mut LayoutCx::new());
+            state.restore_anchor(1);
+            assert_eq!(state.scroll.vertical_offset(), if follow { 2 } else { 0 });
+            assert_eq!(state.scroll.follows_bottom(), follow);
+        }
     }
 
     #[test]

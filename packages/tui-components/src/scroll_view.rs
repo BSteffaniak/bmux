@@ -589,8 +589,32 @@ impl ScrollView {
         state: &mut ScrollViewState,
         event: &Event,
     ) -> ScrollViewOutcome {
+        if state.interaction.disabled {
+            state.dragging = None;
+            return ScrollViewOutcome::Ignored;
+        }
         let resolved = scrollbar_layout(area, self.policy.scrollbar_layout());
-        if let Some(scrollbar_area) = resolved.vertical_scrollbar {
+        let capture_available = match state.dragging {
+            Some(ScrollbarOrientation::Vertical) => {
+                self.vertical_scrollbar_policy.mouse_drag
+                    && resolved
+                        .vertical_scrollbar
+                        .is_some_and(|area| !area.is_empty())
+            }
+            Some(ScrollbarOrientation::Horizontal) => {
+                self.horizontal_scrollbar_policy.mouse_drag
+                    && resolved
+                        .horizontal_scrollbar
+                        .is_some_and(|area| !area.is_empty())
+            }
+            None => true,
+        };
+        if !capture_available {
+            state.dragging = None;
+        }
+        if let Some(scrollbar_area) = resolved.vertical_scrollbar
+            && state.dragging != Some(ScrollbarOrientation::Horizontal)
+        {
             let mut scrollbar = scrollbar_state(
                 content_height(layout),
                 layout.size.height,
@@ -617,7 +641,9 @@ impl ScrollView {
                 ScrollbarOutcome::Ignored => {}
             }
         }
-        if let Some(scrollbar_area) = resolved.horizontal_scrollbar {
+        if let Some(scrollbar_area) = resolved.horizontal_scrollbar
+            && state.dragging != Some(ScrollbarOrientation::Vertical)
+        {
             let mut scrollbar = scrollbar_state(
                 usize::from(content_width(layout)),
                 usize::from(layout.size.width),
@@ -677,8 +703,8 @@ impl ScrollView {
             old.saturating_sub(delta.unsigned_abs())
         } else {
             old.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
-                .min(maximum)
-        };
+        }
+        .min(maximum);
         state.follow_bottom = state.vertical_offset == maximum && delta > 0;
         outcome(old, state.vertical_offset)
     }
@@ -695,8 +721,8 @@ impl ScrollView {
             old.saturating_sub(delta.unsigned_abs())
         } else {
             old.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
-                .min(maximum)
-        };
+        }
+        .min(maximum);
         horizontal_outcome(old, state.horizontal_offset)
     }
 
@@ -736,23 +762,18 @@ impl ScrollView {
         state: &mut ScrollViewState,
         request: &SelectionAutoScrollRequest,
     ) -> ScrollViewOutcome {
-        if request.axis != SelectionScrollAxis::Vertical || state.interaction.disabled {
+        if state.interaction.disabled {
             return ScrollViewOutcome::Ignored;
         }
-        let old = state.vertical_offset;
-        let amount = usize::from(request.intensity.max(1));
-        match request.direction {
-            SelectionScrollDirection::Backward => {
-                state.vertical_offset = state.vertical_offset.saturating_sub(amount);
-                state.follow_bottom = false;
-            }
-            SelectionScrollDirection::Forward => {
-                let maximum = Self::max_vertical_offset(layout);
-                state.vertical_offset = state.vertical_offset.saturating_add(amount).min(maximum);
-                state.follow_bottom = state.vertical_offset == maximum;
-            }
+        let amount = isize::try_from(request.intensity.max(1)).unwrap_or(isize::MAX);
+        let delta = match request.direction {
+            SelectionScrollDirection::Backward => -amount,
+            SelectionScrollDirection::Forward => amount,
+        };
+        match request.axis {
+            SelectionScrollAxis::Vertical => Self::scroll_vertical_by(layout, state, delta),
+            SelectionScrollAxis::Horizontal => Self::scroll_horizontal_by(layout, state, delta),
         }
-        outcome(old, state.vertical_offset)
     }
 
     /// Return whether this viewport can consume one vertical scroll direction.
@@ -806,7 +827,8 @@ impl ScrollView {
         outcome(old, state.vertical_offset)
     }
 
-    /// Place one authoritative descendant's top at the viewport top.
+    /// Place one authoritative descendant's top at the viewport top and stop
+    /// following subsequent appends.
     pub fn scroll_to_layout(
         &self,
         layout: &LayoutNode,
@@ -818,22 +840,33 @@ impl ScrollView {
         };
         let old = state.vertical_offset;
         state.vertical_offset = rect.y.min(Self::max_vertical_offset(layout));
-        state.follow_bottom = state.vertical_offset == Self::max_vertical_offset(layout);
+        state.follow_bottom = false;
         outcome(old, state.vertical_offset)
     }
 
-    /// Ensure one authoritative descendant layout is visible by stable identity.
+    /// Ensure one authoritative descendant layout is visible on both axes by
+    /// stable identity, using the minimum movement needed on each axis.
     pub fn ensure_layout_visible(
         &self,
         layout: &LayoutNode,
         state: &mut ScrollViewState,
         id: &LayoutId,
     ) -> ScrollViewOutcome {
-        layout
-            .find_logical_rect(id)
-            .map_or(ScrollViewOutcome::Ignored, |rect| {
-                self.ensure_visible(layout, state, rect.y, rect.height)
-            })
+        let Some(rect) = layout.find_logical_rect(id) else {
+            return ScrollViewOutcome::Ignored;
+        };
+        let horizontal = Self::ensure_horizontal_visible(
+            layout,
+            state,
+            usize::from(rect.x),
+            usize::from(rect.width),
+        );
+        let vertical = self.ensure_visible(layout, state, rect.y, rect.height);
+        if vertical == ScrollViewOutcome::Ignored {
+            horizontal
+        } else {
+            vertical
+        }
     }
 
     /// Capture one stable descendant's signed viewport-relative row.
@@ -850,7 +883,8 @@ impl ScrollView {
         })
     }
 
-    /// Restore a captured stable descendant after relayout.
+    /// Restore a captured stable descendant after relayout without changing the
+    /// caller's bottom-follow policy.
     pub fn restore_anchor(
         &self,
         layout: &LayoutNode,
@@ -863,7 +897,6 @@ impl ScrollView {
         let old = state.vertical_offset;
         state.vertical_offset = offset_for_viewport_row(rect.y, anchor.viewport_row)
             .min(Self::max_vertical_offset(layout));
-        state.follow_bottom = state.vertical_offset == Self::max_vertical_offset(layout);
         outcome(old, state.vertical_offset)
     }
 
@@ -912,7 +945,9 @@ impl ScrollView {
         let old_horizontal = state.horizontal_offset;
         match event {
             Event::Key(stroke) if self.policy.keyboard && state.interaction.focused => {
-                Self::handle_key(*stroke, layout.size.height, maximum, state);
+                if !Self::handle_key(*stroke, layout.size.height, maximum, state) {
+                    return ScrollViewOutcome::Ignored;
+                }
             }
             Event::Mouse(mouse) if self.policy.mouse_wheel && area.contains(mouse.position) => {
                 match mouse.kind {
@@ -955,7 +990,7 @@ impl ScrollView {
         viewport_height: usize,
         maximum: usize,
         state: &mut ScrollViewState,
-    ) {
+    ) -> bool {
         match stroke.key {
             KeyCode::Left => {
                 state.horizontal_offset = state.horizontal_offset.saturating_sub(1);
@@ -990,8 +1025,9 @@ impl ScrollView {
                 state.vertical_offset = maximum;
                 state.follow_bottom = true;
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 }
 
@@ -1734,6 +1770,67 @@ mod tests {
     }
 
     #[test]
+    fn restoring_anchor_at_bottom_preserves_follow_policy_for_later_appends() {
+        let view = ScrollView::new();
+        let before = layout(20, 5);
+        let after = layout(10, 5);
+        let appended = layout(30, 5);
+        let id = before.children[0].node.id.clone();
+        for follow in [false, true] {
+            let mut state = ScrollViewState::new();
+            state.set_vertical_offset(15);
+            state.set_follow_bottom(follow);
+            let anchor = ScrollView::capture_anchor(&before, &state, &id).unwrap();
+            assert_eq!(
+                view.restore_anchor(&after, &mut state, &anchor),
+                ScrollViewOutcome::Scrolled { vertical_offset: 5 }
+            );
+            assert_eq!(state.follows_bottom(), follow);
+            view.reconcile(&appended, &mut state);
+            assert_eq!(state.vertical_offset(), if follow { 25 } else { 5 });
+            assert_eq!(state.follows_bottom(), follow);
+        }
+    }
+
+    #[test]
+    fn explicit_descendant_navigation_stops_following_even_at_bottom() {
+        fn tree(height: usize) -> LayoutNode {
+            ScrollViewComponent::viewport_layout(
+                "viewport".into(),
+                LogicalSize::new(10, 5),
+                LayoutNode::with_children(
+                    "content".into(),
+                    LogicalSize::new(10, height),
+                    vec![ChildLayout::new(
+                        0,
+                        15,
+                        LayoutNode::leaf("target".into(), LogicalSize::new(10, 1)),
+                    )],
+                ),
+            )
+        }
+        let view = ScrollView::new();
+        let initial = tree(20);
+        let appended = tree(30);
+        for offset in [0, 15] {
+            let mut state = ScrollViewState::new();
+            state.set_vertical_offset(offset);
+            state.set_follow_bottom(true);
+            let before = state;
+            assert_eq!(
+                view.scroll_to_layout(&initial, &mut state, &LayoutId::new("missing")),
+                ScrollViewOutcome::Ignored
+            );
+            assert_eq!(state, before);
+            let _ = view.scroll_to_layout(&initial, &mut state, &LayoutId::new("target"));
+            assert_eq!(state.vertical_offset(), 15);
+            assert!(!state.follows_bottom());
+            view.reconcile(&appended, &mut state);
+            assert_eq!(state.vertical_offset(), 15);
+        }
+    }
+
+    #[test]
     fn stable_anchor_restores_relative_row_after_relayout() {
         fn anchored_layout(target_row: usize) -> LayoutNode {
             let target = LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(10, 2));
@@ -1803,6 +1900,52 @@ mod tests {
     }
 
     #[test]
+    fn stable_identity_reveal_moves_both_axes_minimally() {
+        let layout = ScrollViewComponent::viewport_layout(
+            "viewport".into(),
+            LogicalSize::new(10, 5),
+            LayoutNode::with_children(
+                "content".into(),
+                LogicalSize::new(40, 30),
+                vec![ChildLayout::new(
+                    20,
+                    15,
+                    LayoutNode::leaf("target".into(), LogicalSize::new(3, 2)),
+                )],
+            ),
+        );
+        let view = ScrollView::new();
+        let target = LayoutId::new("target");
+        let mut state = ScrollViewState::new();
+        assert_eq!(
+            view.ensure_layout_visible(&layout, &mut state, &target),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 12
+            }
+        );
+        assert_eq!(state.horizontal_offset(), 13);
+        assert_eq!(
+            view.ensure_layout_visible(&layout, &mut state, &target),
+            ScrollViewOutcome::Ignored
+        );
+
+        state.set_horizontal_offset(30);
+        assert_eq!(
+            view.ensure_layout_visible(&layout, &mut state, &target),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 20
+            }
+        );
+        assert_eq!(state.vertical_offset(), 12);
+        let before = state;
+        assert_eq!(
+            view.ensure_layout_visible(&layout, &mut state, &LayoutId::new("missing")),
+            ScrollViewOutcome::Ignored
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn keyboard_horizontal_navigation_uses_canonical_offset() {
         let view = ScrollView::new();
         let layout = LayoutNode::with_children(
@@ -1850,6 +1993,55 @@ mod tests {
                 horizontal_offset: 2
             }
         );
+    }
+
+    #[test]
+    fn unrelated_keys_leave_scroll_reconciliation_to_the_layout_owner() {
+        let view = ScrollView::new();
+        let area = Rect::new(0, 0, 10, 5);
+        let mut following = ScrollViewState::new();
+        following.interaction.focused = true;
+        let _ = view.handle_event(
+            area,
+            &layout(20, 5),
+            &mut following,
+            &Event::Key(KeyStroke::simple(KeyCode::End)),
+        );
+        let mut out_of_bounds = ScrollViewState::new();
+        out_of_bounds.interaction.focused = true;
+        out_of_bounds.set_vertical_offset(100);
+        for initial in [following, out_of_bounds] {
+            let mut state = initial;
+            for key in [
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+                KeyCode::Tab,
+                KeyCode::Escape,
+            ] {
+                assert_eq!(
+                    view.handle_event(
+                        area,
+                        &layout(25, 5),
+                        &mut state,
+                        &Event::Key(KeyStroke::simple(key)),
+                    ),
+                    ScrollViewOutcome::Ignored
+                );
+                assert_eq!(state, initial);
+            }
+            assert_eq!(
+                view.handle_event(
+                    area,
+                    &layout(25, 5),
+                    &mut state,
+                    &Event::Key(KeyStroke::simple(KeyCode::End)),
+                ),
+                ScrollViewOutcome::Scrolled {
+                    vertical_offset: 20
+                }
+            );
+            assert!(state.follows_bottom());
+        }
     }
 
     #[test]
@@ -1902,6 +2094,107 @@ mod tests {
             &state,
             SelectionScrollDirection::Forward
         ));
+    }
+
+    #[test]
+    fn backward_movement_clamps_stale_offsets_after_content_shrinks() {
+        let view = ScrollView::new();
+        let layout = ScrollViewComponent::viewport_layout(
+            "viewport".into(),
+            LogicalSize::new(5, 5),
+            LayoutNode::leaf("content".into(), LogicalSize::new(20, 20)),
+        );
+        for (delta, expected) in [
+            (-1, 15),
+            (0, 15),
+            (1, 15),
+            (isize::MIN, 0),
+            (isize::MAX, 15),
+        ] {
+            let mut state = ScrollViewState::new();
+            state.set_vertical_offset(100);
+            state.set_horizontal_offset(100);
+            assert_eq!(
+                ScrollView::scroll_vertical_by(&layout, &mut state, delta),
+                ScrollViewOutcome::Scrolled {
+                    vertical_offset: expected
+                }
+            );
+            assert_eq!(
+                ScrollView::scroll_horizontal_by(&layout, &mut state, delta),
+                ScrollViewOutcome::HorizontalScrolled {
+                    horizontal_offset: expected
+                }
+            );
+        }
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(100);
+        let request = SelectionAutoScrollRequest {
+            scope_id: SelectionScopeId::new("content"),
+            axis: SelectionScrollAxis::Vertical,
+            direction: SelectionScrollDirection::Backward,
+            intensity: 1,
+        };
+        assert_eq!(
+            view.handle_selection_auto_scroll(&layout, &mut state, &request),
+            ScrollViewOutcome::Scrolled {
+                vertical_offset: 15
+            }
+        );
+        assert!(!state.follows_bottom());
+    }
+
+    #[test]
+    fn horizontal_selection_autoscroll_preserves_vertical_follow_and_clamps() {
+        let view = ScrollView::new();
+        let layout = ScrollViewComponent::viewport_layout(
+            "viewport".into(),
+            LogicalSize::new(5, 5),
+            LayoutNode::leaf("content".into(), LogicalSize::new(20, 20)),
+        );
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(15);
+        state.set_follow_bottom(true);
+        let mut request = SelectionAutoScrollRequest {
+            scope_id: SelectionScopeId::new("content"),
+            axis: SelectionScrollAxis::Horizontal,
+            direction: SelectionScrollDirection::Forward,
+            intensity: 0,
+        };
+        assert_eq!(
+            view.handle_selection_auto_scroll(&layout, &mut state, &request),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 1
+            }
+        );
+        request.intensity = u16::MAX;
+        assert_eq!(
+            view.handle_selection_auto_scroll(&layout, &mut state, &request),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 15
+            }
+        );
+        assert_eq!(
+            view.handle_selection_auto_scroll(&layout, &mut state, &request),
+            ScrollViewOutcome::Ignored
+        );
+        request.direction = SelectionScrollDirection::Backward;
+        state.interaction.disabled = true;
+        let disabled = state;
+        assert_eq!(
+            view.handle_selection_auto_scroll(&layout, &mut state, &request),
+            ScrollViewOutcome::Ignored
+        );
+        assert_eq!(state, disabled);
+        state.interaction.disabled = false;
+        assert_eq!(
+            view.handle_selection_auto_scroll(&layout, &mut state, &request),
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: 0
+            }
+        );
+        assert_eq!(state.vertical_offset(), 15);
+        assert!(state.follows_bottom());
     }
 
     #[test]
@@ -2012,6 +2305,190 @@ mod tests {
             ScrollViewOutcome::Ignored
         );
         assert!(!state.dragging_scrollbar());
+    }
+
+    #[test]
+    fn unavailable_scrollbar_releases_capture_without_resuming_after_restoration() {
+        let view = ScrollView::new().policy(
+            ScrollViewPolicy::interactive().horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+        );
+        let area = Rect::new(0, 0, 10, 5);
+        let layout = ScrollViewComponent::viewport_layout(
+            "viewport".into(),
+            LogicalSize::new(9, 4),
+            LayoutNode::leaf("content".into(), LogicalSize::new(40, 100)),
+        );
+        for point in [Point::new(0, 4), Point::new(9, 0)] {
+            let press = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                point,
+            ));
+            let drag = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                Point::new(8, 3),
+            ));
+            let mut no_drag = view;
+            no_drag.vertical_scrollbar_policy.mouse_drag = false;
+            no_drag.horizontal_scrollbar_policy.mouse_drag = false;
+            let hidden = view.policy(
+                ScrollViewPolicy::interactive()
+                    .vertical_scrollbar(ScrollbarAxisLayoutMode::Hidden)
+                    .horizontal_scrollbar(ScrollbarAxisLayoutMode::Hidden),
+            );
+            for (unavailable, bounds) in [
+                (hidden, area),
+                (no_drag, area),
+                (view, Rect::new(0, 0, 0, 0)),
+            ] {
+                let mut state = ScrollViewState::new();
+                assert_eq!(
+                    view.handle_scrollbar_event(area, &layout, &mut state, &press),
+                    ScrollViewOutcome::Ignored
+                );
+                assert!(state.dragging_scrollbar());
+                assert_eq!(
+                    unavailable.handle_scrollbar_event(bounds, &layout, &mut state, &drag),
+                    ScrollViewOutcome::Ignored
+                );
+                assert!(!state.dragging_scrollbar());
+                let released = state;
+                assert_eq!(
+                    view.handle_scrollbar_event(area, &layout, &mut state, &drag),
+                    ScrollViewOutcome::Ignored
+                );
+                assert_eq!(state, released);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_scrollbars_reject_input_and_release_capture_on_both_axes() {
+        let view = ScrollView::new().policy(
+            ScrollViewPolicy::interactive().horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+        );
+        let area = Rect::new(2, 3, 10, 5);
+        let layout = ScrollViewComponent::viewport_layout(
+            "viewport".into(),
+            LogicalSize::new(9, 4),
+            LayoutNode::leaf("content".into(), LogicalSize::new(40, 100)),
+        );
+        for point in [Point::new(10, 7), Point::new(11, 6)] {
+            let press = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                point,
+            ));
+            let mut state = ScrollViewState::new();
+            state.interaction.disabled = true;
+            let disabled = state;
+            assert_eq!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &press),
+                ScrollViewOutcome::Ignored
+            );
+            assert_eq!(state, disabled);
+
+            state.interaction.disabled = false;
+            assert_ne!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &press),
+                ScrollViewOutcome::Ignored
+            );
+            assert!(state.dragging_scrollbar());
+            state.interaction.disabled = true;
+            let offsets = (
+                state.vertical_offset(),
+                state.horizontal_offset(),
+                state.follows_bottom(),
+            );
+            let drag = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                Point::new(2, 3),
+            ));
+            assert_eq!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &drag),
+                ScrollViewOutcome::Ignored
+            );
+            assert!(!state.dragging_scrollbar());
+            assert_eq!(
+                (
+                    state.vertical_offset(),
+                    state.horizontal_offset(),
+                    state.follows_bottom()
+                ),
+                offsets
+            );
+            state.interaction.disabled = false;
+            assert_eq!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &drag),
+                ScrollViewOutcome::Ignored
+            );
+            assert_eq!(
+                (
+                    state.vertical_offset(),
+                    state.horizontal_offset(),
+                    state.follows_bottom()
+                ),
+                offsets
+            );
+        }
+    }
+
+    #[test]
+    fn both_gutters_preserve_drag_ownership_until_release() {
+        let view = ScrollView::new().policy(
+            ScrollViewPolicy::interactive().horizontal_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+        );
+        let area = Rect::new(2, 3, 10, 5);
+        let child = LayoutNode::leaf("content".into(), LogicalSize::new(40, 100));
+        let layout =
+            ScrollViewComponent::viewport_layout("viewport".into(), LogicalSize::new(9, 4), child);
+        for (start, end, horizontal) in [
+            (Point::new(2, 7), Point::new(10, 2), true),
+            (Point::new(11, 3), Point::new(1, 6), false),
+        ] {
+            let mut state = ScrollViewState::new();
+            let press = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                start,
+            ));
+            // Pressing the current thumb starts capture even without offset movement.
+            assert_eq!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &press),
+                ScrollViewOutcome::Ignored
+            );
+            assert!(state.dragging_scrollbar());
+            let drag = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                end,
+            ));
+            let outcome = view.handle_scrollbar_event(area, &layout, &mut state, &drag);
+            if horizontal {
+                assert!(matches!(
+                    outcome,
+                    ScrollViewOutcome::HorizontalScrolled { .. }
+                ));
+                assert_eq!(state.horizontal_offset(), 31);
+                assert_eq!(state.vertical_offset(), 0);
+            } else {
+                assert!(matches!(outcome, ScrollViewOutcome::Scrolled { .. }));
+                assert_eq!(state.vertical_offset(), 96);
+                assert_eq!(state.horizontal_offset(), 0);
+            }
+            assert!(state.dragging_scrollbar());
+            let release = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                end,
+            ));
+            assert_eq!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &release),
+                ScrollViewOutcome::Ignored
+            );
+            assert!(!state.dragging_scrollbar());
+            let released = state;
+            assert_eq!(
+                view.handle_scrollbar_event(area, &layout, &mut state, &drag),
+                ScrollViewOutcome::Ignored
+            );
+            assert_eq!(state, released);
+        }
     }
 
     #[test]
