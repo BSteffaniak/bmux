@@ -1024,27 +1024,41 @@ mod tests {
             TreeViewItem::new("child", "Child", 1),
             TreeViewItem::new("sibling", "Sibling", 0),
         ];
-        let tree = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
-        state.set_expanded("root", true);
-        state.hovered_visible = Some(1);
-        state.pressed_visible = Some(1);
-        state.set_expanded("root", true);
-        assert_eq!(state.pressed_visible, Some(1));
-        state.set_expanded("root", false);
-        assert_eq!(state.hovered_visible, None);
-        assert_eq!(state.pressed_visible, None);
-        let outcome = tree.handle_event(
-            Rect::new(0, 0, 20, 2),
-            &mut state,
-            &Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Up(MouseButton::Left),
-                position: Point::new(2, 1),
-                modifiers: bmux_tui::event::MouseModifiers::default(),
-            }),
+        let mut initial = TreeViewState::new(Some(0));
+        initial.set_expanded("root", true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        for kind in [
+            MouseEventKind::Move,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert_eq!(
+                component.handle_event(
+                    &Event::Mouse(MouseEvent::new(kind, Point::new(2, 1))),
+                    &layout,
+                    &mut EventCx::new(&layout),
+                ),
+                TreeViewOutcome::Redraw
+            );
+        }
+        state.borrow_mut().set_expanded("root", true);
+        assert_eq!(state.borrow().pressed_visible, Some(1));
+        state.borrow_mut().set_expanded("root", false);
+        assert_eq!(state.borrow().hovered_visible, None);
+        assert_eq!(state.borrow().pressed_visible, None);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 2);
+        let outcome = component.handle_event(
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(MouseButton::Left),
+                Point::new(2, 1),
+            )),
+            &layout,
+            &mut EventCx::new(&layout),
         );
         assert_eq!(outcome, TreeViewOutcome::Ignored);
-        assert_eq!(state.selected_visible(), Some(0));
+        assert_eq!(state.borrow().selected_visible(), Some(0));
     }
 
     #[test]
@@ -1493,25 +1507,26 @@ mod tests {
     #[test]
     fn keyboard_navigation_moves_selection() {
         let items = sample_items();
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
-        state.set_focused(true);
-        state.set_expanded("src", true);
-
-        let outcome = view.handle_event(
-            Rect::new(0, 0, 20, 4),
-            &mut state,
-            &Event::Key(KeyStroke::simple(KeyCode::Down)),
-        );
-
-        assert_eq!(
-            outcome,
-            TreeViewOutcome::Focused {
-                visible: 1,
-                source: 1
-            }
-        );
-        assert_eq!(state.selected_visible(), Some(1));
+        let mut initial = TreeViewState::new(Some(0));
+        initial.set_focused(true);
+        initial.set_expanded("src", true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        for (key, expected) in [(KeyCode::Down, 1), (KeyCode::Up, 0)] {
+            assert_eq!(
+                component.handle_event(
+                    &Event::Key(KeyStroke::simple(key)),
+                    &layout,
+                    &mut EventCx::new(&layout),
+                ),
+                TreeViewOutcome::Focused {
+                    visible: expected,
+                    source: expected,
+                }
+            );
+            assert_eq!(state.borrow().selected_visible(), Some(expected));
+        }
     }
 
     #[test]
@@ -1588,21 +1603,24 @@ mod tests {
     #[test]
     fn enter_selects_enabled_item() {
         let items = sample_items();
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(1));
-        state.set_focused(true);
-
+        let mut initial = TreeViewState::new(Some(1));
+        initial.set_focused(true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 2);
         assert_eq!(
-            view.handle_event(
-                Rect::new(0, 0, 20, 4),
-                &mut state,
+            component.handle_event(
                 &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
             ),
             TreeViewOutcome::Selected {
                 visible: 1,
                 source: 3
             }
         );
+        assert_eq!(state.borrow().selected_visible(), Some(1));
     }
 
     #[test]
@@ -1648,35 +1666,36 @@ mod tests {
     #[test]
     fn disabled_items_do_not_select() {
         let items = [TreeViewItem::new("disabled", "Disabled", 0).disabled(true)];
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
-
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
         assert_eq!(
-            view.handle_event(
-                Rect::new(0, 0, 20, 1),
-                &mut state,
+            component.handle_event(
                 &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
             ),
             TreeViewOutcome::Ignored
         );
+        assert_eq!(state.borrow().selected_visible(), Some(0));
     }
 
     #[test]
     fn bare_policy_ignores_events() {
         let items = sample_items();
-        let mut view = TreeView::new(&items);
-        view.policy = TreeViewPolicy::bare();
-        let mut state = TreeViewState::new(Some(0));
-
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let component =
+            TreeViewComponent::new("tree", &items, &state).policy(TreeViewPolicy::bare());
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
         assert_eq!(
-            view.handle_event(
-                Rect::new(0, 0, 20, 4),
-                &mut state,
+            component.handle_event(
                 &Event::Key(KeyStroke::simple(KeyCode::Right)),
+                &layout,
+                &mut EventCx::new(&layout),
             ),
             TreeViewOutcome::Ignored
         );
-        assert!(!state.is_expanded("src"));
+        assert!(!state.borrow().is_expanded("src"));
     }
 
     fn sample_items() -> [TreeViewItem; 4] {
