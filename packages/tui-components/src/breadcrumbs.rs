@@ -372,11 +372,19 @@ impl<'a> Breadcrumbs<'a> {
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
                 self.handle_mouse(area, state, *mouse)
             }
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) => {
+                let changed = state.pressed.take().is_some() | state.hovered.take().is_some();
+                if changed {
+                    BreadcrumbsOutcome::Redraw
+                } else {
+                    BreadcrumbsOutcome::Ignored
+                }
+            }
             Event::Key(_)
             | Event::Mouse(_)
             | Event::Resize(_)
             | Event::Paste(_)
-            | Event::Focus(_)
+            | Event::Focus(bmux_tui::event::FocusEvent::Gained)
             | Event::Tick
             | Event::User(_) => BreadcrumbsOutcome::Ignored,
         }
@@ -427,22 +435,20 @@ impl<'a> Breadcrumbs<'a> {
         if self.items.is_empty() {
             return BreadcrumbsOutcome::Ignored;
         }
-        let current = state
-            .current
-            .unwrap_or(0)
-            .min(self.items.len().saturating_sub(1));
+        let current = state.current.filter(|&index| index < self.items.len());
         let next = if delta.is_negative() {
-            current.saturating_sub(1)
+            (0..current.unwrap_or(self.items.len()))
+                .rev()
+                .find(|&index| !self.items[index].disabled)
         } else {
-            current
-                .saturating_add(1)
-                .min(self.items.len().saturating_sub(1))
+            (current.map_or(0, |index| index + 1)..self.items.len())
+                .find(|&index| !self.items[index].disabled)
         };
-        if next == current || self.items[next].disabled {
-            BreadcrumbsOutcome::Ignored
-        } else {
+        if let Some(next) = next {
             state.current = Some(next);
             BreadcrumbsOutcome::Redraw
+        } else {
+            BreadcrumbsOutcome::Ignored
         }
     }
 
@@ -583,6 +589,110 @@ mod tests {
                 |cx| component.paint(&layout, cx),
             );
         }
+    }
+
+    #[test]
+    fn keyboard_navigation_skips_disabled_items_without_wrapping() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("disabled", "Disabled").disabled(true),
+            BreadcrumbItem::new("page", "Page"),
+        ];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        let mut state = BreadcrumbsState::new(Some(0));
+        assert_eq!(
+            breadcrumbs.move_current(&mut state, 1),
+            BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.current(), Some(2));
+        assert_eq!(
+            breadcrumbs.move_current(&mut state, 1),
+            BreadcrumbsOutcome::Ignored
+        );
+        assert_eq!(state.current(), Some(2));
+        assert_eq!(
+            breadcrumbs.move_current(&mut state, -1),
+            BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.current(), Some(0));
+        assert_eq!(
+            breadcrumbs.move_current(&mut state, -1),
+            BreadcrumbsOutcome::Ignored
+        );
+        assert_eq!(state.current(), Some(0));
+    }
+
+    #[test]
+    fn navigation_enters_from_directional_edge_with_missing_or_stale_current() {
+        let items = [
+            BreadcrumbItem::new("start", "Start").disabled(true),
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("page", "Page"),
+            BreadcrumbItem::new("end", "End").disabled(true),
+        ];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        for current in [None, Some(items.len()), Some(usize::MAX)] {
+            for (direction, expected) in [(1, 1), (-1, 2)] {
+                let mut state = BreadcrumbsState::new(current);
+                assert_eq!(
+                    breadcrumbs.move_current(&mut state, direction),
+                    BreadcrumbsOutcome::Redraw
+                );
+                assert_eq!(state.current(), Some(expected));
+            }
+        }
+        let disabled = [BreadcrumbItem::new("disabled", "Disabled").disabled(true)];
+        for items in [&disabled[..], &[][..]] {
+            for direction in [-1, 1] {
+                let mut state = BreadcrumbsState::new(None);
+                assert_eq!(
+                    Breadcrumbs::new(items).move_current(&mut state, direction),
+                    BreadcrumbsOutcome::Ignored
+                );
+                assert_eq!(state.current(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn focus_loss_cancels_pointer_activation_and_hover() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        let area = Rect::new(0, 0, 10, 1);
+        let mut state = BreadcrumbsState::new(Some(0));
+        state.pressed = Some(0);
+        state.hovered = Some(0);
+        assert_eq!(
+            breadcrumbs.handle_event(
+                area,
+                &mut state,
+                &Event::Focus(bmux_tui::event::FocusEvent::Lost)
+            ),
+            BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered(), None);
+        assert_eq!(state.current(), Some(0));
+        assert_eq!(
+            breadcrumbs.handle_event(
+                area,
+                &mut state,
+                &Event::Focus(bmux_tui::event::FocusEvent::Lost)
+            ),
+            BreadcrumbsOutcome::Ignored
+        );
+        assert_eq!(
+            breadcrumbs.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    position: Point::new(0, 0),
+                    modifiers: bmux_tui::event::MouseModifiers::default(),
+                })
+            ),
+            BreadcrumbsOutcome::Redraw
+        );
     }
 
     #[test]
