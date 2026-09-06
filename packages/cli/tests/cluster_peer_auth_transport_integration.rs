@@ -344,8 +344,25 @@ fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
         );
     }
     harness.node_mut(2).restart();
-    let recovered = harness.node(2).run(&["cluster", "members"]);
-    assert_success(&recovered, "read membership after voter restart");
+    // IPC readiness precedes Raft leader discovery after restart. Wait for that
+    // specific transient state, while failing immediately on other read errors.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let recovered = loop {
+        let output = harness.node(2).run(&["cluster", "members"]);
+        if output.status.success()
+            || !combined_output(&output)
+                .contains("NotLeader { leader_node_id: None, leader_endpoint: None }")
+            || std::time::Instant::now() >= deadline
+        {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_success_with_server_logs(
+        &recovered,
+        "read membership after voter restart",
+        &[harness.node(0), harness.node(1), harness.node(2)],
+    );
     assert_eq!(
         combined_output(&recovered)
             .matches(" state=Active role=Voter ")

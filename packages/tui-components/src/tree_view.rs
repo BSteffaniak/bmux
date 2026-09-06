@@ -61,7 +61,7 @@ impl TreeViewItem {
     }
 }
 
-/// Keyboard behavior for [`TreeView`].
+/// Keyboard behavior for [`TreeViewComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeViewKeyboardPolicy {
     /// Whether keyboard events are accepted.
@@ -100,7 +100,7 @@ impl Default for TreeViewKeyboardPolicy {
     }
 }
 
-/// Behavior policy for [`TreeView`].
+/// Behavior policy for [`TreeViewComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeViewPolicy {
     /// Keyboard behavior.
@@ -139,7 +139,7 @@ impl Default for TreeViewPolicy {
     }
 }
 
-/// Visual styles for [`TreeView`].
+/// Visual styles for [`TreeViewComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeViewStyles {
     /// Normal row style.
@@ -172,7 +172,7 @@ impl Default for TreeViewStyles {
     }
 }
 
-/// Runtime state for [`TreeView`].
+/// Runtime state for [`TreeViewComponent`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TreeViewState {
     selected_visible: Option<usize>,
@@ -277,7 +277,7 @@ pub enum TreeViewOutcome {
 
 /// Generic hierarchical tree view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TreeView<'a> {
+struct TreeView<'a> {
     items: &'a [TreeViewItem],
     policy: TreeViewPolicy,
     styles: TreeViewStyles,
@@ -311,20 +311,6 @@ impl<'a> TreeView<'a> {
                 marker: Style::new(),
             },
         }
-    }
-
-    /// Set behavior policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: TreeViewPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    /// Set visual styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: TreeViewStyles) -> Self {
-        self.styles = styles;
-        self
     }
 
     /// Return source indices visible under the current expansion state.
@@ -1274,26 +1260,41 @@ mod tests {
     #[test]
     fn pointer_rows_respect_translation_expansion_and_viewport_bounds() {
         let items = sample_items();
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        let hit_at = |area: Rect, point: Point| {
+            let component = TreeViewComponent::new("tree", &items, &state);
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| {
+                    component.handle_event(
+                        &Event::Mouse(MouseEvent::new(MouseEventKind::Move, point)),
+                        &layout,
+                        cx,
+                    )
+                },
+            );
+            state.borrow().hovered_visible
+        };
         let area = Rect::new(5, 7, 10, 3);
-        assert_eq!(view.visible_at(area, &state, Point::new(5, 7)), Some(0));
-        assert_eq!(view.visible_at(area, &state, Point::new(14, 8)), Some(1));
-        assert_eq!(view.visible_at(area, &state, Point::new(5, 9)), None);
-        state.set_expanded("src", true);
-        assert_eq!(view.visible_at(area, &state, Point::new(5, 9)), Some(2));
+        assert_eq!(hit_at(area, Point::new(5, 7)), Some(0));
+        assert_eq!(hit_at(area, Point::new(14, 8)), Some(1));
+        assert_eq!(hit_at(area, Point::new(5, 9)), None);
+        state.borrow_mut().set_expanded("src", true);
+        assert_eq!(hit_at(area, Point::new(5, 9)), Some(2));
         for point in [
             Point::new(4, 7),
             Point::new(15, 7),
             Point::new(5, 6),
             Point::new(5, 10),
         ] {
-            assert_eq!(view.visible_at(area, &state, point), None);
+            assert_eq!(hit_at(area, point), None);
         }
-        assert_eq!(
-            view.visible_at(Rect::new(5, 7, 0, 3), &state, Point::new(5, 7)),
-            None
-        );
+        assert_eq!(hit_at(Rect::new(5, 7, 0, 3), Point::new(5, 7)), None);
     }
 
     #[test]
@@ -1441,6 +1442,19 @@ mod tests {
             }
         );
         assert_eq!(
+            component.handle_event(
+                &Event::Key(KeyStroke::simple(KeyCode::Left)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            TreeViewOutcome::Toggled {
+                visible: 0,
+                source: 0,
+                expanded: false,
+            }
+        );
+        assert!(!state.borrow().is_expanded("src"));
+        assert_eq!(
             component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
             EventOutcome::Ignored
         );
@@ -1503,14 +1517,18 @@ mod tests {
     #[test]
     fn directly_dispatched_tree_key_navigates_without_visual_focus() {
         let items = sample_items();
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
-        state.set_expanded("src", true);
-
-        let outcome = view.handle_event(
-            Rect::new(0, 0, 20, 4),
-            &mut state,
+        let mut initial = TreeViewState::new(Some(0));
+        initial.set_expanded("src", true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 20, 4).size()),
+            &mut LayoutCx::new(),
+        );
+        let outcome = component.handle_event(
             &Event::Key(KeyStroke::simple(KeyCode::Down)),
+            &layout,
+            &mut EventCx::new(&layout),
         );
 
         assert_eq!(
@@ -1520,21 +1538,24 @@ mod tests {
                 source: 1,
             }
         );
-        assert_eq!(state.selected_visible(), Some(1));
+        assert_eq!(state.borrow().selected_visible(), Some(1));
     }
 
     #[test]
     fn right_and_left_expand_and_collapse_selected_item() {
         let items = sample_items();
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
-        state.set_focused(true);
-
+        let mut initial = TreeViewState::new(Some(0));
+        initial.set_focused(true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let constraints = Constraints::for_width(20);
+        let collapsed = component.layout(constraints, &mut LayoutCx::new());
+        assert_eq!(collapsed.size.height, 2);
         assert_eq!(
-            view.handle_event(
-                Rect::new(0, 0, 20, 4),
-                &mut state,
+            component.handle_event(
                 &Event::Key(KeyStroke::simple(KeyCode::Right)),
+                &collapsed,
+                &mut EventCx::new(&collapsed),
             ),
             TreeViewOutcome::Toggled {
                 visible: 0,
@@ -1542,18 +1563,25 @@ mod tests {
                 expanded: true,
             }
         );
-        assert!(state.is_expanded("src"));
+        assert!(state.borrow().is_expanded("src"));
+        let expanded = component.layout(constraints, &mut LayoutCx::new());
+        assert_eq!(expanded.size.height, 4);
         assert_eq!(
-            view.handle_event(
-                Rect::new(0, 0, 20, 4),
-                &mut state,
+            component.handle_event(
                 &Event::Key(KeyStroke::simple(KeyCode::Left)),
+                &expanded,
+                &mut EventCx::new(&expanded),
             ),
             TreeViewOutcome::Toggled {
                 visible: 0,
                 source: 0,
                 expanded: false,
             }
+        );
+        assert!(!state.borrow().is_expanded("src"));
+        assert_eq!(
+            component.layout(constraints, &mut LayoutCx::new()).size,
+            collapsed.size
         );
     }
 
@@ -1580,26 +1608,30 @@ mod tests {
     #[test]
     fn mouse_click_selects_visible_row() {
         let items = sample_items();
-        let view = TreeView::new(&items);
-        let mut state = TreeViewState::new(Some(0));
-        state.set_expanded("src", true);
-        let area = Rect::new(0, 0, 20, 4);
-
-        let _ = view.handle_event(
-            area,
-            &mut state,
-            &Event::Mouse(MouseEvent::new(
-                MouseEventKind::Down(MouseButton::Left),
-                Point::new(1, 2),
-            )),
+        let mut initial = TreeViewState::new(Some(0));
+        initial.set_expanded("src", true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        let mut cx = EventCx::new(&layout);
+        assert_eq!(
+            component.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(1, 2),
+                )),
+                &layout,
+                &mut cx,
+            ),
+            TreeViewOutcome::Redraw
         );
-        let outcome = view.handle_event(
-            area,
-            &mut state,
+        let outcome = component.handle_event(
             &Event::Mouse(MouseEvent::new(
                 MouseEventKind::Up(MouseButton::Left),
                 Point::new(1, 2),
             )),
+            &layout,
+            &mut cx,
         );
 
         assert_eq!(
@@ -1609,7 +1641,8 @@ mod tests {
                 source: 2
             }
         );
-        assert_eq!(state.selected_visible(), Some(2));
+        assert_eq!(state.borrow().selected_visible(), Some(2));
+        assert_eq!(state.borrow().pressed_visible, None);
     }
 
     #[test]
@@ -1631,7 +1664,8 @@ mod tests {
     #[test]
     fn bare_policy_ignores_events() {
         let items = sample_items();
-        let view = TreeView::new(&items).policy(TreeViewPolicy::bare());
+        let mut view = TreeView::new(&items);
+        view.policy = TreeViewPolicy::bare();
         let mut state = TreeViewState::new(Some(0));
 
         assert_eq!(
